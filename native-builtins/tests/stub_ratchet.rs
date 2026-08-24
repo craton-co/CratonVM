@@ -1285,6 +1285,146 @@ fn synthetic_by_file() -> Vec<(String, usize)> {
 /// ratchet asks that. It does not say anybody adjudicated a row; `kind_stated`
 /// and `scripts/jdk-only-kind-map.py` ask that. It says only that the *default*
 /// decides nothing any more, which is the specific property step 3 names.
+/// INTRINSIC RATCHET — the census cannot see this population, so a gate must.
+///
+/// `WORKER-3-NOTE-5` (2026-08-22) measured what the `Intrinsic` tag costs the
+/// contract. `vm/src/vm/vm_exec.rs` skips it at **all three** sites that can
+/// record a `native-shadows-bytecode` row:
+///
+/// ```text
+/// if policy.is_jdk_only() && bytecode_available && kind != NativeKind::Intrinsic {
+///     record_native_shadows_bytecode(class_name, method_name, descriptor, kind);
+/// }
+/// ```
+///
+/// and `resolve_step1_native` returns `DispatchDecision::Intrinsic` at step 2,
+/// before the step-3 arm that records. So the census population is `Bridge` +
+/// `SyntheticStub` only, by construction.
+///
+/// MEASURED on one `--jdk-only --dump-native-registry` run: **629** intrinsic
+/// registrations, **595** owning their slot, and **398** of those standing where
+/// the real JDK 25 class declares the method WITH CODE — shadows by §1.4's own
+/// definition, uncountable. That is +29% on the published 1387, and 305 of the
+/// 398 are `java/lang`.
+///
+/// **This is why the tag needs a ratchet and the header's "kept forever" needs
+/// reading twice.** Re-tagging a row `Intrinsic` removes it from the census
+/// *without changing behaviour*, and it would score as progress. The exemption
+/// is also not uniformly benign: `String.<init>(AbstractStringBuilder,Void)V` is
+/// `kind=intrinsic`, `owns_slot: true`, over real bytecode, and returned an
+/// empty String for any builder on the real `byte[]` layout until
+/// `WORKER-3-NOTE-6` fixed the body it reaches.
+///
+/// `Math`/`StrictMath` are 138 of the 398 and are what an intrinsic exemption is
+/// for. The other 260 have no cited review, which is the work this gate holds
+/// still while somebody does it.
+///
+/// Like the stub ratchet: a change that ADDS an intrinsic fails; REMOVING one is
+/// welcome and only needs the baseline lowered. Raising it is allowed too — but
+/// deliberately, in a commit that says which row and why, which is the whole
+/// point.
+#[test]
+fn intrinsic_count_does_not_regress() {
+    let rows = census_rows();
+    let intrinsic = rows
+        .iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::Intrinsic)
+        .count();
+
+    println!(
+        "intrinsic-ratchet [{MEASURED_CONFIG}]: {intrinsic} Intrinsic registrations \
+         out of {} total (baseline {BASELINE_INTRINSICS})",
+        rows.len()
+    );
+    println!("intrinsic-ratchet: const BASELINE_INTRINSICS: usize = {intrinsic};");
+
+    // WHERE it lives, on every run — a flat count says the population moved and
+    // never which subsystem moved it, which is the whole cost of acting on a red
+    // ratchet (the lesson `synthetic_by_file` was added for).
+    for (file, n) in intrinsic_by_file() {
+        println!("  intrinsic-ratchet: {n:>4}  {file}");
+    }
+
+    assert!(
+        intrinsic <= BASELINE_INTRINSICS,
+        "INTRINSIC RATCHET: {intrinsic} `Intrinsic` registrations, above the \
+         baseline of {BASELINE_INTRINSICS}.\n\
+         \n\
+         `Intrinsic` is EXEMPT from the jdk-only `native-shadows-bytecode` \
+         census (`vm_exec.rs`, all three recorder sites), so a row that gains \
+         this tag leaves the defect population without its behaviour \
+         changing. If the new rows are genuine hot-path intrinsics, raise the \
+         baseline in a commit that names them and says why. If they were \
+         re-tagged to quiet a census, that is the thing this gate exists to \
+         stop. See `WORKER-3-NOTE-5`."
+    );
+}
+
+/// The intrinsic census grouped by the SOURCE FILE that registered each row —
+/// the `synthetic_by_file` shape, for the reason given there.
+fn intrinsic_by_file() -> Vec<(String, usize)> {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in registry.census() {
+        if r.kind != NativeKind::Intrinsic {
+            continue;
+        }
+        let at = r.registered_by.as_deref().unwrap_or("<unknown>");
+        let file = at.replace('\\', "/");
+        let file = file.rsplit_once(':').map_or(file.as_str(), |(f, _)| f).to_string();
+        *per_file.entry(file).or_default() += 1;
+    }
+    let mut out: Vec<_> = per_file.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Frozen by the run that added the gate; see `intrinsic_count_does_not_regress`.
+///
+/// # 1365 -> 1398, 2026-08-24 — +33, and BOTH movements are hot-path kernels
+/// HotSpot intrinsifies too
+///
+/// The gate asks for the new rows to be NAMED, so they were measured rather
+/// than argued: the per-file breakdown was taken at `2f8367356` (the commit
+/// that set 1365) and at this tip, and diffed.
+///
+/// ```text
+/// native-builtins/src/vector_support_intrinsics.rs   10 -> 38   +28
+/// native-io/src/file_channel_fast_read.rs           (new) -> 5   +5
+/// every other file                                      identical
+///                                                                ---
+///                                                                +33
+/// ```
+///
+/// **The second column classifies it.** Totals moved 13365 -> 13398, i.e. UP by
+/// EXACTLY the intrinsic delta, so every registration added in this window is
+/// one of these 33 and nothing was re-tagged out of the shadow census — which is
+/// the failure this gate exists for.
+///
+/// **+28 `VectorSupport`** (`9a117f991`). Nine entry points that HotSpot itself
+/// marks `@IntrinsicCandidate` and C2 replaces with SIMD; the Java fallback an
+/// interpreter runs is a lambda per operation plus a lambda per LANE, and it was
+/// **93.7% of a 3500-sample profile** of GPULlama3's inference kernel. Measured
+/// 3.8x (79713 -> 20813 ns/lane), one binary, kill switch
+/// `CRATONVM_VECTOR_INTRINSICS=0|1` gating REGISTRATION so the off arm is
+/// bit-for-bit un-intercepted, arms interleaved, checksum identical on all four
+/// runs and on HotSpot. `fell_back=0` PRINTED, not claimed — and that counter
+/// earned itself immediately, naming a defect (`class_id_from_mirror` not
+/// resolving a primitive mirror) that a wall-clock win would have hidden.
+///
+/// **+5 `FileChannelImpl`**. `FileChannel.read` into a HEAP buffer measured
+/// **~8.7x HotSpot** over 20 000 reads. The cause is not allocation and not the
+/// temporary-direct-buffer cache — both were measured and REFUTED — it is ~20
+/// JDK frames of glue per read that C2 inlines to a handful of instructions
+/// around one syscall, with nothing in the profile above 11%. A distribution
+/// like that only moves by removing the chain.
+///
+/// So both are `Intrinsic` by §1.4's own standard: a reviewed exception of the
+/// kind every JVM makes for `Math.sqrt`. Neither is a row that gained the tag to
+/// leave the census.
+const BASELINE_INTRINSICS: usize = 1398;
+
 #[test]
 fn no_registration_runs_on_the_ambient_default() {
     let mut registry = NativeMethodRegistry::new();

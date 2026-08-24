@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1218;
+const BASELINE_TOTAL_DRIFT: usize = 1214;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1351;
+const BASELINE_TOTAL_PAIRS: usize = 1347;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -936,15 +936,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         "register_enum_map_natives",
         &[
             ("java/util/EnumMap", "<init>", "(Ljava/lang/Class;)V"),
-        ],
-    ),
-    (
-        "register_enum_natives",
-        &[
-            ("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V"),
-            ("java/lang/Enum", "name", "()Ljava/lang/String;"),
-            ("java/lang/Enum", "ordinal", "()I"),
-            ("java/lang/Enum", "toString", "()Ljava/lang/String;"),
         ],
     ),
     (

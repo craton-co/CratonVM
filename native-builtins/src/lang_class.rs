@@ -14500,7 +14500,7 @@ fn make_type_not_present_exception(
         let c = cause_pin.map(|p| ctx.read_native_pin(p, c)).unwrap_or(c);
         crate::lang_misc::write_throwable_cause(ctx, exc, Value::Object(Some(c)));
     }
-    let exc = ctx.read_native_pin(pin, exc);
+    let mut exc = ctx.read_native_pin(pin, exc);
     // `capture_throwable_trace` also walks/allocates; keep `exc` pinned
     // through it too. Callers on a hot path (every unresolvable
     // `@ConditionalOnClass`-style element, VM-wide) can skip it — Spring only
@@ -14508,7 +14508,7 @@ fn make_type_not_present_exception(
     // this sentinel, never its stack trace — to avoid the extra work, not for
     // correctness (the actual corruption bug was the missing pins above).
     if capture_trace {
-        crate::lang_misc::capture_throwable_trace(ctx, exc);
+        crate::lang_misc::capture_throwable_trace(ctx, &mut exc);
     }
     let exc = ctx.read_native_pin(pin, exc);
     ctx.unpin_native_roots(pin);

@@ -2227,7 +2227,22 @@ fn jboss_logger_registry(vm: usize) -> &'static Mutex<HashMap<String, u64>> {
     per_vm_table(&INSTANCE, vm)
 }
 
-fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<(), MethodCallFailed> {
+/// Pins `logger` across [`attach_minimal_jboss_logger_node_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `logger` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*logger);
+    let w5_out = attach_minimal_jboss_logger_node_body(ctx, *logger);
+    *logger = ctx.read_native_pin(w5_pin, *logger);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+fn attach_minimal_jboss_logger_node_body(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<(), MethodCallFailed> {
     // Some JIT/real-bytecode paths still execute JBoss Logger methods directly
     // before the native override gate can short-circuit them. Those methods all
     // start by dereferencing `this.loggerNode`. We do not model the full
@@ -2245,10 +2260,10 @@ fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectR
 fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
-        let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
+        let mut obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
         let name_obj = ctx.create_string("");
         ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
-        attach_minimal_jboss_logger_node(ctx, obj)?;
+        attach_minimal_jboss_logger_node(ctx, &mut obj)?;
         return Ok(obj);
     }
     {
@@ -2261,12 +2276,12 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
             }
         }
     }
-    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
+    let mut obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
     let name_obj = ctx.create_string(name);
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
-    attach_minimal_jboss_logger_node(ctx, obj)?;
+    attach_minimal_jboss_logger_node(ctx, &mut obj)?;
     let mut reg = jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());

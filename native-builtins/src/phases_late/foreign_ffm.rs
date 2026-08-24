@@ -2431,7 +2431,22 @@ pub(crate) fn p67_segment_copy_to_array(
     Ok(None)
 }
 
-pub(crate) fn lucene_buffered_checksum_flush(ctx: &mut dyn NativeContext, this: ObjectRef) {
+/// Pins `this` across [`lucene_buffered_checksum_flush_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn lucene_buffered_checksum_flush(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = lucene_buffered_checksum_flush_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+pub(crate) fn lucene_buffered_checksum_flush_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let buffer = match ctx.get_field_by_name(this, "buffer") {
         Value::Object(Some(buffer)) => buffer,
         _ => return,
@@ -2461,7 +2476,7 @@ pub(crate) fn lucene_buffered_checksum_flush(ctx: &mut dyn NativeContext, this: 
 
 pub(crate) fn lucene_buffered_checksum_write(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    mut this: ObjectRef,
     bytes: &[u8],
 ) {
     let buffer = match ctx.get_field_by_name(this, "buffer") {
@@ -2475,7 +2490,7 @@ pub(crate) fn lucene_buffered_checksum_write(
         .unwrap_or(0)
         .max(0) as usize;
     if upto.saturating_add(bytes.len()) > cap {
-        lucene_buffered_checksum_flush(ctx, this);
+        lucene_buffered_checksum_flush(ctx, &mut this);
         upto = ctx
             .get_field_by_name(this, "upto")
             .as_int()

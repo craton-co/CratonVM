@@ -26,10 +26,107 @@ use super::*;
 /// come from `SCRATCH_REGS` **or** `LOCAL_REGS`, and `LOCAL_REGS` holds RBX on
 /// every platform and RSI/RDI on Windows. Forcing REX.B on rewrites the ModRM
 /// `r/m` field to `r + 8`, i.e. compares an entirely different register.
+/// The synthetic bytecode pc the METHOD-ENTRY safepoint poll records.
+///
+/// No real method's bytecode is anywhere near 4 GiB, so this can never collide
+/// with a genuine bci in the sp-id-keyed oop-map lookup — which is the whole
+/// reason `emit_safepoint_poll_prologue` uses it instead of the `0` that
+/// `cur_bc_pc` still holds at that point. Named rather than spelled
+/// `u32::MAX as usize` at each site, because `Compiler::local_oop_mask_at_current_pc`
+/// has to recognise it and a bare literal is not a thing a reader can look up.
+pub(super) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
+
 pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
     // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
     let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
     [rex, 0x81, 0xC0 | (7 << 3) | (r & 7)]
+}
+
+/// Why a safepoint's oop map was recorded as INCOMPLETE, counted per cause.
+///
+/// `emit_oop_map_for_safepoint` withholds such a safepoint's pc from
+/// `mapped_safepoint_pcs`, which turns `CompiledMethod::fully_oop_covered`
+/// false for the whole method, which the runtime reports as one
+/// `map_coverage=N` counter on the `[jitroots]` line. That aggregate is where
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran out of
+/// road: it names the field, never the reason, and the six ways to get there
+/// want six different repairs.
+///
+/// Process-global relaxed counters — compilation is not on any hot path and
+/// these are read once, at the end of a run, by `CRATONVM_DBG_OOPCOV`.
+pub mod map_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// The operand-stack oop mark vector was not exact at this safepoint.
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked operand-stack oop was still register/scratch/xmm resident.
+    pub static OOP_STILL_IN_REGISTER: AtomicUsize = AtomicUsize::new(0);
+    /// An operand-stack frame slot sits further than `i16::MAX` from `rbp`.
+    pub static STACK_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A local-variable home sits further than `i16::MAX` from `rbp`.
+    pub static LOCAL_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A staged invoke-argument home sits further than `i16::MAX` from `rbp`.
+    pub static STAGED_ARG_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A reference was staged somewhere no map can name (native-ABI outgoing
+    /// args, direct-call service slots, inlined-callee parameter locals).
+    pub static STAGED_ARG_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
+    /// staged_unmappable)`.
+    pub fn snapshot() -> [usize; 6] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            MARKS_INEXACT.load(Relaxed),
+            OOP_STILL_IN_REGISTER.load(Relaxed),
+            STACK_OFF_TOO_DEEP.load(Relaxed),
+            LOCAL_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_UNMAPPABLE.load(Relaxed),
+        ]
+    }
+}
+
+/// Why a safepoint's SHADOW claim (`OopMapEntry::moving_young_coverage_complete`)
+/// came out false, counted per cause.
+///
+/// The sibling of [`map_incomplete_cause`], for the other of the two coverage
+/// notions. `CompiledMethod::fully_shadow_covered` ANDs this flag over every
+/// safepoint of a method, and the OSR fallback reads that aggregate — so a
+/// single false here refuses relocation for every collection with one of this
+/// method's frames live. Six causes, six different repairs.
+pub mod shadow_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving-young is off, or the compile already failed.
+    pub static GATE_OFF_OR_FAILED: AtomicUsize = AtomicUsize::new(0);
+    /// `stack.len() != stack_oop_marks.len()` — the lockstep invariant broke.
+    pub static MARK_VECTOR_DESYNC: AtomicUsize = AtomicUsize::new(0);
+    /// The operand-stack oop marks are not exact at this safepoint (a revived
+    /// dead-code merge reconstructed the stack at a nonzero depth).
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked oop is in a scratch or XMM slot, which the push cannot name.
+    pub static OOP_IN_SCRATCH_OR_XMM: AtomicUsize = AtomicUsize::new(0);
+    /// More than 64 locals, so `color_graph`'s mask cannot describe them all.
+    pub static TOO_MANY_LOCALS: AtomicUsize = AtomicUsize::new(0);
+    /// The forward "must be oop" dataflow never reached this bytecode pc, so
+    /// there is no local oop mask to publish from.
+    pub static LOCAL_OOP_DATAFLOW_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+    /// The push was not emitted at all (shadow gate off, helper unwired, or the
+    /// prologue reserved no thread slot).
+    pub static PUSH_NOT_EMITTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(gate_off, desync, marks_inexact, oop_in_scratch, too_many_locals,
+    /// dataflow_unreached, push_not_emitted)`.
+    pub fn snapshot() -> [usize; 7] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            GATE_OFF_OR_FAILED.load(Relaxed),
+            MARK_VECTOR_DESYNC.load(Relaxed),
+            MARKS_INEXACT.load(Relaxed),
+            OOP_IN_SCRATCH_OR_XMM.load(Relaxed),
+            TOO_MANY_LOCALS.load(Relaxed),
+            LOCAL_OOP_DATAFLOW_UNREACHED.load(Relaxed),
+            PUSH_NOT_EMITTED.load(Relaxed),
+        ]
+    }
 }
 
 impl Compiler {
@@ -347,9 +444,51 @@ impl Compiler {
     /// upcoming bytecode loop starts from its expected `0`.
     pub(super) fn emit_safepoint_poll_prologue(&mut self) {
         let saved_pc = self.cur_bc_pc;
-        self.cur_bc_pc = u32::MAX as usize;
+        self.cur_bc_pc = ENTRY_POLL_BC_PC;
         self.emit_safepoint_poll();
         self.cur_bc_pc = saved_pc;
+    }
+
+    /// The live oop LOCALS at the current safepoint, as a bitmask over JVM
+    /// local slots — or `None` when this safepoint's local state is unknown
+    /// and no precise claim may be made about it.
+    ///
+    /// Every reader of `local_oop_masks` / `local_oop_reached` must go through
+    /// here, because the METHOD-ENTRY poll is at `ENTRY_POLL_BC_PC` — a
+    /// synthetic pc chosen (see [`Self::emit_safepoint_poll_prologue`]) so it
+    /// cannot collide with bci 0 in the sp-id-keyed lookup. That choice is
+    /// right, but `local_oop_reached.get(ENTRY_POLL_BC_PC)` is `None`, so the
+    /// entry poll read as "the dataflow never reached here" and its map was
+    /// pushed with `moving_young_coverage_complete: false`.
+    ///
+    /// The consequence was not local to the entry poll. `fully_shadow_covered`
+    /// ANDs that flag over every safepoint of a method, so ONE such entry made
+    /// it false for **every method the fast tier ever compiled**, which through
+    /// the OSR fallback refused relocation on 725 of 759 collections of
+    /// `TestKillProcessWhileWriting` — the
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`
+    /// residual. Measured with `CRATONVM_DBG_OOPCOV=1`: every uncovered method
+    /// reported exactly `shadow_missing_pcs=[4294967295]`.
+    ///
+    /// The entry state is knowable and is not a guess: the prologue has just
+    /// stored every incoming argument to its home (this poll is emitted from
+    /// the END of `emit_prologue`), the operand stack is empty, and the live
+    /// oops are exactly the reference parameters — `param_oop_mask`, the same
+    /// value that seeds the dataflow at bci 0.
+    #[inline]
+    pub(super) fn local_oop_mask_at_current_pc(&self) -> Option<u64> {
+        if self.cur_bc_pc == ENTRY_POLL_BC_PC {
+            return Some(self.param_oop_mask);
+        }
+        if !self
+            .local_oop_reached
+            .get(self.cur_bc_pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.local_oop_masks.get(self.cur_bc_pc).copied()
     }
 
     /// A direct self-call may omit the blind all-GPR spill when this method's
@@ -464,31 +603,37 @@ impl Compiler {
     /// signal to the GC: if this frame is live here, moving-young must divert to
     /// the non-moving sweep for that cycle.
     fn moving_young_safepoint_coverage_complete(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         if !moving_young_enabled() || self.failed {
+            shadow_incomplete_cause::GATE_OFF_OR_FAILED.fetch_add(1, Relaxed);
             return false;
         }
         if self.stack.len() != self.stack_oop_marks.len() {
+            shadow_incomplete_cause::MARK_VECTOR_DESYNC.fetch_add(1, Relaxed);
             return false;
         }
         if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            shadow_incomplete_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
             return false;
         }
         for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
             if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+                shadow_incomplete_cause::OOP_IN_SCRATCH_OR_XMM.fetch_add(1, Relaxed);
                 return false;
             }
         }
         if self.num_locals > 64 {
+            shadow_incomplete_cause::TOO_MANY_LOCALS.fetch_add(1, Relaxed);
             return false;
         }
         if self.num_locals == 0 {
             return true;
         }
-        self.local_oop_reached
-            .get(self.cur_bc_pc)
-            .copied()
-            .unwrap_or(false)
-            && self.local_oop_masks.get(self.cur_bc_pc).is_some()
+        let ok = self.local_oop_mask_at_current_pc().is_some();
+        if !ok {
+            shadow_incomplete_cause::LOCAL_OOP_DATAFLOW_UNREACHED.fetch_add(1, Relaxed);
+        }
+        ok
     }
 
     /// Collect the homes of every live oop at the current safepoint: operand-
@@ -547,19 +692,7 @@ impl Compiler {
         // moving coverage: on the non-moving path a register-local is flushed to
         // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
         if complete {
-            let oop_reached = self
-                .local_oop_reached
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(false);
-            let oop_mask = if oop_reached {
-                self.local_oop_masks
-                    .get(self.cur_bc_pc)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let oop_mask = self.local_oop_mask_at_current_pc().unwrap_or(0);
             for i in 0..self.num_locals {
                 if i >= 64 || (oop_mask & (1u64 << i)) == 0 {
                     continue;
@@ -612,6 +745,8 @@ impl Compiler {
             || self.helpers.get_current_thread == 0
             || self.shadow_thread_slot_off == 0
         {
+            shadow_incomplete_cause::PUSH_NOT_EMITTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.pending_shadow_coverage_complete = false;
             return;
         }
@@ -626,16 +761,8 @@ impl Compiler {
         self.pending_shadow_coverage_complete = self.moving_young_safepoint_coverage_complete();
         let homes = self.collect_live_oop_homes();
         if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
-            let lm = self
-                .local_oop_masks
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(0);
-            let reached = self
-                .local_oop_reached
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(false);
+            let lm = self.local_oop_mask_at_current_pc().unwrap_or(0);
+            let reached = self.local_oop_mask_at_current_pc().is_some();
             eprintln!(
                 "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
                 self.method_label,
@@ -1067,6 +1194,9 @@ impl Compiler {
         // classified — sound only because a conservative sweep follows, which is
         // exactly what the coverage claim suppresses.
         let mut map_incomplete = !self.stack.is_empty() && !self.stack_oop_marks_exact;
+        if map_incomplete {
+            map_incomplete_cause::MARKS_INEXACT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let n = self.stack.len();
         for i in 0..n {
             if !self.stack_oop_marks[i] {
@@ -1076,12 +1206,20 @@ impl Compiler {
                 StackSlot::Frame(off) => match i16::try_from(off) {
                     Ok(i16_off) => slots.push(i16_off),
                     // A frame deeper than i16 from `rbp`. Rare, and silent.
-                    Err(_) => map_incomplete = true,
+                    Err(_) => {
+                        map_incomplete = true;
+                        map_incomplete_cause::STACK_OFF_TOO_DEEP
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 },
                 // An oop operand that is still register/scratch/xmm resident at
                 // the safepoint. There was no `else` arm here: the value is live,
                 // the map does not name it, and nothing recorded that.
-                _ => map_incomplete = true,
+                _ => {
+                    map_incomplete = true;
+                    map_incomplete_cause::OOP_STILL_IN_REGISTER
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // Stage 2 (precise oop maps) — add the canonical frame slots of local
@@ -1094,11 +1232,11 @@ impl Compiler {
         // Sound on the default path regardless of dataflow precision: the
         // consumer re-validates each slot via `heap.is_object_address`.
         if !self.local_oop_masks.is_empty() {
-            let pc = self.cur_bc_pc;
-            if pc < self.local_oop_masks.len()
-                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
-            {
-                let mut mask = self.local_oop_masks[pc];
+            // Via the shared accessor: the METHOD-ENTRY poll must name its
+            // reference parameters here too, or `moving_young_coverage_complete`
+            // (which now claims coverage for it) would be claiming coverage of
+            // a map that names nothing. See `local_oop_mask_at_current_pc`.
+            if let Some(mut mask) = self.local_oop_mask_at_current_pc() {
                 while mask != 0 {
                     // Cast: count/index to usize
                     let k = mask.trailing_zeros() as usize;
@@ -1110,7 +1248,11 @@ impl Compiler {
                                 slots.push(i16_off);
                             }
                         }
-                        Err(_) => map_incomplete = true,
+                        Err(_) => {
+                            map_incomplete = true;
+                            map_incomplete_cause::LOCAL_OFF_TOO_DEEP
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1132,7 +1274,11 @@ impl Compiler {
                         slots.push(i16_off);
                     }
                 }
-                Err(_) => map_incomplete = true,
+                Err(_) => {
+                    map_incomplete = true;
+                    map_incomplete_cause::STAGED_ARG_OFF_TOO_DEEP
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // A reference staged somewhere no map can name it (native-ABI outgoing
@@ -1140,6 +1286,8 @@ impl Compiler {
         // Fail closed.
         if std::mem::take(&mut self.pending_staged_args_unmapped) {
             map_incomplete = true;
+            map_incomplete_cause::STAGED_ARG_UNMAPPABLE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record
@@ -1208,13 +1356,9 @@ impl Compiler {
         if self.failed || self.local_oop_masks.is_empty() {
             return;
         }
-        let pc = self.cur_bc_pc;
-        if pc >= self.local_oop_masks.len()
-            || !self.local_oop_reached.get(pc).copied().unwrap_or(false)
-        {
+        let Some(mut mask) = self.local_oop_mask_at_current_pc() else {
             return;
-        }
-        let mut mask = self.local_oop_masks[pc];
+        };
         while mask != 0 {
             // Cast: count/index to usize
             let k = mask.trailing_zeros() as usize;

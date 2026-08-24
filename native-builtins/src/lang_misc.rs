@@ -477,6 +477,21 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
     }
 }
 
+/// Pins `this` across [`capture_throwable_trace_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = capture_throwable_trace_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Capture the current call stack for a freshly-constructed throwable.
 ///
 /// These `native_exc_init_*` natives SHADOW the JDK `Throwable.<init>`
@@ -502,7 +517,7 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 /// without this capture they left `getStackTrace()` empty for every such
 /// subclass thrown from bytecode (only the Throwable/Exception/RuntimeException/
 /// Error base classes — which those lists omit — kept a working trace).
-pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
+pub(crate) fn capture_throwable_trace_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
     if crate::nbflags().dbg_sttrace {
         // The throwable's CLASS, not just its identity. Counting captures tells
@@ -651,7 +666,10 @@ pub(crate) fn native_exc_init_message(
         }
         // Initialize cause to self-sentinel so a later initCause() succeeds.
         write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -668,7 +686,10 @@ pub(crate) fn native_exc_init_message_cause(
         if let Some(cause) = args.get(2) {
             write_throwable_cause(ctx, *this, *cause);
         }
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -712,7 +733,10 @@ pub(crate) fn native_exc_init_cause(
             _ => Value::Object(None),
         };
         write_throwable_detail_message(ctx, *this, detail_msg);
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -801,7 +825,7 @@ pub(crate) fn native_assertion_error_init_object(
         // contract `native_exc_init_message` maintains.
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
     }
-    capture_throwable_trace(ctx, this);
+    capture_throwable_trace(ctx, &mut this);
     Ok(None)
 }
 
@@ -846,7 +870,7 @@ fn assertion_error_init_scalar(
     args: &[Value],
     kind: ScalarKind,
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(this))) = args.first().copied() {
+    if let Some(Value::Object(Some(mut this))) = args.first().copied() {
         let text = scalar_to_string(kind, args.get(1));
         // Uninterned, like every `String.valueOf` native in `lang_string`: the
         // JDK hands back a fresh String, so `new AssertionError(42).getMessage()
@@ -855,7 +879,7 @@ fn assertion_error_init_scalar(
         let message = ctx.create_string_uninterned(&text);
         write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
-        capture_throwable_trace(ctx, this);
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -873,7 +897,7 @@ fn index_exception_init_index(
     args: &[Value],
     prefix: &str,
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(this))) = args.first().copied() {
+    if let Some(Value::Object(Some(mut this))) = args.first().copied() {
         let index = match args.get(1) {
             Some(Value::Int(v)) => i64::from(*v),
             Some(Value::Long(v)) => *v,
@@ -884,7 +908,7 @@ fn index_exception_init_index(
         let message = ctx.create_string_uninterned(&format!("{prefix}{index}"));
         write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
-        capture_throwable_trace(ctx, this);
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -931,14 +955,14 @@ pub(crate) fn native_parse_exception_init(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(this))) = args.first().copied() {
+    if let Some(Value::Object(Some(mut this))) = args.first().copied() {
         let msg = args.get(1).copied().unwrap_or(Value::Object(None));
         write_throwable_detail_message(ctx, this, msg);
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
         if let Some(offset @ Value::Int(_)) = args.get(2) {
             ctx.set_field_by_name(this, "errorOffset", *offset);
         }
-        capture_throwable_trace(ctx, this);
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -950,7 +974,7 @@ pub(crate) fn native_missing_resource_init(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(this))) = args.first().copied() {
+    if let Some(Value::Object(Some(mut this))) = args.first().copied() {
         let msg = args.get(1).copied().unwrap_or(Value::Object(None));
         write_throwable_detail_message(ctx, this, msg);
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
@@ -960,7 +984,7 @@ pub(crate) fn native_missing_resource_init(
         if let Some(key) = args.get(3) {
             ctx.set_field_by_name(this, "key", *key);
         }
-        capture_throwable_trace(ctx, this);
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -976,7 +1000,10 @@ pub(crate) fn native_invocation_target_exception_init_target(
         ctx.set_field_by_name(*this, "target", target);
         write_throwable_cause(ctx, *this, Value::Object(None));
         write_throwable_detail_message(ctx, *this, Value::Object(None));
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -993,7 +1020,10 @@ pub(crate) fn native_invocation_target_exception_init_target_message(
         ctx.set_field_by_name(*this, "target", target);
         write_throwable_cause(ctx, *this, Value::Object(None));
         write_throwable_detail_message(ctx, *this, msg);
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -1033,7 +1063,10 @@ pub(crate) fn native_exc_init_noargs(
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
-        capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
@@ -1047,7 +1080,7 @@ pub(crate) fn native_throwable_fill_in_stack_trace(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = this (the Throwable), args[1] = dummy int
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj_ref))) => *obj_ref,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
@@ -1057,7 +1090,7 @@ pub(crate) fn native_throwable_fill_in_stack_trace(
         }
     };
 
-    capture_throwable_trace(ctx, this);
+    capture_throwable_trace(ctx, &mut this);
 
     // Return `this` (Throwable.fillInStackTrace returns the Throwable itself)
     Ok(Some(Value::Object(Some(this))))

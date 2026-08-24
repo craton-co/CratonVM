@@ -1832,6 +1832,10 @@ pub fn compile_with_param_slots(
         compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
+    // The entry state, kept alongside the per-pc vectors: the method-entry
+    // safepoint poll is at no bytecode pc, so it has nothing to look up.
+    // See `Compiler::local_oop_mask_at_current_pc`.
+    compiler.param_oop_mask = param_oop_mask;
 
     // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
     // (gated) snapshot consumes it, so skip the scan entirely in production.
@@ -2397,6 +2401,86 @@ pub fn compile_with_param_slots(
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
+    // The SHADOW aggregate, and a different question from the four terms above
+    // — see `CompiledMethod::fully_shadow_covered`. `cm.oop_maps` was assigned
+    // above, so this is the complete set this compilation pushed.
+    cm.fully_shadow_covered = !cm.oop_maps.is_empty()
+        && cm
+            .oop_maps
+            .iter()
+            .all(|m| m.moving_young_coverage_complete);
+    // `CRATONVM_DBG_OOPCOV=1` — WHICH of the four terms said no, per method.
+    //
+    // `moving_young_osr_method_needs_fallback` reports the aggregate as one
+    // `map_coverage` counter, and that counter is what
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` was left
+    // holding: it names the field, not the term, and not the method. The four
+    // terms fail for completely different reasons (a gate that is off, a slot
+    // the prologue did not reserve, an inlined callee, a safepoint that
+    // flushed without recording), so an aggregate cannot be acted on.
+    //
+    // Only the unmapped PCs are listed, capped: on a large method
+    // `safepoint_pcs` can hold hundreds of entries and the difference is the
+    // whole content of the report.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some()
+        && !(cm.fully_oop_covered && cm.fully_shadow_covered)
+    {
+        let mut missing: Vec<u32> = compiler
+            .safepoint_pcs
+            .difference(&compiler.mapped_safepoint_pcs)
+            .copied()
+            .collect();
+        missing.sort_unstable();
+        missing.truncate(16);
+        // The safepoints whose SHADOW claim is false, which is the aggregate
+        // the OSR fallback reads. Listed by `bytecode_pc` so it lines up with
+        // `unmapped_pcs` — the two sets are different questions and, on the
+        // direct-call shape, deliberately disjoint.
+        let mut shadow_missing: Vec<u32> = cm
+            .oop_maps
+            .iter()
+            .filter(|m| !m.moving_young_coverage_complete)
+            .map(|m| m.bytecode_pc)
+            .collect();
+        shadow_missing.sort_unstable();
+        shadow_missing.dedup();
+        shadow_missing.truncate(16);
+        let scauses = crate::x64::safepoint::shadow_incomplete_cause::snapshot();
+        let causes = crate::x64::safepoint::map_incomplete_cause::snapshot();
+        eprintln!(
+            "[oopcov] uncovered method={} frameslot={} shadow={} \
+             shadow_missing_pcs={shadow_missing:?} \
+             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={}) ",
+            compiler.method_key,
+            cm.fully_oop_covered,
+            cm.fully_shadow_covered,
+            scauses[0],
+            scauses[1],
+            scauses[2],
+            scauses[3],
+            scauses[4],
+            scauses[5],
+            scauses[6],
+        );
+        eprintln!(
+            "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
+             safepoints={} mapped={} unmapped_pcs={:?} \
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={} staged_unmappable={})",
+            compiler.method_key,
+            compiler.precise_maps,
+            compiler.sp_id_slot_off,
+            compiler.inline_sites.len(),
+            compiler.safepoint_pcs.len(),
+            compiler.mapped_safepoint_pcs.len(),
+            missing,
+            causes[0],
+            causes[1],
+            causes[2],
+            causes[3],
+            causes[4],
+            causes[5],
+        );
+    }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
     // the `top` watermark) for OSR-entered frames. All 0 when shadow-stack

@@ -127,10 +127,13 @@ on both binaries.
   `tm_migrate_fast_to_array` — and the script IS committed now, as
   `scripts/stale-receiver-audit.py` with a baseline and an exercised failure
   path.
-* **N3 — prefer `&mut ObjectRef` (or a returned `ObjectRef`) for any funnel that
-  allocates.** Three of the four correct funnels found here already do, and the
-  one that did not is the one that had the bug. That is a convention worth
-  stating in the crate's module docs.
+* ~~**N3 — prefer `&mut ObjectRef` (or a returned `ObjectRef`) for any funnel
+  that allocates.**~~ **DONE — `WORKER-5-NOTE-13`.** It is stated on
+  `NativeContext::pin_native_root` in `native-api/src/registry.rs`, beside the
+  pinning rule it qualifies, rather than in one crate's module docs — all seven
+  native crates read that trait, and the point is precisely that pinning alone
+  does not protect the CALLER. `scripts/stale-receiver-audit.py` enforces it and
+  its baseline is empty.
 
 ---
 
