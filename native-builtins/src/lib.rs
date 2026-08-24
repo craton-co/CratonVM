@@ -20194,7 +20194,8 @@ pub fn register_essential_natives_with_shims(
     /// `zoneID == null || zoneID.isEmpty()`). The `runtime_var` read below it
     /// is the pre-W7-92 behaviour, kept so an embedder relying on it does not
     /// regress — but note that `user.timezone` is not a declared flag name, so
-    /// `runtime_var` falls through to `std::env::var("user.timezone")`, i.e. it
+    /// `runtime_var` falls through to a live environment read of that name —
+    /// i.e. it
     /// looks for an ENVIRONMENT VARIABLE of that name and never saw the system
     /// property its own comment claimed to honour.
     fn timezone_fallback_zone_id(ctx: &mut dyn NativeContext) -> String {

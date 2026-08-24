@@ -429,6 +429,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-time-dispatch", on_key: Some("CRATONVM_GPU_TIME_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
+    // Names the class and field behind a punned reference cell, for the
+    // counter that turned out not to be a defect count. Declared here so the
+    // surface guard can see it.
+    E { group: Group::DBG, token: "punned-ref", on_key: Some("CRATONVM_DBG_PUNNED_REF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2parserread", on_key: Some("CRATONVM_DBG_H2PARSERREAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2trace", on_key: Some("CRATONVM_DBG_H2TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hang-sample", on_key: Some("CRATONVM_DBG_HANG_SAMPLE"), off_key: None, off_word: None },
@@ -678,6 +682,12 @@ pub const INVENTORY: &[E] = &[
     // element inside the scan. An empty view that saw no pairs and one whose
     // every comparison landed out of range are different defects and nothing
     // else can tell them apart.
+    // The engagement control for the map-view fail-fast stamp: prints `seed`,
+    // `check` and — decisively — `UNSEEDED`, which is how a working door is
+    // told from a dead stamp with a live check (both read "no CME" on an arm
+    // where nothing was modified). Landed with the fifth-door fix and was
+    // never declared.
+    E { group: Group::DBG, token: "view-comod", on_key: Some("CRATONVM_DBG_VIEW_COMOD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "view-kind", on_key: Some("CRATONVM_DBG_VIEWKIND"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "view-resync", on_key: Some("CRATONVM_DBG_VIEWRESYNC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
