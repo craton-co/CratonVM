@@ -47456,7 +47456,21 @@ pub fn __test_tm_force_array_len() -> usize {
 /// fast-mode side-table entry. Called when a non-extractable key arrives
 /// at a map that previously had fast-mode entries — keeps state coherent
 /// across the mode flip without losing data.
-fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, mut this: ObjectRef) {
+/// # `this` is `&mut` — N2 of `WORKER-5-NOTE-11`
+///
+/// This function ALREADY knew its receiver moves: it declares `mut this` and
+/// reassigns it from `tm_install_backing_array`'s refreshed value below. Taking
+/// the receiver BY VALUE threw that refresh away at the return, so the caller
+/// kept the pre-move address.
+///
+/// One of its two call sites had been protected by hand, with the reason
+/// spelled out — *"The migration allocates (and can move this map); pin and
+/// refresh the receiver across it"* — and the other had not, going straight on
+/// to `tm_state(ctx, this)`. That is "the correct helper exists and one call
+/// site uses it", and it is why the receiver is `&mut` rather than a second
+/// hand-written pin at the missed site: the caller cannot now forget.
+fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this_out: &mut ObjectRef) {
+    let mut this = *this_out;
     let key = tm_obj_key(ctx, this);
     // Snapshot fast-mode entries first, then drop the side-table entry.
     let entries: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
@@ -47464,6 +47478,7 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, mut this: ObjectRef) {
     });
     tm_fast_table().lock().unwrap().remove(&key);
     if entries.is_empty() {
+        *this_out = this;
         return;
     }
     // Box keys back to Java wrappers and insert via the array path.
@@ -47484,6 +47499,7 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, mut this: ObjectRef) {
     for (k, v) in boxed {
         let _ = native_tm_put(ctx, &[Value::Object(Some(this)), k, v]);
     }
+    *this_out = this;
 }
 
 /// Convert a TreeKey back to a Java `Value` for return values that need
@@ -49317,12 +49333,11 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // we don't split state across two stores.
             tm_set_force_array(ctx, this);
             if tm_is_fast_mode(ctx, this) {
-                // The migration allocates (and can move this map); pin and
-                // refresh the receiver across it.
-                let tp = ctx.pin_native_root(this);
-                tm_migrate_fast_to_array(ctx, this);
-                this = ctx.read_native_pin(tp, this);
-                ctx.unpin_native_roots(tp);
+                // The migration allocates and can move this map. The pin that
+                // used to be written out here is now inside the funnel, which
+                // writes the refreshed receiver back through `&mut` -- so the
+                // OTHER call site cannot go on being the one that forgot.
+                tm_migrate_fast_to_array(ctx, &mut this);
             }
         }
     }
@@ -51107,7 +51122,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         } else {
             tm_set_force_array(ctx, this);
             if tm_is_fast_mode(ctx, this) {
-                tm_migrate_fast_to_array(ctx, this);
+                tm_migrate_fast_to_array(ctx, &mut this);
             }
         }
     }

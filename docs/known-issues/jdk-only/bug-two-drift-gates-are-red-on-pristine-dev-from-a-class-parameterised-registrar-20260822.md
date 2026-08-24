@@ -1,4 +1,4 @@
-# FOUR gates are RED on pristine `dev` — three from one refactor, one from GPU work
+# FOUR gates were RED on pristine `dev` — three from one refactor (OPEN), one from GPU work (FIXED)
 
 **Status: OPEN, MEASURED, NOT THIS BRANCH'S.** 2026-08-22.
 
@@ -103,10 +103,33 @@ arrange it in a test — "which is how a flag-dependent test ends up silently
 measuring the developer's ambient environment". Two GPU knobs are currently in
 that state.
 
-Not fixed here for the same reason as the three above: minting a token means
-choosing its group and spelling, which is the GPU lane's semantics, and the
-guard offers three different remedies (declare, reuse an existing token, or
-allowlist as a harness/ABI name) that only that lane can choose between.
+**FIXED 2026-08-23 (`521a5856c`).** The earlier draft of this section declined
+it on the grounds that minting a token is the GPU lane's semantics. That was
+over-cautious: the file already contained the precedent — `CRATONVM_GPU_DUMP_PTX`
+and `CRATONVM_GPU_TRACE_BYTES` are `Group::DBG` rows with an `on_key` and no
+`off_key` — so the shape needed no judgement, only the group:
+
+```text
+Group::JIT  gpu-approx-math     a codegen option; its own doc comment says it
+                                admits Math.exp and nothing else
+Group::DBG  gpu-time-dispatch   timing instrumentation
+```
+
+**Declaring alone would have been a half-fix, and the guard's own text is why.**
+Both sites read `std::env::var` DIRECTLY, so a declaration turns the gate green
+while `CRATONVM_JIT=gpu-approx-math` still cannot reach the flag and
+`with_thread_overrides` still cannot arrange it — the gate satisfied and the
+property it exists for still absent. Both reads now go through
+`flags::runtime_var`. No behaviour change: each site already cached in a
+`OnceLock` on first read, so latched and live are the same value by
+construction.
+
+`flag-surface.txt` updated; both generated docs regenerated with their own
+generators (909 rows / 898 declared, 882 tokens) rather than hand-edited.
+
+The three above stay OPEN for a reason that does NOT apply here: they need the
+resolver taught a new form, which changes the gate every lane is judged by,
+while its subject is still being edited on another branch.
 
 ## Do not fix it by raising the ceiling
 

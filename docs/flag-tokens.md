@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-480 tokens.
+481 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -218,6 +218,7 @@ export inherited from a parent shell.
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
 | `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
+| `gpu-time-dispatch` | `CRATONVM_GPU_TIME_DISPATCH` |
 | `gse` | `CRATONVM_DBG_GSE` |
 | `h2parserread` | `CRATONVM_DBG_H2PARSERREAD` |
 | `h2trace` | `CRATONVM_DBG_H2TRACE` |
@@ -546,11 +547,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-216 tokens.
+217 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
+| `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
 | `sp-ic-deopt-check` | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` |
 | `sp-ic-only` | `CRATONVM_JIT_SP_IC_ONLY` |
