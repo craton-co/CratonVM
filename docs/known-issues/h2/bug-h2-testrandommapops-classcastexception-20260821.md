@@ -103,6 +103,14 @@ Two faces (`NullPointerException: "d" is null` at 823 s, this one at 845 s) at
 nearly the same point is itself the finding: the recorded message is not the
 lever, the same way the recorded seed was not.
 
+**And it is not a reliable reproducer either.** A third 256 m run, with the
+receiver dump armed, reached its **1500 s** cap without failing at all. So the
+base rate on this arm is roughly one occurrence in two or three ~850 s runs,
+and no clean arm shorter than that says anything about it — the same trap this
+page already documents for the `ClassCastException`. Anyone taking this row on
+should budget for the base rate first, or find a smaller reproducer, rather
+than reading a single quiet run as progress.
+
 ## The recorded signature, and why it is not a reproducer
 
 ```
