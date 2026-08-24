@@ -9905,7 +9905,7 @@ pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
 /// total: `compile_osr_artifact`'s ladder bumps the shared pair and these.
 ///
 /// The reason this split exists is a measurement that read as a working
-/// feature. `static-exception-table-callee-pays-the-funnel-20260821.md` flipped
+/// feature. `osr-door-refused-every-exception-table-callee-FIXED-20260824.md` flipped
 /// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` on and the OSR rung of
 /// `probes/NativeFunnelFloorProbe.java` did not move (102.68 -> 100.26 ns/op),
 /// while the census printed `direct callee binds: 0 bound, 0 left on the
@@ -15721,7 +15721,7 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
 ///
 /// The measurement it was waiting for was taken and it is two-sided, so read
 /// both halves before changing this again
-/// (`static-exception-table-callee-pays-the-funnel-20260821.md`):
+/// (`osr-door-refused-every-exception-table-callee-FIXED-20260824.md`):
 ///
 ///  * **per call, 10.2x.** `probes/NativeFunnelFloorProbe.java`, ABBA on one
 ///    binary: a static callee with a never-taken `try`/`catch`, reached from an

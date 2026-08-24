@@ -5237,7 +5237,7 @@ fn run() -> Result<()> {
         // not a third total.
         //
         // Printed separately because its absence was mistaken for its answer:
-        // `static-exception-table-callee-pays-the-funnel-20260821.md` read
+        // `osr-door-refused-every-exception-table-callee-FIXED-20260824.md` read
         // `0 bound, 0 left` in both arms of a gate flip and concluded the gate
         // is unreachable from an OSR body. The conclusion was right and the
         // instrument was not -- the OSR ladder was binding and refusing all

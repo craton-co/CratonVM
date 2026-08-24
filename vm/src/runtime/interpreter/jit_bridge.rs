@@ -101,7 +101,7 @@ pub(super) fn dbg_osr_recompile_reason(
 /// refusing when it was flipped default-ON on 2026-08-21.
 ///
 /// That disagreement is the whole of the OSR half of
-/// `static-exception-table-callee-pays-the-funnel-20260821.md`. The gate's flip
+/// `osr-door-refused-every-exception-table-callee-FIXED-20260824.md`. The gate's flip
 /// moved the ordinary-frame rung of `probes/NativeFunnelFloorProbe.java` from
 /// 107.30 to 10.57 ns/op and left the OSR rung at ~101 in both arms, and the
 /// page read that — correctly, given what it could see — as "an OSR body never
