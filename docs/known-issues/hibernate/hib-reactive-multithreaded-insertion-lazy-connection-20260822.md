@@ -762,7 +762,7 @@ is generated and machine-local, so it is not committed.
 ## 8. 2026-08-24 — the `invokedynamic` bridge does NOT retire this class (checked, negative)
 
 Recorded because the obvious question after
-[`techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`](../../internal/fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md)
+`fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`
 is whether the same merge helps here. `TechEmpowerTest` was retired by
 `730d3e0d9` (compiled code can now EXECUTE an `invokedynamic`), and this class
 sits in the same reactive-dispatch cost family, so it is a reasonable thing to
