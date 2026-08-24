@@ -2639,10 +2639,37 @@ fn moving_young_frame_coverage_complete_at(
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if N.fetch_add(1, Relaxed) < 32 {
+                // For the INNERMOST frame the walk hands no return address, so
+                // read the frame's own saved one here (`[rbp + 8]`). Who the
+                // CALLER is settles the remaining question: if the frame at
+                // `rbp` really is `cm`'s, its return address lands inside a
+                // method that calls `cm`. If the (rbp, compile-id) mirror is
+                // STALE — published by a callee's prologue and not restored on
+                // its return, since `emit_post_call_rbp_republish` has only six
+                // call sites — the two will not correspond, and
+                // `own_ret_ok=false` says the word is not a return address at
+                // all.
+                let own_ret = if rbp != 0 && rbp & 0x7 == 0 {
+                    // SAFETY: the same aligned in-band read the chain walk makes
+                    // a few lines further on, on this thread's own stack.
+                    Some(unsafe { ((rbp + 8) as *const usize).read() })
+                } else {
+                    None
+                };
+                let own_caller = own_ret
+                    .and_then(cratonvm_jit::lookup_jit_code_range)
+                    .map(|p| {
+                        // SAFETY: a resolved range is Arc-owned by the JIT cache
+                        // for as long as any of its frames is live.
+                        let c: &cratonvm_jit::CompiledMethod =
+                            unsafe { &*(p as *const cratonvm_jit::CompiledMethod) };
+                        c.method_label.clone()
+                    });
                 eprintln!(
                     "[frame-cov] no map for stored id: sp_id={sp_id} (0x{sp_id:x}) \
                      method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x} \
-                     ret_addr={:?} plausible_ret={:?}",
+                     walk_ret={:?} walk_ret_ok={:?} own_ret={:?} own_ret_ok={:?} \
+                     own_caller={own_caller:?}",
                     cm.method_label,
                     cm.oop_maps.len(),
                     cm.oop_maps
@@ -2652,6 +2679,8 @@ fn moving_young_frame_coverage_complete_at(
                         .collect::<Vec<_>>(),
                     ret_addr.map(|r| format!("0x{r:x}")),
                     ret_addr.map(is_plausible_return_pc),
+                    own_ret.map(|r| format!("0x{r:x}")),
+                    own_ret.map(is_plausible_return_pc),
                 );
             }
         }
