@@ -2581,6 +2581,26 @@ pub mod frame_coverage_reason {
 }
 
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
+    moving_young_frame_coverage_complete_at(rbp, cm, None)
+}
+
+/// As [`moving_young_frame_coverage_complete`], plus the return address the
+/// rbp-chain walk resolved `cm` from — `None` for the innermost frame, whose
+/// method comes from the chain entry rather than from a return address.
+///
+/// The extra argument exists only for the `no_map` diagnostic: the walk's
+/// "is this a JIT frame" test is `lookup_jit_code_range(ret_addr).is_some()`,
+/// which the A5 probe's own comment says is not sufficient — "cached function
+/// pointers and JIT helper arguments that happen to point inside generated code
+/// read as return PCs and fabricate a frame". `is_plausible_return_pc` is the
+/// sharper test that already exists for exactly that, and reporting it here
+/// says whether a `no_map` frame is a real frame at an unmapped call site or a
+/// fabricated one, which are opposite repairs.
+fn moving_young_frame_coverage_complete_at(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    ret_addr: Option<usize>,
+) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
@@ -2621,7 +2641,8 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
             if N.fetch_add(1, Relaxed) < 32 {
                 eprintln!(
                     "[frame-cov] no map for stored id: sp_id={sp_id} (0x{sp_id:x}) \
-                     method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x}",
+                     method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x} \
+                     ret_addr={:?} plausible_ret={:?}",
                     cm.method_label,
                     cm.oop_maps.len(),
                     cm.oop_maps
@@ -2629,6 +2650,8 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
                         .map(|m| m.bytecode_pc)
                         .take(24)
                         .collect::<Vec<_>>(),
+                    ret_addr.map(|r| format!("0x{r:x}")),
+                    ret_addr.map(is_plausible_return_pc),
                 );
             }
         }
@@ -3316,7 +3339,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 };
                 let cm: &cratonvm_jit::CompiledMethod =
                     unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
-                if !moving_young_frame_coverage_complete(parent_rbp, cm) {
+                if !moving_young_frame_coverage_complete_at(parent_rbp, cm, Some(ret_addr)) {
                     if dbg {
                         eprintln!(
                             "[moving-young-coverage] incomplete: parent frame map at rbp=0x{:x}",
