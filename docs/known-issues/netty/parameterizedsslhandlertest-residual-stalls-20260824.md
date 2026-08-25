@@ -9,11 +9,20 @@ neither explained, neither with a rate. Since then:
   dump mis-reading a never-written reference cell. Reproduced deterministically
   off netty and fixed in the dump. Read correctly, residual 2's stall reports
   exactly residual 1's state, so there was one residual, not two;
-* **residual 1 is REPRODUCED on the current `dev`, and its proximate cause is
-  now measured** — it is not a monitor, a promise, or a selector defect. The
-  server's TLS handshake dies on a `NoSuchMethodError` naming
-  **`java.lang.Object`** as the receiver class, so no alert is produced and the
-  thing that would complete the promise never runs;
+* **residual 1 is REPRODUCED on the current `dev`, and it is not a monitor, a
+  promise, or a selector defect.** The server's TLS handshake dies on a
+  `NoSuchMethodError` naming **`java.lang.Object`** as the receiver class, so
+  no alert is produced and the thing that would complete the promise never
+  runs. The root cause is one line of `jni.rs`: **a JNI LOCAL ref is a raw
+  heap pointer**, so a handle netty-tcnative holds across a G1 evacuation
+  comes back naming from-space, and an evacuated header reads as `ClassId(0)`
+  — which is `java.lang.Object`. Two candidate fixes are costed below;
+  neither is a tail-of-session change and this page stays OPEN for them;
+* a SECOND reproduction, on the same netty frame, is a different failure — a
+  reactor that never returns from the tcnative `SSL_write` native at all,
+  with the VM's own "STW … still waiting for cooperative mutators
+  pending=1 taken=0" printed three times and zero times in the 18 runs that
+  passed. That one is NOT yet attributed;
 * the rate is measured, with a same-day HotSpot control on the same host:
   **1 in 163** whole-class runs, against this page's historical 5 in 80.
 
@@ -98,6 +107,69 @@ exactly this and stops on the first catch:
   the remap did not reach.
 
 Both are terminal-path only, so a healthy run pays nothing for them.
+
+## Root cause of the alert-test face: a JNI LOCAL REF is a raw heap pointer
+
+`vm/src/native/jni.rs::jobject_to_obj` splits on the handle's low bit:
+
+* a **global** ref resolves through `natives.jni_global_refs`, a locked table;
+* a **local** ref is *"a raw heap pointer"* — the function's own words — and is
+  validated with `heap.is_heap_addr` and nothing else.
+
+Its own comment already names the consequence: *"a local ref held across a GC
+safepoint could be a stale from-space pointer under the moving/generational
+collector."* `is_heap_addr` does not catch that: a from-space address in a
+region the collector has not yet reused is a perfectly valid heap address.
+
+`jni_call_instance` then does, in order:
+
+```rust
+let oref = jobject_to_obj(obj)?;                       // may be from-space
+let obj_class_id = shared.mem.heap.class_id_of(oref);  // reads a vacated header
+…
+invoke_on_class_shared(shared, thread, obj_class_id, &method_name, …)
+```
+
+An evacuated object's from-copy reads back an all-zero header, and the class
+manager names `ClassId(0)` **`java.lang.Object`**. The dispatch terminal has a
+retarget for a receiver that moved *during* the lookup, and it deliberately
+excludes `ClassId::new(0)` — correctly, since retargeting to `Object` would be
+worse — so a stale local ref falls straight through to
+`NoSuchMethodError java/lang/Object.<method>`.
+
+Which is the line the reproduction opens with.
+
+This is the same shape, at the JNI boundary, that
+`known-issues/gc/unpinned-native-locals-audit-20260824.md` audits inside
+`native-builtins`: *"the caller's operand slot is a root and gets remapped; the
+native's copy is not… the next read sees an all-zero header — which the class
+manager names `java.lang.Object`."* That page fixed eight in-tree natives with
+`pin_native_root` / `read_native_pin` and names 34 more candidates. **A handle
+handed out to a foreign `.so` cannot be fixed that way** — netty-tcnative holds
+the reference, not this VM — so the JNI local-ref path needs its own answer,
+and this is an independent witness of that family reaching it.
+
+### Two candidate fixes, with what each costs
+
+1. **Table-backed local refs.** Give local refs the treatment global refs
+   already have: a per-thread frame of slots the collector scans and REMAPS,
+   `obj_to_jobject` allocating a slot, `jobject_to_obj` resolving through it,
+   `DeleteLocalRef`/`PopLocalFrame` freeing. This is what the JNI spec
+   describes and what a real `libjvm` does, and the global-ref table is the
+   model to copy. It touches every JNI entry point and every handle producer.
+
+2. **Pin on hand-out.** `obj_to_jobject` takes a native pin for the life of the
+   current native call, so the raw address it returns cannot go stale because
+   the object cannot move. Much smaller, and it reuses machinery this tree
+   already has — but it costs a pin per handle created, on a path that is hot
+   for JNI-heavy workloads, and pinning perturbs evacuation.
+
+Neither is a tail-of-session change, and neither should be taken without its
+own measurement; both are recorded here so the next reader starts from a
+choice rather than from a hunt. What is NOT yet established is that the
+composite test's face (below) has the same cause — the frozen reactor never
+returns from the native at all, which is a different failure than returning
+with a stale handle.
 
 ## The SECOND reproduction is a DIFFERENT shape, on the same netty frame
 
