@@ -3433,7 +3433,22 @@ pub(crate) fn native_p65_pbq_offer(
     // Grow if needed
     if size >= cap {
         let new_cap = cap * 2 + 1;
+        // The grow allocation can move everything this scope still holds:
+        // `this` and `arr` are read through below, and `elem` is stored. Pin
+        // all three across it and re-derive.
+        let this_pin = ctx.pin_native_root(this);
+        let arr_pin = ctx.pin_native_root(arr);
+        let elem_pin = match elem {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
         let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let this = ctx.read_native_pin(this_pin, this);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let elem = match elem_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => elem,
+        };
         for i in 0..size {
             ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
         }

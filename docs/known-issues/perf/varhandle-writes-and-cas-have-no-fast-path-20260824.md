@@ -1,10 +1,11 @@
 # `VarHandle` writes and CAS have no fast path — 35-303x, and it is most of `java.util.concurrent`
 
 ## Status
-**PARTIALLY FIXED (2026-08-24).** `set` is bound and verified — 698 000 native
-dispatches eliminated, 246.5 ns -> 64.8 ns (see below). `compareAndSet` and
-reference READS are still on the generic funnel, and the downstream
-composition workload is CAS-dominated so it has barely moved. The defect was a
+**PARTIALLY FIXED (2026-08-24).** Two of the three steps are done: `set` is
+bound (698 000 native dispatches eliminated, 246.5 ns -> 64.8 ns) and the
+per-call global mutex is gone (**10.9x at 24 threads**, and the anti-scaling
+with it). `compareAndSet` is still on the generic funnel, which is why the
+CAS-dominated composition workload has moved only ~9.5%. The defect was a
 gap in an existing optimisation rather than a bug: `VARHANDLE_READ_DIRECT_FNS`
 bound READS of PRIMITIVE fields and nothing else.
 
@@ -133,22 +134,81 @@ stays slow until step 2.
 The remaining 64.8 ns is also still 65x HotSpot's 1.0 ns. Two costs are left in
 the helper itself, and the second is the bigger prize:
 
-## Steps 2 and 3, in priority order
+## The per-call global mutex is gone (2026-08-24)
 
-2. **Bind `compareAndSet`.** This is where the downstream win is. The helper is
-   `(vm_ptr, vh, receiver, expected, new)` — five words against Windows' four
-   `ARG_REGS`, so unlike `set` it needs the stack-argument setup
-   (`emit_stack_arg_setup`, which the direct-call path already has). The store
-   half can reuse `vm_exec::compare_and_swap_field`'s logic, which already does
-   the hardware CAS with the SATB pre-barrier on `expected` and the post
-   `write_barrier` on success.
-3. **Stop taking a global mutex per operation.**
-   `varhandle_instance_field_plan` locks `vh_meta_table` on EVERY call, on the
-   read path as well as this one, and at 24 threads that is a contention point
-   before it is a cost. A per-handle memo keyed the way the site key already is
-   would take the remaining ~65 ns down and speed the existing read bind up for
-   free.
+`vh_meta_table` is ONE process-global `parking_lot::Mutex` around one map, and
+every `VarHandle` operation took it. That is not a per-op cost, it is a
+scalability wall: measured with `HibfixVarHandleScale`, whose threads each own
+their own object and their own field so there is **no contention on the data**,
+throughput went DOWN with threads.
 
+Both doors into the table are now memoised per thread, guarded by a
+`VH_META_GENERATION` counter that every mutation bumps
+(`vh_meta_put`, `vh_meta_update_field_index`), each bumping AFTER dropping the
+lock so no reader can memoise a pre-change answer against a post-change
+generation:
+
+* `varhandle_instance_field_plan` — the JIT read and write fast paths;
+* `vh_meta_get` — the generic native funnel.
+
+| threads | before | after | gain |
+|---:|---:|---:|---:|
+| 1 | 8 313 819 ops/s | 9 679 449 | 1.16x |
+| 4 | 6 287 026 | 7 760 197 | 1.23x |
+| 8 | 1 521 043 | 7 466 459 | **4.9x** |
+| 16 | 848 673 | 7 446 187 | **8.8x** |
+| 24 | 603 694 | 6 573 526 | **10.9x** |
+
+The collapse is gone: throughput holds ~7M ops/s from 4 threads to 24 instead
+of falling to 0.07x of single-threaded. It is now FLAT rather than scaling, so
+a shared bottleneck remains — the volatile store's stripe lock and
+`java_identity_hash` are the candidates — but the convoy is not it.
+
+71/71 regression vectors and 4149 native-builtins tests pass.
+
+### Memoising only the fast paths did nothing for composition, and that is how the second door was found
+
+The plan memo alone took the scaling probe from 0.07x to 0.68x at 24 threads
+and moved `CompletableFuture` composition by **zero**. Composition is
+CAS-dominated, CAS has no direct bind, and the generic native reaches the table
+through `vh_meta_get` — a different function, the same mutex. One lock, two
+callers, and only one of them covered. The gap between the two measurements is
+what exposed it; either number alone would have been read as a result.
+
+### What the lock was NOT
+
+With both doors memoised, composition improved ~9.5% (90.3 s -> 81.8 s on the
+24-thread probe) and no more. **The mutex was the SCALING problem, not the
+composition bottleneck.** What is left in composition is the CAS's own funnel
+overhead — the SATB flush, the reference-argument forwarding, the site-key
+revalidation and the two thread-local map probes that a direct bind exists to
+skip. That is step 2, and it is now the only thing between this and the 872x.
+
+### A note on reading the per-op numbers
+
+One run after the change showed `VarHandle.set` at 99.4 ns against the 64.8 ns
+measured before it — apparently a regression. The unrelated controls had moved
+too (plain field store 15.7 -> 19.8 ns, `AtomicInteger` 6.4 -> 10.7 ns), i.e.
+the box was ~1.5x busier. Only back-to-back comparisons on the same binary pair
+are usable here; the scaling table above is one.
+
+## What is left: bind `compareAndSet`
+
+The only remaining step, and now the only thing between this page and the 872x
+composition gap. The helper is `(vm_ptr, vh, receiver, expected, new)` — five
+words against Windows' four `ARG_REGS`, so unlike `set` it needs the
+stack-argument setup (`emit_stack_arg_setup`, which the direct-call path
+already has). The store half can reuse `vm_exec::compare_and_swap_field`, which
+already does the hardware CAS with the SATB pre-barrier on `expected` and the
+post `write_barrier` on success.
+
+Bind it at BOTH doors. A single-pass-only bind reads as "bound" and moves
+nothing — see the census note under step 1.
+
+Beyond that, the scaling curve is now FLAT rather than rising, so a second
+shared bottleneck is waiting behind the one that was removed. The volatile
+store's stripe lock and `java_identity_hash` are the two candidates, and
+`HibfixVarHandleScale` is the instrument.
 ## Repro
 
 ```bash

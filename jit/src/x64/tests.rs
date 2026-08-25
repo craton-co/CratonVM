@@ -197,6 +197,121 @@ fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
     );
 }
 
+/// A splice must not rewind the caller's spill cursor UNDER an operand the
+/// caller still owns.
+///
+/// `try_emit_inline_body` restores the cursor from the LOWEST frame offset
+/// among the arguments it popped. That is the caller's new top only while
+/// frame offsets are handed out in stack ORDER, so that the arguments are the
+/// topmost slots. `invalidate_callee_saved` breaks exactly that — it reserves
+/// ONE fresh slot at the top of the reserve and repoints every entry reading
+/// the register at it, however deep — and it runs on every write to a
+/// register-homed local, `iinc` on a loop counter included. The rewind then
+/// hands the buried operand's address out a second time, to this splice's
+/// return value or to the next splice's callee locals.
+///
+/// The sibling test above is the same defect one table over:
+/// `pop_stack` grew a live-slot scan for it, and this is that scan on the path
+/// that bypasses `pop_stack`'s reclaim arm entirely (`reserve_spill_slots` has
+/// already moved the cursor past the argument slots by the time the arguments
+/// are popped, which is why the splice derives the cursor by hand).
+///
+/// Measured consequence: bc-java `LEATest` inside `SimpleTestTest`, where
+///
+/// ```java
+/// pWork[j] = rol32(pWork[j] + rol32(myDelta, j++), ROT3);
+/// ```
+///
+/// lost the array-store index `j` — pushed early, repointed by the `iinc`,
+/// and still live across two `rol32` splices — and reached `iastore` holding
+/// `0xC3EFE9DB`: LEA's `DELTA[0]`, i.e. `myDelta` on the first iteration.
+/// `ArrayIndexOutOfBoundsException: Index -1007687205`.
+///
+/// The assertion is on the CURSOR rather than on a computed answer, because
+/// the operand-stack simulation is where the defect lives; a bytecode-level
+/// test cannot reach it through the `compile` test wrapper, which never
+/// requests register homes for locals and so can never make the offsets
+/// non-monotonic in the first place.
+#[test]
+fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "inline-buried-operand-test".to_string(),
+        ExecutableBuffer::new(65536).expect("test executable buffer"),
+        0,
+        0,
+        64,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Depth 0 — the operand that stays live UNDER the call. In LEA this is the
+    // array-store index, read from a register-homed local.
+    compiler.stack_push(StackSlot::CalleeSaved(R12), false);
+    // Depth 1 — a COMPUTED value, so it owns a frame slot, and it owns one LOW
+    // in the reserve because it was pushed first.
+    let arg_lo = match compiler.push_stack().expect("first argument slot") {
+        StackSlot::Frame(off) => off,
+        other => panic!("push_stack must hand out a frame slot, got {other:?}"),
+    };
+    // The `iinc`. The buried entry is materialised at a FRESH slot, which is
+    // ABOVE the argument sitting below it: offsets are no longer monotonic
+    // with stack depth.
+    compiler.invalidate_callee_saved(R12);
+    let buried = match compiler.stack[0] {
+        StackSlot::Frame(off) => off,
+        other => panic!("the buried entry was not materialised: {other:?}"),
+    };
+    assert!(
+        buried > arg_lo,
+        "the hazard requires the buried operand ABOVE an argument          (buried={buried}, arg={arg_lo}); with these two in the other order          the `min` would be right and this test would prove nothing"
+    );
+    // Depth 2 — the second argument, at the top as usual.
+    compiler
+        .push_stack()
+        .expect("second argument slot");
+
+    // `static int leaf(int a, int b) { return a; }`
+    let site = make_inline_site(&[0x1a, 0xac], 2, 2, true, b'I');
+    assert!(
+        compiler.try_emit_inline_site(0, &site),
+        "a two-argument static leaf must splice; a bail would make every          assertion below vacuous"
+    );
+
+    assert!(
+        compiler.next_spill_offset > buried,
+        "the splice left the cursor at {} with the buried operand still          owning slot {buried}: the next reservation gets that address a          second time",
+        compiler.next_spill_offset
+    );
+    let next = compiler.push_stack().expect("push after the splice");
+    assert!(
+        !matches!(next, StackSlot::Frame(off) if off == buried),
+        "the push after the splice was handed slot {buried}, which the buried          entry {:?} still reads",
+        compiler.stack[0]
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {
@@ -15730,4 +15845,83 @@ fn the_method_entry_poll_knows_its_own_live_oop_locals() {
         None,
         "and so must a pc past the end of the vectors",
     );
+}
+
+/// A site that inlines something ITSELF must be sized for the whole tree.
+///
+/// `InlineSite::nested_sites` holds full recursive `InlineSite`s and the
+/// emitter splices those bodies into the SAME code buffer as the body that
+/// contains them. Both sizing sites in `compile_with_param_slots` — the code
+/// buffer estimate (`callee_code_len * 64`) and the spill reservation
+/// (`max(callee_max_locals, param_span) + callee_code_len`) — used to read the
+/// root site's `callee_code_len` and stop there, reserving the outer body's
+/// bytes and none of the nested ones.
+///
+/// That is not a hypothetical shortfall. `VolumeOps.grad` (kfusion's raycast
+/// normal, 1511 bytes / 273 invokes of 5-15 byte getters that each splice a
+/// constructor and three field loads) overran its 433,312-byte estimate by
+/// 8% — `wanted=468437` — and after `MAX_CODE_BUFFER_RETRIES` stopped being
+/// compiled at all, leaving the app's hottest method interpreted.
+///
+/// TWO arms, because a test that only checked the nested case would pass just
+/// as well against a helper that returned some large constant:
+/// * a leaf site (no nested bodies) must be sized EXACTLY as the old per-site
+///   formula did — this is the no-regression half;
+/// * the same site carrying nested bodies must be sized strictly larger, by
+///   exactly the nested bodies' own contribution, transitively through two
+///   levels (so a one-level-deep walk fails it too).
+#[test]
+fn s31_inline_reservations_count_nested_bodies() {
+    use crate::x64::driver::{spliced_bytecode_len, spliced_stack_reserve};
+
+    // Leaf: 3 bytes of bytecode, 2 locals, static ()I -> param_span 0.
+    let leaf = make_inline_site(&[0x12, 0x05, 0xac], 2, 0, true, b'I');
+    assert_eq!(
+        spliced_bytecode_len(&leaf),
+        3,
+        "a leaf site is its own bytecode and nothing else"
+    );
+    assert_eq!(
+        spliced_stack_reserve(&leaf),
+        2 + 3,
+        "a leaf site keeps the exact pre-existing per-site formula: \
+         max(callee_max_locals, param_span) + callee_code_len"
+    );
+
+    // Depth 2: leaf <- middle <- outer. Distinct sizes so a walk that stops
+    // one level early produces a number no correct walk can also produce.
+    let middle_body = [0xb8, 0x00, 0x01, 0xac, 0x00, 0x00, 0x00]; // 7 bytes
+    let mut middle = make_inline_site(&middle_body, 4, 0, true, b'I');
+    middle.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 0,
+        guard_class_id: 0,
+        site: leaf.clone(),
+    }];
+
+    let outer_body = [0xb8, 0x00, 0x02, 0xac, 0x00]; // 5 bytes
+    let mut outer = make_inline_site(&outer_body, 6, 0, true, b'I');
+    outer.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 0,
+        guard_class_id: 0,
+        site: middle.clone(),
+    }];
+
+    // 5 (outer) + 7 (middle) + 3 (leaf). A one-level walk would say 12.
+    assert_eq!(
+        spliced_bytecode_len(&outer),
+        5 + 7 + 3,
+        "the buffer estimate must count nested bodies transitively"
+    );
+    // (6+5) + (4+7) + (2+3). A one-level walk would say 22.
+    assert_eq!(
+        spliced_stack_reserve(&outer),
+        (6 + 5) + (4 + 7) + (2 + 3),
+        "a nested body gets its own locals and operand stack on top of the \
+         body that splices it, so the reserves add transitively"
+    );
+
+    // And the fix is strictly a GROWTH: never size a nested tree below what
+    // the old root-only formula would have reserved for its root.
+    assert!(spliced_bytecode_len(&outer) > spliced_bytecode_len(&leaf));
+    assert!(spliced_stack_reserve(&outer) > spliced_stack_reserve(&leaf));
 }

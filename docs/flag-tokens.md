@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-487 tokens.
+489 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -72,6 +72,7 @@ export inherited from a parent shell.
 | `dial-doors` | `CRATONVM_DBG_DIAL_DOORS` |
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
+| `watch-pun` | `CRATONVM_DBG_WATCH_PUN` |
 | `read0-latency` | `CRATONVM_DBG_READ0LAT` |
 | `refdisc` | `CRATONVM_DBG_REFDISC` |
 | `site-alias` | `CRATONVM_DBG_SITE_ALIAS` |
@@ -118,6 +119,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `coll-refresh` | `CRATONVM_DBG_COLL_REFRESH` |
 | `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `corrupt-cell-selftest` | `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
@@ -553,7 +555,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-222 tokens.
+223 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -617,6 +619,7 @@ export inherited from a parent shell.
 | `inclusive-bce` | `CRATONVM_JIT_INCLUSIVE_BCE` |
 | `inline-allow-static` | `CRATONVM_INLINE_ALLOW_STATIC` |
 | `inline-getfield` | `CRATONVM_JIT_INLINE_GETFIELD` |
+| `inline-live-slot-clamp` | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` |
 | `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
 | `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
