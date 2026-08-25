@@ -4003,7 +4003,11 @@ impl SharedVm {
                 proxy_method_cache: RwLock::new(FxHashMap::default()),
                 lambda_impl_owner_memo: RwLock::new(FxHashMap::default()),
                 lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
-                next_lambda_id: AtomicU32::new(0x8000_0000),
+                next_lambda_id: AtomicU32::new(
+                    crate::vm::realms::class_realm::LAMBDA_PROXY_ID_BASE,
+                ),
+                annotation_proxy_cid: AtomicU32::new(u32::MAX),
+                annotation_proxy_absent_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
                 primitive_mirrors: RwLock::new(FxHashMap::default()),
                 module_mirrors: RwLock::new(FxHashMap::default()),
                 cached_string_num_fields: AtomicUsize::new(0),

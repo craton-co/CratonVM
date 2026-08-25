@@ -3955,6 +3955,44 @@ pub(super) fn op_getfield(
             ) {
                 field = retargeted;
             }
+            // CRATONVM_DBG_STRAYSTACK, the getfield door -- the READ twin of
+            // the putfield dump above. Deliberately outside `any_field_diag()`,
+            // exactly like its putfield sibling, so the two doors are armed by
+            // one variable and cannot drift.
+            if straystack_enabled() {
+                let h = shared.mem.heap.get_header(obj_ref);
+                let ns = h.num_slots() as usize;
+                if field.field_index >= ns || h.num_slots() > (1 << 24) {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 12 {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        eprintln!(
+                            "[straystack] #{k} OOB getfield recv@0x{:x} cid={} num_slots={} kind={} -> field '{}' idx={} declaring={:?}",
+                            obj_ref.as_ptr() as usize,
+                            h.class_id.as_u32(),
+                            h.num_slots(),
+                            cratonvm_types::ObjectHeader::kind_tag(
+                                h.mark_word.load(std::sync::atomic::Ordering::Relaxed)
+                            ),
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index,
+                            field.declaring_class_id,
+                        );
+                        eprintln!("[straystack] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(28) {
+                            eprintln!(
+                                "[straystack]   {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
             // the common no-diagnostics case (the overwhelmingly hot path) does

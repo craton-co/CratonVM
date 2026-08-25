@@ -575,17 +575,32 @@ fn drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<
     // --- Strategy 2: by-index (standard ByteArrayInputStream layout) ---
     // buf=0, pos=1, mark=2, count=3 — the JDK ByteArrayInputStream
     // instance field order (no instance fields in InputStream parent).
-    let buf_by_idx = match ctx.get_field(stream, 0) {
-        Value::Object(Some(arr)) => Some(arr),
-        _ => None,
-    };
-    let count_by_idx = match ctx.get_field(stream, 3) {
-        Value::Int(n) => Some(n as usize),
-        _ => None,
-    };
-    let pos_by_idx = match ctx.get_field(stream, 1) {
-        Value::Int(n) => Some(n as usize),
-        _ => None,
+    //
+    // The slot COUNT is checked before any of those slots is read. Without it
+    // this is a shape test that reads past a shorter receiver: Tomcat's
+    // `CoyoteInputStream` declares one field, so slots 1 and 3 land on whatever
+    // follows the object -- and the values found there decide whether the
+    // caller goes on to trust `buf`/`pos`/`count`. Same defect, and the same
+    // fix, as `has_byte_array_stream_layout` in `phases_late/zip_streams.rs`.
+    // A receiver too short for the layout leaves all three `None` and falls
+    // through to strategy 3, which works for any real `InputStream`.
+    let (buf_by_idx, count_by_idx, pos_by_idx) = if ctx.object_num_fields(stream) > 3 {
+        (
+            match ctx.get_field(stream, 0) {
+                Value::Object(Some(arr)) => Some(arr),
+                _ => None,
+            },
+            match ctx.get_field(stream, 3) {
+                Value::Int(n) => Some(n as usize),
+                _ => None,
+            },
+            match ctx.get_field(stream, 1) {
+                Value::Int(n) => Some(n as usize),
+                _ => None,
+            },
+        )
+    } else {
+        (None, None, None)
     };
     if let (Some(arr), Some(c), Some(p)) = (buf_by_idx, count_by_idx, pos_by_idx) {
         if c > 0 && c <= MAX_LOAD_BYTES && p <= c {

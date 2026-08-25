@@ -14,7 +14,7 @@ import org.apache.tomcat.util.bcel.classfile.ClassParser;
  * Splits the Tomcat webapp-deploy annotation scan into the parts it is made
  * of, to settle which one the 226x actually is.
  *
- * `docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md`
+ * `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`
  * attributes the cost to object construction ("the parse is never compiled"),
  * while a `--stack-dump-on-timeout` of the same workload puts 94% of samples
  * in `BufferedInputStream.read`. Those are different claims with different

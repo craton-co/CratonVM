@@ -190,3 +190,103 @@ watch is in the tree, wired and ready, and the observation is not made.
 If picking this up: revert the class gate, build with `-j 2` when
 `free -g` shows headroom, and run the concurrent recipe with
 `CRATONVM_DBG_WATCH_PUN=SQLChar:1`. One firing settles it.
+
+---
+
+## Follow-up 2026-08-25 — a second instance, the behavioural tests, and two corrections
+
+Landed from `fix/tomcat-webapp-deploy-20260824`, which reached the same defect
+from the other side on the same day. That branch's own write-up is folded in
+here rather than kept beside this one.
+
+### The residual above is partly answered: there is a second reader
+
+§ Residual asks whether this native is the only reader of the signature.
+`Properties.load`'s drain has a **"Strategy 2: by-index" fallback** that read
+slots 0, 1 and 3 of an arbitrary `InputStream` with no slot-count check —
+byte-for-byte the same defect, in
+`native-builtins/src/properties_sidetable.rs`. It is guarded now: a receiver
+too short for the layout leaves all three `None` and falls through to strategy
+3, which works for any real `InputStream`. It had no observed firing, so this is
+a fix by inspection rather than by measurement.
+
+Two nearby shape reads were checked and deliberately left alone, because both
+already gate on the class name before reading:
+`native_inflater_input_stream_init` in this same file, and `dis_read_byte` in
+`native-builtins/src/classloader.rs`.
+
+### The behavioural test that § Regression test says cannot be written
+
+It can. `crate::test_utils::MockNativeContext` hands an allocation a class id
+and an **exact slot count** (`ensure_class_initialized` + `alloc_object`), which
+is everything the predicate reads. `byte_array_stream_layout_tests` in
+`zip_streams.rs` drives three receivers through it:
+
+* a one-slot `org/apache/catalina/connector/CoyoteInputStream` — refused,
+  without any read past it;
+* a four-slot `java/io/ByteArrayInputStream` — accepted, because the point of
+  the fix is to identify the class, not to disable the path;
+* a four-slot `org/example/ChunkedInputStream` — refused **on identity**, which
+  is the half the old shape test could never get right. `ByteArrayInputStream`
+  is registered in every case so the subclass arm is actually exercised rather
+  than short-circuiting on an unknown name.
+
+The source-ORDER guard stays: reordering is how this comes back, and no
+behavioural test can see an ordering.
+
+### The gate now asks the slot count first, and accepts a subclass
+
+`has_byte_array_stream_layout` is the merged form of both branches' fixes:
+the slot count first (so no read can go out of bounds even if the identity arm
+is later widened), then the class name, then the subclass walk — the spelling
+`native-io`'s `input_stream_has_bais_layout` already uses, so a
+`ByteArrayInputStream` **subclass**, which does carry the layout at slots 0..3,
+is not silently dropped to the slow path. The layout probe is retained as a
+second condition, exactly as § Fix argues for.
+
+### Two corrections to this page
+
+* **The signature is `index=1` and `index=3` with `num_slots=1`** — never index
+  2 or 4, and never `num_slots=0`. Counted on a re-run: 8 hits at index 1 and 8
+  at index 3 in `TestDefaultServletRfc9110Section13`, all `op="get"`. The
+  warning prints `header.num_slots()`, which is the object's own count, so it
+  always agreed with the `header_num_slots=1` the corpse reporter printed beside
+  it; the two lines never disagreed. Reading `num_slots=0` as "the bounds the
+  accessor was given" was an interpretation with nothing under it, and it is
+  what kept the corpse/compaction reading alive after `in_registry=true` had
+  already falsified it. The `1..4` and `num_slots=0` spellings in the header
+  rows above are the original report's, kept for searchability.
+* **`op="set"` was never observed.** Every hit is a read. That matters for the
+  next reader, because it is why the existing instrument found nothing.
+
+### The straystack doors were write-only, and that is fixed too
+
+`CRATONVM_DBG_STRAYSTACK` dumps the culprit native and the Java stack for an
+out-of-bounds slot access, and it was wired to `NativeContext::set_field` and
+the interpreter's `putfield` — **two WRITE doors**. Every hit in this signature
+carries `op="get"`, so the dump stayed empty on all sixteen of them and read as
+an absence of evidence. The READ twins (`NativeContext::get_field` and the
+interpreter's `getfield`) ship with this follow-up and named the native on the
+first run, independently of the backtrace route above:
+
+```text
+[straystack-native] #0 OOB ctx.get_field recv@0x… num_slots=1 idx=1
+    CULPRIT-NATIVE=java/io/InputStream.transferTo(Ljava/io/OutputStream;)J
+[straystack-native]   java/nio/file/Files.copy(…)J pc=145
+[straystack-native]   org/apache/catalina/webresources/DirResourceSet.write(…)
+[straystack-native]   org/apache/catalina/servlets/DefaultServlet.doPut(…)
+```
+
+One extra step was needed and is worth knowing: `native_ring`'s callback→name
+map is only populated when the ring is armed, so the first dump printed
+`CULPRIT-NATIVE=<cb@0x…>`. Re-running with `CRATONVM_ENABLE_NATIVE_RING=1`
+printed the triple.
+
+### `TestSwallowAbortedUploads` — still not evidence
+
+§ The defect cites this class's SIGSEGV. Interleaved control/fix, three pairs at
+load 41–49: control `rc=1, 1, 0`, fix `rc=0, 0, 0` (and 0 on a fourth run). The
+control's failure is `testAbortedUploadUnlimitedNoSwallow` asserting no client
+exception and getting `SocketException: Broken pipe` — a network-timing
+assertion, **not** the SIGSEGV. The SIGSEGV did not reproduce on either arm, so
+3/3 vs 0/4 is suggestive and is not a result at that load.

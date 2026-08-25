@@ -785,7 +785,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-73 tokens.
+74 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -862,6 +862,7 @@ export inherited from a parent shell.
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
+| `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
 
 ## `CRATONVM_REAL`
 
@@ -985,7 +986,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-16 tokens.
+17 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1002,6 +1003,7 @@ export inherited from a parent shell.
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
 | `mh-strict-invokeexact` | `CRATONVM_MH_STRICT_INVOKEEXACT` |
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
+| `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |

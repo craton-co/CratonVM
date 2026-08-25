@@ -3992,7 +3992,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // deploy interpreted — the method was rejected here *before* it was ever
     // counted, which is why `jit-method-stats` reported it neither compiled nor
     // `hot_but_stuck_in_interpreter`. See
-    // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
     //
     // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
     if cached.is_synchronized && !jit_sync_methods_enabled() {
