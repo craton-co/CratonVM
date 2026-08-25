@@ -1794,7 +1794,10 @@ pub(crate) fn p58_gzip_in_init_desc(
     } else {
         Vec::new()
     };
+    // The allocation can move `this`; pin and re-derive before storing into it.
+    let this_pin = ctx.pin_native_root(this);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decompressed.len());
+    let this = ctx.read_native_pin(this_pin, this);
     // PERF: bulk memcpy the decompressed payload instead of a per-element loop.
     ctx.write_byte_array_from(arr, 0, &decompressed);
     ctx.set_field(this, 0, Value::Object(Some(arr))); // decompressed data

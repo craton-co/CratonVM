@@ -9815,6 +9815,206 @@ pub fn varhandle_read_direct_helpers_enabled() -> bool {
     })
 }
 
+
+// ---------------------------------------------------------------------------
+// `VarHandle` WRITE-mode thin direct-call bind.
+//
+// The read table above serves `get`-family sites whose value is a PRIMITIVE.
+// Writes were never in scope, so `VarHandle.set` still pays the whole generic
+// native funnel — measured at 303x HotSpot for a reference field (1.0 ns
+// against 303.4 ns), against a 9x plain-field-store baseline. A native census
+// of `HibfixVarHandleProbe` counts 698 000 `VarHandle.set` invocations for
+// 500 000 probe writes: every one is a full dispatch.
+//
+// See `docs/known-issues/perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`.
+//
+// A write is the EASIER half of what the read bind refused, not the harder one.
+// The read table excludes `L`/`[` because a reference RETURN has to be
+// published as a handoff root before the caller can store it, and the direct
+// arm takes no thread borrow to publish it with. A write has no return: the
+// reference travels INWARD, in a register the compiled caller's own frame
+// already describes, so there is no window to root across and reference values
+// are in scope here from the start.
+//
+// `compareAndSet` is deliberately NOT bound yet. Its helper would be
+// `(vm_ptr, vh, receiver, expected, new)` — five arguments, and Windows'
+// ARG_REGS is four (RCX/RDX/R8/R9), so it needs the stack-argument setup this
+// bind does not. `set` is `(vm_ptr, vh, receiver, value)`, exactly four.
+// ---------------------------------------------------------------------------
+
+/// Thin direct-call helper per (write mode, value kind), or `0` for a slot that
+/// is not served. Indexed by [`varhandle_write_helper_slot`].
+pub static VARHANDLE_WRITE_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_WRITE_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_WRITE_SLOTS];
+
+/// The `VarHandle` write access modes served by [`VARHANDLE_WRITE_DIRECT_FNS`],
+/// in slot-major order.
+///
+/// All four are plain stores of the variable and the VM's registry maps every
+/// one to the same `varhandle_set` callback, so binding them together does not
+/// widen what a bound site may do — the same argument the read modes rest on.
+/// The helper stores through `set_field_volatile_as`, i.e. at the STRONGEST of
+/// the four orderings, which is always a legal implementation of a weaker one.
+pub const VARHANDLE_WRITE_MODES: [&str; 4] = ["set", "setVolatile", "setRelease", "setOpaque"];
+
+/// The value kinds served, in slot-minor order.
+///
+/// `L` IS here, unlike [`VARHANDLE_READ_RETURNS`] — see this section's header
+/// for why a reference is safe inbound. An array-typed field is stored under
+/// `L` too: the plan collapses both to `L`, and the store is the same word.
+pub const VARHANDLE_WRITE_KINDS: [u8; 9] =
+    [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D', b'L'];
+
+/// `VARHANDLE_WRITE_MODES.len() * VARHANDLE_WRITE_KINDS.len()`.
+pub const VARHANDLE_WRITE_SLOTS: usize = 36;
+
+/// The single-reference-coordinate, one-value, `void`-returning shape this bind
+/// serves, as a slot into [`VARHANDLE_WRITE_DIRECT_FNS`].
+///
+/// The descriptor test mirrors [`varhandle_read_helper_slot`]'s and rules out
+/// the same shapes for the same reasons: a static-field handle writes with
+/// `(X)V` (zero coordinates), an array-element or view handle with `([BIX)V`
+/// (two), a `MemorySegment` handle with a `J` offset (two). Only an
+/// instance-field handle writes with exactly one reference coordinate followed
+/// by one value.
+///
+/// The helper re-checks the handle at runtime and declines to the generic
+/// dispatcher for anything the side table does not describe as a resolved
+/// instance field of this kind, so this is a cheap pre-filter and not the
+/// correctness argument.
+pub fn varhandle_write_helper_slot(method: &str, descriptor: &str) -> Option<usize> {
+    let mode = VARHANDLE_WRITE_MODES.iter().position(|m| *m == method)?;
+    if !descriptor.starts_with('(') {
+        return None;
+    }
+    let close = descriptor.find(')')?;
+    if &descriptor[close + 1..] != "V" {
+        return None;
+    }
+    let params = &descriptor[1..close];
+    // Split the leading reference coordinate off; whatever remains is the value.
+    let coord_len = match params.as_bytes().first()? {
+        b'L' => params.find(';')? + 1,
+        b'[' => {
+            let after = params.trim_start_matches('[');
+            let consumed = params.len() - after.len();
+            match after.as_bytes().first()? {
+                b'L' => consumed + after.find(';')? + 1,
+                c if *c != b'L' && VARHANDLE_WRITE_KINDS.contains(c) => consumed + 1,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let value = &params[coord_len..];
+    let kind = match value.as_bytes().first()? {
+        // A reference-typed value, however deeply arrayed, is one word.
+        b'L' if is_single_object_descriptor(value) => b'L',
+        b'[' => b'L',
+        c if value.len() == 1 => *c,
+        _ => return None,
+    };
+    let kind_idx = VARHANDLE_WRITE_KINDS.iter().position(|k| *k == kind)?;
+    Some(mode * VARHANDLE_WRITE_KINDS.len() + kind_idx)
+}
+
+/// Register the `VarHandle` write-mode thin direct-call helpers (called once
+/// from the VM's `build_helpers`), indexed by [`varhandle_write_helper_slot`].
+pub fn set_varhandle_write_direct_fns(addrs: &[usize; VARHANDLE_WRITE_SLOTS]) {
+    for (cell, addr) in VARHANDLE_WRITE_DIRECT_FNS.iter().zip(addrs.iter()) {
+        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS=0` — send every `VarHandle`
+/// write back through the generic native funnel. Default ON.
+///
+/// The twin of [`varhandle_read_direct_helpers_enabled`], and there for the
+/// same reason: the blast radius has to be measurable on ONE binary.
+pub fn varhandle_write_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to a `VarHandle` write helper, split by compile door.
+pub static VARHANDLE_WRITE_SITES_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_WRITE_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(single-pass, OSR)` `VarHandle` write sites bound to a thin direct helper.
+pub fn varhandle_write_direct_helper_sites() -> (u64, u64) {
+    (
+        VARHANDLE_WRITE_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_WRITE_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod varhandle_write_slot_tests {
+    use super::*;
+
+    /// The shape `CompletableFuture.tryPushStack` writes through:
+    /// `NEXT.set(c, h)` on a reference field.
+    #[test]
+    fn instance_field_writes_map_to_slots() {
+        assert_eq!(
+            varhandle_write_helper_slot("set", "(Ljava/lang/Object;Ljava/lang/Object;)V"),
+            Some(8)
+        );
+        assert_eq!(
+            varhandle_write_helper_slot("set", "(Ljava/lang/Object;I)V"),
+            Some(4)
+        );
+        assert_eq!(
+            varhandle_write_helper_slot("setVolatile", "(Ljava/lang/Object;J)V"),
+            Some(VARHANDLE_WRITE_KINDS.len() + 5)
+        );
+        // An array-TYPED field is still an ordinary reference-valued field.
+        assert_eq!(
+            varhandle_write_helper_slot("set", "(Ljava/lang/Object;[Ljava/lang/String;)V"),
+            Some(8)
+        );
+    }
+
+    /// Everything that is NOT a one-coordinate instance-field write keeps the
+    /// dispatch it has today.
+    #[test]
+    fn other_varhandle_shapes_are_refused() {
+        // static field: zero coordinates
+        assert_eq!(varhandle_write_helper_slot("set", "(I)V"), None);
+        // array element / byte-array view: two coordinates
+        assert_eq!(varhandle_write_helper_slot("set", "([BII)V"), None);
+        assert_eq!(
+            varhandle_write_helper_slot("set", "(Ljava/nio/ByteBuffer;II)V"),
+            None
+        );
+        // a read mode is not a write mode
+        assert_eq!(
+            varhandle_write_helper_slot("get", "(Ljava/lang/Object;)I"),
+            None
+        );
+        // compareAndSet is not bound here (five arguments; see the header)
+        assert_eq!(
+            varhandle_write_helper_slot("compareAndSet", "(Ljava/lang/Object;II)Z"),
+            None
+        );
+        // a non-void return is not a write
+        assert_eq!(
+            varhandle_write_helper_slot("getAndSet", "(Ljava/lang/Object;I)I"),
+            None
+        );
+    }
+}
+
 /// Sites bound to a `VarHandle` read helper, split by compile door, so "did
 /// this land" is answerable without a timing run. The OSR column is the one
 /// that matters here: netty reads `refCnt` inside the transfer loops, and a
@@ -21319,6 +21519,67 @@ fn try_compile_inner(
                                     num_params: 1,
                                     return_type: VARHANDLE_READ_RETURNS
                                         [slot % VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                // `VarHandle.set`/`setVolatile`/`setRelease`/`setOpaque` on an
+                // instance field (see `VARHANDLE_WRITE_DIRECT_FNS`). The same
+                // argument as the read bind directly above, and it carries over
+                // unchanged: every write mode resolves to ONE registered native
+                // (`varhandle_set`) regardless of the receiver's concrete handle
+                // class, so there is no subclass override a guard would have to
+                // protect, and the helper re-validates the handle at runtime.
+                //
+                // What is DIFFERENT from the read bind is the value kinds. The
+                // read table refuses `L`/`[` because a reference RETURN needs a
+                // handoff root and the direct arm has no thread borrow to
+                // publish one with. A write returns nothing: the reference
+                // travels inward in a register the compiled caller's frame
+                // already describes, so references are served here.
+                //
+                // `num_params: 2` — the coordinate and the value.
+                // `needs_context: true` puts `vm_ptr` in ARG_REGS[0], so the
+                // helper sees `(vm_ptr, varhandle, receiver, value)`. That is
+                // four words, which is exactly Windows' ARG_REGS; it is also
+                // why `compareAndSet` (five) is not bound here.
+                if direct_jit_callee_calls_enabled
+                    && varhandle_write_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/invoke/VarHandle"
+                {
+                    if let Some(slot) = varhandle_write_helper_slot(&method_name, &descriptor) {
+                        // The descriptor handed to the policy check is the
+                        // native's REGISTERED (erased) one, not the call site's
+                        // — `register_varhandle_natives` files `set` under
+                        // `([Ljava/lang/Object;)V`, and asking the registry
+                        // about the site's own descriptor would find nothing
+                        // and refuse for the wrong reason. It is
+                        // `NativeKind::Bridge`, so under `JdkOnly` this bind is
+                        // refused, deliberately and on the same terms as the
+                        // read bind.
+                        let entry = direct_native_helper(
+                            &VARHANDLE_WRITE_DIRECT_FNS[slot],
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            "([Ljava/lang/Object;)V",
+                        );
+                        if entry != 0 {
+                            VARHANDLE_WRITE_SITES_SINGLEPASS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 2,
+                                    return_type: b'V',
                                     guard_class_id: 0,
                                 },
                             ));
@@ -33147,3 +33408,6 @@ pub fn jit_gate_pass_census() -> (u64, u64) {
         JIT_GATE_PASS_FILLS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
+
+/// See [`ir_lower::ic_frame_republish_sites`].
+pub use ir_lower::ic_frame_republish_sites;
