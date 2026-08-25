@@ -1,5 +1,10 @@
 # `batch.BatchTest` — CratonVM is 4.5-7.2x slower than HotSpot on Hibernate's JDBC batch path, and the gap is NOT MySQL-specific
 
+> **RETIRED to internal 2026-08-24.** This page's own Status records the
+> outcome: root-caused, **no VM defect found**, and its MySQL-specific premise
+> refuted by a direct cross-database control. It was never a known issue in the
+> sense the `known-issues/` folder is for; it is a measurement record.
+
 ## Status
 **ROOT-CAUSED (2026-08-22). No VM defect found, and the page's original
 MySQL-specific premise is REFUTED by a direct cross-database control.** The

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-487 tokens.
+488 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -118,6 +118,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `coll-refresh` | `CRATONVM_DBG_COLL_REFRESH` |
 | `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `corrupt-cell-selftest` | `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
@@ -553,7 +554,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-220 tokens.
+221 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -653,6 +654,7 @@ export inherited from a parent shell.
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
+| `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |

@@ -221,37 +221,70 @@ both on the default policy and under `--jdk-only` with the dial scoped to
 `java/util/ArrayList`** — so the real bytecode does drive CratonVM's ArrayList
 correctly.
 
-**Mechanically it did not engage.** Registering `size`/`isEmpty`/`get` as
-`SyntheticStub` and adding `java/util/ArrayList` to
-`real_protected_stub_class_common` — exactly the Term 3 change, one class over —
-produced `CRATONVM_DBG_STUB_YIELD` counts of **zero**, with and without
-`--nojit`. The static path and the virtual path do not arbitrate the same way,
-and the piece that works for `java.util.Objects` does not reach an instance
-accessor. Whatever the next attempt is, it starts by finding which predicate the
-virtual path actually consults for a `SyntheticStub` instance method — not by
-assuming this one.
+**Mechanically it did not engage, and the retag half was a no-op from the
+start.** The census says `java/util/ArrayList.get` is **ALREADY**
+`kind: synthetic-stub` on plain dev, with `kind_stated: true` — even though
+`register_arraylist_natives` sets an ambient `set_category(Bridge)` around it.
+`NativeMethodRegistry::register` adjudicates the kind itself (its "two drop arms
+and the `keep_real_*` heuristics"), so **the ambient category is not what
+lands**, and reading the registrar to learn a triple's kind is unreliable. Use
+the census.
 
-**And it silently disabled the Objects yield.** Same run, same binary:
+So the only effective half was the allow-list entry, and with it in place every
+precondition is satisfied and it STILL does not yield:
 
-| rung | dev | dev + the ArrayList attempt |
-|---|---:|---:|
-| `Objects.equals` | 50.6 ns | **155.6 ns** |
-| `Objects.isNull` | 28.0 ns | **117.0 ns** |
-| `myEquals` (control) | 59.2 ns | 56.0 ns |
-| `myIsNull` (control) | 33.0 ns | 26.8 ns |
+* `kind` is `synthetic-stub` ✓
+* `real_protected_stub_class("java/util/ArrayList")` ✓ (arms C and D)
+* all five terms of the yield predicate ✓ — the census's own
+  `real_declaring_method` block reads
+  `{loaded: true, declared: true, acc_native: false, has_code: true}`
 
-The controls do not move, so this is the Term 3 fix being switched off, not a
-slower VM. The mechanism is not identified — adding one arm to a `matches!`
-cannot remove another — so the two halves (the `SyntheticStub` retag and the
-allow-list entry) need bisecting SEPARATELY before either is trusted. **Reverted
-rather than shipped**; only the probe is kept.
+and `invocations` stays at 127 in every arm and every mode. The refusal is
+therefore in the **dispatch path**, not in the registration, the allow-list or
+the predicate — and not in the JIT, since `--nojit` refuses identically.
 
-**The engagement counter is what caught both.** The timings alone said "no
-faster", which reads as a null result and invites shipping it as harmless; the
-counter said "never ran", and the control rungs said the Objects regression was
-real. This is the second time on this page that a fix attempt measured nothing —
-the first was the original Term 3 attempt — and both times the counter was the
-difference between a null result and a wrong one.
+**The next probe is named:** `dispatch_virtual` has three doors that could serve
+`ArrayList.get` — `execute_invokevirtual_vtable_fast`'s
+`registered_native_will_run` (line ~150), the population filter on
+`resolve_cached_native_registration` (line ~3261), and `revalidate_cached_native`
+on cache hits. All three spell the same three-term test. Put one trace line in
+each, run `probes/ListYieldProbe`, and the door that never prints is the answer.
+Do not add another allow-list entry before doing that; two attempts have now
+been spent assuming the arbitration is reached.
+
+**~~And it silently disabled the Objects yield.~~ RETRACTED 2026-08-24 — that
+claim was wrong.** It was published off one paired reading (`Objects.equals`
+50.6 → 155.6 ns, `isNull` 28.0 → 117.0, with two local-twin controls flat) and
+it does not reproduce. Bisected properly, four binaries from the same commit:
+
+| arm | change | `Objects.equals` invocations | `ArrayList.get` invocations |
+|---|---|---:|---:|
+| A | dev, control | 0 | 127 |
+| B | the `SyntheticStub` retag only | 0 | 127 |
+| C | the allow-list entry only | 0 | 127 |
+| D | **both** — exactly the reverted attempt | 0 | 127 |
+
+Timings agree: `Objects.equals` reads 56.8-66.8 ns on D against 57.0-60.2 on A,
+i.e. noise. **No arm regresses anything.** The controls being flat is what made
+the original reading persuasive, and it should not have been — two rungs moving
+3× with two controls flat is a coincidence, not a mechanism, and "adding one arm
+to a `matches!` cannot remove another" was reason enough to withhold the claim
+until it was bisected. What the original reading actually was is not known; it
+was taken against a binary built at an earlier dev commit, which was not
+re-tested.
+
+**`invocations` is the instrument that settles this, not ns/call.**
+`--dump-native-registry` writes a row per registered triple carrying
+`invocations`, `kind`, `owns_slot`, `registered_by`, `overwrote` and a
+`real_declaring_method` block. `java/util/Objects.equals` reading
+**`invocations: 0`** is a far better proof that Term 3 works than any timing:
+the native is never entered at all. Every question on this page that is really
+"did the native run?" should be asked this way.
+
+**What DID survive the bisect is the engagement failure**, and it is sharper
+than first stated. `ArrayList.get` runs its native 127 times in all four arms,
+under `--nojit` as well as compiled — so it is not the JIT site cache, and the
+interpreter refuses it too.
 
 **Still open, unchanged:** ~6× is available on indexed list access if the
 engagement problem is solved. Do NOT extend it to the iterator family on the

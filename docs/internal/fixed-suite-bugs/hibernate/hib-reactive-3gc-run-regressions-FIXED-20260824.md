@@ -1,5 +1,14 @@
 # hibernate-reactive 3-GC run (2026-08-20): two defects, both now fixed
 
+> **RETIRED to internal 2026-08-24.** Both defects this page opened for are
+> fixed (`nio_selector` field corruption, and the JIT lambda direct-call arm
+> dropping a deoptimized frame), and §10's closing sweep re-ran the whole
+> 61-class non-passed set on current `dev`: 14 of the 17 genuine failures now
+> pass, and the three that remain are two host-environment classes that fail
+> identically under real HotSpot plus one documented performance residual.
+> No class in the hibernate-reactive suite is failing for a CratonVM
+> correctness reason. Kept for its method trail, which several later pages cite.
+
 **Status: BOTH FIXED (2026-08-22).**
 
 1. `nio_selector.rs`'s `SelectorImpl` field corruption — fixed and measured
@@ -33,7 +42,7 @@ which are the host's own timezone/locale (not CratonVM), 5 of which are one
 open lambda/`CompletableFuture`-dispatch performance characteristic.
 
 **Regression surfaced by:**
-[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+[RESULTS-20260820-3gc-postgres-local.md](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
 — the first full run of all 249 classes against a live Postgres container on
 3 collectors (ZGC/G1/Generational), at `dev@26e4b5db4`. 10 classes FAIL on
 every collector (GC-independent); of those, 2 are the already-known host
@@ -81,7 +90,7 @@ ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));     // SI_OPEN_FLAG = 4
 `SI_ID`/`SI_OPEN_FLAG` (0/4) are reference-typed on this class
 (`AbstractSelector.selectorOpen`, `SelectorImpl.selectedKeys` — confirmed via
 `javap -p` field-index flattening and the developer's own comment). Per
-[G30-1](../jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)'s
+[G30-1](../../../known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)'s
 `primitive-into-reference` coercion, an `Int` store there is silently
 descriptor-coerced to `null`. `SelectorImpl.selectedKeys()` is `public final`
 real JDK bytecode returning that field directly, so **every** `Selector.open()`
@@ -198,7 +207,7 @@ found by `contains()` yet.
 * Not the `nio_selector.rs` defect in §1 — reproduced identically on the
   binary carrying that fix.
 * Not the `primitive-into-reference` coercion guard
-  ([G30-1](../jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)):
+  ([G30-1](../../../known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)):
   a targeted `CRATONVM_DBG_COERCION=1`/`CRATONVM_DBG_LAYOUT=1` run of
   `FilterWithPaginationTest`, cross-referenced against
   `-Dhibernate.show_sql=true` timestamps around the failing query, found no
@@ -545,7 +554,7 @@ this section's traces was not committed.
 ## 5. 2026-08-21 — full rerun of the 18 non-passed classes on the idle Azure host, current dev tip
 
 All 18 classes named as non-passed in
-[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+[RESULTS-20260820-3gc-postgres-local.md](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
 rerun against `dev@77e712ec6` + this session's docs-only branch (same binary
 as section 4, `cratonvm-hibidle`), on the idle Azure host, default (ZGC)
 collector.
@@ -1137,7 +1146,7 @@ The whole 249-class `testlist.txt` on the fixed binary against **MySQL** in
 Docker (Testcontainers, one container per class), all three collectors, with a
 real-HotSpot control on the same database, list, argfile and shard count. Full
 write-up:
-[`RESULTS-20260822-3gc-mysql-local.md`](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
+[`RESULTS-20260822-3gc-mysql-local.md`](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
 
 204 runnable classes per arm (249 minus the 45 no-`@@RESULT` classes):
 
@@ -1394,3 +1403,80 @@ remaining search space:
 `techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md` (retired to
 docs/internal 2026-08-24: the wrong answer was the pre-bridge `invokedynamic`
 trap, and `CRATONVM_JIT_INDY_BRIDGE=0` puts it back on any current binary).
+
+---
+
+## 10. 2026-08-24 — the closing sweep: of the 61 non-passed classes, 14 of the 17 genuine failures are gone, and ZERO CratonVM correctness defects remain
+
+Every section above measures one class or one defect. This is the measurement
+none of them is: **the whole non-passed set, re-run on current `dev`, after all
+three fixes landed.** Until now the suite's recorded state predated the
+`nio_selector` fix (§1), the lambda-deopt fix (§8), and the `invokedynamic`
+trap fix that retired `TechEmpowerTest`, so "what is actually left" was an
+inference rather than a number.
+
+Local Windows box, live Postgres via Testcontainers, binary built from `dev`
+`35bc2d5a7`. Deliberately the **same** invocation the 2026-08-20 baseline used —
+`--category others --shards 6 --timeout 180`, JIT on, default (ZGC) collector —
+so the two are comparable line for line.
+
+| | 2026-08-20 (ZGC arm) | **2026-08-24** |
+|---|---|---|
+| PASS | — | **14** |
+| FAIL | 15 | **2** |
+| HANG | 1 | 1 |
+| CRASH | 1 | **0** |
+| NOTESTS | 44 | 44 |
+| wall | — | 4m02s |
+
+The 44 `NOTESTS` are structural — base/abstract classes in `testlist.txt` that
+declare no tests — and are identical in both runs. So the real population is
+**17 genuine failures, of which 14 now pass.**
+
+### 10.1 The three that remain, attributed per class
+
+**None of the three is an open CratonVM correctness defect.**
+
+| class | status | cause |
+|---|---|---|
+| `ORMReactivePersistenceTest` | FAIL | **this box** — `ServiceException` … `invalid value for parameter "TimeZone": "America/Buenos_Aires"` |
+| `it.quarkus.qe.database.DatabaseHibernateReactiveTest` | FAIL | **this box** — `nameIsNull` `AssertionError`, the `ru_RU` Bean Validation message |
+| `MultithreadedInsertionWithLazyConnectionTest` | HANG | known perf residual, and an artifact of the flat cap (below) |
+
+The first two are the pair
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+§1 established fail **identically under real HotSpot** on this host, and which
+pass on the Azure box because it is UTC/`en`. They are the host's timezone and
+display language, not the VM.
+
+The third is not news either: it is `HANG` here only because this run used the
+flat `--timeout 180` to stay comparable with the baseline. Given its real budget
+it is `1 of 2` methods, with `testIdentityGeneratorWithTransaction` over the
+fixture's own hardcoded 10-minute deadline — see
+[hib-reactive-multithreaded-insertion-lazy-connection-20260822.md](hib-reactive-multithreaded-insertion-lazy-connection-20260822.md),
+whose §8 also records that the `invokedynamic` fix does **not** retire it.
+
+### 10.2 A trap avoided while reading this result
+
+The first attempt to attribute the two FAILs grepped
+`shard-*/raw.log` for the timezone signature and found it for **both** classes —
+which would have mis-recorded `DatabaseHibernateReactiveTest` as a timezone
+failure. `raw.log` is **cumulative per shard**: it holds every class that shard
+ran, so a signature found in it belongs to *some* class in that shard, not
+necessarily the one being asked about. That is the same `$RAW`-scope hazard
+§7.4 documents in the runner's own `NO-DB` tagging, met from the reading side
+rather than the writing side.
+
+Attributing per class — locating each one's `@@TESTFAIL` line and reading only
+the lines that follow it — gives the correct and *different* answer above:
+`ORMReactivePersistenceTest` is the timezone, `DatabaseHibernateReactiveTest`
+is the locale. Both were already documented that way; the sloppy grep would have
+"confirmed" a wrong story that happened to agree with the tidier half of it.
+
+### 10.3 Status of this page
+
+The regressions this page was opened for are **closed**. Of the 17 genuine
+failures in the 2026-08-20 non-passed set, 14 pass on today's `dev`; the other
+three are two host-environment classes that fail under HotSpot too and one
+documented performance residual with its own page. No class in the
+hibernate-reactive suite is currently failing for a CratonVM correctness reason.
