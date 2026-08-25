@@ -25483,6 +25483,59 @@ fn stream_process_chain(
     result
 }
 
+/// How often the synthetic-stream drain loops re-publish this thread's GC root
+/// snapshot: every Nth element, not every element.
+///
+/// `NativeContext::refresh_root_snapshot`'s contract asks for a publish "right
+/// after establishing such a batch of pins (**and optionally again
+/// periodically** across a long per-element loop)". The up-front publish is the
+/// one that closes the documented gap — it is what makes this thread's
+/// `native_pin_roots` visible to a peer-initiated STW collection at all. The
+/// per-iteration one is the optional half, and it was running on EVERY element.
+///
+/// It is not free. Each call is a full deposit: the whole per-frame root
+/// snapshot is cleared and rebuilt, `scan_active_jit_frames` runs (including
+/// the A5 unregistered-frame probe, a raw word scan of the native stack above
+/// the scanner), and the SATB buffer is flushed. Measured on a
+/// `StackWalker.walk` over a 120-frame stack, 500 walks
+/// (`CRATONVM_DBG_ROOTPROF=1`):
+///
+/// ```text
+/// scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=86,700
+/// jitprobe calls=86,081 words=637,620,424
+/// ```
+///
+/// 638 MILLION words — 5.1 GB of native stack read — for 500 walks, at a
+/// constant ~7,400 words (59 KB) per call, with the call COUNT scaling linearly
+/// in stack depth because the stream has one element per frame. Neither the
+/// collector nor a safepoint asked for any of it: both other callers are zero.
+///
+/// The pins this refresh exists to publish are pushed ONCE, before the loop,
+/// and do not change across iterations — so every one of those deposits
+/// republished a bit-identical snapshot. Refreshing every Nth element keeps the
+/// periodic republish the contract asks for, with a bounded window, at 1/N the
+/// cost. `CRATONVM_GC_STREAM_REFRESH_EACH=1` restores the per-element cadence,
+/// so both arms are reachable from one binary.
+fn stream_refresh_interval() -> usize {
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STREAM_REFRESH_EACH").is_some() {
+            1
+        } else {
+            32
+        }
+    })
+}
+
+/// Should the drain loop re-publish before element `idx`?
+///
+/// `idx == 0` is never asked (the caller publishes up front, unconditionally).
+#[inline]
+fn stream_should_refresh(idx: usize) -> bool {
+    let every = stream_refresh_interval();
+    every <= 1 || idx % every == 0
+}
+
 fn stream_pull_internal(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -25546,7 +25599,10 @@ fn stream_pull_internal(
             if stream_limit_saturated(&chain, &state, 0) {
                 return Ok(PullStep::Continue);
             }
-            ctx.refresh_root_snapshot();
+            // Periodic, not per-element — see `stream_refresh_interval`.
+            if stream_should_refresh(idx) {
+                ctx.refresh_root_snapshot();
+            }
             let v = read_pinned_elem(ctx, base_pins[idx], v);
             let mut emit_stopped = false;
             let step = {
@@ -28446,7 +28502,10 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.refresh_root_snapshot();
     let mut result = Ok(None);
     for (i, &elem) in elements.iter().enumerate() {
-        ctx.refresh_root_snapshot();
+        // Periodic, not per-element — see `stream_refresh_interval`.
+        if stream_should_refresh(i) {
+            ctx.refresh_root_snapshot();
+        }
         let c = ctx.read_native_pin(con_pin, consumer);
         let e = read_pinned_elem(ctx, elem_handles[i], elem);
         if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {
@@ -45101,8 +45160,89 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 /// `containsAll` and `AbstractSet.hashCode`. All read a collection passed as an
 /// ARGUMENT, never the receiver of an element-reading native, which is why
 /// driving the argument's own `toArray()` from here cannot re-enter.
+/// How many times [`collect_collection_elements_or_real`] found its receiver had
+/// MOVED across one of its own Java re-entries, and the trace that names them.
+///
+/// The counter is the engagement evidence for the pinning below. Without it the
+/// fix is only "the symptom went away", which a timing-dependent defect can fake
+/// on any given run — see [`coll_refresh`]'s call sites.
+static COLL_REFRESH_MOVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn dbg_coll_refresh() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COLL_REFRESH").is_some())
+}
+
+/// Re-read a pinned receiver after a GC point, counting the moves.
+#[inline]
+fn coll_refresh(
+    ctx: &mut dyn NativeContext,
+    pin: usize,
+    stale: ObjectRef,
+    site: &'static str,
+) -> ObjectRef {
+    let cur = ctx.read_native_pin(pin, stale);
+    if !std::ptr::eq(cur.as_ptr(), stale.as_ptr()) {
+        COLL_REFRESH_MOVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_coll_refresh() {
+            eprintln!(
+                "[COLL-REFRESH] {site}: 0x{:x} -> 0x{:x} (total {})",
+                stale.as_ptr() as usize,
+                cur.as_ptr() as usize,
+                COLL_REFRESH_MOVED.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+    cur
+}
+
+/// How many receiver moves this helper has absorbed. Zero on a run means the
+/// pinning was never load-bearing THERE, not that it is unnecessary.
+pub fn collection_refresh_moved_count() -> usize {
+    COLL_REFRESH_MOVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY (Family 1 — the stale-`ObjectRef` shape this file has paid for
+    // repeatedly). Every call below re-enters Java and is therefore a GC point,
+    // and `coll` arrives as a bare Rust local that nothing roots. A collector
+    // that evacuates `coll`'s region between two of them leaves the next one
+    // dispatching against an address that no longer holds the object.
+    //
+    // MEASURED on `org.h2.test.store.TestRandomMapOps`, `-XX:+UseG1GC --Xmx 1g`:
+    // the `size()` below returned, G1 evacuated and RECYCLED the region `coll`
+    // lived in, and the `toArray()` on the next line dispatched against that
+    // region's base address. An all-zero header reads as `ClassId(0)`, which IS
+    // `java.lang.Object` — the first class this VM loads — so the failure
+    // surfaced as
+    //   `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'`
+    // from `new ArrayList<>(map.keySet())`, naming a class that was never
+    // involved. Three controls place it: it reproduces under `--nojit` (so it is
+    // NOT a lost JIT root, which is where the "wrong class" reading sends you),
+    // `--Xmx 8g` does not reach it (so it needs a collection), and ZGC and
+    // generational do not reach it either (so it needs an EVACUATING one).
+    //
+    // `report_reclaimed_receiver` stayed silent the whole time, and that is not
+    // a contradiction: it asks the FREE LIST, and a whole evacuated G1 region is
+    // not a free-list block. A quiet reclaim guard is not a clean one.
+    let coll_pin = ctx.pin_native_root(coll);
+    let r = collect_collection_elements_or_real_pinned(ctx, coll, coll_pin);
+    ctx.unpin_native_roots(coll_pin);
+    r
+}
+
+/// [`collect_collection_elements_or_real`]'s body, with the receiver already
+/// pinned so every return path unwinds through one `unpin` in the caller —
+/// strictly LIFO, the discipline `collection_elements_generic` documents.
+fn collect_collection_elements_or_real_pinned(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    coll_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let elems = collect_collection_elements(ctx, coll)?;
+    let coll = coll_refresh(ctx, coll_pin, coll, "after collect_collection_elements");
     if !elems.is_empty() {
         if heuristic_snapshot_is_suspect(ctx, coll, &elems) {
             // A plausible-looking but null-holed snapshot of a foreign
@@ -45133,6 +45273,9 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
     if real_size <= 0 {
         return Ok(elems);
     }
+    // THE line this function's doc block is about: `size()` above is a GC point,
+    // so the `coll` this `toArray()` dispatches on has to be re-read.
+    let coll = coll_refresh(ctx, coll_pin, coll, "between size() and toArray()");
     let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
         Err(e) => return Err(e),
@@ -45147,7 +45290,26 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
 }
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
+///
+/// GC-SAFETY: same obligation as [`collect_collection_elements_or_real`], and
+/// for the same reason — four of the branches below drive the receiver's own
+/// Java (`size()` then `get(i)`, `getNameCount()` then `getName(i)`, `size()`
+/// then `toArray()`), and each of those calls is a GC point that can evacuate
+/// the receiver out from under the next one. `coll` is pinned here so those
+/// branches can re-read it; the branches that only read fields need nothing,
+/// because a field read is not a GC point.
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
+    let coll_pin = ctx.pin_native_root(coll);
+    let r = collect_collection_elements_pinned(ctx, coll, coll_pin);
+    ctx.unpin_native_roots(coll_pin);
+    r
+}
+
+fn collect_collection_elements_pinned(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    coll_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
     // wrap their backing collection in field `c`.  Recurse into that to
     // surface the wrapped list's elements — without this, callers like
@@ -45330,6 +45492,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(size);
             for i in 0..size {
+                let coll = coll_refresh(ctx, coll_pin, coll, "BlockingArrayQueue.get");
                 match ctx.invoke_virtual(
                     coll,
                     "get",
@@ -45434,6 +45597,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if size <= 0 {
                 return Ok(Vec::new());
             }
+            let coll = coll_refresh(ctx, coll_pin, coll, "hibernate size()->toArray()");
             if let Ok(Some(Value::Object(Some(arr)))) =
                 ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])
             {
@@ -45470,6 +45634,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
+                let coll = coll_refresh(ctx, coll_pin, coll, "Path.getName");
                 if let Ok(Some(v)) =
                     ctx.invoke_virtual(coll, "getName", "(I)Ljava/nio/file/Path;", &[Value::Int(i)])
                 {
@@ -45496,6 +45661,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(size as usize);
             for i in 0..size {
+                let coll = coll_refresh(ctx, coll_pin, coll, "AbstractList.get");
                 match ctx.invoke_virtual(coll, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
                     Ok(Some(v)) => out.push(v),
                     _ => break,

@@ -152,6 +152,92 @@ than as a negative result.
 
 ---
 
+---
+
+# 2. 2026-08-24 — §0.5's "fix regardless" is now done for the last three readers, and §0.3's mechanism was independently confirmed elsewhere
+
+Two things happened to this page's analysis without this page being told.
+
+## 2.1 The mechanism was confirmed, with the same arithmetic, from a different crash
+
+`gc/src/heap.rs`'s `read_value_cell_checked` carries a doc comment describing
+**exactly** §0.3's mechanism, derived independently from a Spring Boot crash
+(`JsonMarshallerTests`) rather than from these eight `hs_err` files:
+
+> ZGC and G1 transmuted it and handed the result to a `match`, whose jump-table
+> load is `[table + disc*4]` with no bounds check because Rust guarantees an
+> in-range discriminant — so the low word of a heap pointer became the index.
+
+and it names the same register arithmetic this page decoded — table in `r10`,
+bogus discriminant in `rax`, faulting address `r10 + rax*4`. Two crashes, two
+suites, two investigations, one mechanism. §0.3 is not a lone reading of eight
+files any more.
+
+It also supplies the piece §0.4 could only infer. The reason the pattern is
+**always G1 or ZGC, never Generational** is not a `Value` read those two
+collectors uniquely perform — it is that `gen_heap::read_slot` had *screened the
+discriminant since HIB-CV-32* while the other legacy-cell readers had not.
+Generational was not avoiding the corrupt cell; it was **surviving** it, returning
+null and logging, while G1 and ZGC transmuted and jumped. The collector
+correlation is a property of the *reader*, not of the collector's barriers.
+
+## 2.2 The producer is still open, and the guard does not touch it
+
+Worth stating plainly, because it is easy to misread the above as a fix:
+screening the read does **not** repair whatever writes two heap pointers into a
+16-byte cell. That producer — a live object reclaimed and its storage re-served —
+is a separate, still-open defect, present under Generational too, "where this
+guard is the only reason its green looks clean". This page stays OPEN for that
+reason. What changed is that the same corrupt cell is no longer a localizable
+diagnostic on one collector and an unrecoverable crash on the others.
+
+## 2.3 The three readers §0.5 item 3 had not reached
+
+`heap::read_slot`, `g1::get_field` and `zgc::get_field` were moved onto the
+checked reader. Three legacy-cell readers were not, and all three are on
+**G1/ZGC-only marking paths** — the exact collectors in this page's title:
+
+| site | path |
+|---|---|
+| `gc/src/concurrent_mark.rs` `scan_object` | concurrent marker's 16-byte `Value` slot loop |
+| `gc/src/g1.rs` `for_each_object_reference` | legacy-object reference walk |
+| `gc/src/g1.rs` `concurrent_mark_step` | G1 concurrent mark |
+
+Each called `cratonvm_types::read_value_atomic`, which loads two words and
+`transmute`s them into a `Value` with **no discriminant check** — the unchecked
+half of the pair whose checked half (`read_value_checked` / `read_value_atomic`'s
+screened sibling) already existed and is what §0.5 item 3 asks for. All three now
+call `heap::read_value_cell_checked`, so a corrupt cell decodes to
+`Value::Object(None)`, is skipped by the `if let` that follows, and is counted by
+the cell census instead of becoming a `Value` that is UB the instant it exists.
+
+`cargo test -p cratonvm-gc --release`: **1687 passed, 0 failed.**
+
+**What this is NOT.** All three sites match with a single-variant
+`if let Value::Object(Some(..))`, which lowers to a discriminant compare rather
+than the seven-entry jump table §0.2 decoded (targets grouped 0/1/3, 2/5, 4/6).
+So **none of them is likely the faulting instruction in these eight files**, and
+this change should not be recorded as having found it. What it removes is real
+but different: the UB of constructing an invalid `Value`, and the marker's
+ability to push a garbage pointer onto the mark queue that a later `scan_object`
+dereferences as an `ObjectHeader` — a memory-safety hole `concurrent_mark.rs`'s
+own comment already worried about for the *tearing* case while leaving the
+*invalid-tag* case open.
+
+## 2.4 What is left for whoever reopens this
+
+1. The producer (§2.2) — the stale-receiver defect that puts two heap pointers
+   in a `Value` cell. That is the actual bug; everything above is containment.
+2. If a crash with this signature recurs, it should now be *rarer and
+   better-labelled*: the census counts corrupt cells and the guard records the
+   slot address and both raw words. §0.5 item 1 still stands and is still the
+   single most valuable thing to do — **keep the binary next to the `hs_err`**.
+3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
+   slot count?) is NOT answered by this section. The `num_slots` bound in
+   `concurrent_mark.rs` is still only a `min(1 << 24)` plausibility clamp, not a
+   real extent check, and `0x5B == 91` from the register dump remains
+   unexplained.
+
 # 1. The 2026-08-21 not-reproducible investigation, preserved
 
 Its negative results all stand. Its VERDICT ("the trigger is environmental")

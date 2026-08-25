@@ -454,7 +454,11 @@ impl OffloadCache {
 /// A failure to write is reported once at `warn` and otherwise ignored:
 /// a diagnostic knob must never take down a run.
 fn dump_ptx_if_requested(class_name: &str, method_name: &str, ptx_text: &str) {
-    let Ok(dir) = std::env::var("CRATONVM_GPU_DUMP_PTX") else {
+    // Through the config boundary, not `std::env` directly: this IS a declared
+    // flag (`CRATONVM_DBG=gpu-dump-ptx`), so it must be served by the immutable
+    // snapshot like every other one. A raw read also made the grouped spelling
+    // silently do nothing here.
+    let Ok(dir) = cratonvm_types::flags::runtime_var("CRATONVM_GPU_DUMP_PTX") else {
         return;
     };
     if dir.is_empty() {

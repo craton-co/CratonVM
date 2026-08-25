@@ -8,6 +8,18 @@ this defect; they moved to their own page,
 `known-issues/netty/parameterizedsslhandlertest-residual-stalls-20260824.md`.
 This page is the record of the one that is closed.
 
+**One of those two is now closed, and the other has a cause (2026-08-24,
+later the same day).** The `Int(0)` one was never a second stall: the dump was
+mis-reading a never-written reference cell, and read correctly it reports the
+same `null(PENDING)` as the other. The remaining one REPRODUCES on this `dev`,
+at 1 whole-class run in 163 against a HotSpot control of 0 in 40, and it is
+not a monitor, promise or selector defect at all — the server's handshake dies
+on `NoSuchMethodError 'void java.lang.Object.checkClientTrusted(…)'`, so no TLS
+alert is produced and the thing that would complete the promise never runs.
+`java.lang.Object` as the receiver class is this tree's `ClassId(0)`
+stale-receiver signature at INVOKE. The residual page carries the whole
+account.
+
 `Object.wait()` depended on the CONDVAR ALONE — it parked on
 `wait_condvar` and treated a signalled return as the notification, with no
 condition under the mutex to re-check. A `notifyAll()` that is delivered while

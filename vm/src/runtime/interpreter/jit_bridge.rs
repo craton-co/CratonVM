@@ -1288,6 +1288,48 @@ pub(super) fn compile_osr_artifact(
                             continue;
                         }
                     }
+                    // `VarHandle` write modes on an instance field — parity
+                    // with `jit::try_compile`'s recognition (see
+                    // `cratonvm_jit::VARHANDLE_WRITE_DIRECT_FNS`).
+                    //
+                    // THIS door is the load-bearing one, for the same reason
+                    // the read bind above says it is, and the write bind
+                    // learned it the expensive way: bound in the single-pass
+                    // ladder ALONE, a native census of `HibfixVarHandleProbe`
+                    // still counted 698 000 `VarHandle.set` dispatches with the
+                    // bind on and 698 000 with it off — identical, because the
+                    // probe's stores are in a `main` loop and a loop body is
+                    // what OSR compiles. The site counter said "bound"; the
+                    // census said "moved nothing".
+                    //
+                    // Asks the policy question for the same reason: `set` is
+                    // registered `NativeKind::Bridge`, which JDK-ONLY-WAVE2
+                    // §1.4 does not permit a compile-time bake of.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_write_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_write_helper_slot(&mn, &desc) {
+                            // Address taken directly rather than out of the
+                            // jit-crate cell — this path can run before
+                            // `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_write_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_WRITE_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 2,
+                                    return_type: b'V',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
                     // helper verifies the receiver's EXACT class and routes
@@ -3950,7 +3992,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // deploy interpreted — the method was rejected here *before* it was ever
     // counted, which is why `jit-method-stats` reported it neither compiled nor
     // `hot_but_stuck_in_interpreter`. See
-    // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
     //
     // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
     if cached.is_synchronized && !jit_sync_methods_enabled() {

@@ -1,9 +1,34 @@
 # Hibernate and Hibernate Reactive — fails/hangs that are not CratonVM defects
 
-**Status:** consolidates the two suites' known-non-bug residuals as of `dev@090416c56`
-(2026-08-17). One entry is a genuine but open CratonVM performance characteristic
-(not a correctness defect); the rest are host/environment artifacts that
-reproduce identically under real HotSpot.
+**Status:** consolidates the two suites' known-non-bug residuals. **Re-verified
+2026-08-24 on `dev@35bc2d5a7`** — every claim below was re-measured, not
+carried forward. One entry is a genuine but open CratonVM performance
+characteristic (not a correctness defect); the rest are host/environment
+artifacts that reproduce identically under real HotSpot.
+
+> ### What changed since the 2026-08-17 version
+>
+> The Hibernate Reactive half of this page was written when the residual was
+> **seven** classes. It is now **three**, and the reasons the other four left are
+> all recorded elsewhere:
+>
+> * `MultithreadedInsertionTest`, `MultithreadedIdentityGenerationTest` and
+>   `it.LocalContextTest` no longer fail — the 61-class non-passed set was
+>   re-run in full on 2026-08-24 and 14 of its 17 genuine failures now pass
+>   (`internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`
+>   §10). Three fixes account for that: the `nio_selector` `SelectorImpl` field
+>   corruption, the JIT lambda direct-call arm dropping a deoptimized frame, and
+>   the `invokedynamic` trap.
+> * `techempower.TechEmpowerTest` is **fixed**, and its old entry here was
+>   wrong in kind: it was never a volume/timeout class. It returned a wrong
+>   answer under the pre-bridge `invokedynamic` trap and passed with `--jit off`
+>   in ~72 s, well inside its own budget. See
+>   `internal/fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`.
+>
+> **The "five are one open lambda-dispatch performance defect" framing in
+> `residual-seven-after-the-afc-fix-20260817.md` should not be cited.** That
+> page's own §5 records the prediction being A/B'd and failing to convert, and
+> what actually closed four of the five was correctness work, not dispatch cost.
 
 ## Hibernate ORM
 
@@ -15,6 +40,21 @@ day. Full detail in
 | Class | CratonVM | Real HotSpot | Verdict |
 |---|---|---|---|
 | `hql.HqlParserMemoryUsageTest` | FAIL: found=1 ok=0 failed=1, ms=41932 | PASS: found=1 ok=1 failed=0, ms=5433 | **Open, attributed CratonVM perf characteristic** — not a correctness bug |
+
+**Re-measured 2026-08-24** on `dev@35bc2d5a7`, local Windows box, same
+`common.args`, both VMs back to back — it still reproduces and is still
+CratonVM-specific:
+
+| | result | wall |
+|---|---|---|
+| CratonVM | **FAIL** `found=1 ok=0 failed=1` | 37.1 s |
+| real HotSpot (JDK 25) | PASS `found=1 ok=1 failed=0` | 6.7 s |
+
+Same shape as the 2026-08-17 figures (41.9 s / 5.4 s), so nothing about it has
+drifted. This remains the one entry on this page that is a real CratonVM
+characteristic rather than a host artifact, and it stays open —
+[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead-20260817.md)
+is the detail.
 | `annotations.uniqueconstraint.UniqueConstraintBatchingTest` | PASS | PASS | No longer reproduces |
 | `query.hql.FunctionTests` | PASS (124/118/6skip) | PASS (124/118/6skip) | No longer reproduces |
 | `query.hql.StandardFunctionTests` | PASS (44/44) | PASS (44/44) | No longer reproduces |
@@ -54,36 +94,57 @@ wrong answer.
 
 ### Two are the host, not the VM — fail identically under real HotSpot
 
+**Both re-confirmed 2026-08-24** in the closing sweep, where they are now the
+only two FAILs left in the entire 61-class non-passed set. Worth recording *how*
+they were attributed, because the obvious method gets it wrong: the runner's
+`shard-N/raw.log` is **cumulative for every class that shard ran**, so grepping
+it for the timezone signature matches both classes and would misfile
+`DatabaseHibernateReactiveTest` as a timezone failure. Attributed per class —
+reading only the lines following each one's own `@@TESTFAIL` — they are
+distinct, and match the table below: `ORMReactivePersistenceTest` fails with
+`ServiceException … invalid value for parameter "TimeZone"`, while
+`DatabaseHibernateReactiveTest` fails with an `AssertionError` in `nameIsNull`.
+
 | Class | Cause |
 |---|---|
 | `ORMReactivePersistenceTest` | Windows host's `America/Buenos_Aires` time zone ID is the pre-2009 spelling; the `postgres:18.4` container's tzdata (no `backward` file) rejects it in the JDBC driver's startup packet. Verified identical under HotSpot and CratonVM (`../../../probes/DefaultLocaleTimeZoneProbe.java`), and both classes pass on the Azure host, which is UTC/`en`. |
 | `it.quarkus.qe.database.DatabaseHibernateReactiveTest` | Windows host's `ru_RU` display language makes hibernate-validator resolve the Russian Bean Validation message instead of the English one the test asserts. Identical under HotSpot. |
 
-### Five are one open CratonVM performance defect, not a correctness bug
+### One is an open CratonVM performance residual — the other four are FIXED
 
-`MultithreadedInsertionTest`, `MultithreadedIdentityGenerationTest`,
-`MultithreadedInsertionWithLazyConnectionTest`, `it.LocalContextTest`,
-`techempower.TechEmpowerTest` — all volume-driven (thousands of inserts or
-HTTP round trips), all correct when given enough time (raising only the
-timeout, two pass outright at 11.9x and 21.2x HotSpot's wall time; the other
-three get much further than the suite lets them before hitting the fixture's
-own hardcoded Vert.x deadline, which no runner flag can reach).
+**Rewritten 2026-08-24.** This section used to read "five are one open CratonVM
+performance defect". Four of the five no longer fail, and the framing was wrong
+about the fifth's neighbours, so it is replaced rather than amended.
 
-Root cause, measured and reproduced on both Windows and Azure Linux: invoking
-a lambda/functional-interface method costs CratonVM ~1.7–2.1 µs — 8–10x
-HotSpot's *interpreter*, while a plain static call on CratonVM is 2–4x
-*faster* than HotSpot's interpreter (own control probe,
-`../../../probes/CompositionPrimitivesProbe.java`). HotSpot's interpreter puts a lambda
-call at ~11–13x a static call; CratonVM puts it at ~200–300x. hibernate-reactive's
-`CompletableFuture`/`AsyncTrampoline`/Vert.x `Handler` pipeline is built almost
-entirely out of functional-interface invocations, which is why exactly these
-five classes (and no others) are left. A `perf record` profile is flat — no
-single hot body, ~11% in lambda-dispatch-named frames — consistent with a
-structural per-call cost (an `RwLock` read plus a `HashMap` lookup on the
-process-global `classes.lambda_proxies` map, up to twice per invocation) rather
-than one fixable hot spot. This page deliberately stops at the measurement and
-does not prescribe a fix; any candidate must be A/B'd on
-`MultithreadedInsertionTest`'s wall clock, not the microbenchmark.
+| class | status 2026-08-24 |
+|---|---|
+| `MultithreadedInsertionTest` | **passes** |
+| `MultithreadedIdentityGenerationTest` | **passes** |
+| `it.LocalContextTest` | **passes** |
+| `techempower.TechEmpowerTest` | **fixed** — and never a timeout class; it returned a WRONG ANSWER under the pre-bridge `invokedynamic` trap |
+| `MultithreadedInsertionWithLazyConnectionTest` | **still open** — 1 of 2 methods |
+
+The three that now pass were closed by correctness fixes, not by dispatch cost
+going away: the `nio_selector` `SelectorImpl` field corruption and the JIT
+lambda direct-call arm dropping a deoptimized frame. The closing sweep that
+establishes this re-ran all 61 non-passed classes on current `dev`
+(`internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`
+§10).
+
+**The remaining one is genuinely a dispatch-cost residual**, and it is bounded
+by the fixture's own hardcoded `@Timeout(10, MINUTES)` that no runner flag or
+system property can reach — `testIdentityGenerator` passes,
+`testIdentityGeneratorWithTransaction` does not. Checked on 2026-08-24 whether
+the `invokedynamic` fix that retired TechEmpower also closes this: **it does
+not**. Detail, including six dead hypotheses and a separate silent-insert-loss
+finding, is in
+[hib-reactive-multithreaded-insertion-lazy-connection-20260822.md](hib-reactive-multithreaded-insertion-lazy-connection-20260822.md).
+
+The lambda-dispatch measurements the old text quoted (~1.7–2.1 µs per
+functional-interface call, ~200–300x a static call) are still accurate as
+measurements. What is retired is the claim that they *explain these classes* —
+`residual-seven-after-the-afc-fix-20260817.md` §5 records that prediction being
+A/B'd and failing to convert.
 
 ## Azure host note
 
