@@ -178,7 +178,7 @@ pub(crate) fn resolve_field_ref(
 ///
 /// That reproduces the Azure figures the lever was accepted on
 /// (1.9-2.7x per pass, and 12.7% off the real Tomcat annotation scan; see
-/// known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md),
+/// known-issues/perf/interpreted-invoke-cost-350ns-20260825.md),
 /// which is why the default moved rather than the measurement being retaken.
 ///
 /// The correctness argument is unchanged and lives in `site_cache`'s module

@@ -420,7 +420,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_phase51_natives", 44),
     ("register_phase52_natives", 35),
     ("register_phase53_natives", 45),
-    ("register_phase54_natives", 100),
+    ("register_phase54_natives", 111),
     ("register_phase55_natives", 33),
     ("register_phase56_natives", 40),
     ("register_phase57_natives", 27),
@@ -658,6 +658,21 @@ const SYNTHETIC_ONLY_CLOSURE: &[&str] = &[
     "register_pd_stream_gatherers",
     "register_pd_structured_concurrency",
     "register_pe2_string_marshaling",
+    // Added 2026-08-24. A helper `register_pe2_string_marshaling` extracted
+    // on 2026-08-22 so the same nine triples could be registered on BOTH
+    // spellings of the segment class:
+    //
+    //     for ms in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+    //         register_pe2_string_marshaling_on(r, ms);
+    //     }
+    //
+    // It is synthetic-only by INHERITANCE, not by a lost shipping call site:
+    // its only caller is the line above, that caller is already pinned here,
+    // and the chain to the root is register_synthetic_overrides ->
+    // register_pe_panama -> register_pe2_string_marshaling -> this. No
+    // DELIBERATE_SYNTHETIC_ONLY_FAMILIES row: that list is for DIRECT
+    // children of register_synthetic_overrides, and this is a grandchild.
+    "register_pe2_string_marshaling_on",
     "register_pe2_struct_layouts",
     "register_pe_arena",
     "register_pe_function_descriptor",

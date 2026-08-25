@@ -375,6 +375,10 @@ pub(crate) fn vh_meta_put(ctx: &mut dyn NativeContext, vh: ObjectRef, meta: VarH
     let key = ctx.identity_hash_code(vh);
     let mut t = vh_meta_table().lock();
     t.insert(key, Arc::new(meta));
+    drop(t);
+    // After the insert, so no reader can memoise the pre-insert answer against
+    // the post-insert generation.
+    vh_meta_bump_generation();
 }
 
 pub(crate) fn vh_meta_get(
@@ -382,9 +386,26 @@ pub(crate) fn vh_meta_get(
     vh: ObjectRef,
 ) -> Option<Arc<VarHandleMeta>> {
     let key = ctx.identity_hash_code(vh);
-    let t = vh_meta_table().lock();
-    // Refcount bump only — no per-field String clone.
-    t.get(&key).cloned()
+    let generation = VH_META_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let slot = (key as usize) & (VH_PLAN_MEMO_SLOTS - 1);
+    let hit = VH_META_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let line = &memo[slot];
+        (line.key == key && line.generation == generation).then(|| line.meta.clone())
+    });
+    if let Some(meta) = hit {
+        return meta;
+    }
+    let meta = {
+        let t = vh_meta_table().lock();
+        // Refcount bump only — no per-field String clone.
+        t.get(&key).cloned()
+    };
+    VH_META_MEMO.with(|memo| {
+        memo.borrow_mut()[slot] =
+            VhMetaMemoLine { key, generation, meta: meta.clone() };
+    });
+    meta
 }
 
 /// What a `VarHandle` access mode reduces to when the handle names an
@@ -418,7 +439,9 @@ pub struct VarHandleInstanceFieldPlan {
 /// or byte-array/ByteBuffer-view handle (all distinct `kind`s), a handle
 /// whose field slot has not been resolved yet, and a `SegmentVarHandle`
 /// (a real JDK class, never in this table at all).
-pub fn varhandle_instance_field_plan(identity_hash: i32) -> Option<VarHandleInstanceFieldPlan> {
+fn varhandle_instance_field_plan_uncached(
+    identity_hash: i32,
+) -> Option<VarHandleInstanceFieldPlan> {
     let table = vh_meta_table().lock();
     let meta = table.get(&identity_hash)?;
     if meta.kind != VH_KIND_INSTANCE || meta.field_index < 0 {
@@ -436,6 +459,121 @@ pub fn varhandle_instance_field_plan(identity_hash: i32) -> Option<VarHandleInst
     })
 }
 
+/// Bumped whenever [`vh_meta_table`]'s contents change, so a reader that
+/// cached a lookup can tell in one relaxed load whether its answer still
+/// stands.
+///
+/// Every mutation site bumps it: `vh_meta_put` (a new handle) and
+/// `vh_meta_update_field_index` (a handle whose field slot has just been
+/// resolved, which turns a `None` plan into a `Some`). Those are the only two,
+/// and a stale NEGATIVE answer is exactly as dangerous as a stale positive one
+/// — the resolve-on-first-use path depends on the second call seeing the newly
+/// resolved slot.
+static VH_META_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish that [`vh_meta_table`] has changed.
+fn vh_meta_bump_generation() {
+    VH_META_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// One direct-mapped thread-local memo line for [`vh_meta_get`].
+#[derive(Clone)]
+struct VhMetaMemoLine {
+    key: i32,
+    generation: u64,
+    meta: Option<Arc<VarHandleMeta>>,
+}
+
+thread_local! {
+    /// Per-thread memo of [`vh_meta_get`], guarded by [`VH_META_GENERATION`].
+    ///
+    /// The plan memo beside this one took the global lock off the JIT's fast
+    /// paths, and the scaling probe went from 0.07x to 0.68x at 24 threads. It
+    /// did NOTHING for `CompletableFuture` composition, because composition is
+    /// CAS-dominated, CAS has no direct bind, and the GENERIC native reaches
+    /// the table through `vh_meta_get` — which was still taking the mutex on
+    /// every operation. Memoising only the fast paths leaves the funnel
+    /// convoying exactly as before.
+    ///
+    /// Holding the `Arc` here keeps the meta alive per thread, which costs
+    /// nothing real: every `VarHandle` is already a permanent GC root
+    /// (`vh_meta_put` registers one) and the table holds the same `Arc`.
+    static VH_META_MEMO: std::cell::RefCell<Vec<VhMetaMemoLine>> =
+        std::cell::RefCell::new(vec![
+            VhMetaMemoLine { key: 0, generation: u64::MAX, meta: None };
+            VH_PLAN_MEMO_SLOTS
+        ]);
+}
+
+/// One direct-mapped thread-local memo line.
+#[derive(Clone, Copy)]
+struct VhPlanMemoLine {
+    key: i32,
+    generation: u64,
+    plan: Option<VarHandleInstanceFieldPlan>,
+}
+
+/// Slots in the per-thread memo. A power of two so the index is a mask, and
+/// small enough to stay in L1 — a thread touches a handful of distinct handles
+/// in practice (`CompletableFuture` uses three).
+const VH_PLAN_MEMO_SLOTS: usize = 64;
+
+thread_local! {
+    /// Per-thread memo of [`varhandle_instance_field_plan`].
+    ///
+    /// **Why per-thread and not a better shared map.** `vh_meta_table` is ONE
+    /// process-global `parking_lot::Mutex`, and every `VarHandle` operation
+    /// took it — the JIT read fast path, the write fast path and the generic
+    /// funnel alike. Measured with `HibfixVarHandleScale`, whose threads each
+    /// own their own object and their own field so there is no contention on
+    /// the DATA:
+    ///
+    /// ```text
+    ///  1 thread   8 780 723 ops/s   1.00x
+    ///  8 threads  1 343 026 ops/s   0.15x
+    /// 16 threads    790 919 ops/s   0.09x
+    /// ```
+    ///
+    /// Throughput went DOWN with threads — 11x slower at 16 than at 1. That is
+    /// lock convoying, and no amount of making the critical section cheaper
+    /// fixes it; the shared cache line has to leave the steady-state path.
+    /// A `RwLock` would not do it either: a reader still does an atomic RMW on
+    /// one word, which is the thing that convoys.
+    ///
+    /// The generation check IS a shared read, but a relaxed LOAD of a word
+    /// nothing is writing stays in every core's cache and scales.
+    static VH_PLAN_MEMO: std::cell::RefCell<[VhPlanMemoLine; VH_PLAN_MEMO_SLOTS]> =
+        std::cell::RefCell::new(
+            [VhPlanMemoLine { key: 0, generation: u64::MAX, plan: None }; VH_PLAN_MEMO_SLOTS],
+        );
+}
+
+/// Look a [`VarHandleInstanceFieldPlan`] up by the VarHandle's GC-stable
+/// identity hash, without taking the global table lock in the steady state.
+///
+/// Same answer as [`varhandle_instance_field_plan_uncached`] always: the memo
+/// is discarded whenever [`VH_META_GENERATION`] moves, which every mutation of
+/// the table does. A `None` is memoised too — the read path asks about handles
+/// that are not resolved instance fields on every call, and those are exactly
+/// the ones that would otherwise take the lock forever.
+pub fn varhandle_instance_field_plan(identity_hash: i32) -> Option<VarHandleInstanceFieldPlan> {
+    let generation = VH_META_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let slot = (identity_hash as usize) & (VH_PLAN_MEMO_SLOTS - 1);
+    let hit = VH_PLAN_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let line = memo[slot];
+        (line.key == identity_hash && line.generation == generation).then_some(line.plan)
+    });
+    if let Some(plan) = hit {
+        return plan;
+    }
+    let plan = varhandle_instance_field_plan_uncached(identity_hash);
+    VH_PLAN_MEMO.with(|memo| {
+        memo.borrow_mut()[slot] = VhPlanMemoLine { key: identity_hash, generation, plan };
+    });
+    plan
+}
+
 pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: ObjectRef, idx: i32) {
     let key = ctx.identity_hash_code(vh);
     let mut t = vh_meta_table().lock();
@@ -447,6 +585,11 @@ pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: Object
     let mut updated = (**existing).clone();
     updated.field_index = idx;
     t.insert(key, Arc::new(updated));
+    drop(t);
+    // This is the resolve-on-first-use transition: the plan for `key` was
+    // `None` a moment ago and is `Some` now, so every memoised negative for it
+    // has to be discarded.
+    vh_meta_bump_generation();
 }
 
 // ---------------------------------------------------------------------------
@@ -16811,5 +16954,81 @@ mod tests {
             ),
             "cannot explicitly cast MethodHandle(int)void to ()void"
         );
+    }
+}
+
+#[cfg(test)]
+mod vh_plan_memo_tests {
+    use super::*;
+
+    /// A memoised NEGATIVE must not survive the resolve-on-first-use
+    /// transition. This is the dangerous direction: `varhandle_instance_field_plan`
+    /// answers `None` for a handle whose field slot is not resolved yet, the
+    /// funnel then resolves it via `vh_meta_update_field_index`, and the SECOND
+    /// call has to see the newly resolved slot. A memo that outlived that
+    /// transition would keep every such handle on the slow path forever — and
+    /// silently, because the answer would still be a legal `None`.
+    #[test]
+    fn a_generation_bump_discards_a_memoised_negative() {
+        let key = 0x5EED_1234u32 as i32;
+        // Nothing under this key yet: `None`, and now memoised as `None`.
+        assert_eq!(varhandle_instance_field_plan(key), None);
+        {
+            let mut t = vh_meta_table().lock();
+            t.insert(
+                key,
+                Arc::new(VarHandleMeta {
+                    kind: VH_KIND_INSTANCE,
+                    class_name: String::new(),
+                    field_name: String::new(),
+                    field_desc: "I".to_string(),
+                    field_index: 7,
+                    class_id: 0,
+                }),
+            );
+        }
+        // Deliberately NOT asserting that the memo is stale here. That would be
+        // asserting the cache caches, which is not a correctness property, and
+        // it is racy besides: the generation counter is global, so any sibling
+        // test bumping it makes the "stale" step spuriously fail. The property
+        // that matters is the one below — a memoised NEGATIVE becomes visible
+        // once the table publishes the change.
+        vh_meta_bump_generation();
+        let plan = varhandle_instance_field_plan(key).expect("visible after the bump");
+        assert_eq!(plan.field_index, 7);
+        assert_eq!(plan.value_desc, b'I');
+        // Clean up so a later test in this process is not affected.
+        vh_meta_table().lock().remove(&key);
+        vh_meta_bump_generation();
+    }
+
+    /// A repeated lookup returns the same answer the uncached path would, which
+    /// is the whole contract — the memo is an optimisation, never a different
+    /// answer.
+    #[test]
+    fn the_memo_agrees_with_the_uncached_lookup() {
+        let key = 0x0BAD_5A1Du32 as i32;
+        vh_meta_table().lock().insert(
+            key,
+            Arc::new(VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: String::new(),
+                field_name: String::new(),
+                field_desc: "Ljava/lang/String;".to_string(),
+                field_index: 3,
+                class_id: 0,
+            }),
+        );
+        vh_meta_bump_generation();
+        for _ in 0..4 {
+            assert_eq!(
+                varhandle_instance_field_plan(key),
+                varhandle_instance_field_plan_uncached(key)
+            );
+        }
+        // A reference field collapses to `L`, as `varhandle_instance_field_plan_uncached` does.
+        assert_eq!(varhandle_instance_field_plan(key).unwrap().value_desc, b'L');
+        vh_meta_table().lock().remove(&key);
+        vh_meta_bump_generation();
     }
 }

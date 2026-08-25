@@ -111,7 +111,7 @@ question, not a Tomcat one.
 |---|---|
 | `catalina.core.TestAsyncContextImpl` | 4 of 70 |
 | `catalina.connector.TestSendFile` | 1 of 2 |
-| `catalina.manager.TestManagerWebapp` | 1 of 4 |
+| `catalina.manager.TestManagerWebapp` | 2 of 4 on 2026-08-25 (1 of 4 on 08-14) — `testServlets` times out reading `GET /manager/jmxproxy` (`:147`), `testJsps` fails `assertTrue(body.contains("Sessions Administration"))` on `/manager/html/sessions` (`:697`). Both reproduce on pristine `dev`; HotSpot is `OK (4 tests)` in 19.6 s. **Not deploy timing** — the deploy itself finishes in 15.5 s and `testBug57700`/`testDeploy` both pass, which is what closed `fixed-suite-bugs/tomcat/webapp-deploy-annotation-scan-interpreted-226x-CLOSED-20260825.md` |
 | `catalina.manager.TestHostManagerWebapp` | 1 of 1 — **flaky**: serially `OK` (29 s) on 08-22, `FAILURES` (31 s) on 08-23 |
 
 ## WebSocket — FIXED 2026-08-22, all 19 pass

@@ -1980,7 +1980,72 @@ fn seed_direct_native_engine_services() {
     for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512", "SHAKE128-256", "SHAKE256-512"] {
         put_service(SUN, "MessageDigest", algorithm, "sun.security.provider.Native");
     }
-    put_alias(SUN, "MessageDigest", "SHA256", "SHA-256");
+    // SUN's `MessageDigest` ALIASES, enumerated from
+    // `Security.getProvider("SUN").keySet()` on HotSpot 25 rather than
+    // recalled: forty rows, of which this seed carried three.
+    //
+    // An alias is not decoration. `check_provider_ownership` gates every
+    // NAMED-provider `getInstance` on `get_service_entry`, which resolves the
+    // alias table first, so a name HotSpot's SUN answers and this table does
+    // not is a refusal against a JDK provider for a digest it demonstrably
+    // implements:
+    //
+    // ```text
+    // MessageDigest.getInstance("SHA1", "SUN")
+    //   HotSpot 25 -> a working SHA-1
+    //   CratonVM   -> NoSuchAlgorithmException:
+    //                 no such algorithm: SHA1 for provider SUN
+    // ```
+    //
+    // MEASURED. That is bc-java `cms`'s `SunProviderTest.testSHA1WithRSAStream`,
+    // the last CratonVM failure in the 53-class sweep of 2026-08-24, and the
+    // un-hyphenated spelling is the one every pre-JCA-4 caller uses. The
+    // hyphenated `SHA-1` resolved all along, which is why this survived: the
+    // primary name is a service, and only the alias spellings were missing.
+    //
+    // Every canonical below is already a seeded SUN service (the array above),
+    // so this widens the SPELLINGS this provider answers to and not the set of
+    // digests it claims — `sun_message_digest_aliases_all_resolve_to_a_seeded_service`
+    // is the ratchet on exactly that. Aliases stay out of
+    // `Security.getAlgorithms("MessageDigest")` (see `algorithms_for_service`),
+    // so the advertised count remains HotSpot's 15.
+    for (alias, canonical) in [
+        ("SHA", "SHA-1"),
+        ("SHA1", "SHA-1"),
+        ("SHA224", "SHA-224"),
+        ("SHA256", "SHA-256"),
+        ("SHA384", "SHA-384"),
+        ("SHA512", "SHA-512"),
+        ("SHA512/224", "SHA-512/224"),
+        ("SHA512/256", "SHA-512/256"),
+    ] {
+        put_alias(SUN, "MessageDigest", alias, canonical);
+    }
+    // The OID rows, in both spellings HotSpot registers: bare, and `OID.`-
+    // prefixed. X.509/PKCS/CMS callers name digests this way — bc-java's
+    // `EnvelopedDataHelper` and `DigestFactory` among them — and
+    // `canonical_if_unrecognised` needs the row to map the OID onto a name the
+    // engine's own table knows.
+    for (oid, canonical) in [
+        ("1.2.840.113549.2.2", "MD2"),
+        ("1.2.840.113549.2.5", "MD5"),
+        ("1.3.14.3.2.26", "SHA-1"),
+        ("2.16.840.1.101.3.4.2.1", "SHA-256"),
+        ("2.16.840.1.101.3.4.2.2", "SHA-384"),
+        ("2.16.840.1.101.3.4.2.3", "SHA-512"),
+        ("2.16.840.1.101.3.4.2.4", "SHA-224"),
+        ("2.16.840.1.101.3.4.2.5", "SHA-512/224"),
+        ("2.16.840.1.101.3.4.2.6", "SHA-512/256"),
+        ("2.16.840.1.101.3.4.2.7", "SHA3-224"),
+        ("2.16.840.1.101.3.4.2.8", "SHA3-256"),
+        ("2.16.840.1.101.3.4.2.9", "SHA3-384"),
+        ("2.16.840.1.101.3.4.2.10", "SHA3-512"),
+        ("2.16.840.1.101.3.4.2.11", "SHAKE128-256"),
+        ("2.16.840.1.101.3.4.2.12", "SHAKE256-512"),
+    ] {
+        put_alias(SUN, "MessageDigest", oid, canonical);
+        put_alias(SUN, "MessageDigest", &format!("OID.{oid}"), canonical);
+    }
     // ALIASES, not services. HotSpot's SUN carries
     // `Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`, so
     // `MessageDigest.getInstance("SHAKE128")` resolves and returns bytes
@@ -6467,6 +6532,105 @@ mod tests {
                  which is where HotSpot keeps it"
             );
         }
+    }
+
+    /// Every `MessageDigest` alias HotSpot's SUN declares is one this seed
+    /// declares too, resolves to a service this VM can compute, and stays out
+    /// of `Security.getAlgorithms`.
+    ///
+    /// The list below is the forty rows of
+    /// `Security.getProvider("SUN").keySet()` on HotSpot 25, filtered to
+    /// `Alg.Alias.MessageDigest.*` and written out independently of the seed —
+    /// which is the whole value of it. Three of the forty were present before
+    /// 2026-08-24; `MessageDigest.getInstance("SHA1", "SUN")` was one of the
+    /// thirty-seven that were not, and it is a `NoSuchAlgorithmException`
+    /// against a provider that has served SHA-1 since the first seed.
+    ///
+    /// Two directions, both load-bearing:
+    ///
+    ///   * the alias must RESOLVE — `check_provider_ownership` reads
+    ///     `get_service_entry`, so a missing row refuses the call outright;
+    ///   * the alias must not be ADVERTISED — registering these as services
+    ///     instead would satisfy the first half and make
+    ///     `Security.getAlgorithms("MessageDigest")` answer 55 where HotSpot
+    ///     answers 15.
+    #[test]
+    fn sun_message_digest_aliases_all_resolve_to_a_seeded_service() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("MessageDigest");
+        const HOTSPOT_SUN_MD_ALIASES: &[(&str, &str)] = &[
+            ("SHA", "SHA-1"),
+            ("SHA1", "SHA-1"),
+            ("SHA224", "SHA-224"),
+            ("SHA256", "SHA-256"),
+            ("SHA384", "SHA-384"),
+            ("SHA512", "SHA-512"),
+            ("SHA512/224", "SHA-512/224"),
+            ("SHA512/256", "SHA-512/256"),
+            ("SHAKE128", "SHAKE128-256"),
+            ("SHAKE256", "SHAKE256-512"),
+            ("1.2.840.113549.2.2", "MD2"),
+            ("1.2.840.113549.2.5", "MD5"),
+            ("1.3.14.3.2.26", "SHA-1"),
+            ("2.16.840.1.101.3.4.2.1", "SHA-256"),
+            ("2.16.840.1.101.3.4.2.2", "SHA-384"),
+            ("2.16.840.1.101.3.4.2.3", "SHA-512"),
+            ("2.16.840.1.101.3.4.2.4", "SHA-224"),
+            ("2.16.840.1.101.3.4.2.5", "SHA-512/224"),
+            ("2.16.840.1.101.3.4.2.6", "SHA-512/256"),
+            ("2.16.840.1.101.3.4.2.7", "SHA3-224"),
+            ("2.16.840.1.101.3.4.2.8", "SHA3-256"),
+            ("2.16.840.1.101.3.4.2.9", "SHA3-384"),
+            ("2.16.840.1.101.3.4.2.10", "SHA3-512"),
+            ("2.16.840.1.101.3.4.2.11", "SHAKE128-256"),
+            ("2.16.840.1.101.3.4.2.12", "SHAKE256-512"),
+            ("OID.1.2.840.113549.2.2", "MD2"),
+            ("OID.1.2.840.113549.2.5", "MD5"),
+            ("OID.1.3.14.3.2.26", "SHA-1"),
+            ("OID.2.16.840.1.101.3.4.2.1", "SHA-256"),
+            ("OID.2.16.840.1.101.3.4.2.2", "SHA-384"),
+            ("OID.2.16.840.1.101.3.4.2.3", "SHA-512"),
+            ("OID.2.16.840.1.101.3.4.2.4", "SHA-224"),
+            ("OID.2.16.840.1.101.3.4.2.5", "SHA-512/224"),
+            ("OID.2.16.840.1.101.3.4.2.6", "SHA-512/256"),
+            ("OID.2.16.840.1.101.3.4.2.7", "SHA3-224"),
+            ("OID.2.16.840.1.101.3.4.2.8", "SHA3-256"),
+            ("OID.2.16.840.1.101.3.4.2.9", "SHA3-384"),
+            ("OID.2.16.840.1.101.3.4.2.10", "SHA3-512"),
+            ("OID.2.16.840.1.101.3.4.2.11", "SHAKE128-256"),
+            ("OID.2.16.840.1.101.3.4.2.12", "SHAKE256-512"),
+        ];
+        assert_eq!(
+            HOTSPOT_SUN_MD_ALIASES.len(),
+            40,
+            "the measured HotSpot 25 alias set is forty rows; a loop over a              truncated list passes vacuously"
+        );
+        for (alias, canonical) in HOTSPOT_SUN_MD_ALIASES {
+            let entry = get_service_entry("SUN", "MessageDigest", alias);
+            assert!(
+                entry.is_some(),
+                "SUN answers MessageDigest.{alias} on HotSpot 25 and this seed                  has no row for it, so check_provider_ownership refuses                  getInstance({alias:?}, \"SUN\") outright"
+            );
+            assert!(
+                crate::jca::message_digest::algorithm_supported_public(canonical),
+                "{alias} resolves to {canonical}, which the digest engine                  cannot compute: the alias would trade a refusal for a failure                  one call later"
+            );
+            assert!(
+                !advertised
+                    .iter()
+                    .any(|(_, a)| a.eq_ignore_ascii_case(alias)),
+                "{alias} is an ALIAS and must stay out of                  Security.getAlgorithms, which is where HotSpot keeps it"
+            );
+        }
+        assert_eq!(
+            advertised
+                .iter()
+                .filter(|(provider, _)| provider == "SUN")
+                .count(),
+            15,
+            "SUN advertises fifteen MessageDigest services on HotSpot 25;              adding aliases must not move that number"
+        );
     }
 
     /// W7-63 ratchet: no advertised `Signature` name may be refused at

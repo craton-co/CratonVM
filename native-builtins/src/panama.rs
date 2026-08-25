@@ -6717,85 +6717,68 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
     }
 }
 
+/// `MemorySegment.reinterpret(long)` -- a new segment over the SAME address,
+/// with a caller-chosen size.
+///
+/// A free function rather than a closure because two registrars need to name
+/// it. They each carried their OWN body until 2026-08-24, and the shipping one
+/// -- the only body a `--jdk-only` process ever had -- copied slots 0..5
+/// verbatim and performed no native-access check at all.
+///
+/// The address is read through `panama_libffi::segment_address` so a REAL
+/// JDK-loaded segment is not mistaken for the synthetic six-slot carrier, on
+/// which slot 0 means something else entirely.
+pub(crate) fn pe_segment_reinterpret(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Gate size-stamping behind native access: reinterpret can grant an
+    // arbitrary access window over a (possibly raw) address, which is
+    // the second half of the arbitrary-memory primitive. Refuse unless
+    // native access is enabled.
+    if !native_access_enabled() {
+        return Err(RuntimeError::IllegalCallerException {
+            message: "Native access is not enabled for this module \
+                      (MemorySegment.reinterpret denied)"
+                .into(),
+        }
+        .into());
+    }
+    let new_size = match args.get(1) {
+        Some(Value::Long(n)) => *n,
+        _ => 0,
+    };
+    let ptr = crate::panama_libffi::segment_address(ctx, this);
+    let read_only = match ctx.get_field_by_name(this, "readOnly") {
+        Value::Int(n) => Value::Int(n),
+        _ => ctx.get_field(this, 3),
+    };
+
+    let seg = alloc_segment_carrier(ctx, 6)?;
+    ctx.set_field(seg, 0, Value::Long(ptr));
+    ctx.set_field(seg, 1, Value::Long(new_size));
+    ctx.set_field(seg, 2, Value::Object(None));
+    ctx.set_field(seg, 3, read_only);
+    ctx.set_field(seg, 4, Value::Int(1));
+    ctx.set_field(seg, 5, Value::Long(0));
+    Ok(Some(Value::Object(Some(seg))))
+}
+
 fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
 
-    // getUtf8String(long offset) → String
-    r.register(ms, "getUtf8String", "(J)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let offset = match args.get(1) {
-            Some(Value::Long(n)) => *n,
-            _ => 0,
-        };
-        let ptr = crate::panama_libffi::segment_address(ctx, this);
-        // Validate address arithmetic doesn't overflow (matches setUtf8String/copy)
-        let total = (ptr as u64).checked_add(offset as u64);
-        let addr_val = match total {
-            Some(v) => v,
-            None => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "address arithmetic overflow in getUtf8String".into(),
-                }
-                .into());
-            }
-        };
-        let addr = addr_val as *const u8;
-
-        if addr.is_null() {
-            return Ok(Some(Value::Object(None)));
-        }
-
-        // Read null-terminated C string with a bounded scan.
-        // The scan length MUST be clamped to the segment's recorded size
-        // (field 1) — `from_raw_parts` over a Java-supplied address with an
-        // unverified length is an out-of-bounds-read primitive. A segment
-        // with size 0 has unknown bounds (e.g. created via ofAddress or
-        // wrapping a raw function pointer); the JDK rejects reading a
-        // C string from such a segment, so we do too rather than blindly
-        // scanning MAX_CSTR_LEN bytes from an unbounded address.
-        let seg_size = match crate::panama_libffi::segment_byte_size(ctx, this) {
-            n if n > 0 => {
-                // Account for offset within the segment
-                let remaining = n - offset;
-                if remaining <= 0 {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: format!(
-                            "getUtf8String offset {} exceeds segment size {}",
-                            offset, n
-                        ),
-                    }
-                    .into());
-                }
-                (remaining as usize).min(MAX_CSTR_LEN)
-            }
-            _ => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "getUtf8String on a segment with unknown bounds \
-                              (size 0): reinterpret the segment with a known \
-                              size before reading a C string"
-                        .into(),
-                }
-                .into());
-            }
-        };
-        // SAFETY: addr has been null-checked above. `seg_size` is clamped to
-        // the segment's recorded byte size (field 1) minus `offset`, so the
-        // scan stays within the region the segment claims to own.
-        let slice = unsafe { std::slice::from_raw_parts(addr, seg_size) };
-        let nul_pos = slice.iter().position(|&b| b == 0);
-        let s = match nul_pos {
-            Some(pos) => std::str::from_utf8(&slice[..pos]).unwrap_or(""),
-            None => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: format!(
-                        "C string at {addr:?} exceeds maximum length of {MAX_CSTR_LEN} bytes"
-                    ),
-                }
-                .into());
-            }
-        };
-        let java_str = ctx.create_string(s);
-        Ok(Some(Value::Object(Some(java_str))))
-    });
+    // `getUtf8String(J)` and `reinterpret(J)` USED TO BE REGISTERED HERE, on
+    // both class names, and both drifted: `register_p67_foreign_memory`
+    // registers the same triples, and THAT pass is the one a shipping binary
+    // reaches. This pass is synthetic-only, so its bodies won the
+    // last-write-wins race under `--features synthetic-jdk` and were absent
+    // from every other mode -- i.e. every test built that way measured code
+    // that does not ship, and the code that DID ship was the weaker of the two
+    // in both cases. One body each now, registered by the shipping pass:
+    // `p67_segment_get_string` and `pe_segment_reinterpret` above.
+    //
+    // `setUtf8String` and `allocateUtf8String` below have NO shipping twin and
+    // stay exactly where they are.
 
     // setUtf8String(long offset, String value) → void
     r.register(
@@ -6865,45 +6848,6 @@ fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
         },
     );
 
-    // reinterpret(long newSize) → MemorySegment with same address but different size
-    r.register(
-        ms,
-        "reinterpret",
-        "(J)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Gate size-stamping behind native access: reinterpret can grant an
-            // arbitrary access window over a (possibly raw) address, which is
-            // the second half of the arbitrary-memory primitive. Refuse unless
-            // native access is enabled.
-            if !native_access_enabled() {
-                return Err(RuntimeError::IllegalCallerException {
-                    message: "Native access is not enabled for this module \
-                              (MemorySegment.reinterpret denied)"
-                        .into(),
-                }
-                .into());
-            }
-            let new_size = match args.get(1) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let ptr = crate::panama_libffi::segment_address(ctx, this);
-            let read_only = match ctx.get_field_by_name(this, "readOnly") {
-                Value::Int(n) => Value::Int(n),
-                _ => ctx.get_field(this, 3),
-            };
-
-            let seg = alloc_segment_carrier(ctx, 6)?;
-            ctx.set_field(seg, 0, Value::Long(ptr));
-            ctx.set_field(seg, 1, Value::Long(new_size));
-            ctx.set_field(seg, 2, Value::Object(None));
-            ctx.set_field(seg, 3, read_only);
-            ctx.set_field(seg, 4, Value::Int(1));
-            ctx.set_field(seg, 5, Value::Long(0));
-            Ok(Some(Value::Object(Some(seg))))
-        },
-    );
 
     // Arena.allocateUtf8String(String) → MemorySegment. JDK 22 renamed this to
     // `allocateFrom`, which shares the body — see the registration in

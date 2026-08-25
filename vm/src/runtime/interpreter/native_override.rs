@@ -7072,11 +7072,11 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
         || real_protected_stub_class_common(class_name)
 }
 
-/// The twelve classes **both** dispatch paths yield to real bytecode.
+/// The classes **both** dispatch paths yield to real bytecode.
 ///
 /// Kept as a `matches!` over string literals rather than a slice scan: this is
 /// on the native-dispatch path, and `matches!` compiles to a length-bucketed
-/// comparison chain rather than eleven `str` equality calls.
+/// comparison chain rather than one `str` equality call per entry.
 #[inline]
 fn real_protected_stub_class_common(class_name: &str) -> bool {
     matches!(
@@ -7085,6 +7085,26 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             | "java/util/concurrent/LinkedBlockingDeque"
             | "java/util/concurrent/atomic/AtomicBoolean"
             | "java/util/EnumSet"
+            // `java/util/Objects` is registered TWICE, and only the
+            // real-JDK-path registration is a `SyntheticStub`:
+            // `register_synthetic_overrides` installs it `Intrinsic` (on a
+            // synthetic image those bodies ARE the implementation and this
+            // entry cannot reach them, because the kind gate runs first),
+            // while `register_annotation_overrides` -- the real-JDK essentials
+            // path -- installs it `SyntheticStub` as a partial-stub-boot
+            // fallback. This entry arms the yield for that second one.
+            //
+            // Unlike its neighbours the motive is throughput, not correctness:
+            // the stub answers the same as the real bytecode, but winning
+            // meant `Objects.equals` / `hashCode` / `requireNonNull` /
+            // `isNull` could never be JIT-compiled, because a static's
+            // native-vs-bytecode arbitration is `NativeKind` alone.
+            // `requireNonNull` is among the most-called methods in the JDK and
+            // in Spring, so it was a VM-wide tax. Measured 10M calls,
+            // nativized against a byte-identical local static: equals
+            // 203.5 -> 47.2 ns, hashCode 174.1 -> 47.8, requireNonNull
+            // 124.3 -> 48.6, isNull 91.8 -> 24.6.
+            | "java/util/Objects"
             // JDK-ONLY-WAVE2, 2026-08-06. `native_es_execute` (retagged
             // `SyntheticStub` in `native-builtins/src/util_concurrent_ext.rs`)
             // is the compatibility stand-in for CratonVM's synthetic 2-field

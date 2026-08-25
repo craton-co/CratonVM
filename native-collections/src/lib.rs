@@ -6981,6 +6981,12 @@ fn alloc_arraylist_iterator_as(
                     ctx.set_field(itr, b + AL_ITR_FIELD_CURSOR, Value::Int(0));
                     ctx.set_field(itr, b + AL_ITR_FIELD_LAST_RET, Value::Int(-1));
                     let itr = ctx.read_native_pin(itr_pin, itr);
+                    // The values-shaped views' `expectedModCount = modCount`.
+                    // It goes in the carrier's OWN declared slot, not in the
+                    // three snapshot fields above — see `al_view_itr_seed`.
+                    let list = ctx.read_native_pin(roots_base, list);
+                    al_view_itr_seed(ctx, itr, list);
+                    let itr = ctx.read_native_pin(itr_pin, itr);
                     ctx.unpin_native_roots(roots_base);
                     return Ok(itr);
                 }
@@ -17419,6 +17425,32 @@ fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// absolute slots 1 and 2, past both declared fields).
 fn hs_map_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(this);
+    // Memoized per `(vm, class)`. Reached once per `next()` through
+    // `map_itr_comod_source`, and the two `is_subclass` calls below are what
+    // put `Class::is_subclass_of_inner` and its `hashbrown` visited set at the
+    // top of the `KeySetBench hoisted` profile. Positive answers only — see the
+    // note on `class_memo_get` for why a `None` here must not be kept.
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let vm = ctx.vm_identity();
+    if let Some(slot) = MEMO.with(|t| class_memo_get(t, vm, cid.as_u32())) {
+        return Some(slot);
+    }
+    let answer = hs_map_slot_uncached(ctx, this, cid);
+    if let Some(slot) = answer {
+        MEMO.with(|t| class_memo_put(t, vm, cid.as_u32(), slot));
+    }
+    answer
+}
+
+/// The uncached body of [`hs_map_slot`].
+fn hs_map_slot_uncached(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    cid: cratonvm_types::ClassId,
+) -> Option<usize> {
+    let _ = this;
     for class_name in [
         "java/util/HashSet",
         "java/util/concurrent/CopyOnWriteArraySet",
@@ -19024,16 +19056,28 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // for entrySet views (it allocates a live entry per pair) — `backing`
     // must be pinned BEFORE it, not after (pinning afterwards captured an
     // already-stale address; canary-caught live at `view_backing_source`).
+    //
+    // ONE collect, not two. The shape above was "collect for the length,
+    // allocate, then collect AGAIN because `alloc_ref_array` may have moved
+    // everything the first collect produced" — and the second collect's results
+    // are then immediately handed to `pin_value_slice`, which is the OTHER way
+    // to survive an allocation and the one this file uses everywhere else. So
+    // pin the FIRST collect instead and the second walk is pure waste: for a
+    // `LinkedHashMap` keySet view it is 1000 nodes x 2 `ctx.get_field` calls per
+    // `iterator()`, on a path the Spring workload this was traced from runs
+    // 100 000 times per test.
+    //
+    // The pins are unchanged in kind and in order relative to `this_pin`, which
+    // is still this frame's base and still releases all of them.
     let backing_pin = ctx.pin_native_root(backing);
-    let len = collect_view_snapshot_ordered(ctx, backing)?.len();
-    let backing = ctx.read_native_pin(backing_pin, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let (_, key_handles) = pin_value_slice(ctx, &keys);
+    let len = keys.len();
     let keys_arr = alloc_ref_array(ctx, len);
     let keys_arr_pin = ctx.pin_native_root(keys_arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
-    let (_, key_handles) = pin_value_slice(ctx, &keys);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
-    let total = std::cmp::min(len, keys.len());
+    let total = len;
     if dbg_hs_itr() {
         eprintln!(
             "[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}",
@@ -19444,6 +19488,159 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
     }
 }
 
+/// The THIRD fail-fast door: a [`VALUES_ITR_CARRIERS`] iterator, i.e. the one
+/// `TreeMap.entrySet()`, `TreeMap.values()`, `HashMap.values()` and
+/// `LinkedHashMap.values()` hand out.
+///
+/// It needs its own slot resolver because [`al_itr_expected_mod_count_slot`]
+/// deliberately answers `None` here — that helper resolves
+/// `ArrayList$Itr.expectedModCount`, which names nothing on a
+/// `TreeMap$EntryIterator`. These carriers declare an `expectedModCount` of
+/// their OWN, below the undeclared snapshot block at [`al_itr_alt_base`], and
+/// that is the slot to use: it is `int`-typed in every carrier, so writing it
+/// cannot type-pun a reference the way the `MAP_VIEW_CARRIERS` `modCount`
+/// collision described on [`al_mod_count_slot`] would.
+///
+/// MEASURED, and the reason the encoding below is biased: relaxing
+/// `al_itr_expected_mod_count_slot` to cover these carriers instead made every
+/// Spring Boot class die inside JUnit discovery with a SPURIOUS
+/// `ConcurrentModificationException`. An iterator minted on a path that does
+/// not seed reads **0**, and 0 is a perfectly legal generation, so the raw
+/// value cannot distinguish "unseeded" from "the source is on generation 0".
+fn al_view_itr_expected_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
+    let base = al_itr_alt_base(ctx, itr)?;
+    let cid = ctx.class_id_of_object(itr);
+    let slot = ctx.resolve_field_index_by_class_id(cid, "expectedModCount")?;
+    if slot >= base {
+        return None;
+    }
+    Some(slot)
+}
+
+/// The generation a values-shaped view carrier is fail-fast against: the
+/// SOURCE map's, read through whichever back-reference that carrier has.
+///
+/// Both readers are tried because the two producers differ. A carrier this
+/// crate minted stashes its source in the element buffer's trailing capacity
+/// slot ([`values_view_source`]); a real view-class receiver that arrived from
+/// elsewhere carries it in its declared `this$0`/`map`
+/// ([`values_view_class_source`]). A source with no `modCount` — a `TreeSet`
+/// behind a `descendingSet()`, a synthetic layout — answers `None`, which is
+/// the no-check case.
+fn al_view_generation(ctx: &dyn NativeContext, list: ObjectRef) -> Option<i32> {
+    let src = values_view_source(ctx, list).or_else(|| values_view_class_source(ctx, list))?;
+    map_itr_mod_count(ctx, src)
+}
+
+/// The stamp a source generation is stored as: `generation + 1`.
+///
+/// Kept as a pair of free functions with [`view_comod_is_stale`] so the
+/// arithmetic that decides whether to throw is testable without a heap. That
+/// separation is not cosmetic: the bug this encoding exists to prevent —
+/// attempt 1's spurious `ConcurrentModificationException` on every Spring Boot
+/// class — is entirely an arithmetic property (`0` had to mean two different
+/// things at once), and a unit test can pin it.
+#[inline]
+fn view_comod_stamp(gen: i32) -> i32 {
+    gen.wrapping_add(1)
+}
+
+/// `true` iff a stamped iterator has been outlived by its source.
+///
+/// `stored == 0` is the UNSEEDED encoding and answers `false` — fail open. Any
+/// other value is a real stamp and the comparison undoes the bias.
+#[inline]
+fn view_comod_is_stale(stored: i32, actual: i32) -> bool {
+    stored != 0 && actual != stored.wrapping_sub(1)
+}
+
+/// Stamp `itr` with the source generation, stored as `generation + 1`.
+///
+/// The bias is the whole design. `0` means "never seeded, do not check", so a
+/// mint path this function was never wired into fails OPEN rather than throwing
+/// on its first `next()`. `al_view_itr_check_comod` is the only reader and it
+/// subtracts the same 1. (A source sitting on `-1` therefore loses the check;
+/// no `bump_map_mod_count` path ever produces that, and losing a check is the
+/// safe direction anyway.)
+fn al_view_itr_seed(ctx: &mut dyn NativeContext, itr: ObjectRef, list: ObjectRef) {
+    if !map_itr_failfast_enabled() {
+        return;
+    }
+    let Some(slot) = al_view_itr_expected_slot(&*ctx, itr) else {
+        return;
+    };
+    let Some(gen) = al_view_generation(&*ctx, list) else {
+        return;
+    };
+    ctx.set_field(itr, slot, Value::Int(view_comod_stamp(gen)));
+    if dbg_view_comod() {
+        eprintln!(
+            "[VIEW-COMOD] seed itr={} slot={slot} gen={gen}",
+            ctx.class_name_of_id(ctx.class_id_of_object(itr))
+                .unwrap_or_else(|| "<unknown>".into()),
+        );
+    }
+}
+
+/// [`al_itr_check_comod`] for the values-shaped views, whose snapshot made a
+/// structural change to the source invisible.
+///
+/// Fails open on every arm, including the unseeded one — see
+/// [`al_view_itr_seed`] for why that arm has to be representable at all.
+fn al_view_itr_check_comod(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+    list: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !map_itr_failfast_enabled() {
+        return Ok(());
+    }
+    let Some(slot) = al_view_itr_expected_slot(ctx, itr) else {
+        return Ok(());
+    };
+    let stored = match ctx.get_field(itr, slot) {
+        Value::Int(v) => v,
+        _ => return Ok(()),
+    };
+    if stored == 0 {
+        if dbg_view_comod() {
+            eprintln!(
+                "[VIEW-COMOD] UNSEEDED itr={} slot={slot}",
+                ctx.class_name_of_id(ctx.class_id_of_object(itr))
+                    .unwrap_or_else(|| "<unknown>".into()),
+            );
+        }
+        return Ok(());
+    }
+    let Some(actual) = al_view_generation(ctx, list) else {
+        return Ok(());
+    };
+    if dbg_view_comod() {
+        eprintln!(
+            "[VIEW-COMOD] check itr={} expected={} actual={actual}",
+            ctx.class_name_of_id(ctx.class_id_of_object(itr))
+                .unwrap_or_else(|| "<unknown>".into()),
+            stored.wrapping_sub(1),
+        );
+    }
+    if view_comod_is_stale(stored, actual) {
+        return Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into());
+    }
+    Ok(())
+}
+
+/// Engagement trace for the values-view comodification check — `seed`,
+/// `check` and, decisively, `UNSEEDED`. Two earlier attempts at this door were
+/// reverted, the second because its seed was INERT: a run that only ever prints
+/// `UNSEEDED` has a live check and a dead stamp, which is exactly the state a
+/// pass/fail cell cannot distinguish from "the door works".
+#[inline]
+fn dbg_view_comod() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VIEW_COMOD").is_some())
+}
+
 /// Off-switch for the map/set iterator comodification check. Default ON.
 #[inline]
 fn map_itr_failfast_enabled() -> bool {
@@ -19462,9 +19659,104 @@ fn map_itr_failfast_enabled() -> bool {
 /// block this file writes from `key_itr_base` upward, keeps the old
 /// never-throw behaviour rather than guessing. A missed exception on an
 /// incorrect program is far better than a spurious one on a correct program.
+
+// ─────────────────── per-(vm, ClassId) memo for pure class questions ────────
+//
+// Several helpers on the per-ELEMENT iterator path answer a question that
+// depends only on the receiver's class: "where does this set keep its backing
+// map", "which slot is `expectedModCount`", "which slot is `modCount`". Each
+// answered it by re-resolving names through the class manager on every call.
+//
+// MEASURED. `probes/KeySetBench hoisted` (1000-entry `LinkedHashMap`, iterate a
+// hoisted `keySet()` view) against the SAME binary with
+// `CRATONVM_NO_MAP_ITERATOR_FAILFAST=1`, three interleaved rounds:
+//
+// ```text
+//              fail-fast ON      OFF        ratio
+//   hoisted    10930 / 10472 / 10872 ms     5478 / 5469 ms     2.0x
+//   perCall    14357 / 13076 ms             5707 / 4409 ms     2.5-3.0x
+// ```
+//
+// i.e. HALF of everything this workload had left after the 2026-08-23 map-view
+// fix was `map_itr_check_comod` re-deriving, per element, three facts that are
+// constant for the life of the iterator. `perf record` names the same chain
+// from the other end: `hashbrown::HashMap<ClassId,()>::insert` 9.91 %,
+// `Class::is_subclass_of_inner` 4.59 %, `classify_exact_name` 1.80 %,
+// `get_field_by_name` 1.57 %, `find_unique_class_by_name` 1.45 %,
+// `resolve_field_index_by_class_id` 1.27 %, `class_id_by_name` 1.14 %.
+// (The absolute walls above are from a host at load ~50 and are NOT comparable
+// to the quiet-host figures on the known-issue page; the ON/OFF ratio is what
+// they establish, and it was taken ABBA-interleaved on one binary.)
+//
+// The memo is DIRECT-MAPPED and per-thread: one array slot per `ClassId & 127`,
+// holding `(vm identity, class id, answer)` so a collision or a second VM in
+// the same process is a miss rather than a wrong answer. The VM identity is in
+// the key because `ClassId`s are per-VM dense indices and the test harness
+// builds several `SharedVm`s in one process.
+//
+// **Only POSITIVE answers are cached.** These questions are pure functions of
+// the class STORE, and the store grows: `hs_map_slot` asks
+// `class_id_by_name("java/util/HashSet")`, which answers `None` until that
+// class is loaded. Caching that `None` would pin "this receiver has no backing
+// map" for the process. A positive answer cannot change the same way — the
+// class it names is already loaded — so it is the half that is safe to keep.
+
+/// Slots in a [`class_memo_get`] table. A power of two so the index is a mask.
+const CLASS_MEMO_SLOTS: usize = 128;
+
+type ClassMemo<T> = std::cell::RefCell<Vec<Option<(usize, u32, T)>>>;
+
+#[inline]
+fn class_memo_get<T: Copy>(table: &ClassMemo<T>, vm: usize, cid: u32) -> Option<T> {
+    let b = table.borrow();
+    match b.get((cid as usize) & (CLASS_MEMO_SLOTS - 1)) {
+        Some(Some((v, c, val))) if *v == vm && *c == cid => Some(*val),
+        _ => None,
+    }
+}
+
+#[inline]
+fn class_memo_put<T: Copy>(table: &ClassMemo<T>, vm: usize, cid: u32, val: T) {
+    let mut b = table.borrow_mut();
+    if b.len() != CLASS_MEMO_SLOTS {
+        b.resize(CLASS_MEMO_SLOTS, None);
+    }
+    b[(cid as usize) & (CLASS_MEMO_SLOTS - 1)] = Some((vm, cid, val));
+}
+
+/// [`resolve_field_index_by_class_id`](NativeContext::resolve_field_index_by_class_id)
+/// with the answer remembered per `(vm, class)`.
+///
+/// The underlying resolution hashes the name, walks the superclass chain and
+/// compares field names under the class-manager read lock. On the iterator path
+/// it is asked the same question — `expectedModCount` on one iterator class,
+/// `modCount` on one map class — once per element.
+///
+/// `name` is NOT part of the key: each call site passes a fixed literal and
+/// gets its own table, which is what keeps the key a single `u32` compare.
+#[inline]
+fn memoized_field_slot(
+    ctx: &dyn NativeContext,
+    table: &ClassMemo<usize>,
+    cid: cratonvm_types::ClassId,
+    name: &str,
+) -> Option<usize> {
+    let vm = ctx.vm_identity();
+    let key = cid.as_u32();
+    if let Some(slot) = class_memo_get(table, vm, key) {
+        return Some(slot);
+    }
+    let slot = ctx.resolve_field_index_by_class_id(cid, name)?;
+    class_memo_put(table, vm, key, slot);
+    Some(slot)
+}
+
 fn map_itr_expected_mod_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(itr);
-    let slot = ctx.resolve_field_index_by_class_id(cid, "expectedModCount")?;
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let slot = MEMO.with(|t| memoized_field_slot(ctx, t, cid, "expectedModCount"))?;
     let base = key_itr_base(ctx, itr);
     if slot >= base || slot >= ctx.object_num_fields(itr) {
         return None;
@@ -19490,6 +19782,28 @@ fn map_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<Objec
 
 /// `src`'s current modification generation, or `None` when it keeps none.
 fn map_itr_mod_count(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
+    // By SLOT when the class metadata can name one, and only then by name.
+    //
+    // `get_field_by_name` re-resolves the string on every call, and this runs
+    // once per `next()` — see the measurement on `memoized_field_slot`. The two
+    // forms can only disagree when two fields in one hierarchy share a name and
+    // the by-name resolver picks the other one; `modCount` is declared exactly
+    // once across the `java.util` map hierarchy (`HashMap`, and `Hashtable`'s
+    // own), so there is no second candidate to pick. The by-name arm stays as
+    // the fallback for a receiver whose class metadata has no such field at all
+    // — a fabricated map whose `modCount` lives in an overlay rather than in a
+    // declared slot — which is exactly the population that used to depend on it.
+    let cid = ctx.class_id_of_object(src);
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(slot) = MEMO.with(|t| memoized_field_slot(ctx, t, cid, "modCount")) {
+        if slot < ctx.object_num_fields(src) {
+            if let Value::Int(v) = ctx.get_field(src, slot) {
+                return Some(v);
+            }
+        }
+    }
     match ctx.get_field_by_name(src, "modCount") {
         Value::Int(v) => Some(v),
         _ => None,
@@ -19850,6 +20164,7 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // deliberately does not, which is why the JDK's failure surfaces on the
     // iteration AFTER the offending `add`, not on the `hasNext` before it.
     al_itr_check_comod(ctx, this, list)?;
+    al_view_itr_check_comod(ctx, this, list)?;
     let (data, size) = al_state(ctx, list);
     if cursor >= size {
         // Fix (item 3): `Iterator.next()` past the end must throw
@@ -19913,6 +20228,7 @@ fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // stale iterator reports `IllegalStateException` where the JDK does and
     // `ConcurrentModificationException` where the JDK does.
     al_itr_check_comod(ctx, this, list)?;
+    al_view_itr_check_comod(ctx, this, list)?;
     // Live `values()` view: capture the element about to be removed and, after
     // removing it from the snapshot, delete the matching entry from the source
     // map. Captured before removal because the shift clobbers the slot.
@@ -19954,6 +20270,10 @@ fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(this, cursor_slot, Value::Int(last_ret));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
     al_itr_sync_mod_count(ctx, this, list);
+    // ...and the same line for the values-shaped views, whose removal was just
+    // propagated INTO the source map by `propagate_list_removal` above and so
+    // moved the very generation this iterator is watching.
+    al_view_itr_seed(ctx, this, list);
     Ok(None)
 }
 
@@ -25163,6 +25483,59 @@ fn stream_process_chain(
     result
 }
 
+/// How often the synthetic-stream drain loops re-publish this thread's GC root
+/// snapshot: every Nth element, not every element.
+///
+/// `NativeContext::refresh_root_snapshot`'s contract asks for a publish "right
+/// after establishing such a batch of pins (**and optionally again
+/// periodically** across a long per-element loop)". The up-front publish is the
+/// one that closes the documented gap — it is what makes this thread's
+/// `native_pin_roots` visible to a peer-initiated STW collection at all. The
+/// per-iteration one is the optional half, and it was running on EVERY element.
+///
+/// It is not free. Each call is a full deposit: the whole per-frame root
+/// snapshot is cleared and rebuilt, `scan_active_jit_frames` runs (including
+/// the A5 unregistered-frame probe, a raw word scan of the native stack above
+/// the scanner), and the SATB buffer is flushed. Measured on a
+/// `StackWalker.walk` over a 120-frame stack, 500 walks
+/// (`CRATONVM_DBG_ROOTPROF=1`):
+///
+/// ```text
+/// scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=86,700
+/// jitprobe calls=86,081 words=637,620,424
+/// ```
+///
+/// 638 MILLION words — 5.1 GB of native stack read — for 500 walks, at a
+/// constant ~7,400 words (59 KB) per call, with the call COUNT scaling linearly
+/// in stack depth because the stream has one element per frame. Neither the
+/// collector nor a safepoint asked for any of it: both other callers are zero.
+///
+/// The pins this refresh exists to publish are pushed ONCE, before the loop,
+/// and do not change across iterations — so every one of those deposits
+/// republished a bit-identical snapshot. Refreshing every Nth element keeps the
+/// periodic republish the contract asks for, with a bounded window, at 1/N the
+/// cost. `CRATONVM_GC_STREAM_REFRESH_EACH=1` restores the per-element cadence,
+/// so both arms are reachable from one binary.
+fn stream_refresh_interval() -> usize {
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STREAM_REFRESH_EACH").is_some() {
+            1
+        } else {
+            32
+        }
+    })
+}
+
+/// Should the drain loop re-publish before element `idx`?
+///
+/// `idx == 0` is never asked (the caller publishes up front, unconditionally).
+#[inline]
+fn stream_should_refresh(idx: usize) -> bool {
+    let every = stream_refresh_interval();
+    every <= 1 || idx % every == 0
+}
+
 fn stream_pull_internal(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -25226,7 +25599,10 @@ fn stream_pull_internal(
             if stream_limit_saturated(&chain, &state, 0) {
                 return Ok(PullStep::Continue);
             }
-            ctx.refresh_root_snapshot();
+            // Periodic, not per-element — see `stream_refresh_interval`.
+            if stream_should_refresh(idx) {
+                ctx.refresh_root_snapshot();
+            }
             let v = read_pinned_elem(ctx, base_pins[idx], v);
             let mut emit_stopped = false;
             let step = {
@@ -28126,7 +28502,10 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.refresh_root_snapshot();
     let mut result = Ok(None);
     for (i, &elem) in elements.iter().enumerate() {
-        ctx.refresh_root_snapshot();
+        // Periodic, not per-element — see `stream_refresh_interval`.
+        if stream_should_refresh(i) {
+            ctx.refresh_root_snapshot();
+        }
         let c = ctx.read_native_pin(con_pin, consumer);
         let e = read_pinned_elem(ctx, elem_handles[i], elem);
         if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {
@@ -44781,8 +45160,89 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 /// `containsAll` and `AbstractSet.hashCode`. All read a collection passed as an
 /// ARGUMENT, never the receiver of an element-reading native, which is why
 /// driving the argument's own `toArray()` from here cannot re-enter.
+/// How many times [`collect_collection_elements_or_real`] found its receiver had
+/// MOVED across one of its own Java re-entries, and the trace that names them.
+///
+/// The counter is the engagement evidence for the pinning below. Without it the
+/// fix is only "the symptom went away", which a timing-dependent defect can fake
+/// on any given run — see [`coll_refresh`]'s call sites.
+static COLL_REFRESH_MOVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn dbg_coll_refresh() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COLL_REFRESH").is_some())
+}
+
+/// Re-read a pinned receiver after a GC point, counting the moves.
+#[inline]
+fn coll_refresh(
+    ctx: &mut dyn NativeContext,
+    pin: usize,
+    stale: ObjectRef,
+    site: &'static str,
+) -> ObjectRef {
+    let cur = ctx.read_native_pin(pin, stale);
+    if !std::ptr::eq(cur.as_ptr(), stale.as_ptr()) {
+        COLL_REFRESH_MOVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_coll_refresh() {
+            eprintln!(
+                "[COLL-REFRESH] {site}: 0x{:x} -> 0x{:x} (total {})",
+                stale.as_ptr() as usize,
+                cur.as_ptr() as usize,
+                COLL_REFRESH_MOVED.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+    cur
+}
+
+/// How many receiver moves this helper has absorbed. Zero on a run means the
+/// pinning was never load-bearing THERE, not that it is unnecessary.
+pub fn collection_refresh_moved_count() -> usize {
+    COLL_REFRESH_MOVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
+    // GC-SAFETY (Family 1 — the stale-`ObjectRef` shape this file has paid for
+    // repeatedly). Every call below re-enters Java and is therefore a GC point,
+    // and `coll` arrives as a bare Rust local that nothing roots. A collector
+    // that evacuates `coll`'s region between two of them leaves the next one
+    // dispatching against an address that no longer holds the object.
+    //
+    // MEASURED on `org.h2.test.store.TestRandomMapOps`, `-XX:+UseG1GC --Xmx 1g`:
+    // the `size()` below returned, G1 evacuated and RECYCLED the region `coll`
+    // lived in, and the `toArray()` on the next line dispatched against that
+    // region's base address. An all-zero header reads as `ClassId(0)`, which IS
+    // `java.lang.Object` — the first class this VM loads — so the failure
+    // surfaced as
+    //   `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'`
+    // from `new ArrayList<>(map.keySet())`, naming a class that was never
+    // involved. Three controls place it: it reproduces under `--nojit` (so it is
+    // NOT a lost JIT root, which is where the "wrong class" reading sends you),
+    // `--Xmx 8g` does not reach it (so it needs a collection), and ZGC and
+    // generational do not reach it either (so it needs an EVACUATING one).
+    //
+    // `report_reclaimed_receiver` stayed silent the whole time, and that is not
+    // a contradiction: it asks the FREE LIST, and a whole evacuated G1 region is
+    // not a free-list block. A quiet reclaim guard is not a clean one.
+    let coll_pin = ctx.pin_native_root(coll);
+    let r = collect_collection_elements_or_real_pinned(ctx, coll, coll_pin);
+    ctx.unpin_native_roots(coll_pin);
+    r
+}
+
+/// [`collect_collection_elements_or_real`]'s body, with the receiver already
+/// pinned so every return path unwinds through one `unpin` in the caller —
+/// strictly LIFO, the discipline `collection_elements_generic` documents.
+fn collect_collection_elements_or_real_pinned(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    coll_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let elems = collect_collection_elements(ctx, coll)?;
+    let coll = coll_refresh(ctx, coll_pin, coll, "after collect_collection_elements");
     if !elems.is_empty() {
         if heuristic_snapshot_is_suspect(ctx, coll, &elems) {
             // A plausible-looking but null-holed snapshot of a foreign
@@ -44813,6 +45273,9 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
     if real_size <= 0 {
         return Ok(elems);
     }
+    // THE line this function's doc block is about: `size()` above is a GC point,
+    // so the `coll` this `toArray()` dispatches on has to be re-read.
+    let coll = coll_refresh(ctx, coll_pin, coll, "between size() and toArray()");
     let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
         Err(e) => return Err(e),
@@ -44827,7 +45290,26 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
 }
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
+///
+/// GC-SAFETY: same obligation as [`collect_collection_elements_or_real`], and
+/// for the same reason — four of the branches below drive the receiver's own
+/// Java (`size()` then `get(i)`, `getNameCount()` then `getName(i)`, `size()`
+/// then `toArray()`), and each of those calls is a GC point that can evacuate
+/// the receiver out from under the next one. `coll` is pinned here so those
+/// branches can re-read it; the branches that only read fields need nothing,
+/// because a field read is not a GC point.
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
+    let coll_pin = ctx.pin_native_root(coll);
+    let r = collect_collection_elements_pinned(ctx, coll, coll_pin);
+    ctx.unpin_native_roots(coll_pin);
+    r
+}
+
+fn collect_collection_elements_pinned(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    coll_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
     // wrap their backing collection in field `c`.  Recurse into that to
     // surface the wrapped list's elements — without this, callers like
@@ -45010,6 +45492,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(size);
             for i in 0..size {
+                let coll = coll_refresh(ctx, coll_pin, coll, "BlockingArrayQueue.get");
                 match ctx.invoke_virtual(
                     coll,
                     "get",
@@ -45114,6 +45597,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if size <= 0 {
                 return Ok(Vec::new());
             }
+            let coll = coll_refresh(ctx, coll_pin, coll, "hibernate size()->toArray()");
             if let Ok(Some(Value::Object(Some(arr)))) =
                 ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])
             {
@@ -45150,6 +45634,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
+                let coll = coll_refresh(ctx, coll_pin, coll, "Path.getName");
                 if let Ok(Some(v)) =
                     ctx.invoke_virtual(coll, "getName", "(I)Ljava/nio/file/Path;", &[Value::Int(i)])
                 {
@@ -45176,6 +45661,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             };
             let mut out = Vec::with_capacity(size as usize);
             for i in 0..size {
+                let coll = coll_refresh(ctx, coll_pin, coll, "AbstractList.get");
                 match ctx.invoke_virtual(coll, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
                     Ok(Some(v)) => out.push(v),
                     _ => break,
@@ -68194,6 +68680,48 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    /// THE regression test for the values-view fail-fast door.
+    ///
+    /// The first attempt at that door compared the iterator's raw
+    /// `expectedModCount` against the source generation. It made every
+    /// measured cell throw -- and then made every Spring Boot class die inside
+    /// JUnit discovery with a SPURIOUS `ConcurrentModificationException`,
+    /// because an iterator minted on a path that never seeded read **0** and
+    /// `0` is a legal generation. The unseeded state has to be REPRESENTABLE
+    /// and it has to fail OPEN, which is the whole reason the stamp is biased.
+    #[test]
+    fn an_unseeded_values_view_iterator_never_reports_a_comodification() {
+        // Nothing wrote the slot. Whatever the source is doing, no throw.
+        assert!(!view_comod_is_stale(0, 0));
+        assert!(!view_comod_is_stale(0, 5));
+        assert!(!view_comod_is_stale(0, i32::MAX));
+        assert!(!view_comod_is_stale(0, -1));
+    }
+
+    /// A stamped iterator agrees with its own generation and disagrees with
+    /// every other one -- including generation 0, the value the raw encoding
+    /// could not tell apart from "unseeded".
+    #[test]
+    fn a_stamped_values_view_iterator_tracks_exactly_its_own_generation() {
+        for gen in [0i32, 1, 2, 7, 1_000_000, i32::MAX - 1] {
+            let stamp = view_comod_stamp(gen);
+            assert_ne!(stamp, 0, "gen {gen} must not encode as the unseeded 0");
+            assert!(!view_comod_is_stale(stamp, gen), "gen {gen} is its own");
+            assert!(view_comod_is_stale(stamp, gen.wrapping_add(1)));
+            assert!(view_comod_is_stale(stamp, gen.wrapping_sub(1)));
+        }
+    }
+
+    /// The one generation the bias cannot carry is `-1`, which stamps to the
+    /// unseeded `0`. No `bump_map_mod_count` path produces it, and losing a
+    /// check is the direction this whole door is allowed to fail in -- but it
+    /// is stated here rather than left to be rediscovered.
+    #[test]
+    fn generation_minus_one_degrades_to_no_check_rather_than_to_a_wrong_one() {
+        assert_eq!(view_comod_stamp(-1), 0);
+        assert!(!view_comod_is_stale(view_comod_stamp(-1), 99));
+    }
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.

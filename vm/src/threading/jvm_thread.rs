@@ -876,7 +876,7 @@ impl JvmThread {
     /// `memcpy` under `Vec::pop<Frame>` and `pop_and_recycle_frame_with_reason`
     /// at 6.97% of the invoke arm, inside a frame-lifecycle group worth ~24.7%
     /// of it. See
-    /// `known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`.
+    /// `known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
     ///
     /// Returns `false` when there was no frame to pop, so callers keep the
     /// `if let Some(..)` shape the `pop()` form gave them.

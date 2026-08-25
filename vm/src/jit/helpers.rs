@@ -2863,6 +2863,117 @@ unsafe fn resolve_callee_cached(
     ))
 }
 
+/// WHICH implicit signal a compiled callee left behind alongside the `i64::MIN`
+/// sentinel — the one place that answers it, for both doors.
+///
+/// A bounds check, a null array reference and a zero divisor do NOT hand back a
+/// throwable. Each sets a flag and returns the sentinel, and the throwable is
+/// built on this side ([`materialize_implicit_signal`]). Two functions route
+/// such a sentinel through the CALLEE's own exception table —
+/// [`route_implicit_exc_through_callee`] for the Rust dispatch helper's
+/// compiled-entry fast paths, and [`handle_compiled_callee_deopt_sentinel`] for
+/// the machine-code direct `CALL` and the MIC/PIC cascade.
+///
+/// **They each carried their own copy of the table, and the copies drifted.**
+/// The arithmetic arm existed only in the second, so a `/ by zero` arriving at
+/// the first read as "no implicit signal here" and the sentinel went out to the
+/// compiled CALLER, whose drain threw the `ArithmeticException` through the
+/// CALLER's exception table. 198 000 of 200 000 `catch (ArithmeticException)`
+/// skipped on `probes/EscapeStaticProbe`; ~8 % of `probes/ExcTableDirectCallOracle`
+/// runs dying at `main:156`. Both pages are in
+/// `docs/internal/fixed-suite-bugs/jit/`.
+///
+/// The arm was added where it was missing. This type is the other half: there is
+/// now ONE table, and — the load-bearing part — the question *"is there an
+/// implicit signal at all?"* is answered by the SAME function that decides
+/// *which one*. What made the drift possible was that the first door asked it
+/// with a hand-written `aioobe.is_none() && !npe` companion to the `match`, so
+/// adding a flag to the `match` and not to the companion was a silent no-op.
+///
+/// Precedence — AIOOBE, then NPE, then arithmetic — is the order both callers
+/// already drained in. It is a precedence and not a set because only one
+/// throwable can be delivered, and the compiled body can only have trapped once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImplicitSignal {
+    Aioobe { index: i64, length: i64 },
+    Npe,
+    Arithmetic,
+    None,
+}
+
+/// Classify a drained signal triple. Pure, so the table above is testable
+/// without a heap — the bug it encodes is entirely an arithmetic property.
+pub(crate) fn implicit_signal_of(
+    aioobe: Option<(i64, i64)>,
+    npe: bool,
+    arithmetic: bool,
+) -> ImplicitSignal {
+    match aioobe {
+        Some((index, length)) => ImplicitSignal::Aioobe { index, length },
+        None if npe => ImplicitSignal::Npe,
+        None if arithmetic => ImplicitSignal::Arithmetic,
+        None => ImplicitSignal::None,
+    }
+}
+
+/// Put a classified signal back exactly as it was drained.
+///
+/// Both doors fall back on this, and it is not hygiene: the compiled caller's
+/// own drain builds the throwable FROM the flag, so a signal consumed here and
+/// not restored is an exception that never happens at all — the caller sees a
+/// bare deopt sentinel and carries on.
+fn restash_implicit_signal(signal: ImplicitSignal) {
+    match signal {
+        ImplicitSignal::Aioobe { index, length } => stash_jit_pending_aioobe(index, length),
+        ImplicitSignal::Npe => stash_jit_pending_npe(),
+        ImplicitSignal::Arithmetic => stash_jit_pending_arithmetic(),
+        ImplicitSignal::None => {}
+    }
+}
+
+/// Build the throwable an implicit signal is a *request* for.
+///
+/// One body, so the message text cannot diverge by dispatch route: a
+/// `getMessage()` that depended on which door serviced the trap would be its
+/// own wrong answer, and keeping the two arms in step by hand is what this
+/// replaces.
+///
+/// `create_exception_object` allocates, so this is a safepoint; each caller
+/// documents what it has pinned across it.
+fn materialize_implicit_signal(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    signal: ImplicitSignal,
+) -> Option<ObjectRef> {
+    match signal {
+        ImplicitSignal::Aioobe { index, length } => {
+            let msg = format!("Index {index} out of bounds for length {length}");
+            crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ArrayIndexOutOfBoundsException",
+                Some(&msg),
+            )
+            .ok()
+        }
+        ImplicitSignal::Npe => crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/NullPointerException",
+            None,
+        )
+        .ok(),
+        ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/ArithmeticException",
+            Some("/ by zero"),
+        )
+        .ok(),
+        ImplicitSignal::None => None,
+    }
+}
+
 /// Run the compiled callee's own handler for an exception that escaped it,
 /// resuming AT the handler instead of re-running the method from entry.
 ///
@@ -3076,24 +3187,56 @@ unsafe fn route_implicit_exc_through_callee(
         }
     }
     // Did the callee raise an *implicit* runtime exception?
+    //
+    // THREE flags, not two. `/ by zero` is stashed by the same machinery as
+    // the other two (`stash_jit_pending_arithmetic`, from the compiled `idiv`
+    // /`irem` guard and from `handle_compiled_callee_deopt_sentinel`'s
+    // fall-through), and this function used to consult only AIOOBE and NPE:
+    // an ArithmeticException fell into the `aioobe.is_none() && !npe` branch
+    // below, found no *general* pending exception either (the flag is not one),
+    // and left through the bare `return rc` — the callee's own exception table
+    // never consulted, the sentinel handed to the next frame out.
+    //
+    // Measured on `probes/EscapeStaticProbe.java`: from the iteration where the
+    // caller is compiled to the end of the loop, 198 000 of 200 000 `catch
+    // (ArithmeticException)` in the CALLER were skipped and the throw surfaced
+    // one frame too high. `route_implicit_exc_through_callee ENTER … pending_exc
+    // =false has_last_deopt=false` was printed 198 000 times, which is this
+    // function being handed a signal it had no arm for. The sibling door
+    // (`handle_compiled_callee_deopt_sentinel`) has always had the arm; the two
+    // doors simply disagreed.
     let aioobe = take_jit_pending_aioobe();
     let npe = if aioobe.is_none() {
         take_jit_pending_npe()
     } else {
         false
     };
+    let arithmetic = if aioobe.is_none() && !npe {
+        take_jit_pending_arithmetic()
+    } else {
+        false
+    };
+    // ONE classification, used for both questions this function asks of the
+    // three flags — which signal, and whether there is one. See
+    // [`ImplicitSignal`]: the second question used to be a separate,
+    // hand-written test, and that is what let the arm above go missing here
+    // while the sibling door had it.
+    let implicit = implicit_signal_of(aioobe, npe, arithmetic);
+    if rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_implicit_exc_through_callee IMPLICIT {implicit:?} \
+             callee_has_handler={callee_has_handler} {}.{}{}",
+            info.class_name, info.method_name, info.descriptor,
+        );
+    }
     // Re-stash the consumed flag and propagate the sentinel unchanged. Used for
     // the pure-deopt case (no flag) and the no-local-handler case (the callee
     // cannot catch it, so existing outward propagation is already correct).
     let restash_and_return = || {
-        if let Some((idx, len)) = aioobe {
-            stash_jit_pending_aioobe(idx, len);
-        } else if npe {
-            stash_jit_pending_npe();
-        }
+        restash_implicit_signal(implicit);
         rc
     };
-    if aioobe.is_none() && !npe {
+    if implicit == ImplicitSignal::None {
         // KCFULL-13 — *general* pending exception (an explicit `athrow`, or a
         // native-raised throwable, originating in this compiled callee's own
         // callee chain). The original bug-H assumption — "methods-with-tables
@@ -3269,26 +3412,12 @@ unsafe fn route_implicit_exc_through_callee(
         // path where the compiled attempt is FINISHED or ABANDONED, so its
         // frame can never be legitimately claimed and must not be left for a
         // later drain to mis-match.
-        let exc = match (aioobe, npe) {
-            (Some((index, length)), _) => {
-                let msg = format!("Index {index} out of bounds for length {length}");
-                crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArrayIndexOutOfBoundsException",
-                    Some(&msg),
-                )
-                .ok()
-            }
-            (None, true) => crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                "java/lang/NullPointerException",
-                None,
-            )
-            .ok(),
-            (None, false) => None,
-        };
+        // The message text cannot diverge from
+        // `handle_compiled_callee_deopt_sentinel`'s or from the interpreter's
+        // own `idiv`, because there is one body — a `getMessage()` that changed
+        // with the dispatch route would be its own wrong answer, and this used
+        // to be kept true by hand.
+        let exc = materialize_implicit_signal(vm, thread, implicit);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3555,33 +3684,15 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 return Some(v);
             }
         } else {
-            let implicit = match signals.aioobe {
-                Some((index, length)) => {
-                    let msg = format!("Index {index} out of bounds for length {length}");
-                    crate::runtime::exceptions::create_exception_object(
-                        vm,
-                        thread,
-                        "java/lang/ArrayIndexOutOfBoundsException",
-                        Some(&msg),
-                    )
-                    .ok()
-                }
-                None if signals.npe => crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/NullPointerException",
-                    None,
-                )
-                .ok(),
-                None if signals.arithmetic => crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArithmeticException",
-                    Some("/ by zero"),
-                )
-                .ok(),
-                None => None,
-            };
+            // The SAME table the dispatch-helper door uses. This door is where
+            // the arithmetic arm always existed; sharing the table is what stops
+            // the two from disagreeing about the SET again. See
+            // [`ImplicitSignal`].
+            let implicit = materialize_implicit_signal(
+                vm,
+                thread,
+                implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
+            );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
                     vm,
@@ -13763,6 +13874,250 @@ pub fn varhandle_read_direct_fn(slot: usize) -> usize {
     varhandle_read_direct_fns()[slot]
 }
 
+// ---------------------------------------------------------------------------
+// `VarHandle` write-mode thin direct-call helpers.
+//
+// The callee half of `cratonvm_jit::VARHANDLE_WRITE_DIRECT_FNS`: a
+// `(vm_ptr, varhandle, receiver, value)` `extern "C"` function per
+// (write mode, value kind) slot. Four arguments, which is exactly Windows'
+// ARG_REGS — see the jit-crate header for why `compareAndSet` (five) is not
+// bound here.
+//
+// Unlike the read helpers this arm serves REFERENCE values as well as
+// primitives, because the reference travels inward in a register the compiled
+// caller's frame already describes; there is no return value to root.
+// ---------------------------------------------------------------------------
+
+/// Served / declined counts for the `VarHandle` write direct helpers.
+///
+/// Same contract as the read pair beside it: `hits == 0` with a bound site is
+/// the specific failure this exists to name, and a non-zero `declines` beside a
+/// non-zero `hits` is normal — the first call on a handle resolves its field
+/// slot inside the native, so it declines and the second qualifies.
+pub static VARHANDLE_WRITE_DIRECT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_WRITE_DIRECT_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(served, declined)` counts for the `VarHandle` write direct helpers.
+pub fn varhandle_write_direct_counts() -> (u64, u64) {
+    (
+        VARHANDLE_WRITE_DIRECT_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_WRITE_DIRECT_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Decode one JIT-ABI argument word into the `Value` a field of `kind` holds.
+///
+/// The inverse of `varhandle_instance_field_read_bits`'s encode, and the same
+/// table: an int-category kind is the low half sign-extended by its own width,
+/// a `float`/`double` is its bit pattern, and a reference is the raw pointer
+/// with zero for null.
+///
+/// Returns `None` for a word that cannot be a reference — which sends the call
+/// to the funnel rather than fabricating an object out of an arbitrary integer.
+unsafe fn varhandle_write_value_of(vm: &SharedVm, kind: u8, bits: i64) -> Option<Value> {
+    Some(match kind {
+        b'Z' => Value::Int((bits & 1) as i32), // Cast: JIT ABI -- boolean is 0/1
+        b'B' => Value::Int(bits as i8 as i32), // Cast: JIT ABI -- byte is sign-extended
+        b'C' => Value::Int(bits as u16 as i32), // Cast: JIT ABI -- char is zero-extended
+        b'S' => Value::Int(bits as i16 as i32), // Cast: JIT ABI -- short is sign-extended
+        b'I' => Value::Int(bits as i32),       // Cast: JIT ABI -- int is the low half
+        b'J' => Value::Long(bits),
+        b'F' => Value::Float(f32::from_bits(bits as u32)), // Cast: JIT ABI -- float bits
+        b'D' => Value::Double(f64::from_bits(bits as u64)), // Cast: JIT ABI -- double bits
+        b'L' => {
+            if bits == 0 {
+                Value::Object(None)
+            } else {
+                // A non-null word must actually be an object this heap owns.
+                // Anything else is not a reference the store may take.
+                Value::Object(Some(vm.mem.heap.is_object_address(bits as usize)?))
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Body of every [`VARHANDLE_WRITE_DIRECT_FNS`] slot.
+///
+/// Fast path: the handle describes a resolved instance field whose kind agrees
+/// with the call site's value, and the answer is one barriered field store.
+/// Everything else — a null handle or coordinate, an unresolved or
+/// non-instance-field handle, a kind disagreement, a value word that is not a
+/// reference — falls through to the generic dispatcher with this slot's
+/// synthetic call site, so the exception and the `VarHandle` access-mode rules
+/// stay the registered native's rather than a copy of them.
+///
+/// The store goes through `set_field_volatile_as`, which routes to the
+/// collector's own inherent write barrier. That matters more here than on the
+/// read side: a reference store has to be visible to a concurrent marker, and
+/// borrowing the collector's path rather than open-coding one is what keeps
+/// this arm and the interpreter's `putfield` telling the GC the same story.
+///
+/// # SAFETY
+///
+/// Called only from JIT-compiled code, with a `vm_ptr` compiled against this
+/// live VM and raw references the compiled frame is holding.
+unsafe fn varhandle_write_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, value: i64, slot: usize) {
+    crate::jit::conservative_roots::note_jit_boundary();
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let site_kind =
+        cratonvm_jit::VARHANDLE_WRITE_KINDS[slot % cratonvm_jit::VARHANDLE_WRITE_KINDS.len()];
+    if vh != 0 && receiver != 0 {
+        if varhandle_instance_field_write(vm, vh as u64, receiver as u64, site_kind, value) {
+            VARHANDLE_WRITE_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+    VARHANDLE_WRITE_DIRECT_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [vh, receiver, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &VARHANDLE_WRITE_INFOS[slot] as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    );
+}
+
+/// The store itself, shared by the direct arm and the funnel-side twin so the
+/// two cannot drift apart in what they consider a servable handle.
+///
+/// `true` when the write happened; `false` declines to the caller's cold arm.
+///
+/// # SAFETY
+///
+/// `vh_raw` and `recv_raw` are raw references a compiled frame is holding.
+unsafe fn varhandle_instance_field_write(
+    vm: &SharedVm,
+    vh_raw: u64,
+    recv_raw: u64,
+    site_kind: u8,
+    value_bits: i64,
+) -> bool {
+    let Some(vh) = vm.mem.heap.is_object_address(vh_raw as usize) else {
+        return false;
+    };
+    let Some(receiver) = vm.mem.heap.is_object_address(recv_raw as usize) else {
+        return false;
+    };
+    // The same GC-stable key `vh_meta_get` files the handle under — see
+    // `varhandle_instance_field_read_bits`, which resolves it identically.
+    let heap = &vm.mem.heap;
+    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
+        heap.next_identity_hash()
+    });
+    let Some(plan) = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)
+    else {
+        return false;
+    };
+    // Reference/primitive agreement between the variable and the call site,
+    // the same test the read side makes.
+    let site_is_ref = site_kind == b'L';
+    let plan_is_ref = plan.value_desc == b'L';
+    if site_is_ref != plan_is_ref || (!site_is_ref && site_kind != plan.value_desc) {
+        return false;
+    }
+    let Some(value) = varhandle_write_value_of(vm, plan.value_desc, value_bits) else {
+        return false;
+    };
+    let receiver = heap.load_and_forward(receiver);
+    // Volatile because it is the STRONGEST of the four bound modes and always a
+    // legal implementation of a weaker one; the collector's inherent barrier
+    // rides on this path.
+    heap.set_field_volatile_as(receiver, plan.field_index as usize, value, plan.value_desc);
+    true
+}
+
+/// The thin direct-call target for slot `SLOT` of
+/// `cratonvm_jit::VARHANDLE_WRITE_DIRECT_FNS`.
+///
+/// One monomorphisation per slot, so the slot — and with it the site's value
+/// kind and the synthetic call site the cold arm uses — is a compile-time
+/// constant in the emitted `CALL`'s target.
+///
+/// # SAFETY
+///
+/// See [`varhandle_write_direct_impl`].
+pub unsafe extern "C" fn jit_varhandle_write_direct<const SLOT: usize>(
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    value: i64,
+) {
+    varhandle_write_direct_impl(vm_ptr, vh, receiver, value, SLOT)
+}
+
+/// Addresses of every [`jit_varhandle_write_direct`] monomorphisation, in slot
+/// order.
+fn varhandle_write_direct_fns() -> [usize; cratonvm_jit::VARHANDLE_WRITE_SLOTS] {
+    macro_rules! slots {
+        ($($slot:literal),* $(,)?) => {
+            [$( jit_varhandle_write_direct::<$slot> as *const () as usize ),*]
+        };
+    }
+    slots!(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+    )
+}
+
+/// The thin direct-call helper address for one write slot, for the OSR door.
+pub fn varhandle_write_direct_fn(slot: usize) -> usize {
+    varhandle_write_direct_fns()[slot]
+}
+
+/// Erased call-site descriptors for [`VARHANDLE_WRITE_INFOS`], indexed by the
+/// value-kind half of a slot.
+///
+/// A baked direct call has no `JitInvokeInfo` of its own, so the cold arm
+/// cannot hand the generic dispatcher the site's real descriptor. These stand
+/// in for it. The substitution is not observable here for the same reason it is
+/// not on the read side for a primitive: the descriptor's readers are the
+/// argument decode (one reference coordinate and one value either way) and the
+/// return handling, and a `void` return has none. The REFERENCE value slot is
+/// safe for the same reason the read side's reference RETURN was not —
+/// `varhandle_reference_return_mismatch` compares a returned object against the
+/// site's declared class, and there is no returned object here.
+const VARHANDLE_WRITE_DESCRIPTORS: [&str; 9] = [
+    "(Ljava/lang/Object;Z)V",
+    "(Ljava/lang/Object;B)V",
+    "(Ljava/lang/Object;C)V",
+    "(Ljava/lang/Object;S)V",
+    "(Ljava/lang/Object;I)V",
+    "(Ljava/lang/Object;J)V",
+    "(Ljava/lang/Object;F)V",
+    "(Ljava/lang/Object;D)V",
+    "(Ljava/lang/Object;Ljava/lang/Object;)V",
+];
+
+/// Synthetic call sites for the cold arm of the `VarHandle` write helpers, one
+/// per slot. `static` for the same reason [`VARHANDLE_READ_INFOS`] is: 
+/// `jit_invoke_dispatch` keys its per-site memos on `(vm_identity, info
+/// address)`, so the address has to be process-stable.
+static VARHANDLE_WRITE_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_WRITE_SLOTS] = [
+    vh_write_info(0, 0), vh_write_info(0, 1), vh_write_info(0, 2), vh_write_info(0, 3), vh_write_info(0, 4), vh_write_info(0, 5), vh_write_info(0, 6), vh_write_info(0, 7), vh_write_info(0, 8),
+    vh_write_info(1, 0), vh_write_info(1, 1), vh_write_info(1, 2), vh_write_info(1, 3), vh_write_info(1, 4), vh_write_info(1, 5), vh_write_info(1, 6), vh_write_info(1, 7), vh_write_info(1, 8),
+    vh_write_info(2, 0), vh_write_info(2, 1), vh_write_info(2, 2), vh_write_info(2, 3), vh_write_info(2, 4), vh_write_info(2, 5), vh_write_info(2, 6), vh_write_info(2, 7), vh_write_info(2, 8),
+    vh_write_info(3, 0), vh_write_info(3, 1), vh_write_info(3, 2), vh_write_info(3, 3), vh_write_info(3, 4), vh_write_info(3, 5), vh_write_info(3, 6), vh_write_info(3, 7), vh_write_info(3, 8),
+];
+
+/// One entry of [`VARHANDLE_WRITE_INFOS`]. `num_jit_args: 3` counts the
+/// receiver — the `VarHandle` itself — plus the coordinate and the value.
+const fn vh_write_info(mode: usize, kind: usize) -> JitInvokeInfo {
+    JitInvokeInfo {
+        class_name: "java/lang/invoke/VarHandle",
+        method_name: cratonvm_jit::VARHANDLE_WRITE_MODES[mode],
+        descriptor: VARHANDLE_WRITE_DESCRIPTORS[kind],
+        num_jit_args: 3,
+        return_type: b'V',
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    }
+}
+
 /// Try to compile a callee method from a JitInvokeInfo.
 /// Returns (entry_ptr, needs_context) if compilation succeeds.
 // SAFETY: Caller must ensure vm is a valid SharedVm reference and info points to a live
@@ -14105,6 +14460,11 @@ impl DirectNativeShadow {
 
     /// The Rust item name, so a refusal and the source witness can both name
     /// the same symbol the ladders name.
+    /// Test-only: every caller is in this file's `#[cfg(test)]` module, where
+    /// it names the `extern "C"` item each shadow is supposed to point at so
+    /// the string and the item cannot drift apart. Nothing in production asks
+    /// a shadow for its symbol NAME -- the doors take `entry_addr()`.
+    #[cfg(test)]
     pub const fn helper_symbol(self) -> &'static str {
         match self {
             DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
@@ -18675,6 +19035,122 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // Every implicit JIT signal is an implicit exception at BOTH callee doors
+    // -----------------------------------------------------------------------
+
+    /// The regression this file's `ImplicitSignal` exists for.
+    ///
+    /// `route_implicit_exc_through_callee` used to decide "is there an implicit
+    /// signal at all?" with a hand-written `aioobe.is_none() && !npe`, while
+    /// `handle_compiled_callee_deopt_sentinel` decided the same question with a
+    /// three-armed `match` that also knew about `arithmetic`. A `/ by zero` in a
+    /// compiled callee reached through the dispatch helper therefore read as
+    /// "nothing implicit pending", and the callee's own
+    /// `catch (ArithmeticException)` was skipped.
+    ///
+    /// A pass/fail probe could only ever sample that — which door a call takes
+    /// depends on compile ordering, so it showed up at ~8 % of runs. The
+    /// arithmetic is not a race, so pin it here where it is deterministic.
+    #[test]
+    fn a_pending_arithmetic_signal_is_an_implicit_exception() {
+        assert_eq!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::Arithmetic,
+            "a zero-divisor signal must classify as an implicit exception; \
+             reading it as `None` is the ExcTableDirectCallOracle flake"
+        );
+        assert_ne!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::None,
+            "and in particular must not take the `no implicit signal` branch"
+        );
+    }
+
+    /// Only the empty triple is `None`. Stated as its own test because it is
+    /// the property a future fourth signal would break: adding a field to
+    /// `JitSignals` and forgetting this function puts the new signal back in
+    /// the `None` bucket, which is silently "propagate to the caller".
+    #[test]
+    fn the_no_signal_answer_is_reserved_for_the_empty_triple() {
+        assert_eq!(implicit_signal_of(None, false, false), ImplicitSignal::None);
+        for signal in [
+            implicit_signal_of(Some((3, 2)), false, false),
+            implicit_signal_of(None, true, false),
+            implicit_signal_of(None, false, true),
+        ] {
+            assert_ne!(signal, ImplicitSignal::None);
+        }
+    }
+
+    /// Precedence is AIOOBE, then NPE, then arithmetic — the order both doors
+    /// already drained the flags in, kept so this refactor is behaviour-neutral
+    /// for the two signals that were already handled. Only one throwable can be
+    /// delivered, so an overlapping triple must pick exactly one.
+    #[test]
+    fn implicit_signal_precedence_is_aioobe_then_npe_then_arithmetic() {
+        assert_eq!(
+            implicit_signal_of(Some((7, 5)), true, true),
+            ImplicitSignal::Aioobe {
+                index: 7,
+                length: 5
+            }
+        );
+        assert_eq!(implicit_signal_of(None, true, true), ImplicitSignal::Npe);
+        assert_eq!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::Arithmetic
+        );
+    }
+
+    /// The AIOOBE payload has to survive classification: the message the
+    /// throwable carries is built from it, and HotSpot's text names both
+    /// numbers.
+    #[test]
+    fn the_aioobe_payload_survives_classification() {
+        assert_eq!(
+            implicit_signal_of(Some((-1, 0)), false, false),
+            ImplicitSignal::Aioobe {
+                index: -1,
+                length: 0
+            }
+        );
+    }
+
+    /// A drained signal that is restashed must classify back to itself.
+    ///
+    /// This is the fallback both doors take when the callee's own table does
+    /// not cover the throw: the caller's drain builds the throwable FROM the
+    /// flag, so a round trip that loses it is not a missed optimisation, it is
+    /// an exception that never happens. Runs on this thread's real
+    /// `JIT_SIGNALS`, and leaves it clear.
+    #[test]
+    fn a_restashed_implicit_signal_round_trips_through_the_thread_local() {
+        for original in [
+            ImplicitSignal::Aioobe {
+                index: 9,
+                length: 4,
+            },
+            ImplicitSignal::Npe,
+            ImplicitSignal::Arithmetic,
+        ] {
+            restash_implicit_signal(original);
+            let aioobe = take_jit_pending_aioobe();
+            let npe = take_jit_pending_npe();
+            let arithmetic = take_jit_pending_arithmetic();
+            assert_eq!(implicit_signal_of(aioobe, npe, arithmetic), original);
+        }
+        restash_implicit_signal(ImplicitSignal::None);
+        assert_eq!(
+            implicit_signal_of(
+                take_jit_pending_aioobe(),
+                take_jit_pending_npe(),
+                take_jit_pending_arithmetic()
+            ),
+            ImplicitSignal::None
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // The `Matcher` leaf's index and its arg-count table must agree
     // -----------------------------------------------------------------------
 
@@ -21747,6 +22223,9 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // `varhandle_read_helper_slot`'s order by construction, not by a
         // hand-kept list of `set_*` calls in the right sequence.
         cratonvm_jit::set_varhandle_read_direct_fns(&varhandle_read_direct_fns());
+        // Same contract, one table over: the write slots are in
+        // `varhandle_write_helper_slot`'s order by construction.
+        cratonvm_jit::set_varhandle_write_direct_fns(&varhandle_write_direct_fns());
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =

@@ -3978,6 +3978,66 @@ pub fn execute(
                                             shared,
                                             &rframe_for_despec,
                                         );
+                                    } else if !cratonvm_jit::bytecode_commits_side_effect(
+                                        &code_attr.code,
+                                        code_attr.code.len(),
+                                    ) {
+                                        // The refusal below is about DUPLICATED
+                                        // SIDE EFFECTS, and this method has none
+                                        // to duplicate: no store outside the
+                                        // frame, no call, no monitor action. Its
+                                        // locals are rebuilt from the same
+                                        // arguments, so a re-run from bci 0 is
+                                        // observably the abandoned attempt.
+                                        //
+                                        // This arm is not a relaxation, it is the
+                                        // other half of a rule that was only ever
+                                        // written down once.
+                                        // `ir_unresumable_protected_trap` ADMITS
+                                        // the optimizing tier for a protected
+                                        // range carrying an unresumable trap when
+                                        // the range is read-only, on the stated
+                                        // ground that "a read-only
+                                        // `try { return a[i]; } catch (...)`
+                                        // replays harmlessly, so the refusal would
+                                        // buy nothing and cost the compile" — and
+                                        // then this sink refused every replay,
+                                        // harmless or not. The compiler's
+                                        // narrowing rested on a behaviour the
+                                        // consumer did not have, so exactly the
+                                        // shape it deliberately let through was
+                                        // the shape that died here.
+                                        //
+                                        // `probes/EscapeKindProbe.java` is the
+                                        // witness: its `virtual` / `iface` /
+                                        // `special` arms are
+                                        // `try { return 10 / (i - i); }
+                                        // catch (IllegalStateException e) { ... }`
+                                        // reached through the dispatch helper, and
+                                        // all three died with `InternalError:
+                                        // precise deoptimization unavailable ...
+                                        // refusing side-effecting replay` where
+                                        // HotSpot and `--nojit` return the
+                                        // ArithmeticException the caller catches.
+                                        //
+                                        // The two ends now ask ONE predicate
+                                        // (`opcode_commits_side_effect`) so they
+                                        // cannot drift apart again.
+                                        if cratonvm_types::flags::runtime_var_os(
+                                            "CRATONVM_DBG_DEOPT",
+                                        )
+                                        .is_some()
+                                        {
+                                            eprintln!(
+                                                "[cratonvm-deopt] replaying {}.{}{} from entry: \
+                                                 unresumable at bci {} but the body commits no \
+                                                 side effect",
+                                                class_name_str,
+                                                method_name,
+                                                method_descriptor,
+                                                rframe_for_despec.bci,
+                                            );
+                                        }
                                     } else {
                                     // Precise reconstruction is a correctness
                                     // requirement once native code has executed
@@ -4860,7 +4920,7 @@ pub(crate) fn try_osr_with_backoff(
     // Measured: with the stock thresholds this workload reports `osr=0` — not a
     // single OSR body in the entire scan — while the per-constant methods it
     // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
-    // See docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+    // See docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
     //
     // Credit loop work towards that same invocation counter, the way HotSpot
     // sums its invocation and back-edge counters against a single threshold.
@@ -5328,7 +5388,7 @@ fn execute_frame_from_index(
         // burned the wall clock).
         //
         // What the sample POSITION means, because three profiles on
-        // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md
+        // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md
         // were read wrong: this hook is the first thing a loop iteration does,
         // and an invoke pushes the callee frame and `continue`s. So the time
         // an expensive INVOKE burns is reported against the callee at

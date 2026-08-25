@@ -247,6 +247,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dial-doors", on_key: Some("CRATONVM_DBG_DIAL_DOORS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "watch-pun", on_key: Some("CRATONVM_DBG_WATCH_PUN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "refdisc", on_key: Some("CRATONVM_DBG_REFDISC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "site-alias", on_key: Some("CRATONVM_DBG_SITE_ALIAS"), off_key: None, off_word: None },
@@ -306,6 +307,7 @@ pub const INVENTORY: &[E] = &[
     // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` stayed open for
     // two days. Costs one relaxed load per `NativeContext::get_field` while
     // armed and nothing at all while it is not.
+    E { group: Group::DBG, token: "coll-refresh", on_key: Some("CRATONVM_DBG_COLL_REFRESH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
     // Declared 2026-08-23 with the widening it verifies. Fabricates one
     // corrupt-cell hit at a site that HAS a read door and one at a site that
@@ -708,6 +710,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    // The named-writer arm of the punned-reference counter: on a NON-ZERO
+    // payload word under a non-`Object` tag, print the class and field so the
+    // writer can be found rather than inferred. Diagnostic only -- the counter
+    // itself is unconditional; this names what it counted.
+    E { group: Group::DBG, token: "punned-ref", on_key: Some("CRATONVM_DBG_PUNNED_REF"), off_key: None, off_word: None },
+    // Per-event trace of the map/set VIEW comodification door: which check
+    // fired, and whether the modCount stamp behind it is live or dead. A
+    // pass/fail cell cannot tell a working door from a dead stamp, which is
+    // what this exists to distinguish.
+    E { group: Group::DBG, token: "view-comod", on_key: Some("CRATONVM_DBG_VIEW_COMOD"), off_key: None, off_word: None },
     // Was the bare `CRATONVM_DBG`, which is now the group variable itself. It
     // gated exactly one call site (`quarkus_staticinit.rs`), so it becomes an
     // ordinary topic. `CRATONVM_DBG=1` no longer enables it — that spelling now
@@ -954,6 +966,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inclusive-bce", on_key: Some("CRATONVM_JIT_INCLUSIVE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-allow-static", on_key: Some("CRATONVM_INLINE_ALLOW_STATIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-getfield", on_key: Some("CRATONVM_JIT_INLINE_GETFIELD"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-live-slot-clamp", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP"), off_word: None },
     E { group: Group::JIT, token: "inline-new", on_key: None, off_key: Some("CRATONVM_JIT_DISABLE_INLINE_NEW"), off_word: None },
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None },
@@ -1025,6 +1038,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "long-intrinsics", on_key: None, off_key: Some("CRATONVM_JIT_NO_LONG_INTRINSICS"), off_word: None },
     E { group: Group::JIT, token: "long-box-direct-helpers", on_key: Some("CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "varhandle-read-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "varhandle-write-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "main-inline", on_key: Some("CRATONVM_JIT_MAIN_INLINE"), off_key: None, off_word: None },
     // Default-ON kill switch for the `int[][]` matrix-dot emitter.
@@ -1082,6 +1096,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
+    // Declared 2026-08-24. An OPT-OUT: the optimizing tier republishes the
+    // innermost-frame mirror after an inline-cache hit by default, and this key
+    // restores the stale-mirror behaviour so one binary has both arms. See
+    // `ir_lower::emit_call_cached_entry`.
+    E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
@@ -1632,6 +1651,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "lazy-streams", on_key: Some("CRATONVM_LAZY_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "mh-strict-invokeexact", on_key: Some("CRATONVM_MH_STRICT_INVOKEEXACT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the
