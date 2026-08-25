@@ -1498,8 +1498,23 @@ pub(crate) fn native_es_knn_score_doc_query_init(
     }
     hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.cmp(&b.3)));
 
+    // Everything still live across the two allocations below has to be pinned:
+    // `score_docs` and `reader` are dereferenced afterwards, and `hits` holds a
+    // whole Vec of raw `ObjectRef`s that are stored back into `score_docs`.
+    // This is the `format_impl` shape with a collection instead of one array.
+    let sd_pin = ctx.pin_native_root(score_docs);
+    let rd_pin = ctx.pin_native_root(reader);
+    let mut hit_pins: Vec<usize> = Vec::with_capacity(hits.len());
+    for h in &hits {
+        hit_pins.push(ctx.pin_native_root(h.2));
+    }
     let docs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
     let scores_arr = ctx.new_array(cratonvm_types::ArrayElementType::Float, len);
+    let score_docs = ctx.read_native_pin(sd_pin, score_docs);
+    let reader = ctx.read_native_pin(rd_pin, reader);
+    for (i, h) in hits.iter_mut().enumerate() {
+        h.2 = ctx.read_native_pin(hit_pins[i], h.2);
+    }
     let mut docs = Vec::with_capacity(len);
     for (i, (doc, score, hit, _)) in hits.into_iter().enumerate() {
         docs.push(doc);

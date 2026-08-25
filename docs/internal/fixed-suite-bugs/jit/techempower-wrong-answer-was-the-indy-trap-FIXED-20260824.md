@@ -202,7 +202,7 @@ both arms fail alike, the flag is exonerated for one run's cost.
 ## 9. Related
 
 * `techempower-jit-wrong-answer-20260822.md` — the page this retires.
-* `hibernate/hib-reactive-3gc-run-regressions-20260820.md` §7.3 — where the 500
+* `../hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` §7.3 — where the 500
   was first seen, and still cites the retired page.
 * `jit::indy_bridge_enabled` (`CRATONVM_JIT_INDY_BRIDGE`) — the flag, and the
   measurement that motivated the bridge.

@@ -1,5 +1,14 @@
 # hibernate-reactive 3-GC run (2026-08-20): two defects, both now fixed
 
+> **RETIRED to internal 2026-08-24.** Both defects this page opened for are
+> fixed (`nio_selector` field corruption, and the JIT lambda direct-call arm
+> dropping a deoptimized frame), and §10's closing sweep re-ran the whole
+> 61-class non-passed set on current `dev`: 14 of the 17 genuine failures now
+> pass, and the three that remain are two host-environment classes that fail
+> identically under real HotSpot plus one documented performance residual.
+> No class in the hibernate-reactive suite is failing for a CratonVM
+> correctness reason. Kept for its method trail, which several later pages cite.
+
 **Status: BOTH FIXED (2026-08-22).**
 
 1. `nio_selector.rs`'s `SelectorImpl` field corruption — fixed and measured
@@ -33,7 +42,7 @@ which are the host's own timezone/locale (not CratonVM), 5 of which are one
 open lambda/`CompletableFuture`-dispatch performance characteristic.
 
 **Regression surfaced by:**
-[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+[RESULTS-20260820-3gc-postgres-local.md](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
 — the first full run of all 249 classes against a live Postgres container on
 3 collectors (ZGC/G1/Generational), at `dev@26e4b5db4`. 10 classes FAIL on
 every collector (GC-independent); of those, 2 are the already-known host
@@ -81,7 +90,7 @@ ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));     // SI_OPEN_FLAG = 4
 `SI_ID`/`SI_OPEN_FLAG` (0/4) are reference-typed on this class
 (`AbstractSelector.selectorOpen`, `SelectorImpl.selectedKeys` — confirmed via
 `javap -p` field-index flattening and the developer's own comment). Per
-[G30-1](../jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)'s
+[G30-1](../../../known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)'s
 `primitive-into-reference` coercion, an `Int` store there is silently
 descriptor-coerced to `null`. `SelectorImpl.selectedKeys()` is `public final`
 real JDK bytecode returning that field directly, so **every** `Selector.open()`
@@ -198,7 +207,7 @@ found by `contains()` yet.
 * Not the `nio_selector.rs` defect in §1 — reproduced identically on the
   binary carrying that fix.
 * Not the `primitive-into-reference` coercion guard
-  ([G30-1](../jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)):
+  ([G30-1](../../../known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md)):
   a targeted `CRATONVM_DBG_COERCION=1`/`CRATONVM_DBG_LAYOUT=1` run of
   `FilterWithPaginationTest`, cross-referenced against
   `-Dhibernate.show_sql=true` timestamps around the failing query, found no
@@ -545,7 +554,7 @@ this section's traces was not committed.
 ## 5. 2026-08-21 — full rerun of the 18 non-passed classes on the idle Azure host, current dev tip
 
 All 18 classes named as non-passed in
-[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+[RESULTS-20260820-3gc-postgres-local.md](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
 rerun against `dev@77e712ec6` + this session's docs-only branch (same binary
 as section 4, `cratonvm-hibidle`), on the idle Azure host, default (ZGC)
 collector.
@@ -1137,7 +1146,7 @@ The whole 249-class `testlist.txt` on the fixed binary against **MySQL** in
 Docker (Testcontainers, one container per class), all three collectors, with a
 real-HotSpot control on the same database, list, argfile and shard count. Full
 write-up:
-[`RESULTS-20260822-3gc-mysql-local.md`](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
+[`RESULTS-20260822-3gc-mysql-local.md`](../../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
 
 204 runnable classes per arm (249 minus the 45 no-`@@RESULT` classes):
 

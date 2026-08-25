@@ -4457,7 +4457,12 @@ fn bs_checked_range(
 fn native_bs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let layout = bs_layout(ctx);
+    // `new_array` allocates, so it can collect and move `this`. Pin and
+    // re-derive before writing through it -- the `format_impl` shape, see
+    // `docs/known-issues/gc/unpinned-native-locals-candidate-audit-20260824.md`.
+    let this_pin = ctx.pin_native_root(this);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, 1);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, layout.words, Value::Object(Some(words)));
     if let Some(slot) = layout.words_in_use {
         ctx.set_field(this, slot, Value::Int(0));
@@ -4481,7 +4486,10 @@ fn native_bs_init_nbits(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let layout = bs_layout(ctx);
     let nwords = bs_word_count(nbits).max(1);
+    // See `native_bs_init`: the allocation can move `this`.
+    let this_pin = ctx.pin_native_root(this);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, nwords);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, layout.words, Value::Object(Some(words)));
     if let Some(slot) = layout.words_in_use {
         ctx.set_field(this, slot, Value::Int(0));
