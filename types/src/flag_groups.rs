@@ -679,6 +679,9 @@ pub const INVENTORY: &[E] = &[
     // element inside the scan. An empty view that saw no pairs and one whose
     // every comparison landed out of range are different defects and nothing
     // else can tell them apart.
+    // `<class-name-substring>:<slot>` — narrow the punned-reference report to
+    // one field, e.g. `SQLChar:1`. Carries a VALUE, not a bare on/off.
+    E { group: Group::DBG, token: "watch-pun", on_key: Some("CRATONVM_DBG_WATCH_PUN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "view-kind", on_key: Some("CRATONVM_DBG_VIEWKIND"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "view-resync", on_key: Some("CRATONVM_DBG_VIEWRESYNC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
@@ -1060,6 +1063,9 @@ pub const INVENTORY: &[E] = &[
     // BigEndianHeapByteBufTest against 736 for the native shadow), and
     // interlocked with `sp-ic-deopt-check` the same way.
     E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // Stop republishing the innermost-frame mirror at an inline-cache call
+    // site. Default-ON; the opt-out is the A/B for that republish.
+    E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
