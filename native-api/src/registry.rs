@@ -708,6 +708,21 @@ pub trait NativeClassAccess {
     /// `String` is genuinely what the caller needs.
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String>;
 
+    /// The `SourceFile` attribute of `class_id`, or `None` when the class
+    /// declares none (or is not loaded).
+    ///
+    /// Added so a `StackWalker` frame carrier can store a `ClassId` and build
+    /// its file name only if someone asks: `StackFrame.getFileName()` is read
+    /// for roughly one frame of a `filter(..).findFirst()` walk, and building
+    /// it eagerly cost a Java `String` allocation for every frame on the stack.
+    /// Default `None` so the many test `NativeContext` mocks are unaffected —
+    /// a carrier that gets `None` here answers `null`, exactly as one built
+    /// from a frame with no source file always did.
+    fn class_source_file(&self, class_id: ClassId) -> Option<String> {
+        let _ = class_id;
+        None
+    }
+
     /// The class name for a `ClassId`, **without allocating**.
     ///
     /// The VM stores a class's name as an `Arc<str>` and

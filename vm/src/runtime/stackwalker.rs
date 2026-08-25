@@ -368,6 +368,53 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
     interleave_compiled_frames(class_store, frames, &jit)
 }
 
+/// The declaring class of every frame on this thread's Java stack, INNERMOST
+/// first, with compiled frames spliced in — the [`capture_full_trace`] frame set
+/// without any of its string, line-number or `StackTraceEntry` work.
+///
+/// This exists because `NativeContext::frame_class_ids` used to map
+/// `thread.frames` alone. A JIT-compiled method pushes no interpreter `Frame`,
+/// so its class was ABSENT from that list, and every caller-attribution site
+/// that walks it silently answered with the next frame down:
+///
+///   * `lang_class::resolve_caller_class_id` — the accessor for the JEP 403
+///     deep-reflection check and the member-modifier gate;
+///   * `classloader.rs` / `lang_system.rs` — the caller's `ClassLoader` for
+///     `Class.forName(String)` and friends.
+///
+/// It fails in BOTH directions, which is why it is worth fixing rather than
+/// tolerating: a java.base caller that tiered up disappears and a classpath
+/// frame below it is blamed (`StackStreamFactory$StackFrameBuffer.fill`
+/// constructing `StackFrameInfo` was denied with `module java.base does not
+/// "opens java.lang" to unnamed module`, and only with the JIT on), and
+/// symmetrically a compiled APPLICATION frame disappears behind a JDK frame and
+/// is granted access it should not have.
+///
+/// Same ordering and same OSR de-duplication as [`capture_full_trace`]; the
+/// two must agree about what "the frames of this thread" are.
+pub fn frame_class_ids_with_compiled(frames: &[Frame]) -> Vec<ClassId> {
+    let jit = crate::jit::conservative_roots::active_compiled_frames();
+    if jit.is_empty() {
+        return frames.iter().rev().map(|f| f.class_id).collect();
+    }
+    let jit = drop_osr_continuations(frames, jit);
+    let mut out: Vec<ClassId> = Vec::with_capacity(frames.len() + jit.len());
+    let mut next = 0usize;
+    for (i, f) in frames.iter().enumerate() {
+        while next < jit.len() && (jit[next].0 as usize) <= i {
+            out.push(ClassId::new(jit[next].2));
+            next += 1;
+        }
+        out.push(f.class_id);
+    }
+    for slot in &jit[next..] {
+        out.push(ClassId::new(slot.2));
+    }
+    // `frames` is outermost-first; every consumer wants innermost-first.
+    out.reverse();
+    out
+}
+
 /// Kill switch for [`drop_osr_continuations`]. Default ON;
 /// `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE=1` restores the duplicate, which is what
 /// makes the frame-count difference an A/B inside one binary.
