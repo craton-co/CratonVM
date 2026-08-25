@@ -1506,6 +1506,63 @@ fn zip_output_write_primitive(
     Ok(None)
 }
 
+/// Does `stream` really carry the real-JDK `ByteArrayInputStream` layout
+/// `{ buf, pos, mark, count }`, so `transferTo`'s "just advance `pos`" fast
+/// path may write slot 1?
+///
+/// # Why this is not a slot-shape test
+///
+/// It used to be one: read slots 0, 1 and 3 and accept any
+/// `(ref, int, int)`. Two things are wrong with that, and the second is the one
+/// that reached production.
+///
+/// * **A receiver with fewer slots is read out of bounds.** Tomcat's
+///   `org.apache.catalina.connector.CoyoteInputStream` declares exactly one
+///   field (`ib`), and its supertypes `ServletInputStream` / `InputStream`
+///   declare none -- so `get_field(input, 1)` and `get_field(input, 3)` read
+///   two slots past the object. Every `Files.copy(request.getInputStream(),
+///   path, ...)` in `DefaultServlet.doPut` did it: 16 hits of
+///   `zgc real: field index OOB index=1/3 num_slots=1 op="get"` in one
+///   `catalina.servlets.TestDefaultServletRfc9110Section13` run, 8 in
+///   `TestWebdavServletOptionsUnknown`, and the same receiver is on the stack
+///   of the `TestSwallowAbortedUploads` SIGSEGV.
+///
+///   ZGC's `check_field_index` catches the read and hands back a default, so on
+///   that collector the duck test merely answers "no" noisily. That is the
+///   benign end of the range, not the contract: a collector that does not
+///   bounds-check the slot reads whatever follows the object -- the next
+///   object's header, or a free-list cell -- and a `(ref, int, int)` answer
+///   there ADMITS the fast path, which then `set_field`s slot 1 of a stream
+///   that has no slot 1. An out-of-bounds read that decides a subsequent
+///   out-of-bounds write is how a wrong answer becomes heap corruption.
+///
+/// * **Even in bounds it identifies the wrong class.** Any stream whose slots
+///   0/1/3 happen to hold `(ref, int, int)` passes -- the shape is not
+///   distinctive, and nothing about it implies the `pos`/`count` contract the
+///   fast path then assumes.
+///
+/// `native-io`'s `input_stream_has_bais_layout` already answers this question
+/// the right way, and this is deliberately the same test: the slot count first
+/// (so no read can go out of bounds), then class identity, then the subclass
+/// walk. The bare `java/io/InputStream` arm is carried over from that function
+/// unchanged so no receiver this path used to accept is dropped.
+fn has_byte_array_stream_layout(ctx: &mut dyn NativeContext, stream: ObjectRef) -> bool {
+    // Slot 3 is the highest index the fast path touches, so four slots is the
+    // minimum that makes any of the reads below legal.
+    if ctx.object_num_fields(stream) <= 3 {
+        return false;
+    }
+    let cid = ctx.class_id_of_object(stream);
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some("java/io/ByteArrayInputStream") | Some("java/io/InputStream") => return true,
+        _ => {}
+    }
+    match ctx.class_id_by_name("java/io/ByteArrayInputStream") {
+        Some(bais_cid) => ctx.is_subclass(cid, bais_cid),
+        None => false,
+    }
+}
+
 fn native_input_stream_transfer_to(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1526,14 +1583,7 @@ fn native_input_stream_transfer_to(
     // for a ByteArrayInputStream the observable result is simply consuming its
     // remaining bytes.  The null stream is fresh/open here, so advancing `pos`
     // preserves the JDK contract without touching the payload.
-    let byte_array_stream_layout = matches!(
-        (
-            ctx.get_field(input, 0),
-            ctx.get_field(input, 1),
-            ctx.get_field(input, 3),
-        ),
-        (Value::Object(Some(_)), Value::Int(_), Value::Int(_))
-    );
+    let byte_array_stream_layout = has_byte_array_stream_layout(ctx, input);
     if byte_array_stream_layout
         && ctx
             .class_name_arc_of_id(ctx.class_id_of_object(output))
@@ -3487,6 +3537,64 @@ pub(crate) fn inflater_advance(
         return (input_len, false);
     }
     (start + consumed, false)
+}
+
+#[cfg(test)]
+mod byte_array_stream_layout_tests {
+    use super::has_byte_array_stream_layout;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::{NativeClassAccess, NativeContext, NativeHeapAccess};
+
+    /// Register `java/io/ByteArrayInputStream` in every case, so the subclass
+    /// arm of the predicate is actually exercised rather than short-circuiting
+    /// on an unknown name -- a negative that held for the wrong reason would
+    /// not guard anything.
+    fn ctx_with_bais() -> (MockNativeContext, cratonvm_types::ClassId) {
+        let mut ctx = MockNativeContext::new();
+        let bais = ctx
+            .ensure_class_initialized("java/io/ByteArrayInputStream")
+            .expect("declare ByteArrayInputStream");
+        (ctx, bais)
+    }
+
+    /// The shape test this replaced read slots 1 and 3 of any receiver.
+    /// Tomcat's `CoyoteInputStream` declares exactly one field, so those reads
+    /// landed past the object -- 16 `zgc real: field index OOB index=1/3
+    /// num_slots=1 op="get"` warnings per
+    /// `catalina.servlets.TestDefaultServletRfc9110Section13` run.
+    #[test]
+    fn a_one_slot_stream_is_refused_and_never_read_past() {
+        let (mut ctx, _bais) = ctx_with_bais();
+        let coyote = ctx
+            .ensure_class_initialized("org/apache/catalina/connector/CoyoteInputStream")
+            .expect("declare CoyoteInputStream");
+        let stream = ctx.alloc_object(coyote, 1);
+        assert_eq!(ctx.object_num_fields(stream), 1);
+        assert!(!has_byte_array_stream_layout(&mut ctx, stream));
+    }
+
+    /// A real `ByteArrayInputStream` still takes the fast path: the point of
+    /// the fix is to identify the class, not to disable the path.
+    #[test]
+    fn a_real_byte_array_input_stream_is_accepted() {
+        let (mut ctx, bais) = ctx_with_bais();
+        let stream = ctx.alloc_object(bais, 4);
+        assert!(has_byte_array_stream_layout(&mut ctx, stream));
+    }
+
+    /// An unrelated stream WIDE ENOUGH for the reads is refused on class
+    /// identity. The old test accepted it whenever slots 0/1/3 happened to hold
+    /// `(ref, int, int)`, which is not a distinctive shape.
+    #[test]
+    fn a_wide_but_unrelated_stream_is_refused_on_identity() {
+        let (mut ctx, _bais) = ctx_with_bais();
+        let other = ctx
+            .ensure_class_initialized("org/example/ChunkedInputStream")
+            .expect("declare ChunkedInputStream");
+        let stream = ctx.alloc_object(other, 4);
+        assert_eq!(ctx.object_num_fields(stream), 4);
+        assert!(!has_byte_array_stream_layout(&mut ctx, stream));
+    }
 }
 
 #[cfg(test)]

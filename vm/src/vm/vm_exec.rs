@@ -12191,6 +12191,43 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
+        // CRATONVM_DBG_STRAYSTACK, the native READ door -- the twin of the
+        // write door in `set_field` below. Every door instrumented before
+        // today was a WRITE door, so an accessor that only ever READS
+        // out of bounds had nothing to name it: the Tomcat
+        // `CoyoteInputStream` signature is 16 hits all carrying `op="get"`,
+        // and the straystack dump stayed empty on every one of them.
+        if youngscan_straystack_enabled() {
+            let h = self.shared.mem.heap.get_header(obj);
+            if index >= h.num_slots() as usize || h.num_slots() > (1 << 24) {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let k = N.fetch_add(1, Ordering::Relaxed);
+                if k < 12 {
+                    let (_cb_addr, culprit) = CURRENT_NATIVE_STACK
+                        .with(|s| s.borrow().last().cloned())
+                        .unwrap_or((0, "<none: not inside a native>".to_string()));
+                    eprintln!(
+                        "[straystack-native] #{k} OOB ctx.get_field recv@0x{:x} cid={} num_slots={} idx={} CULPRIT-NATIVE={}",
+                        obj.as_ptr() as usize,
+                        h.class_id.as_u32(),
+                        h.num_slots(),
+                        index,
+                        culprit,
+                    );
+                    eprintln!("[straystack-native] Java stack (top first):");
+                    for f in self.thread.frames.iter().rev().take(28) {
+                        eprintln!(
+                            "[straystack-native]   {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc,
+                        );
+                    }
+                }
+            }
+        }
         // CRATONVM_DBG_CORRUPT_CELL: remember the collector's corrupt-cell
         // counter across this read, so a read that trips it can be attributed to
         // its RECEIVER and its Java frames. See `corrupt_cell_dbg`.

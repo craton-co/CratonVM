@@ -1754,28 +1754,14 @@ pub(super) fn execute_invokevirtual_cached(
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
                     // slow path, which dispatches their SAM method handle.
-                    if !is_special
-                        && shared
-                            .classes
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.classes.is_lambda_proxy_class(actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
                     // toString from Object) must dispatch through the spec-compliant
                     // interception in `execute_invoke`, not Object's bytecode.
-                    if !is_special {
-                        let cm = shared.classes.class_manager.read();
-                        let is_ann_proxy = cm
-                            .get_class(actual_class_id)
-                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
-                            .unwrap_or(false);
-                        drop(cm);
-                        if is_ann_proxy {
-                            return Ok(CachedCallResult::CacheMiss);
-                        }
+                    if !is_special && shared.classes.is_annotation_proxy_class(actual_class_id) {
+                        return Ok(CachedCallResult::CacheMiss);
                     }
 
                     // A cache entry created through a vtable slot is valid for
@@ -2050,7 +2036,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // `OrderedPlRwLock<ClassManager>::try_read` at 1.67% and
                     // `::read` at 1.38% of the interpreted-invoke arm, both
                     // attributed straight to this function. See
-                    // known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+                    // known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
                     //
                     // Called in place in the `&&` chain they inherit its
                     // short-circuit, which is what the ordering of that chain
@@ -2408,28 +2394,14 @@ pub(super) fn execute_invokevirtual_cached(
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
-                    if !is_special
-                        && shared
-                            .classes
-                            .lambda_proxies
-                            .read()
-                            .contains_key(&actual_class_id)
-                    {
+                    if !is_special && shared.classes.is_lambda_proxy_class(actual_class_id) {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:
                     // AnnotationProxy method dispatch must always go through
                     // `execute_invoke`'s spec-compliant interception layer.
-                    if !is_special {
-                        let cm = shared.classes.class_manager.read();
-                        let is_ann_proxy = cm
-                            .get_class(actual_class_id)
-                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
-                            .unwrap_or(false);
-                        drop(cm);
-                        if is_ann_proxy {
-                            return Ok(CachedCallResult::CacheMiss);
-                        }
+                    if !is_special && shared.classes.is_annotation_proxy_class(actual_class_id) {
+                        return Ok(CachedCallResult::CacheMiss);
                     }
 
                     let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
