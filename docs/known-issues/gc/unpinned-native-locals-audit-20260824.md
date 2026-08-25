@@ -1,8 +1,14 @@
-# ✅ RESOLVED — eight natives held an unpinned reference across a GC-capable call
+# Eight natives fixed, and the search that found them has a blind spot worth 34 more
 
 ## Status
 
-**RESOLVED 2026-08-24.** Audited `native-builtins` for the shape that cost a
+**OPEN.** Eight instances fixed 2026-08-24; the audit that found them was then
+shown to miss an entire shape, and re-running it with that shape included yields
+**34 further candidates in the same crate**. See "The blind spot is real" below.
+This page moved to `docs/internal` as resolved for about an hour and moved back;
+the fixes below stand, the SEARCH does not.
+
+**What is fixed:** Audited `native-builtins` for the shape that cost a
 week in
 `bug-generational-ntru-unpinned-jit-reference-20260821-FIXED.md`, found eight
 instances, fixed all eight with the idiom already used ~4900 times in this tree.
@@ -76,6 +82,59 @@ reviewer hand-checks a pile of those.
   allowlist: `unsafe_natives.rs` pins the AQS blocker for *retention only*
   across `park()` and never dereferences it, and `graalvm_compat.rs` pins
   `ImageSingletons` permanently by design.
+
+## The blind spot is real, and it is mine
+
+`ea5ed2704` (an independent session, same day) found a confirmed defect of this
+exact shape that **this audit could not see**, and named two reasons:
+
+1. **Scope.** This search covered `native-builtins/src` only. Their defect —
+   `collect_collection_elements_or_real`, dispatching `toArray()` on a receiver
+   G1 had evacuated during the `size()` one line above — is in
+   `native-collections/src/lib.rs`.
+2. **Parameters are invisible.** My rule was "an object-typed local *bound*
+   before a GC-capable call". A function PARAMETER is never `let`-bound, so it
+   never matched — and as they point out, a helper that takes a receiver and
+   drives its Java is the *normal* way this code is factored, so the parameter
+   case is probably the commoner one.
+
+Their complementary rule is better and does not care about binding at all: **two
+or more `ctx.invoke_*` on the SAME receiver identifier within one scope, with no
+`read_native_pin` between them.**
+
+Re-running that rule, with this page's closure-scoping filter applied:
+
+```text
+native-collections/src   0     (they fixed it; 1065 read_native_pin there now)
+native-builtins/src     34     <- NOT covered by the eight fixes above
+```
+
+Tightest spans first, which is roughly risk order:
+
+```text
+span 1   io_streams.rs:853          register_p70_object_streams()  `stream`
+span 1   properties_sidetable.rs:3303  native_properties_equals()  `entry`
+span 1   nio_file.rs:6759           register_phase57_nio_file()    `out`
+span 1   ssl_security.rs:760/824    register_p68_crypto_mac()      `spi`
+span 2   logging_shims.rs:1289      native_printstream_close()     `sink`
+span 2   phases_early.rs:5643       enum_declaring_class_from_object()  `elem`
+span 4   jmx.rs:2585                try_delegate_to_real_provider() `iter_obj`
+span 4   service_loader.rs:3209     native_sl_spliterator()        `iter`
+span 4   phases_late.rs:1369        collect_map_entries_as_strings() `entry`
+```
+
+Several are the iterator shape — `hasNext()` then `next()` on a receiver held
+across both — which is structurally what their confirmed defect was.
+
+**These 34 are not triaged and not fixed.** They have not been through the two
+filters that took the original 1074 to 8 (real object handle; actually
+dereferenced after), so the true count is lower. That triage is the remaining
+work on this page.
+
+One caution they record, which applies to anything on this list:
+`report_reclaimed_receiver` stayed silent throughout their investigation. It
+asks the FREE LIST, and an evacuated G1 region is not a free-list block — so a
+quiet reclaim guard does not clear a candidate.
 
 ## If this is worth a gate
 
