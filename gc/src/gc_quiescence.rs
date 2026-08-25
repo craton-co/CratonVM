@@ -1795,12 +1795,36 @@ pub fn root_source_of(addr: usize) -> Option<&'static str> {
 /// Installed by the VM: capture the native return-address chain as
 /// `exe`-relative RVAs, ready to paste into `CRATONVM_SYMBOLIZE`.
 ///
-/// `std::backtrace::Backtrace` is useless in this tree's release profile --
-/// fat LTO plus `debug = "line-tables-only"` renders every frame `<unknown>`
-/// -- but the crash handler's `RtlCaptureStackBackTrace` + `exe+RVA` pair
-/// symbolizes fine offline against the matching PDB. That machinery is
-/// Windows FFI living in the VM crate, so the collector reaches it through a
-/// doorway, exactly as with the root-source lookup above.
+/// The crash handler's `RtlCaptureStackBackTrace` + `exe+RVA` pair symbolizes
+/// offline against the matching PDB. That machinery is Windows FFI living in
+/// the VM crate, so the collector reaches it through a doorway, exactly as
+/// with the root-source lookup above.
+///
+/// # This hook has NO caller, and on Linux it needs none
+///
+/// `install_native_rva_hook` is called nowhere in the tree, so [`native_rvas`]
+/// returns empty and every caller takes its `Backtrace::force_capture`
+/// fallback.
+///
+/// That is fine, and the claim this comment used to carry -- that
+/// `std::backtrace::Backtrace` "is useless in this tree's release profile, fat
+/// LTO plus `debug = "line-tables-only"` renders every frame `<unknown>`" --
+/// is **false on Linux**. Measured 2026-08-24 on a fat-LTO release build:
+/// `report_corpse_read`'s fallback emitted **40 fully symbolized frames with
+/// file:line**, naming the offending native four frames up
+/// (`native_input_stream_transfer_to` at `zip_streams.rs:1532:17`).
+/// `panic = "unwind"` is set for this profile, so `.eh_frame` is emitted and
+/// the unwinder walks normally, and `debug = "line-tables-only"` is precisely
+/// what a backtrace needs.
+///
+/// The warning cost time in the other direction: believing it, a session went
+/// to `gdb` for an answer the report had already printed, and then reported
+/// the in-process capture as broken. On Linux, read the log lines AFTER the
+/// `backtrace=` field -- `Display` is multi-line, so a one-line `grep` shows
+/// the first frame and nothing else, which is exactly what "one frame, useless"
+/// looks like.
+///
+/// Whether the MSVC build still needs the RVA path is untested here.
 static NATIVE_RVA_HOOK: std::sync::OnceLock<fn() -> Vec<usize>> = std::sync::OnceLock::new();
 
 /// Install the RVA capture. First call wins.
