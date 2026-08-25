@@ -4156,9 +4156,14 @@ fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // and threw "HttpURLConnection: URL not set").
     if let Some(Value::Object(Some(url_obj))) = args.get(1) {
         let url_obj = *url_obj;
-        if let Ok(Some(Value::Object(Some(s)))) =
-            ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
-        {
+        // `toExternalForm()` is real Java: it allocates a String and can move
+        // both `this` and `url_obj`, each of which is written through below.
+        let this_pin = ctx.pin_native_root(this);
+        let url_pin = ctx.pin_native_root(url_obj);
+        let call = ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[]);
+        let this = ctx.read_native_pin(this_pin, this);
+        let url_obj = ctx.read_native_pin(url_pin, url_obj);
+        if let Ok(Some(Value::Object(Some(s)))) = call {
             if let Some(full) = ctx.read_string(s) {
                 if full.contains("://") {
                     ctx.set_field(this, HUC_CONN_ID, Value::Object(Some(url_obj)));

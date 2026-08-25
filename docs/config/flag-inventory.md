@@ -685,6 +685,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_CLONE` | DBG | `CRATONVM_DBG=clone` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_COERCE` | DBG | `CRATONVM_DBG=coerce` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_COERCION` | DBG | `CRATONVM_DBG=coercion` | opt-in | off | diag | snapshot | gc |
+| `CRATONVM_DBG_COLL_REFRESH` | DBG | `CRATONVM_DBG=coll-refresh` | opt-in | off | diag | snapshot | native-collections |
 | `CRATONVM_DBG_COMPACTVALUE` | DBG | `CRATONVM_DBG=compactvalue` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_COMPACT_INLINE` | DBG | `CRATONVM_DBG=compact-inline` | opt-in | off | diag | snapshot | jit, vm |
 | `CRATONVM_DBG_COMPACT_LEGACY` | DBG | `CRATONVM_DBG=compact-legacy` | opt-in | off | diag | snapshot | types |

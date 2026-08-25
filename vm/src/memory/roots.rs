@@ -1099,6 +1099,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // number of cycles it actually decided.
         let (xt_accepted, xt_refused, xt_deposits) =
             cratonvm_gc::gc_quiescence::peer_coverage_counters();
+        // Engagement for the 2026-08-24 inline-cache frame-record republish:
+        // the COMPILE-time count of optimizing-tier IC sites that got it. A
+        // zero means that repair decided nothing in this run, whatever the
+        // frame_cov numbers beside it say.
+        let ic_fr_sites = cratonvm_jit::ic_frame_republish_sites();
         eprintln!(
             "[jitroots] precise_only={precise_only} proven={proven} moving_young={moving_young} \
              osr_fb={osr_fb} osr_reason=(shadow={osr_bad_shadow} debug={osr_debug_disabled} \
@@ -1106,6 +1111,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
              frame_cov=(no_slot={fc_no_slot} misaligned={fc_misaligned} no_map={fc_no_map} \
              incomplete={fc_incomplete} ok={fc_ok}) \
              xt_cov=(accepted={xt_accepted} refused={xt_refused} deposits={xt_deposits}) \
+             ic_fr_sites={ic_fr_sites} \
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \

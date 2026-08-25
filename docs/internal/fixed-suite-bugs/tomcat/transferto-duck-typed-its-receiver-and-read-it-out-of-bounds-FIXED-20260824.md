@@ -84,22 +84,33 @@ real layout differs — a textbook twin asymmetry. **They are not the reader**:
 those overrides were dropped (`_bis_dropped_overrides`), so the registration
 never happens. A registration proves nothing until its registrar runs.
 
-What actually named it was a debugger. The in-process capture is useless here —
-`gc_quiescence::native_rvas()` has **no installed hook at all**
-(`install_native_rva_hook` has zero callers, and the machinery it was written
-for is Windows `RtlCaptureStackBackTrace`), so it falls back to
-`Backtrace::force_capture`, which yields one frame under fat LTO. `gdb` unwinds
-what the process cannot:
+What actually named it was the report's own backtrace — and the fact that it
+took a debugger to notice is a mistake worth recording.
+
+`report_corpse_read` prints `backtrace=`, and on Linux that field carried **40
+fully symbolized frames with file:line**, naming the defect four frames up:
 
 ```text
-#0  report_corpse_read              gc/src/zgc.rs:8332
-#1  check_field_index               gc/src/zgc.rs:8059
-#2  get_field                       gc/src/zgc.rs:11594
-#3  get_field                       vm/src/vm/vm_exec.rs:12237
-#4  native_input_stream_transfer_to native-builtins/.../zip_streams.rs:1532
+  1: check_field_index                gc/src/zgc.rs:8059
+  2: get_field                        gc/src/zgc.rs:11594
+  3: get_field                        vm/src/vm/vm_exec.rs:12237
+  4: native_input_stream_transfer_to  native-builtins/.../zip_streams.rs:1532:17
 ```
 
-Line 1532 is the probe. One breakpoint, one backtrace, done.
+That was in the log from the first run. I did not see it because `Display` is
+multi-line: I printed the matching line, and a one-line view of a multi-line
+field shows frame 0 and nothing else. I read that as "one frame", concluded the
+in-process capture was broken under fat LTO, and went to `gdb` — which returned
+the same chain the log already had.
+
+Two comments in the tree encouraged that reading, and both are false on Linux:
+`gc_quiescence::native_rvas` said `std::backtrace::Backtrace` "is useless in
+this tree's release profile — fat LTO plus `debug = "line-tables-only"` renders
+every frame `<unknown>`", and `report_corpse_read` pointed at it. This profile
+sets `panic = "unwind"`, so `.eh_frame` is emitted and the unwinder walks
+normally; `line-tables-only` is exactly what a backtrace needs. Both comments
+are corrected, and `install_native_rva_hook` — which has no caller anywhere — is
+now documented as Windows-only machinery that Linux does not need.
 
 ## Regression test
 
@@ -139,3 +150,43 @@ dev, reproduce 3/3 in isolation there, and are untouched by this change.
 This fixes the reader that the backtrace named. Whether it is the *only* reader
 of the `num_slots` OOB signature across the suite is not established — these two
 classes are the ones that carry it today, and both are now clean.
+
+## Was this also the WRITER of the punned cell? Consistent, not observed
+
+The crash that started this family was a `[C` field, `SQLChar.rawData`, holding
+`Value::Int(1)` — a primitive in a reference slot. This native writes exactly
+that shape:
+
+```rust
+ctx.set_field(input, 1, Value::Int(count));   // slot 1
+```
+
+and `rawData` **is** slot 1. The pre-fix gate required only slots 0/1/3 to look
+like `(Object, Int, Int)`, which a `SQLChar` satisfies whenever `value` (slot 0)
+holds a String and `rawData` (1) and `cKey` (3) are still zero-filled — a
+zero-filled cell decodes as `Int(0)`.
+
+Interleaved A/B on `TestWebdavPropertyStore`, same host, arms alternated per
+run, counting dangerous punned cells (non-zero payload under a non-`Object`
+tag):
+
+| arm | runs | punned |
+|---|---:|---:|
+| before this fix | 93 | **3** |
+| after it | 93 | **0** |
+
+All three pre-fix hits are byte-identical: `class_id=1849 num_slots=8
+field_index=1 tag=0 payload32=0x1 payload64=0x1 decoded=Int(1)`.
+
+**That is consistent, not proof.** Against a 3-in-93 base rate, 0 in 93 is about
+a 1-in-20 coincidence — the same strength as the crash A/B, and quoted the same
+way. The decisive experiment is the writer-side watch added alongside this
+(`CRATONVM_DBG_WATCH_PUN=<class-substring>:<slot>`, which prints a backtrace at
+the store), run on a binary that still has the bug. That build was attempted
+twice and **OOM-killed both times** (`signal: 9`, once at full parallelism and
+once at `-j 2`) on a shared host running 23–30 GB of other people's work. So the
+watch is in the tree, wired and ready, and the observation is not made.
+
+If picking this up: revert the class gate, build with `-j 2` when
+`free -g` shows headroom, and run the concurrent recipe with
+`CRATONVM_DBG_WATCH_PUN=SQLChar:1`. One firing settles it.
