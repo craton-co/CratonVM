@@ -4825,6 +4825,18 @@ pub fn dump_selector_state_to_stderr() {
             st.in_flight_selects,
             st.keys.len()
         );
+        #[cfg(target_os = "linux")]
+        eprintln!(
+            "    epoll_fd={:?} wakeup_pipe=({:?},{:?}) wakeup_pipe_readable={}",
+            st.epoll_fd,
+            st.wakeup_pipe_read,
+            st.wakeup_pipe_write,
+            st.wakeup_pipe_read
+                .map(|fd| kernel_readiness(fd)
+                    .map(|r| format!("{}", r & libc::POLLIN as i16 != 0))
+                    .unwrap_or_else(|| "<poll failed>".to_string()))
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
         for (slot, k) in st.keys.iter() {
             // `slot` is the map key: for a channel registered before it had a
             // socket this is a placeholder, not an fd. `alloc_unresolved_fd`
@@ -4833,14 +4845,103 @@ pub fn dump_selector_state_to_stderr() {
             // on `k.net_fd > 0` and therefore skips every such key.
             let unresolved = *slot <= UNRESOLVED_FD_BASE;
             eprintln!(
-                "    slot={slot}{} net_fd={} interest=0x{:x} ready=0x{:x} cancelled={} listener={}",
+                "    slot={slot}{} net_fd={} interest=0x{:x} ready=0x{:x} cancelled={} listener={} kernel={}",
                 if unresolved { " (UNRESOLVED)" } else { "" },
                 k.net_fd,
                 k.interest_ops,
                 k.ready_ops,
                 k.cancelled,
                 k.handle.is_listener(),
+                describe_kernel_readiness(if unresolved { -1 } else { *slot }),
             );
+        }
+    }
+}
+
+/// The KERNEL's own readiness bitmask for `fd`, via a zero-timeout `poll(2)`.
+///
+/// `None` when the fd is not pollable (negative, closed, or `poll` errored),
+/// which is itself worth printing: a registered key whose fd the kernel will
+/// not even poll is a different finding from one that polls clean.
+///
+/// Zero timeout, one fd, no allocation, and it runs only from the watchdog
+/// census — so it cannot perturb the race it is measuring, and it cannot
+/// block the way a diagnostic that took a lock could.
+fn kernel_readiness(fd: i32) -> Option<i16> {
+    if fd < 0 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: (libc::POLLIN | libc::POLLOUT | libc::POLLPRI) as i16,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd`, count 1, zero timeout — `poll` reads
+        // `events` and writes `revents` and nothing else.
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+        if rc < 0 {
+            return None;
+        }
+        Some(pfd.revents)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// Render [`kernel_readiness`] as flags a reader can act on.
+///
+/// # Why the census needs an INDEPENDENT readiness answer
+///
+/// `interest_ops` and `ready_ops` are this multiplexer's own bookkeeping. When
+/// a reactor sits in `select` while a Java thread waits forever on a promise,
+/// the two candidate explanations —
+///
+///  * the peer never sent anything, so there was nothing to report; and
+///  * the peer sent, and this multiplexer never reported it —
+///
+/// produce the SAME census line (`ready=0x0`), which is why the netty residual
+/// page could not choose between them. `poll(2)` is a second opinion from the
+/// kernel, taken at the moment of the stall: `POLLIN` on a socket whose key
+/// reads `ready=0x0`, with the reactor parked, says readiness was lost inside
+/// the VM. A clean poll on every socket says the bytes were never sent and the
+/// defect is upstream of the selector entirely.
+fn describe_kernel_readiness(fd: i32) -> String {
+    match kernel_readiness(fd) {
+        None => "<not-pollable>".to_string(),
+        Some(revents) => {
+            let mut flags: Vec<&str> = Vec::new();
+            #[cfg(unix)]
+            {
+                let bit = |b: libc::c_short| revents & (b as i16) != 0;
+                if bit(libc::POLLIN) {
+                    flags.push("IN");
+                }
+                if bit(libc::POLLOUT) {
+                    flags.push("OUT");
+                }
+                if bit(libc::POLLPRI) {
+                    flags.push("PRI");
+                }
+                if bit(libc::POLLERR) {
+                    flags.push("ERR");
+                }
+                if bit(libc::POLLHUP) {
+                    flags.push("HUP");
+                }
+                if bit(libc::POLLNVAL) {
+                    flags.push("NVAL");
+                }
+            }
+            if flags.is_empty() {
+                format!("0x{revents:x}(quiet)")
+            } else {
+                format!("0x{revents:x}({})", flags.join("|"))
+            }
         }
     }
 }
