@@ -6820,12 +6820,27 @@ impl<'a> NativeContextImpl<'a> {
         }
         drop(snapshot);
         // Publish a line-less frame trace alongside the root snapshot so another
-        // thread can read where THIS thread is parked (cross-thread
-        // `Thread.getStackTrace()` / `dumpThreads()`). Same deposit points as the
-        // root snapshot, so for a blocked thread it reflects the blocking call
-        // site. Capture is lock-free (no ClassStore / line lookup) to stay cheap
-        // at every deposit site.
-        {
+        // thread can read where THIS thread is PARKED (cross-thread
+        // `Thread.getStackTrace()` / `dumpThreads()`). For a blocked thread it
+        // reflects the blocking call site, which is the whole point of it.
+        //
+        // ONLY on the flag-raising deposit. This is a DIAGNOSTIC, not a GC root
+        // — nothing in `collect_all_root_snapshots` reads it — and for a thread
+        // that is still RUNNING (`deposit_root_snapshot_no_flag`: the wake path
+        // and `refresh_root_snapshot`) it answers a question nobody asked: the
+        // thread is not parked anywhere, and its trace is stale again before the
+        // deposit returns. A running thread's dump has a live producer anyway
+        // (`stw_publish_frame_traces`, which republishes at the pause).
+        //
+        // It is not cheap, despite "capture is lock-free": it allocates a
+        // `Vec<StackTraceEntry>` with four `Arc` clones PER JAVA FRAME, every
+        // time. On the synthetic-stream drain loops — which refresh the deposit
+        // once per element (`stream_pull_internal`) — that is O(depth)
+        // allocations per stream element. Profiling a `StackWalker.walk` at
+        // depth 120 put `capture_frames_no_lines` at 3.9% and the matching
+        // `drop_glue::<Vec<StackTraceEntry>>` at 3.3%, i.e. ~7% of the run spent
+        // building and freeing a trace of a thread that was never parked.
+        if raise_blocked_flag {
             let trace = crate::runtime::stackwalker::capture_frames_no_lines(&self.thread.frames);
             *self.thread.frame_trace.lock() = trace;
         }
@@ -8477,6 +8492,16 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         let class_id = self.resolve_class_loader_faithful(name)?;
         let mirror = super::get_or_create_class_mirror(self.shared, class_id);
         Ok(Some(Value::Object(Some(mirror))))
+    }
+
+    fn class_source_file(&self, class_id: ClassId) -> Option<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let file = cm
+            .class_store()
+            .get(class_id)
+            .and_then(|c| c.source_file.as_deref().map(str::to_string));
+        drop(cm);
+        file
     }
 
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
@@ -16459,16 +16484,15 @@ impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
     }
 
     fn frame_class_ids(&self) -> Vec<ClassId> {
-        // `self.thread.frames` is stored outermost-first (index 0 = the
-        // oldest call still on the stack); reverse so callers see
-        // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
+        // Innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
         // convention (see its own callers, e.g. `resolve_caller_class_id`).
-        self.thread
-            .frames
-            .iter()
-            .rev()
-            .map(|f| f.class_id)
-            .collect()
+        //
+        // This used to map `self.thread.frames` directly, which SKIPS every
+        // JIT-compiled frame — a compiled method pushes no interpreter `Frame`.
+        // Caller attribution then blamed the next frame down. See
+        // `stackwalker::frame_class_ids_with_compiled` for the two directions
+        // that gets wrong and the witness for each.
+        crate::runtime::stackwalker::frame_class_ids_with_compiled(&self.thread.frames)
     }
 }
 

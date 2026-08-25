@@ -25328,6 +25328,59 @@ fn stream_process_chain(
     result
 }
 
+/// How often the synthetic-stream drain loops re-publish this thread's GC root
+/// snapshot: every Nth element, not every element.
+///
+/// `NativeContext::refresh_root_snapshot`'s contract asks for a publish "right
+/// after establishing such a batch of pins (**and optionally again
+/// periodically** across a long per-element loop)". The up-front publish is the
+/// one that closes the documented gap — it is what makes this thread's
+/// `native_pin_roots` visible to a peer-initiated STW collection at all. The
+/// per-iteration one is the optional half, and it was running on EVERY element.
+///
+/// It is not free. Each call is a full deposit: the whole per-frame root
+/// snapshot is cleared and rebuilt, `scan_active_jit_frames` runs (including
+/// the A5 unregistered-frame probe, a raw word scan of the native stack above
+/// the scanner), and the SATB buffer is flushed. Measured on a
+/// `StackWalker.walk` over a 120-frame stack, 500 walks
+/// (`CRATONVM_DBG_ROOTPROF=1`):
+///
+/// ```text
+/// scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=86,700
+/// jitprobe calls=86,081 words=637,620,424
+/// ```
+///
+/// 638 MILLION words — 5.1 GB of native stack read — for 500 walks, at a
+/// constant ~7,400 words (59 KB) per call, with the call COUNT scaling linearly
+/// in stack depth because the stream has one element per frame. Neither the
+/// collector nor a safepoint asked for any of it: both other callers are zero.
+///
+/// The pins this refresh exists to publish are pushed ONCE, before the loop,
+/// and do not change across iterations — so every one of those deposits
+/// republished a bit-identical snapshot. Refreshing every Nth element keeps the
+/// periodic republish the contract asks for, with a bounded window, at 1/N the
+/// cost. `CRATONVM_GC_STREAM_REFRESH_EACH=1` restores the per-element cadence,
+/// so both arms are reachable from one binary.
+fn stream_refresh_interval() -> usize {
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STREAM_REFRESH_EACH").is_some() {
+            1
+        } else {
+            32
+        }
+    })
+}
+
+/// Should the drain loop re-publish before element `idx`?
+///
+/// `idx == 0` is never asked (the caller publishes up front, unconditionally).
+#[inline]
+fn stream_should_refresh(idx: usize) -> bool {
+    let every = stream_refresh_interval();
+    every <= 1 || idx % every == 0
+}
+
 fn stream_pull_internal(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -25391,7 +25444,10 @@ fn stream_pull_internal(
             if stream_limit_saturated(&chain, &state, 0) {
                 return Ok(PullStep::Continue);
             }
-            ctx.refresh_root_snapshot();
+            // Periodic, not per-element — see `stream_refresh_interval`.
+            if stream_should_refresh(idx) {
+                ctx.refresh_root_snapshot();
+            }
             let v = read_pinned_elem(ctx, base_pins[idx], v);
             let mut emit_stopped = false;
             let step = {
@@ -28291,7 +28347,10 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.refresh_root_snapshot();
     let mut result = Ok(None);
     for (i, &elem) in elements.iter().enumerate() {
-        ctx.refresh_root_snapshot();
+        // Periodic, not per-element — see `stream_refresh_interval`.
+        if stream_should_refresh(i) {
+            ctx.refresh_root_snapshot();
+        }
         let c = ctx.read_native_pin(con_pin, consumer);
         let e = read_pinned_elem(ctx, elem_handles[i], elem);
         if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {

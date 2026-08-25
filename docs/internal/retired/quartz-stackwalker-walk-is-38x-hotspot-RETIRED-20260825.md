@@ -1,12 +1,207 @@
-# `QuartzEndpointWebIntegrationTests` hangs because `StackWalker.walk` is ~38x HotSpot — Mockito builds one per mock call
+# RETIRED — `QuartzEndpointWebIntegrationTests` passes 45/45; the hang was gone from pristine dev, and this page's "full fix" is a regression
 
-**Status: ROOT-CAUSED 2026-08-18 on `dev` `24a5d4528` (Azure Linux). Not yet
-fixed. It is not a spin loop, not a leak and not an admission gap: every mock
-invocation makes Mockito build a `LocationImpl`, which runs a
-`StackWalker.walk`, and each walk pays a GC root-snapshot deposit plus a
-conservative stack scan. The walk terminates correctly — it is just far too
-slow, and slower with the JIT on than with `--nojit`, which is why `--nojit`
-finishes the class and the default does not.**
+**Status: RETIRED 2026-08-25. The class passes 45/45 under the shipped default,
+and it does so on PRISTINE dev — this page's symptom was already gone before any
+of the work below was written. Three real VM defects were found underneath it
+and are fixed; the stack-walk throughput residual is 3.8x better on the shape
+that pays it. Both of this page's nominated fixes were built and measured, and
+the one it called "the only one with the right ceiling" is a REGRESSION.**
+
+## What the class actually does now
+
+`MEMCAP=8G /data/sb4.sh … 600`, one process per arm, ABBA-interleaved, on a
+quiet box (load 27). The loop count is this page's own instrument
+(`grep -c 'QuartzEndpoint.triggerQuartzJob'`):
+
+| arm | result | wall | `triggerQuartzJob` frames |
+|---|---|---:|---:|
+| HotSpot 25 | ✓ 45/45, 0 failed | 42 s | — |
+| CratonVM, pristine dev | ✓ 45/45, 0 failed | 189 / 234 s | **8** |
+| CratonVM, this branch | ✓ 45/45, 0 failed | 163 / 150 s | **8** |
+| CratonVM, `--nojit` | ✓ 45/45, 0 failed | 224 s | **8** |
+
+This page records the class as OOM-killed at ~24 s with 22 GB RSS, driven by
+~23,700 complete server dispatches for ONE client request, with `--nojit` the
+only passing arm. Measured now: **8** frames, not 47,362. No spin, no OOM, no
+hang, and **the JIT arm is the FASTER one** — which inverts this page's central
+thesis ("it is not that `--nojit` avoids a bug, it is that `--nojit` is *faster*
+on the operation the workload is bottlenecked on").
+
+Something between 2026-08-18 and 2026-08-25 closed it. This page does not know
+what, and did not find out: by the time it was re-measured the symptom was
+already absent from pristine dev, so there was nothing left to bisect against.
+
+**A warning about this class, which cost a full re-measurement.** An earlier run
+of the same arms reported `tests=45 failed=27` for pristine dev and two 420 s
+`NO-RESULT` timeouts. That run climbed from load 52 to load 113 while it
+executed. At load 27 the identical binaries are clean. This class's verdict is
+decided by host load as much as by the binary — exactly as the "Run it under a
+cap" note below says about memory, and it applies to PASS/FAIL too. Do not
+report an arm from this class without the load beside it.
+
+## What was fixed, and how it was found
+
+The path switch in item 3 is what exposed items 1 and 2: `p59_sw_walk`
+intercepts `StackWalker.walk` in real-JDK mode, so `lang_stackwalker.rs`'s
+`callStackWalk` / `fetchStackFrames` — and everything they call — had no reachable
+consumer for `walk()` at all. `CRATONVM_DEBUG_STACKWALK=1` on a walk logged
+**zero** `callStackWalk capture` lines. Three defects had accumulated behind that.
+
+1. **`ClassFrameInfo.declaringClass()` enforced RETAIN_CLASS_REFERENCE.** The
+   JDK says the opposite on the declaration itself:
+
+   ```java
+   // package-private called by StackStreamFactory to skip
+   // the capability check
+   Class<?> declaringClass() { return (Class<?>) classOrMemberName; }
+   ```
+
+   and `ClassFrameInfo.getClassName()` is `declaringClass().getName()`. The guard
+   blocked `StackStreamFactory$StackFrameBuffer.at(int)`, which the JDK runs for
+   EVERY populated frame inside `setBatch()`, so a plain
+   `StackWalker.getInstance().walk(…)` threw `UnsupportedOperationException` out
+   of its first batch. The capability check belongs to the public
+   `getDeclaringClass()` (`ensureRetainClassRefEnabled(); return declaringClass();`),
+   which now has its own wrapper.
+
+2. **`populate_sfi` wrote `StackTraceElement` at synthetic-stub offsets.** Slots
+   `0..3` are `[class, method, file, line]` on the stub; real JDK 25 declares
+   `classLoaderName, moduleName, moduleVersion, declaringClass, methodName,
+   fileName, lineNumber, declaringClassObject`, so every write landed a
+   field-group early. `getClassName()` read a null loader name, `getLineNumber()`
+   read a `String` slot, and `StackFrameInfo.toString()` NPE'd inside
+   `StackTraceElement.computeFormat()` on a null `declaringClass`. Now resolved
+   by name and memoized, `declaringClassObject` included — `computeFormat()`
+   dereferences it with no null guard.
+
+3. **`frame_class_ids` skipped JIT-compiled frames.** It mapped `thread.frames`
+   alone, and a compiled method pushes no interpreter `Frame`, so every
+   caller-attribution site blamed the next frame down. It fails in BOTH
+   directions: a `java.base` caller that tiered up disappears and a classpath
+   frame is blamed — `StackFrameBuffer.fill` constructing `StackFrameInfo` was
+   denied with `module java.base does not "opens java.lang" to unnamed module`,
+   **and only with the JIT on**, which is the discriminator that named it — and
+   symmetrically a compiled APPLICATION frame disappears behind a JDK frame and
+   is granted access it should not have. The same list backs `Class.forName`'s
+   caller-loader resolution.
+
+## Both nominated fixes, built and measured
+
+This page names two. Neither survives in the form it was written.
+
+### "The full fix, and the only one with the right ceiling" — a REGRESSION
+
+Routing real-JDK `walk`/`forEach` through the JDK's own batched
+`StackStreamFactory` is **slower at every depth**. ABBA in one binary,
+`probes/StackWalkerTerminationProbe.java`, 2000 iterations, two runs per arm:
+
+| depth | eager native | JDK batched |
+|---:|---|---|
+| 2 | **706 / 740** | 3,039 / 4,386 |
+| 40 | **4,748 / 6,400** | 12,453 / 14,609 |
+| 120 | **25,384 / 30,024** | 37,459 / 41,980 |
+
+Both arms byte-identical to HotSpot, so this is a clean throughput comparison.
+The reason is that the JDK's laziness is written in **Java**: a reflective
+`Constructor.newInstance` per buffer slot, an `Array.newInstance`, a
+spliterator, the `doStackWalk` re-entry, and a native call per frame for
+`StackFrameBuffer.at`. Interpreted, that fixed cost (~300 µs/walk at depth 2
+against the eager native's ~88 µs) is larger than the per-frame cost batching
+saves, and its per-frame slope is worse too.
+
+It is kept behind `CRATONVM_SW_JDK_WALK=1`, because it is the arm that proves
+the above and the only thing that exercises `callStackWalk`/`fetchStackFrames`
+at all — which is how items 1–3 went unnoticed.
+
+### "The smaller change" — real, bounded, and right for a reason this page does not give
+
+Making the frame's strings and mirror lazy is worth ~40% on the early-match
+shape (depth 40, 326 → 195 ms). But this page's profile cannot justify it:
+`populate_stack_frame`, `create_string`, `try_alloc_concurrent_synthetic` and
+`get_class_mirror` **do not appear in the profile at all** above 0.7%. It works
+because the walk's cost is the object COUNT, not any one symbol — the `near`
+profile is flat with ~24% in mimalloc's `mmap` and no resolvable Rust caller.
+
+Deferring the mirror does NOT reintroduce the `<clinit>` failure the eager
+resolve exists to avoid: the carrier stores the same frame-captured `ClassId`,
+so only the LOOKUP moved. `StackWalkerLog4jCallerProbe` and
+`StackWalkerLog4jStressProbe` are the fixtures for that case and both pass.
+
+## The ceiling argument was aimed at the wrong layer
+
+This page prices the residual from `native_stack_has_jit_frame` at 17.9% and
+concludes "deleting it entirely buys 1.2x against a 38x gap", then that the rest
+is "a native call made from a JIT frame pays a per-call conservative root
+deposit". The caller census disagrees:
+
+```
+scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=86,700
+jitprobe calls=86,081 words=637,620,424
+```
+
+Not GC, not the safepoint, **not the native call**. It is
+`NativeContext::refresh_root_snapshot()`, which the synthetic-stream drain loops
+call once per ELEMENT, each call a full deposit — 638 million words, 5.1 GB of
+native stack read, for 500 walks over a 120-frame stack, at a constant ~7,400
+words per call with the call COUNT scaling linearly in depth because a
+`StackWalker` stream has one element per frame.
+
+The pins that refresh exists to publish are pushed ONCE before the loop and
+never change, so all 86,700 deposits republished a bit-identical snapshot.
+`refresh_root_snapshot`'s own contract asks for a publish "right after
+establishing such a batch of pins (**and optionally again periodically**)" — the
+per-iteration half is the optional one. Now every 32nd element
+(`CRATONVM_GC_STREAM_REFRESH_EACH=1` restores the old cadence in the same
+binary):
+
+| shape | depth | HotSpot | per-element | periodic |
+|---|---:|---:|---:|---:|
+| full drain | 40 | 159 | 1,234 | **615** |
+| full drain | 120 | 221 | 5,681 | **1,508** |
+| early match | 40 | 30 | 178 | 165 |
+| early match | 120 | 20 | 476 | 449 |
+
+**3.8x at depth 120, and 25.7x → 6.8x against HotSpot.** The early-match control
+does not move, correctly: it already made ~1.7 deposits per walk, flat in depth,
+against 37 (depth 40) and 105 (depth 120) for the full drain. That split is also
+what makes the two shapes worth separating at all —
+`StackWalkerTerminationProbe` cannot see it, because three of its four arms
+traverse the whole stack by construction, so batching can only ADD round trips
+to them. `probes/StackWalkerFindFirstProbe.java` was added for that.
+
+**Not done, deliberately:** skipping `scan_active_jit_frames` on the
+non-blocking deposit, which would remove the remaining scans.
+`collect_all_root_snapshots` consumes every ALIVE thread's snapshot, not only
+blocked ones, so that is a GC-safety change and being wrong there is a reclaimed
+live object, not a slow one.
+
+## What is left
+
+`StackWalker.walk` over a stack it fully drains is still ~7x HotSpot at depth
+120 (1,508 ms against 221). That residual is the per-object-returning-native-call
+conservative root scan — one scan per frame the stream touches, ~59 KB of native
+stack each — and it is genuinely architectural. It is NOT specific to
+`StackWalker`, has no failing witness left on this page, and the memo route into
+it is closed by construction (see "the memo is 100% cold" below, which still
+stands).
+
+## Verification
+
+`probes/StackWalkerCrossVmProbe.java` (added with this) is the differential
+oracle: 17 rungs — collect, count, findFirst hit and miss, skip, limit, frame
+fields, `toStackTraceElement`, RETAIN_CLASS_REFERENCE including the negative
+half, `forEach`, `getCallerClass`, nested walks, 200x repeat stability, depth-40,
+reflect frames — byte-identical to HotSpot 25 in BOTH walk arms. All four
+`vm/tests/wp1_9_stackwalker.rs` integration probes pass in both arms.
+
+---
+
+*Everything below is the original page as it stood on 2026-08-18, kept because
+its refuted hypotheses and its four inert memo attempts are still the record
+that stops them being re-run. Read the status above first: the class passes, the
+"full fix" it recommends is a regression, and its ceiling argument names the
+wrong caller.*
+
 
 Found re-measuring the four classes on
 retired/moving-young-fallback-four-springboot-classes-RETIRED-20260818.md. That

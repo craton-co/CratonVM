@@ -1,4 +1,4 @@
-# `BigDecimal` arithmetic is slower than HotSpot — three per-call taxes removed 2026-08-18 (31x -> 21x on the benchmark), residual is general native->heap cost
+# `BigDecimal` arithmetic is slower than HotSpot — 4.6x on the benchmark as of 2026-08-25, but the witness class is STILL over the 90 s budget
 
 **Status: OPEN (reduced). Profiled 2026-08-18 on `dev` `64c02b7ac`, which
 REFUTED the original per-call-overhead hypothesis in the form it was written.
@@ -10,6 +10,105 @@ the 90 s per-class suite budget to ON it. It scored PASS in the 310-class sweep
 and in 4 of 7 timed runs, and still exceeded 90 s in the other 3 under heavier
 host load, so call this borderline rather than closed. The remaining ~32x is not
 bignum-specific and is tracked on the two pages under "Related".**
+
+**UPDATE 2026-08-25 — the page's own witness is NOT closed at the 90 s budget,
+and this page STAYS OPEN because of it.** Two of the three things this page says
+about its residual are now measured false, one of its two remaining
+recommendations is priced at ~zero, and the gap on its own benchmark is 4.6x,
+not the 21x recorded below. But `LegendreHighPrecisionTest` — the class this page
+calls "closed at the 90 s budget" — takes **111-134 s** on a quiet box, on
+pristine dev and with every fix in this session applied. It is over budget, and
+it was over budget before this session touched anything.
+
+### The witness, re-measured
+
+Serial, 300 s cap, ABBA-interleaved, HotSpot as the scale. Load beside every
+number, because this page's own warning about that is right:
+
+| class | HotSpot | pristine dev | current dev + this session | budget |
+|---|---:|---|---|---|
+| `LegendreHighPrecisionTest` | 6 s | 111 / 134 / 133 / 118 s | 88 / 122 / 115 / 112 s | 90 s |
+| `PSquarePercentileTest` | 5 s | 131 / 144 / 145 / 111 s | 146 / 145 / 122 / 112 s | 90 s |
+
+(load 6-15 throughout. At load 18-41 the same `LegendreHighPrecisionTest`
+binaries read 137-148 s or time out at 300 s entirely, which is this page's
+"a class that costs ~90 s is scored PASS or HANG by load as much as by the
+binary" — still true, and the reason the quiet-box row is the one to quote.)
+
+So: **withdraw "Call the witness closed at the 90 s budget."** It was stated on
+an interleaved comparison against a `dev` base, with the honest qualifier that
+the control never came in under 90 s — but the fixed arm does not either, on a
+quiet box, four months of dev later. The 2026-08-18 improvement was real
+(110-120 s → 86-105 s); it did not cross the line.
+
+`PSquarePercentileTest` is unchanged and still over budget, as this page says.
+
+### What IS closed
+
+**The "name / metadata resolution ~15%" group is now ~2.5%.** A fresh
+`perf record` on `BigDecimalBench 50000`:
+
+| group | 2026-08-18 | now |
+|---|---:|---:|
+| heap validation + allocation | ~15% | ~21% |
+| native dispatch plumbing | ~6% | ~13% |
+| **name / metadata resolution** | **~15%** | **~2.5%** |
+| the bignum arithmetic itself | ~2% | *absent above 0.7%* |
+
+`resolve_field_index`, the class-by-name hash search and its `memcmp` are gone;
+what is left of that group is `resolve_field_descriptor_byte_cached` at 1.5% and
+0.9% of `memcmp`. The layout/`ClassId` memoization this page describes did what
+it claimed. No bignum arithmetic symbol reaches 0.7% any more — `BigInt::to_decimal`
+and `bi_read_int` have both fallen out.
+
+**The benchmark is 4.6x, not 21x.** `BigDecimalBench 50000`, interleaved,
+medians of 6: HotSpot 516 ms, CratonVM ~2,350 ms. Quote this with the load
+(≈27) — this page's own note that the Linux host's HotSpot is ~5x slower than
+the Windows one, so no single number is "the" ratio, applies to the box's load
+state too.
+
+### The JIT native-shadow caller seal: priced at ~zero
+
+This page's residual is "make native→heap interaction cheap in general", and the
+one contained lever anybody had identified for it is the per-method seal that
+keeps every caller of a `BigDecimal`/`BigInteger` native out of the JIT
+(`jit_method_calls_native_shadowed`). `jit_bridge.rs` records it as worth 0.5%
+on a netty workload and asks for it to be priced before anyone builds the
+per-site version. Priced now, on the bignum workload it was never tried on —
+ABBA in one binary, `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL=0`:
+
+| arm | median | spread | checksum |
+|---|---:|---|---|
+| HotSpot 25 | 404 ms | — | identical |
+| seal on (default) | 3,410 ms | 2550-4256 | identical |
+| seal off | 3,170 ms | 2452-4551 | identical |
+
+~7% apart inside an 85% spread, i.e. indistinguishable, and matching the netty
+figure. Every arm produced the identical checksum, so the lever was not buying
+speed by being wrong either. **That route is closed** — the per-SITE granularity
+change this page's sibling comment contemplates should not be attempted on these
+numbers.
+
+### The shared residual, named exactly
+
+This page and `quartz-stackwalker-walk-is-38x-hotspot` both end on "a native
+call made from a JIT frame pays a per-call conservative root deposit whose cost
+scales with stack depth". On the Quartz side that attribution is now measured
+WRONG — the deposits came from `NativeContext::refresh_root_snapshot()` being
+called once per synthetic-stream element, and fixing the cadence bought 3.8x
+there (see that page, retired 2026-08-25).
+
+**It buys nothing here.** `BigDecimalBench` builds no synthetic streams:
+interleaved, medians of 6, pristine dev 2,348 ms against 2,460 ms with the fix.
+Unchanged. So the two pages' shared conclusion was two different costs wearing
+one sentence, and only one of them has been found.
+
+What remains on this page is the other one: ~21% heap validation + allocation
+and ~13% native dispatch plumbing, flat, with the largest single symbol at 4.98%
+(`alloc_raw_tlab`). There is still no contained fix visible in that profile, and
+this page should not acquire a fourth recommendation until one is measured
+rather than argued.
+
 
 **UPDATE 2026-08-19 — the witness class is off the border, and neither fix was
 bignum-specific.** Two general VM changes landed on
