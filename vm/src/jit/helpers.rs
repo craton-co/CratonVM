@@ -2881,7 +2881,7 @@ unsafe fn resolve_callee_cached(
 /// CALLER's exception table. 198 000 of 200 000 `catch (ArithmeticException)`
 /// skipped on `probes/EscapeStaticProbe`; ~8 % of `probes/ExcTableDirectCallOracle`
 /// runs dying at `main:156`. Both pages are in
-/// `docs/internal/fixed-suite-bugs/jit/`.
+/// the internal tree's `fixed-suite-bugs/jit/`.
 ///
 /// The arm was added where it was missing. This type is the other half: there is
 /// now ONE table, and — the load-bearing part — the question *"is there an
