@@ -259,6 +259,21 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Receiver-type speculation and the per-bci de-spec registry it now
+        // consults. `sites-declined` is the only number that says the consult
+        // engaged; `guards-emitted` separates "wired and never needed" from
+        // "no guarded site compiled at all"; `escalations-spared` is the policy
+        // half -- whole-method blacklists withheld from an already-withdrawn
+        // speculation. Zeros printed, for the same reason as the lines above.
+        eprintln!(
+            "[cratonvm] receiver despec: {} escalations-spared={}",
+            cratonvm_jit::metrics::receiver_despec_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            cratonvm_jit::metrics::despec_escalations_spared()
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is

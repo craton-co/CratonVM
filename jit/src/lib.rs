@@ -2035,6 +2035,42 @@ pub fn deopt_real_enabled() -> bool {
 /// exposed were found. `docs/known-issues/netty/
 /// httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md` is the
 /// class it was written for.
+/// Let receiver-type speculation consult the per-bci de-spec registry
+/// (`CRATONVM_JIT_RECEIVER_DESPEC`, **default-ON; `=0` restores the old
+/// route**). Read-once cached.
+///
+/// With this off -- the state this VM shipped in until 2026-08-24 -- a
+/// call-site intrinsic guarded on one receiver class (`guard_class_id != 0`:
+/// the `java/lang/CharSequence` String family, CRC32, the atomic-field family)
+/// is re-emitted with the identical guard on every recompile, even at a bci the
+/// de-spec registry has already recorded as a proven-failing speculation. A
+/// site whose receiver is never that class therefore deopts on every call until
+/// `recommend_action` bars the method from compilation for good.
+///
+/// With it on, such a bci declines the intrinsic and takes the ordinary
+/// MIC/PIC dispatch, and the `MakeNotCompilable` escalation is withheld from
+/// the method (`DeoptimizationLog::recommend_action_at_bci`). The engagement
+/// counter is `[cratonvm] receiver despec: sites-declined=` under
+/// `CRATONVM_DBG=jit-method-stats` -- a zero there means this changed nothing,
+/// whatever the clock says.
+///
+/// `docs/known-issues/netty/httpheadervalidationutiltest-exhaustive-loop-
+/// timeout-20260816.md` is the class it was written for: 1.67
+/// `ReceiverTypeChanged` deopts per loop iteration on a `CharSequence.length()`
+/// reached only with `AsciiString`.
+pub fn receiver_despec_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_RECEIVER_DESPEC") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 pub fn local_handlers_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
@@ -10577,6 +10613,127 @@ pub fn try_resolve_atomic_intrinsic(
     Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
 }
 
+/// Speculate a `java/lang/String` receiver at a `java/lang/CharSequence`-declared
+/// `length`/`charAt`/`isEmpty` call site WITHOUT positive receiver evidence
+/// (`CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC`, **default-OFF as of 2026-08-24;
+/// `=1` restores the old unconditional speculation**). Read-once cached.
+///
+/// A `java/lang/String` site is `final` and needs no guard, so this knob does
+/// not touch it, and neither does any of the receiver-de-spec machinery. A
+/// `CharSequence` site is different in kind: the emitted inline body decodes the
+/// String layout, so it is valid only behind an exact class-id compare, and the
+/// MISS EDGE IS A DEOPT -- not a fall-through to dispatch. That makes the
+/// speculation unusually asymmetric, and the asymmetry is measured
+/// (`probes/CharSeqStringIntrinsicProbe.java`, one binary, four interleaved
+/// readings per arm, Azure host `vm1`):
+///
+/// | | guard on | guard off |
+/// |---|---:|---:|
+/// | `length()` on a `String` | 7.85-8.37 ns | 28.50-31.36 ns |
+/// | `length()` on a `StringBuilder` | 416.82-460.71 ns | 282.56-320.55 ns |
+/// | `charAt()` on a `String` | 9.04-10.26 ns | 53.83-66.35 ns |
+/// | `charAt()` on a `StringBuilder` | 652.36-716.12 ns | 310.99-399.96 ns |
+///
+/// A hit is worth 22 ns (`length`) / 47 ns (`charAt`); a miss costs 140 ns /
+/// 320 ns, plus a whole-method `MakeNotCompilable` once the deopts add up. The
+/// break-even is therefore ~87% `String` receivers, not 50% -- which is where
+/// [`MIN_GUARDED_RECEIVER_PCT`] comes from -- and until 2026-08-24 the compiler
+/// took the bet with NO evidence at all, because `CRATONVM_TIER_PGO` is
+/// default-OFF so there is no receiver profile to read on an ordinary run.
+///
+/// On netty's `HttpHeaderValidationUtilTest`, whose `CharSequence.length()` is
+/// reached only with `AsciiString` and an anonymous `CharSequence`, refusing the
+/// unevidenced guard is worth **6.5x on the value loop and 3.8x on the name
+/// loop** (`probes/io/netty/.../HeaderValidationLoopRate.java`, ABBA, one
+/// binary), and takes the run's deopt census from 263 502 to **18** with the
+/// `UnreachedCode` traps at 85 193 -> **0**.
+pub fn charseq_blind_guard_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | ""
+            ),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Minimum share of a call site's recorded receivers that must be the class a
+/// speculative receiver guard is about, before the guard is worth emitting.
+///
+/// A receiver-guarded call-site intrinsic does not FALL BACK on a miss -- it
+/// DEOPTS, at roughly a microsecond a time. So the break-even is nowhere near
+/// 50%: a site that is 60% the guarded class still pays 0.4 deopts per call and
+/// is far worse than the ordinary dispatch it replaced. 90 is deliberately
+/// conservative about the other direction too -- a site the profile says is
+/// overwhelmingly `String` keeps the intrinsic exactly as before.
+pub const MIN_GUARDED_RECEIVER_PCT: u32 = 90;
+
+/// Minimum recorded receivers at a call site before [`MIN_GUARDED_RECEIVER_PCT`]
+/// is allowed to decide anything. Below this the profile is noise, and refusing
+/// on it would turn a cold-start artifact into a permanently un-intrinsified
+/// one.
+pub const MIN_GUARDED_RECEIVER_EVIDENCE: u32 = 32;
+
+/// `true` when `profile` has enough evidence at `pc` to say that a receiver
+/// guard on `class_id` would hold at least [`MIN_GUARDED_RECEIVER_PCT`] of the
+/// time -- the POSITIVE evidence a trap-on-miss guard needs before it is worth
+/// emitting. Fail-CLOSED: no profile, no entry, too few samples -> `false`.
+///
+/// This is the counterpart of [`receiver_profile_rejects_guard`], and the two
+/// are deliberately not each other's negation: "the profile says no" and "the
+/// profile says nothing" are different answers, and only one of them may leave
+/// an unevidenced trap-on-miss guard standing (see `charseq_blind_guard_enabled`
+/// for the measurement that settles which).
+pub fn receiver_profile_supports_guard(
+    profile: Option<&profile::MethodProfile>,
+    pc: usize,
+    class_id: u32,
+) -> bool {
+    let Some(counts) = profile.and_then(|p| p.receivers.get(&pc)) else {
+        return false;
+    };
+    let total: u32 = counts.values().copied().fold(0u32, u32::saturating_add);
+    if total < MIN_GUARDED_RECEIVER_EVIDENCE {
+        return false;
+    }
+    let hits = counts.get(&class_id).copied().unwrap_or(0);
+    // Widening u32 -> u64 so the percentage cannot overflow on a hot site.
+    u64::from(hits) * 100 >= u64::from(total) * u64::from(MIN_GUARDED_RECEIVER_PCT)
+}
+
+/// `true` when `profile` has enough evidence at `pc` to say that a receiver
+/// guard on `class_id` would fail most of the time.
+///
+/// This is the COMPILE-TIME half of receiver de-speculation, and the half that
+/// costs nothing: the per-bci de-spec registry can only act after a site has
+/// already deopted `PER_BCI_DESPEC_LIMIT` times and been recompiled, whereas
+/// the interpreter has usually already recorded thousands of receivers at the
+/// same bci before the method is compiled at all. `bytecode_walk.rs`'s own
+/// header comment describes exactly this trap for a different guard, and moves
+/// the screen to compile time to avoid it.
+///
+/// Fail-open in every uncertain case -- no profile, no entry for this pc, too
+/// few samples -- so a site with no evidence speculates exactly as it did.
+pub fn receiver_profile_rejects_guard(
+    profile: Option<&profile::MethodProfile>,
+    pc: usize,
+    class_id: u32,
+) -> bool {
+    let Some(counts) = profile.and_then(|p| p.receivers.get(&pc)) else {
+        return false;
+    };
+    let total: u32 = counts.values().copied().fold(0u32, u32::saturating_add);
+    if total < MIN_GUARDED_RECEIVER_EVIDENCE {
+        return false;
+    }
+    let hits = counts.get(&class_id).copied().unwrap_or(0);
+    // Widening u32 -> u64 so the percentage cannot overflow on a hot site.
+    u64::from(hits) * 100 < u64::from(total) * u64::from(MIN_GUARDED_RECEIVER_PCT)
+}
+
 pub fn try_resolve_string_intrinsic(
     class: &str,
     name: &str,
@@ -10622,6 +10779,13 @@ pub fn try_resolve_string_intrinsic(
     let guard: u32 = if is_string { 0 } else { layout.string_class_id };
     // A CharSequence site needs a real String class id; without one the
     // inline decode would be unguarded — bail to native dispatch.
+    //
+    // WHETHER a guarded site is worth taking is decided by the CALLERS that
+    // have a receiver profile (the method-entry door in `try_compile_inner`
+    // and the OSR door in `vm/.../jit_bridge.rs`), not here: this function is
+    // also the "does this method contain a String-intrinsic site" predicate for
+    // scan admission and for the registration path, and those must keep seeing
+    // the site. See `charseq_blind_guard_enabled`.
     if is_charseq && guard == 0 {
         return None;
     }
@@ -21516,7 +21680,69 @@ fn try_compile_inner(
                     &method_name,
                     &descriptor,
                     resolved_string_layout,
-                ) {
+                )
+                // A `java/lang/CharSequence` site is intrinsified behind an
+                // exact `String` class-id guard whose MISS IS A DEOPT. Ask the
+                // interpreter's own receiver profile first: if this bci has
+                // been reached thousands of times and hardly ever by a
+                // `String`, the guard is not mis-tuned, it is wrong about the
+                // program, and emitting it buys a deopt per call plus an
+                // eventual whole-method blacklist. netty's
+                // `HttpHeaderValidationUtil.validateValidHeaderValue` is that
+                // site (`CharSequence.length()` at bci 1, reached only with
+                // `AsciiString` and an anonymous `CharSequence`).
+                .filter(|&(_, _, _, guard_class_id)| {
+                    if guard_class_id == 0 || !receiver_despec_enabled() {
+                        return true;
+                    }
+                    // Positive evidence admits the guard outright; the de-spec
+                    // registry can still veto it below if this exact bci has
+                    // already proven the profile wrong.
+                    let supported = receiver_profile_supports_guard(profile, pc, guard_class_id)
+                        || charseq_blind_guard_enabled();
+                    // Two independent reasons to refuse the guard, in the order
+                    // they become available. (1) the receiver profile already
+                    // says the guarded class is a minority here -- free, but
+                    // only populated under `CRATONVM_TIER_PGO`. (2) this bci is
+                    // in the per-bci de-spec registry, i.e. it has ALREADY
+                    // deopted `PER_BCI_DESPEC_LIMIT` times on this guard. (2) is
+                    // the one that fires on an ordinary run, and it has to be
+                    // asked HERE rather than in the backend: a site the resolver
+                    // registers as an intrinsic never gets `invoke_info`
+                    // (`direct_calls.push(..); continue;` happens above the
+                    // `invoke_info.push`), so a backend that drops the direct
+                    // call leaves the pc with no dispatch metadata at all and
+                    // compiles an `UnreachedCode` trap there instead. Refusing
+                    // at the resolver keeps the site on the ordinary path and
+                    // it gets its MIC like any other invoke.
+                    let by_profile = !supported
+                        || receiver_profile_rejects_guard(profile, pc, guard_class_id);
+                    let by_despec = crate::deopt::despec_contains(
+                        &format!(
+                            "{}.{}:{}",
+                            cached.class_name, cached.method_name, cached.method_descriptor
+                        ),
+                        pc as u32,
+                    );
+                    if by_profile {
+                        crate::metrics::note_receiver_despec(
+                            crate::metrics::RECEIVER_DESPEC_PROFILE_DECLINED,
+                        );
+                    }
+                    if by_despec {
+                        crate::metrics::note_receiver_despec(
+                            crate::metrics::RECEIVER_DESPEC_DECLINED,
+                        );
+                    }
+                    if (by_profile || by_despec)
+                        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                    {
+                        eprintln!(
+                            "[cratonvm-jitc] string-intrinsic DECLINED {class_name}.{method_name}{descriptor} @pc={pc} guard_class_id={guard_class_id} by_profile={by_profile} by_despec={by_despec}"
+                        );
+                    }
+                    !(by_profile || by_despec)
+                }) {
                     needs_heap = true;
                     direct_calls.push((
                         pc,
