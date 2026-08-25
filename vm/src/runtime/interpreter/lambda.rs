@@ -1684,7 +1684,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
     };
     // A handler-bearing callee is never entered by a direct compiled call —
     // the same gate as every other direct-call site in this VM
-    // (`mic_callee_has_exception_table`, `osr_callee_declares_handlers`).
+    // (`mic_callee_has_exception_table`, `osr_callee_bars_direct_call`).
     if !cached.exception_table.is_empty() || cached.is_synchronized || !cached.is_static {
         return SiteVerdict::Never;
     }
@@ -2338,7 +2338,7 @@ pub(super) fn try_invoke_cached_lambda_impl(
     //
     // Gates, in order of cost. `exception_table.is_empty()` is the same
     // restriction every other direct-compiled-call site in this VM applies
-    // (`mic_callee_has_exception_table`, `osr_callee_declares_handlers`, the
+    // (`mic_callee_has_exception_table`, `osr_callee_bars_direct_call`, the
     // poly-cache arm's own `cached.exception_table.is_empty()`): a
     // handler-bearing callee is never entered by a direct compiled call. A
     // virtual thread is excluded because compiled entry carries none of the

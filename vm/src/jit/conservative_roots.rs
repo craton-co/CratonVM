@@ -3565,22 +3565,23 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     complete
 }
 
-/// Pure predicate behind [`other_thread_in_jit`], split out so it is testable
-/// without racing the process-global depth counter.
+/// Whether some OTHER thread holds live JIT frames that this thread's scan
+/// cannot account for: `GLOBAL_JIT_DEPTH` counts every registered JIT entry
+/// process-wide, `current_thread_jit_depth()` counts this thread's, and a
+/// positive difference means at least one peer is inside compiled code.
+///
+/// Test-only. It was written as the trigger for the cross-thread proof
+/// obligation and then never called: as the block below
+/// `refresh_moving_young_coverage_for_collection` says, those obligations are
+/// discharged by machinery that does not consult a global-vs-local depth
+/// comparison -- a parked peer publishes into its `root_snapshot`, and an
+/// OS-frozen peer is scanned conservatively and marks the cycle incomplete.
+/// The predicate is kept because the invariant it states is worth pinning; the
+/// `pub` wrapper around it was surface with nothing behind it.
+#[cfg(test)]
 #[inline]
 const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> bool {
     global_depth > local_depth
-}
-
-/// Whether some OTHER thread holds live JIT frames that this thread's scan
-/// cannot account for.
-///
-/// `GLOBAL_JIT_DEPTH` counts every registered JIT entry process-wide;
-/// `current_thread_jit_depth()` counts this thread's. A positive difference
-/// means at least one peer is inside compiled code right now.
-#[inline]
-pub fn other_thread_in_jit() -> bool {
-    peer_jit_frames_present(GLOBAL_JIT_DEPTH.get(), current_thread_jit_depth())
 }
 
 /// Collection-authoritative moving-young coverage refresh.

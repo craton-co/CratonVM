@@ -153,8 +153,20 @@ to be seen. 70 of 70 regression vectors pass on the fix.
 
 **Probe** (`probes/ArrayReceiverProbe`): every shape-probing door — rendering,
 identity, five collection shapes, the `Arrays` helpers — over eight array
-receivers, compared against HotSpot. Byte-identical on `dev` and on the fix,
-under all three collectors, with `array_receiver=0`.
+receivers. Its HotSpot transcript is committed beside it
+(`ArrayReceiverProbe.expected.txt`, reduced to array SHAPES so it is
+host-independent); CratonVM matches it byte for byte under Generational, G1 and
+ZGC, with `array_receiver=0`.
+
+**Per collector.** The whole regression suite, three times, one collector each —
+because a PASS on the default arm can be a masked failure and this defect is on
+a path all three share:
+
+```text
+--XX:UseGc Generational   71 passed, 0 failed
+--XX:UseGc G1             71 passed, 0 failed
+--XX:UseGc ZGC            71 passed, 0 failed
+```
 
 **Sweep**: the full Spring Boot suite on Windows, the same corpus and harness
 the sighting came from, census armed:
@@ -227,6 +239,27 @@ receiver kind and routed an array base to `get/set_array_element`. The four
 FLOAT and DOUBLE natives did not — they passed the byte OFFSET to
 `ctx.{get,set}_field` as a slot index. `putFloat` and `putDouble` are called
 exactly once each by that probe, which is why the count was exactly two.
+
+**And the first fix had its own residual, which the first vector could not
+see.** Routing an array base to `set_array_element` stops the out-of-bounds
+write and is right for a `float[]`; on a `byte[]` it is still wrong, because
+`Unsafe.putFloat(byte[], off, v)` writes FOUR bytes at that offset and one
+coerced element truncates it. `Bits.writeIntL([BII)` — one frame BELOW
+Hazelcast's probe in the same stack — is exactly that idiom. Both halves now go
+through the `unsafe_multibyte_put!`/`get!` helpers that short/char/int/long have
+always used, byte[]-gated so a typed array keeps its element accessor as the
+authority. Measured on one binary each:
+
+```text
+element-only (the first fix)  FAIL  byte[] getFloat round trip: expected [1.5] got [0.0]
+byte-addressed                PASS
+HotSpot                       PASS  (344 checks — the assertions are the platform's)
+```
+
+The lesson is the one the vector now carries in its own comments: a
+"nothing was corrupted" assertion cannot tell a correct write from a truncated
+one. The neighbour arrays caught the out-of-bounds write; only a ROUND TRIP
+caught the width.
 
 Two shapes, one bug, and `RUnsafeArrayBase` asserts both:
 

@@ -1583,7 +1583,47 @@ fn native_input_stream_transfer_to(
     // for a ByteArrayInputStream the observable result is simply consuming its
     // remaining bytes.  The null stream is fresh/open here, so advancing `pos`
     // preserves the JDK contract without touching the payload.
-    let byte_array_stream_layout = has_byte_array_stream_layout(ctx, input);
+    // ASK THE CLASS before probing the layout, and ask the SLOT COUNT before
+    // either.
+    //
+    // This used to duck-type the receiver by reading slots 0, 1 and 3 and
+    // seeing whether they looked like `(buf, pos, count)`. A stream that is not
+    // a `ByteArrayInputStream` can have FEWER slots than that, and the probe
+    // then reads out of bounds: measured 2026-08-24, every
+    // `org.apache.catalina.connector.CoyoteInputStream` reaching here (it
+    // declares exactly one field, `ib`) produced `zgc real: field index OOB
+    // index=1/3 num_slots=1 op="get"` -- 8 hits per run of
+    // `TestWebdavServletOptionsUnknown`, 16 per run of
+    // `TestDefaultServletRfc9110Section13`, on tests that PASS. The heap
+    // returns a default for an out-of-range slot, so the probe just failed and
+    // fell through, which is why this stayed invisible.
+    //
+    // The dangerous half is the other direction. Had the probe ever MATCHED on
+    // a wrong class, the `set_field(input, 1, Value::Int(count))` below writes a
+    // PRIMITIVE into whatever slot 1 is on that class -- a reference field, in
+    // general. That is exactly the punned cell that made a compiled
+    // `arraylength` dereference the integer `1`, see
+    // `fixed-suite-bugs/jit/inline-getfield-read-a-non-reference-cell-as-a-pointer`.
+    //
+    // Asking the class is what the comment above always meant -- it says "for a
+    // ByteArrayInputStream" -- and is what `dis_fast_window` already does for
+    // the same stream shapes. [`has_byte_array_stream_layout`] is that question
+    // plus the slot-count bound, spelled the way `native-io`'s
+    // `input_stream_has_bais_layout` already spells it (so a `ByteArrayInputStream`
+    // SUBCLASS, which does carry the layout at slots 0..3, is not silently
+    // dropped to the slow path). The shape probe stays as a second condition so
+    // a future field reordering degrades to the slow path instead of writing
+    // the wrong slot -- and because the helper has already bounded the receiver,
+    // that retained probe can no longer be the out-of-bounds read it was.
+    let byte_array_stream_layout = has_byte_array_stream_layout(ctx, input)
+        && matches!(
+            (
+                ctx.get_field(input, 0),
+                ctx.get_field(input, 1),
+                ctx.get_field(input, 3),
+            ),
+            (Value::Object(Some(_)), Value::Int(_), Value::Int(_))
+        );
     if byte_array_stream_layout
         && ctx
             .class_name_arc_of_id(ctx.class_id_of_object(output))
@@ -1814,7 +1854,10 @@ pub(crate) fn p58_gzip_in_init_desc(
     } else {
         Vec::new()
     };
+    // The allocation can move `this`; pin and re-derive before storing into it.
+    let this_pin = ctx.pin_native_root(this);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decompressed.len());
+    let this = ctx.read_native_pin(this_pin, this);
     // PERF: bulk memcpy the decompressed payload instead of a per-element loop.
     ctx.write_byte_array_from(arr, 0, &decompressed);
     ctx.set_field(this, 0, Value::Object(Some(arr))); // decompressed data
@@ -4427,4 +4470,67 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
     ()
+}
+
+#[cfg(test)]
+mod transfer_to_receiver_gate_tests {
+    /// `native_input_stream_transfer_to` must ask the receiver's CLASS before
+    /// it indexes the receiver's fields.
+    ///
+    /// The fast path here exists for `ByteArrayInputStream` and recognises it
+    /// by reading slots 0, 1 and 3. Any stream with fewer slots than that is
+    /// read out of bounds by the probe itself — measured 2026-08-24, every
+    /// `CoyoteInputStream` (one field, `ib`) that reached this native produced
+    /// `zgc real: field index OOB index=1..4`: 16 per run of
+    /// `TestDefaultServletRfc9110Section13` and 8 per run of
+    /// `TestWebdavServletOptionsUnknown`, both of which PASS, which is how it
+    /// went unnoticed. Worse, a probe that MATCHED on a wrong class would then
+    /// `set_field(input, 1, Value::Int(..))` — a primitive into whatever slot 1
+    /// is there, in general a reference field, which is the punned cell that
+    /// made a compiled `arraylength` dereference the integer 1.
+    ///
+    /// A SOURCE guard for the ORDER: the receiver gate must precede the first
+    /// indexed read of `input`. Reordering is the way this defect comes back,
+    /// and no behavioural test can see an ordering.
+    ///
+    /// The BEHAVIOUR is covered separately, by `byte_array_stream_layout_tests`
+    /// above. An earlier revision of this comment said there was no mock
+    /// `NativeContext` in this crate that could carry a real receiver; that is
+    /// wrong — `crate::test_utils::MockNativeContext` gives a class id and an
+    /// exact slot count to an allocation (`ensure_class_initialized` +
+    /// `alloc_object`), which is all this predicate reads. Those three tests
+    /// drive a one-slot `CoyoteInputStream`, a four-slot
+    /// `ByteArrayInputStream`, and a four-slot unrelated stream.
+    ///
+    /// The measured signature is `index=1` and `index=3` with `num_slots=1`,
+    /// and never index 2 or 4: the pair is `pos` and `count` of the
+    /// `ByteArrayInputStream` layout, which is what points at the shape test.
+    #[test]
+    fn the_class_gate_precedes_any_indexed_read_of_the_receiver() {
+        let src = include_str!("zip_streams.rs");
+        let start = src
+            .find("fn native_input_stream_transfer_to")
+            .expect("the native must still exist under this name");
+        let body = &src[start..];
+        // Split so this test does not match its own source.
+        let probe = concat!("ctx.get_", "field(input, ");
+        let gate = concat!("has_byte_array_", "stream_layout(ctx, input)");
+
+        let gate_at = body.find(gate).unwrap_or_else(|| {
+            panic!(
+                "native_input_stream_transfer_to no longer asks \
+                 has_byte_array_stream_layout before probing its layout; a stream with \
+                 fewer slots than the ByteArrayInputStream shape is read out of bounds"
+            )
+        });
+        let probe_at = body
+            .find(probe)
+            .expect("the layout probe should still be there");
+        assert!(
+            gate_at < probe_at,
+            "the class gate must come BEFORE the first indexed read of `input` \
+             (gate at {gate_at}, probe at {probe_at}) — otherwise the probe \
+             itself is the out-of-bounds access"
+        );
+    }
 }

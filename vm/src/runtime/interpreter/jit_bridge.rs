@@ -90,29 +90,66 @@ pub(super) fn dbg_osr_recompile_reason(
     );
 }
 
-/// A direct compiled call has no interpreter boundary to route an implicit
-/// exception through the callee's own handler. Keep those callees on checked
-/// dispatch for every entry tier, including OSR.
-pub(super) fn osr_callee_declares_handlers(
+/// Why the OSR door must leave a statically bound callee on the checked
+/// dispatch helper — `None` when it may bake a direct machine-code `CALL`.
+///
+/// This is the OSR door's copy of the refusal `callee_compiler` and
+/// `direct_callee_lookup` each spell out, and until 2026-08-24 it disagreed
+/// with both: it refused **every** callee declaring an exception table,
+/// unconditionally, while the other two doors had asked
+/// `direct_call_exc_table_publish_enabled` since that gate existed and stopped
+/// refusing when it was flipped default-ON on 2026-08-21.
+///
+/// That disagreement is the whole of the OSR half of
+/// `osr-door-refused-every-exception-table-callee-FIXED-20260824.md`. The gate's flip
+/// moved the ordinary-frame rung of `probes/NativeFunnelFloorProbe.java` from
+/// 107.30 to 10.57 ns/op and left the OSR rung at ~101 in both arms, and the
+/// page read that — correctly, given what it could see — as "an OSR body never
+/// consults the gate at all". It does not consult it because this predicate
+/// never asked; a hot loop is always an OSR body, so the sites that stand to
+/// gain most from a direct call were by construction the ones excluded.
+///
+/// Nothing else about the OSR door needed to change for this to be sound. The
+/// gate's two stated preconditions are properties of the EMITTER, not of the
+/// door: `emit_inline_callee_deopt_check` is emitted after the baked `CALL` by
+/// the same `x64/bytecode_walk.rs` arms this door reaches through
+/// `compile_with_param_slots`, and a site that cannot reserve the service
+/// slots fails the compile (`direct-call-service-slots`) rather than emitting
+/// an unserviced edge. The OSR ladder already registers a `JitInvokeInfo` for
+/// every direct-bound site, which is what that check reads.
+///
+/// The two refusals that are NOT about the gate stay unconditional: a callee
+/// this door cannot resolve, and a callee with no `Code` attribute at all —
+/// there is no body to bake a `CALL` to. `direct_callee_lookup` maps the
+/// no-`Code` case onto `CalleeExceptionTable` as well, and this mirrors it so
+/// the census table means the same thing at all three doors.
+pub(super) fn osr_callee_bars_direct_call(
     shared: &SharedVm,
     caller_class_id: ClassId,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
-) -> bool {
+) -> Option<cratonvm_jit::DirectBindRefusal> {
     let cm = shared.classes.class_manager.read();
     let Some(callee_cid) = cm.find_class_by_name_for_class(callee_class, caller_class_id) else {
-        return true;
+        return Some(cratonvm_jit::DirectBindRefusal::CalleeClassNotFound);
     };
     let store = cm.class_store();
     let Some((method, _decl)) =
         crate::classloading::find_method_recursive(callee_cid, callee_method, callee_desc, store)
     else {
-        return true;
+        return Some(cratonvm_jit::DirectBindRefusal::CalleeMethodNotFound);
     };
-    method
-        .code()
-        .map_or(true, |code| !code.exception_table.is_empty())
+    match method.code() {
+        None => Some(cratonvm_jit::DirectBindRefusal::CalleeExceptionTable),
+        Some(code)
+            if !code.exception_table.is_empty()
+                && !cratonvm_jit::direct_call_exc_table_publish_enabled() =>
+        {
+            Some(cratonvm_jit::DirectBindRefusal::CalleeExceptionTable)
+        }
+        Some(_) => None,
+    }
 }
 
 pub(super) fn compile_osr_artifact(
@@ -1251,6 +1288,48 @@ pub(super) fn compile_osr_artifact(
                             continue;
                         }
                     }
+                    // `VarHandle` write modes on an instance field — parity
+                    // with `jit::try_compile`'s recognition (see
+                    // `cratonvm_jit::VARHANDLE_WRITE_DIRECT_FNS`).
+                    //
+                    // THIS door is the load-bearing one, for the same reason
+                    // the read bind above says it is, and the write bind
+                    // learned it the expensive way: bound in the single-pass
+                    // ladder ALONE, a native census of `HibfixVarHandleProbe`
+                    // still counted 698 000 `VarHandle.set` dispatches with the
+                    // bind on and 698 000 with it off — identical, because the
+                    // probe's stores are in a `main` loop and a loop body is
+                    // what OSR compiles. The site counter said "bound"; the
+                    // census said "moved nothing".
+                    //
+                    // Asks the policy question for the same reason: `set` is
+                    // registered `NativeKind::Bridge`, which JDK-ONLY-WAVE2
+                    // §1.4 does not permit a compile-time bake of.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_write_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_write_helper_slot(&mn, &desc) {
+                            // Address taken directly rather than out of the
+                            // jit-crate cell — this path can run before
+                            // `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_write_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_WRITE_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 2,
+                                    return_type: b'V',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
                     // helper verifies the receiver's EXACT class and routes
@@ -1587,7 +1666,7 @@ pub(super) fn compile_osr_artifact(
                         &callee_method,
                         &callee_desc,
                     );
-                    let refuse_handlers = osr_callee_declares_handlers(
+                    let refuse_handlers = osr_callee_bars_direct_call(
                         shared,
                         class_id,
                         &callee_class,
@@ -1610,14 +1689,22 @@ pub(super) fn compile_osr_artifact(
                             callee_method,
                             callee_desc,
                             ipc,
-                            !(refuse_dispatch || refuse_handlers || refuse_indy),
+                            !(refuse_dispatch || refuse_handlers.is_some() || refuse_indy),
                             entry,
                             refuse_dispatch,
-                            refuse_handlers,
+                            refuse_handlers
+                                .map(|r| cratonvm_jit::DIRECT_BIND_REFUSAL_NAMES[r as usize])
+                                .unwrap_or("no"),
                             refuse_indy
                         );
                     }
-                    if !refuse_dispatch && !refuse_handlers && !refuse_indy {
+                    if !refuse_dispatch && refuse_handlers.is_none() && !refuse_indy {
+                        // The OSR door's engagement counter. See
+                        // `note_osr_direct_callee_bind_hit`: this ladder used to
+                        // bind and refuse without touching the census at all, so
+                        // `direct callee binds: 0 bound, 0 left` was printed by a
+                        // process whose hot loops were doing both.
+                        cratonvm_jit::note_osr_direct_callee_bind_hit();
                         direct_calls2.push((
                             ipc,
                             crate::jit::JitDirectCall {
@@ -1678,6 +1765,22 @@ pub(super) fn compile_osr_artifact(
                         invoke_info.push((ipc, info_ptr));
                         continue;
                     }
+                    // Bound-then-refused: the callee compiled, and one of the
+                    // three gates above sent the site to the helper anyway.
+                    // Attributed rather than lumped in with "not compiled yet",
+                    // because the two want opposite fixes -- a compile-ORDER
+                    // miss is re-bindable, a policy refusal is not.
+                    cratonvm_jit::note_osr_direct_callee_bind_miss(if refuse_dispatch {
+                        cratonvm_jit::DirectBindRefusal::EagerChainCycle
+                    } else if let Some(reason) = refuse_handlers {
+                        reason
+                    } else {
+                        cratonvm_jit::DirectBindRefusal::IndyTrap
+                    });
+                } else {
+                    cratonvm_jit::note_osr_direct_callee_bind_miss(
+                        cratonvm_jit::DirectBindRefusal::CalleeNotYetCompiled,
+                    );
                 }
 
                 // Compilation failed, or the callee participates in a recursive
