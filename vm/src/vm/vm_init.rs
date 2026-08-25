@@ -7817,6 +7817,49 @@ impl SharedVm {
         self.threads
             .thread_registry
             .dump_thread_summary_to_stderr(&acked);
+        self.dump_object_wait_census();
+    }
+
+    /// EVERY thread parked in `Object.wait()` at dump time, and the state of
+    /// the object each one is parked on.
+    ///
+    /// # The question this exists to answer
+    ///
+    /// `known-issues/netty/parameterizedsslhandlertest-residual-stalls` named
+    /// one cheap step that had never been taken: at stall time, dump
+    /// every parked waiter rather than the first one the watchdog reaches. The
+    /// residual it was written for is a promise that was never completed with
+    /// no notification due — for which "nothing completed it" and "the thread
+    /// that would have completed it is itself parked" are different defects
+    /// with different suspect lists, and the single-thread dump cannot
+    /// separate them. This can, in the stall that is already happening.
+    ///
+    /// An EMPTY census is a result, not a gap, and it is labelled as one: it
+    /// means no thread in the process is in `Object.wait()`, so a stalled test
+    /// thread is blocked on something else entirely (`LockSupport.park`, a
+    /// native, a lock acquire) and the whole `Object.wait()` line of enquiry
+    /// is the wrong one.
+    pub fn dump_object_wait_census(&self) {
+        let rows = self.threads.thread_registry.waiting_monitor_census();
+        eprintln!(
+            "--- [WAIT-CENSUS] {} thread(s) parked in Object.wait() \
+             (registry `jmx_waiting_monitor`, a GC-forwarded root) ---",
+            rows.len()
+        );
+        if rows.is_empty() {
+            eprintln!(
+                "  [WAIT-CENSUS] none. NOT a missing instrument: no thread in this \
+                 process is inside Object.wait(), so a stall here is parked on \
+                 something else (LockSupport.park, a lock acquire, or a native call)."
+            );
+        }
+        for (tid, name, alive, obj, waited_ms) in rows {
+            eprintln!(
+                "  [WAIT-CENSUS] tid={tid} name={name:?} alive={alive} waited_ms={waited_ms}"
+            );
+            crate::vm::vm_init::dump_wait_object_state(self, obj);
+        }
+        eprintln!("--- [WAIT-CENSUS] end ---");
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -8111,6 +8154,15 @@ pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
         drop(cm);
         Some(shared.mem.heap.get_field(obj, idx))
     };
+    // SLOT PROVENANCE. The 2026-08-24 `ParameterizedSslHandlerTest` residual
+    // page asked, of a dump that read `Int(0)` out of a
+    // `private volatile Object`, whether the value was real or whether
+    // `resolve_field_index_in_hierarchy` had answered with the wrong slot for
+    // that receiver. The dump could not say, because it printed neither the
+    // index it used nor the layout it used it against. It does now, and the
+    // two together are decidable by inspection. (It was neither — see the
+    // never-written-cell note below.)
+    let result_slot = resolve_declared_instance_field(shared, cid, "result");
     // WHAT `result` ACTUALLY IS, not just whether it is non-null.
     //
     // `result != null` is NOT the same claim as "the promise completed", and
@@ -8143,13 +8195,155 @@ pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
     // Distinguishing the two is a pointer comparison against the class's own
     // statics, so the dump does it rather than leaving the reader to assume.
     let result = field("result");
-    let verdict = classify_promise_result(shared, cid, &result);
+    // A NEVER-WRITTEN REFERENCE CELL IS NOT A TYPE-PUNNED ONE.
+    //
+    // `Value` is `#[repr(u32)]` with `Int = 0` and `Object = 4`, so a
+    // zero-filled 16-byte slot decodes as `Value::Int(0)` and NOT as
+    // `Object(None)` — see `init_primitive_fields`' G56-1 note. The
+    // interpreter's allocation path writes the `Object(None)` tag explicitly;
+    // the JIT's arms clear the body to zero and rely on every reader
+    // repairing the tag locally (`opcodes.rs`' `getfield` fixup, the inline
+    // read's payload-only load, `coerce_field_value_for_slot`,
+    // `values_equal_for_cas`). Both are "null" to Java. This dump was the one
+    // reader that did NOT repair it, and it reported the difference as
+    // `result_is=not-a-reference-slot` — which reads as heap corruption when
+    // it is an unwritten field of a promise that is simply still pending.
+    //
+    // So normalise exactly as the other readers do, print BOTH values, and
+    // say which one the verdict is about.
+    let result_desc = result_slot.as_ref().map(|s| s.descriptor.clone());
+    let ref_declared = result_desc
+        .as_deref()
+        .is_some_and(|d| d.starts_with('L') || d.starts_with('['));
+    let normalised = match (&result, ref_declared) {
+        (Some(cratonvm_types::Value::Int(0)), true) => Some(cratonvm_types::Value::Object(None)),
+        _ => result.clone(),
+    };
+    let verdict = classify_promise_result(shared, cid, &normalised);
     eprintln!(
         "[WAIT-OBJECT] obj={:p} class={name} result={:?} result_is={verdict} waiters={:?}",
         obj.as_ptr(),
         result,
         field("waiters"),
     );
+    match &result_slot {
+        Some(slot) => {
+            eprintln!(
+                "[WAIT-OBJECT] result_slot=index {} declared {} on {} (receiver layout: {})",
+                slot.index,
+                slot.descriptor,
+                slot.owner,
+                describe_instance_layout(shared, cid),
+            );
+            if ref_declared && !matches!(result, Some(cratonvm_types::Value::Object(_))) {
+                eprintln!(
+                    "[WAIT-OBJECT] result cell is a NEVER-WRITTEN zero cell, not a punned \
+                     slot: the field is declared {} and the slot decodes as {:?}, which is \
+                     what a zero-filled 16-byte `Value` cell decodes to (`Int` is \
+                     discriminant 0). Every other reader in the VM treats it as null, so the \
+                     verdict above is taken on the normalised value and this promise is \
+                     PENDING, not corrupt.",
+                    slot.descriptor, result,
+                );
+            }
+        }
+        None => eprintln!(
+            "[WAIT-OBJECT] result_slot=UNRESOLVED — no instance field named `result` anywhere \
+             in this receiver's hierarchy, so the value above was read from nothing and must \
+             not be interpreted (receiver layout: {})",
+            describe_instance_layout(shared, cid),
+        ),
+    }
+}
+
+/// One declared instance field, resolved through a receiver's hierarchy.
+pub struct DeclaredField {
+    /// Layout slot index — what `heap.get_field` is indexed with.
+    pub index: usize,
+    /// The field's declared JVM descriptor, e.g. `Ljava/lang/Object;`.
+    pub descriptor: String,
+    /// The class in the hierarchy that DECLARES it, which is usually not the
+    /// receiver's own class.
+    pub owner: String,
+}
+
+/// Resolve `field_name` on `cid`'s hierarchy to its slot index, declared
+/// descriptor and declaring class.
+///
+/// Mirrors [`crate::vm::vm_exec::resolve_field_index_in_hierarchy`] slot for
+/// slot — same walk, same `instance_offset` accounting — and exists so a
+/// diagnostic can print WHAT it resolved rather than only the value it read
+/// through it. A dump that prints a value without the slot it came from
+/// cannot be checked, which is exactly the gap the netty residual page names.
+pub fn resolve_declared_instance_field(
+    shared: &SharedVm,
+    cid: ClassId,
+    field_name: &str,
+) -> Option<DeclaredField> {
+    let cm = shared.classes.class_manager.read();
+    let mut current = Some(cid);
+    while let Some(c) = current {
+        let class = cm.class_store.get(c)?;
+        let mut instance_offset = 0usize;
+        for f in &class.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == field_name {
+                return Some(DeclaredField {
+                    index: class.first_field_index + instance_offset,
+                    descriptor: f.descriptor.to_string(),
+                    owner: class.name.to_string(),
+                });
+            }
+            instance_offset += 1;
+        }
+        current = class.superclass;
+    }
+    None
+}
+
+/// Every instance field a receiver carries, most-derived class first, as
+/// `owner.name:descriptor@index`.
+///
+/// Printed beside a resolved slot so "the dump read the wrong index" is a
+/// claim the reader can check instead of one they have to trust. Capped, so a
+/// receiver with a large hierarchy cannot flood a watchdog dump.
+pub fn describe_instance_layout(shared: &SharedVm, cid: ClassId) -> String {
+    const MAX: usize = 48;
+    let cm = shared.classes.class_manager.read();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = Some(cid);
+    let mut truncated = false;
+    while let Some(c) = current {
+        let Some(class) = cm.class_store.get(c) else {
+            parts.push(format!("<class_id {c:?} not in store>"));
+            break;
+        };
+        let mut instance_offset = 0usize;
+        for f in &class.fields {
+            if f.is_static() {
+                continue;
+            }
+            if parts.len() >= MAX {
+                truncated = true;
+            } else {
+                parts.push(format!(
+                    "{}.{}:{}@{}",
+                    class.name,
+                    f.name,
+                    f.descriptor,
+                    class.first_field_index + instance_offset
+                ));
+            }
+            instance_offset += 1;
+        }
+        current = class.superclass;
+    }
+    if truncated {
+        parts.push("...".to_string());
+    }
+    parts.join(" ")
 }
 
 /// Name a `DefaultPromise.result` value against that class's own `SUCCESS` /
@@ -8165,7 +8359,16 @@ fn classify_promise_result(
     cid: ClassId,
     result: &Option<cratonvm_types::Value>,
 ) -> String {
-    let Some(cratonvm_types::Value::Object(slot)) = result else {
+    let Some(value) = result else {
+        // NOT the same claim as "the slot holds a primitive". `None` here means
+        // the receiver has no instance field called `result` anywhere in its
+        // hierarchy, so nothing was read at all — and printing a verdict about
+        // the value would be a verdict about nothing. This dump has already
+        // mislabelled one unread slot (see the zero-cell note in
+        // `dump_wait_object_state`); it does not get to do it twice.
+        return "no-result-field(NOTHING-WAS-READ)".to_string();
+    };
+    let cratonvm_types::Value::Object(slot) = value else {
         return "not-a-reference-slot".to_string();
     };
     let Some(r) = slot else {

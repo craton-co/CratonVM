@@ -219,6 +219,9 @@ pub fn prev_insn_int_const_for_test(code: &[u8], code_len: usize, pc: usize) -> 
 }
 
 mod inlining;
+/// Engagement count for the splice cursor clamp, for `jit-method-stats`.
+/// A number beside a result is what says whether the guard ran at all.
+pub(crate) use inlining::inline_live_slot_clamps;
 mod objects;
 mod arrays;
 mod simd;
