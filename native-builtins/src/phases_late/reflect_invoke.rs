@@ -2104,7 +2104,7 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
 /// **Default OFF, on a measurement.** The JDK path pulls frames one BATCH at a
 /// time and stops when the consumer stops, so on paper it should beat an
 /// implementation that materialises every frame up front — and
-/// `quartz-stackwalker-walk-is-38x-hotspot-20260818.md` named it "the full fix,
+/// `quartz-stackwalker-walk-is-38x-hotspot (retired 2026-08-25)` named it "the full fix,
 /// and the only one on this page with the right ceiling". Built and measured
 /// ABBA in one binary, on `probes/StackWalkerTerminationProbe.java`, it is
 /// SLOWER at every depth (ms, 2000 iterations, two runs per arm):
@@ -2175,7 +2175,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     // `probes/StackWalkerFindFirstProbe.java`: the walk's profile is flat and
     // allocation-shaped (no symbol above 2.3%, ~24% in mimalloc's `mmap` with
     // no resolvable Rust caller), so the object COUNT is the lever, not any one
-    // symbol. See `quartz-stackwalker-walk-is-38x-hotspot-20260818.md`.
+    // symbol. See `quartz-stackwalker-walk-is-38x-hotspot (retired 2026-08-25)`.
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
