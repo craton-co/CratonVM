@@ -8201,6 +8201,73 @@ impl Compiler {
                         )
                     });
 
+                    // Receiver-type speculation consults the per-bci de-spec
+                    // registry. A call-site intrinsic with `guard_class_id != 0`
+                    // (the `java/lang/CharSequence` String family, the CRC32
+                    // family, the atomic-field family) is a SPECULATION: the
+                    // inline body it emits is valid for exactly that one
+                    // receiver class and every other receiver takes the
+                    // `ReceiverTypeChanged` deopt edge. On a site whose receiver
+                    // is NEVER that class the guard fails on every single call,
+                    // so the method deopts per invocation, is recompiled with
+                    // the identical guard, and is finally barred from
+                    // compilation altogether by `recommend_action`'s
+                    // `MakeNotCompilable` escalation -- for a speculation the
+                    // compiler chose, about a program that never satisfied it.
+                    // netty's `HttpHeaderValidationUtil.validateValidHeaderValue`
+                    // is that shape: its `CharSequence.length()` at bci 1 is
+                    // reached only with `AsciiString` and an anonymous
+                    // `CharSequence`, and the class measured 1.67 deopts per
+                    // loop iteration (docs/known-issues/netty/httpheader-
+                    // validationutiltest-exhaustive-loop-timeout-20260816.md).
+                    //
+                    // `real_frame_deopt_resume_and_despeculate` already records
+                    // such a bci in the de-spec registry after
+                    // `PER_BCI_DESPEC_LIMIT` deopts and prints "speculation
+                    // suppressed on next compile" -- but until now nothing on
+                    // the receiver-guard path READ that registry (only the two
+                    // loop-hoist gates in `driver.rs` and the
+                    // `ArraycopyPrimitive` intrinsic below did), so the claim
+                    // was false and the next compile emitted the same guard.
+                    // The consult belongs at the RESOLVER, not here, and this
+                    // block counts rather than declines. Measured 2026-08-24,
+                    // and it cost most of a session: declining a registered
+                    // intrinsic in THIS filter does not send the site to the
+                    // `else` arm's MIC/PIC dispatch, because that arm needs
+                    // `invoke_info` at this pc and there is none. A site the
+                    // resolver registered as an intrinsic took
+                    // `direct_calls.push(..); continue;` in `try_compile_inner`
+                    // BEFORE the `invoke_info.push` below it, so the dispatch
+                    // metadata was never built. With both `direct` and
+                    // `info_ptr` `None` the emitter falls through to the
+                    // unconditional `UnreachedCode` trap at the bottom of this
+                    // arm -- so the "declined" site deopts on EVERY execution
+                    // instead of dispatching. The de-spec consult read as inert
+                    // (deopts 3502 -> 3055 on `HeaderValidationLoopRate`) while
+                    // its own `sites-declined` counter said it had fired 51
+                    // times; only correlating the decline trace against the
+                    // deopt stream separated the two -- 33 declines at
+                    // `oldHeaderValueValidationAlgorithm pc=6` and 1466 deopts
+                    // at that same bci AFTERWARDS.
+                    //
+                    // The pre-existing `ArraycopyPrimitive` and
+                    // `StringIndexOfChar` filters in the invokestatic ladder
+                    // above have the identical shape and therefore the identical
+                    // defect; they are left alone here because each needs its
+                    // own A/B, and are named on the known-issue page.
+                    let direct = direct.filter(|&(_, _, _, _, guard_class_id)| {
+                        if guard_class_id == 0 {
+                            crate::metrics::note_receiver_despec(
+                                crate::metrics::RECEIVER_DESPEC_UNGUARDED,
+                            );
+                            return true;
+                        }
+                        crate::metrics::note_receiver_despec(
+                            crate::metrics::RECEIVER_DESPEC_GUARD_EMITTED,
+                        );
+                        true
+                    });
+
                     if let Some((
                         callee_entry,
                         callee_needs_ctx,
