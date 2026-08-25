@@ -102,7 +102,17 @@ fn for_each_flat_object_reference(
     } else {
         for index in first_index..header.num_slots() as usize {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
-            let value = unsafe { cratonvm_types::read_value_atomic(slot as *const Value) };
+            // Discriminant-screened: see `heap::read_value_cell_checked`. An
+            // unchecked transmute here turns a swept-and-reused cell into a
+            // `Value` with an out-of-range tag — UB, and it hands `visit` a
+            // garbage reference. Corrupt cells decode to `Value::Object(None)`
+            // and are skipped by the `if let` below.
+            let value = unsafe {
+                crate::heap::read_value_cell_checked(
+                    slot as *const Value,
+                    "g1::for_each_object_reference",
+                )
+            };
             if let Value::Object(Some(reference)) = value {
                 visit(slot, reference.as_ptr() as usize, false);
             }
@@ -7989,7 +7999,16 @@ impl G1Collector {
                         value_from_bytes(&buf)
                     } else {
                         let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
-                        unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
+                        // Discriminant-screened: see `heap::read_value_cell_checked`.
+                        // Corrupt cells decode to `Value::Object(None)` and are
+                        // skipped, instead of transmuting to a UB `Value` whose
+                        // garbage pointer would be pushed onto the mark worklist.
+                        unsafe {
+                            crate::heap::read_value_cell_checked(
+                                slot_ptr as *const Value,
+                                "g1::concurrent_mark_step",
+                            )
+                        }
                     };
                     if let Value::Object(Some(ref_obj)) = value {
                         let ref_ptr = ref_obj.as_ptr();
