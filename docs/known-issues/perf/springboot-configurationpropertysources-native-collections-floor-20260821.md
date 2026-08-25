@@ -1,10 +1,14 @@
 # `ConfigurationPropertySourcesTests` — decomposed, Term 1 fixed, ~23× HotSpot
 
-**Status: OPEN — Terms 1 and 3 CLOSED, Term 2 RE-TAKEN and re-scoped, all on
-2026-08-24. Term 3's fix is real but measured NOT to move this class**, so what
-is left of the gap here is Term 2 alone. What is left is one precisely-named next step (`ArrayList.get`,
-worth ~6×) and one open question (why `ArrayList$Itr` bytecode is SLOWER than
-its native), both in Term 2 below.
+**Status: OPEN — Terms 1 and 3 CLOSED, Term 2 RE-TAKEN, re-scoped, and one of
+its three doors CLOSED, all on 2026-08-24. Term 3's fix is real but measured NOT
+to move this class**, so what is left of the gap here is Term 2 alone. Of Term
+2's three doors, the ITERATOR door is now fixed (1.5×, and the cost was the
+fail-fast check re-deriving per element what is constant per iterator — see
+"The iterator door, fixed"); it is the worst door in the table but NOT the one
+this class takes. What is left is one precisely-named next step (`ArrayList.get`,
+worth ~6×, on the door this class DOES take) and one open question (why
+`ArrayList$Itr` bytecode is SLOWER than its native), both in Term 2 below.
 Rewritten from the 2026-08-21 first cut, which called this "the
 native-collections floor, no leaf over ~8%, no dominant term to attack" and left
 it there. That reading was **wrong in the way that matters**: a flat profile does
@@ -212,6 +216,96 @@ safety and `CRATONVM_DBG_STUB_YIELD` as the engagement counter. It is worth
 the same reasoning; the number above says it would be a pessimisation, and it
 needs its own investigation into why `ArrayList$Itr` bytecode is slow (the
 first question being whether it is compiled at all).
+
+### The iterator door, fixed — 1.5×, and it was not the natives, it was the fail-fast check
+
+**FIXED 2026-08-24**, for the worst of the three doors in the table above (the
+view iterator, ~50× HotSpot). This does not move the Spring class — the re-take
+above is right that `getPropertyNames()` takes the `toArray` door — but the
+iterator door is what `HashSet`, `keySet()` and every `for (x : collection)` in
+the VM take, and it was carrying an avoidable 1.5×.
+
+**The A/B that found it needed no build.** `map_itr_check_comod` — the
+`HashMap$HashIterator.nextNode()` comodification test added on 2026-08-23 —
+already has a kill switch, so pricing it is one environment variable on the
+existing binary. Three interleaved rounds, `LinkedHashMap` width 1000:
+
+| rung | fail-fast ON | `CRATONVM_NO_MAP_ITERATOR_FAILFAST=1` | ratio |
+|---|---:|---:|---:|
+| `hoisted` | 10930 / 10472 / 10872 ms | 5478 / 5469 | **2.0×** |
+| `perCall` | 14357 / 13076 ms | 5707 / 4409 | **2.5–3.0×** |
+
+**Half of everything this workload had left after Term 1 was the fail-fast
+check** — which is not a reason to weaken it. It runs once per `next()`, and on
+every one of those calls it re-derived three facts that are constant for the
+life of the iterator:
+
+* `resolve_field_index_by_class_id(cid, "expectedModCount")` — a name-keyed
+  field resolution under the class-manager read lock;
+* the comodification SOURCE, via `hs_backing_map` → `hs_map_slot`, which asks
+  `class_id_by_name` twice and `is_subclass` twice;
+* `get_field_by_name(src, "modCount")` — another name-keyed resolution.
+
+`perf record -F 999` over `probes/KeySetBench hoisted` names the same chain from
+the other end, and its top leaf is not in this file at all:
+
+| share | symbol |
+|---|---|
+| **9.91 %** | `hashbrown::HashMap<ClassId, ()>::insert` |
+| 5.37 % | `resolve_field_descriptor_byte_cached` |
+| 5.01 % | `ZObjectStarts::contains` |
+| 4.59 % | `Class::is_subclass_of_inner` |
+| 4.39 % | `ZgcRealHeap::is_object_address` |
+| 1.80 % | `ClassManager::classify_exact_name` |
+| 1.57 % | `NativeContextImpl::get_field_by_name` |
+| 1.45 % | `ClassManager::find_unique_class_by_name` |
+| 1.27 % | `resolve_field_index_by_class_id` |
+| 1.14 % | `class_id_by_name` |
+
+The largest single leaf in the profile is the **visited set of
+`Class::is_subclass_of`** — an `FxHashSet<ClassId>` allocated per subtype test,
+pre-sized to 16 so it would not rehash, holding a handful of `u32`s. Reached
+from `hs_map_slot`'s two `is_subclass` calls, once per element.
+
+### The three changes
+
+1. **`Class::is_subclass_of`'s visited set is a stack array** (`VisitedClasses`,
+   32 inline `u32`s with a `Vec` spill). No allocation, no hashing; the spill
+   keeps the linear bound for a pathological hierarchy rather than losing the
+   dedupe and going exponential, which is what the set exists to prevent. This
+   is VM-wide — the same set is on the JIT invoke path.
+2. **The three name lookups are memoized per `(vm identity, ClassId)`** in a
+   direct-mapped 128-slot per-thread table. A collision or a second `SharedVm`
+   in one process is a MISS, not a wrong answer; the VM identity is in the key
+   because `ClassId`s are per-VM dense indices. **Only POSITIVE answers are
+   cached** — these are pure functions of the class STORE and the store grows,
+   so a `None` from `class_id_by_name("java/util/HashSet")` before that class is
+   loaded must not be pinned for the process.
+3. **`native_hs_iterator` collects the snapshot ONCE.** It used to collect for
+   the length, allocate the array, and collect AGAIN because `alloc_ref_array`
+   may have moved everything the first collect produced — and then hand the
+   second collect's results to `pin_value_slice`, which is the other way to
+   survive an allocation and the one this file uses everywhere else. Pinning the
+   FIRST collect makes the second walk pure waste: 1000 nodes × 2 `get_field`
+   calls per `iterator()`.
+
+### Measured
+
+Two binaries from ONE tree (the control is the same merge with only these four
+files stashed), ABBA-interleaved, minimum per round, `LinkedHashMap` width 1000,
+2000 calls:
+
+| rung | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| `hoisted` before → after | 5248 → 3543 | 5432 → 3720 | 5254 → 3389 |
+| `perCall` before → after | 4837 → 3353 | 4914 → 3248 | 6358 → 3282 |
+
+**1.44–1.94×, six rounds out of six.** The comodification behaviour is
+unchanged and that is checked rather than argued: `probes/MapModCountProbe`
+reports **CME in all twelve cells and both `LIVEVIEW` rows, byte-identical to
+HotSpot 25.0.3+9**, i.e. the 16-of-16 state `a6911c502` reached is preserved.
+That control is not decoration — an earlier cut of this work regressed
+`TreeMap.entrySet()` from CME to NONE and nothing else would have caught it.
 
 ## Term 2 (ORIGINAL 2026-08-22 reading) — the per-element constant is ~2 µs, and it is linear
 
