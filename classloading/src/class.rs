@@ -509,6 +509,72 @@ pub fn class_origin_epoch() -> u64 {
     CLASS_ORIGIN_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The dedupe set for [`Class::is_subclass_of_inner`]'s DAG walk.
+///
+/// # Why not a hash set
+///
+/// It was `FxHashSet<ClassId>`, pre-sized to 16 — one heap allocation plus a
+/// hash and a probe per node visited, for a set that holds a handful of `u32`s.
+/// `perf record -F 999` over `probes/KeySetBench hoisted` (the
+/// `native-collections` per-element floor written up in
+/// `docs/known-issues/perf/springboot-configurationpropertysources-native-
+/// collections-floor-20260821.md`) attributed **9.91 %** of the whole process
+/// to `hashbrown::HashMap<ClassId, ()>::insert`, plus a further 4.59 % to
+/// `is_subclass_of_inner` itself: the largest single leaf in that profile,
+/// above every GC and dispatch frame, and reached from the collection natives'
+/// receiver-shape tests, which run once per element.
+///
+/// A linear scan over a stack array of `u32`s has no allocation, no hashing and
+/// no indirection, and at these sizes it is not close. The set is small by
+/// construction — one entry per node of the (superclass, interface) DAG
+/// actually walked — and the widest real-JDK shapes here (the `Collection`
+/// family, `CompletableFuture`, `Function`) are a couple of dozen nodes.
+///
+/// The `Vec` spill exists so that a pathological hierarchy degrades to a longer
+/// linear scan rather than losing the dedupe and going exponential, which is
+/// the failure the set was introduced to prevent in the first place.
+struct VisitedClasses {
+    inline: [u32; VISITED_INLINE],
+    len: usize,
+    spill: Vec<u32>,
+}
+
+/// Inline capacity of [`VisitedClasses`], in `ClassId`s. 16 `u32`s is one cache
+/// line; 32 is two, and covers every real-JDK interface DAG measured here.
+const VISITED_INLINE: usize = 32;
+
+impl VisitedClasses {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inline: [0; VISITED_INLINE],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// `true` when `id` was NOT already present — the same sense as
+    /// `HashSet::insert`, so the caller's `if !visited.insert(..) { return }`
+    /// reads unchanged.
+    #[inline]
+    fn insert(&mut self, id: ClassId) -> bool {
+        let v = id.as_u32();
+        if self.inline[..self.len].contains(&v) {
+            return false;
+        }
+        if !self.spill.is_empty() && self.spill.contains(&v) {
+            return false;
+        }
+        if self.len < VISITED_INLINE {
+            self.inline[self.len] = v;
+            self.len += 1;
+        } else {
+            self.spill.push(v);
+        }
+        true
+    }
+}
+
 impl Class {
     // ----- Provenance ------------------------------------------------------
 
@@ -949,7 +1015,8 @@ impl Class {
     /// Walks the superclass chain and interface list recursively. Needs access
     /// to the `ClassStore` to look up parent classes by `ClassId`.
     ///
-    /// **Visited set:** the recursion uses an `FxHashSet<ClassId>` to dedupe
+    /// **Visited set:** the recursion uses a [`VisitedClasses`] stack array to
+    /// dedupe
     /// nodes already explored. Without it, diamond interface hierarchies
     /// (e.g. `B implements I1, I2` where `I1 extends I3` and `I2 extends I3`,
     /// or the much wider real-JDK shapes around `java/util/List` /
@@ -964,16 +1031,11 @@ impl Class {
         if self.id == other_id {
             return true;
         }
-        // Pre-sized, not `default()`. A `default()` table starts at capacity 0
-        // and REHASHES as the walk inserts: `hashbrown`'s `reserve_rehash` for
-        // `(ClassId, ())` measured 2.18% of `LambdaCompositionProbe`, with its
-        // callers `jit_invoke_virtual_mic` and
-        // `try_jit_site_cached_native_dispatch` — i.e. the JIT invoke path pays
-        // it per call. 16 covers the real-JDK interface DAGs this walks
-        // (`CompletableFuture`, `Function`, the `Collection` family) without a
-        // single resize.
-        let mut visited: FxHashSet<ClassId> =
-            FxHashSet::with_capacity_and_hasher(16, Default::default());
+        // NOT a hash set. Pre-sizing an `FxHashSet` to 16 removed the rehash
+        // but kept the allocation and the hashing, and `perf record` still put
+        // `hashbrown::HashMap<ClassId, ()>::insert` at 9.91 % of the whole
+        // process on `probes/KeySetBench hoisted`. See [`VisitedClasses`].
+        let mut visited = VisitedClasses::new();
         self.is_subclass_of_inner(other_id, store, 0, &mut visited)
     }
 
@@ -982,7 +1044,7 @@ impl Class {
         other_id: ClassId,
         store: &ClassStore,
         depth: usize,
-        visited: &mut FxHashSet<ClassId>,
+        visited: &mut VisitedClasses,
     ) -> bool {
         if depth > MAX_HIERARCHY_DEPTH {
             return false;
