@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-488 tokens.
+489 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -72,6 +72,7 @@ export inherited from a parent shell.
 | `dial-doors` | `CRATONVM_DBG_DIAL_DOORS` |
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
+| `watch-pun` | `CRATONVM_DBG_WATCH_PUN` |
 | `read0-latency` | `CRATONVM_DBG_READ0LAT` |
 | `refdisc` | `CRATONVM_DBG_REFDISC` |
 | `site-alias` | `CRATONVM_DBG_SITE_ALIAS` |
@@ -554,7 +555,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-221 tokens.
+223 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -618,6 +619,7 @@ export inherited from a parent shell.
 | `inclusive-bce` | `CRATONVM_JIT_INCLUSIVE_BCE` |
 | `inline-allow-static` | `CRATONVM_INLINE_ALLOW_STATIC` |
 | `inline-getfield` | `CRATONVM_JIT_INLINE_GETFIELD` |
+| `inline-live-slot-clamp` | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` |
 | `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
 | `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
@@ -681,6 +683,7 @@ export inherited from a parent shell.
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
+| `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
