@@ -376,14 +376,109 @@ crossings is wrong.** The count was right (2 002 000 / 2 000 000, exact); the
 attribution was not. Removing the crossings does not remove the cost, so the
 crossings were the symptom.
 
-**The real next question is narrower and better posed:** why does the JIT never
-compile `java/util/ArrayList$Itr.next()` — a five-line accessor called two
-million times — when it compiles that class's `<init>`? Answer that and the
-retag above probably becomes a win rather than a regression; until then, do not
-re-apply it. Start with whether a registered native for the triple makes the
-compile door refuse it (the `might_have_method_descriptor` shape), since that
-would make "is a native registered" both the reason it is slow AND the reason
-the alternative is slow.
+### Why the JIT never compiles it — ANSWERED 2026-08-24
+
+**Registering a native for a method makes that method permanently
+un-compilable.** Not by a refusal in the compile door — by an omission in the
+call-site cache.
+
+The invocation counter that nominates a method for tier-up lives in exactly one
+place: the `CachedInvokeTarget::VirtualBytecode` arm of `dispatch_virtual`
+(`profile_store.increment_invocation` → `on_method_invocation_observed`). The
+**`VirtualNative` arm has no counter at all.** So a call site that resolves to a
+registered native is never counted, never nominated, never enqueued, and never
+compiled — no matter how hot. It is not that the compile was attempted and
+refused; it was never requested.
+
+Measured, `CRATONVM_DBG_JITC=1` on `probes/KeySetBench iterList` (2M calls each):
+
+```text
+[ir] admission   java/util/ArrayList$Itr.<init>(Ljava/util/ArrayList;)V: admitted
+[cratonvm-jitc]  full-compile java/util/ArrayList$Itr.<init>...
+                 …and NOTHING for next() or hasNext(), ever
+```
+
+`<init>` has no native registered and compiles. `next`/`hasNext` do, and never
+appear in the log in any form.
+
+**The converse confirms it.** `java/util/ArrayList.get`/`size` — which the fix
+above made YIELD to real bytecode — now read:
+
+```text
+[ir] admission   java/util/ArrayList.get(I)Ljava/lang/Object;: admitted to the optimizing pipeline
+[cratonvm-jitc]  full-compile java/util/ArrayList.get(I)Ljava/lang/Object; len=2526
+CRATONVM_DBG_JIT_COMPILED: put java/util/ArrayList.get(I)Ljava/lang/Object;
+```
+
+So the 11.1× that fix bought was not merely "skip the native". It was **making
+the method compilable at all** — the site flips from `VirtualNative` to
+`VirtualBytecode`, which is the arm that owns the counter.
+
+Two gates that are NOT the cause, checked and eliminated:
+`CRATONVM_JIT_VIRTUAL_TIERUP` is default-ON, and `ArrayList$Itr.next()` carries
+**no exception table** (`javap -c` on the real JDK class), so the
+`cached.exception_table.is_empty()` precondition passes.
+
+### The iterator: 6.2× is REAL and MEASURED, and one thing blocks it
+
+**Population never declined. The previous two arms were both mis-measured, one
+of them by an editing mistake of mine.**
+
+* *allow-list alone* — no effect, because term 1 of the yield predicate is
+  `kind != SyntheticStub → refuse` and these natives are `Bridge`.
+* *"retag + allow-list", reported as a 1.56× PESSIMISATION* — that arm's
+  allow-list entry had landed in `redefine_immune_synthetic_collection_native`
+  instead of `real_protected_stub_class_common`, forty lines of `matches!`
+  away, by a mis-anchored edit. **It was measuring the retag alone**, and the
+  retag alone is exactly a pessimisation: `resolve_native_site` refuses to cache
+  ANY `SyntheticStub`, so the site drops out of the JIT's native cache onto the
+  generic path — still running the native, by the expensive route. Confirmed
+  with `CRATONVM_DBG_NATIVE_ENTRY=1`: 599 065 funnel entries moved from
+  `jit/helpers.rs` to `vm_exec.rs` and the count did not fall.
+
+With the entry in the RIGHT function, both halves together do exactly what the
+crossing count predicted. One binary, `CRATONVM_ITR_BYTECODE` as the A/B,
+interleaved, µs/call:
+
+| rung | OFF (`Bridge`, today) | ON | HotSpot |
+|---|---:|---:|---:|
+| `iterList` | 944.0/972.5/965.0 | **150.0/159.0/153.0** | 6.0 |
+| `hoisted` (map-view itr) | 618.5/589.5/593.0 | 622.0/622.5/608.0 | 8.5 |
+| `iterSet` (HashSet itr) | 637.5/640.0/675.5 | 656.5/655.5/738.0 | 11.5 |
+| `idxList` | 82.0/69.5/72.0 | 67.5/67.5/83.5 | 6.0 |
+| `rawArr` (**control**) | 17.5/17.5/17.5 | 20.0/18.0/21.0 | 3.5 |
+
+**6.2×**, controls flat, and `ArrayList$Itr.hasNext`/`next` go from never
+appearing in `CRATONVM_DBG_JITC` to `admitted … full-compile`. It is also more
+CORRECT: `probes/ItrYieldProbe` (new, 39 rows — fail-fast, the `lastRet`
+contract, `remove()` interop, sublists, `Arrays.asList`, COW snapshot
+semantics, map views) is byte-identical to HotSpot with it ON, while **today's
+`Bridge` arm gets `cmeClear` wrong** — iterating while calling `list.clear()`
+does not throw `ConcurrentModificationException`.
+
+### What blocks it, exactly
+
+`for (String v : map.values())` throws a **spurious
+`ConcurrentModificationException`** from `ArrayList$Itr.checkForComodification`.
+The cause is already documented in `native-collections`: a `MAP_VIEW_CARRIERS`
+receiver **has no `modCount` slot**. It extends `AbstractCollection`, not
+`AbstractList`, so `AbstractList`'s resolved index names the carrier's own first
+declared field — `HashMap$Values.this$0` and friends, all REFERENCES. The native
+cursor tolerated that; the real one reads it as an int and compares it to
+`expectedModCount`.
+
+A values view hands out an `ArrayList$Itr`, the same class an ordinary list
+does, so a class-name allow-list cannot separate the two cases. **The enabling
+change is to mint a distinct iterator class for view carriers** (the
+`VALUES_ITR_CARRIERS` machinery already exists for the values families) so that
+`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its
+own. Do that and this 6.2× is available.
+
+**A coverage note worth acting on independently:** `regression-suite/run.sh`
+passed **72/72 on the broken binary**. A change that makes
+`for (v : map.values())` throw on the first element is invisible to the suite;
+`probes/MapViewBehaviourProbe` caught it immediately. That gap is worth a vector
+regardless of what happens to this fix.
 
 ### The fix: one allow-list entry, 11.1×
 

@@ -741,6 +741,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_G1_LIVE_MEMO` | DBG | `CRATONVM_DBG=g1-live-memo` | opt-in | off | diag | snapshot | gc |
 | `CRATONVM_DBG_GCPART` | DBG | `CRATONVM_DBG=gcpart` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_GCPAUSE` | DBG | `CRATONVM_DBG=gcpause` | opt-in | off | diag | snapshot | types |
+| `CRATONVM_DBG_JNI_LOCALREF` | DBG | `CRATONVM_DBG=jni-localref` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_GCPHASE` | DBG | `CRATONVM_DBG=gcphase` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_GCWRITE` | DBG | `CRATONVM_DBG=gcwrite` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_GC_FALLBACK_REASONS` | DBG | `CRATONVM_DBG=gc-fallback-reasons` | opt-in | off | diag | snapshot | gc |
