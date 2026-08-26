@@ -95,11 +95,25 @@ CratonVM --jdk-only     FAIL (3 of 10)
 ```
 
 The probe deliberately uses a bare `Handler` subclass with no-op sinks rather
-than `ConsoleHandler`: constructing a `ConsoleHandler` in `--jdk-only` dies in
+than `ConsoleHandler`: constructing a `ConsoleHandler` dies in
 `Charset.newEncoder()` with `AbstractMethodError: has no Code attribute`, a
 SEPARATE defect that would have stopped this probe before it measured anything.
-That is recorded here because it is a live `--jdk-only` blocker on the whole
-`StreamHandler` family and is **not** fixed by this change.
+
+**Corrected 2026-08-25.** The first draft of this paragraph called that "a live
+`--jdk-only` blocker on the whole `StreamHandler` family". Both halves of that
+were wrong, and measuring took one probe:
+
+* it is **not** `--jdk-only`-specific — `PrintStream.charset()` answers a
+  fabricated ABSTRACT `java.nio.charset.Charset` in BOTH modes (6 of 9 checks
+  wrong in compatible, 7 of 9 in strict). Compatible only escapes the crash on
+  the `OutputStreamWriter` path because a native covers it there;
+* it is **not** the whole family — `new StreamHandler(baos, fmt)` is fine, and
+  so is every `Charset.forName(...).newEncoder()`. Only a `PrintStream` SOURCE
+  triggers it, because JDK 19+ `OutputStreamWriter(OutputStream)` asks a
+  `PrintStream` for its `charset()`.
+
+Root cause and fix are in
+`bug-printstream-charset-answers-the-abstract-base-20260825.md`.
 
 **Why the round-trip checks pass and hid this.** `setLevel` wrote slot 0 and
 `getLevel` read slot 0, so they agreed with each other perfectly. Only a reader
