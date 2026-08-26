@@ -296,6 +296,18 @@ audited. That is the obvious next piece of the same audit, and it was left
 alone here rather than changed blind. The `0x5B == 91` constant in
 `rbx`/`r8`/`r13` also remains unexplained.
 
+> **CLOSED 2026-08-26.** All fifteen callers have now been audited, the helper
+> refuses an `Array` header outright, and its uncapped entry point is named
+> `for_each_flat_object_reference_trusting_header` so the fourteen that still
+> trust the count say so. See
+> `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+>
+> That work also found the reader THIS section's pass missed: the semi-space
+> collector (`gc/src/gc.rs`) had the identical validated-then-re-read TOCTOU in
+> three scan arms, with an unchecked `Value` transmute beside it. Both are fixed
+> with the identical fix — see §6 of that page. `0x5B == 91` is still
+> unexplained; §2.7.2 has the only candidate.
+
 ## 2.6 §0.5 item 2, second reader: `g1` clamped the array walk and left the flat walk beside it unclamped
 
 §2.5 answered the audit question for the concurrent marker and left
@@ -354,6 +366,13 @@ walker without a region do with an implausible count?) rather than a
 mechanical edit. They were left alone on purpose; `usize::MAX` through the
 delegating entry point makes that a *visible* default rather than an implicit
 one.
+
+> **2026-08-26.** That design question was answered. The delegating entry point
+> is now spelled `for_each_flat_object_reference_trusting_header` (grep for the
+> old name and you will find only this page's history), the shared body refuses
+> an `Array` header outright, and the fourteen stay uncapped as a written-down
+> decision rather than an omission —
+> `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
 
 And as with §2.5: this is not a demonstration that this walk produced the eight
 `hs_err` files in this page's title. It is the fix for a *different*, recorded,
@@ -425,12 +444,15 @@ identified producer.
 * Still open: **these eight `hs_err` files have never been attributed.** Every
   fix above is a mechanism removed, not this crash reproduced, and §0.4's
   finding stands that symbolization is impossible without the binaries.
-* Still open as a *design* matter, now with its own page:
-  fourteen callers of the flat walk remain unbounded —
-  [what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md](../gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md).
-  A census (`FLAT_WALK_GIVEN_ARRAY`) now counts how often that walk is handed an
-  array, which is the number §5 of that page needs to decide the question. It
-  counts and warns; it deliberately does not refuse.
+* ~~Still open as a *design* matter, now with its own page: fourteen callers
+  of the flat walk remain unbounded.~~ **ANSWERED 2026-08-26** —
+  `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+  The census the note here described (`FLAT_WALK_GIVEN_ARRAY`, "counts and warns;
+  it deliberately does not refuse") rested on a premise that turned out to be
+  false — every one of the fifteen callers DOES pre-branch on kind — so the walk
+  now REFUSES an array header and counts the refusal (`FLAT_WALK_REFUSED_ARRAY`,
+  observed zero). The fourteen remain unbounded by decision, written down, and
+  visibly so at each call site.
 
 **This page is now close to retirable.** What holds it open is one honest gap —
 eight unattributed crash files — and not any known-live defect.
@@ -446,7 +468,11 @@ eight unattributed crash files — and not any known-live defect.
 3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
    slot count?) is answered for the concurrent marker in **§2.5** — yes, by
    TOCTOU on the header, now fixed — and in **§2.6** for `g1::for_each_flat_object_reference`'s
-   crash-path caller; its other fourteen callers remain unaudited. `0x5B == 91` has a candidate explanation in §2.7.2 (an array's length, read
+   crash-path caller. Its other fourteen callers were audited on 2026-08-26 and
+   the question is closed for all of them, plus for the semi-space collector
+   this page's own pass had skipped:
+   `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+   `0x5B == 91` has a candidate explanation in §2.7.2 (an array's length, read
    through the `shape` dword that `num_slots` and `array_length` share).
 
 # 1. The 2026-08-21 not-reproducible investigation, preserved
