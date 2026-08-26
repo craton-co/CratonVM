@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-489 tokens.
+490 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -552,6 +552,7 @@ export inherited from a parent shell.
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
+| `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
 
 ## `CRATONVM_JIT`
 
