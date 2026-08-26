@@ -276,6 +276,18 @@ fn maybe_dump_shutdown_reports() {
                 .join(" "),
             cratonvm_jit::metrics::despec_escalations_spared()
         );
+        // The per-call safepoint blind spill, and how often the oop-clean-frame
+        // proof let a direct call publish the safepoint id alone instead of
+        // copying the whole GPR file into the frame. `elided` is the engagement
+        // counter; the two refusal rows say why the others did not.
+        eprintln!(
+            "[cratonvm] direct-call spill: {}",
+            cratonvm_jit::metrics::call_spill_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is
