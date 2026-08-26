@@ -722,6 +722,24 @@ fn despec_set() -> &'static std::sync::RwLock<FxHashSet<(String, u32)>> {
     DESPEC_SET.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))
 }
 
+/// How many times `max_deopts_per_method` a de-spec'd method may keep
+/// recompiling before the whole-method blacklist fires anyway
+/// (`CRATONVM_JIT_DESPEC_SPARE_FACTOR`, default 2). The backstop exists because
+/// "this bci is de-spec'd" is a claim about the NEXT compile: a site that keeps
+/// trapping past the factor is evidence the claim is wrong, and an unbounded
+/// spare would recompile forever. Tunable so the factor can be swept against
+/// the deopt count without a rebuild.
+pub fn despec_spare_factor() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DESPEC_SPARE_FACTOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&f| f > 0)
+            .unwrap_or(2)
+    })
+}
+
 /// Record `(method_key, bci)` as a failed speculation site that must not be
 /// re-speculated. Idempotent. See [`DESPEC_SET`].
 pub fn despec_insert(method_key: &str, bci: u32) {
@@ -1004,6 +1022,50 @@ impl DeoptimizationLog {
     ///   - 2..threshold/2                → RecompileAndReinterpret
     ///   - threshold/2..threshold        → MakeNotEntrant
     ///   - >= threshold                  → MakeNotCompilable
+    /// [`Self::recommend_action`], but told WHICH bci trapped -- so the
+    /// whole-method `MakeNotCompilable` escalation can be withheld from a
+    /// method whose only failing speculation has already been withdrawn.
+    ///
+    /// `ReceiverTypeChanged` / `ClassCheck` escalate on the AGGREGATE per-method
+    /// deopt count, which is right when the type profile is merely unstable and
+    /// wrong when one call site speculates on a receiver class the program never
+    /// produces. The second case is not fixed by recompiling and is not the
+    /// method's fault: the per-bci de-spec registry exists precisely to drop
+    /// that ONE guard on the next compile (see `despec_insert`'s caller,
+    /// `real_frame_deopt_resume_and_despeculate`), and since the emitter now
+    /// honours it (`x64::bytecode_walk`'s invoke ladder) the recompile really
+    /// does come back without the guard. Blacklisting the method anyway retires
+    /// it to the interpreter for a speculation that no longer exists.
+    ///
+    /// So: when the trapping bci is already de-spec'd, recompile instead of
+    /// blacklisting. The per-method backstop is kept rather than removed -- at
+    /// twice `max_deopts_per_method` the escalation happens regardless, because
+    /// "de-spec'd" is a claim about the NEXT compile and a site that keeps
+    /// trapping past that point is evidence the claim is wrong. Deopts at any
+    /// OTHER bci are untouched and still escalate on the ordinary schedule.
+    pub fn recommend_action_at_bci(
+        &self,
+        method: &str,
+        reason: DeoptReason,
+        bci: u32,
+    ) -> DeoptAction {
+        let action = self.recommend_action(method, reason);
+        if action != DeoptAction::MakeNotCompilable
+            || !matches!(
+                reason,
+                DeoptReason::ReceiverTypeChanged | DeoptReason::ClassCheck
+            )
+            || !crate::receiver_despec_enabled()
+            || !despec_contains(method, bci)
+            || self.deopt_count(method)
+                >= despec_spare_factor() * self.max_deopts_per_method as usize
+        {
+            return action;
+        }
+        crate::metrics::note_despec_escalation_spared();
+        DeoptAction::RecompileAndReinterpret
+    }
+
     pub fn recommend_action(&self, method: &str, reason: DeoptReason) -> DeoptAction {
         let count = self.deopt_count(method);
 

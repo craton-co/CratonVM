@@ -4457,7 +4457,12 @@ fn bs_checked_range(
 fn native_bs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let layout = bs_layout(ctx);
+    // `new_array` allocates, so it can collect and move `this`. Pin and
+    // re-derive before writing through it -- the `format_impl` shape, see
+    // `docs/known-issues/gc/unpinned-native-locals-candidate-audit-20260824.md`.
+    let this_pin = ctx.pin_native_root(this);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, 1);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, layout.words, Value::Object(Some(words)));
     if let Some(slot) = layout.words_in_use {
         ctx.set_field(this, slot, Value::Int(0));
@@ -4481,7 +4486,10 @@ fn native_bs_init_nbits(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let layout = bs_layout(ctx);
     let nwords = bs_word_count(nbits).max(1);
+    // See `native_bs_init`: the allocation can move `this`.
+    let this_pin = ctx.pin_native_root(this);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, nwords);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, layout.words, Value::Object(Some(words)));
     if let Some(slot) = layout.words_in_use {
         ctx.set_field(this, slot, Value::Int(0));
@@ -5632,7 +5640,13 @@ fn enum_declaring_class_from_object(
     ctx: &mut dyn NativeContext,
     elem: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::ObjectRef> {
-    match ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]) {
+    // `elem` is a PARAMETER, which is exactly as unrooted as a local -- the
+    // blind spot recorded in the audit page. The fallback arm below runs AFTER
+    // `getDeclaringClass()` has already had its chance to collect and move it.
+    let elem_pin = ctx.pin_native_root(elem);
+    let declaring = ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]);
+    let elem = ctx.read_native_pin(elem_pin, elem);
+    match declaring {
         Ok(Some(Value::Object(Some(class)))) => Some(class),
         _ => match ctx.invoke_virtual(elem, "getClass", "()Ljava/lang/Class;", &[]) {
             Ok(Some(Value::Object(Some(class)))) => Some(class),
@@ -20959,6 +20973,40 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
 /// CONCRETE subclass as the receiver. Dispatch to that subclass's own bytecode;
 /// only a bare `java.util.logging.Handler` (which has no implementation
 /// anywhere) keeps the historical no-op.
+/// Does this `Handler` receiver carry the REAL JDK field layout?
+///
+/// MEASURED, `javap -p --system` on Temurin 25.0.3+9 — `java.util.logging.Handler`
+/// declares six INSTANCE fields, in this order:
+///
+/// ```text
+///   0 manager(LogManager)  1 filter  2 formatter
+///   3 logLevel(Level)      4 errorManager        5 encoding
+/// ```
+///
+/// (`offValue` is static and takes no slot.) So slot 0 is the `LogManager`, and
+/// a native reading slot 0 for the level answers the log manager while one
+/// WRITING slot 0 overwrites it — which is exactly what `getLevel`/`setLevel`
+/// did in `--jdk-only` until 2026-08-24. `probes/JulHandlerLevel.java` measures
+/// both halves off the real fields through `--add-opens`:
+///
+/// ```text
+///   --jdk-only   getLevel() on a fresh Handler -> java.util.logging.LogManager@587
+///                setLevel(WARNING) -> Handler.logLevel still ALL,
+///                                     Handler.manager now holds WARNING
+///   compatible   correct        HotSpot 25.0.3+9   correct
+/// ```
+///
+/// The count is the discriminator rather than a name probe because every
+/// instance field here is a REFERENCE, so `get_field_by_name` cannot be
+/// type-checked the way [`log_record_real_layout`](crate::log_record_real_layout)
+/// checks `longThreadID` for a `Long` — and it answers `Value::Object(None)` for
+/// a name it cannot resolve, which is indistinguishable from a genuinely null
+/// `logLevel` ("inherit from the parent" is a legal state). Same shape as
+/// `panama_libffi::segment_address`'s `object_num_fields(seg) >= 6`.
+fn handler_real_layout(ctx: &dyn NativeContext, h: cratonvm_types::ObjectRef) -> bool {
+    ctx.object_num_fields(h) >= 6
+}
+
 fn jul_handler_delegate(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -21359,7 +21407,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             if matches!(args.get(1), None | Some(Value::Object(None))) {
                 return Err(RuntimeError::NullPointerException { message: None }.into());
             }
-            ctx.set_field(this, 0, args[1]);
+            if handler_real_layout(ctx, this) {
+                ctx.set_field_by_name(this, "logLevel", args[1]);
+            } else {
+                ctx.set_field(this, 0, args[1]);
+            }
             Ok(Some(Value::Object(None)))
         },
     );
@@ -21369,6 +21421,9 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Level;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if handler_real_layout(ctx, this) {
+                return Ok(Some(ctx.get_field_by_name(this, "logLevel")));
+            }
             Ok(Some(ctx.get_field(this, 0)))
         },
     );

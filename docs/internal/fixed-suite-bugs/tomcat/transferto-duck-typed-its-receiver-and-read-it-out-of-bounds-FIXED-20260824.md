@@ -7,6 +7,7 @@
 | **Signature** | `zgc real: field index OOB index=1..4 num_slots=0 op="get"/"set"` |
 | **Before** | 16 hits per run of `TestDefaultServletRfc9110Section13`, 8 per run of `TestWebdavServletOptionsUnknown` |
 | **After** | **0 and 0** |
+| **Re-verified** | 2026-08-26 on `origin/dev` `ccdafa676`, four merges past the fix: still **0 and 0**, both classes `rc=0`. See the re-verification section of the annotation-scan CLOSED page for the caveat on reading a zero from this counter. |
 
 ## The defect
 
@@ -84,22 +85,33 @@ real layout differs — a textbook twin asymmetry. **They are not the reader**:
 those overrides were dropped (`_bis_dropped_overrides`), so the registration
 never happens. A registration proves nothing until its registrar runs.
 
-What actually named it was a debugger. The in-process capture is useless here —
-`gc_quiescence::native_rvas()` has **no installed hook at all**
-(`install_native_rva_hook` has zero callers, and the machinery it was written
-for is Windows `RtlCaptureStackBackTrace`), so it falls back to
-`Backtrace::force_capture`, which yields one frame under fat LTO. `gdb` unwinds
-what the process cannot:
+What actually named it was the report's own backtrace — and the fact that it
+took a debugger to notice is a mistake worth recording.
+
+`report_corpse_read` prints `backtrace=`, and on Linux that field carried **40
+fully symbolized frames with file:line**, naming the defect four frames up:
 
 ```text
-#0  report_corpse_read              gc/src/zgc.rs:8332
-#1  check_field_index               gc/src/zgc.rs:8059
-#2  get_field                       gc/src/zgc.rs:11594
-#3  get_field                       vm/src/vm/vm_exec.rs:12237
-#4  native_input_stream_transfer_to native-builtins/.../zip_streams.rs:1532
+  1: check_field_index                gc/src/zgc.rs:8059
+  2: get_field                        gc/src/zgc.rs:11594
+  3: get_field                        vm/src/vm/vm_exec.rs:12237
+  4: native_input_stream_transfer_to  native-builtins/.../zip_streams.rs:1532:17
 ```
 
-Line 1532 is the probe. One breakpoint, one backtrace, done.
+That was in the log from the first run. I did not see it because `Display` is
+multi-line: I printed the matching line, and a one-line view of a multi-line
+field shows frame 0 and nothing else. I read that as "one frame", concluded the
+in-process capture was broken under fat LTO, and went to `gdb` — which returned
+the same chain the log already had.
+
+Two comments in the tree encouraged that reading, and both are false on Linux:
+`gc_quiescence::native_rvas` said `std::backtrace::Backtrace` "is useless in
+this tree's release profile — fat LTO plus `debug = "line-tables-only"` renders
+every frame `<unknown>`", and `report_corpse_read` pointed at it. This profile
+sets `panic = "unwind"`, so `.eh_frame` is emitted and the unwinder walks
+normally; `line-tables-only` is exactly what a backtrace needs. Both comments
+are corrected, and `install_native_rva_hook` — which has no caller anywhere — is
+now documented as Windows-only machinery that Linux does not need.
 
 ## Regression test
 
@@ -139,3 +151,52 @@ dev, reproduce 3/3 in isolation there, and are untouched by this change.
 This fixes the reader that the backtrace named. Whether it is the *only* reader
 of the `num_slots` OOB signature across the suite is not established — these two
 classes are the ones that carry it today, and both are now clean.
+
+## Was this also the WRITER of the punned cell? NO — tested and ruled out
+
+The crash that started this family was `SQLChar.rawData` (declared `[C`, slot 1)
+holding `Value::Int(1)`. This native writes that exact shape —
+`ctx.set_field(input, 1, Value::Int(count))`, and `rawData` **is** slot 1 — and
+an interleaved A/B looked like it agreed: **3 punned cells in 93 runs before
+this fix, 0 in 93 after**, the three byte-identical.
+
+**That correlation did not survive a direct test.** A writer-side watch
+(`CRATONVM_DBG_WATCH_PUN=<class>:<slot>`, which prints a backtrace at the store)
+was run on a binary that still has the bug:
+
+| watched slot | what it is | store-watch firings |
+|---|---|---:|
+| `SQLChar:2` | `rawLength`, an `int` | **6 879** |
+| `SQLChar:1` | `rawData`, the punned one | **0** |
+
+The instrument is live for this class — slot 2 proves it — and in the one run
+that demonstrably produced the punned cell (`punned_reports=1`) it fired **zero**
+times for slot 1. `ctx.set_field` reaches the watch
+(`set_field` → `set_field_no_satb` → `set_field_no_card`), so had this native
+written that cell, it would have shown.
+
+**The write therefore bypasses the heap store accessor entirely**, which leaves
+compiled code writing the 16-byte cell directly — the JIT's inline `putfield`.
+The A/B above was a coincidence, and it is left in place as the reminder that a
+3-vs-0 at n=93 is a 1-in-20 event, which is exactly what it turned out to be.
+
+This fix stands on its own merits regardless: the probe read out of bounds on
+every `CoyoteInputStream` that reached it, 16 and 8 times per run on two PASSING
+tests.
+
+## The next experiment, and what it needs
+
+JIT-on vs `--nojit` on the same binary decides whether compiled code is the
+writer. The JIT-side detector lives in `jit_getfield_impl`, so turning the JIT
+off blinds it; a READ-side arm of the same watch was added to the heap accessor
+so the question survives. Both arms are positive-controlled:
+
+| mode | read-watch firings | store-watch firings |
+|---|---:|---:|
+| JIT on | 8 220 | 6 879 |
+| `--nojit` | 51 827 | 14 964 |
+
+First attempt: **102 runs, zero occurrences in either arm** — uninformative, not
+negative. The punned cell's rate on this binary is ~0.5–1% per run (1 in 120 on
+the previous build), so 102 runs expects about one event. Budget ~300 runs per
+arm before reading anything into a zero.

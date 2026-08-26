@@ -3205,11 +3205,17 @@ fn native_sl_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Drain the iterator into a Vec<Value>.
     let mut collected: Vec<Value> = Vec::new();
     const SAFETY_CAP: usize = 1_000_000;
+    // `iter` is held across every call in this loop, each of which is real
+    // Java that can collect. Pin once, re-derive per use.
+    let iter_pin = ctx.pin_native_root(iter);
+    let mut iter = iter;
     loop {
+        iter = ctx.read_native_pin(iter_pin, iter);
         let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[]);
         if !matches!(has_next, Ok(Some(Value::Int(1)))) {
             break;
         }
+        iter = ctx.read_native_pin(iter_pin, iter);
         let next = ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]);
         let val = match next {
             Ok(Some(v)) => v,

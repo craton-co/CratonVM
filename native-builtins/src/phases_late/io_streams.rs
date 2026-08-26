@@ -129,9 +129,13 @@ pub(crate) fn p58_pushback_in_close(
         // the delegation, so the wrapped stream is not closed twice.
         return Ok(None);
     }
+    // The delegated `close()` is arbitrary Java: it can allocate, collect and
+    // move `this` before the field writes below. Pin across it and re-derive.
+    let this_pin = ctx.pin_native_root(this);
     if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
         ctx.invoke_virtual(underlying, "close", "()V", &[])?;
     }
+    let this = ctx.read_native_pin(this_pin, this);
     // After the delegation, and with no `finally` — HotSpot's `in = null;
     // buf = null;` sit after `in.close()` in a straight-line body, so a
     // failed close leaves the stream NOT marked closed there either, and a
@@ -630,9 +634,13 @@ pub(crate) fn p66_pushback_reader_close(
     // release where HotSpot delivers two). The closed marker stays slot 1,
     // which `read`/`ready`/`unread` above already key on, so refusing the
     // post-close surface does not depend on slot 0 being cleared.
+    // The delegated `close()` is arbitrary Java and can move `this` before the
+    // closed-marker write below. Pin across it and re-derive.
+    let this_pin = ctx.pin_native_root(this);
     if let Value::Object(Some(inner)) = ctx.get_field(this, 0) {
         ctx.invoke_virtual(inner, "close", "()V", &[])?;
     }
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Object(None));
     Ok(None)
 }
@@ -842,7 +850,11 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            // `flush()` is arbitrary Java and can move `stream` before the
+            // `close()` below dereferences it. Pin across, then re-derive.
+            let s_pin = ctx.pin_native_root(stream);
             ctx.invoke_virtual(stream, "flush", "()V", &[])?;
+            let stream = ctx.read_native_pin(s_pin, stream);
             ctx.invoke_virtual(stream, "close", "()V", &[])?;
         }
         Ok(None)

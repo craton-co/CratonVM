@@ -956,10 +956,33 @@ impl ConcurrentMarker {
             // `ObjectRef` only as a stripe-lock key (its address is hashed),
             // never to mutate the object.
             let obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(obj_ptr) };
-            // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24` plausibility
-            // bound used throughout gc/src/gen_heap.rs for a header's
-            // `num_slots` — see `for_each_ref_slot`'s matching fix.
-            let num_slots = (header.num_slots() as usize).min(1 << 24);
+            // Bound the walk by the extent this function ALREADY VALIDATED,
+            // not by a fresh read of the header.
+            //
+            // `total_size` came from `concurrent_mark_object_size`, which reads
+            // a `ConcurrentMarkHeaderSnapshot` and cross-validates it, and the
+            // guard above then required
+            // `old_gen.contains(obj_ptr + total_size - 1)` — the object's last
+            // byte is inside the old generation. Re-reading `header.num_slots()`
+            // here discards that: it is a SECOND read of a header this module
+            // explicitly treats as racy (the snapshot reader exists precisely
+            // because the header can be torn or garbage), so the count that was
+            // validated and the count that is walked need not be the same
+            // number. If the second read is the larger one, this loop visits
+            // slots past the extent `old_gen.contains` approved — which is the
+            // "can a reader visit slot n of an object whose real slot count is
+            // below n" question that
+            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // §0.5 item 2 asks of exactly this code.
+            //
+            // Deriving the count from `total_size` closes the window by
+            // construction: the same arithmetic that was validated
+            // (`HEADER_SIZE + num_slots * SLOT_SIZE`) is inverted here, so the
+            // walk cannot outrun the bytes that were checked. The `1 << 24`
+            // plausibility clamp still applies — it is enforced inside
+            // `concurrent_mark_object_size`, which returns `None` (and so
+            // returns early above) for anything larger.
+            let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;
             for slot_idx in 0..num_slots {
                 // Serialize the 16-byte read against striped mutator writes so
                 // we never observe a torn (tag, payload) pair. Held only for

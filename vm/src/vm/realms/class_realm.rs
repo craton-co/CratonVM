@@ -15,6 +15,30 @@ use crate::runtime::lock_order::{
 use crate::types::{ObjectRef, Value};
 use crate::vm::vm_init::ANON_CLASS_CACHE_LEN;
 use parking_lot::RwLock;
+
+/// First `ClassId` the lambda-proxy allocator ([`ClassRealm::next_lambda_id`])
+/// hands out. Synthetic proxy ids are minted from a counter seeded here so they
+/// can never collide with a real `ClassStore` id, which starts at 0 and is
+/// bumped once per loaded class -- 2^31 real classes is not a reachable state.
+///
+/// The range is therefore a **sound necessary precondition**: a class id below
+/// this base is not a lambda proxy, and no lookup is needed to say so. That
+/// matters because `lambda_proxies` is behind an `RwLock` and was probed on
+/// every non-`invokespecial` virtual invoke in the interpreter -- see
+/// [`ClassRealm::is_lambda_proxy_class`].
+///
+/// Declared here so the seed and the predicate cannot drift apart; `vm_init`
+/// seeds the counter from this constant.
+pub const LAMBDA_PROXY_ID_BASE: u32 = 0x8000_0000;
+
+/// The VM-internal class every annotation proxy instance shares.
+///
+/// No JDK declares this name -- it is minted by `ensure_vm_internal_class` and
+/// lives in the VM's own reserved namespace -- so exactly one class can ever
+/// carry it, under the bootstrap loader. That uniqueness is what lets
+/// [`ClassRealm::is_annotation_proxy_class`] answer from a single `ClassId`
+/// instead of a name comparison under the class-manager lock.
+pub const ANNOTATION_PROXY_CLASS: &str = "java/lang/annotation/AnnotationProxy";
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -474,8 +498,36 @@ pub struct ClassRealm {
     pub lambda_proxy_hosts: RwLock<FxHashMap<ClassId, ClassId>>,
 
     /// Counter for generating unique synthetic lambda proxy ClassIds.
-    /// Starts at 0x8000_0000 to avoid collisions with real ClassIds from the ClassStore.
+    /// Seeded from [`LAMBDA_PROXY_ID_BASE`] to avoid collisions with real
+    /// ClassIds from the ClassStore, and to keep the seed and the range test
+    /// in [`ClassRealm::is_lambda_proxy_class`] spelled once.
     pub next_lambda_id: AtomicU32,
+
+    /// Resolved `ClassId` of [`ANNOTATION_PROXY_CLASS`], or `u32::MAX` while it
+    /// has not been observed. Written once, by
+    /// [`ClassRealm::resolve_annotation_proxy_cid`].
+    ///
+    /// Per-realm rather than process-global on purpose: two VMs in one process
+    /// mint the class independently and need not agree on its id, and this
+    /// value gates a **correctness** decision (annotation-proxy dispatch must
+    /// reach `execute_invoke`'s interception layer), not a fast-path hint.
+    ///
+    /// Safe to hold without an invalidation key: CratonVM does not unload
+    /// classes and in-place `redefine_class` keeps the `ClassId`, so a
+    /// `ClassId`'s class identity is immutable for the life of the VM. That is
+    /// the same standing property `lambda_impl_owner_memo` above relies on.
+    pub annotation_proxy_cid: AtomicU32,
+
+    /// `class_definition_epoch()` at which [`ANNOTATION_PROXY_CLASS`] was last
+    /// confirmed **not** to be defined, or `u64::MAX` if it has never been
+    /// looked up.
+    ///
+    /// The negative half needs a key where the positive half does not: "no
+    /// class carries this name" is only true until the next class definition,
+    /// and the epoch moves on every one of them (`loaded_classes_insert` is its
+    /// sole writer). Holding the answer for one epoch turns an unbounded
+    /// per-invoke lookup into one lookup per class defined.
+    pub annotation_proxy_absent_epoch: std::sync::atomic::AtomicU64,
 
     /// Primitive type Class mirrors: "int" → ObjectRef, "boolean" → ObjectRef, etc.
     /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
@@ -570,6 +622,82 @@ pub struct ClassRealm {
 }
 
 impl ClassRealm {
+    /// Is `class_id` one of the synthetic proxy classes spun for a lambda or
+    /// method reference?
+    ///
+    /// Lambda proxies have no bytecode implementation of their
+    /// functional-interface method, so every dispatch path that would install
+    /// or use a direct target has to recognise them and cede to the slow SAM
+    /// route. That check ran as `lambda_proxies.read().contains_key(&cid)` on
+    /// **every** non-`invokespecial` virtual invoke in the interpreter -- an
+    /// `RwLock` acquisition plus a hash probe to answer "no" for every ordinary
+    /// class in the program.
+    ///
+    /// The range test in front of it is exact rather than heuristic: proxy ids
+    /// come only from `alloc_lambda_proxy_id`, whose counter is seeded at
+    /// [`LAMBDA_PROXY_ID_BASE`], so an id below the base cannot be in the map.
+    /// A hit still pays the full lookup, which is what keeps the answer
+    /// identical -- the map, not the range, remains the authority on membership
+    /// (`MAX_LAMBDA_PROXIES` means an allocated id can be refused a table slot).
+    #[inline]
+    pub fn is_lambda_proxy_class(&self, class_id: ClassId) -> bool {
+        class_id.as_u32() >= LAMBDA_PROXY_ID_BASE
+            && self.lambda_proxies.read().contains_key(&class_id)
+    }
+
+    /// Is `class_id` the VM-internal [`ANNOTATION_PROXY_CLASS`]?
+    ///
+    /// Annotation proxies have no real bytecode for the `Annotation` contract
+    /// (nor for `Object.equals`/`hashCode`/`toString`), so a cached virtual
+    /// target must never serve them -- the dispatch has to fall through to
+    /// `execute_invoke`'s interception layer. The gate is consumed immediately
+    /// and decides correctness, so unlike an optional tier-up predicate it
+    /// cannot be deferred; it can only be made cheaper.
+    ///
+    /// Steady state is one relaxed load and one `u32` compare. The name
+    /// comparison it replaces took the class-manager read lock, resolved the
+    /// class, and compared an `Arc<str>` against a literal, once per virtual
+    /// invoke.
+    #[inline]
+    pub fn is_annotation_proxy_class(&self, class_id: ClassId) -> bool {
+        let hint = self.annotation_proxy_cid.load(Ordering::Relaxed);
+        if hint != u32::MAX {
+            return class_id.as_u32() == hint;
+        }
+        self.resolve_annotation_proxy_cid() == Some(class_id)
+    }
+
+    /// The cold half of [`Self::is_annotation_proxy_class`]: look the class up
+    /// by name, at most once per class-definition epoch until it exists.
+    ///
+    /// Answering by NAME rather than per-receiver is what makes the negative
+    /// cacheable at all. "Is receiver X the proxy" depends on X and cannot be
+    /// held across receivers; "is the proxy class defined yet" does not depend
+    /// on X, and is fixed for as long as the class-definition epoch is.
+    #[cold]
+    fn resolve_annotation_proxy_cid(&self) -> Option<ClassId> {
+        let epoch = crate::classloading::class_definition_epoch();
+        if self.annotation_proxy_absent_epoch.load(Ordering::Relaxed) == epoch {
+            return None;
+        }
+        let found = self
+            .class_manager
+            .read()
+            .get_loaded_class_id(ANNOTATION_PROXY_CLASS);
+        match found {
+            Some(cid) => {
+                self.annotation_proxy_cid
+                    .store(cid.as_u32(), Ordering::Relaxed);
+                Some(cid)
+            }
+            None => {
+                self.annotation_proxy_absent_epoch
+                    .store(epoch, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     /// Acquire the L10 `class_manager` write lock through a guard that
     /// drains any JVMTI ClassLoad/ClassPrepare events queued during the
     /// critical section once the underlying lock is released.
@@ -627,6 +755,106 @@ impl Drop for ClassManagerWriteGuard<'_> {
         // `class_manager_write()`/`.read()` itself: the lock this guard held
         // is already gone by this point.
         cratonvm_classloading::drain_pending_class_hooks();
+    }
+}
+
+#[cfg(test)]
+mod receiver_shape_gate_tests {
+    use super::*;
+    use crate::vm::SharedVm;
+    use crate::VmConfig;
+    use std::sync::Arc;
+
+    /// The range test in [`ClassRealm::is_lambda_proxy_class`] must never
+    /// answer "no" for an id that IS in the table, and must answer "no"
+    /// without touching the table for every ordinary class id. Both halves are
+    /// asserted: a range test that were merely conservative would be silently
+    /// wrong here, because the caller uses `true` to cede to the slow SAM route.
+    #[test]
+    fn is_lambda_proxy_class_agrees_with_the_table() {
+        use crate::classloading::resolution::{LambdaCallSite, MethodHandle, MethodHandleKind};
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+
+        // Every id the allocator hands out is inside the reserved range.
+        let proxy = shared.alloc_lambda_proxy_id();
+        assert!(
+            proxy.as_u32() >= LAMBDA_PROXY_ID_BASE,
+            "lambda proxy ids must come from the range the predicate tests"
+        );
+
+        // In range but not registered: the table stays the authority.
+        assert!(!shared.classes.is_lambda_proxy_class(proxy));
+
+        shared.classes.lambda_proxies.write().insert(
+            proxy,
+            Arc::new(LambdaCallSite {
+                functional_interface_id: None,
+                functional_interface: "java/lang/Runnable".into(),
+                sam_method_name: "run".into(),
+                sam_descriptor: "()V".into(),
+                impl_handle: MethodHandle {
+                    kind: MethodHandleKind::InvokeStatic,
+                    class_name: "test/A".into(),
+                    member_name: "lambda$0".into(),
+                    descriptor: "()V".into(),
+                },
+                instantiated_descriptor: "()V".into(),
+                capture_types: vec![],
+                proxy_class_id: proxy,
+                serializable_flag: false,
+            }),
+        );
+        assert!(shared.classes.is_lambda_proxy_class(proxy));
+
+        // Ordinary class ids are below the base and answer "no".
+        for raw in [0u32, 1, 42, 65_535, LAMBDA_PROXY_ID_BASE - 1] {
+            assert!(
+                !shared.classes.is_lambda_proxy_class(ClassId::new(raw)),
+                "class id {raw} is not a lambda proxy"
+            );
+        }
+    }
+
+    /// [`ClassRealm::is_annotation_proxy_class`] replaced a name comparison
+    /// under the class-manager lock with a `ClassId` identity test. The failure
+    /// mode that matters is the NEGATIVE one: the memo must not latch "absent"
+    /// from before the class was minted, because a stale `false` sends an
+    /// annotation proxy down a cached-target path that has no bytecode for it.
+    #[test]
+    fn is_annotation_proxy_class_learns_the_class_after_it_is_minted() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+
+        // Before the class exists every id answers "no" -- and asking
+        // repeatedly is exactly what would latch a wrong answer if the negative
+        // memo were not keyed on the class-definition epoch.
+        for _ in 0..4 {
+            for raw in [0u32, 1, 7, 1234] {
+                assert!(!shared.classes.is_annotation_proxy_class(ClassId::new(raw)));
+            }
+        }
+
+        // Mint it the way `ensure_vm_internal_class` does.
+        let proxy_cid = shared.classes.class_manager_write().ensure_generated_class(
+            ANNOTATION_PROXY_CLASS,
+            4,
+            cratonvm_classloading::ClassOrigin::VmInternal,
+        );
+
+        assert!(
+            shared.classes.is_annotation_proxy_class(proxy_cid),
+            "the proxy class must be recognised once defined, even though every \
+             earlier query answered `no`"
+        );
+        // Repeat reads take the memoized identity path and stay stable.
+        assert!(shared.classes.is_annotation_proxy_class(proxy_cid));
+        // ...and nothing else is the proxy.
+        for raw in [0u32, 1, 7, 1234] {
+            let other = ClassId::new(raw);
+            if other != proxy_cid {
+                assert!(!shared.classes.is_annotation_proxy_class(other));
+            }
+        }
     }
 }
 

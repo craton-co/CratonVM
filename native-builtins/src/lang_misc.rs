@@ -2521,7 +2521,7 @@ const STE_FIELD_LINE: usize = 3;
 /// module/loader strings), not slot 0. The legacy synthetic-stub layout
 /// uses raw slots `[class, method, file, line]`. Prefer the named field
 /// when the class carries it; fall back to the raw slot otherwise.
-fn ste_read_field(ctx: &dyn NativeContext, ste: ObjectRef, named: &str, raw_slot: usize) -> Value {
+pub(crate) fn ste_read_field(ctx: &dyn NativeContext, ste: ObjectRef, named: &str, raw_slot: usize) -> Value {
     if ctx
         .resolve_field_index("java/lang/StackTraceElement", "declaringClass")
         .is_some()

@@ -4066,82 +4066,30 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         crate::panama::PE_SEGMENT_INTERFACE,
         crate::panama::CRATON_SEGMENT_CLASS,
     ] {
+        // Was an inline closure that copied slots 0..5 across verbatim and had
+        // NO native-access check. Both halves were wrong on a shipping binary:
+        // the raw slot copy assumes the synthetic six-slot layout on a receiver
+        // that need not have it, and `reinterpret` is exactly the call real JDK
+        // 25 restricts -- it hands back an arbitrary-size window over a
+        // possibly-raw address. The synthetic-only twin had both right and never
+        // shipped; it is now the only body, and lives in `panama.rs`.
         r.register(
             ms,
             "reinterpret",
             "(J)Ljava/lang/foreign/MemorySegment;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let size = match args.get(1) {
-                    Some(Value::Long(size)) => *size,
-                    _ => 0,
-                };
-                let seg = crate::panama::alloc_segment_carrier(ctx, 6)?;
-                ctx.set_field(seg, 0, ctx.get_field(this, 0));
-                ctx.set_field(seg, 1, Value::Long(size));
-                ctx.set_field(seg, 2, ctx.get_field(this, 2));
-                ctx.set_field(seg, 3, ctx.get_field(this, 3));
-                ctx.set_field(seg, 4, Value::Int(1));
-                ctx.set_field(seg, 5, ctx.get_field(this, 5));
-                Ok(Some(Value::Object(Some(seg))))
-            },
+            crate::panama::pe_segment_reinterpret,
         );
-        r.register(
-            ms,
-            "getUtf8String",
-            "(J)Ljava/lang/String;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let offset = match args.get(1) {
-                    Some(Value::Long(offset)) if *offset >= 0 => *offset,
-                    _ => 0,
-                };
-                let base = match ctx.get_field(this, 0) {
-                    Value::Long(address) => address,
-                    _ => 0,
-                };
-                let base_offset = match ctx.get_field(this, 5) {
-                    Value::Long(offset) => offset,
-                    _ => 0,
-                };
-                let remaining = match ctx.get_field(this, 1) {
-                    Value::Long(size) if size > offset => size - offset,
-                    _ => {
-                        return Err(RuntimeError::IllegalStateException {
-                            message: "getUtf8String requires a non-empty reinterpreted MemorySegment"
-                                .into(),
-                        }
-                        .into());
-                    }
-                };
-                let address = (base as u64)
-                    .checked_add(base_offset as u64)
-                    .and_then(|address| address.checked_add(offset as u64))
-                    .ok_or_else(|| -> MethodCallFailed {
-                        RuntimeError::IllegalStateException {
-                            message: "getUtf8String address arithmetic overflow".into(),
-                        }
-                        .into()
-                    })? as *const u8;
-                if address.is_null() {
-                    return Ok(Some(Value::Object(None)));
-                }
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(address, (remaining as usize).min(4096)) };
-                let nul =
-                    bytes
-                        .iter()
-                        .position(|byte| *byte == 0)
-                        .ok_or_else(|| -> MethodCallFailed {
-                            RuntimeError::IllegalStateException {
-                                message: "getUtf8String exceeded its bounded scan".into(),
-                            }
-                            .into()
-                        })?;
-                let text = std::str::from_utf8(&bytes[..nul]).unwrap_or("");
-                Ok(Some(Value::Object(Some(ctx.create_string(text)))))
-            },
-        );
+        // The JDK-21-preview spelling of `getString`, and now the same body.
+        // It was an independent closure reading `get_field(this, 0)` as the base
+        // address -- correct ONLY for the synthetic six-slot carrier. On a real
+        // JDK-loaded segment slot 0 is the segment's byte LENGTH, which is the
+        // precise confusion `panama_libffi::segment_address` exists to end; its
+        // own comment records `ofArray(new byte[16])` faulting at `address 0x10`,
+        // and 0x10 == 16 == that array's length. `p67_segment_get_string` reads
+        // through `segment_address`/`segment_byte_size`, which accept BOTH
+        // segment models, and raises `IndexOutOfBoundsException` where the JDK
+        // does rather than `IllegalStateException`.
+        r.register(ms, "getUtf8String", "(J)Ljava/lang/String;", p67_segment_get_string);
     }
 
     r.register(

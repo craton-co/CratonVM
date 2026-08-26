@@ -11,7 +11,7 @@ import java.util.concurrent.CountDownLatch;
  * layer Tomcat's BCEL annotation scan drives per byte
  * (`ByteArrayInputStream.read()` and friends, all synchronized one-liners) ran
  * interpreted, ~226x slower than HotSpot. See
- * docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
+ * docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
  *
  * Admitting them makes the guard load-bearing on a hot path, and a dropped or
  * double-released monitor is a SILENT wrong-answer bug, not a crash. This

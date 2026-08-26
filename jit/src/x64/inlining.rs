@@ -21,6 +21,31 @@ use super::*;
 /// bytecode cannot produce one — the JVM's own verifier requires every path to
 /// a merge to agree on stack depth and types — so this is a ratchet against the
 /// walk having mis-modelled something, not a case that is expected to fire.
+/// How many times the live-slot clamp below MOVED the cursor — i.e. how
+/// many splices would have handed a caller-owned frame slot out twice. Zero
+/// means the guard never engaged on this run, which is what a report of it has
+/// to say next to any result that credits it.
+static INLINE_LIVE_SLOT_CLAMPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_inline_live_slot_clamp() {
+    INLINE_LIVE_SLOT_CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Engagement count for the inline live-slot clamp. Printed by
+/// `jit-method-stats`.
+pub fn inline_live_slot_clamps() -> u64 {
+    INLINE_LIVE_SLOT_CLAMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT=-inline-live-slot-clamp` — measurement-only escape hatch
+/// that restores the pre-fix cursor rewind, so the fix can be A/B'd in ONE
+/// binary. Turning it off reinstates a wrong-address store; it is not a
+/// supported configuration.
+fn inline_live_slot_clamp_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP").is_some()
+}
+
 fn record_merge_state(
     states: &mut [Option<(usize, Vec<bool>)>],
     target: usize,
@@ -372,6 +397,64 @@ impl Compiler {
             let local_off = callee_local_base + (local_idx as i32) * 8; // Cast: x86-64 immediate encoding
             self.load_slot_to_reg(RAX, slot);
             self.emit_store_local(local_off, RAX);
+        }
+        // ...AND A POP DOES NOT FREE A SLOT A DEEPER ENTRY STILL OWNS.
+        //
+        // The `min` above is the whole answer only while frame offsets are
+        // handed out in stack ORDER, so that the popped arguments are exactly
+        // the topmost slots. Two mechanisms break that, and both are load-
+        // bearing elsewhere:
+        //
+        //  * `flush_scratch_registers` (called at the top of this function)
+        //    gives every `Scratch`/`Xmm` operand a FRESH slot at the cursor,
+        //    whatever its depth — so a buried operand can end up above
+        //    shallower ones;
+        //  * `invalidate_callee_saved` does the same for every stack entry
+        //    aliasing a local register when that local is written, which an
+        //    `iinc` on a register-resident loop counter does on every
+        //    iteration.
+        //
+        // When either has fired, `min` over the popped arguments rewinds the
+        // cursor BELOW a slot the caller still owns, and the next reservation
+        // — this splice's own `callee_local_base` on the NEXT invoke in the
+        // same expression, or the `push_from_rax` that lands the return value
+        // — hands that address out twice. The buried operand then reads back
+        // whatever the new owner stored.
+        //
+        // Measured on bc-java `LEATest` inside `SimpleTestTest` (193 tests in
+        // one JVM, which is what makes `LEAEngine.generate128RoundKeys` hot
+        // enough to be compiled with `rol32` spliced in):
+        //
+        // ```java
+        // pWork[j] = rol32(pWork[j] + rol32(myDelta, j++), ROT3);
+        // ```
+        //
+        // The array-store INDEX (`j`) is pushed early and stays live across
+        // two splices; `iinc j` repoints it to a fresh top slot; the inner
+        // splice then rewinds the cursor under it, and the outer splice stores
+        // its argument 0 — `myDelta` — straight onto the index. The result was
+        // `ArrayIndexOutOfBoundsException: Index -1007687205`, which is
+        // `0xC3EFE9DB`: LEA's `DELTA[0]`, the value of `myDelta` on the first
+        // iteration, read as an array index.
+        //
+        // `pop_stack`'s own reclaim arm carries the same guard, added for the
+        // same reason one table over; this is that guard on the path that
+        // bypasses it.
+        if !inline_live_slot_clamp_disabled() {
+            let live_top = self
+                .stack
+                .iter()
+                .filter_map(|slot| match *slot {
+                    StackSlot::Frame(off) => Some(off + 8),
+                    _ => None,
+                })
+                .max();
+            if let Some(live_top) = live_top {
+                if live_top > caller_post_pop_spill {
+                    caller_post_pop_spill = live_top;
+                    note_inline_live_slot_clamp();
+                }
+            }
         }
 
         // Zero-init every non-parameter callee local. Do not start at

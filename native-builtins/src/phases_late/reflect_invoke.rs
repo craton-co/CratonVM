@@ -2097,23 +2097,67 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
 // StackWalker expansion — walk(), forEach(), getCallerClass(), StackFrame
 // =============================================================================
 
+/// `CRATONVM_SW_JDK_WALK=1` (`CRATONVM_COMPAT=stackwalker-jdk-walk`) -- serve
+/// real-JDK `StackWalker.walk` / `forEach` from the JDK's OWN
+/// `StackStreamFactory` bytecode instead of the natives below.
+///
+/// **Default OFF, on a measurement.** The JDK path pulls frames one BATCH at a
+/// time and stops when the consumer stops, so on paper it should beat an
+/// implementation that materialises every frame up front — and
+/// `quartz-stackwalker-walk-is-38x-hotspot (retired 2026-08-25)` named it "the full fix,
+/// and the only one on this page with the right ceiling". Built and measured
+/// ABBA in one binary, on `probes/StackWalkerTerminationProbe.java`, it is
+/// SLOWER at every depth (ms, 2000 iterations, two runs per arm):
+///
+/// | depth | eager native | JDK batched |
+/// |---:|---|---|
+/// | 2 | 706 / 740 | 3,039 / 4,386 |
+/// | 40 | 4,748 / 6,400 | 12,453 / 14,609 |
+/// | 120 | 25,384 / 30,024 | 37,459 / 41,980 |
+///
+/// The reason is that the JDK's laziness is written in Java: a reflective
+/// `Constructor.newInstance` per buffer slot, an `Array.newInstance`, a
+/// spliterator, the `doStackWalk` re-entry and a native call per frame for
+/// `StackFrameBuffer.at`. Interpreted, that fixed cost is larger than the
+/// per-frame cost it saves. On the one shape where batching CAN win — an early
+/// `findFirst` at depth (`probes/StackWalkerFindFirstProbe.java`, `near`) — it
+/// is inside the run-to-run spread.
+///
+/// Kept, rather than deleted, for three reasons: it is the arm that proves the
+/// above, it exercises `lang_stackwalker.rs`'s `callStackWalk` /
+/// `fetchStackFrames` (otherwise unreachable for `walk`, which is how three
+/// real defects went unnoticed in it — see that file), and a future cheaper
+/// `StackStreamFactory` would make it the better default.
+fn stackwalker_jdk_walk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SW_JDK_WALK").is_some())
+}
+
 pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sw = "java/lang/StackWalker";
-    // walk(Function<Stream<StackFrame>, R>) → R
-    r.register(
-        sw,
-        "walk",
-        "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        p59_sw_walk,
-    );
-    r.register(
-        sw,
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        p59_sw_for_each,
-    );
+    // `walk`/`forEach` are served by the natives below unless
+    // `CRATONVM_SW_JDK_WALK=1` hands them to the JDK's own
+    // `StackStreamFactory` bytecode — see `stackwalker_jdk_walk_enabled` for
+    // the measurement that made the native the default. Synthetic-JDK mode has
+    // no choice to make: the real `StackStreamFactory` may not be present at
+    // all there, so the natives always register.
+    if !r.real_jdk() || !stackwalker_jdk_walk_enabled() {
+        // walk(Function<Stream<StackFrame>, R>) → R
+        r.register(
+            sw,
+            "walk",
+            "(Ljava/util/function/Function;)Ljava/lang/Object;",
+            p59_sw_walk,
+        );
+        r.register(
+            sw,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            p59_sw_for_each,
+        );
+    }
     r.register(
         sw,
         "getCallerClass",
@@ -2121,22 +2165,36 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 8-field synthetic — WP1.9 (+ WP1.10 slots 6-7):
+    // StackFrame = 9-field synthetic — WP1.9 (+ WP1.10 slots 6-7):
+    //
+    // LAZY SLOTS (2, 5, 6). `populate_stack_frame` leaves these NULL and the
+    // getters below build them on demand from slot 8. The three of them cost a
+    // Java `String`, a Java `String` and a class-mirror resolve PER FRAME, and
+    // a `filter(..).findFirst()` — the shape Mockito's `LocationImpl` runs on
+    // every mock invocation — reads them for ONE frame. Measured on
+    // `probes/StackWalkerFindFirstProbe.java`: the walk's profile is flat and
+    // allocation-shaped (no symbol above 2.3%, ~24% in mimalloc's `mmap` with
+    // no resolvable Rust caller), so the object COUNT is the lever, not any one
+    // symbol. See `quartz-stackwalker-walk-is-38x-hotspot (retired 2026-08-25)`.
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
     //   slot 3: lineNumber (Int, -1/-2 sentinels)
     //   slot 4: byteCodeIndex (Int, -1 for unknown/native)
     //   slot 5: declaringClassInternalName (String, '/'-form; used only by
-    //           `toStackTraceElement()`'s formatting fallback)
-    //   slot 6: declaringClassMirror (Class or null) — resolved EAGERLY at
-    //           `populate_stack_frame` time from the entry's own ClassId
-    //           (see that function's doc comment for why: a fresh by-name
-    //           lookup performed later, from `getDeclaringClass()`, can fail
-    //           for a frame whose class is still running its own `<clinit>`)
+    //           `toStackTraceElement()`'s formatting fallback) — LAZY
+    //   slot 6: declaringClassMirror (Class or null) — LAZY, resolved from
+    //           slot 8. It is resolved from the frame's OWN ClassId, never by
+    //           name: a fresh by-name lookup can fail for a frame whose class
+    //           is still running its own `<clinit>` (see
+    //           `populate_stack_frame`'s doc comment). Deferring the resolve
+    //           does not reintroduce that failure mode, because slot 8 carries
+    //           the same guaranteed-valid id the eager resolve used.
     //   slot 7: retainClassRef (Int boolean) — copied from the owning walker so
     //           a StackFrame returned from walk() keeps its access contract
     //           after the user Function has returned.
+    //   slot 8: declaringClassId (Int, -1 when the frame has no resolvable
+    //           class) — the seed for every lazy slot above.
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2148,7 +2206,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     });
     r.register(sf, "getFileName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        Ok(Some(p59_frame_file_name(ctx, this)))
     });
     r.register(sf, "getLineNumber", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2183,7 +2241,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(ctx.get_field(this, 6)))
+            Ok(Some(p59_frame_mirror(ctx, this)))
         },
     );
     r.register(
@@ -2223,7 +2281,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => "unknown".to_string(),
         };
-        let file_name = match ctx.get_field(this, 2) {
+        let file_name = match p59_frame_file_name(ctx, this) {
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         };
@@ -2258,15 +2316,17 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let class_slashed = match ctx.get_field(this, 5) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => class_dotted.replace('.', "/"),
+            let class_slashed = p59_frame_internal_name(ctx, this);
+            let class_slashed = if class_slashed.is_empty() {
+                class_dotted.replace('.', "/")
+            } else {
+                class_slashed
             };
             let method_name = match ctx.get_field(this, 1) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let file_name = match ctx.get_field(this, 2) {
+            let file_name = match p59_frame_file_name(ctx, this) {
                 Value::Object(Some(s)) => ctx.read_string(s),
                 _ => None,
             };
@@ -2351,10 +2411,7 @@ pub(crate) fn p59_sf_get_method_type(
     // A fabricated stub names its fields `_f0.._fN`, so the by-name read
     // misses there and the slot-1 fallback is taken automatically; no mode
     // flag is involved.
-    let internal = match ctx.get_field(this, 5) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let internal = p59_frame_internal_name(ctx, this);
     let method_name = match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => match ctx.get_field(this, 1) {
@@ -2453,6 +2510,88 @@ pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegis
 
 /// Populate the 8-slot StackFrame synthetic from a `StackTraceEntry`, including
 /// the eagerly resolved declaring-class mirror and persistent retain-class bit.
+/// Slot of the declaring-class `ClassId` on the p59 `StackFrame` carrier.
+pub(crate) const P59_SF_CLASS_ID: usize = 8;
+/// Number of slots the p59 `StackFrame` carrier declares.
+pub(crate) const P59_SF_FIELDS: usize = 9;
+
+/// The carrier's declaring-class id, or `None` when the frame had no resolvable
+/// class (slot 8 holds `-1`) or the carrier predates the slot.
+pub(crate) fn p59_frame_class_id(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+) -> Option<ClassId> {
+    if ctx.object_num_fields(this) <= P59_SF_CLASS_ID {
+        return None;
+    }
+    match ctx.get_field(this, P59_SF_CLASS_ID) {
+        Value::Int(id) if id >= 0 => Some(ClassId::new(id as u32)),
+        _ => None,
+    }
+}
+
+/// Slot 2 (`fileName`), built on first read from slot 8 and memoized back into
+/// the slot. A frame whose class declares no `SourceFile` answers null every
+/// time, which is what an eagerly-populated carrier did for the same frame.
+fn p59_frame_file_name(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> Value {
+    if let Value::Object(Some(s)) = ctx.get_field(this, 2) {
+        return Value::Object(Some(s));
+    }
+    let Some(cid) = p59_frame_class_id(ctx, this) else {
+        return Value::Object(None);
+    };
+    let Some(file) = ctx.class_source_file(cid) else {
+        return Value::Object(None);
+    };
+    // GC-SAFETY: `create_string` allocates, so re-read `this` through a pin
+    // before writing the slot back.
+    let pin = ctx.pin_native_root(this);
+    let s = ctx.create_string(&file);
+    let s_pin = ctx.pin_native_root(s);
+    let this = ctx.read_native_pin(pin, this);
+    let s = ctx.read_native_pin(s_pin, s);
+    ctx.set_field(this, 2, Value::Object(Some(s)));
+    ctx.unpin_native_roots(pin);
+    Value::Object(Some(s))
+}
+
+/// Slot 5 (the '/'-form declaring class name), built on first read from slot 8.
+fn p59_frame_internal_name(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> String {
+    if let Value::Object(Some(s)) = ctx.get_field(this, 5) {
+        return ctx.read_string(s).unwrap_or_default();
+    }
+    if let Some(cid) = p59_frame_class_id(ctx, this) {
+        if let Some(name) = ctx.class_name_of_id(cid) {
+            return name;
+        }
+    }
+    // Last resort: the dotted name in slot 0. `toStackTraceElement` already
+    // carried this fallback for a carrier whose slot 5 was empty.
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().replace('.', "/"),
+        _ => String::new(),
+    }
+}
+
+/// Slot 6 (the declaring-class mirror), built on first read from slot 8 and
+/// memoized back into the slot.
+fn p59_frame_mirror(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> Value {
+    if let Value::Object(Some(m)) = ctx.get_field(this, 6) {
+        return Value::Object(Some(m));
+    }
+    let Some(cid) = p59_frame_class_id(ctx, this) else {
+        return Value::Object(None);
+    };
+    let pin = ctx.pin_native_root(this);
+    let m = ctx.get_class_mirror(cid);
+    let m_pin = ctx.pin_native_root(m);
+    let this = ctx.read_native_pin(pin, this);
+    let m = ctx.read_native_pin(m_pin, m);
+    ctx.set_field(this, 6, Value::Object(Some(m)));
+    ctx.unpin_native_roots(pin);
+    Value::Object(Some(m))
+}
+
 pub(crate) fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
@@ -2463,48 +2602,43 @@ pub(crate) fn populate_stack_frame(
     // (allocation-free) field writes. Holding the freshly-allocated `sf` and
     // strings in bare locals across the subsequent `create_string` calls is a
     // use-after-move/free under the moving collector.
-    // Slot 6: the declaring-class `Class` mirror, resolved EAGERLY here from
-    // `entry.class_id` when available. `entry.class_id` is captured directly
-    // off the live interpreter `Frame` (see `stackwalker::entry_from_frame`)
-    // and is therefore always valid for a real frame -- unlike a fresh
-    // by-name lookup (`class_id_by_name(&entry.class_name)`) performed LATER,
-    // from `getDeclaringClass()`, which can fail for a frame whose class is
-    // still executing its own `<clinit>` (observed: `SpringFactoriesLoader`/
-    // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from their
-    // own static initializers -- log4j-api's `StackLocator` walks back to
-    // that exact self-frame and NPEs when the by-name lookup comes back
-    // empty). Resolving from the guaranteed-valid ClassId at population time
-    // sidesteps that failure mode entirely; `class_id_by_name` remains a
-    // fallback for synthetic/no-frame entries (`entry.class_id.is_none()`).
+    //
+    // THREE allocations per frame, not six. `fileName` (slot 2), the '/'-form
+    // class name (slot 5) and the declaring-class mirror (slot 6) are LAZY --
+    // built by `p59_frame_file_name` / `p59_frame_internal_name` /
+    // `p59_frame_mirror` from the `ClassId` in slot 8 on first read, and
+    // memoized back into their slots. `getClassName()` and `getMethodName()`
+    // stay eager because a stream predicate reads them for every frame it
+    // visits, which is what makes them the only two worth paying for up front.
+    //
+    // Slot 8 carries `entry.class_id` -- the id captured directly off the live
+    // interpreter `Frame` (see `stackwalker::entry_from_frame`), which is
+    // always valid for a real frame. Deferring the mirror resolve is therefore
+    // NOT the same as deferring to a by-name lookup: `class_id_by_name` is
+    // loader-blind and ambiguity-strict and can miss for a frame whose class is
+    // still executing its own `<clinit>` (observed: `SpringFactoriesLoader` /
+    // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from their own
+    // static initializers, walked by log4j-api's `StackLocator`, which NPE'd
+    // when the lookup came back empty). The id is resolved once, here, exactly
+    // as before; only the mirror LOOKUP moved.
     let decl_cid = entry
         .class_id
         .or_else(|| ctx.class_id_by_name(&entry.class_name));
 
-    let mut sf = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 8)?;
+    let mut sf =
+        try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", P59_SF_FIELDS)?;
     let base = ctx.pin_native_root(sf);
-    let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
+    // The dotted form comes from the shared per-ClassId cache when the class is
+    // known, so a repeated frame does not re-run `.replace('/', '.')` and
+    // allocate a fresh Rust `String` on top of the Java one.
+    let dotted: std::sync::Arc<str> = match decl_cid {
+        Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &entry.class_name),
+        None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
+    };
+    let mut cls_str = ctx.create_string(&dotted);
     let h_cls = ctx.pin_native_root(cls_str);
     let mut meth_str = ctx.create_string(&entry.method_name);
     let h_meth = ctx.pin_native_root(meth_str);
-    let (mut file_str, h_file) = match &entry.source_file {
-        Some(f) => {
-            let s = ctx.create_string(f);
-            let h = ctx.pin_native_root(s);
-            (Some(s), Some(h))
-        }
-        None => (None, None),
-    };
-    // Preserve the '/' form too (used by toStackTraceElement()'s fallback).
-    let mut decl_internal = ctx.create_string(&entry.class_name);
-    let h_decl = ctx.pin_native_root(decl_internal);
-    let (mut decl_mirror, h_mirror) = match decl_cid {
-        Some(cid) => {
-            let m = ctx.get_class_mirror(cid);
-            let h = ctx.pin_native_root(m);
-            (Some(m), Some(h))
-        }
-        None => (None, None),
-    };
 
     sf = ctx.read_native_pin(base, sf);
     cls_str = ctx.read_native_pin(h_cls, cls_str);
@@ -2513,32 +2647,17 @@ pub(crate) fn populate_stack_frame(
     meth_str = ctx.read_native_pin(h_meth, meth_str);
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
     sf = ctx.read_native_pin(base, sf);
-    if let (Some(s), Some(h)) = (file_str, h_file) {
-        file_str = Some(ctx.read_native_pin(h, s));
-    }
-    ctx.set_field(
-        sf,
-        2,
-        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
-    );
-    sf = ctx.read_native_pin(base, sf);
+    ctx.set_field(sf, 2, Value::Object(None));
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
-    sf = ctx.read_native_pin(base, sf);
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
-    sf = ctx.read_native_pin(base, sf);
-    decl_internal = ctx.read_native_pin(h_decl, decl_internal);
-    ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
-    sf = ctx.read_native_pin(base, sf);
-    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
-        decl_mirror = Some(ctx.read_native_pin(h, m));
-    }
+    ctx.set_field(sf, 5, Value::Object(None));
+    ctx.set_field(sf, 6, Value::Object(None));
+    ctx.set_field(sf, 7, Value::Int(i32::from(retain_class_ref)));
     ctx.set_field(
         sf,
-        6,
-        decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
+        P59_SF_CLASS_ID,
+        Value::Int(decl_cid.map_or(-1, |c| c.as_u32() as i32)),
     );
-    sf = ctx.read_native_pin(base, sf);
-    ctx.set_field(sf, 7, Value::Int(i32::from(retain_class_ref)));
     sf = ctx.read_native_pin(base, sf);
     ctx.unpin_native_roots(base);
     Ok(sf)
@@ -4149,6 +4268,9 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
         // Class mirror or a real reifier impl: ask the VM for getTypeName(),
         // falling back to toString() and finally the dotted class name.
         _ => {
+            // `obj` is a parameter held across both calls; the first allocates
+            // a String and can move it before the second dereferences it.
+            let obj_pin = ctx.pin_native_root(obj);
             if let Ok(Some(Value::Object(Some(s)))) =
                 ctx.invoke_virtual(obj, "getTypeName", "()Ljava/lang/String;", &[])
             {
@@ -4156,6 +4278,7 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
                     return rendered;
                 }
             }
+            let obj = ctx.read_native_pin(obj_pin, obj);
             if let Ok(Some(Value::Object(Some(s)))) =
                 ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
             {

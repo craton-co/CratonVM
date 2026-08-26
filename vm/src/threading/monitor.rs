@@ -1490,6 +1490,29 @@ impl Monitor {
                                 interrupt_wakes_now.wrapping_sub(interrupt_wakes_at_entry),
                                 started.elapsed().as_millis(),
                             );
+                            // THE MONITOR'S OWN STATE, read under the state
+                            // lock this loop is already holding.
+                            //
+                            // `Object.wait()` must have RELEASED the monitor.
+                            // An `owner` that is still this thread would mean
+                            // no completer's `synchronized` block can ever run,
+                            // which presents as `notify=0` on a promise nobody
+                            // ever completed — indistinguishable, from the
+                            // lines above alone, from a completer that simply
+                            // never ran. Those need opposite investigations,
+                            // and the netty `ParameterizedSslHandlerTest`
+                            // residual stalls were stuck on exactly that fork.
+                            // `parked_waiters` beside it distinguishes "this is
+                            // the only waiter" from "several are queued here".
+                            eprintln!(
+                                "[WAIT-OBJECT] monitor owner={:?} entry_count={} \
+                                 parked_waiters={} pending_notifies={} self_is_owner={}",
+                                state.owner,
+                                state.entry_count,
+                                state.parked_waiters,
+                                state.pending_notifies,
+                                state.owner == Some(thread_id),
+                            );
                             // ORPHAN CHECK. If the object's mark word stops
                             // pointing at `self`, a later `notifyAll()` inflates
                             // a DIFFERENT monitor and can never reach this

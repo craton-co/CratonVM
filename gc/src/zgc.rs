@@ -8348,12 +8348,18 @@ impl ZgcRealHeap {
                     .map(|(from, v)| (*from, *v))
             })
         };
-        // `exe+RVA` rather than a symbolized backtrace: see
-        // `gc_quiescence::native_rvas` for why `Backtrace::force_capture`
-        // yields nothing but `<unknown>` in this tree's release profile.
-        // Paste the list into `CRATONVM_SYMBOLIZE` with the SAME binary (and
-        // its PDB in place, i.e. `target/release/cratonvm.exe`, not a renamed
-        // copy -- the debug directory records the original PDB path).
+        // `exe+RVA` when the hook is installed; `Backtrace::force_capture`
+        // otherwise. Paste an RVA list into `CRATONVM_SYMBOLIZE` with the SAME
+        // binary (and its PDB in place, i.e. `target/release/cratonvm.exe`, not
+        // a renamed copy -- the debug directory records the original PDB path).
+        //
+        // ON LINUX THE FALLBACK IS THE PATH, AND IT WORKS. No caller installs
+        // the hook, and this comment used to say the fallback "yields nothing
+        // but `<unknown>`". Measured 2026-08-24 on a fat-LTO release build:
+        // **40 symbolized frames with file:line**, which named the defect four
+        // frames up. `Display` is MULTI-LINE, so a one-line grep of the log
+        // shows frame 0 and nothing else -- read the lines after `backtrace=`
+        // before concluding the capture is broken, as one session did.
         let backtrace = {
             let rvas = crate::gc_quiescence::native_rvas();
             if rvas.is_empty() {
@@ -9088,6 +9094,28 @@ const Z_PARMARK_DEFAULT_WORKERS: usize = 0;
 fn zgc_corpse_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_CORPSE").is_some())
+}
+
+
+/// `CRATONVM_DBG_WATCH_PUN=<class-name-substring>:<slot>` — the parsed watch.
+///
+/// A primitive stored into a slot the class declares a REFERENCE is the G30-1
+/// species, and the read side can only report that it HAPPENED. This names the
+/// WRITER: it prints a backtrace at the store, which on Linux is 40 symbolized
+/// frames (see the note on `report_corpse_read`'s `backtrace` field — the
+/// in-process capture works, contrary to what two comments used to claim).
+///
+/// Written for `SQLChar.rawData` — declared `[C`, found holding `Int(1)`, and
+/// the cell a compiled `arraylength` dereferenced as the pointer 1. Watch it
+/// with `CRATONVM_DBG_WATCH_PUN=SQLChar:1`.
+fn punned_store_watch() -> Option<&'static (String, usize)> {
+    static W: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let spec = cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_PUN").ok()?;
+        let (class, slot) = spec.rsplit_once(':')?;
+        Some((class.to_string(), slot.parse().ok()?))
+    })
+    .as_ref()
 }
 
 fn zgc_verify_slide_enabled() -> bool {
@@ -11372,8 +11400,83 @@ impl ZgcRealHeap {
     /// [`Self::set_field_no_satb`] without the card -- the store itself. Split
     /// out so the card is paid once, after whichever of the three exits below
     /// this store takes, rather than repeated at each.
+
+    /// Read-side arm of `CRATONVM_DBG_WATCH_PUN`: report a watched slot that
+    /// holds a primitive, whether or not the JIT is on.
+    ///
+    /// Reads the raw 16-byte cell rather than going through the decode, so the
+    /// report carries the same tag/payload32/payload64 triple the JIT-side
+    /// detector prints and the two can be compared directly.
+    #[cold]
+    fn report_watched_punned_read(&self, obj: ObjectRef, index: usize) {
+        let Some((want_class, want_slot)) = punned_store_watch() else {
+            return;
+        };
+        if index != *want_slot {
+            return;
+        }
+        let header = self.header(obj);
+        if cratonvm_types::compact_object_field_storage(header, index).is_some() {
+            return; // compact cells carry no tag; nothing to mismatch
+        }
+        // SAFETY: `index` is in bounds (checked by the caller) and the object is
+        // not compact, so its body is `num_slots` uniform 16-byte cells.
+        let (tag, p32, p64) = unsafe {
+            let cell = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
+            (
+                std::ptr::read_unaligned(
+                    cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32
+                ),
+                std::ptr::read_unaligned(
+                    cell.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32
+                ),
+                std::ptr::read_unaligned(
+                    cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64
+                ),
+            )
+        };
+        if tag == cratonvm_types::FIELD_CELL_TAG_OBJECT {
+            return;
+        }
+        let name = crate::collector::class_name_for_diagnostics(header.class_id.as_u32());
+        if !name.contains(want_class.as_str()) {
+            return;
+        }
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            class = %name,
+            index,
+            tag,
+            payload32 = p32,
+            payload64 = p64,
+            "punned read watch: the watched slot does not hold an Object"
+        );
+    }
     fn set_field_no_card(&self, obj: ObjectRef, index: usize, value: Value) {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
+        // WRITER-side trap for the G30-1 species. Off unless
+        // `CRATONVM_DBG_WATCH_PUN=<class-substring>:<slot>` is set; when it is,
+        // a primitive landing in the watched slot prints a backtrace naming the
+        // code that stored it. The read side can only say a punned cell EXISTS.
+        if !matches!(value, Value::Object(_)) {
+            if let Some((want_class, want_slot)) = punned_store_watch() {
+                if index == *want_slot {
+                    let class_id = self.header(obj).class_id.as_u32();
+                    let name = crate::collector::class_name_for_diagnostics(class_id);
+                    if name.contains(want_class.as_str()) {
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            class = %name,
+                            class_id,
+                            index,
+                            ?value,
+                            backtrace = %std::backtrace::Backtrace::force_capture(),
+                            "punned store watch: a PRIMITIVE was stored into the watched slot"
+                        );
+                    }
+                }
+            }
+        }
         let header = self.header(obj);
         if self.check_field_index(header, index, "set").is_none() {
             return;
@@ -11593,6 +11696,23 @@ impl GarbageCollector for ZgcRealHeap {
         let header = self.header(obj);
         if self.check_field_index(header, index, "get").is_none() {
             return Value::Object(None);
+        }
+        // READ side of the same watch, so the question survives `--nojit`.
+        //
+        // The JIT-side punned-cell detector lives in `jit_getfield_impl`, which
+        // means turning the JIT off to ask "is COMPILED CODE the writer?" also
+        // turns the detector off — the experiment blinds its own instrument.
+        // This arm reads through the heap accessor the interpreter uses, so
+        // `CRATONVM_DBG_WATCH_PUN=<class>:<slot>` reports the punned cell with
+        // or without the JIT.
+        //
+        // Measured 2026-08-24: the STORE-side watch is live for this class
+        // (6881 firings watching `SQLChar:2`) and fired ZERO times for slot 1
+        // in a run that demonstrably produced the punned cell — so the write
+        // does not go through `set_field` at all, and compiled code writing the
+        // 16-byte cell directly is what is left to test.
+        if punned_store_watch().is_some() {
+            self.report_watched_punned_read(obj, index);
         }
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(header, index)

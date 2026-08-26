@@ -2863,6 +2863,117 @@ unsafe fn resolve_callee_cached(
     ))
 }
 
+/// WHICH implicit signal a compiled callee left behind alongside the `i64::MIN`
+/// sentinel — the one place that answers it, for both doors.
+///
+/// A bounds check, a null array reference and a zero divisor do NOT hand back a
+/// throwable. Each sets a flag and returns the sentinel, and the throwable is
+/// built on this side ([`materialize_implicit_signal`]). Two functions route
+/// such a sentinel through the CALLEE's own exception table —
+/// [`route_implicit_exc_through_callee`] for the Rust dispatch helper's
+/// compiled-entry fast paths, and [`handle_compiled_callee_deopt_sentinel`] for
+/// the machine-code direct `CALL` and the MIC/PIC cascade.
+///
+/// **They each carried their own copy of the table, and the copies drifted.**
+/// The arithmetic arm existed only in the second, so a `/ by zero` arriving at
+/// the first read as "no implicit signal here" and the sentinel went out to the
+/// compiled CALLER, whose drain threw the `ArithmeticException` through the
+/// CALLER's exception table. 198 000 of 200 000 `catch (ArithmeticException)`
+/// skipped on `probes/EscapeStaticProbe`; ~8 % of `probes/ExcTableDirectCallOracle`
+/// runs dying at `main:156`. Both pages are in
+/// `fixed-suite-bugs/jit/`.
+///
+/// The arm was added where it was missing. This type is the other half: there is
+/// now ONE table, and — the load-bearing part — the question *"is there an
+/// implicit signal at all?"* is answered by the SAME function that decides
+/// *which one*. What made the drift possible was that the first door asked it
+/// with a hand-written `aioobe.is_none() && !npe` companion to the `match`, so
+/// adding a flag to the `match` and not to the companion was a silent no-op.
+///
+/// Precedence — AIOOBE, then NPE, then arithmetic — is the order both callers
+/// already drained in. It is a precedence and not a set because only one
+/// throwable can be delivered, and the compiled body can only have trapped once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImplicitSignal {
+    Aioobe { index: i64, length: i64 },
+    Npe,
+    Arithmetic,
+    None,
+}
+
+/// Classify a drained signal triple. Pure, so the table above is testable
+/// without a heap — the bug it encodes is entirely an arithmetic property.
+pub(crate) fn implicit_signal_of(
+    aioobe: Option<(i64, i64)>,
+    npe: bool,
+    arithmetic: bool,
+) -> ImplicitSignal {
+    match aioobe {
+        Some((index, length)) => ImplicitSignal::Aioobe { index, length },
+        None if npe => ImplicitSignal::Npe,
+        None if arithmetic => ImplicitSignal::Arithmetic,
+        None => ImplicitSignal::None,
+    }
+}
+
+/// Put a classified signal back exactly as it was drained.
+///
+/// Both doors fall back on this, and it is not hygiene: the compiled caller's
+/// own drain builds the throwable FROM the flag, so a signal consumed here and
+/// not restored is an exception that never happens at all — the caller sees a
+/// bare deopt sentinel and carries on.
+fn restash_implicit_signal(signal: ImplicitSignal) {
+    match signal {
+        ImplicitSignal::Aioobe { index, length } => stash_jit_pending_aioobe(index, length),
+        ImplicitSignal::Npe => stash_jit_pending_npe(),
+        ImplicitSignal::Arithmetic => stash_jit_pending_arithmetic(),
+        ImplicitSignal::None => {}
+    }
+}
+
+/// Build the throwable an implicit signal is a *request* for.
+///
+/// One body, so the message text cannot diverge by dispatch route: a
+/// `getMessage()` that depended on which door serviced the trap would be its
+/// own wrong answer, and keeping the two arms in step by hand is what this
+/// replaces.
+///
+/// `create_exception_object` allocates, so this is a safepoint; each caller
+/// documents what it has pinned across it.
+fn materialize_implicit_signal(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    signal: ImplicitSignal,
+) -> Option<ObjectRef> {
+    match signal {
+        ImplicitSignal::Aioobe { index, length } => {
+            let msg = format!("Index {index} out of bounds for length {length}");
+            crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ArrayIndexOutOfBoundsException",
+                Some(&msg),
+            )
+            .ok()
+        }
+        ImplicitSignal::Npe => crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/NullPointerException",
+            None,
+        )
+        .ok(),
+        ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/ArithmeticException",
+            Some("/ by zero"),
+        )
+        .ok(),
+        ImplicitSignal::None => None,
+    }
+}
+
 /// Run the compiled callee's own handler for an exception that escaped it,
 /// resuming AT the handler instead of re-running the method from entry.
 ///
@@ -3105,20 +3216,27 @@ unsafe fn route_implicit_exc_through_callee(
     } else {
         false
     };
+    // ONE classification, used for both questions this function asks of the
+    // three flags — which signal, and whether there is one. See
+    // [`ImplicitSignal`]: the second question used to be a separate,
+    // hand-written test, and that is what let the arm above go missing here
+    // while the sibling door had it.
+    let implicit = implicit_signal_of(aioobe, npe, arithmetic);
+    if rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_implicit_exc_through_callee IMPLICIT {implicit:?} \
+             callee_has_handler={callee_has_handler} {}.{}{}",
+            info.class_name, info.method_name, info.descriptor,
+        );
+    }
     // Re-stash the consumed flag and propagate the sentinel unchanged. Used for
     // the pure-deopt case (no flag) and the no-local-handler case (the callee
     // cannot catch it, so existing outward propagation is already correct).
     let restash_and_return = || {
-        if let Some((idx, len)) = aioobe {
-            stash_jit_pending_aioobe(idx, len);
-        } else if npe {
-            stash_jit_pending_npe();
-        } else if arithmetic {
-            stash_jit_pending_arithmetic();
-        }
+        restash_implicit_signal(implicit);
         rc
     };
-    if aioobe.is_none() && !npe && !arithmetic {
+    if implicit == ImplicitSignal::None {
         // KCFULL-13 — *general* pending exception (an explicit `athrow`, or a
         // native-raised throwable, originating in this compiled callee's own
         // callee chain). The original bug-H assumption — "methods-with-tables
@@ -3294,37 +3412,12 @@ unsafe fn route_implicit_exc_through_callee(
         // path where the compiled attempt is FINISHED or ABANDONED, so its
         // frame can never be legitimately claimed and must not be left for a
         // later drain to mis-match.
-        // The message text matches `handle_compiled_callee_deopt_sentinel`'s
-        // arm for the same signal, and the interpreter's own `idiv` — a
-        // `getMessage()` that changed with the dispatch route would be its own
-        // wrong answer.
-        let exc = match (aioobe, npe, arithmetic) {
-            (Some((index, length)), _, _) => {
-                let msg = format!("Index {index} out of bounds for length {length}");
-                crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArrayIndexOutOfBoundsException",
-                    Some(&msg),
-                )
-                .ok()
-            }
-            (None, true, _) => crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                "java/lang/NullPointerException",
-                None,
-            )
-            .ok(),
-            (None, false, true) => crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                "java/lang/ArithmeticException",
-                Some("/ by zero"),
-            )
-            .ok(),
-            (None, false, false) => None,
-        };
+        // The message text cannot diverge from
+        // `handle_compiled_callee_deopt_sentinel`'s or from the interpreter's
+        // own `idiv`, because there is one body — a `getMessage()` that changed
+        // with the dispatch route would be its own wrong answer, and this used
+        // to be kept true by hand.
+        let exc = materialize_implicit_signal(vm, thread, implicit);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3591,33 +3684,15 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 return Some(v);
             }
         } else {
-            let implicit = match signals.aioobe {
-                Some((index, length)) => {
-                    let msg = format!("Index {index} out of bounds for length {length}");
-                    crate::runtime::exceptions::create_exception_object(
-                        vm,
-                        thread,
-                        "java/lang/ArrayIndexOutOfBoundsException",
-                        Some(&msg),
-                    )
-                    .ok()
-                }
-                None if signals.npe => crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/NullPointerException",
-                    None,
-                )
-                .ok(),
-                None if signals.arithmetic => crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArithmeticException",
-                    Some("/ by zero"),
-                )
-                .ok(),
-                None => None,
-            };
+            // The SAME table the dispatch-helper door uses. This door is where
+            // the arithmetic arm always existed; sharing the table is what stops
+            // the two from disagreeing about the SET again. See
+            // [`ImplicitSignal`].
+            let implicit = materialize_implicit_signal(
+                vm,
+                thread,
+                implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
+            );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
                     vm,
@@ -19152,6 +19227,122 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Every implicit JIT signal is an implicit exception at BOTH callee doors
+    // -----------------------------------------------------------------------
+
+    /// The regression this file's `ImplicitSignal` exists for.
+    ///
+    /// `route_implicit_exc_through_callee` used to decide "is there an implicit
+    /// signal at all?" with a hand-written `aioobe.is_none() && !npe`, while
+    /// `handle_compiled_callee_deopt_sentinel` decided the same question with a
+    /// three-armed `match` that also knew about `arithmetic`. A `/ by zero` in a
+    /// compiled callee reached through the dispatch helper therefore read as
+    /// "nothing implicit pending", and the callee's own
+    /// `catch (ArithmeticException)` was skipped.
+    ///
+    /// A pass/fail probe could only ever sample that — which door a call takes
+    /// depends on compile ordering, so it showed up at ~8 % of runs. The
+    /// arithmetic is not a race, so pin it here where it is deterministic.
+    #[test]
+    fn a_pending_arithmetic_signal_is_an_implicit_exception() {
+        assert_eq!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::Arithmetic,
+            "a zero-divisor signal must classify as an implicit exception; \
+             reading it as `None` is the ExcTableDirectCallOracle flake"
+        );
+        assert_ne!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::None,
+            "and in particular must not take the `no implicit signal` branch"
+        );
+    }
+
+    /// Only the empty triple is `None`. Stated as its own test because it is
+    /// the property a future fourth signal would break: adding a field to
+    /// `JitSignals` and forgetting this function puts the new signal back in
+    /// the `None` bucket, which is silently "propagate to the caller".
+    #[test]
+    fn the_no_signal_answer_is_reserved_for_the_empty_triple() {
+        assert_eq!(implicit_signal_of(None, false, false), ImplicitSignal::None);
+        for signal in [
+            implicit_signal_of(Some((3, 2)), false, false),
+            implicit_signal_of(None, true, false),
+            implicit_signal_of(None, false, true),
+        ] {
+            assert_ne!(signal, ImplicitSignal::None);
+        }
+    }
+
+    /// Precedence is AIOOBE, then NPE, then arithmetic — the order both doors
+    /// already drained the flags in, kept so this refactor is behaviour-neutral
+    /// for the two signals that were already handled. Only one throwable can be
+    /// delivered, so an overlapping triple must pick exactly one.
+    #[test]
+    fn implicit_signal_precedence_is_aioobe_then_npe_then_arithmetic() {
+        assert_eq!(
+            implicit_signal_of(Some((7, 5)), true, true),
+            ImplicitSignal::Aioobe {
+                index: 7,
+                length: 5
+            }
+        );
+        assert_eq!(implicit_signal_of(None, true, true), ImplicitSignal::Npe);
+        assert_eq!(
+            implicit_signal_of(None, false, true),
+            ImplicitSignal::Arithmetic
+        );
+    }
+
+    /// The AIOOBE payload has to survive classification: the message the
+    /// throwable carries is built from it, and HotSpot's text names both
+    /// numbers.
+    #[test]
+    fn the_aioobe_payload_survives_classification() {
+        assert_eq!(
+            implicit_signal_of(Some((-1, 0)), false, false),
+            ImplicitSignal::Aioobe {
+                index: -1,
+                length: 0
+            }
+        );
+    }
+
+    /// A drained signal that is restashed must classify back to itself.
+    ///
+    /// This is the fallback both doors take when the callee's own table does
+    /// not cover the throw: the caller's drain builds the throwable FROM the
+    /// flag, so a round trip that loses it is not a missed optimisation, it is
+    /// an exception that never happens. Runs on this thread's real
+    /// `JIT_SIGNALS`, and leaves it clear.
+    #[test]
+    fn a_restashed_implicit_signal_round_trips_through_the_thread_local() {
+        for original in [
+            ImplicitSignal::Aioobe {
+                index: 9,
+                length: 4,
+            },
+            ImplicitSignal::Npe,
+            ImplicitSignal::Arithmetic,
+        ] {
+            restash_implicit_signal(original);
+            let aioobe = take_jit_pending_aioobe();
+            let npe = take_jit_pending_npe();
+            let arithmetic = take_jit_pending_arithmetic();
+            assert_eq!(implicit_signal_of(aioobe, npe, arithmetic), original);
+        }
+        restash_implicit_signal(ImplicitSignal::None);
+        assert_eq!(
+            implicit_signal_of(
+                take_jit_pending_aioobe(),
+                take_jit_pending_npe(),
+                take_jit_pending_arithmetic()
+            ),
+            ImplicitSignal::None
+        );
+    }
 
     // -----------------------------------------------------------------------
     // The `Matcher` leaf's index and its arg-count table must agree
