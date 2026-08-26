@@ -179,6 +179,14 @@ pub(crate) mod rootprof {
     /// pointers, dwarf unwinding fails on this VM's stack depths) and reading
     /// the call sites did not either. Index: 0 = gc-roots, 1 = safepoint,
     /// 2 = blocked-deposit.
+    ///
+    /// A fourth slot for "the scan `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN=1`
+    /// did NOT run" was added here and removed again: this reporter only fires
+    /// every 4096 `note_stack_scan` passes, and `note_stack_scan` is driven by
+    /// the scan the skip removes — so the one arm that needed the counter is
+    /// exactly the arm that can never print it. `CRATONVM_DBG_JIT_SCAN_PROF`'s
+    /// exit-time `scans=` is the engagement counter for that switch instead,
+    /// and it answered cleanly: 8,495 with the skip off, 0 with it on.
     pub static SCAN_BY_CALLER: [AtomicU64; 3] =
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
