@@ -9651,10 +9651,13 @@ fn fmt_resolve_zone(
     // ZONE_OFFSET alone, so the difference IS DST_OFFSET. Asking the zone rather
     // than reading a Calendar field keeps the `long`/`Date` and `Calendar`
     // sources on one code path.
+    // `getOffset()` is real Java and can move `tz` before `getRawOffset()`.
+    let tz_pin = ctx.pin_native_root(tz);
     let total = match ctx.invoke_virtual(tz, "getOffset", "(J)I", &[Value::Long(millis)]) {
         Ok(Some(Value::Int(v))) => v,
         _ => return FmtZone::NONE,
     };
+    let tz = ctx.read_native_pin(tz_pin, tz);
     let raw = match ctx.invoke_virtual(tz, "getRawOffset", "()I", &[]) {
         Ok(Some(Value::Int(v))) => v,
         // A zone that answered its offset but not its raw offset is still a
@@ -10078,10 +10081,14 @@ fn extract_temporal_fields(
                 };
                 Ok(epoch(zoned_fields(ctx, None, millis)))
             } else if is_a(ctx, "java/util/Calendar") {
+                // `obj` is passed to `zoned_fields` below, after this call has
+                // had its chance to collect and move it.
+                let obj_pin = ctx.pin_native_root(obj);
                 let millis = match ctx.invoke_virtual(obj, "getTimeInMillis", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
+                let obj = ctx.read_native_pin(obj_pin, obj);
                 // The Calendar's OWN zone, not the default: measured on
                 // HotSpot 25, `%tc` of a `Calendar.getInstance(TimeZone
                 // .getTimeZone("Asia/Tokyo"))` set to 1699999999000 is
@@ -10089,10 +10096,14 @@ fn extract_temporal_fields(
                 // `user.timezone` is.
                 Ok(epoch(zoned_fields(ctx, Some(obj), millis)))
             } else if is_a(ctx, "java/time/Instant") {
+                // Two sequential accessors on `obj` in the SAME arm; the first
+                // can move it before the second reads it.
+                let obj_pin = ctx.pin_native_root(obj);
                 let sec = match ctx.invoke_virtual(obj, "getEpochSecond", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
+                let obj = ctx.read_native_pin(obj_pin, obj);
                 let nano = match ctx.invoke_virtual(obj, "getNano", "()I", &[])? {
                     Some(Value::Int(v)) => v,
                     _ => 0,
