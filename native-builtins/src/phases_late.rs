@@ -1354,7 +1354,12 @@ fn collect_map_entries_as_strings(
         Ok(Some(Value::Object(Some(i)))) => i,
         _ => return out,
     };
+    // `it` lives across the whole loop and `entry` across its two accessors;
+    // every call here is real Java that can collect.
+    let it_pin = ctx.pin_native_root(it);
+    let mut it = it;
     loop {
+        it = ctx.read_native_pin(it_pin, it);
         let has_next = matches!(
             ctx.invoke_virtual(it, "hasNext", "()Z", &[]),
             Ok(Some(Value::Int(n))) if n != 0
@@ -1362,14 +1367,17 @@ fn collect_map_entries_as_strings(
         if !has_next {
             break;
         }
+        it = ctx.read_native_pin(it_pin, it);
         let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(e)))) => e,
             _ => break,
         };
+        let entry_pin = ctx.pin_native_root(entry);
         let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(k)))) => ctx.read_string(k),
             _ => None,
         };
+        let entry = ctx.read_native_pin(entry_pin, entry);
         let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
             Ok(Some(Value::Object(None))) => Some(String::new()),
