@@ -290,6 +290,70 @@ audited. That is the obvious next piece of the same audit, and it was left
 alone here rather than changed blind. The `0x5B == 91` constant in
 `rbx`/`r8`/`r13` also remains unexplained.
 
+## 2.6 §0.5 item 2, second reader: `g1` clamped the array walk and left the flat walk beside it unclamped
+
+§2.5 answered the audit question for the concurrent marker and left
+`g1::for_each_flat_object_reference` open, because it validates nothing itself
+and its 15 callers had not been read. They have been now, and one of them
+already contains the argument for the fix — applied to the wrong half.
+
+`record_outgoing_rset_edges` is hardened. It screens its seed with
+`candidate_header_is_plausible`, and then clamps the walk:
+
+```rust
+// `array_length` is a u32 bounded only by `i32::MAX`, so `HEADER_SIZE + len * 8`
+// is not implied to be inside the region by the header being plausible.
+let walkable_elements = /* holder_walkable_slots(..) */;
+```
+
+That reasoning is correct and it is **not array-specific**. `num_slots` is a
+header field of the same kind, bounded by nothing a plausible header
+guarantees, and the legacy walk strides `SLOT_SIZE` = 16 bytes — so it leaves
+the region **twice as fast** as the array path that was thought to need the
+clamp. The array branch got it; the `else` branch one screen below handed the
+object to the uncapped `for_each_flat_object_reference` and walked
+`0..header.num_slots()`.
+
+This is the reader in the crash this file records two dozen lines above:
+
+```
+collect_garbage -> retry_after_evacuation_failure -> record_outgoing_rset_edges
+  -> for_each_flat_object_reference   (faulting on a 4 MiB-aligned address
+                                       well past the committed arena)
+```
+
+The clamp existed, in the same function, guarding the sibling branch.
+
+### The fix
+
+* `holder_walkable_slots` computed `room = (end - addr - HEADER_SIZE) / 8` — a
+  hard-coded 8-byte stride, which is why it could not serve the flat walk at
+  all. It now takes a `stride`; its three existing call sites pass `8` and are
+  unchanged in behaviour.
+* `for_each_flat_object_reference_capped` bounds the legacy loop by
+  `max_slots`. The original entry point delegates with `usize::MAX`, so the
+  other **14** call sites are byte-for-byte identical — this deliberately does
+  not re-bound walks whose callers have not been audited.
+* `record_outgoing_rset_edges`'s `else` branch now derives its bound exactly as
+  its array sibling does, with `SLOT_SIZE` as the stride.
+
+`cargo test -p cratonvm-gc --release`: **1687 passed, 0 failed.**
+
+### Scope, stated honestly
+
+One caller of fifteen is now bounded — the one with a recorded crash. The other
+fourteen still walk on `header.num_slots()` alone, and most of them do not hold
+region geometry, so bounding them is a larger design question (what does a
+walker without a region do with an implausible count?) rather than a
+mechanical edit. They were left alone on purpose; `usize::MAX` through the
+delegating entry point makes that a *visible* default rather than an implicit
+one.
+
+And as with §2.5: this is not a demonstration that this walk produced the eight
+`hs_err` files in this page's title. It is the fix for a *different*, recorded,
+crash that arrives through the same helper, plus the removal of one more way a
+G1 walk can read past an object.
+
 ## 2.4 What is left for whoever reopens this
 
 1. The producer (§2.2) — the stale-receiver defect that puts two heap pointers
@@ -300,8 +364,8 @@ alone here rather than changed blind. The `0x5B == 91` constant in
    single most valuable thing to do — **keep the binary next to the `hs_err`**.
 3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
    slot count?) is answered for the concurrent marker in **§2.5** — yes, by
-   TOCTOU on the header, now fixed — and remains open for
-   `g1::for_each_flat_object_reference`. `0x5B == 91` from the register dump remains unexplained.
+   TOCTOU on the header, now fixed — and in **§2.6** for `g1::for_each_flat_object_reference`'s
+   crash-path caller; its other fourteen callers remain unaudited. `0x5B == 91` from the register dump remains unexplained.
 
 # 1. The 2026-08-21 not-reproducible investigation, preserved
 

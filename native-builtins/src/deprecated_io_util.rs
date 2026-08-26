@@ -1423,6 +1423,9 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
             _ => -1,
         };
 
+        // `inner` is read twice below (the wrapped read, then the CR peek);
+        // the first can collect and move it.
+        let inner_pin = ctx.pin_native_root(inner);
         let byte_val = if pushback >= 0 {
             ctx.set_field(this, 3, Value::Int(-1));
             pushback
@@ -1440,6 +1443,7 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
 
         if byte_val == b'\r' as i32 {
             // Peek at next byte
+            let inner = ctx.read_native_pin(inner_pin, inner);
             let next = match ctx.invoke_virtual(inner, "read", "()I", &[])? {
                 Some(Value::Int(v)) => v,
                 _ => -1,
@@ -1494,6 +1498,10 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(-1))),
         };
 
+        // `inner` is read on every iteration below and each read can collect.
+        // Pinned ONCE here, not per iteration -- a pin inside the loop would
+        // accumulate roots for the whole read.
+        let inner_pin = ctx.pin_native_root(inner);
         let mut count = 0i32;
         for i in 0..len {
             let pushback = match ctx.get_field(this, 3) {
@@ -1501,6 +1509,7 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
                 _ => -1,
             };
 
+            let inner = ctx.read_native_pin(inner_pin, inner);
             let byte_val = if pushback >= 0 {
                 ctx.set_field(this, 3, Value::Int(-1));
                 pushback
@@ -1516,6 +1525,7 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
             }
 
             let actual_byte = if byte_val == b'\r' as i32 {
+                let inner = ctx.read_native_pin(inner_pin, inner);
                 let next = match ctx.invoke_virtual(inner, "read", "()I", &[])? {
                     Some(Value::Int(v)) => v,
                     _ => -1,

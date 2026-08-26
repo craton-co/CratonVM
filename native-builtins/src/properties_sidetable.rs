@@ -3294,8 +3294,16 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // `other` must be a Map of the same size. A non-Map `size()` call fails →
     // treated as not equal (the `instanceof Map` guard in Hashtable.equals).
+    // Both receivers are held across the calls below, and each call is real
+    // Java that can collect.
+    let this_pin0 = ctx.pin_native_root(this);
+    let other_pin0 = ctx.pin_native_root(other);
     let this_size = int_of(ctx.invoke_virtual(this, "size", "()I", &[]));
+    let this = ctx.read_native_pin(this_pin0, this);
+    let other = ctx.read_native_pin(other_pin0, other);
     let other_size = int_of(ctx.invoke_virtual(other, "size", "()I", &[]));
+    let this = ctx.read_native_pin(this_pin0, this);
+    let other = ctx.read_native_pin(other_pin0, other);
     if this_size < 0 || other_size != this_size {
         return Ok(Some(Value::Int(0)));
     }

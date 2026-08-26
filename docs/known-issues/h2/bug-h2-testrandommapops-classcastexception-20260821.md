@@ -12,7 +12,7 @@ as the reproducer passes on CratonVM *and* on stock HotSpot 25.
 | failure | state |
 |---|---|
 | `-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'` | **FIXED** — an unpinned receiver across a GC point; see below |
-| `--Xmx 256m`: a stale receiver inside `assertEquals`, ~823–845 s | **OPEN**, and it has now shown TWO different faces |
+| `--Xmx 256m`: a stale/corrupted reference | **OPEN** — THREE faces, ~1 failure in 3 runs of ~20 min, a different signature each time |
 | the recorded `ClassCastException` | **not reproduced**, retired as a starting point |
 
 The page stays open on the second row.
@@ -80,7 +80,7 @@ mappers, `COWAL.addAll`); they are listed here rather than patched blind,
 because nothing measured reaches them and an unmeasured fix to nine sites is
 nine chances to break something.
 
-## The `--Xmx 256m` failure is still open, and has two faces
+## The `--Xmx 256m` failure is still open, and has THREE faces
 
 On the **fixed** binary, `--Xmx 256m` (default collector) still fails at
 **845 s** — close to the 823 s this page recorded, but with a different
@@ -103,13 +103,49 @@ Two faces (`NullPointerException: "d" is null` at 823 s, this one at 845 s) at
 nearly the same point is itself the finding: the recorded message is not the
 lever, the same way the recorded seed was not.
 
-**And it is not a reliable reproducer either.** A third 256 m run, with the
-receiver dump armed, reached its **1500 s** cap without failing at all. So the
-base rate on this arm is roughly one occurrence in two or three ~850 s runs,
-and no clean arm shorter than that says anything about it — the same trap this
-page already documents for the `ClassCastException`. Anyone taking this row on
-should budget for the base rate first, or find a smaller reproducer, rather
-than reading a single quiet run as progress.
+**A THIRD face, 2026-08-26: SIGSEGV at 155 s.** Five further 256 m runs on the
+post-fix binary, receiver dump armed:
+
+| rep | cap | outcome |
+|---|---|---|
+| 1 | 1300 s | clean to cap |
+| 2 | 1300 s | clean to cap |
+| 3 | — | **SIGSEGV at 155 s** |
+| (earlier) | 1500 s | clean to cap |
+| (earlier) | — | `NoSuchMethodError` at 845 s |
+
+So the measured base rate is **roughly one failure in three runs of ~20 min**,
+and the *face changes every time*. That is the profile of heap corruption
+surfacing wherever the recycled memory happens to land — not of one localised
+defect with one signature.
+
+Two readings that follow from it, both worth having before spending runs:
+
+* **`2460030832` is not a class id.** It reads as a truncated pointer, so that
+  cell had been REUSED, not merely zeroed. That places this at the opposite end
+  of the stale-reference family from the G1 bug fixed above, whose receiver was
+  an all-zero header (`ClassId(0)` = `java.lang.Object`). The two ends need
+  different questions: "who freed it" versus "who else allocated over it".
+* **The segfault's Java frames are not a location.** They name
+  `TzdbZoneRulesProvider.load` / `BufferedInputStream.fill`, but the crash
+  header says in as many words that frames are "published at the last
+  blocking/safepoint deposit — may lag the faulting instruction". Registers at
+  the fault (`rax=0x0000FFFFFFFFFFFC`, `r10=0xFFFFFFFFFFFFFB05`, unreadable)
+  look like a length or index computed off a bad header, which is consistent
+  with the other two faces and NOT with a timezone-loading defect.
+
+**Repro-and-dump is the wrong instrument at this rate.** One in three, twenty
+minutes a run, and a different symptom each time means an attempt costs an hour
+and buys a signature you have not seen before. The next move is to make the
+defect cheaper before diagnosing it — raise the rate (smaller heap: `128m` /
+`192m` were the arms being tried when this was written, results not yet in), or
+find a smaller workload that corrupts the heap the same way. Only then is a
+kill-switch bisect worth running, because only then does a clean arm mean
+something.
+
+Until that exists, no clean arm shorter than the base rate says anything about
+this row — the same trap this page already documents for the
+`ClassCastException`, and the reason the recorded seed was retired.
 
 ## The recorded signature, and why it is not a reproducer
 

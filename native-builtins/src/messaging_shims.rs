@@ -490,6 +490,9 @@ fn native_activemq_abstract_subscription_init(
         Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
         _ => None,
     };
+    // `info_now` was derived from `info_pin` before the `getSelector()` call
+    // above, which can collect -- re-derive rather than reuse the stale copy.
+    let info_now = ctx.read_native_pin(info_pin, info);
     let no_local = match ctx.invoke_virtual(info_now, "isNoLocal", "()Z", &[]) {
         Ok(Some(Value::Int(v))) => v != 0,
         Ok(_) => false,
