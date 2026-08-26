@@ -1999,7 +1999,10 @@ pub fn jobject_to_obj(jobj: JObject) -> Option<ObjectRef> {
         JNI_SHARED_VM.with(|c| {
             let borrow = c.borrow();
             match borrow.as_ref() {
-                Some(shared) => shared.mem.heap.is_heap_addr(jobj as usize),
+                Some(shared) => {
+                    note_suspect_local_ref(shared, jobj as usize);
+                    shared.mem.heap.is_heap_addr(jobj as usize)
+                }
                 None => {
                     tracing::warn!(
                         "jobject_to_obj: local ref {jobj:#x} resolved outside JNI context"
@@ -2009,6 +2012,77 @@ pub fn jobject_to_obj(jobj: JObject) -> Option<ObjectRef> {
             }
         })
     }
+}
+
+/// `CRATONVM_DBG=jni-localref` — report a LOCAL `jobject` naming an address a
+/// recent collection moved an object away from.
+///
+/// # What this decides
+///
+/// A local ref is a raw heap pointer with no remap table (see the branch
+/// above), so a handle a foreign `.so` holds across a moving collection comes
+/// back naming from-space. When the vacated span has been re-issued, its
+/// header reads back all-zero, `ClassId(0)` is `java/lang/Object`, and the
+/// dispatch that follows raises `NoSuchMethodError java/lang/Object.<method>`.
+///
+/// The netty `ParameterizedSslHandlerTest` stall produces exactly that line
+/// from at least three different producers, and one of them —
+/// `checkClientTrusted` on the OPENSSL provider, which reaches the trust
+/// manager through tcnative's JNI — has never had its holder named, because no
+/// guard fires on its receiver. This one does, at the boundary, with the
+/// backtrace that names the JNI entry point.
+///
+/// # What it cannot become
+///
+/// A stronger validity check here would NOT fix it: `is_heap_addr` is
+/// alignment plus live-region containment, `is_object_address` adds header-tag
+/// validation, and an all-zero header satisfies both (`kind` tag 0 is
+/// `ObjectKind::Object`, `element_type` 0 is `Reference`). Only the per-thread
+/// handle table this branch's FOLLOW-UP note describes removes the hazard.
+///
+/// Off by default and free when off: one relaxed load of the flag. Armed, it
+/// costs a probe of the relocation ring, which itself only holds anything when
+/// `CRATONVM_DBG=gcpart` is also set — so the two are meant to be armed
+/// together, and the report says so when they are not.
+#[inline]
+fn note_suspect_local_ref(shared: &SharedVm, addr: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JNI_LOCALREF").is_some()
+    });
+    if !on {
+        return;
+    }
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    const MAX_REPORTS: u64 = 24;
+    let forwards = crate::memory::gc::gcpart_probe(addr);
+    let moved: Vec<String> = forwards
+        .iter()
+        .filter_map(|(epoch, moved_to, _len, _dest)| {
+            moved_to.map(|to| format!("epoch {epoch} -> {to:#x}"))
+        })
+        .collect();
+    if moved.is_empty() {
+        return;
+    }
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+    let live_base = shared.mem.heap.is_object_address(addr).is_some();
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        forwards = moved.join(", "),
+        passes_is_object_address = live_base,
+        backtrace = %std::backtrace::Backtrace::force_capture(),
+        "a JNI LOCAL ref names an address a recent collection moved an object \
+         away from. A local ref is a raw heap pointer with no remap table, so \
+         the foreign caller in the backtrace is holding a stale handle; the \
+         next dispatch on it resolves ClassId(0) == java/lang/Object. Note \
+         `passes_is_object_address`: an all-zero header satisfies that check, \
+         so no validity gate here can catch this.",
+    );
 }
 
 /// Old-style sentinel for use in JniLocalFrame (kept for compatibility).

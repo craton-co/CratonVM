@@ -33,6 +33,10 @@ export CRATONVM_DBG_STW_CENSUS=1
 # whether the forward was RECORDED and the slot missed the remap, or never
 # recorded at all. Debug-gated; the ring is empty without it.
 export CRATONVM_DBG_GCPART=1
+# Names a stale LOCAL jobject at the JNI boundary, which is the one place
+# the checkClientTrusted face could be coming from and the one holder no
+# guard has ever reported.
+export CRATONVM_DBG_JNI_LOCALREF=1
 for i in $(seq 1 "$N"); do
   L="$D/run-$i.log"
   t0=$(date +%s); la=$(cut -d' ' -f1 /proc/loadavg)
