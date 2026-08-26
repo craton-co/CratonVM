@@ -57,7 +57,10 @@ Every link after the first is conditional on the first.
 
 Here the trust-manager call never reaches the test's `checkClientTrusted` at
 all: dispatch resolves the receiver's class as **`java.lang.Object`** and
-raises `NoSuchMethodError`. That is a `LinkageError`, not the
+raises `NoSuchMethodError`. **One of its three known producers is now named
+and fixed** (`native_properties_equals`, an unpinned native local); the other
+two are not, and this page says which is which rather than generalising from
+the one that was solved. That is a `LinkageError`, not the
 `CertificateException` the engine is prepared to convert, so **no alert is
 produced** — the server just closes. The client sees a plain close, its
 `exceptionCaught` never fires, `promise.trySuccess(null)` is never reached,
@@ -309,7 +312,8 @@ is what `huntloop.sh` runs.
 ### Where this belongs
 
 This is the `ClassId(0)` / stale-receiver family, not a netty defect:
-`known-issues/gc/unpinned-native-locals-audit-20260824.md` describes the same
+the retired `unpinned-native-locals-audit` write-up (whose 48 fixes landed on
+`dev` on 2026-08-25, while this was in flight) describes the same
 signature (*"the next read sees an all-zero header — which the class manager
 names `java.lang.Object`"*) and fixes the in-tree native instances with
 `pin_native_root` / `read_native_pin`. The catch above is a witness that the

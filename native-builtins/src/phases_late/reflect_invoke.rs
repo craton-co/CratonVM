@@ -4268,6 +4268,9 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
         // Class mirror or a real reifier impl: ask the VM for getTypeName(),
         // falling back to toString() and finally the dotted class name.
         _ => {
+            // `obj` is a parameter held across both calls; the first allocates
+            // a String and can move it before the second dereferences it.
+            let obj_pin = ctx.pin_native_root(obj);
             if let Ok(Some(Value::Object(Some(s)))) =
                 ctx.invoke_virtual(obj, "getTypeName", "()Ljava/lang/String;", &[])
             {
@@ -4275,6 +4278,7 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
                     return rendered;
                 }
             }
+            let obj = ctx.read_native_pin(obj_pin, obj);
             if let Ok(Some(Value::Object(Some(s)))) =
                 ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
             {
