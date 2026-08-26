@@ -416,6 +416,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jni-localref", on_key: Some("CRATONVM_DBG_JNI_LOCALREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
