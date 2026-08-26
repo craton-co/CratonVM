@@ -9651,10 +9651,13 @@ fn fmt_resolve_zone(
     // ZONE_OFFSET alone, so the difference IS DST_OFFSET. Asking the zone rather
     // than reading a Calendar field keeps the `long`/`Date` and `Calendar`
     // sources on one code path.
+    // `getOffset()` is real Java and can move `tz` before `getRawOffset()`.
+    let tz_pin = ctx.pin_native_root(tz);
     let total = match ctx.invoke_virtual(tz, "getOffset", "(J)I", &[Value::Long(millis)]) {
         Ok(Some(Value::Int(v))) => v,
         _ => return FmtZone::NONE,
     };
+    let tz = ctx.read_native_pin(tz_pin, tz);
     let raw = match ctx.invoke_virtual(tz, "getRawOffset", "()I", &[]) {
         Ok(Some(Value::Int(v))) => v,
         // A zone that answered its offset but not its raw offset is still a
