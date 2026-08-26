@@ -3307,17 +3307,31 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
+    // Every handle below is a raw `ObjectRef` held across Java calls that can
+    // allocate and collect: `it` and `other` live for the whole loop, `entry`
+    // across its own two accessors. Pin the long-lived pair once and re-derive
+    // them each iteration; pin `entry` per iteration. See
+    // `docs/known-issues/gc/unpinned-native-locals-audit-20260824.md`.
+    let it_pin = ctx.pin_native_root(it);
+    let other_pin = ctx.pin_native_root(other);
+    let mut it = it;
+    let mut other = other;
     loop {
+        it = ctx.read_native_pin(it_pin, it);
         if int_of(ctx.invoke_virtual(it, "hasNext", "()Z", &[])) != 1 {
             break;
         }
+        it = ctx.read_native_pin(it_pin, it);
         let entry = match obj_of(ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])) {
             Some(o) => o,
             None => return Ok(Some(Value::Int(0))),
         };
+        let entry_pin = ctx.pin_native_root(entry);
         let key = ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])?;
+        let entry = ctx.read_native_pin(entry_pin, entry);
         let value = obj_of(ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]));
         let key_arg = key.clone().unwrap_or(Value::Object(None));
+        other = ctx.read_native_pin(other_pin, other);
         let other_val = obj_of(ctx.invoke_virtual(
             other,
             "get",
