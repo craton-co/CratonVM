@@ -208,7 +208,7 @@ reference-manipulating frames: 100% of the refusals on both netty exhaustive
 loops are the single clause `ref-local-in-reg`, with the operand-stack,
 scratch-survivor and moving-young clauses all zero. The next lever there is to
 NARROW the spill to the registers that can hold an oop rather than elide it. See
-`performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
+[`../perf/per-call-blind-gpr-spill-20260826.md`](../perf/per-call-blind-gpr-spill-20260826.md).
 
 
 ## Repro
