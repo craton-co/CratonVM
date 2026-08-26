@@ -850,7 +850,11 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            // `flush()` is arbitrary Java and can move `stream` before the
+            // `close()` below dereferences it. Pin across, then re-derive.
+            let s_pin = ctx.pin_native_root(stream);
             ctx.invoke_virtual(stream, "flush", "()V", &[])?;
+            let stream = ctx.read_native_pin(s_pin, stream);
             ctx.invoke_virtual(stream, "close", "()V", &[])?;
         }
         Ok(None)

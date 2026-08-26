@@ -7545,7 +7545,10 @@ impl SharedVm {
         tiered_key: &crate::jit::tiered::MethodKey,
     ) -> crate::jit::deopt::DeoptAction {
         let mut log = self.jit.deopt_log.lock();
-        let action = log.recommend_action(method_key, event.reason);
+        // The bci-aware policy: a method whose only failing speculation has
+        // already been de-spec'd is recompiled, not blacklisted. See
+        // `DeoptimizationLog::recommend_action_at_bci`.
+        let action = log.recommend_action_at_bci(method_key, event.reason, event.bci);
         log.record_deopt(method_key, event);
         self.jit.tiered_manager.on_deoptimization(tiered_key);
         action

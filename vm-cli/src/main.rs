@@ -157,6 +157,7 @@ fn maybe_dump_shutdown_reports() {
     // activity" is not a reading that silence can support. See
     // `runtime::interpreter::report_lambda_census_at_exit`.
     cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+    cratonvm_vm::runtime::interpreter::report_stub_door_tally_at_exit();
 
     // The map-view rebuild-elision census, on `CRATONVM_DBG=map-view-cache`.
     // `resync_skipped` is the ENGAGEMENT counter for the keySet-view fast path:
@@ -258,6 +259,21 @@ fn maybe_dump_shutdown_reports() {
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
                 .join(" ")
+        );
+        // Receiver-type speculation and the per-bci de-spec registry it now
+        // consults. `sites-declined` is the only number that says the consult
+        // engaged; `guards-emitted` separates "wired and never needed" from
+        // "no guarded site compiled at all"; `escalations-spared` is the policy
+        // half -- whole-method blacklists withheld from an already-withdrawn
+        // speculation. Zeros printed, for the same reason as the lines above.
+        eprintln!(
+            "[cratonvm] receiver despec: {} escalations-spared={}",
+            cratonvm_jit::metrics::receiver_despec_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            cratonvm_jit::metrics::despec_escalations_spared()
         );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
@@ -5189,6 +5205,26 @@ fn run() -> Result<()> {
             let (served, declined) = cratonvm_vm::jit::helpers::varhandle_read_direct_counts();
             eprintln!(
                 "[cratonvm] VarHandle read thin direct calls: served={served} declined={declined}",
+            );
+        }
+        // The WRITE direction's two routes, which the read direction has had all
+        // along and this one did not. `write thin direct calls` is the bind
+        // baked into compiled code; `field CAS in-funnel` is the short circuit
+        // inside `jit_invoke_dispatch`, the twin of the read fast path above.
+        //
+        // The CAS pair is load-bearing in a way the census is NOT: a served CAS
+        // still calls `count_jit_native_dispatch`, exactly as a served read
+        // does, so `--dump-native-registry` reports the SAME
+        // `VarHandle.compareAndSet` count whether the fast path ran or not.
+        // These counters are the only way to tell the two apart.
+        {
+            let (served, declined) = cratonvm_vm::jit::helpers::varhandle_write_direct_counts();
+            eprintln!(
+                "[cratonvm] VarHandle write thin direct calls: served={served} declined={declined}",
+            );
+            let (cas_served, cas_declined) = cratonvm_vm::jit::helpers::varhandle_field_cas_counts();
+            eprintln!(
+                "[cratonvm] VarHandle field CAS in-funnel: served={cas_served} declined={cas_declined}",
             );
         }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of

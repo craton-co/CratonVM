@@ -1386,6 +1386,10 @@ pub(crate) fn native_es_max_score_top_knn_collector_unsorted_top_k(
         ctx.unpin_native_roots(score_docs_pin);
     }
 
+    // NOT branch-exclusive, despite an `} else {` sitting between this call and
+    // the `visitedCount()` below -- that else belongs to `relation_name`. Both
+    // calls run, with an allocating `lucene_static_object` between them.
+    let this_pin = ctx.pin_native_root(this);
     let early_terminated = matches!(
         ctx.invoke_virtual(this, "earlyTerminated", "()Z", &[])?,
         Some(Value::Int(v)) if v != 0
@@ -1400,6 +1404,7 @@ pub(crate) fn native_es_max_score_top_knn_collector_unsorted_top_k(
         "org/apache/lucene/search/TotalHits$Relation",
         relation_name,
     )?;
+    let this = ctx.read_native_pin(this_pin, this);
     let visited_count = match ctx.invoke_virtual(this, "visitedCount", "()J", &[])? {
         Some(Value::Long(v)) => v,
         Some(Value::Int(v)) => v as i64,

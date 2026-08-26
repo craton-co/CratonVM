@@ -5640,7 +5640,13 @@ fn enum_declaring_class_from_object(
     ctx: &mut dyn NativeContext,
     elem: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::ObjectRef> {
-    match ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]) {
+    // `elem` is a PARAMETER, which is exactly as unrooted as a local -- the
+    // blind spot recorded in the audit page. The fallback arm below runs AFTER
+    // `getDeclaringClass()` has already had its chance to collect and move it.
+    let elem_pin = ctx.pin_native_root(elem);
+    let declaring = ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]);
+    let elem = ctx.read_native_pin(elem_pin, elem);
+    match declaring {
         Ok(Some(Value::Object(Some(class)))) => Some(class),
         _ => match ctx.invoke_virtual(elem, "getClass", "()Ljava/lang/Class;", &[]) {
             Ok(Some(Value::Object(Some(class)))) => Some(class),

@@ -860,9 +860,17 @@ fn stax_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) -> String 
         Ok(Some(Value::Int(n))) if n > 0 => n as usize,
         _ => 4096,
     };
+    // `is` is held across the allocation and every `read`; `buf` across every
+    // `read`. Both are pinned and re-derived per iteration.
+    let is_pin = ctx.pin_native_root(is);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, available.max(4096));
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut is = ctx.read_native_pin(is_pin, is);
+    let mut buf = buf;
     let mut result = Vec::new();
     loop {
+        is = ctx.read_native_pin(is_pin, is);
+        buf = ctx.read_native_pin(buf_pin, buf);
         let n = match ctx.invoke_virtual(is, "read", "([B)I", &[Value::Object(Some(buf))]) {
             Ok(Some(Value::Int(n))) => n,
             _ => -1,
