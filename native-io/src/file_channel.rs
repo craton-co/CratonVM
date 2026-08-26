@@ -965,6 +965,67 @@ fn transfer_userspace_loop(
 /// Idempotent: calling after `register_nio_natives_real` will
 /// replace the stub registrations there, since the registry's
 /// `register` overwrites duplicate keys.
+/// `FileDispatcher.canTransferToDirectly(SelectableChannel) -> false`.
+///
+/// # What this stops
+///
+/// `FileChannelImpl.transferTo` tries three strategies in order: a DIRECT
+/// `sendfile(2)`, a "trusted channel" copy, and finally an arbitrary-channel
+/// `ByteBuffer` loop. The first one asks this method whether the target is a
+/// channel it may `sendfile` into, and the stock `UnixFileDispatcherImpl` answers
+/// an unconditional `true` (its whole body is `iconst_1; ireturn`).
+///
+/// Taking it is fatal here, and not because of `sendfile`. The direct arm calls
+/// `SocketChannelImpl.beforeTransferTo()` first, which is ordinary JDK bytecode
+/// reading the channel's OWN fields -- and CratonVM does not build socket
+/// channels by running the JDK constructor. Every per-channel fact this VM keeps
+/// lives in an identity-keyed side table (`socket_channel.rs`, `cf_set`/`cf_get`),
+/// so the real class's `private final` slots are still null/zero. MEASURED, a
+/// `FileChannel.transferTo(0, size, SocketChannel)` on
+/// `probes/TransferToSocketProbe.java`:
+///
+/// ```text
+/// NullPointerException: Cannot invoke "ReentrantLock.lock()"
+///                       because "this.writeLock" is null
+///     at sun/nio/ch/SocketChannelImpl.beforeTransferTo(SocketChannelImpl.java:671)
+/// ```
+///
+/// On the wire that is a response with `Content-Length: 951` and a body of ZERO
+/// bytes -- the client then reports `Premature end of Content-Length delimited
+/// message body (expected: 951; received: 0)`, which is how it reached us
+/// (Spring's `ZeroCopyIntegrationTests`, Reactor Netty's `sendFile` -> Netty's
+/// `DefaultFileRegion.transferTo` -> here).
+///
+/// # Why DECLINE rather than seed the missing fields
+///
+/// Seeding `writeLock` is not enough and was checked before being rejected.
+/// `beforeTransferTo` also takes `synchronized (stateLock)`, calls
+/// `ensureOpenAndConnected()` -- which reads the JDK's own `state` int -- and
+/// writes `writerThread`. CratonVM maintains none of them, so a seeded lock only
+/// moves the failure from `NullPointerException` to `ClosedChannelException`.
+/// (It does NOT deadlock: the handler at bci 68 unlocks before rethrowing. That
+/// was checked too, because a leaked write lock would have been much worse than
+/// the bug being fixed.) Making the direct arm genuinely work means maintaining
+/// the real `SocketChannelImpl` state machine, which is a different project.
+///
+/// # Why this is a correct answer and not a workaround
+///
+/// `false` is the JDK's OWN way of saying "not this target": the arm returns
+/// `IOStatus.UNSUPPORTED` and `transferTo` falls through to
+/// `transferToTrustedChannel` / `transferToArbitraryChannel`, which copy through
+/// a `ByteBuffer` using `SocketChannelImpl.write` -- a path this VM implements
+/// and that measures 951/951 bytes delivered, byte-identical to HotSpot.
+///
+/// The gate is consulted ONLY when the target is a `SelectableChannel`, so
+/// file->file transfers keep using [`native_fc_transfer_to0`]'s real
+/// `sendfile(2)`. This narrows one arm; it does not disable zero-copy.
+fn native_fc_can_transfer_to_directly(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
 pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -977,6 +1038,17 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     // backed, and the second `map0`/`transferTo0` shapes are older JDKs' and
     // are backed nowhere either.
     use crate::nio_native::{register_fd_native, FD_LEAF, FD_UNIX};
+    // `backed` is empty on purpose: `canTransferToDirectly` is ordinary
+    // bytecode in every JDK 25 image (`iconst_1; ireturn`), not `ACC_NATIVE`,
+    // so this row is an override of a real body rather than a JNI bridge and
+    // must not claim the `Bridge` kind. See the doc comment on the callback.
+    register_fd_native(
+        r,
+        "canTransferToDirectly",
+        "(Ljava/nio/channels/SelectableChannel;)Z",
+        native_fc_can_transfer_to_directly,
+        &[],
+    );
     register_fd_native(
         r,
         "map0",
