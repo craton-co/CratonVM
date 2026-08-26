@@ -345,13 +345,45 @@ SHAPE: `list.get(i)` is a virtual call on `java/util/ArrayList`, while
 receiver-class native (`ArrayList$Itr.hasNext`) is resolved and cached without
 anyone asking `real_protected_stub_class`.
 
-**Next step, and it is not another allow-list entry.** Find the path that
-resolves an `invokeinterface` to a receiver-class native and give it the same
-three-term test the other six doors already spell. `CRATONVM_DBG_STUB_DOOR=1`
-is the check: the fix is working when `java/util/ArrayList$Itr` starts appearing
-in that tally. Worth roughly what `ArrayList.get` was worth — the iterator is
-~14× the cost of the now-fixed indexed access on the same 1000 elements — and
-it is the single biggest remaining number on this page.
+**~~Next step, and it is not another allow-list entry~~ — DONE 2026-08-24, and
+the answer was not a dispatch bug. It was the KIND again, and closing it made
+things WORSE.**
+
+There is no missing arbitration on the interface path. `resolve_native_site`
+(the JIT's native site cache) already refuses to cache a `SyntheticStub`,
+explicitly because those "are subject to the `real_protected_stub_class` /
+`has_real` yield-to-bytecode arbitration … which this path does not reproduce".
+`ArrayList$Itr.hasNext`/`next` are **`Bridge`**, so they are cached and served
+without any of that — and term 1 of the yield predicate is
+`kind != SyntheticStub → refuse`, which is why the earlier allow-list-only arm
+did nothing and why `java/util/ArrayList$Itr` never appeared at a door. The
+allow-list is term 2; term 1 had already refused.
+
+Retagging both to `SyntheticStub` and allow-listing the class does engage: the
+census kind flips, and native crossings fall from ~300 000 to ~1 000 on the same
+walk. **And `iterList` gets 1.56× SLOWER** — 1192.5/1219.0/1166.0 → 1830.5/
+1808.0/1936.5, interleaved, every other rung flat (`hoisted`, `iterSet`,
+`idxList`, `toArrHoisted`, `rawArr` all within noise).
+
+**Why, in one line:** `CRATONVM_DBG_JIT_COMPILED` counts **zero** compiles of
+`ArrayList$Itr.next`/`hasNext` in either arm — `<init>` compiles, the two hot
+methods never do. So the yield trades one native crossing per element for one
+*interpreted* method invocation per element, which is worse. The change was
+reverted rather than shipped.
+
+**So the earlier claim on this page that the iterator's cost IS its two native
+crossings is wrong.** The count was right (2 002 000 / 2 000 000, exact); the
+attribution was not. Removing the crossings does not remove the cost, so the
+crossings were the symptom.
+
+**The real next question is narrower and better posed:** why does the JIT never
+compile `java/util/ArrayList$Itr.next()` — a five-line accessor called two
+million times — when it compiles that class's `<init>`? Answer that and the
+retag above probably becomes a win rather than a regression; until then, do not
+re-apply it. Start with whether a registered native for the triple makes the
+compile door refuse it (the `might_have_method_descriptor` shape), since that
+would make "is a native registered" both the reason it is slow AND the reason
+the alternative is slow.
 
 ### The fix: one allow-list entry, 11.1×
 
