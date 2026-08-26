@@ -274,6 +274,71 @@ event move. Until then the fix stands on the capture that named its holder and
 on the code being wrong on its own terms — a raw `ObjectRef` live across a call
 that allocates — not on this table.
 
+### The `checkClientTrusted` face: holder named, and the JNI hypothesis is dead
+
+`hunt9`'s predecessor `hunt8` caught at run 5 with `CRATONVM_DBG=jni-localref`
+armed — the instrument built specifically to test whether this face arrives
+through a stale JNI local ref. **It does not.** The audit fired 24 times and
+named real JNI entry points (`jni_get_direct_buffer_address`,
+`jni_new_object_a/v`, `jni_new_global_ref`), and **none of them is the failing
+receiver.** That receiver's holder is a CratonVM native:
+
+```
+site="class_id_of" obj=0x2002344e480 moved_to="0x2002b0261c0" was_vacated=true
+  1: class_id_of                     gc/src/vm_heap.rs:502
+  2: tm_is_extended                  native-builtins/src/t27_tls.rs:15025
+  3: engine_consult_trust_managers   native-builtins/src/t27_tls.rs:14822
+  4: engine_run_trust_check          native-builtins/src/t27_tls.rs:14679
+  5: do_unwrap                       native-builtins/src/t27_tls.rs:17843
+  6: unwrap_single                   native-builtins/src/t27_tls.rs:17073
+```
+
+So the JNI-local-ref hypothesis — asserted from source-reading, withdrawn on
+one face's evidence, revived as "live again for THIS face" — is now **refuted
+by measurement on the face it was revived for**. The local-ref hazard in
+`jobject_to_obj` is real and still worth fixing on its own terms; it is not
+what stalls this test. Three assertions, one measurement: the measurement wins.
+
+### And this one is NOT an unpinned local — the PIN was stale
+
+That distinction matters, because it is a different and worse defect.
+`engine_consult_trust_managers` does the right thing already:
+
+```rust
+let tm_pins: Vec<usize> = trust_managers.iter().map(|tm| ctx.pin_native_root(*tm)).collect();
+…
+let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
+let engine_now = engine_pin.map(|(pin, e)| ctx.read_native_pin(pin, e));   // no allocation
+match engine_now { Some(engine) if tm_is_extended(ctx, tm_now) => …
+```
+
+`tm_now` is re-derived from its pin on the line before the read that faulted,
+and nothing between them can collect. `tm_is_extended` is clean too — its
+first statement is the `class_id_of_object` that faulted. So the value the pin
+HANDED BACK was already stale: this is not "a native forgot to pin", it is
+"the pin did not hold".
+
+### Three ways that can happen, and the instrument for each
+
+1. **The pin slot was never remapped.** `native_pin_roots` is rewritten in two
+   places, both keyed on a `pointer_map`: `update_all_roots`, which takes ONE
+   `&mut JvmThread` and is called only by the thread that RUNS the collection;
+   and `check_post_block_gc_refs`, for a thread waking from a blocked region.
+   A thread that is a running mutator when a PEER's STW stops it at an
+   interpreter safepoint goes through neither. **Not yet checked** — and the
+   netty case is many event loops, where most collections are a peer's.
+2. **The forward was never recorded**, so no remap could have applied. The
+   `[gcpart]` ring answers this and is armed.
+3. **Pin-stack imbalance.** `read_native_pin` silently falls back to the RAW
+   `fallback` address when its handle is past the pin stack — a callee
+   truncated below this caller's pins. The tree already has the diagnostic
+   (`PIN-DANGLING`, plus a ring naming the truncator), gated behind
+   `CRATONVM_DBG=blockgc` / `unpin-ring`. Measured at 190 lines on a
+   whole-class run, so arming it is practical; `huntloop.sh` now does.
+
+These are three different fixes and the page does not pick between them. What
+is established is the holder and that its pin did not hold.
+
 ### Other holders the same captures name, not yet investigated
 
 The stripped backtraces of those runs also name, repeatedly and outside the

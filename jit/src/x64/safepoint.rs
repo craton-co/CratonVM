@@ -559,14 +559,57 @@ impl Compiler {
     /// Any reference home or incomplete analysis still fails closed to the full
     /// spill + shadow publication.
     pub(super) fn can_elide_self_call_register_spill(&self) -> bool {
+        self.call_spill_elision_core(true)
+    }
+
+    /// Shared body of [`Self::can_elide_self_call_register_spill`] and
+    /// [`Self::can_elide_direct_call_register_spill`].
+    ///
+    /// `strict_survivors` is the ONE difference, and it is why this is a
+    /// parameter rather than a copy. The self-call form requires every operand-
+    /// stack survivor to be `StackSlot::Frame`. That is stronger than the
+    /// mechanism needs, and it is stronger in the same way the predicate's own
+    /// history records for LOCALS: it used to fail closed on *any* register-
+    /// homed local and was narrowed to register-homed *reference* locals once
+    /// it was shown that a primitive's slot is never read as a root.
+    ///
+    /// A survivor in a `CalleeSaved` register is preserved across the `CALL` by
+    /// the callee's own prologue/epilogue (`LOCAL_REGS` is callee-saved on both
+    /// ABIs), and its saved copy lives inside the callee's frame where the
+    /// conservative `[scanner_sp, entry_sp)` walk reads it. Under the moving
+    /// proof `collect_live_oop_homes()` must be empty anyway, so no oop is
+    /// riding in one. A survivor in `Scratch`/`Xmm` is a different matter — the
+    /// call CLOBBERS those registers, which is why `flush_scratch_registers`
+    /// exists and why `emit_pre_safepoint_spill` runs it — so the relaxed form
+    /// still refuses outright when one is present, rather than eliding the
+    /// flush that keeps the value alive.
+    ///
+    /// `probes/CallArgCostProbe.java`'s arms are the shape this unlocks:
+    /// `s += int1(i)` leaves the `long` accumulator on the operand stack across
+    /// the invoke, in a callee-saved register. Strict survivors refused every
+    /// one of them (`direct-call spill: elided=0 frame-not-clean=6`).
+    fn call_spill_elision_core(&self, strict_survivors: bool) -> bool {
         let any_reference_local_in_a_register =
             reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
-        if full_self_call_spill_requested()
-            || !self.precise_maps
-            || any_reference_local_in_a_register
-            || self.stack.len() != self.stack_oop_marks.len()
-            || !self.stack_oop_marks_exact
-        {
+        if full_self_call_spill_requested() {
+            return false;
+        }
+        if !self.precise_maps {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_NO_PRECISE_MAPS);
+            }
+            return false;
+        }
+        if any_reference_local_in_a_register {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_REF_LOCAL_IN_REG);
+            }
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() || !self.stack_oop_marks_exact {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MARKS_INEXACT);
+            }
             return false;
         }
 
@@ -576,11 +619,20 @@ impl Compiler {
         // values that survive in the caller to be frame-resident means the
         // conservative frame walk sees them regardless of their oop tags; any
         // register/XMM home fails closed to the SB-CRASH-04 full spill.
-        let all_survivors_frame_resident = self
-            .stack
-            .iter()
-            .all(|slot| matches!(slot, StackSlot::Frame(_)));
-        if !all_survivors_frame_resident {
+        let survivors_ok = if strict_survivors {
+            self.stack
+                .iter()
+                .all(|slot| matches!(slot, StackSlot::Frame(_)))
+        } else {
+            !self
+                .stack
+                .iter()
+                .any(|slot| matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)))
+        };
+        if !survivors_ok {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_SURVIVOR_IN_SCRATCH);
+            }
             return false;
         }
 
@@ -589,12 +641,63 @@ impl Compiler {
         // predicate and fails the compile closed if the two ever disagree, so
         // they must move together. Default-identical to the old expression.
         if self.shadow_enabled || self_call_moving_proof_enabled() {
-            return moving_oop_free_self_call_is_publishable(
+            let ok = moving_oop_free_self_call_is_publishable(
                 self_call_moving_proof_enabled(),
                 self.moving_young_safepoint_coverage_complete(),
                 self.collect_live_oop_homes().len(),
             );
+            if !ok && !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MOVING_UNPUBLISHABLE);
+            }
+            return ok;
         }
+        true
+    }
+
+    /// [`Self::can_elide_self_call_register_spill`], generalised to a DIRECT
+    /// call to a compiled callee that is not this method.
+    ///
+    /// Everything the self-call predicate proves is about THIS frame — no
+    /// register-homed reference local, exact operand-stack oop marks, every
+    /// surviving stack value frame-resident, and (under moving-young) a
+    /// complete analysis over an empty live-oop set. None of it depends on
+    /// which compiled method is called, so it transfers unchanged.
+    ///
+    /// What does NOT transfer is the ARGUMENTS. At the `CALL` they are staged
+    /// in ABI registers, so a reference argument is a live oop with no frame
+    /// home that the caller-frame proof cannot see. Two answers, selected by
+    /// [`call_spill_elision_mode`]:
+    ///
+    ///  * mode 1 (default) — refuse the elision outright if any argument is a
+    ///    reference. Conservative and needs no assumption about the callee.
+    ///  * mode 2 (`args`) — admit them when `service_args_base` is `Some`, i.e.
+    ///    `reserve_direct_call_service_slots` copied every argument into a
+    ///    contiguous frame range for the cold callee-sentinel service. That
+    ///    range lives inside `[scanner_sp, entry_sp)`, so the conservative walk
+    ///    reads it, and the argument oop is frame-resident at the `CALL` after
+    ///    all.
+    ///
+    /// Fails closed in every uncertain case, and the whole thing is off under
+    /// `CRATONVM_JIT_CALL_SPILL_ELISION=0`.
+    pub(super) fn can_elide_direct_call_register_spill(
+        &self,
+        arg_oops: &[bool],
+        args_frame_resident: bool,
+        min_mode: u8,
+    ) -> bool {
+        let mode = call_spill_elision_mode();
+        if mode == 0 || mode < min_mode {
+            return false;
+        }
+        if !self.call_spill_elision_core(false) {
+            // The core already counted WHICH clause refused.
+            return false;
+        }
+        if arg_oops.iter().any(|&o| o) && (mode < 2 || !args_frame_resident) {
+            crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_OOP_ARG);
+            return false;
+        }
+        crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_ELIDED);
         true
     }
 

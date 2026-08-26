@@ -7449,8 +7449,20 @@ impl Compiler {
                             // stack), 16-byte aligned at the CALL site.
                             let total_sub = self.emit_stack_arg_setup(&arg_slots, callee_needs_ctx);
                             // Round-8 wave-3: defensive callee-saved spill
-                            // before any GC-triggering CALL.
-                            self.emit_pre_safepoint_spill();
+                            // before any GC-triggering CALL -- unless the frame
+                            // is provably oop-clean here, in which case the
+                            // 14-store blind copy publishes nothing and only the
+                            // safepoint id is needed. See
+                            // `can_elide_direct_call_register_spill`.
+                            if self.can_elide_direct_call_register_spill(
+                                &arg_oops,
+                                service_args_base.is_some(),
+                                1,
+                            ) {
+                                self.emit_safepoint_metadata_only();
+                            } else {
+                                self.emit_pre_safepoint_spill();
+                            }
                             // Emit direct CALL to callee entry point
                             self.emit_call_absolute(callee_entry);
                             self.emit_post_call_rbp_republish();
@@ -7594,9 +7606,20 @@ impl Compiler {
                             self.emit_xor_reg_self(ARG_REGS[2]);
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
-                                                                       // Round-8 wave-3: defensive callee-saved spill
-                                                                       // before any GC-triggering CALL.
-                        self.emit_pre_safepoint_spill();
+                        // Round-8 wave-3: defensive callee-saved spill before any
+                        // GC-triggering CALL -- unless the caller frame is
+                        // provably oop-clean here. Every argument of this site,
+                        // reference or not, was just stored into the helper's
+                        // args buffer at `args_base_offset`, and each oop among
+                        // them was pushed to `pending_staged_arg_oops` so the map
+                        // below NAMES it: `args_frame_resident` is
+                        // unconditionally true here, which is a stronger
+                        // guarantee than the direct sites' service slots.
+                        if self.can_elide_direct_call_register_spill(&arg_oops, true, 2) {
+                            self.emit_safepoint_metadata_only();
+                        } else {
+                            self.emit_pre_safepoint_spill();
+                        }
                         self.emit_call_absolute(self.helpers.invoke_dispatch);
                         // T1.1.2 — invoke dispatch is a full safepoint:
                         // the callee may allocate, trigger GC, or throw.
@@ -9722,8 +9745,18 @@ impl Compiler {
                             // receiver+params exceed ARG_REGS.
                             let total_sub = self.emit_stack_arg_setup(&arg_slots, callee_needs_ctx);
                             // Round-8 wave-3: defensive callee-saved spill
-                            // before any GC-triggering CALL.
-                            self.emit_pre_safepoint_spill();
+                            // before any GC-triggering CALL -- see the
+                            // invokestatic site above for why an oop-clean frame
+                            // can publish the safepoint id alone.
+                            if self.can_elide_direct_call_register_spill(
+                                &arg_oops,
+                                service_args_base.is_some(),
+                                1,
+                            ) {
+                                self.emit_safepoint_metadata_only();
+                            } else {
+                                self.emit_pre_safepoint_spill();
+                            }
                             self.emit_call_absolute(callee_entry);
                             self.emit_post_call_rbp_republish();
                             // Stage A (precise oop maps, B-K fix) — a direct
@@ -9925,7 +9958,22 @@ impl Compiler {
                             // here (vs the .miss slow path) also keeps the inline-hit
                             // `jmp .done` rel8 span from being widened by the spill.
                             if self.precise_maps || self.safepoint_reg_spill {
-                                self.emit_pre_safepoint_spill();
+                                // The hoisted spill dominates the inline-hit and
+                                // the miss path and pairs with ONE shared reload
+                                // at `.done`. Both halves of that pairing survive
+                                // the elision: the predicate requires
+                                // `precise_maps` and refuses any register-homed
+                                // reference local, so the shared
+                                // `emit_post_safepoint_reload` -- which walks
+                                // `local_oop_masks[pc]`, oops only -- has nothing
+                                // to reload and emits nothing. Every argument,
+                                // receiver included, is already in the args
+                                // buffer with its oops named in the map above.
+                                if self.can_elide_direct_call_register_spill(&arg_oops, true, 3) {
+                                    self.emit_safepoint_metadata_only();
+                                } else {
+                                    self.emit_pre_safepoint_spill();
+                                }
                             }
 
                             // CRIT-8 — Inline MIC fast-path guard.
