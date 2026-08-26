@@ -13511,6 +13511,18 @@ unsafe fn try_jit_site_cached_native_dispatch(
             count_jit_native_dispatch(vm, entry.native_id);
             return Some(bits);
         }
+        // The write direction had no equivalent, which is why a funnelled CAS
+        // cost ~182 ns more than a bound call while a funnelled READ cost ~49.
+        // See `try_varhandle_instance_field_cas`.
+        if varhandle_cas_funnel_fast_enabled() {
+            if let Some(bits) = try_varhandle_instance_field_cas(vm, info, args_slice) {
+                SITE_CACHED_NATIVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                VARHANDLE_FIELD_CAS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                count_jit_native_dispatch(vm, entry.native_id);
+                return Some(bits);
+            }
+            VARHANDLE_FIELD_CAS_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     // `JitDecodedArgs::new()` and not `with_capacity(args_slice.len())`: the
     // latter is an outlined call whose ~144-byte return the caller has to
@@ -13575,6 +13587,40 @@ unsafe fn try_jit_site_cached_native_dispatch(
 static VARHANDLE_FIELD_READ_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `VarHandle` instance-field CAS operations served inside the funnel, and the
+/// ones that declined to the generic native.
+///
+/// The pair is the point, exactly as it is for the write direct helpers: a
+/// zero HIT count beside a large DECLINE count says the fast path is reached
+/// and refuses every handle, which looks identical to "no CAS happened" if
+/// only one of the two is printed.
+static VARHANDLE_FIELD_CAS_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static VARHANDLE_FIELD_CAS_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(served, declined)` counts for the in-funnel `VarHandle` CAS fast path.
+pub fn varhandle_field_cas_counts() -> (u64, u64) {
+    (
+        VARHANDLE_FIELD_CAS_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_FIELD_CAS_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST=0` -- send every `VarHandle` CAS
+/// back through the generic native, as before this fast path existed. Default
+/// ON. Same role as the read and write bind switches: it is what makes an A/B
+/// on ONE binary possible, which is the only kind that means anything when the
+/// host's load drifts between runs.
+fn varhandle_cas_funnel_fast_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST").as_deref(),
+            Ok("0")
+        )
+    })
+}
 /// `VarHandle` reads served as a direct field load from compiled code.
 pub fn varhandle_field_read_hit_count() -> u64 {
     VARHANDLE_FIELD_READ_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -13607,6 +13653,154 @@ pub fn varhandle_field_read_hit_count() -> u64 {
 ///
 /// Every refusal is a fall-through to the existing dispatch, so the worst
 /// case is the cost that was already being paid.
+/// `VarHandle.compareAndSet` on an ordinary instance field, served from inside
+/// the native funnel.
+///
+/// The twin of [`try_varhandle_instance_field_read`], and it exists because the
+/// two access directions were not symmetric. A funnelled READ is caught here
+/// and costs ~49 ns; a funnelled CAS ran the whole `varhandle_compare_and_set`
+/// native — its segment-handle probe, its FFM-layout probe, its byte-view probe
+/// and its array probe — before ever reaching the instance-field case, and cost
+/// ~182 ns more than a bound call. Measured with the read and write kill
+/// switches on `HibfixVarHandleProbe`.
+///
+/// Serving it here rather than only from a thin direct call is deliberate: this
+/// route also covers the sites the JIT declines and every interpreter dispatch,
+/// which a compile-time bind cannot reach.
+///
+/// Declines to the generic native for anything it cannot prove: a coordinate
+/// count that is not `[VarHandle, receiver, expected, new]`, a handle the side
+/// table does not describe as a resolved instance field, or a call site whose
+/// declared operand types disagree with the variable's own kind. The native
+/// then applies the `VarHandle` access-mode rules, as it does today.
+///
+/// SAFETY: the raw words come from a live compiled frame; every reference among
+/// them is heap-validated before any dereference.
+unsafe fn try_varhandle_instance_field_cas(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+) -> Option<i64> {
+    if info.method_name != "compareAndSet" {
+        return None;
+    }
+    // `[VarHandle, receiver, expected, new]` and nothing else. An array-element
+    // or byte-view CAS carries an index and is not an instance-field CAS.
+    if args_slice.len() != 4 {
+        return None;
+    }
+    if info.return_type != b'Z' {
+        return None;
+    }
+    let vh_raw = args_slice[0] as u64;
+    let recv_raw = args_slice[1] as u64;
+    if vh_raw == 0 || recv_raw == 0 {
+        return None;
+    }
+    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
+    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
+    // Same GC-stable key the read path files handles under.
+    let heap = &vm.mem.heap;
+    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
+        heap.next_identity_hash()
+    });
+    let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
+    // The call site's declared operand types have to agree with the variable's
+    // own kind, for the reason the read path checks its return type: the
+    // registered descriptor is the erased `([Ljava/lang/Object;)Z`, so the
+    // site's is the only statement of what the caller actually passed.
+    let (expected_desc, new_desc) = varhandle_cas_operand_kinds(info.descriptor)?;
+    if expected_desc != plan.value_desc || new_desc != plan.value_desc {
+        return None;
+    }
+    let expected = varhandle_operand_value(vm, args_slice[2], plan.value_desc)?;
+    let new_val = varhandle_operand_value(vm, args_slice[3], plan.value_desc)?;
+    let receiver = heap.load_and_forward(receiver);
+    // One implementation, shared with `VmExec::compare_and_swap_field`, so the
+    // SATB pre-barrier on `expected` and the post `write_barrier` on success
+    // cannot drift from the interpreter's copy.
+    let swapped = crate::vm::vm_exec::compare_and_swap_field_shared(
+        vm,
+        receiver,
+        plan.field_index as usize,
+        expected,
+        new_val,
+    );
+    Some(i64::from(swapped))
+}
+
+/// The last two parameter kinds of a `compareAndSet` call site, collapsed the
+/// way [`cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan`]
+/// collapses a field descriptor: any reference is `b'L'`.
+///
+/// `None` unless the descriptor is exactly `(receiver, expected, new)` — three
+/// parameters, the first a reference.
+fn varhandle_cas_operand_kinds(descriptor: &str) -> Option<(u8, u8)> {
+    let close = descriptor.find(')')?;
+    let params = descriptor.strip_prefix('(')?.get(..close - 1)?;
+    let mut kinds = [0u8; 3];
+    let mut n = 0usize;
+    let bytes = params.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if n == kinds.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'L' => {
+                let end = params[i..].find(';')? + i;
+                kinds[n] = b'L';
+                i = end + 1;
+            }
+            b'[' => {
+                let mut j = i;
+                while j < bytes.len() && bytes[j] == b'[' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                i = if bytes[j] == b'L' { params[j..].find(';')? + j + 1 } else { j + 1 };
+                kinds[n] = b'L';
+            }
+            c @ (b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D') => {
+                kinds[n] = c;
+                i += 1;
+            }
+            _ => return None,
+        }
+        n += 1;
+    }
+    if n != 3 || kinds[0] != b'L' {
+        return None;
+    }
+    Some((kinds[1], kinds[2]))
+}
+
+/// Decode one raw JIT-ABI operand word against the variable's kind.
+///
+/// The inverse of the read path's encode, and the same table: a reference is
+/// its raw address (zero for `null`), a `float`/`double` travels as its bit
+/// pattern, and the whole int category as the low word. A non-zero reference
+/// that is not a heap address declines rather than being dereferenced.
+fn varhandle_operand_value(vm: &SharedVm, raw: i64, value_desc: u8) -> Option<Value> {
+    Some(match value_desc {
+        b'L' => {
+            if raw == 0 {
+                Value::Object(None)
+            } else {
+                // SAFETY: validated as a live heap address before use.
+                Value::Object(Some(unsafe { vm.mem.heap.is_object_address(raw as usize) }?))
+            }
+        }
+        b'J' => Value::Long(raw),
+        b'F' => Value::Float(f32::from_bits(raw as u32)), // Cast: JIT ABI -- float bits
+        b'D' => Value::Double(f64::from_bits(raw as u64)), // Cast: JIT ABI -- double bits
+        b'Z' | b'B' | b'C' | b'S' | b'I' => Value::Int(raw as i32), // Cast: JIT ABI -- low word
+        _ => return None,
+    })
+}
+
 unsafe fn try_varhandle_instance_field_read(
     vm: &SharedVm,
     info: &JitInvokeInfo,
