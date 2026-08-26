@@ -1772,6 +1772,61 @@ pub(super) fn safepoint_reg_spill_all() -> bool {
     })
 }
 
+/// Elide the SB-CRASH-04 full-GPR blind spill at a DIRECT call to a compiled
+/// callee whose caller frame is provably oop-clean there
+/// (`CRATONVM_JIT_CALL_SPILL_ELISION`; default `1`).
+///
+///  * `0` — never elide: every call keeps the unconditional 14-store spill.
+///    This is the pre-2026-08-26 behaviour.
+///  * `1` — direct calls to a compiled callee only, and only when no argument
+///    of the call is a reference.
+///  * `args` / `2` — also the `jit_invoke_dispatch` helper site,
+///    and reference arguments are admitted whenever they are frame-resident at
+///    the `CALL`: the direct sites copy every argument into the callee-sentinel
+///    service slots, and the dispatch site stages them into the helper's args
+///    buffer and NAMES the oops among them in the safepoint map
+///    (`pending_staged_arg_oops`). An argument oop that is only in an ABI
+///    register still refuses.
+///  * `mic` / `3` (**default**) — additionally the MIC/PIC inline-dispatch
+///    cascade, whose hoisted spill dominates both the inline-hit and the slow
+///    path and pairs with a single shared post-safepoint reload. Both halves of
+///    that pairing survive the elision: the predicate requires `precise_maps`
+///    and refuses any register-homed reference local, so the shared
+///    `emit_post_safepoint_reload` — which walks `local_oop_masks[pc]`, oops
+///    only — has nothing to reload. This is the arm that reaches
+///    `invokevirtual`/`invokeinterface`, i.e. most of the call traffic in real
+///    code; `CallArgCostProbe`'s `virtRef` is 11.66 → 7.50 ns over control on
+///    it.
+///
+/// Why this exists: the spill is 14 `mov [rbp-off], reg` at EVERY GC-capable
+/// call, and `probes/CallArgCostProbe.java` prices a compiled static call at
+/// ~4 ns against HotSpot's ~0. A disassembly of its `armInt1` arm
+/// (`CRATONVM_DBG_JIT_DISASM=CallArgCostProbe.armInt1`) shows 26 instructions
+/// of call overhead on the hot path, 14 of them this spill — in a loop whose
+/// frame contains no reference at all.
+///
+/// The proof it reuses is `can_elide_self_call_register_spill`'s, and nothing
+/// in that proof is about the callee: it establishes that every live oop in
+/// THIS frame is frame-resident, so a conservative register copy publishes
+/// nothing new. The one call-site-specific hazard is an oop ARGUMENT, which is
+/// staged in an ABI register at the CALL and is not covered by the caller-frame
+/// proof — hence the argument clause, and hence mode `1` refusing outright.
+pub(super) fn call_spill_elision_mode() -> u8 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u8> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALL_SPILL_ELISION") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => 0,
+                "1" => 1,
+                "args" | "2" => 2,
+                _ => 3,
+            },
+            Err(_) => 3,
+        }
+    })
+}
+
 /// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
 /// full-GPR safepoint register spill (see the call site in `Compiler::new`).
 /// `precise_maps` has been default-on since 2026-07-07, but its own

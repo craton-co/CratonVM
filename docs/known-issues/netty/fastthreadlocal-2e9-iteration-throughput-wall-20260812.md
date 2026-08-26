@@ -116,6 +116,19 @@ real run is consistently worse than the steady-state probe predicts, because
 2.1 billion immediately-dead allocations against a 1500 m heap pay a GC cost
 the probe does not.
 
+## The per-call spill, narrowed 2026-08-26
+
+Not this page's allocation cost, but the other half of the same wall and worth
+recording here because this is the family page. `emit_pre_safepoint_spill`
+emitted a 14-store blind copy of the whole GPR file at EVERY GC-capable call;
+it is now elided where the caller frame is provably oop-clean
+(`CRATONVM_JIT_CALL_SPILL_ELISION`, default on), which is **1.4–2.2x on every
+call shape** in `probes/CallArgCostProbe.java`. It does not fire on
+reference-manipulating frames — 100% of the refusals on real netty loops are the
+single clause `ref-local-in-reg` — so the next lever there is narrowing the
+spill to the registers that can hold an oop. See
+`performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
+
 ## Recommendation
 
 Unchanged in shape, better in size: leave this as a recorded throughput gap.
