@@ -1114,6 +1114,11 @@ pub const INVENTORY: &[E] = &[
     // innermost-frame mirror after an inline-cache hit by default, and this key
     // restores the stale-mirror behaviour so one binary has both arms. See
     // `ir_lower::emit_call_cached_entry`.
+    // Declared 2026-08-26. An OPT-OUT: the staged invoke-argument buffer is
+    // published on the SHADOW stack by default, not merely named in the oop
+    // map. The band verifier consults only the shadow stack. See
+    // `x64::safepoint::collect_live_oop_homes`.
+    E { group: Group::JIT, token: "staged-arg-shadow", on_key: None, off_key: Some("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"), off_word: None },
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
