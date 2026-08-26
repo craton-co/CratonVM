@@ -3296,6 +3296,19 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // treated as not equal (the `instanceof Map` guard in Hashtable.equals).
     // Both receivers are held across the calls below, and each call is real
     // Java that can collect.
+    //
+    // MEASURED, and this function is the netty witness for the whole family: a
+    // `ParameterizedSslHandlerTest` capture (2026-08-26, 600m heap) named it as
+    // the only application-level holder in all sixteen dead-base dereferences
+    // of that run —
+    //
+    //   site="class_id_of" obj="0x2002c100180" moved_to="0x2002ba00260"
+    //   was_vacated=true  …  3: native_properties_equals
+    //
+    // — with `this` reaching `entrySet()` after these two calls had collected
+    // under it, which surfaced in Java as
+    // `NoSuchMethodError java/lang/Object.entrySet()Ljava/util/Set;` from
+    // `JdkSslContext.<init>` (`java.security.Provider extends Properties`).
     let this_pin0 = ctx.pin_native_root(this);
     let other_pin0 = ctx.pin_native_root(other);
     let this_size = int_of(ctx.invoke_virtual(this, "size", "()I", &[]));
@@ -3311,6 +3324,10 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
+    // `es` only has to survive `iterator()` — but that call is real Java and
+    // allocates, which is the whole of the window.
+    let es_pin = ctx.pin_native_root(es);
+    let es = ctx.read_native_pin(es_pin, es);
     let it = match obj_of(ctx.invoke_virtual(es, "iterator", "()Ljava/util/Iterator;", &[])) {
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
@@ -3319,7 +3336,7 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // allocate and collect: `it` and `other` live for the whole loop, `entry`
     // across its own two accessors. Pin the long-lived pair once and re-derive
     // them each iteration; pin `entry` per iteration. See
-    // `docs/known-issues/gc/unpinned-native-locals-audit-20260824.md`.
+    // the retired `unpinned-native-locals-audit` write-up.
     let it_pin = ctx.pin_native_root(it);
     let other_pin = ctx.pin_native_root(other);
     let mut it = it;
@@ -3334,11 +3351,27 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             Some(o) => o,
             None => return Ok(Some(Value::Int(0))),
         };
-        let entry_pin = ctx.pin_native_root(entry);
+        // Per-iteration pins. `entry` was already covered; `key` and `value`
+        // are the same shape and were not: `key` is produced by `getKey()` and
+        // consumed by `get()` AFTER `getValue()` runs, and `value` is produced
+        // by `getValue()` and used as a RECEIVER after `get()` runs. Released
+        // at the bottom of the loop so a large map does not grow
+        // `native_pin_roots` by three entries per entry; an early return needs
+        // no release, because `safe_native_call` truncates the pin stack to
+        // its entry floor.
+        let iter_pin_base = ctx.pin_native_root(entry);
         let key = ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[])?;
-        let entry = ctx.read_native_pin(entry_pin, entry);
+        let key_pin = match key {
+            Some(Value::Object(Some(k))) => Some((ctx.pin_native_root(k), k)),
+            _ => None,
+        };
+        let entry = ctx.read_native_pin(iter_pin_base, entry);
         let value = obj_of(ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]));
-        let key_arg = key.clone().unwrap_or(Value::Object(None));
+        let value_pin = value.map(|v| (ctx.pin_native_root(v), v));
+        let key_arg = match key_pin {
+            Some((pin, k)) => Value::Object(Some(ctx.read_native_pin(pin, k))),
+            None => key.clone().unwrap_or(Value::Object(None)),
+        };
         other = ctx.read_native_pin(other_pin, other);
         let other_val = obj_of(ctx.invoke_virtual(
             other,
@@ -3346,13 +3379,14 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[key_arg],
         ));
-        match value {
+        match value_pin {
             None => {
                 if other_val.is_some() {
                     return Ok(Some(Value::Int(0)));
                 }
             }
-            Some(v) => {
+            Some((pin, v)) => {
+                let v = ctx.read_native_pin(pin, v);
                 let eq = int_of(ctx.invoke_virtual(
                     v,
                     "equals",
@@ -3364,6 +3398,7 @@ fn native_properties_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 }
             }
         }
+        ctx.unpin_native_roots(iter_pin_base);
     }
     Ok(Some(Value::Int(1)))
 }

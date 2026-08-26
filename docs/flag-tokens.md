@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-490 tokens.
+491 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -219,6 +219,7 @@ export inherited from a parent shell.
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
 | `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
+| `native-entry` | `CRATONVM_DBG_NATIVE_ENTRY` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
 | `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
@@ -791,7 +792,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-75 tokens.
+76 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -831,6 +832,7 @@ export inherited from a parent shell.
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `cm-id-pairing` | `CRATONVM_GC_NO_CM_ID_PAIRING` |
 | `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |

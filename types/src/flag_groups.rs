@@ -429,6 +429,10 @@ pub const INVENTORY: &[E] = &[
     // Tally every `real_protected_stub_class` question and its answer, so the
     // stub door can be priced rather than argued about.
     E { group: Group::DBG, token: "stub-door", on_key: Some("CRATONVM_DBG_STUB_DOOR"), off_key: None, off_word: None },
+    // Companion to `stub-door`: that one says which doors ASK the SyntheticStub
+    // arbitration, this one tallies which code path actually INVOKES the native
+    // funnel, by call site.
+    E { group: Group::DBG, token: "native-entry", on_key: Some("CRATONVM_DBG_NATIVE_ENTRY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
