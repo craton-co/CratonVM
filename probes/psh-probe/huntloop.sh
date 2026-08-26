@@ -29,6 +29,10 @@ export CRATONVM_DBG_VACATED_FRAMES=1
 # Names the mutator an STW takeover is waiting for. Printed only once a
 # takeover has already been stuck 64 rounds, so a healthy run is silent.
 export CRATONVM_DBG_STW_CENSUS=1
+# Keeps the last 8 relocation pointer maps so a stale-ref capture can say
+# whether the forward was RECORDED and the slot missed the remap, or never
+# recorded at all. Debug-gated; the ring is empty without it.
+export CRATONVM_DBG_GCPART=1
 for i in $(seq 1 "$N"); do
   L="$D/run-$i.log"
   t0=$(date +%s); la=$(cut -d' ' -f1 /proc/loadavg)
