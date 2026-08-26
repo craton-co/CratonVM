@@ -197,6 +197,121 @@ fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
     );
 }
 
+/// A splice must not rewind the caller's spill cursor UNDER an operand the
+/// caller still owns.
+///
+/// `try_emit_inline_body` restores the cursor from the LOWEST frame offset
+/// among the arguments it popped. That is the caller's new top only while
+/// frame offsets are handed out in stack ORDER, so that the arguments are the
+/// topmost slots. `invalidate_callee_saved` breaks exactly that — it reserves
+/// ONE fresh slot at the top of the reserve and repoints every entry reading
+/// the register at it, however deep — and it runs on every write to a
+/// register-homed local, `iinc` on a loop counter included. The rewind then
+/// hands the buried operand's address out a second time, to this splice's
+/// return value or to the next splice's callee locals.
+///
+/// The sibling test above is the same defect one table over:
+/// `pop_stack` grew a live-slot scan for it, and this is that scan on the path
+/// that bypasses `pop_stack`'s reclaim arm entirely (`reserve_spill_slots` has
+/// already moved the cursor past the argument slots by the time the arguments
+/// are popped, which is why the splice derives the cursor by hand).
+///
+/// Measured consequence: bc-java `LEATest` inside `SimpleTestTest`, where
+///
+/// ```java
+/// pWork[j] = rol32(pWork[j] + rol32(myDelta, j++), ROT3);
+/// ```
+///
+/// lost the array-store index `j` — pushed early, repointed by the `iinc`,
+/// and still live across two `rol32` splices — and reached `iastore` holding
+/// `0xC3EFE9DB`: LEA's `DELTA[0]`, i.e. `myDelta` on the first iteration.
+/// `ArrayIndexOutOfBoundsException: Index -1007687205`.
+///
+/// The assertion is on the CURSOR rather than on a computed answer, because
+/// the operand-stack simulation is where the defect lives; a bytecode-level
+/// test cannot reach it through the `compile` test wrapper, which never
+/// requests register homes for locals and so can never make the offsets
+/// non-monotonic in the first place.
+#[test]
+fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "inline-buried-operand-test".to_string(),
+        ExecutableBuffer::new(65536).expect("test executable buffer"),
+        0,
+        0,
+        64,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Depth 0 — the operand that stays live UNDER the call. In LEA this is the
+    // array-store index, read from a register-homed local.
+    compiler.stack_push(StackSlot::CalleeSaved(R12), false);
+    // Depth 1 — a COMPUTED value, so it owns a frame slot, and it owns one LOW
+    // in the reserve because it was pushed first.
+    let arg_lo = match compiler.push_stack().expect("first argument slot") {
+        StackSlot::Frame(off) => off,
+        other => panic!("push_stack must hand out a frame slot, got {other:?}"),
+    };
+    // The `iinc`. The buried entry is materialised at a FRESH slot, which is
+    // ABOVE the argument sitting below it: offsets are no longer monotonic
+    // with stack depth.
+    compiler.invalidate_callee_saved(R12);
+    let buried = match compiler.stack[0] {
+        StackSlot::Frame(off) => off,
+        other => panic!("the buried entry was not materialised: {other:?}"),
+    };
+    assert!(
+        buried > arg_lo,
+        "the hazard requires the buried operand ABOVE an argument          (buried={buried}, arg={arg_lo}); with these two in the other order          the `min` would be right and this test would prove nothing"
+    );
+    // Depth 2 — the second argument, at the top as usual.
+    compiler
+        .push_stack()
+        .expect("second argument slot");
+
+    // `static int leaf(int a, int b) { return a; }`
+    let site = make_inline_site(&[0x1a, 0xac], 2, 2, true, b'I');
+    assert!(
+        compiler.try_emit_inline_site(0, &site),
+        "a two-argument static leaf must splice; a bail would make every          assertion below vacuous"
+    );
+
+    assert!(
+        compiler.next_spill_offset > buried,
+        "the splice left the cursor at {} with the buried operand still          owning slot {buried}: the next reservation gets that address a          second time",
+        compiler.next_spill_offset
+    );
+    let next = compiler.push_stack().expect("push after the splice");
+    assert!(
+        !matches!(next, StackSlot::Frame(off) if off == buried),
+        "the push after the splice was handed slot {buried}, which the buried          entry {:?} still reads",
+        compiler.stack[0]
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {

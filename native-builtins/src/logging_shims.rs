@@ -1286,7 +1286,13 @@ pub(crate) fn native_printstream_close(
         return Ok(None);
     };
     cratonvm_native_api::print_error_state::latch_closing(&*ctx, this);
+    // `flush()` can move both `sink` (dereferenced by the `close()` below) and
+    // `this` (passed to the recorder either side). Pin across and re-derive.
+    let sink_pin = ctx.pin_native_root(sink);
+    let this_pin = ctx.pin_native_root(this);
     let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+    let sink = ctx.read_native_pin(sink_pin, sink);
+    let this = ctx.read_native_pin(this_pin, this);
     cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, flushed)?;
     let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
     cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, closed)?;

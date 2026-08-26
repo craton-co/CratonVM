@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1237;
+const BASELINE_TOTAL_DRIFT: usize = 1225;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1370;
+const BASELINE_TOTAL_PAIRS: usize = 1358;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -419,7 +419,89 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// `Bridge` is `allowed_in(JdkOnly)`, so the shipping bodies serve all 24 in
 /// both modes -- including the `NavigableMap`/`NavigableSet` *interface* rows,
 /// which are the ones §5's trap is actually about.
+///
+/// # Provenance of the 8 ThreadMXBean rows and the 4 MemorySegment rows
+///
+/// 2026-08-24. Both families became visible only when `registrar_drift.rs`
+/// learned one-level call-site parameter binding (`ffe741b6f`): each shipping
+/// twin is a CLASS-PARAMETERISED registrar, which is the form the resolver
+/// could not follow, so neither pair had ever been reported by any gate.
+///
+/// **ThreadMXBean (8).** `phases_late/management.rs::register_p59_management`
+/// carried a whole `java/lang/management/ThreadMXBean` block, all 8 triples of
+/// which `jmx.rs::register_thread_mxbean_for` also registers -- on a SUPERSET
+/// of the class names, since it is called for `com/sun/management/ThreadMXBean`
+/// too. The synthetic-only block is deleted.
+///
+/// Reading BOTH bodies mattered, because the better one was not the same one
+/// twice:
+///
+/// * `getThreadCount` / `getTotalStartedThreadCount` / `getDaemonThreadCount`
+///   were LIVE on the deleted side and frozen `<init>`-time slot reads on the
+///   surviving side. `ManagementFactory.getThreadMXBean()` hands back one
+///   cached bean, so a shipping binary answered the thread count as of whenever
+///   that bean was first built, forever. `getPeakThreadCount`'s own comment
+///   diagnoses exactly this and had been applied to one counter of four. The
+///   other three are now live too.
+/// * `isThreadContentionMonitoringSupported` was `false` on the deleted side
+///   and `true` on the surviving one -- opposite answers, each under a comment
+///   arguing for `false`. The comments are STALE:
+///   `ThreadJmxSnapshot::blocked_time_ms`/`waited_time_ms` are real, filled by
+///   `vm_exec.rs` from the registry and read back into `ThreadInfo.blockedTime`,
+///   and `native_set_thread_contention_monitoring_enabled` resets them. The
+///   capability exists; the prose describing its absence outlived it in two
+///   files. So synthetic-JDK mode had been denying a feature this VM has.
+///
+/// **MemorySegment (4).** `panama.rs::register_pe2_string_marshaling_on` and
+/// `phases_late/foreign_ffm.rs::register_p67_foreign_memory` each registered
+/// `getUtf8String(J)` and `reinterpret(J)` on both `PE_SEGMENT_INTERFACE` and
+/// `CRATON_SEGMENT_CLASS`. Here the SHIPPING copy was the weaker one twice:
+///
+/// * `getUtf8String` read `get_field(this, 0)` as the base address, which is
+///   right only for the synthetic six-slot carrier -- on a real JDK-loaded
+///   segment slot 0 is the byte LENGTH. That is the confusion
+///   `panama_libffi::segment_address` exists to end; its comment records
+///   `ofArray(new byte[16])` faulting at `address 0x10`, and 0x10 == 16 == that
+///   array's length. It now points at `p67_segment_get_string`, the body that
+///   already served the JDK-22 spelling `getString` and already reads through
+///   `segment_address`/`segment_byte_size`.
+/// * `reinterpret` shipped with NO native-access check, while the synthetic-only
+///   twin refused unless `native_access_enabled()` -- calling the operation the
+///   second half of the arbitrary-memory primitive, which is also how real JDK
+///   25 treats it. The gated body survives, lifted out of its closure into
+///   `panama::pe_segment_reinterpret` so the shipping pass can name it.
+///
+/// MEASURED, not read off the source, on `--dump-native-registry` from the
+/// PATCHED tree in both modes (`RStrings`, debug binary 2026-08-24 18:59). All
+/// 12 triples: `kind = bridge`, `owns_slot = true`, **`overwrote = null`**, one
+/// owner each -- `jmx.rs` for the eight, `phases_late/foreign_ffm.rs` for the
+/// four -- and byte-identical rows in compatible mode and under `--jdk-only`.
+/// `overwrote = null` is the load-bearing field: it is positive evidence that
+/// nothing registered these triples ahead of the survivor, i.e. the duplicate
+/// really is gone rather than merely losing the race. `Bridge` is
+/// `allowed_in(JdkOnly)`, and the strict dump reports `synthetic-stub: 0`
+/// whole-registry, so the surviving bodies serve both modes.
 const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
+    ("java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J"),
+    ("java/lang/management/ThreadMXBean", "getDaemonThreadCount", "()I"),
+    ("java/lang/management/ThreadMXBean", "getPeakThreadCount", "()I"),
+    ("java/lang/management/ThreadMXBean", "getThreadCount", "()I"),
+    ("java/lang/management/ThreadMXBean", "getTotalStartedThreadCount", "()J"),
+    ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringEnabled", "()Z"),
+    ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringSupported", "()Z"),
+    ("java/lang/management/ThreadMXBean", "isThreadCpuTimeSupported", "()Z"),
+    ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
+    (
+        "java/lang/foreign/MemorySegment",
+        "reinterpret",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+    ),
+    ("cratonvm/internal/foreign/MemorySegmentImpl", "getUtf8String", "(J)Ljava/lang/String;"),
+    (
+        "cratonvm/internal/foreign/MemorySegmentImpl",
+        "reinterpret",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+    ),
     ("java/io/ByteArrayOutputStream", "<init>", "()V"),
     ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
     ("java/io/ByteArrayOutputStream", "close", "()V"),
@@ -1252,14 +1334,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/management/RuntimeMXBean", "getUptime", "()J"),
             ("java/lang/management/RuntimeMXBean", "getVmName", "()Ljava/lang/String;"),
             ("java/lang/management/RuntimeMXBean", "getVmVersion", "()Ljava/lang/String;"),
-            ("java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J"),
-            ("java/lang/management/ThreadMXBean", "getDaemonThreadCount", "()I"),
-            ("java/lang/management/ThreadMXBean", "getPeakThreadCount", "()I"),
-            ("java/lang/management/ThreadMXBean", "getThreadCount", "()I"),
-            ("java/lang/management/ThreadMXBean", "getTotalStartedThreadCount", "()J"),
-            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringEnabled", "()Z"),
-            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringSupported", "()Z"),
-            ("java/lang/management/ThreadMXBean", "isThreadCpuTimeSupported", "()Z"),
         ],
     ),
     (
@@ -1650,15 +1724,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/ServerSocket", "getLocalPort", "()I"),
             ("java/net/ServerSocket", "getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
             ("java/net/ServerSocket", "isBound", "()Z"),
-        ],
-    ),
-    (
-        "register_pe2_string_marshaling_on",
-        &[
-            ("cratonvm/internal/foreign/MemorySegmentImpl", "getUtf8String", "(J)Ljava/lang/String;"),
-            ("cratonvm/internal/foreign/MemorySegmentImpl", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
-            ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
-            ("java/lang/foreign/MemorySegment", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
         ],
     ),
     (

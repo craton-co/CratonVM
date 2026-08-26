@@ -307,8 +307,16 @@ pub(super) fn execute_instruction(
             let value = normalize_aastore_value(shared, raw_value);
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
-            let _diag_method = thread.frames[frame_idx].method_name().to_string();
-            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            // The class and method NAMES used to be materialised here, as two
+            // `String` allocations per array store, for a message that is only
+            // ever built when the array reference turns out to be null. They
+            // are resolved inside the closure now, from `npe_cid` and
+            // `npe_mname` below — both of which this site already had to
+            // capture for the JEP 358 arm. Hoisting them was not a mistake to
+            // begin with: the closure cannot borrow `thread` while
+            // `thread.frames[..].stack` is mutably borrowed by
+            // `pop_object_ref_ctx_with`. `npe_cid` is a plain `ClassId` and
+            // needs no such borrow, which is what makes the lazy form possible.
             // JEP 358 increment 2: `Cannot store to object array because
             // "<expr>" is null`. Source stack `[..., arrayref, index, value]`
             // → array at depth 2.
@@ -330,10 +338,14 @@ pub(super) fn execute_instruction(
                             shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
                         )
                     } else {
-                        format!(
-                            "aastore in {}.{} pc={}",
-                            _diag_class, _diag_method, _diag_pc
-                        )
+                        let class_name = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("aastore in {}.{} pc={}", class_name, npe_mname, _diag_pc)
                     }
                 },
             )?;
@@ -418,7 +430,14 @@ pub(super) fn execute_instruction(
                 .map_err(|i| {
                     if aioobe_dbg() {
                         let alen = shared.mem.heap.array_length(array_ref);
-                        eprintln!("AIOOBE-AASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
+                        let _diag_class = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        eprintln!("AIOOBE-AASTORE class={_diag_class} method={npe_mname} pc={_diag_pc} idx={i} len={alen}");
                     }
                     RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
@@ -432,8 +451,16 @@ pub(super) fn execute_instruction(
             let value = thread.frames[frame_idx].stack.pop()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
-            let _diag_method = thread.frames[frame_idx].method_name().to_string();
-            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            // The class and method NAMES used to be materialised here, as two
+            // `String` allocations per array store, for a message that is only
+            // ever built when the array reference turns out to be null. They
+            // are resolved inside the closure now, from `npe_cid` and
+            // `npe_mname` below — both of which this site already had to
+            // capture for the JEP 358 arm. Hoisting them was not a mistake to
+            // begin with: the closure cannot borrow `thread` while
+            // `thread.frames[..].stack` is mutably borrowed by
+            // `pop_object_ref_ctx_with`. `npe_cid` is a plain `ClassId` and
+            // needs no such borrow, which is what makes the lazy form possible.
             // JEP 358 increment 2: array at depth 2 (`[..., arrayref, index,
             // value]`); element kind from the opcode.
             let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
@@ -461,10 +488,14 @@ pub(super) fn execute_instruction(
                             shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
                         )
                     } else {
-                        format!(
-                            "Xastore in {}.{} pc={}",
-                            _diag_class, _diag_method, _diag_pc
-                        )
+                        let class_name = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("Xastore in {}.{} pc={}", class_name, npe_mname, _diag_pc)
                     }
                 },
             )?;
@@ -478,7 +509,14 @@ pub(super) fn execute_instruction(
                 .map_err(|i| {
                     if aioobe_dbg() {
                         let alen = shared.mem.heap.array_length(array_ref);
-                        eprintln!("AIOOBE-XASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
+                        let _diag_class = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        eprintln!("AIOOBE-XASTORE class={_diag_class} method={npe_mname} pc={_diag_pc} idx={i} len={alen}");
                     }
                     RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
@@ -496,8 +534,16 @@ pub(super) fn execute_instruction(
             let v = thread.frames[frame_idx].stack.pop_long()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
-            let _diag_method = thread.frames[frame_idx].method_name().to_string();
-            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            // The class and method NAMES used to be materialised here, as two
+            // `String` allocations per array store, for a message that is only
+            // ever built when the array reference turns out to be null. They
+            // are resolved inside the closure now, from `npe_cid` and
+            // `npe_mname` below — both of which this site already had to
+            // capture for the JEP 358 arm. Hoisting them was not a mistake to
+            // begin with: the closure cannot borrow `thread` while
+            // `thread.frames[..].stack` is mutably borrowed by
+            // `pop_object_ref_ctx_with`. `npe_cid` is a plain `ClassId` and
+            // needs no such borrow, which is what makes the lazy form possible.
             // JEP 358 increment 2: long array store, array at depth 2.
             let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
             let npe_code = Arc::clone(&thread.frames[frame_idx].code);
@@ -517,10 +563,14 @@ pub(super) fn execute_instruction(
                             shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
                         )
                     } else {
-                        format!(
-                            "lastore in {}.{} pc={}",
-                            _diag_class, _diag_method, _diag_pc
-                        )
+                        let class_name = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("lastore in {}.{} pc={}", class_name, npe_mname, _diag_pc)
                     }
                 },
             )?;
@@ -551,8 +601,16 @@ pub(super) fn execute_instruction(
             let d = thread.frames[frame_idx].stack.pop_double()?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
-            let _diag_method = thread.frames[frame_idx].method_name().to_string();
-            let _diag_class = thread.frames[frame_idx].class_name().to_string();
+            // The class and method NAMES used to be materialised here, as two
+            // `String` allocations per array store, for a message that is only
+            // ever built when the array reference turns out to be null. They
+            // are resolved inside the closure now, from `npe_cid` and
+            // `npe_mname` below — both of which this site already had to
+            // capture for the JEP 358 arm. Hoisting them was not a mistake to
+            // begin with: the closure cannot borrow `thread` while
+            // `thread.frames[..].stack` is mutably borrowed by
+            // `pop_object_ref_ctx_with`. `npe_cid` is a plain `ClassId` and
+            // needs no such borrow, which is what makes the lazy form possible.
             // JEP 358 increment 2: double array store, array at depth 2.
             let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
             let npe_code = Arc::clone(&thread.frames[frame_idx].code);
@@ -572,10 +630,14 @@ pub(super) fn execute_instruction(
                             shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
                         )
                     } else {
-                        format!(
-                            "dastore in {}.{} pc={}",
-                            _diag_class, _diag_method, _diag_pc
-                        )
+                        let class_name = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(npe_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("dastore in {}.{} pc={}", class_name, npe_mname, _diag_pc)
                     }
                 },
             )?;
@@ -3954,6 +4016,44 @@ pub(super) fn op_getfield(
                 &field,
             ) {
                 field = retargeted;
+            }
+            // CRATONVM_DBG_STRAYSTACK, the getfield door -- the READ twin of
+            // the putfield dump above. Deliberately outside `any_field_diag()`,
+            // exactly like its putfield sibling, so the two doors are armed by
+            // one variable and cannot drift.
+            if straystack_enabled() {
+                let h = shared.mem.heap.get_header(obj_ref);
+                let ns = h.num_slots() as usize;
+                if field.field_index >= ns || h.num_slots() > (1 << 24) {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 12 {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        eprintln!(
+                            "[straystack] #{k} OOB getfield recv@0x{:x} cid={} num_slots={} kind={} -> field '{}' idx={} declaring={:?}",
+                            obj_ref.as_ptr() as usize,
+                            h.class_id.as_u32(),
+                            h.num_slots(),
+                            cratonvm_types::ObjectHeader::kind_tag(
+                                h.mark_word.load(std::sync::atomic::Ordering::Relaxed)
+                            ),
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index,
+                            field.declaring_class_id,
+                        );
+                        eprintln!("[straystack] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(28) {
+                            eprintln!(
+                                "[straystack]   {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc,
+                            );
+                        }
+                    }
+                }
             }
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so

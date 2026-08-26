@@ -823,11 +823,80 @@ pub(super) fn array_is_assignable_to_impl(
 /// [`array_is_assignable_to`]. It only returns `false` when both types resolve
 /// to loaded classes AND the element is provably NOT assignable to the
 /// component.
+/// `true` when `array_ref`'s component type is exactly `java.lang.Object`.
+///
+/// # Why this is not just `array_descriptor_of(..) == "[Ljava/lang/Object;"`
+///
+/// Because that costs a class-manager read lock and TWO `String` allocations
+/// (`c.name.to_string()`, then `format!("[L{};", ..)`) on EVERY reference-array
+/// store, to answer a question about one `ClassId`. `Object[]` is the single
+/// most common reference-array shape there is — `ArrayList`'s `elementData`,
+/// every varargs pack, every `toArray()` — so that arm carries most of the
+/// traffic and returns `true` without ever reading the string it built.
+///
+/// MEASURED (`probes/BarrierProbe`, 4M stores, min of five interleaved rounds,
+/// 2026-08-24, 8-core Linux host): a non-null reference store into an `Object[]`
+/// cost 1335 ms against 614 ms for the byte-identical NULL store — `refself` vs
+/// `refnull`, whose only differences inside the interpreter are this covariance
+/// check and the post-write barrier. The same 2.2x appears on ZGC, whose
+/// post-write barrier does nothing, which is what pins it on this check rather
+/// than on the collector.
+///
+/// The one-slot per-thread memo is keyed by `(vm identity, component ClassId)`.
+/// Array stores are overwhelmingly repetitive — a loop filling one array asks
+/// about one component class — and the VM identity is in the key because
+/// `ClassId`s are per-VM dense indices, so two `SharedVm`s in one process (the
+/// test harness builds several) must not share an answer.
+#[inline]
+fn reference_array_component_is_object(
+    shared: &SharedVm,
+    array_ref: cratonvm_types::ObjectRef,
+) -> bool {
+    // On a reference array the header's class id holds the COMPONENT class.
+    let comp_id = shared.mem.heap.class_id_of(array_ref).as_u32();
+    let key = (shared.vm_identity, comp_id);
+    thread_local! {
+        static MEMO: std::cell::Cell<Option<((usize, u32), bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    if let Some((k, v)) = MEMO.with(|c| c.get()) {
+        if k == key {
+            return v;
+        }
+    }
+    // A component class the store cannot name answers `true` as well:
+    // `array_descriptor_of` substitutes `[Ljava/lang/Object;` for it, so the arm
+    // this replaces returned `true` for that case too.
+    let v = match shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(ClassId::new(comp_id))
+    {
+        Some(c) => &*c.name == "java/lang/Object",
+        None => true,
+    };
+    MEMO.with(|c| c.set(Some((key, v))));
+    v
+}
+
 pub(crate) fn aastore_element_assignable(
     shared: &SharedVm,
     array_ref: cratonvm_types::ObjectRef,
     value_ref: cratonvm_types::ObjectRef,
 ) -> bool {
+    // FAST PATH for the `Object[]` RULE stated ~40 lines below, taken without
+    // building a descriptor at all. Everything after this point allocates two
+    // `String`s before it can look at the component, and this arm is the one
+    // most stores land on. See `reference_array_component_is_object` for the
+    // measurement and for why the two forms agree on every input.
+    if shared.mem.heap.kind_of(array_ref) == cratonvm_types::ObjectKind::Array
+        && shared.mem.heap.element_type_of(array_ref) == ArrayElementType::Reference
+        && reference_array_component_is_object(shared, array_ref)
+    {
+        return true;
+    }
+
     // Determine the array's component descriptor by stripping the leading '['
     // from its full descriptor (e.g. "[Ljava/lang/Number;" -> "Ljava/lang/Number;").
     let array_desc = match array_descriptor_of(shared, array_ref) {

@@ -17425,6 +17425,32 @@ fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// absolute slots 1 and 2, past both declared fields).
 fn hs_map_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(this);
+    // Memoized per `(vm, class)`. Reached once per `next()` through
+    // `map_itr_comod_source`, and the two `is_subclass` calls below are what
+    // put `Class::is_subclass_of_inner` and its `hashbrown` visited set at the
+    // top of the `KeySetBench hoisted` profile. Positive answers only — see the
+    // note on `class_memo_get` for why a `None` here must not be kept.
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let vm = ctx.vm_identity();
+    if let Some(slot) = MEMO.with(|t| class_memo_get(t, vm, cid.as_u32())) {
+        return Some(slot);
+    }
+    let answer = hs_map_slot_uncached(ctx, this, cid);
+    if let Some(slot) = answer {
+        MEMO.with(|t| class_memo_put(t, vm, cid.as_u32(), slot));
+    }
+    answer
+}
+
+/// The uncached body of [`hs_map_slot`].
+fn hs_map_slot_uncached(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    cid: cratonvm_types::ClassId,
+) -> Option<usize> {
+    let _ = this;
     for class_name in [
         "java/util/HashSet",
         "java/util/concurrent/CopyOnWriteArraySet",
@@ -19030,16 +19056,28 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // for entrySet views (it allocates a live entry per pair) — `backing`
     // must be pinned BEFORE it, not after (pinning afterwards captured an
     // already-stale address; canary-caught live at `view_backing_source`).
+    //
+    // ONE collect, not two. The shape above was "collect for the length,
+    // allocate, then collect AGAIN because `alloc_ref_array` may have moved
+    // everything the first collect produced" — and the second collect's results
+    // are then immediately handed to `pin_value_slice`, which is the OTHER way
+    // to survive an allocation and the one this file uses everywhere else. So
+    // pin the FIRST collect instead and the second walk is pure waste: for a
+    // `LinkedHashMap` keySet view it is 1000 nodes x 2 `ctx.get_field` calls per
+    // `iterator()`, on a path the Spring workload this was traced from runs
+    // 100 000 times per test.
+    //
+    // The pins are unchanged in kind and in order relative to `this_pin`, which
+    // is still this frame's base and still releases all of them.
     let backing_pin = ctx.pin_native_root(backing);
-    let len = collect_view_snapshot_ordered(ctx, backing)?.len();
-    let backing = ctx.read_native_pin(backing_pin, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    let (_, key_handles) = pin_value_slice(ctx, &keys);
+    let len = keys.len();
     let keys_arr = alloc_ref_array(ctx, len);
     let keys_arr_pin = ctx.pin_native_root(keys_arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
-    let keys = collect_view_snapshot_ordered(ctx, backing)?;
-    let (_, key_handles) = pin_value_slice(ctx, &keys);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
-    let total = std::cmp::min(len, keys.len());
+    let total = len;
     if dbg_hs_itr() {
         eprintln!(
             "[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}",
@@ -19621,9 +19659,104 @@ fn map_itr_failfast_enabled() -> bool {
 /// block this file writes from `key_itr_base` upward, keeps the old
 /// never-throw behaviour rather than guessing. A missed exception on an
 /// incorrect program is far better than a spurious one on a correct program.
+
+// ─────────────────── per-(vm, ClassId) memo for pure class questions ────────
+//
+// Several helpers on the per-ELEMENT iterator path answer a question that
+// depends only on the receiver's class: "where does this set keep its backing
+// map", "which slot is `expectedModCount`", "which slot is `modCount`". Each
+// answered it by re-resolving names through the class manager on every call.
+//
+// MEASURED. `probes/KeySetBench hoisted` (1000-entry `LinkedHashMap`, iterate a
+// hoisted `keySet()` view) against the SAME binary with
+// `CRATONVM_NO_MAP_ITERATOR_FAILFAST=1`, three interleaved rounds:
+//
+// ```text
+//              fail-fast ON      OFF        ratio
+//   hoisted    10930 / 10472 / 10872 ms     5478 / 5469 ms     2.0x
+//   perCall    14357 / 13076 ms             5707 / 4409 ms     2.5-3.0x
+// ```
+//
+// i.e. HALF of everything this workload had left after the 2026-08-23 map-view
+// fix was `map_itr_check_comod` re-deriving, per element, three facts that are
+// constant for the life of the iterator. `perf record` names the same chain
+// from the other end: `hashbrown::HashMap<ClassId,()>::insert` 9.91 %,
+// `Class::is_subclass_of_inner` 4.59 %, `classify_exact_name` 1.80 %,
+// `get_field_by_name` 1.57 %, `find_unique_class_by_name` 1.45 %,
+// `resolve_field_index_by_class_id` 1.27 %, `class_id_by_name` 1.14 %.
+// (The absolute walls above are from a host at load ~50 and are NOT comparable
+// to the quiet-host figures on the known-issue page; the ON/OFF ratio is what
+// they establish, and it was taken ABBA-interleaved on one binary.)
+//
+// The memo is DIRECT-MAPPED and per-thread: one array slot per `ClassId & 127`,
+// holding `(vm identity, class id, answer)` so a collision or a second VM in
+// the same process is a miss rather than a wrong answer. The VM identity is in
+// the key because `ClassId`s are per-VM dense indices and the test harness
+// builds several `SharedVm`s in one process.
+//
+// **Only POSITIVE answers are cached.** These questions are pure functions of
+// the class STORE, and the store grows: `hs_map_slot` asks
+// `class_id_by_name("java/util/HashSet")`, which answers `None` until that
+// class is loaded. Caching that `None` would pin "this receiver has no backing
+// map" for the process. A positive answer cannot change the same way — the
+// class it names is already loaded — so it is the half that is safe to keep.
+
+/// Slots in a [`class_memo_get`] table. A power of two so the index is a mask.
+const CLASS_MEMO_SLOTS: usize = 128;
+
+type ClassMemo<T> = std::cell::RefCell<Vec<Option<(usize, u32, T)>>>;
+
+#[inline]
+fn class_memo_get<T: Copy>(table: &ClassMemo<T>, vm: usize, cid: u32) -> Option<T> {
+    let b = table.borrow();
+    match b.get((cid as usize) & (CLASS_MEMO_SLOTS - 1)) {
+        Some(Some((v, c, val))) if *v == vm && *c == cid => Some(*val),
+        _ => None,
+    }
+}
+
+#[inline]
+fn class_memo_put<T: Copy>(table: &ClassMemo<T>, vm: usize, cid: u32, val: T) {
+    let mut b = table.borrow_mut();
+    if b.len() != CLASS_MEMO_SLOTS {
+        b.resize(CLASS_MEMO_SLOTS, None);
+    }
+    b[(cid as usize) & (CLASS_MEMO_SLOTS - 1)] = Some((vm, cid, val));
+}
+
+/// [`resolve_field_index_by_class_id`](NativeContext::resolve_field_index_by_class_id)
+/// with the answer remembered per `(vm, class)`.
+///
+/// The underlying resolution hashes the name, walks the superclass chain and
+/// compares field names under the class-manager read lock. On the iterator path
+/// it is asked the same question — `expectedModCount` on one iterator class,
+/// `modCount` on one map class — once per element.
+///
+/// `name` is NOT part of the key: each call site passes a fixed literal and
+/// gets its own table, which is what keeps the key a single `u32` compare.
+#[inline]
+fn memoized_field_slot(
+    ctx: &dyn NativeContext,
+    table: &ClassMemo<usize>,
+    cid: cratonvm_types::ClassId,
+    name: &str,
+) -> Option<usize> {
+    let vm = ctx.vm_identity();
+    let key = cid.as_u32();
+    if let Some(slot) = class_memo_get(table, vm, key) {
+        return Some(slot);
+    }
+    let slot = ctx.resolve_field_index_by_class_id(cid, name)?;
+    class_memo_put(table, vm, key, slot);
+    Some(slot)
+}
+
 fn map_itr_expected_mod_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     let cid = ctx.class_id_of_object(itr);
-    let slot = ctx.resolve_field_index_by_class_id(cid, "expectedModCount")?;
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let slot = MEMO.with(|t| memoized_field_slot(ctx, t, cid, "expectedModCount"))?;
     let base = key_itr_base(ctx, itr);
     if slot >= base || slot >= ctx.object_num_fields(itr) {
         return None;
@@ -19649,6 +19782,28 @@ fn map_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<Objec
 
 /// `src`'s current modification generation, or `None` when it keeps none.
 fn map_itr_mod_count(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
+    // By SLOT when the class metadata can name one, and only then by name.
+    //
+    // `get_field_by_name` re-resolves the string on every call, and this runs
+    // once per `next()` — see the measurement on `memoized_field_slot`. The two
+    // forms can only disagree when two fields in one hierarchy share a name and
+    // the by-name resolver picks the other one; `modCount` is declared exactly
+    // once across the `java.util` map hierarchy (`HashMap`, and `Hashtable`'s
+    // own), so there is no second candidate to pick. The by-name arm stays as
+    // the fallback for a receiver whose class metadata has no such field at all
+    // — a fabricated map whose `modCount` lives in an overlay rather than in a
+    // declared slot — which is exactly the population that used to depend on it.
+    let cid = ctx.class_id_of_object(src);
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(slot) = MEMO.with(|t| memoized_field_slot(ctx, t, cid, "modCount")) {
+        if slot < ctx.object_num_fields(src) {
+            if let Value::Int(v) = ctx.get_field(src, slot) {
+                return Some(v);
+            }
+        }
+    }
     match ctx.get_field_by_name(src, "modCount") {
         Value::Int(v) => Some(v),
         _ => None,
@@ -25328,6 +25483,59 @@ fn stream_process_chain(
     result
 }
 
+/// How often the synthetic-stream drain loops re-publish this thread's GC root
+/// snapshot: every Nth element, not every element.
+///
+/// `NativeContext::refresh_root_snapshot`'s contract asks for a publish "right
+/// after establishing such a batch of pins (**and optionally again
+/// periodically** across a long per-element loop)". The up-front publish is the
+/// one that closes the documented gap — it is what makes this thread's
+/// `native_pin_roots` visible to a peer-initiated STW collection at all. The
+/// per-iteration one is the optional half, and it was running on EVERY element.
+///
+/// It is not free. Each call is a full deposit: the whole per-frame root
+/// snapshot is cleared and rebuilt, `scan_active_jit_frames` runs (including
+/// the A5 unregistered-frame probe, a raw word scan of the native stack above
+/// the scanner), and the SATB buffer is flushed. Measured on a
+/// `StackWalker.walk` over a 120-frame stack, 500 walks
+/// (`CRATONVM_DBG_ROOTPROF=1`):
+///
+/// ```text
+/// scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=86,700
+/// jitprobe calls=86,081 words=637,620,424
+/// ```
+///
+/// 638 MILLION words — 5.1 GB of native stack read — for 500 walks, at a
+/// constant ~7,400 words (59 KB) per call, with the call COUNT scaling linearly
+/// in stack depth because the stream has one element per frame. Neither the
+/// collector nor a safepoint asked for any of it: both other callers are zero.
+///
+/// The pins this refresh exists to publish are pushed ONCE, before the loop,
+/// and do not change across iterations — so every one of those deposits
+/// republished a bit-identical snapshot. Refreshing every Nth element keeps the
+/// periodic republish the contract asks for, with a bounded window, at 1/N the
+/// cost. `CRATONVM_GC_STREAM_REFRESH_EACH=1` restores the per-element cadence,
+/// so both arms are reachable from one binary.
+fn stream_refresh_interval() -> usize {
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STREAM_REFRESH_EACH").is_some() {
+            1
+        } else {
+            32
+        }
+    })
+}
+
+/// Should the drain loop re-publish before element `idx`?
+///
+/// `idx == 0` is never asked (the caller publishes up front, unconditionally).
+#[inline]
+fn stream_should_refresh(idx: usize) -> bool {
+    let every = stream_refresh_interval();
+    every <= 1 || idx % every == 0
+}
+
 fn stream_pull_internal(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -25391,7 +25599,10 @@ fn stream_pull_internal(
             if stream_limit_saturated(&chain, &state, 0) {
                 return Ok(PullStep::Continue);
             }
-            ctx.refresh_root_snapshot();
+            // Periodic, not per-element — see `stream_refresh_interval`.
+            if stream_should_refresh(idx) {
+                ctx.refresh_root_snapshot();
+            }
             let v = read_pinned_elem(ctx, base_pins[idx], v);
             let mut emit_stopped = false;
             let step = {
@@ -28291,7 +28502,10 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.refresh_root_snapshot();
     let mut result = Ok(None);
     for (i, &elem) in elements.iter().enumerate() {
-        ctx.refresh_root_snapshot();
+        // Periodic, not per-element — see `stream_refresh_interval`.
+        if stream_should_refresh(i) {
+            ctx.refresh_root_snapshot();
+        }
         let c = ctx.read_native_pin(con_pin, consumer);
         let e = read_pinned_elem(ctx, elem_handles[i], elem);
         if let Err(err) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[e]) {
