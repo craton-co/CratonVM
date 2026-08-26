@@ -556,7 +556,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-227 tokens.
+228 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -667,6 +667,7 @@ export inherited from a parent shell.
 | `metrics-ring` | `CRATONVM_JIT_METRICS_RING` |
 | `mic-exc-table-publish` | `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` |
 | `direct-exc-table-publish` | `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` |
+| `new-class-init-memo` | `CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO` |
 | `mic-rust-entry-cache` | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` |
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
@@ -790,7 +791,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-74 tokens.
+75 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -868,6 +869,7 @@ export inherited from a parent shell.
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
+| `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
 
 ## `CRATONVM_REAL`
 

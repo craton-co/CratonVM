@@ -884,6 +884,13 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         v.push(entry);
         let n = v.len();
         top_rbp_set(0);
+        // The incoming entry starts unrecorded in BOTH mirrors. Zeroing only
+        // the RBP left the identity naming the entry we just pushed BELOW us,
+        // so the pair described two different frames from the first instruction
+        // of the new entry. See `reload_top_rbp_cache` for what that cost.
+        if cm_id_pairing_enabled() {
+            top_cm_id_mirror_write(0);
+        }
         n
     });
     GLOBAL_JIT_DEPTH.inc();
@@ -4529,11 +4536,56 @@ pub fn set_top_frame_base(rbp: usize) {
 /// pushed, which is the common case. See `prune_returned_jit_entries`.
 #[inline]
 fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
-    let val = v
+    let (rbp, cm_id) = v
         .last()
         .and_then(|e| e.precise.as_ref())
-        .map_or(0, |info| info.exact_rbp);
-    top_rbp_set(val);
+        .map_or((0, 0), |info| (info.exact_rbp, info.exact_cm_id));
+    top_rbp_set(rbp);
+    // BOTH halves, from the SAME snapshot. Restoring only the RBP is what
+    // `top_cm_id_mirror_read` warns about in as many words: it leaves the pair
+    // naming two different frames — this entry's rbp beside whatever method
+    // last ran — "and the scan cannot detect that, because both halves would
+    // still read consistently out of the mirrors".
+    //
+    // That is not hypothetical. It is what
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`'s
+    // `ACTIVE_FRAME_MAP` residual was: `[frame-cov]` showed ONE rbp
+    // (`0x…3a00`, correctly restored here) claimed across collections by four
+    // different methods (`MVMap.put`, `MVStore.openMap`,
+    // `MVStore$Builder.autoCommitDisabled`, `RootReference.isLocked` — the last
+    // with `maps=0`, so it emits no safepoint and cannot be the frame at a
+    // collection at all). `moving_young_frame_coverage_complete` then read
+    // `[rbp - wrong_method.sp_id_slot_off]`, matched no map, and refused the
+    // cycle.
+    //
+    // The path that makes it the coverage proof's OWN input:
+    // `refresh_moving_young_coverage_for_current_thread` calls
+    // `prune_returned_jit_entries` first, which lands here when it pruned
+    // anything, and then immediately stamps
+    // `info.exact_rbp = top_rbp_get(); info.exact_cm_id = published_compile_id()`
+    // — a correct rbp paired with the identity this function failed to move.
+    //
+    // Zero is the honest value when the top entry has no snapshot: it means
+    // "nothing published", which routes `published_innermost_method` to the
+    // stack decode and, failing that, fails closed. A WRONG id does not fail
+    // closed; it resolves confidently to the wrong map.
+    if cm_id_pairing_enabled() {
+        top_cm_id_mirror_write(cm_id);
+    }
+}
+
+/// `CRATONVM_GC_NO_CM_ID_PAIRING=1` — stop moving the compile-id mirror with
+/// the RBP mirror, restoring the 2026-08-24 behaviour in which only the RBP
+/// half was reset on push and restored on pop.
+///
+/// The bisect lever for that repair, default-ON. Latched: it decides what the
+/// entry-chain bookkeeping does, and that must not change under a running
+/// process.
+fn cm_id_pairing_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_CM_ID_PAIRING").is_none()
+    })
 }
 
 #[inline]
@@ -6854,6 +6906,90 @@ mod tests {
             cratonvm_jit::ExecutableBuffer::new(64)
                 .expect("executable buffer alloc must succeed in tests"),
         )
+    }
+
+    /// The two innermost-frame mirrors move TOGETHER across every entry-chain
+    /// mutation, or the pair names two different frames.
+    ///
+    /// `top_cm_id_mirror_read`'s own doc states the rule: "restoring one
+    /// without the other is how the identity becomes actively wrong rather than
+    /// merely absent", and the scan cannot detect it because both halves still
+    /// read consistently out of the mirrors. Until 2026-08-24 the chain
+    /// bookkeeping broke it in both directions — `push_entry_full` zeroed only
+    /// the RBP for the incoming entry, and `reload_top_rbp_cache` restored only
+    /// the RBP on pop.
+    ///
+    /// That is what `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`
+    /// saw as `ACTIVE_FRAME_MAP` / `frame_cov=(no_map=N …)`: ONE rbp claimed by
+    /// four different methods across collections, one of them
+    /// `RootReference.isLocked` with `maps=0` — a method that emits no
+    /// safepoint and therefore cannot be the frame at a collection.
+    /// `refresh_moving_young_coverage_for_current_thread` is what makes it the
+    /// proof's own input: it calls `prune_returned_jit_entries` first, which
+    /// reloads the mirror, then stamps the snapshot from BOTH mirrors.
+    ///
+    /// Asserted through the public push/pop entry points rather than on the
+    /// private helpers, because the invariant is about what a JIT boundary
+    /// leaves behind, not about one function.
+    #[test]
+    fn both_frame_record_mirrors_move_together_across_a_jit_boundary() {
+        // A distinctive pair, so a stale value cannot be mistaken for a fresh
+        // one. The RBP must be 8-aligned and non-zero to survive the readers.
+        const RBP_A: usize = 0x7fff_0000_0000_1000;
+        const ID_A: u32 = 0xABCD_1234;
+
+        // Entries carrying PRECISE info, because the snapshot fields the pop
+        // restores from live there — a bare `push_jit_entry()` has none, and
+        // reloading from it correctly yields zero for both halves.
+        let cm = dummy_compiled_method();
+        let _outer = JitEntryGuard::enter_with_compiled(&cm);
+        top_rbp_mirror_write(RBP_A);
+        top_cm_id_mirror_write(ID_A);
+        assert_eq!(top_rbp_mirror_read(), RBP_A, "mirror write must land");
+        assert_eq!(top_cm_id_mirror_read(), ID_A, "identity write must land");
+
+        // Pushing a nested entry makes the outer one stop being top. The
+        // incoming entry is unrecorded, so BOTH halves must read as such —
+        // zeroing only the RBP leaves `ID_A` naming the frame BELOW.
+        let inner_cm = dummy_compiled_method();
+        let inner = JitEntryGuard::enter_with_compiled(&inner_cm);
+        assert_eq!(top_rbp_mirror_read(), 0, "incoming entry must start with no rbp");
+        assert_eq!(
+            top_cm_id_mirror_read(),
+            0,
+            "incoming entry must start with no IDENTITY either — a leftover id \
+             pairs the new entry's rbp with the old entry's method"
+        );
+
+        // Popping restores the outer entry's snapshot. Both halves, or the
+        // restored rbp is paired with whatever ran in between.
+        drop(inner);
+        assert_eq!(top_rbp_mirror_read(), RBP_A, "pop must restore the rbp");
+        assert_eq!(
+            top_cm_id_mirror_read(),
+            ID_A,
+            "pop must restore the IDENTITY that rbp was snapshotted with"
+        );
+    }
+
+    /// The control for the test above: it must be able to FAIL.
+    ///
+    /// With `CRATONVM_GC_NO_CM_ID_PAIRING=1` the identity half stops moving, so
+    /// running the suite under that variable turns the two identity assertions
+    /// red. This test asserts only what holds in BOTH arms — the rbp half,
+    /// which was always correct — so a future change that breaks the rbp
+    /// bookkeeping cannot hide behind the pairing switch.
+    #[test]
+    fn the_rbp_mirror_half_is_restored_regardless_of_the_pairing_switch() {
+        const RBP_B: usize = 0x7fff_0000_0000_2000;
+        let cm = dummy_compiled_method();
+        let _outer = JitEntryGuard::enter_with_compiled(&cm);
+        top_rbp_mirror_write(RBP_B);
+        let inner_cm = dummy_compiled_method();
+        let inner = JitEntryGuard::enter_with_compiled(&inner_cm);
+        assert_eq!(top_rbp_mirror_read(), 0);
+        drop(inner);
+        assert_eq!(top_rbp_mirror_read(), RBP_B);
     }
 
     fn add_shadow_osr_layout(cm: &mut cratonvm_jit::CompiledMethod) {

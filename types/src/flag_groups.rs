@@ -1066,6 +1066,11 @@ pub const INVENTORY: &[E] = &[
     // BigEndianHeapByteBufTest against 736 for the native shadow), and
     // interlocked with `sp-ic-deopt-check` the same way.
     E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // Serve `new`'s JVMS 5.5 initialization check from `class_init_memo`
+    // instead of `ensure_class_initialized_shared`, as getstatic/putstatic
+    // already do. Default-ON; the opt-out is the same-binary A/B, and its OFF
+    // position is the older, correct, slower path.
+    E { group: Group::JIT, token: "new-class-init-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO"), off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
@@ -1355,6 +1360,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
     E { group: Group::GC, token: "format-arg-pin", on_key: None, off_key: Some("CRATONVM_NO_FORMAT_ARG_PIN"), off_word: None },
+    // Declared 2026-08-24. An OPT-OUT: the JIT entry chain moves the compile-id
+    // mirror together with the RBP mirror by default. This key restores the
+    // behaviour where only the RBP half was reset on push and restored on pop,
+    // which left the pair naming two different frames. See
+    // `conservative_roots::reload_top_rbp_cache`.
+    E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
     // built it, instead of giving up whenever that method is not the chain
@@ -1667,6 +1678,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the
