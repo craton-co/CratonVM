@@ -5191,6 +5191,26 @@ fn run() -> Result<()> {
                 "[cratonvm] VarHandle read thin direct calls: served={served} declined={declined}",
             );
         }
+        // The WRITE direction's two routes, which the read direction has had all
+        // along and this one did not. `write thin direct calls` is the bind
+        // baked into compiled code; `field CAS in-funnel` is the short circuit
+        // inside `jit_invoke_dispatch`, the twin of the read fast path above.
+        //
+        // The CAS pair is load-bearing in a way the census is NOT: a served CAS
+        // still calls `count_jit_native_dispatch`, exactly as a served read
+        // does, so `--dump-native-registry` reports the SAME
+        // `VarHandle.compareAndSet` count whether the fast path ran or not.
+        // These counters are the only way to tell the two apart.
+        {
+            let (served, declined) = cratonvm_vm::jit::helpers::varhandle_write_direct_counts();
+            eprintln!(
+                "[cratonvm] VarHandle write thin direct calls: served={served} declined={declined}",
+            );
+            let (cas_served, cas_declined) = cratonvm_vm::jit::helpers::varhandle_field_cas_counts();
+            eprintln!(
+                "[cratonvm] VarHandle field CAS in-funnel: served={cas_served} declined={cas_declined}",
+            );
+        }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because
