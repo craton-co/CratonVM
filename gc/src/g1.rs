@@ -417,7 +417,11 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// This is option **D** of
 /// `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4, paired with option C (the `_trusting_header` rename). **Expected to be
-/// ZERO**, and observed zero across the regression suite and the GC unit tests.
+/// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
+/// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
+/// measured with the walk proved engaged — 67 young evacuation pauses,
+/// 2,220,704 objects copied, every one of them enumerated through this helper
+/// or its callers' array arm.
 pub static FLAT_WALK_REFUSED_ARRAY: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`FLAT_WALK_REFUSED_ARRAY`].

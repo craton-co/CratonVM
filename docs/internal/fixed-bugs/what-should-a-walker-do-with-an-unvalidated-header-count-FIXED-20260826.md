@@ -189,6 +189,16 @@ bound is unchanged in effect: it lives inside `object_body_size`, which returns
 The three `Value` decodes are now `read_value_cell_checked`, matching every
 other legacy-cell reader.
 
+**Impact, stated honestly.** `gc::collect` is reached only through
+`gc::heap::Heap`, and `VmHeap` has no semi-space variant — its three arms are
+`Generational`, `G1`, `Zgc` — so nothing in a running VM constructs it. Every
+`Heap::new()` in the tree is inside a `#[cfg(test)]` block. This is therefore
+correctness hygiene on a test-only collector, not a live-crash fix. It is still
+worth doing: unlike `region.rs` (§9) the type is not deprecated, it is the heap
+a good deal of `vm/src/threading/monitor.rs` tests against, and leaving one
+collector holding the exact defect its sibling was fixed for is how the next
+sweep re-finds it.
+
 ---
 
 # Part III — evidence
@@ -201,7 +211,60 @@ two) at `tracing::warn!`, which the VM's default `EnvFilter` admits to stderr,
 so the marker string `flat 16-byte-slot walk REFUSED an ARRAY header` is a
 reliable zero/non-zero test on any run log.
 
-MEASUREMENTS_PLACEHOLDER
+### Regression suite, once per collector
+
+`regression-suite/run.sh` against the branch binary
+(`cratonvm-walker-20260826.exe`), each arm a full pass with HotSpot as the
+output oracle:
+
+| arm | collector | result | `REFUSED an ARRAY header` lines |
+|---|---|---|---|
+| 1 | default (ZGC) | **72 passed, 0 failed** | 0 |
+| 2 | `-XX:+UseG1GC` | **72 passed, 0 failed** | 0 |
+| 3 | `-XX:+UseGenerationalGC` | **72 passed, 0 failed** | 0 |
+
+### The G1 arm, with the walk proved engaged
+
+A zero refusal count is worthless if the walk never ran, and the first attempt
+at this arm *was* that vacuous green: the six GC vectors under
+`-XX:+UseG1GC` at the 4 GB ergonomic default heap printed
+`flat_walk_refused_array=0` **and no `[GC-SUMMARY]` line at all** — G1 had never
+collected. Re-run at `--Xmx 64m` and `--Xmx 128m`, where they do:
+
+* **12 runs, 67 young evacuation pauses, 2,220,704 objects copied.**
+* Every run `PASS`, every run `[GC] g1 flat_walk_refused_array=0`.
+* The sibling guards on the same line are zero too: `evac_ref_rejected=0
+  evac_holder_rejected=0 evac_holder_clamped=0 source_walk_desync=0
+  kept_seed_rejected=0`.
+
+Every one of those 2.2 M copied objects had its reference fields enumerated —
+through the array arm if it was an array, through this walk if it was not. That
+is the base rate the zero is measured against.
+
+No **mixed** pause occurred in any arm (`mixed count=0` throughout), so the
+rset-source callers (#3, #5) are engaged only through their young-pause use.
+Stated rather than glossed.
+
+### Unit tests
+
+`cargo test -p cratonvm-gc --release --lib`: **1689 passed**, plus the three new
+ones by name —
+
+```
+test g1::tests::flat_walk_refuses_an_array_header_and_counts_it ... ok
+test g1::tests::flat_walk_still_visits_a_legacy_objects_reference_cells ... ok
+test g1::tests::capped_walk_bounds_a_legacy_object_below_its_claimed_slot_count ... ok
+```
+
+One failure, in `gen_heap::published_bounds_ownership` / `zgc::tests`, is a
+**pre-existing test-isolation flake and not a regression**: unmodified `dev`
+fails the same assertion in 4 runs out of 5 (the tests assert on a process-wide
+JIT read-bounds table that siblings in the same binary write concurrently; each
+passes in isolation). Filed separately.
+
+The twelve `gc::tests::gc_*` semi-space tests — which are what exercise §6's
+three rewritten scan arms, since they allocate through `alloc_object(ClassId, n)`
+with no registered layout and are therefore legacy-layout — all pass.
 
 ## 8. What closes this page
 
