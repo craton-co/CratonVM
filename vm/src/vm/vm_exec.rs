@@ -6712,7 +6712,15 @@ impl<'a> NativeContextImpl<'a> {
         // ReferenceQueue.remove), false positives are filtered by
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
-        if !moving_young_precise_only {
+        // MEASUREMENT LEVER (`CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN=1`,
+        // default OFF): the no-flag deposit is a republish by a thread that is
+        // still RUNNING, and this scan's stated obligation is to a thread that
+        // has PARKED — see `env_cache::noflag_deposit_skips_jit_scan` for the
+        // measurement, the argument, and the two holes in the argument that
+        // keep it off by default.
+        let skip_jit_scan = !raise_blocked_flag
+            && crate::runtime::env_cache::noflag_deposit_skips_jit_scan();
+        if !moving_young_precise_only && !skip_jit_scan {
             let jit_scan_start = snapshot.len();
             crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
             crate::jit::conservative_roots::scan_active_jit_frames(

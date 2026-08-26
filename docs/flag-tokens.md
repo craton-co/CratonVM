@@ -555,7 +555,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-223 tokens.
+226 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -782,10 +782,13 @@ export inherited from a parent shell.
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
+| `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
+| `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
+| `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
 
 ## `CRATONVM_GC`
 
-74 tokens.
+75 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -863,6 +866,7 @@ export inherited from a parent shell.
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
+| `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
 
 ## `CRATONVM_REAL`
 
