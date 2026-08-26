@@ -273,7 +273,17 @@ tryPushStack" was never evidence about which part of that call was expensive.
 not measurable on this host regardless. Any future composition claim needs many
 runs, not two.)
 
-### Where the 872x actually is: unknown, and that is the next question
+### Where the 872x actually is: FOUND, and it is not VarHandle at all
+
+A native profile settled it: composition runs INTERPRETED (92.35% in the VM
+binary, **0.32% in JIT code**), because `CompletableFuture.complete` is a
+registered native and every method calling it is sealed from compilation. On
+the current binary `--nojit` is marginally FASTER than JIT, which is what "never
+compiled" looks like. See
+[`native-shadow-seal-keeps-completablefuture-interpreted-20260824.md`](native-shadow-seal-keeps-completablefuture-interpreted-20260824.md).
+
+That is why every fix on this page moved the primitive and not the workload.
+The old text below is kept as written:
 
 What is now excluded: the global mutex (removed, 10.9x on scaling), the CAS
 funnel (served in full, 0.5%), the `set` funnel (bound, 698 000 dispatches
