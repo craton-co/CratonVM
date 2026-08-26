@@ -2581,11 +2581,16 @@ fn try_delegate_to_real_provider(
     };
 
     let mut first_exception: Option<ObjectRef> = None;
+    // `iter_obj` is held across every call below; each can collect.
+    let iter_pin = ctx.pin_native_root(iter_obj);
+    let mut iter_obj = iter_obj;
     loop {
+        iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
         match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,
         }
+        iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
         let provider_obj = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(p)))) => p,
             _ => break,

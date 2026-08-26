@@ -7,6 +7,7 @@
 | **Signature** | `zgc real: field index OOB index=1..4 num_slots=0 op="get"/"set"` |
 | **Before** | 16 hits per run of `TestDefaultServletRfc9110Section13`, 8 per run of `TestWebdavServletOptionsUnknown` |
 | **After** | **0 and 0** |
+| **Re-verified** | 2026-08-26 on `origin/dev` `ccdafa676`, four merges past the fix: still **0 and 0**, both classes `rc=0`. See the re-verification section of the annotation-scan CLOSED page for the caveat on reading a zero from this counter. |
 
 ## The defect
 

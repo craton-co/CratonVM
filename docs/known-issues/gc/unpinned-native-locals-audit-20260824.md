@@ -126,10 +126,29 @@ span 4   phases_late.rs:1369        collect_map_entries_as_strings() `entry`
 Several are the iterator shape — `hasNext()` then `next()` on a receiver held
 across both — which is structurally what their confirmed defect was.
 
-**These 34 are not triaged and not fixed.** They have not been through the two
-filters that took the original 1074 to 8 (real object handle; actually
-dereferenced after), so the true count is lower. That triage is the remaining
-work on this page.
+**Four of the 34 are now triaged and fixed** (2026-08-25), tightest spans first:
+
+| file | function | receivers | shape |
+|---|---|---|---|
+| `phases_late/io_streams.rs` | `register_p70_object_streams` | `stream` | `flush()` then `close()`, consecutive |
+| `logging_shims.rs` | `native_printstream_close` | `sink`, `this` | `flush()` then `close()` |
+| `phases_early.rs` | `enum_declaring_class_from_object` | `elem` (**a parameter**) | fallback arm after the first call |
+| `properties_sidetable.rs` | `native_properties_equals` | `it`, `other`, `entry` | whole iterator loop |
+
+`cargo test -p cratonvm-native-builtins`: 4149 passed, 0 failed.
+
+**CORRECTION to the sentence that stood here.** It said these 34 had not been
+through the two filters that took 1074 to 8, "so the true count is lower". That
+is wrong, and optimistically so. For the RECEIVER rule both filters are
+satisfied **by construction**: a receiver *is* an object handle, and the second
+invoke *is* a dereference. The only genuine filter left is whether the two calls
+are mutually exclusive branches rather than sequential — and all four checked so
+far were sequential, including one where the second call sits in the *fallback
+arm* of the first's result and therefore always follows it.
+
+So expect the remaining ~30 to be mostly real, not mostly noise. Triage by span
+order: a tight span is the least likely to be branch-exclusive and the cheapest
+to confirm by reading.
 
 One caution they record, which applies to anything on this list:
 `report_reclaimed_receiver` stayed silent throughout their investigation. It
