@@ -4749,12 +4749,18 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             };
             let mut collected: Vec<Value> = Vec::new();
             const SAFETY_CAP: usize = 1_000_000;
+            // `iter` is held across every call in this loop; pin once and
+            // re-derive per use.
+            let iter_pin = ctx.pin_native_root(iter);
+            let mut iter = iter;
             loop {
+                iter = ctx.read_native_pin(iter_pin, iter);
                 let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[]);
                 let proceed = matches!(has_next, Ok(Some(Value::Int(1))));
                 if !proceed {
                     break;
                 }
+                iter = ctx.read_native_pin(iter_pin, iter);
                 let next = ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]);
                 let val = match next {
                     Ok(Some(v)) => v,

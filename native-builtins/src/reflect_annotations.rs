@@ -404,6 +404,14 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             };
             let level = ctx.get_field_by_name(this, "logLevel");
             let record_level = ctx.get_field_by_name(*record, "level");
+            // NOT the shape the receiver rule flagged (the two `level`
+            // bindings below are distinct shadows in separate match arms).
+            // The real hazard is `record_level`, read here and dereferenced
+            // AFTER the `intValue()` call below, which can collect.
+            let rl_pin = match record_level {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
             let level_value = match level {
                 Value::Object(Some(level)) => {
                     match ctx.invoke_virtual(level, "intValue", "()I", &[])? {
@@ -412,6 +420,10 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                     }
                 }
                 _ => return Ok(Some(Value::Int(0))),
+            };
+            let record_level = match rl_pin {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => record_level,
             };
             let record_value = match record_level {
                 Value::Object(Some(level)) => {

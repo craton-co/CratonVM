@@ -199,6 +199,35 @@ ring is simply never populated unless `CRATONVM_DBG_GCPART` is set, which is
 why the catch above printed no `[gcpart]` lines. It is armed in `huntloop.sh`
 now.
 
+### The isolated reproducer does NOT reproduce — recorded as a negative
+
+Catching this in netty costs about five hours a hit (1 whole-class run in
+100-230), which is not a loop anyone can iterate a fix in, so
+`probes/MhStaleReceiverProbe.java` tries to build the shape directly: a
+six-field receiver constructed immediately before the call, invoked **through a
+MethodHandle** (so it routes through `mh_dispatch` rather than an ordinary
+`invokevirtual`), with heavy allocation in the window between the two.
+
+| arm | rounds | heap | result |
+|---|---:|---|---|
+| single-threaded | 1 500 000 | 256m | 0 caught, **0** `was_vacated` events |
+| 6 workers + a dedicated GC-pressure thread | 2 000 000 | 256m | 0 caught, **0** `was_vacated` events |
+
+Both with `CRATONVM_DBG_VACATED_FRAMES`, `CRATONVM_DBG_GCPART` and
+`CRATONVM_DBG_CCE_BT` armed. **Zero** vacated-reference events means the ledger
+never even saw a stale reference, not merely that no dispatch failed — so the
+three ingredients this probe has are NOT sufficient:
+
+* a MethodHandle virtual invoke through `mh_dispatch`;
+* a receiver allocated immediately before the call;
+* young evacuations forced by a PEER thread rather than by the caller.
+
+Whatever else the netty path contributes — JIT-compiled callers around the
+dispatch, the FFM/`Arena` allocation itself, the `invokedynamic` bridge, a
+deopt in the window — is load-bearing, and the next probe should add those
+rather than repeat these. Until then the netty loop is the only capture, and it
+is what `huntloop.sh` runs.
+
 ### Where this belongs
 
 This is the `ClassId(0)` / stale-receiver family, not a netty defect:

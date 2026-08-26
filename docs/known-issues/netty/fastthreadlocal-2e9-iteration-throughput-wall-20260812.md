@@ -1,146 +1,215 @@
-# FastThreadLocalTest — a 2.1-billion-iteration loop against a per-allocation helper call
+# FastThreadLocalTest — the inline allocator is not missing a contract, it is starved on the default collector
 
-**Status: OPEN — throughput, not correctness.** Narrowed **2.1x** on
-2026-08-17 and re-sized against current measurements. The class still does not
-finish inside any reasonable per-class wall, so this page stays open; what
-changed is that both of its open *questions* are now answered, and the one
-remaining cost has a named blocker instead of a hypothesis.
+**Status: OPEN — throughput, not correctness.** The wall is unchanged. What
+changed on 2026-08-26 is that **this page's item 1 was aimed at the wrong
+thing**, and the real blocker is now measured and specified rather than guessed.
 
-The forensics — what was fixed, and why the allocation lever this page tested
-twice was never going to move — are in
-`fixed-suite-bugs/netty/osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
-Everything below is the *current* state. The long 08-12 / 08-13 measurement
-history lives in that record rather than here, because every number in it has
-since moved.
+The class still does not finish inside any reasonable per-class wall. Read
+"What would close it" first; everything above it is why the previous answer to
+that question could not have worked.
 
-## What the test does
+## The correction
 
-`io.netty.util.concurrent.FastThreadLocalTest.testConstructionWithIndex`:
+The previous revision of this page said, quoting `emit_inline_tlab_new`'s own
+comment:
 
-```java
-int ARRAY_LIST_CAPACITY_MAX_SIZE = Integer.MAX_VALUE - 8;
-...
-while (nextIndex.get() < ARRAY_LIST_CAPACITY_MAX_SIZE) {
-    new FastThreadLocal<Boolean>();
+> `emit_inline_tlab_new` **does not allocate inline**: its own comment records
+> that the raw compiled TLAB-cursor bump was routed back through the checked
+> runtime helper […] Only the header writes are inline.
+
+**The comment is stale and the code below it does the opposite.** As of the
+BinTrees-18 fix, `emit_inline_tlab_new` emits the whole bump: it loads
+`thread.tlab.cursor`, aligns it to 8, `LEA`s the new cursor, bounds-checks
+against `thread.tlab.end`, writes the **complete** header (class_id, num_slots,
+mark word), and only then commits the cursor —
+
+```
+    // Commit the bump LAST: [R10 + cursor_off] = RAX. […] x86-64 TSO preserves
+    // the required header/body-before-cursor store order; the STW handshake
+    // provides the acquire side.
+```
+
+That is `Tlab::alloc_initialized`'s publication protocol, in machine code, with
+the ordering argument written out. **Item 1 as it stood — "give the JIT-emitted
+TLAB bump the publication contract `Tlab::alloc_initialized` has" — asks for
+something it already has.** Anyone who took that item would have gone looking
+for a missing fence and found one already there.
+
+## What is actually wrong
+
+`thread.tlab` — the exact TLAB that bump reads — is **never refilled under the
+default collector**:
+
+```rust
+pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
+    match self {
+        VmHeap::Generational(h) => h.refill_tlab(requested_size),
+        VmHeap::G1(h) => h.refill_tlab(requested_size),
+        #[cfg(feature = "zgc")]
+        VmHeap::Zgc(_) => None,
+    }
 }
 ```
 
-`FastThreadLocal()` is `index = InternalThreadLocalMap.nextVariableIndex()`,
-i.e. `nextIndex.getAndIncrement()` plus a bounds check. **2 147 483 639
-iterations of (allocate one object + one atomic increment)** by construction —
-there is no shortcut and nothing the VM can do to shorten the loop itself.
+`ZgcRealHeap` implements no `refill_tlab` at all — it has its own, separate
+per-thread buffers (`ZArenaTlabRegistry` / `ZArenaTlab`), reached only through
+`alloc_raw_tlab`. So on ZGC `thread.tlab` stays empty for the life of the
+process, the inline bump's `CMP RAX, [R10+end_off]; JA slow_path` is taken on
+**every** allocation, and every compiled `new` lands in `jit_new_object` →
+`alloc_raw_tlab`. Which is exactly the profile this page already recorded:
+`alloc_raw_tlab` 22.2%, `jit_new_object` 8.5%.
 
-HotSpot JDK 25 runs the whole class in ~50 s.
+The only production writer of `thread.tlab` is the refill path in
+`runtime/interpreter/gc_and_alloc.rs`, which asks the heap and gets `None`.
+(`vm_init.rs` also installs one, but that is inside a `#[test]`.)
 
-The correctness half — the JIT eliding the constructor's write to the static
-`nextIndex`, which made the loop non-terminating — was fixed 2026-08-12 and is
-not at issue here. `lastVariableIndex()` advances by exactly the iteration
-count on every arm measured below.
+### The measurement that says so
 
-## Where it stands
+`CRATONVM_JIT_REAL_NEW_SITE_FLAGS=1` is what lets the inline path be emitted at
+all. ONE binary, one probe (`probes/CtorOnly alloc` = `new Object()`), four
+collector settings, flag off -> on, three interleaved rounds, ns/op:
 
-Interleaved, same binary, `CRATONVM_NO_OSR_CTOR_BIND=1` as the off-arm:
-
-| loop | before 08-17 | after | HotSpot |
+| collector | round 1 | round 2 | round 3 |
 |---|---|---|---|
-| `new FastThreadLocal<Boolean>()` | 420-495 ns/op | **199-266 ns/op** | 7.3-7.8 ns/op |
-| `new Object()` — allocation alone | ~110 ns/op | ~110 ns/op | ~1.8 ns/op |
-| `nextIndex.getAndIncrement()` alone | ~5.7 ns/op | ~5.7 ns/op | ~5.0 ns/op |
+| default | 445.7 -> 394.0 | 255.6 -> 249.0 | 299.7 -> 274.4 |
+| ZGC (explicit) | 422.9 -> 281.2 | 243.4 -> 265.5 | 406.6 -> 364.7 |
+| **Generational** | **205.9 -> 46.6** | **320.0 -> 110.4** | **163.1 -> 39.2** |
+| **G1** | **164.3 -> 93.6** | **255.7 -> 46.0** | **161.7 -> 73.1** |
 
-The constructor dispatch is no longer the gap. **Allocation is**, and at
-~110 ns/op it is ~236 s for this iteration count on its own — already past the
-netty suite's 180 s per-class wall before anything else is counted.
+and the `field` shape on the two extremes:
 
-## What the atomic is NOT
+| collector | off -> on | off -> on |
+|---|---|---|
+| ZGC | 379.4 -> 409.4 | 397.3 -> 335.3 |
+| **Generational** | **233.4 -> 137.3** | **260.9 -> 107.7** |
 
-Ruled out on 2026-08-17, from the other direction. The optimizing tier cannot
-emit a call-site intrinsic, so a constructor whose own body calls
-`AtomicInteger.getAndIncrement()` was paying ~120 ns for a 5.8 ns operation
-(`ctorAtomic` 351 -> 165 ns/op once routed to the single-pass backend; see the
-FIXED record). That is a real defect and it is fixed.
+**Neutral where the TLAB is never refilled; 2.9-5.6x where it is.** That is the
+signature the `refill_tlab` table predicts, and it is also the explanation this
+page owed for a result it recorded but could not account for: the previous
+revision measured the flag at 111.4 vs 118.0 ns and called it neutral. It was
+measured on ZGC, the one backend where the feature is inert **by construction**.
+`default` behaves as ZGC because ZGC *is* the default.
 
-**It is not this class's.** `FastThreadLocal.<init>` calls
-`invokestatic InternalThreadLocalMap.nextVariableIndex()I` — the atomic is one
-level deeper — so the constructor legitimately stays on the optimizing tier and
-the real loop is unmoved: interleaved, 279/213/197/204 ns/op before against
-279/260/209/221 after. Recorded here so the next reader does not re-derive it.
+Generational with the flag on reaches **39-47 ns/op** against HotSpot's 11.2 on
+the same host — a 3.5-4x gap where the default collector shows 12-15x.
 
-## Why allocation costs what it does
+## The trap: that `None` is load-bearing by accident
 
-Not because of the gating flags this page tested twice. `emit_inline_tlab_new`
-**does not allocate inline**: its own comment records that the raw compiled
-TLAB-cursor bump was routed back through the checked runtime helper after it
-left a malformed young-space span under concurrent Elasticsearch merge churn.
-Only the header writes are inline. So every `new` pays a helper call by
-design, and `skip_helper` — which the 08-17 work made reachable from the OSR
-door for the first time — only removes a *second* call
-(`jit_post_tlab_init`), which measures neutral (111.4 vs 118.0 ns/op, three
-interleaved rounds). It is available behind
-`CRATONVM_JIT_REAL_NEW_SITE_FLAGS` and deliberately off.
+It arrived with `2f0d5bbbe feat: zgc` and carries no comment, so it reads like a
+simple omission — a ten-line `refill_tlab` away from being fixed. **It is not.**
 
-Inside the helper, `ZgcRealHeap::alloc_raw_tlab` is 22% of a whole-process
-profile of this loop, and its fast path is not a pointer bump: a thread-local
-lookup, a linear scan of a `Vec<(u64, Arc<Mutex<ZArenaTlab>>)>`, an
-`Arc::clone`, a `parking_lot` lock, the bump, an unlock, an `Arc` drop, and an
-atomic `fetch_add`.
+`ZgcRealHeap::alloc_tlab` registers every object base **inside the cell lock and
+before the pointer is returned**, because `is_object_address` is a *mutator*-path
+oracle on this backend, not just a GC one — `jit_invoke_dispatch` uses it to
+resolve a receiver's class. An object produced by the inline bump registers
+nothing. So the moment `refill_tlab` starts returning `Some` for ZGC, the JIT
+bump begins succeeding and silently producing objects that
+`is_object_address` denies exist.
+
+**Anything that makes `refill_tlab` return `Some` for ZGC must, in the same
+change, either register inline or keep the JIT bump off on that collector.**
 
 ## What would close it, in order
 
-1. **Give the JIT-emitted TLAB bump the publication contract
-   `Tlab::alloc_initialized` has.** The one change that makes the ~110 ns
-   collapse, and the one that makes `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` worth
-   defaulting on. It is also the change that corrupted the heap the last time
-   it was attempted, so it needs the contract — not a revert of the revert.
-2. **Cheapen `alloc_raw_tlab`'s fast path** — the `Arc` clone/drop pair and the
-   TLS `Vec` scan, ~10-20 ns of the ~110, no protocol change. Carries a
-   re-entrancy hazard (`tlab_refill` runs under the same borrow), so it wants
-   care rather than a quick edit.
-3. **Cache the per-allocation class-initialisation re-check** — 12.2% of the
-   profile, for a predicate whose state is monotonic.
-4. **Constructor inlining**, which is what lets IR-level escape analysis
-   scalar-replace the allocation while keeping the atomic side effect. This is
-   what C2 does here, and why HotSpot's constructor loop outruns its own bare
-   atomic loop.
+1. **Bridge ZGC to `thread.tlab`, with inline registration.** This replaces the
+   old item 1. Worth the 2.9-5.6x measured above, on the collector the netty
+   suite actually runs. Three parts:
+   * `ZgcRealHeap::refill_tlab` — carve a chunk from the arena and hand back
+     `(ptr, size)`. The carving machinery already exists for its own
+     `ZArenaTlab` (`tlab_refill`);
+   * emit the registry insert inline. This is the part that looks frightening
+     and is not: the registry is a **bitmap**, and its address mapping is four
+     arithmetic ops —
+     `off = addr - base; bit = off >> 3; word = bit >> 6; mask = 1 << (bit & 63)`
+     — over a `base`/`span`/`words` triple fixed at heap construction. One
+     `lock or [words + word*8], mask` discharges it. The bump already aligns to
+     8, which is the `off & 7 != 0` exactness rejection `locate` relies on;
+   * `allocated.fetch_add(bytes)` plus the `gc_threshold` compare, so
+     collections still trigger: one `lock add` and a branch to a helper on
+     crossing.
+
+   Refuse the fast path unless the registry is in `Bits` mode with an empty
+   overflow set, and keep a kill switch. What this removes per allocation is a
+   TLS lookup, a `Vec` scan, an `Arc::clone`, a `parking_lot` lock, an unlock
+   and an `Arc` drop — around the *same two atomics* it keeps.
+
+2. **Cheapen `alloc_raw_tlab`'s fast path** — unchanged from the previous
+   revision, and it is what the DEFAULT collector pays today whatever happens
+   to (1). The `Arc` clone/drop pair is two atomic RMWs on a cell that is
+   thread-local by construction; the mutex exists only so the collector can
+   walk other threads' buffers. ~10-20 ns of the ~110, with the stated
+   re-entrancy hazard (`tlab_refill` runs under the TLS borrow, so the bump and
+   the refill have to be split across it).
+
+3. ~~Cache the per-allocation class-initialisation re-check~~ — **DONE
+   2026-08-26.** `jit_new_object` called `ensure_class_initialized_shared` on
+   every allocation; `class_init_memo` (a dense per-`ClassId` bitmap, one
+   relaxed load and a bit test) already served `getstatic`/`putstatic` and `new`
+   never got it. The saving is doubled at this call site because it also skips
+   the `jit_thread_mut()` acquire taken purely to have a thread to pass in.
+   Measured, ONE binary, 12 ABBA pairs, 24 samples per arm:
+
+   | shape | memo on | memo off |
+   |---|---|---|
+   | `new Object()` | min **106.4**, p25 120.3, med **125.2** | min 122.4, p25 129.9, med 139.6 |
+   | `FtlRate` (the real loop) | min 166.4, med 208.4 | min 163.8, med 204.6 |
+
+   **10-13% on pure allocation and nothing measurable on this page's own loop**,
+   where allocation is a smaller share of a ~200 ns operation. Kept because it
+   is a strict improvement with a JVMS §5.5 monotonicity argument, and recorded
+   here at its real size rather than at the 12.2% its profile share suggested.
+   `CRATONVM_JIT=-new-class-init-memo` is the A/B.
+
+4. **Constructor inlining**, unchanged — what lets IR-level escape analysis
+   scalar-replace the allocation while keeping the atomic side effect.
+
+## An adjacent decision this reopens, but does not settle
+
+`real-new-site-flags` is off by default, and the stated reason is the neutral
+measurement corrected above. On Generational and G1 it is worth 2.9-5.6x
+**today**, with no VM change at all.
+
+That is not sufficient to flip it, and this page is not claiming it should be.
+`skip_helper` elides `jit_post_tlab_init`, which installs non-zero primitive
+`Value` discriminants and registers finalizers; a wrong `has_prim_init` /
+`has_finalizer` is silent corruption, not a slow path, which is why the
+conservative `(true, true)` existed. What has been run is
+`regression-suite/run.sh` across six arms — Generational, G1 and default, flag
+on and off — **72 passed, 0 failed in every one**. That is a floor, not a
+clearance: the map-view fail-fast attempt passed `cratonvm-native-collections`
+136/136 and still killed every Spring Boot class in ~1.5 s. A real clearance
+needs the map- and allocation-heavy Spring Boot and netty classes on
+Generational with the flag on.
 
 ## Ground truth
 
-Re-run on the 08-17 binary with a **2400-second cap**: still `rc=124`. Re-run
-again on the FINAL 08-17 binary — constructor bind, real new-site flags
-available, and the IR-intrinsic refusal all in — **still `rc=124`**. Two
-independent runs. No `@@TESTFAIL` in either: nothing has failed, the loop is
-simply still going.
+Unchanged, and re-confirmed on the 2026-08-26 binary. `probes/FtlRate`, default
+collector, host load 22-25:
 
-That run was on a host under load 20-35 from unrelated work, which inflates
-it. The microbenchmark extrapolation on a quiet host is ~430-500 s, and the
-real run is consistently worse than the steady-state probe predicts, because
-2.1 billion immediately-dead allocations against a 1500 m heap pay a GC cost
-the probe does not.
+```
+ftl ns/op=173.4  fullLoopSec=372   advanced=5000000
+ftl ns/op=210.4  fullLoopSec=452   advanced=5000000
+ftl ns/op=226.2  fullLoopSec=486   advanced=5000000
+```
+
+`advanced` matching the iteration count on every arm is the correctness half
+holding. HotSpot on the same host: 8.4-47.5 ns/op, i.e. 18-102 s for the whole
+loop.
 
 ## The per-call spill, narrowed 2026-08-26
 
-Not this page's allocation cost, but the other half of the same wall and worth
-recording here because this is the family page. `emit_pre_safepoint_spill`
-emitted a 14-store blind copy of the whole GPR file at EVERY GC-capable call;
-it is now elided where the caller frame is provably oop-clean
-(`CRATONVM_JIT_CALL_SPILL_ELISION`, default on), which is **1.4–2.2x on every
-call shape** in `probes/CallArgCostProbe.java`. It does not fire on
-reference-manipulating frames — 100% of the refusals on real netty loops are the
-single clause `ref-local-in-reg` — so the next lever there is narrowing the
-spill to the registers that can hold an oop. See
+Not this page's allocation cost, but the other half of the same wall, and
+recorded here because this is the family page. `emit_pre_safepoint_spill`
+blind-copied the whole GPR file — 14 stores — into frame slots at EVERY
+GC-capable call; it is now elided where the caller frame is provably oop-clean
+(`CRATONVM_JIT_CALL_SPILL_ELISION`, default on), which is **1.4-2.2x on every
+shape of compiled call** in `probes/CallArgCostProbe.java`. It does NOT fire on
+reference-manipulating frames: 100% of the refusals on both netty exhaustive
+loops are the single clause `ref-local-in-reg`, with the operand-stack,
+scratch-survivor and moving-young clauses all zero. The next lever there is to
+NARROW the spill to the registers that can hold an oop rather than elide it. See
 `performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
 
-## Recommendation
-
-Unchanged in shape, better in size: leave this as a recorded throughput gap.
-
-A `class-overrides.tsv` floor would convert the HANG into a real result, and
-would also let the class's **other 12 tests** report for the first time — they
-are not known to fail, they simply never reach `@@RESULT`, because JUnit runs
-`testConstructionWithIndex` in the same fork and the harness kills it at the
-wall. That trade is worth revisiting once item 1 lands and the required cap is
-minutes rather than tens of minutes. At the current cost the class would still
-be the slowest in a 657-class suite by a wide margin, which is why no row is
-added yet.
 
 ## Repro
 
@@ -150,7 +219,10 @@ echo io.netty.util.concurrent.FastThreadLocalTest > /tmp/one.txt
 CV_BIN=<binary> bash run-netty-suite.sh --list /tmp/one.txt --shards 1 --timeout 2400 --out /tmp/repro
 ```
 
-`probes/FtlRate.java` (the real loop) and `probes/CtorShapeRateProbe.java`
-(the same loop split into allocation / atomic / constructor shapes) are the
-quick way to re-check progress. **Interleave the arms** — a loaded host moves
-every number, including `atomicOnly`, which no change in this area can touch.
+`probes/FtlRate.java` and `probes/CtorShapeRateProbe.java` are the quick
+re-check. **Interleave the arms, and take the MINIMUM, not the mean.** A first
+attempt at the item-3 A/B used three interleaved pairs and produced arms that
+disagreed *between shapes* — `alloc` said the memo helped, `ftl` said it hurt —
+with ~2x spread inside a single arm at load 22-25. Twelve pairs and a
+min/p25/median summary resolved it. On this host the mean is a measurement of
+who else is on the box.

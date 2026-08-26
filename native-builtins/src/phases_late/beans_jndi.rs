@@ -890,10 +890,14 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         // implementation would.
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // `isUserNode()` is real Java and can move `this` before
+            // `absolutePath()` below dereferences it.
+            let this_pin = ctx.pin_native_root(this);
             let user = matches!(
                 ctx.invoke_virtual(this, "isUserNode", "()Z", &[])?,
                 Some(Value::Int(v)) if v != 0
             );
+            let this = ctx.read_native_pin(this_pin, this);
             let path = match ctx.invoke_virtual(this, "absolutePath", "()Ljava/lang/String;", &[])? {
                 Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),

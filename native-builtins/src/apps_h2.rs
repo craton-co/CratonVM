@@ -2504,10 +2504,14 @@ fn h2_constraint_run_existing_data_query(
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
+        // `next()` walks a real ResultSet and can collect, moving `result`
+        // before `close()` dereferences it.
+        let result_pin = ctx.pin_native_root(result);
         let has_bad_row = matches!(
             ctx.invoke_virtual(result, "next", "()Z", &[])?,
             Some(Value::Int(v)) if v != 0
         );
+        let result = ctx.read_native_pin(result_pin, result);
         let close_result = ctx.invoke_virtual(result, "close", "()V", &[]);
         if let Err(e) = close_result {
             return Err(e);
