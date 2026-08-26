@@ -360,7 +360,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// That is not a hypothetical pairing: the corrupt-`Value`-cell producer closed
 /// on 2026-08-22 was exactly this kind confusion, identified as
 /// `receiver_class=java/lang/String receiver_kind=Array`
-/// (`docs/internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
+/// (`fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
 ///
 /// **Counted, not refused.** Refusing would be a behaviour change, and this
 /// helper has fifteen call sites of which several do not visibly pre-branch on
