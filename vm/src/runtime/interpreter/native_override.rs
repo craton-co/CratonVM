@@ -7116,6 +7116,54 @@ fn stub_door_note(file: &'static str, line: u32, class_name: &str, verdict: bool
     }
 }
 
+/// `CRATONVM_DBG_NATIVE_ENTRY` — tally native-funnel entries by CALL SITE.
+///
+/// Companion to [`dbg_stub_door`]: that one says which doors ASK the
+/// `SyntheticStub` arbitration, this one says which code path actually INVOKES
+/// a native. A triple entered millions of times that appears at no door at all
+/// is a dispatch path with no arbitration in it — which is the shape both were
+/// built to hunt.
+///
+/// It earned its keep immediately. Instrumenting only `safe_native_call` showed
+/// ~10 000 entries where the probe makes 600 000 native calls; the hot paths
+/// use `safe_native_call_prevalidated_objects`, and once that was counted too
+/// the answer was one line: `vm/src/jit/helpers.rs` x598 302, i.e. the JIT's
+/// site-cached native dispatch serves essentially all of it.
+pub(crate) fn dbg_native_entry() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NATIVE_ENTRY").is_some())
+}
+
+static NATIVE_ENTRY_TALLY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, u32), u64>>,
+> = std::sync::OnceLock::new();
+
+pub fn native_entry_note(file: &'static str, line: u32) {
+    let m =
+        NATIVE_ENTRY_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut g) = m.lock() {
+        *g.entry((file, line)).or_insert(0) += 1;
+    }
+}
+
+/// Print the [`dbg_native_entry`] tally, busiest call site first.
+pub fn report_native_entry_tally_at_exit() {
+    if !dbg_native_entry() {
+        return;
+    }
+    let Some(m) = NATIVE_ENTRY_TALLY.get() else {
+        return;
+    };
+    let Ok(g) = m.lock() else { return };
+    let mut v: Vec<_> = g.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("[NATIVE-ENTRY] native-funnel entries, by call site:");
+    for ((file, line), n) in v.into_iter().take(12) {
+        eprintln!("[NATIVE-ENTRY]   {file}:{line}  x{n}");
+    }
+}
+
 /// Print the [`dbg_stub_door`] tally. Called from the same exit path as the
 /// other census dumps.
 pub fn report_stub_door_tally_at_exit() {

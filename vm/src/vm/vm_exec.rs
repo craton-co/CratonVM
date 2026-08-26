@@ -3310,12 +3310,28 @@ fn forward_boundary_args<'a>(
     }
 }
 
+#[track_caller]
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    // DIAGNOSTIC (perf/invokeinterface-native-arbitration-20260824).
+    //
+    // `java/util/ArrayList$Itr.hasNext`/`next` are entered 2 000 000 times on a
+    // 2000x1000 walk and NEVER appear at any of the six
+    // `real_protected_stub_class` doors -- while `cratonvm/internal/
+    // UnmodifiableListItr`, also an iterator reached by `invokeinterface`, DOES
+    // appear at two of them. So "interface calls bypass the arbitration" is not
+    // the rule, and the next question is which of this function's 77 callers
+    // actually invokes the Itr natives.
+    //
+    // `#[track_caller]` again rather than 77 hand-placed traces.
+    if crate::runtime::interpreter::dbg_native_entry() {
+        let l = std::panic::Location::caller();
+        crate::runtime::interpreter::native_entry_note(l.file(), l.line());
+    }
     safe_native_call_impl(shared, thread, callback, args, false)
 }
 
@@ -3323,12 +3339,21 @@ pub fn safe_native_call(
 /// `Value::Object` against this VM's heap. It preserves ordinary native-call
 /// pinning and all return/exception handling while avoiding a duplicate heap
 /// membership search for each argument.
+#[track_caller]
 pub(crate) fn safe_native_call_prevalidated_objects(
     shared: &SharedVm,
     thread: &mut JvmThread,
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    // Same tally as `safe_native_call`. This variant is the one the HOT paths
+    // use -- the first pass instrumented only the other wrapper and saw ~10 000
+    // entries where the probe makes 600 000 native calls, which is how this
+    // split came to light.
+    if crate::runtime::interpreter::dbg_native_entry() {
+        let l = std::panic::Location::caller();
+        crate::runtime::interpreter::native_entry_note(l.file(), l.line());
+    }
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 

@@ -100,6 +100,22 @@ fn ka_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
 fn ka_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // An alias spelling — an OID, in practice — becomes the name
+    // `ka_spi_class` knows. Seeding `Alg.Alias.KeyAgreement.<oid>` gets the
+    // caller past the ownership gate and no further: this table is
+    // hand-written and never consulted the registry. Six measured rows
+    // (four SunEC, two SunJCE) resolved on HotSpot and refused here.
+    //
+    // A third-party alias whose canonical this table does not know leaves
+    // `alg` untouched, so the `third_party_service_class` lookup below
+    // still sees the spelling the caller used.
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        requested_provider.as_deref(),
+        "KeyAgreement",
+        &alg,
+        &|name| ka_spi_class(name).is_some(),
+    )
+    .unwrap_or(alg);
     // A named THIRD-PARTY provider supplies its own `KeyAgreementSpi`. Every
     // native on this class already forwards to whatever SPI sits in the slot, so
     // this is a change of which class gets constructed and nothing else — but it

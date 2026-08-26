@@ -1360,6 +1360,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
     E { group: Group::GC, token: "format-arg-pin", on_key: None, off_key: Some("CRATONVM_NO_FORMAT_ARG_PIN"), off_word: None },
+    // Declared 2026-08-24. An OPT-OUT: the JIT entry chain moves the compile-id
+    // mirror together with the RBP mirror by default. This key restores the
+    // behaviour where only the RBP half was reset on push and restored on pop,
+    // which left the pair naming two different frames. See
+    // `conservative_roots::reload_top_rbp_cache`.
+    E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
     // built it, instead of giving up whenever that method is not the chain
