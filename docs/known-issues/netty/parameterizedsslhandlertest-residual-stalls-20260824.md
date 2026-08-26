@@ -343,6 +343,45 @@ HANDED BACK was already stale: this is not "a native forgot to pin", it is
 Two remain, they need different fixes, and the page does not pick between
 them. What is established is the holder and that its pin did not hold.
 
+### A second unrecorded-forward hole, found by inspection — and its engagement is ZERO
+
+Mechanism 2 above ("the forward was never recorded") turns out to have a real
+instance, and it is the same shape as one already fixed. `evacuate`'s parallel
+path can return a forwarding address three ways, and only two of them recorded
+it in `forwards` — which becomes the cycle's `pointer_map`:
+
+| path | recorded? |
+|---|---|
+| fast path: already forwarded when we looked | yes — DEFECT-2 part 1 |
+| we won the CAS and copied | yes |
+| **we LOST the CAS to another worker** | **no** |
+
+The third arm returned the winner's target and dropped `old_ptr -> target`,
+which is verbatim what DEFECT-2 part 1 fixed for the first — and that fix's own
+comment names the symptom it leaves: *"no root naming `old_ptr` could be
+remapped … it dangled when the region was reused (the rare
+`java/lang/Object`)."* It also has the right shape for the load dependence this
+page has recorded since 2026-08-24 and never explained: losing that CAS needs
+TWO WORKERS RACING ON ONE OBJECT, so it gets commoner exactly as parallelism
+rises.
+
+That is a good story, and **the counter shipped with the fix refuses it.**
+`CRATONVM_DBG=jit-method-stats` prints the arm's hit count at exit:
+
+```
+[cratonvm] G1 evacuation CAS losses (forwards this VM would have dropped
+           before the 2026-08-26 fix): 0
+```
+
+**Zero, on a full clean whole-class run at 600m** — 63 tests, the same
+configuration the catches come from. So the hole is real and worth closing, but
+on this workload the arm is not reached and it **cannot be what stalls this
+test**. The fix is landed as a latent defect, not as this page's answer.
+
+What the zero does NOT settle: a clean run is not a stalling one, and the arm
+needs the race that load produces. `huntloop.sh` now prints the counter on
+every run, so the next CATCH carries its own answer for the run that failed.
+
 ### The fix A/B is INCONCLUSIVE, and the reason is worth more than the table
 
 Second attempt, 61 unfixed / 61 fixed runs interleaved at 600m:
