@@ -247,14 +247,18 @@ and `invocations` stays at 127 in every arm and every mode. The refusal is
 therefore in the **dispatch path**, not in the registration, the allow-list or
 the predicate — and not in the JIT, since `--nojit` refuses identically.
 
-**The next probe is named:** `dispatch_virtual` has three doors that could serve
-`ArrayList.get` — `execute_invokevirtual_vtable_fast`'s
-`registered_native_will_run` (line ~150), the population filter on
-`resolve_cached_native_registration` (line ~3261), and `revalidate_cached_native`
-on cache hits. All three spell the same three-term test. Put one trace line in
-each, run `probes/ListYieldProbe`, and the door that never prints is the answer.
-Do not add another allow-list entry before doing that; two attempts have now
-been spent assuming the arbitration is reached.
+**~~The next probe is named~~ — RUN, and it answered the opposite of what the
+question assumed.** All three doors print. The arbitration was never the
+problem; the instrument was. See the retraction above and the 11.1× fix that
+came out of it.
+
+What the probe left behind is `CRATONVM_DBG_STUB_DOOR=1`, a `#[track_caller]`
+tally of every `real_protected_stub_class` question by CALL SITE, class and
+verdict, dumped at exit. It is a tally rather than a line per call because this
+predicate is on the dispatch path. It also found a **sixth** door this page had
+never listed (`vm_exec.rs:19183`), which is the other reason to prefer
+`#[track_caller]` over hand-placed traces: a hand-written list of doors is a
+list of the doors you already knew about.
 
 **~~And it silently disabled the Objects yield.~~ RETRACTED 2026-08-24 — that
 claim was wrong.** It was published off one paired reading (`Objects.equals`
@@ -277,18 +281,51 @@ until it was bisected. What the original reading actually was is not known; it
 was taken against a binary built at an earlier dev commit, which was not
 re-tested.
 
-**`invocations` is the instrument that settles this, not ns/call.**
-`--dump-native-registry` writes a row per registered triple carrying
-`invocations`, `kind`, `owns_slot`, `registered_by`, `overwrote` and a
-`real_declaring_method` block. `java/util/Objects.equals` reading
-**`invocations: 0`** is a far better proof that Term 3 works than any timing:
-the native is never entered at all. Every question on this page that is really
-"did the native run?" should be asked this way.
+**~~`invocations` is the instrument that settles this, not ns/call.~~ ALSO
+RETRACTED, same day, and this one matters more than the first.** The native
+census's `invocations` **SATURATES**. It reads the same `127` for
+`ArrayList.get` whether the probe does 5 000 iterations or 50 000, and it
+prints **`invocations_complete: false`** in the very same JSON row to say so.
+I read past that field twice and built a four-arm bisect on a counter that
+could not move. The four arms agreeing proved nothing whatsoever.
 
-**What DID survive the bisect is the engagement failure**, and it is sharper
-than first stated. `ArrayList.get` runs its native 127 times in all four arms,
-under `--nojit` as well as compiled — so it is not the JIT site cache, and the
-interpreter refuses it too.
+(The first retraction above still stands — it rests on the A-vs-D *timings*,
+which were measured directly and were within noise. Only the invocation-count
+argument is withdrawn.)
+
+**And the conclusion drawn from it was wrong too.** "The arbitration is never
+reached" is false. A `#[track_caller]` tally on `real_protected_stub_class`
+(`CRATONVM_DBG_STUB_DOOR=1`, shipped with this) shows `java/util/ArrayList`
+asked at **all three** virtual doors on a plain `ListYieldProbe` run:
+
+```text
+[STUB-DOOR] dispatch_virtual.rs:168   java/util/ArrayList -> false  x3
+[STUB-DOOR] dispatch_virtual.rs:3235  java/util/ArrayList -> false  x9
+[STUB-DOOR] native_override.rs:6983   java/util/ArrayList -> false  x381
+```
+
+`-> false` only because the class was not allow-listed. Arm it, and it yields.
+
+### The fix: one allow-list entry, 11.1×
+
+`java/util/ArrayList` joins `real_protected_stub_class_common`. MEASURED on one
+tree, three interleaved rounds, µs/call at width 1000:
+
+| rung | unarmed | armed | effect |
+|---|---:|---:|---:|
+| `idxList` (1000 × `list.get(i)`) | 744.5/751.5/760.5 | **67.5/67.0/68.5** | **11.1×** |
+| `toArrHoisted` (Spring's door) | 113.5/108.0/110.0 | 97.0/95.0/95.5 | 1.15× |
+| `iterList` (the iterator) | 1023.5/960.0/978.5 | 963.5/985.5/964.5 | flat |
+| `rawArr` (**control**, no collection) | 20.0/20.0/17.5 | 17.0/18.0/20.5 | flat |
+
+The iterator does not go through `get`, so it does not move — which is also
+what says the 11.1× is `get` and not a warmer VM. An earlier reading had
+`hoisted` looking 15% worse under the armed arm; on a quiet host it is
+578/592/650 against 585/578/585, i.e. one noisy round.
+
+**Two attempts were reverted before this one, both on the saturating counter,
+both concluding "it does not engage".** Both were wrong. The yield worked the
+whole time. Score this class by TIME; `invocations` cannot see it.
 
 **Still open, unchanged:** ~6× is available on indexed list access if the
 engagement problem is solved. Do NOT extend it to the iterator family on the
