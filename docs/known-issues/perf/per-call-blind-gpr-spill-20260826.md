@@ -1,9 +1,16 @@
-# The 14-store blind GPR spill at every compiled call — halved, and what still blocks the rest
+# The 14-store blind GPR spill at every compiled call — halved for oop-clean frames, OPEN for every other frame
 
-**Status: LANDED 2026-08-26**, `CRATONVM_JIT_CALL_SPILL_ELISION` (default `mic`,
-`=0` restores the old route). A compiled call's overhead drops **~2x on every
-call shape** where the caller frame is provably oop-clean, and the ONE clause
-that refuses everywhere else is now counted by name.
+**Status: OPEN, throughput.** Half of this is done and half is not, and the
+open half is why this page is in `known-issues/` rather than in the internal
+record: a compiled call still carries a blind 14-store copy of the whole GPR
+file on **every frame that holds a reference in a register-homed local**, which
+is most real code. What landed 2026-08-26
+(`CRATONVM_JIT_CALL_SPILL_ELISION`, default `mic`, `=0` restores the old route)
+elides that spill where the caller frame is provably oop-clean — **~2x on every
+call shape** there — and, more usefully for whoever picks this up, it makes the
+remaining refusals countable: they are **100% one clause**, and
+[the next lever](#the-next-lever-therefore-is-to-narrow-the-spill-not-to-elide-it)
+is named at the bottom of this page.
 
 All numbers: **Azure Linux host `vm1`, quiet (load 3.9–4.7)**, 2026-08-26,
 release build, real-JDK mode, ONE binary with the flag off and on, eight
@@ -202,10 +209,13 @@ CRATONVM_DBG_JIT_DISASM=CallArgCostProbe.armInt1 cratonvm --java-home <jdk> -cp 
 
 ## Related
 
-* `../../known-issues/netty/httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`
-  and its sibling — the two pages whose entire remainder is this wall. This
-  narrows the wall for oop-free frames and, as measured above, not for theirs.
-* `../../known-issues/netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`
+* [`../netty/httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](../netty/httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md)
+  and [its sibling](../netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
+  — the two pages whose entire remainder is this wall. This narrows the wall for
+  oop-free frames and, as measured above, not for theirs.
+* [`../netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](../netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)
   — the family page for the same wall.
-* `a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md` — the
-  previous per-call cost to be measured and closed.
+* [`interpreted-invoke-cost-350ns-20260825.md`](interpreted-invoke-cost-350ns-20260825.md)
+  — the same question one tier down, for calls that never reach compiled code.
+* `performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+  (internal) — the previous per-call cost to be measured and closed.
