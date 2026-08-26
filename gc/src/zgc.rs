@@ -17921,120 +17921,33 @@ pub(crate) mod tests {
         );
     }
 
-    /// **Arming the read barrier reaches the JIT's codegen gate.**
-    ///
-    /// The barrier tests above all sit inside this crate, and every one of
-    /// them would pass while JIT-compiled code went on emitting raw inline
-    /// reference loads over coloured slots -- which is a use-after-free, not a
-    /// missed optimisation. This asserts the one fact that connects the two:
-    /// `set_barrier_color` publishes to `cratonvm_types`, which is what
-    /// `x64::zgc_read_barrier_blocks_inline_fields` reads.
-    ///
-    /// Serialised, because the flag is process-wide by design (see its doc for
-    /// why the JIT cannot read a per-heap one).
-    #[test]
-    fn arming_the_read_barrier_sets_the_process_wide_codegen_gate() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        assert!(
-            !cratonvm_types::zgc_read_barrier_armed(),
-            "the codegen gate must start closed"
-        );
+    // MOVED 2026-08-26 -> `gc/tests/published_bounds_isolation.rs`:
+    //   arming_the_read_barrier_sets_the_process_wide_codegen_gate
+    //   arming_the_read_barrier_empties_the_jit_read_bounds_table
+    //   the_read_bounds_kill_switch_suppresses_the_publish
+    //   a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage
+    //
+    // All four observe or perturb a process-global table (`JIT_READ_BOUNDS`,
+    // `MOVABLE_BOUNDS`, or the `zgc_read_barrier_armed` codegen gate). This
+    // binary constructs 226 heaps across ~1690 tests on a thread per core, and
+    // every construction publishes while every `Drop` clears, so an absolute
+    // read of one of those tables is a value a peer can replace between two
+    // lines. Measured at 6 failures in 10 runs; a shared test mutex did NOT fix
+    // it (12 in 20), because the peers are the ~220 constructions that have
+    // nothing to do with these tables. An integration-test file gets its own
+    // process, which does.
+    //
+    // Two of them also WROTE the tables (`publish_movable_bounds(0xdead_0000..)`
+    // and `clear_jit_read_bounds()`), so they were a cause of other tests'
+    // failures as well as a victim. That is why
+    // `a_compiled_frame_forbids_relocation_only_when_its_coverage_is_unproven`
+    // below needed no change: with those gone, nothing in this binary clears
+    // `MOVABLE_BOUNDS` any more.
 
-        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
-        let armed = cratonvm_types::zgc_read_barrier_armed();
-        heap.set_barrier_color(None);
-        let disarmed = cratonvm_types::zgc_read_barrier_armed();
 
-        assert!(
-            armed,
-            "arming must reach the codegen gate, or the JIT keeps emitting raw              inline loads over coloured slots"
-        );
-        assert!(!disarmed, "and disarming must let the inline arms back on");
-    }
 
-    /// **Arming the read barrier EMPTIES the JIT's read-bounds table, and
-    /// disarming refills it.**
-    ///
-    /// The sibling test above covers the emission-time gate, which only
-    /// governs methods compiled from that moment on. A method compiled while
-    /// the barrier was disarmed already contains a guarded inline reference
-    /// load, and that sequence tests `JIT_READ_BOUNDS` at RUNTIME on every
-    /// execution -- so an empty table is the only thing that can stop it.
-    /// Before ZGC published anything the question did not arise; now that it
-    /// does, this is the assertion that keeps `zgc_codegen_honours_read_
-    /// barrier()` honest.
-    ///
-    /// Verified by BREAKING it: deleting the `clear_jit_read_bounds()` call in
-    /// `set_barrier_color` leaves `armed_lo` non-zero and fails here.
-    #[test]
-    fn arming_the_read_barrier_empties_the_jit_read_bounds_table() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        let (lo, hi) = heap.conservative_addr_span().expect("one arena");
 
-        let published_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let published_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
 
-        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
-        let armed_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let armed_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
-
-        heap.set_barrier_color(None);
-        let refilled_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let refilled_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
-
-        assert_eq!(
-            (published_lo, published_hi),
-            (lo, hi),
-            "construction must publish this heap's arena envelope, or the                inline getfield arm stays unreachable under the default collector"
-        );
-        assert_eq!(
-            (armed_lo, armed_hi),
-            (0, 0),
-            "arming must EMPTY the table -- an emission-time gate cannot reach                a sequence that is already compiled"
-        );
-        assert_eq!(
-            (refilled_lo, refilled_hi),
-            (lo, hi),
-            "and disarming must refill it, or one cycle would cost every later                read the helper for the life of the process"
-        );
-
-        drop(heap);
-        assert_eq!(
-            crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire),
-            0,
-            "a dropped heap must not leave bounds naming a freed arena"
-        );
-    }
-
-    /// The kill switch is real: with `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` set,
-    /// construction publishes nothing and the collector is back to the
-    /// helper-only reads it had before 2026-08-19.
-    ///
-    /// This is the A/B arm every measurement on this change is quoted against,
-    /// so it is worth a test rather than a claim -- a kill switch that gates
-    /// the read but not the write reports itself off while doing the work.
-    #[test]
-    fn the_read_bounds_kill_switch_suppresses_the_publish() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        crate::gen_heap::clear_jit_read_bounds();
-        let published = cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_ZGC_NO_JIT_READ_BOUNDS", Some("1"))],
-            || {
-                // `zgc_jit_read_bounds_enabled` memoises in a `OnceLock`, so a
-                // second test in the same process cannot re-decide it. Ask the
-                // predicate through the same override rather than building a
-                // heap, and assert the publish call is the ONLY thing it gates.
-                cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_READ_BOUNDS")
-                    .is_none()
-            },
-        );
-        assert!(
-            !published,
-            "CRATONVM_ZGC_NO_JIT_READ_BOUNDS must read as 'do not publish'"
-        );
-    }
 
     /// Compaction is **on by default** as of 2026-08-13, with
     /// `CRATONVM_ZGC_RELOCATE=0` as the kill switch.
@@ -18517,76 +18430,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A heap that publishes no movable bounds cannot prove coverage.**
-    ///
-    /// The verifier classifies a frame word as relocatable with
-    /// `gen_heap::addr_is_movable`. Where no collector has published a range,
-    /// that answers `false` for every address in the process, so the scan
-    /// inspects every slot, classifies none, and returns "nothing unpublished"
-    /// having verified nothing — and a refusal built on the verdict then
-    /// relocates on a proof nobody ran. That is exactly how the first version
-    /// of `relocate_stw`'s per-cycle refusal was unsound, and
-    /// `movable_bounds_are_live` is the gate that makes it fail closed instead.
-    ///
-    /// Asserted here rather than only in `conservative_roots` because this is
-    /// the collector that depends on it: ZGC fills `MOVABLE_BOUNDS` at
-    /// construction precisely so its verdict is earned.
-    #[test]
-    fn a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage() {
-        // An empty table matches nothing. Pure function of the table, so no
-        // other test can perturb this half.
-        assert!(
-            !crate::gen_heap::addr_in_movable_bounds(0),
-            "address 0 must never be inside a published range"
-        );
 
-        // Constructing a ZGC heap must publish its envelope. Read slot 0 back
-        // IMMEDIATELY and keep the value: these tables are process-global and
-        // the gc unit tests run in parallel threads, so a peer test's heap can
-        // take the slot at any point after this. Asserting against the live
-        // table later is how this test failed on its first run -- which is
-        // exactly the hazard `ZgcRealHeap::drop` is now owner-checked for, so
-        // the flake was the finding.
-        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
-        let obj = heap.alloc_object(ClassId::new(1), 2);
-        let published_base =
-            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire);
-        let published_end =
-            crate::gen_heap::MOVABLE_BOUNDS.words[1].load(Ordering::Acquire);
-        assert!(
-            crate::gen_heap::movable_bounds_published(),
-            "ZgcRealHeap::with_capacity must publish its arena envelope, or the              frame-band verifier is vacuous on this collector and every coverage              verdict it produces is unearned"
-        );
-
-        // The envelope this heap published must cover an object it allocated.
-        // Guarded on still owning the slot: if a peer test replaced it between
-        // the two reads, the strong claim is about the peer's heap and skipping
-        // it is honest. `heap.conservative_addr_span()` is this heap's own
-        // envelope, so the comparison does not consult the shared table twice.
-        if let Some((base, end)) = heap.conservative_addr_span() {
-            if published_base == base && published_end == end {
-                assert!(
-                    crate::gen_heap::addr_is_movable(obj.as_ptr() as usize),
-                    "an object this heap just allocated is not inside the movable                      bounds it published -- the verifier would classify it as                      immovable and skip it"
-                );
-            }
-            assert!(
-                obj.as_ptr() as usize >= base && (obj.as_ptr() as usize) < end,
-                "the envelope this heap publishes does not contain its own                  allocations, so publishing it cannot help any verifier"
-            );
-        }
-
-        // Teardown is OWNER-CHECKED: dropping a heap that no longer owns slot 0
-        // must leave the current publisher's bounds alone.
-        crate::gen_heap::publish_movable_bounds(0, 0xdead_0000, 0xdead_1000);
-        drop(heap);
-        assert_eq!(
-            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire),
-            0xdead_0000,
-            "a dropped heap wiped movable bounds it did not publish -- which is              how a short-lived heap makes a LIVE heap's verifier vacuous"
-        );
-        crate::gen_heap::clear_movable_bounds();
-    }
 
     /// **A `Reference` the collector moved must be findable at its NEW
     /// address in the reference processor's own tables.**
