@@ -419,17 +419,66 @@ Two gates that are NOT the cause, checked and eliminated:
 **no exception table** (`javap -c` on the real JDK class), so the
 `cached.exception_table.is_empty()` precondition passes.
 
-**What is still open, and it is now one question rather than a mystery.**
-Retagging the `Itr` natives `SyntheticStub` makes them yield, so the site
-*ought* to cache `VirtualBytecode` and tier up — and it measured 1.56× SLOWER
-with zero compiles. `ArrayList.get` yields and does compile. So for the `Itr`
-triples the yield is evidently happening on the SLOW path
-(`invoke_or_native`) rather than at cache-population time, leaving the site
-uncached: every call takes the generic dispatcher, which is both slower than the
-native AND still has no counter. **Yielding is not sufficient; the yield has to
-happen where the site is POPULATED.** Find why population declines for an
-`invokeinterface`-reached `Itr` triple where it accepts `ArrayList.get`, and the
-retag becomes the win the crossing count always suggested it should be.
+### The iterator: 6.2× is REAL and MEASURED, and one thing blocks it
+
+**Population never declined. The previous two arms were both mis-measured, one
+of them by an editing mistake of mine.**
+
+* *allow-list alone* — no effect, because term 1 of the yield predicate is
+  `kind != SyntheticStub → refuse` and these natives are `Bridge`.
+* *"retag + allow-list", reported as a 1.56× PESSIMISATION* — that arm's
+  allow-list entry had landed in `redefine_immune_synthetic_collection_native`
+  instead of `real_protected_stub_class_common`, forty lines of `matches!`
+  away, by a mis-anchored edit. **It was measuring the retag alone**, and the
+  retag alone is exactly a pessimisation: `resolve_native_site` refuses to cache
+  ANY `SyntheticStub`, so the site drops out of the JIT's native cache onto the
+  generic path — still running the native, by the expensive route. Confirmed
+  with `CRATONVM_DBG_NATIVE_ENTRY=1`: 599 065 funnel entries moved from
+  `jit/helpers.rs` to `vm_exec.rs` and the count did not fall.
+
+With the entry in the RIGHT function, both halves together do exactly what the
+crossing count predicted. One binary, `CRATONVM_ITR_BYTECODE` as the A/B,
+interleaved, µs/call:
+
+| rung | OFF (`Bridge`, today) | ON | HotSpot |
+|---|---:|---:|---:|
+| `iterList` | 944.0/972.5/965.0 | **150.0/159.0/153.0** | 6.0 |
+| `hoisted` (map-view itr) | 618.5/589.5/593.0 | 622.0/622.5/608.0 | 8.5 |
+| `iterSet` (HashSet itr) | 637.5/640.0/675.5 | 656.5/655.5/738.0 | 11.5 |
+| `idxList` | 82.0/69.5/72.0 | 67.5/67.5/83.5 | 6.0 |
+| `rawArr` (**control**) | 17.5/17.5/17.5 | 20.0/18.0/21.0 | 3.5 |
+
+**6.2×**, controls flat, and `ArrayList$Itr.hasNext`/`next` go from never
+appearing in `CRATONVM_DBG_JITC` to `admitted … full-compile`. It is also more
+CORRECT: `probes/ItrYieldProbe` (new, 39 rows — fail-fast, the `lastRet`
+contract, `remove()` interop, sublists, `Arrays.asList`, COW snapshot
+semantics, map views) is byte-identical to HotSpot with it ON, while **today's
+`Bridge` arm gets `cmeClear` wrong** — iterating while calling `list.clear()`
+does not throw `ConcurrentModificationException`.
+
+### What blocks it, exactly
+
+`for (String v : map.values())` throws a **spurious
+`ConcurrentModificationException`** from `ArrayList$Itr.checkForComodification`.
+The cause is already documented in `native-collections`: a `MAP_VIEW_CARRIERS`
+receiver **has no `modCount` slot**. It extends `AbstractCollection`, not
+`AbstractList`, so `AbstractList`'s resolved index names the carrier's own first
+declared field — `HashMap$Values.this$0` and friends, all REFERENCES. The native
+cursor tolerated that; the real one reads it as an int and compares it to
+`expectedModCount`.
+
+A values view hands out an `ArrayList$Itr`, the same class an ordinary list
+does, so a class-name allow-list cannot separate the two cases. **The enabling
+change is to mint a distinct iterator class for view carriers** (the
+`VALUES_ITR_CARRIERS` machinery already exists for the values families) so that
+`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its
+own. Do that and this 6.2× is available.
+
+**A coverage note worth acting on independently:** `regression-suite/run.sh`
+passed **72/72 on the broken binary**. A change that makes
+`for (v : map.values())` throw on the first element is invisible to the suite;
+`probes/MapViewBehaviourProbe` caught it immediately. That gap is worth a vector
+regardless of what happens to this fix.
 
 ### The fix: one allow-list entry, 11.1×
 
