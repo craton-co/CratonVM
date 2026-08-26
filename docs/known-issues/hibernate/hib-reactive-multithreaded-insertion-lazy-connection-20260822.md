@@ -754,8 +754,8 @@ is generated and machine-local, so it is not committed.
 - `apps/hibernate-reactive/hibernate-reactive-core/src/test/java/org/hibernate/reactive/MultithreadedInsertionWithLazyConnectionTest.java`
 - `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`, `hibfix-seqcheck.sh`, `hibfix-commitcheck.sh`, `hibfix-seqtime.sh`, `HibfixComposeProbe.java`, `HibfixVertxBridgeProbe.java`, `hibfix-wtcheck.sh`, `hibfix-arms.sh`, `hibfix-jitab.sh`, `hibfix-seqrace.sh`, `HibfixThreadIdentityProbe.java`
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
-- [`../../internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`](../../internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md) §8
-- [`../../internal/fixed-suite-bugs/hibernate/batchtest-mysql-jdbc-batching-NOT-A-VM-DEFECT-20260822.md`](../../internal/fixed-suite-bugs/hibernate/batchtest-mysql-jdbc-batching-NOT-A-VM-DEFECT-20260822.md) — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
+- `fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` §8
+- `fixed-suite-bugs/hibernate/batchtest-mysql-jdbc-batching-NOT-A-VM-DEFECT-20260822.md` — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
 
 ---
 

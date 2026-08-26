@@ -224,6 +224,72 @@ dereferences as an `ObjectHeader` — a memory-safety hole `concurrent_mark.rs`'
 own comment already worried about for the *tearing* case while leaving the
 *invalid-tag* case open.
 
+## 2.5 §0.5 item 2 is ANSWERED for the concurrent marker: yes, via TOCTOU on the header
+
+§2.4 left item 2's audit question open — *can a G1/ZGC reader visit slot `n` of
+an object whose real slot count is below `n`?* For
+`concurrent_mark::scan_object` the answer is **yes**, and the route is not a
+missing bound but a second read of a racy header.
+
+The function does validate an extent. `concurrent_mark_object_size` reads a
+`ConcurrentMarkHeaderSnapshot`, cross-validates kind tag / element tag /
+gc-flag universe / size arithmetic, and returns
+`total_size = HEADER_SIZE + num_slots * SLOT_SIZE`; `scan_object` then requires
+
+```rust
+old_gen.contains(obj_ptr + total_size - 1)      // last byte is inside old-gen
+```
+
+and bails otherwise. That is a real check. **`total_size` is then never used
+again.** The slot loop re-read the header:
+
+```rust
+let num_slots = (header.num_slots() as usize).min(1 << 24);   // BEFORE
+for slot_idx in 0..num_slots { /* read a 16-byte Value */ }
+```
+
+So the count that was validated and the count that was walked are two separate
+loads of a header this very module treats as untrustworthy — the snapshot
+reader exists *because* a header can be torn or garbage, and
+`ConcurrentMarkHeaderSnapshot::read` deliberately uses unaligned per-field
+loads for that reason. Nothing makes the second load agree with the first. If
+it is the larger of the two, the loop reads slots beyond the bytes
+`old_gen.contains` approved, and `min(1 << 24)` does not help: it is a
+plausibility clamp with a reach of 16 M slots — 256 MB — not an extent.
+
+Fixed by inverting the arithmetic that was already validated, so the walk
+cannot outrun the checked bytes by construction:
+
+```rust
+let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;   // AFTER
+```
+
+The `1 << 24` clamp is unchanged in effect — it is enforced inside
+`concurrent_mark_object_size`, which returns `None` for anything larger and so
+exits through the guard above. `cargo test -p cratonvm-gc --release`: **1687
+passed, 0 failed.**
+
+### What this does and does not settle
+
+It removes a mechanism by which the marker could read past an object and hand
+whatever it found to `read_value_cell_checked` — which, since §2.3, screens the
+discriminant, so the pairing is now "bounded read, screened decode" rather than
+"unbounded read, unchecked transmute". Those two changes are complementary and
+neither subsumes the other.
+
+It is **not** a demonstration that this is what produced the eight `hs_err`
+files. No reproduction exists (§1), the crashing binaries are gone (§0.4), and
+the faulting instruction is a multi-arm jump table that none of the sites
+touched here contains. It is one concrete answer to one of §0.5's audit
+questions, on one of the three readers.
+
+**Still unanswered from §0.5 item 2:** `g1::for_each_flat_object_reference`
+iterates `first_index..header.num_slots()` with no validation *in the function
+at all* — it is a helper that trusts its caller, and its callers have not been
+audited. That is the obvious next piece of the same audit, and it was left
+alone here rather than changed blind. The `0x5B == 91` constant in
+`rbx`/`r8`/`r13` also remains unexplained.
+
 ## 2.4 What is left for whoever reopens this
 
 1. The producer (§2.2) — the stale-receiver defect that puts two heap pointers
@@ -233,10 +299,9 @@ own comment already worried about for the *tearing* case while leaving the
    slot address and both raw words. §0.5 item 1 still stands and is still the
    single most valuable thing to do — **keep the binary next to the `hs_err`**.
 3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
-   slot count?) is NOT answered by this section. The `num_slots` bound in
-   `concurrent_mark.rs` is still only a `min(1 << 24)` plausibility clamp, not a
-   real extent check, and `0x5B == 91` from the register dump remains
-   unexplained.
+   slot count?) is answered for the concurrent marker in **§2.5** — yes, by
+   TOCTOU on the header, now fixed — and remains open for
+   `g1::for_each_flat_object_reference`. `0x5B == 91` from the register dump remains unexplained.
 
 # 1. The 2026-08-21 not-reproducible investigation, preserved
 

@@ -5503,9 +5503,14 @@ fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(cls, "getThreadCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+    // REAL, and live: slot 0 is a snapshot `init_thread_mxbean_fields` takes
+    // once, at `<init>`. `ManagementFactory.getThreadMXBean()` hands back one
+    // cached bean, so reading the slot answered the thread count as of whenever
+    // that bean was first built -- forever. This is the same defect
+    // `getPeakThreadCount` below already names and fixes; it was fixed for one
+    // of the four counters and left in the other three.
+    r.register(cls, "getThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.active_thread_count())))
     });
     // REAL: read the live process-wide high-water mark rather than slot 1's
     // construction-time snapshot — otherwise `resetPeakThreadCount()` is
@@ -5514,13 +5519,21 @@ fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
     r.register(cls, "getPeakThreadCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(peak_thread_count(ctx))))
     });
-    r.register(cls, "getTotalStartedThreadCount", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+    // Live, for the reason `getThreadCount` above gives -- slot 2 is the same
+    // `<init>` snapshot. NOT a monotone ever-started count, which is what the
+    // JMM specifies and what neither registration of this triple ever
+    // provided: nothing in the VM counts thread STARTS, only live threads, so
+    // this can still go DOWN. Stated rather than papered over; a real counter
+    // needs a hook at thread start, which is a larger change than converging
+    // two bodies. `max(1)` because the calling thread is always one of them.
+    r.register(cls, "getTotalStartedThreadCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(i64::from(ctx.active_thread_count()).max(1))))
     });
-    r.register(cls, "getDaemonThreadCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+    // Live, same reason. `daemon_thread_count` is the helper
+    // `init_thread_mxbean_fields` already calls to FILL slot 3 -- calling it
+    // per query rather than once per bean is the whole change.
+    r.register(cls, "getDaemonThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(daemon_thread_count(ctx))))
     });
     // REAL: the calling thread's CPU and user time, read from the OS
     // scheduler's own per-thread accounting (`current_thread_cpu_time_ns`).

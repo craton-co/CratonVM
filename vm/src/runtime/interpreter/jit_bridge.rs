@@ -722,6 +722,26 @@ pub(super) fn compile_osr_artifact(
                 }
             }
 
+            // This method's own receiver profile, for the guarded String
+            // call-site intrinsics resolved below. The method-entry door gets
+            // one as a parameter (`try_compile_inner`'s `profile`) and screens
+            // its guarded intrinsics against it; this door never had one, so
+            // an OSR artifact would emit a `String` receiver guard at a
+            // `CharSequence` site the interpreter had already recorded
+            // thousands of non-`String` receivers at. Fetched once for the
+            // whole scan, not per site.
+            let osr_receiver_profile = {
+                let profile_key = crate::jit::profile::MethodKey {
+                    class_id: class_id.as_u32(),
+                    method_name: method_name.as_str().into(),
+                    descriptor: method_descriptor.as_str().into(),
+                };
+                shared.jit.profile_store.get_profile(&profile_key)
+            };
+            // Same `"<class>.<method>:<descriptor>"` key the deopt log and
+            // `method_epochs` use; see `despec_contains`.
+            let osr_despec_key = format!("{class_name}.{method_name}:{method_descriptor}");
+
             // Resolve invokes — collect info under lock, then compile callees after release
             let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
             let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
@@ -892,6 +912,44 @@ pub(super) fn compile_osr_artifact(
                                 desc,
                                 osr_string_layout,
                             )
+                            // The same screen the method-entry door applies: a
+                            // `CharSequence` site's `String` class-id guard
+                            // DEOPTS on a miss, so a bci the profile says is
+                            // hardly ever a `String` must not get one. See
+                            // `cratonvm_jit::receiver_profile_rejects_guard`.
+                            .filter(|&(_, _, _, guard_class_id)| {
+                                if guard_class_id == 0
+                                    || !cratonvm_jit::receiver_despec_enabled()
+                                {
+                                    return true;
+                                }
+                                let supported = cratonvm_jit::receiver_profile_supports_guard(
+                                    osr_receiver_profile.as_ref(),
+                                    pc,
+                                    guard_class_id,
+                                ) || cratonvm_jit::charseq_blind_guard_enabled();
+                                let by_profile = !supported
+                                    || cratonvm_jit::receiver_profile_rejects_guard(
+                                        osr_receiver_profile.as_ref(),
+                                        pc,
+                                        guard_class_id,
+                                    );
+                                let by_despec = cratonvm_jit::deopt::despec_contains(
+                                    &osr_despec_key,
+                                    pc as u32,
+                                );
+                                if by_profile {
+                                    cratonvm_jit::metrics::note_receiver_despec(
+                                        cratonvm_jit::metrics::RECEIVER_DESPEC_PROFILE_DECLINED,
+                                    );
+                                }
+                                if by_despec {
+                                    cratonvm_jit::metrics::note_receiver_despec(
+                                        cratonvm_jit::metrics::RECEIVER_DESPEC_DECLINED,
+                                    );
+                                }
+                                !(by_profile || by_despec)
+                            })
                         {
                             direct_calls2.push((
                                 pc,
@@ -3992,7 +4050,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // deploy interpreted — the method was rejected here *before* it was ever
     // counted, which is why `jit-method-stats` reported it neither compiled nor
     // `hot_but_stuck_in_interpreter`. See
-    // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
     //
     // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
     if cached.is_synchronized && !jit_sync_methods_enabled() {

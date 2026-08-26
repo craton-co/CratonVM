@@ -1,3 +1,120 @@
+> # CLOSED 2026-08-25 — both of this page's own exit criteria are met, and the third was never this page's work
+>
+> Retired to `fixed-suite-bugs/tomcat/`. Everything below is the investigation
+> as it stood, unedited; this header is the closing measurement and the hand-off.
+>
+> ## Criterion 1 — no test fails on deploy timing. MET.
+>
+> `org.apache.catalina.manager.TestManagerWebapp`, driven alone on
+> `origin/dev` `5a760532c` + this branch, Azure, load 16–22:
+>
+> | | CratonVM | HotSpot 25 |
+> |---|---|---|
+> | `testBug57700` (§ Symptom's first method) | **PASS** | PASS |
+> | `testDeploy` (§ Symptom's second method) | **PASS** | PASS |
+> | deploy of `/bug57700` | 15 506 / 16 618 ms | 1 363 / 1 466 ms |
+>
+> ≈ **11x**, against the ~16x this page recorded on 2026-08-07. The class as a
+> whole is `Tests run: 4, Failures: 2` — but the two that fail are **not this
+> page's**, and that is a measurement rather than an assertion: they fail
+> **identically on pristine `origin/dev`**, with the same two names and the same
+> count, on a binary built from the unmodified tree.
+>
+> * `testServlets` — `SocketTimeoutException` at `TestManagerWebapp.java:147`,
+>   which is `GET /manager/jmxproxy`. A JMX-proxy servlet failure.
+> * `testJsps` — bare `assertTrue` at `:697`, asserting the
+>   `/manager/html/sessions` page contains `Sessions Administration`. A manager
+>   JSP content failure.
+>
+> Neither is a deploy, and neither is a timing assertion on one. They belong to
+> `known-issues/tomcat/nonpassed-class-census.md`, whose
+> `catalina.manager.TestManagerWebapp | 1 of 4` row is updated with today's
+> evidence. HotSpot is `OK (4 tests)` in 19.6 s.
+>
+> ## Criterion 2 — deploy throughput stays within its measured band. MET.
+>
+> `AnnotationScanCostProbe`, `taglibs-standard-impl`, fat-LTO build, four
+> interleaved passes with HotSpot every pass and the arm order reversed on even
+> passes, load steady at 23.4–23.7, µs/class:
+>
+> | pass | 1 | 2 | 3 | 4 | mean |
+> |---|---:|---:|---:|---:|---:|
+> | CratonVM | 626.0 | 764.3 | 823.7 | 659.8 | **718.5** |
+> | HotSpot | 149.2 | 53.6 | 157.0 | 20.9 | 95.2 |
+>
+> Against the **813.5 µs/class** band this page set on 2026-08-06: inside it,
+> and below its midpoint. Take the CratonVM column — HotSpot's own swings 7.5x
+> across four passes at this load, exactly as § Measuring this at all says.
+>
+> ## Criterion 3 — the real work. HANDED OFF, not abandoned.
+>
+> `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
+>
+> That page inherits everything on this one that is about the interpreted
+> invoke rather than about Tomcat: the ~350 ns figure and its two-arm
+> calibration, the control-arm decomposition (frame lifecycle ~24.7%,
+> dispatcher ~17.1%, and the rest), the four pieces already taken off it, the
+> two untaken levers with the "do not just count them" result attached, the six
+> falsified root causes, and § Measuring this at all in full. The eight `.rs`
+> comments that cited this page were repointed there, because every one of them
+> was citing it for an invoke-path fact and a `docs/internal/…` path in a source
+> comment is a dead link the day that folder is dropped.
+>
+> ## A fourth piece was taken on the way out
+>
+> `execute_invokevirtual_cached` asked two questions on **every**
+> non-`invokespecial` virtual invoke, each of which is a per-cache-entry
+> constant, and each of which took a lock to answer:
+>
+> * "is the receiver class a lambda proxy" — `lambda_proxies.read()` plus a hash
+>   probe, to answer *no* for every ordinary class in the program;
+> * "is the receiver class the synthetic `AnnotationProxy`" — the class-manager
+>   read lock, `get_class`, and an `Arc<str>` compared against a literal. This
+>   is the item § The annotation-proxy gate: scoped left specified and unbuilt.
+>
+> They are now `ClassRealm::is_lambda_proxy_class` and
+> `ClassRealm::is_annotation_proxy_class`. The first puts a range test in front
+> of the map — proxy ids come only from `alloc_lambda_proxy_id`, whose counter
+> is seeded at `LAMBDA_PROXY_ID_BASE`, so an id below the base cannot be in the
+> table and the map stays the authority for ids that could be. The second
+> memoizes the proxy's `ClassId` per realm, with the **negative** half keyed on
+> `class_definition_epoch` so it cannot latch "absent" from before the class was
+> minted.
+>
+> This page's own § scoped a different implementation — a bool computed at
+> cache-population time and stored on `CachedInvokeTarget::VirtualBytecode`.
+> That was not built, and the reason is worth recording: the flag would have to
+> be set correctly at 45 construction sites, and a site that defaulted it to
+> `false` would send an annotation proxy down a cached-target path that has no
+> bytecode for it — a silent wrong dispatch. The memo has a strictly safer
+> failure mode, because the predicate stays in one function and only the
+> *caching* is new. Its soundness rests on the same standing property
+> `lambda_impl_owner_memo` already relies on and states: CratonVM does not
+> unload classes, and in-place `redefine_class` keeps the `ClassId`.
+>
+> **It did not separate on the wall clock, and that is recorded as a
+> non-result** — the `noCall` control arm, which contains no invoke at all,
+> moved as much as the test arm on a box at load 33–43. The full table is on the
+> successor page. It was kept because it *deletes* work and code from a
+> correctness gate rather than adding a cache that has to earn its keep, which
+> is the distinction between it and the levers this page reverted.
+>
+> ## Gates
+>
+> `cratonvm-vm --lib` 2617/0, `native-io` 526/0, `classloading` 797/0, `types`
+> 581/0, `gc` 1687/0, `jit` 2105/0, `native-api` 338/0; `native-builtins`
+> 4161 pass / 2 fail, both `shared_secrets_bridge::tests`, **reproduced on
+> pristine `origin/dev` with this branch's changes reverted in place**.
+> `regression-suite/run.sh` **72 passed, 0 failed**, including a new
+> `RAnnotationProxyGate` vector added with this closure: it drives an annotation
+> proxy through a WARM call site, alternates that one site between a proxy and a
+> hand-written implementation of the same interface, and diffs 20 observables
+> against HotSpot. Nothing in the suite drove a proxy through a warm site
+> before, so a memo answering `false` one query too early would have gone
+> unnoticed.
+
+---
+
 # Webapp deploy: BCEL annotation scan is 226x slower — it never compiles
 
 | | |

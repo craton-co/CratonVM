@@ -2816,6 +2816,88 @@ pub const LOCAL_HANDLER_ENTERED: usize = 2;
 /// Index: a throwable this frame does not catch, sent down the old route.
 pub const LOCAL_HANDLER_PROPAGATED: usize = 3;
 
+/// Receiver-type-speculation census, index-parallel with
+/// `RECEIVER_DESPEC_COUNTS`. Compile-time counts, from the one filter every
+/// receiver-guarded call-site intrinsic crosses in
+/// `x64::bytecode_walk`'s invoke ladder.
+///
+/// Three numbers, because a lone `sites-declined=0` has two readings that a
+/// timing table cannot tell apart: "the de-spec consult is wired and nothing
+/// needed it" and "no guarded site was compiled at all". `guards-emitted`
+/// separates them, and `unguarded` says how much of the direct-call traffic
+/// the question does not apply to.
+pub const RECEIVER_DESPEC_NAMES: [&str; 4] = [
+    "unguarded",
+    "guards-emitted",
+    "sites-declined",
+    "profile-declined",
+];
+
+static RECEIVER_DESPEC_COUNTS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`RECEIVER_DESPEC_NAMES`]: a direct-bound call site with no
+/// receiver guard (`guard_class_id == 0`), which the de-spec consult never
+/// applies to.
+pub const RECEIVER_DESPEC_UNGUARDED: usize = 0;
+/// Index: a receiver class-id guard emitted -- the site speculates.
+pub const RECEIVER_DESPEC_GUARD_EMITTED: usize = 1;
+/// Index: a receiver-guarded intrinsic DECLINED because this bci is in the
+/// per-bci de-spec registry. Non-zero is the only proof the consult engaged.
+pub const RECEIVER_DESPEC_DECLINED: usize = 2;
+/// Index: a receiver-guarded intrinsic REFUSED AT RESOLUTION because the
+/// method's own receiver profile at that bci says the guarded class is under
+/// `MIN_GUARDED_RECEIVER_PCT` of the receivers. This is the cheap half -- it
+/// costs no deopts at all, where `sites-declined` costs
+/// `PER_BCI_DESPEC_LIMIT` of them plus a recompile.
+pub const RECEIVER_DESPEC_PROFILE_DECLINED: usize = 3;
+
+/// Bump one [`RECEIVER_DESPEC_NAMES`] counter.
+#[inline]
+pub fn note_receiver_despec(index: usize) {
+    if let Some(slot) = RECEIVER_DESPEC_COUNTS.get(index) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for the receiver-type-speculation census, INCLUDING zeros --
+/// see [`RECEIVER_DESPEC_NAMES`] for why each zero is a different answer.
+pub fn receiver_despec_counts() -> Vec<(&'static str, u64)> {
+    RECEIVER_DESPEC_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                RECEIVER_DESPEC_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Bump the "escalation spared" counter: a `MakeNotCompilable` withheld by
+/// `DeoptimizationLog::recommend_action_at_bci` because the failing bci had
+/// already been de-spec'd. Counted separately from the compile-side census
+/// because it is a POLICY event, not an emission.
+static RECEIVER_DESPEC_ESCALATIONS_SPARED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// See [`RECEIVER_DESPEC_ESCALATIONS_SPARED`].
+#[inline]
+pub fn note_despec_escalation_spared() {
+    RECEIVER_DESPEC_ESCALATIONS_SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Number of whole-method blacklists withheld because the failing speculation
+/// site had already been de-spec'd.
+pub fn despec_escalations_spared() -> u64 {
+    RECEIVER_DESPEC_ESCALATIONS_SPARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bump one [`LOCAL_HANDLER_NAMES`] counter.
 #[inline]
 pub fn note_local_handler(index: usize) {

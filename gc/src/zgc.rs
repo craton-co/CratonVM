@@ -8348,12 +8348,18 @@ impl ZgcRealHeap {
                     .map(|(from, v)| (*from, *v))
             })
         };
-        // `exe+RVA` rather than a symbolized backtrace: see
-        // `gc_quiescence::native_rvas` for why `Backtrace::force_capture`
-        // yields nothing but `<unknown>` in this tree's release profile.
-        // Paste the list into `CRATONVM_SYMBOLIZE` with the SAME binary (and
-        // its PDB in place, i.e. `target/release/cratonvm.exe`, not a renamed
-        // copy -- the debug directory records the original PDB path).
+        // `exe+RVA` when the hook is installed; `Backtrace::force_capture`
+        // otherwise. Paste an RVA list into `CRATONVM_SYMBOLIZE` with the SAME
+        // binary (and its PDB in place, i.e. `target/release/cratonvm.exe`, not
+        // a renamed copy -- the debug directory records the original PDB path).
+        //
+        // ON LINUX THE FALLBACK IS THE PATH, AND IT WORKS. No caller installs
+        // the hook, and this comment used to say the fallback "yields nothing
+        // but `<unknown>`". Measured 2026-08-24 on a fat-LTO release build:
+        // **40 symbolized frames with file:line**, which named the defect four
+        // frames up. `Display` is MULTI-LINE, so a one-line grep of the log
+        // shows frame 0 and nothing else -- read the lines after `backtrace=`
+        // before concluding the capture is broken, as one session did.
         let backtrace = {
             let rvas = crate::gc_quiescence::native_rvas();
             if rvas.is_empty() {
@@ -9088,6 +9094,28 @@ const Z_PARMARK_DEFAULT_WORKERS: usize = 0;
 fn zgc_corpse_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_CORPSE").is_some())
+}
+
+
+/// `CRATONVM_DBG_WATCH_PUN=<class-name-substring>:<slot>` — the parsed watch.
+///
+/// A primitive stored into a slot the class declares a REFERENCE is the G30-1
+/// species, and the read side can only report that it HAPPENED. This names the
+/// WRITER: it prints a backtrace at the store, which on Linux is 40 symbolized
+/// frames (see the note on `report_corpse_read`'s `backtrace` field — the
+/// in-process capture works, contrary to what two comments used to claim).
+///
+/// Written for `SQLChar.rawData` — declared `[C`, found holding `Int(1)`, and
+/// the cell a compiled `arraylength` dereferenced as the pointer 1. Watch it
+/// with `CRATONVM_DBG_WATCH_PUN=SQLChar:1`.
+fn punned_store_watch() -> Option<&'static (String, usize)> {
+    static W: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let spec = cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_PUN").ok()?;
+        let (class, slot) = spec.rsplit_once(':')?;
+        Some((class.to_string(), slot.parse().ok()?))
+    })
+    .as_ref()
 }
 
 fn zgc_verify_slide_enabled() -> bool {
@@ -11374,6 +11402,29 @@ impl ZgcRealHeap {
     /// this store takes, rather than repeated at each.
     fn set_field_no_card(&self, obj: ObjectRef, index: usize, value: Value) {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
+        // WRITER-side trap for the G30-1 species. Off unless
+        // `CRATONVM_DBG_WATCH_PUN=<class-substring>:<slot>` is set; when it is,
+        // a primitive landing in the watched slot prints a backtrace naming the
+        // code that stored it. The read side can only say a punned cell EXISTS.
+        if !matches!(value, Value::Object(_)) {
+            if let Some((want_class, want_slot)) = punned_store_watch() {
+                if index == *want_slot {
+                    let class_id = self.header(obj).class_id.as_u32();
+                    let name = crate::collector::class_name_for_diagnostics(class_id);
+                    if name.contains(want_class.as_str()) {
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            class = %name,
+                            class_id,
+                            index,
+                            ?value,
+                            backtrace = %std::backtrace::Backtrace::force_capture(),
+                            "punned store watch: a PRIMITIVE was stored into the watched slot"
+                        );
+                    }
+                }
+            }
+        }
         let header = self.header(obj);
         if self.check_field_index(header, index, "set").is_none() {
             return;

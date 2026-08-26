@@ -20973,6 +20973,40 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
 /// CONCRETE subclass as the receiver. Dispatch to that subclass's own bytecode;
 /// only a bare `java.util.logging.Handler` (which has no implementation
 /// anywhere) keeps the historical no-op.
+/// Does this `Handler` receiver carry the REAL JDK field layout?
+///
+/// MEASURED, `javap -p --system` on Temurin 25.0.3+9 — `java.util.logging.Handler`
+/// declares six INSTANCE fields, in this order:
+///
+/// ```text
+///   0 manager(LogManager)  1 filter  2 formatter
+///   3 logLevel(Level)      4 errorManager        5 encoding
+/// ```
+///
+/// (`offValue` is static and takes no slot.) So slot 0 is the `LogManager`, and
+/// a native reading slot 0 for the level answers the log manager while one
+/// WRITING slot 0 overwrites it — which is exactly what `getLevel`/`setLevel`
+/// did in `--jdk-only` until 2026-08-24. `probes/JulHandlerLevel.java` measures
+/// both halves off the real fields through `--add-opens`:
+///
+/// ```text
+///   --jdk-only   getLevel() on a fresh Handler -> java.util.logging.LogManager@587
+///                setLevel(WARNING) -> Handler.logLevel still ALL,
+///                                     Handler.manager now holds WARNING
+///   compatible   correct        HotSpot 25.0.3+9   correct
+/// ```
+///
+/// The count is the discriminator rather than a name probe because every
+/// instance field here is a REFERENCE, so `get_field_by_name` cannot be
+/// type-checked the way [`log_record_real_layout`](crate::log_record_real_layout)
+/// checks `longThreadID` for a `Long` — and it answers `Value::Object(None)` for
+/// a name it cannot resolve, which is indistinguishable from a genuinely null
+/// `logLevel` ("inherit from the parent" is a legal state). Same shape as
+/// `panama_libffi::segment_address`'s `object_num_fields(seg) >= 6`.
+fn handler_real_layout(ctx: &dyn NativeContext, h: cratonvm_types::ObjectRef) -> bool {
+    ctx.object_num_fields(h) >= 6
+}
+
 fn jul_handler_delegate(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -21373,7 +21407,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             if matches!(args.get(1), None | Some(Value::Object(None))) {
                 return Err(RuntimeError::NullPointerException { message: None }.into());
             }
-            ctx.set_field(this, 0, args[1]);
+            if handler_real_layout(ctx, this) {
+                ctx.set_field_by_name(this, "logLevel", args[1]);
+            } else {
+                ctx.set_field(this, 0, args[1]);
+            }
             Ok(Some(Value::Object(None)))
         },
     );
@@ -21383,6 +21421,9 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Level;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if handler_real_layout(ctx, this) {
+                return Ok(Some(ctx.get_field_by_name(this, "logLevel")));
+            }
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
