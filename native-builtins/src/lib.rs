@@ -13557,7 +13557,23 @@ pub fn register_essential_natives_with_shims(
             let Some(Value::Object(Some(this))) = args.first() else {
                 return Ok(None);
             };
-            let name = args.get(1).cloned().unwrap_or(Value::Object(None));
+            // `Thread.setName`'s first statement is
+            // `if (name == null) throw new NullPointerException("name cannot be
+            // null")`. Accepting the null was TWO defects, not one: the throw
+            // never happened, and the null was then written into `name`, so
+            // `getName()` answered null afterwards -- a Thread whose name is
+            // null is a state the JDK's own API cannot produce. MEASURED:
+            // `probes/ReflectBufferSweep.java`, the single difference in 316
+            // assertions across four families, in BOTH modes.
+            let name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => v.clone(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("name cannot be null".to_string()),
+                    }
+                    .into())
+                }
+            };
             if ctx.object_num_fields(*this) > 0 {
                 ctx.set_field(*this, 0, name.clone());
             }
