@@ -1132,7 +1132,9 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Primary: DER round-trip from the real X500Name.
+            // Primary: DER round-trip from the real X500Name. `this` is read
+            // again by the RFC2253 fallback below, after this call.
+            let this_pin = ctx.pin_native_root(this);
             if let Ok(Some(Value::Object(Some(arr)))) =
                 ctx.invoke_virtual(this, "getEncoded", "()[B", &[])
             {
@@ -1146,7 +1148,9 @@ pub fn register(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // Fallback: RFC2253 name string.
+            // Fallback: RFC2253 name string. `getEncoded()` above allocated a
+            // byte array and may have moved `this`.
+            let this = ctx.read_native_pin(this_pin, this);
             if let Ok(Some(Value::Object(Some(s)))) =
                 ctx.invoke_virtual(this, "getName", "()Ljava/lang/String;", &[])
             {

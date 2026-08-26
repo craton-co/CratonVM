@@ -6756,7 +6756,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (`try (Writer w = out) { flushBuffer(); }`). Swallowing it is how
             // a full disk turns into a clean `try`-with-resources exit and a
             // truncated file nobody hears about.
+            // `flush()` can move `out` before `close()` dereferences it.
+            let out_pin = ctx.pin_native_root(out);
             ctx.invoke_virtual(out, "flush", "()V", &[])?;
+            let out = ctx.read_native_pin(out_pin, out);
             ctx.invoke_virtual(out, "close", "()V", &[])?;
             return Ok(None);
         }

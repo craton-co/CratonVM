@@ -35475,17 +35475,43 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 _ => {
                     // No receiver — still hand back a usable UTF-8 Charset
                     // rather than null so callers never NPE.
-                    let cs = charset_alloc(ctx, "UTF-8")?;
+                    let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
                     return Ok(Some(Value::Object(Some(cs))));
                 }
             };
             // Honour an already-set charset (e.g. a PrintStream constructed
-            // with an explicit charset, or one stamped by install_charset).
+            // with an explicit charset, or one stamped by install_charset) --
+            // but ONLY if it is concrete. `install_charset` runs at bootstrap,
+            // before `Charset.forName` is safe to call, so it stamps a
+            // hand-allocated `java/nio/charset/Charset`, and that class is
+            // ABSTRACT: `newEncoder()` on it has no `Code` attribute. Returning
+            // it here is what made `new OutputStreamWriter(System.err)` die with
+            // `AbstractMethodError` (MEASURED: `probes/PrintStreamCharset.java`,
+            // System.out and System.err in BOTH modes). Repair it instead --
+            // this accessor runs lazily, long after bootstrap, so asking the
+            // real `Charset.forName` is safe HERE even though it is not there.
             if let Value::Object(Some(cs)) = ctx.get_field_by_name(this, "charset") {
-                return Ok(Some(Value::Object(Some(cs))));
+                let cid = ctx.class_id_of_object(cs);
+                if !matches!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some("java/nio/charset/Charset")
+                ) {
+                    return Ok(Some(Value::Object(Some(cs))));
+                }
+                // Abstract stand-in: replace it, and write the repair back so
+                // the direct `getfield charset` that real `PrintStream` bytecode
+                // performs sees the concrete one too.
+                let fixed = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+                ctx.set_field_by_name(this, "charset", Value::Object(Some(fixed)));
+                return Ok(Some(Value::Object(Some(fixed))));
             }
-            // Field missing or null: synthesize UTF-8 and write it back.
-            let cs = charset_alloc(ctx, "UTF-8")?;
+            // Field missing or null: resolve UTF-8 and write it back. This must
+            // be a CONCRETE charset: the caller's next move is almost always
+            // `new OutputStreamWriter(this)`, which asks a `PrintStream` for its
+            // charset and then calls `newEncoder()` on it — abstract on the
+            // fabricated base, so a stand-in here trades the NPE this override
+            // exists to prevent for an `AbstractMethodError` one call later.
+            let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
             ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
             Ok(Some(Value::Object(Some(cs))))
         },
@@ -35661,6 +35687,51 @@ pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
     register_charset_natives(registry);
     register_tomcat_jni_natives(registry);
     register_netty_internal_tcnative_natives(registry);
+}
+
+/// A **concrete** `Charset` for `name`, preferring the real JDK's own.
+///
+/// [`charset_alloc`] fabricates `java/nio/charset/Charset` itself, which is
+/// ABSTRACT — so `newEncoder()`/`newDecoder()` on the result have no `Code`
+/// attribute and every caller that encodes dies with `AbstractMethodError`.
+/// That is the same class-is-abstract trap `panama::CRATON_SEGMENT_CLASS` and
+/// `CRATON_BUFFER_POOL_CLASS` are named for.
+///
+/// MEASURED 2026-08-25, `probes/PrintStreamCharset.java`, before this helper:
+///
+/// ```text
+///   System.out.charset()             -> java.nio.charset.Charset   [abstract]
+///   System.out.charset().newEncoder()-> AbstractMethodError
+///   new PrintStream(baos,true,"UTF-8").charset() -> sun.nio.cs.UTF_8   [ok]
+/// ```
+///
+/// The explicit-charset constructor was already right, which is the tell: the
+/// real `Charset.forName` returns a concrete `sun.nio.cs.*` on a real image, so
+/// there is a good answer available and the fabrication was reaching for it
+/// unnecessarily. Ask the JDK first; fall back to the stand-in only when there
+/// is no real class library to ask (a synthetic-JDK image), where an abstract
+/// carrier is still better than a null.
+fn charset_concrete_or_synthetic(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arg = ctx.create_string(name);
+    if let Ok(Some(Value::Object(Some(cs)))) = ctx.invoke(
+        "java/nio/charset/Charset",
+        "forName",
+        "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        &[Value::Object(Some(arg))],
+    ) {
+        // Only accept it if it is NOT the abstract base — `Charset.forName` is
+        // itself shimmed by `native_charset_for_name`, which calls
+        // `charset_alloc`, so a bare `java/nio/charset/Charset` coming back here
+        // means the shim answered and we have gained nothing.
+        let cid = ctx.class_id_of_object(cs);
+        if !matches!(ctx.class_name_of_id(cid).as_deref(), Some("java/nio/charset/Charset")) {
+            return Ok(cs);
+        }
+    }
+    charset_alloc(ctx, name)
 }
 
 fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
