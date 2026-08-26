@@ -703,6 +703,36 @@ impl Compiler {
                     homes.push(ShadowHome::Frame(self.local_offset(i)));
                 }
             }
+            // The STAGED INVOKE-ARGUMENT buffer. Same set the oop map's Stage 3
+            // names, and for the same reason: these oops were popped off the
+            // simulated operand stack before the call, so neither loop above can
+            // see them.
+            //
+            // Naming them in the MAP is not enough. The map makes them precise
+            // roots for marking; the SHADOW STACK is the rewritable channel, and
+            // it is the only one `moving_young_unpublished_frame_oop_present`
+            // consults — `published_shadow_values(shadow_window_from_frame(..))`,
+            // with no reference to the map at all. So a staged argument that was
+            // mapped but not pushed sat in the frame's spill band as a
+            // movable-resident word the shadow stack never published, and the
+            // band verifier correctly refused the whole collection with
+            // UNPUBLISHED_FRAME_OOP.
+            //
+            // Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`:
+            // `CRATONVM_JIT_INDY_BRIDGE=0` took that reason from 28 to 5 per 76
+            // collections while four other 2026-08-24 switches left it above 21,
+            // because a bridged `invokedynamic` stages a capturing lambda's
+            // arguments across a call that runs a bootstrap and allocates.
+            // `a51077342` closed the map half of this and stopped there.
+            //
+            // READ, not taken: `emit_oop_map_for_safepoint` still consumes the
+            // list after the call, and taking it here would silently empty the
+            // map's Stage 3.
+            if staged_arg_shadow_enabled() {
+                for off in &self.pending_staged_arg_oops {
+                    homes.push(ShadowHome::Frame(*off));
+                }
+            }
             // A local and an operand entry can share the same home register (or two
             // operand entries the same frame slot). Deduplicate preserving order:
             // the push and reload walk the identical list, so a duplicate would
@@ -1436,6 +1466,118 @@ mod tests {
         }
     }
 
+    /// A staged invoke argument is published on the SHADOW stack, not only
+    /// named in the oop map.
+    ///
+    /// The two are different channels with different consumers. The map makes a
+    /// slot a precise root for MARKING; the shadow stack is the REWRITABLE
+    /// channel, and it is the only one
+    /// `conservative_roots::moving_young_unpublished_frame_oop_present`
+    /// consults — it asks `published_shadow_values(shadow_window_from_frame(..))`
+    /// and never looks at the map. So a staged argument that reached the map but
+    /// not the shadow stack sat in the frame's spill band as a movable-resident
+    /// word the shadow stack never published, and the band verifier correctly
+    /// refused the entire collection with `UNPUBLISHED_FRAME_OOP`.
+    ///
+    /// `a51077342` added the map half (`emit_oop_map_for_safepoint`'s Stage 3)
+    /// and stopped there. Measured consequence on
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// `CRATONVM_JIT_INDY_BRIDGE=0` took `compiled-frame-oop-not-published`
+    /// from 28 to 5 per 76 collections where four other switches left it above
+    /// 21 — a bridged `invokedynamic` stages a capturing lambda's arguments
+    /// across a call that runs a bootstrap and allocates.
+    ///
+    /// The assertion is `shadow ⊇ map Stage 3`, which is the invariant that was
+    /// violated; it deliberately does not require equality, because the shadow
+    /// list also carries register homes the map has no slot for.
+    #[test]
+    fn a_staged_invoke_argument_is_published_on_the_shadow_stack_too() {
+        // The staged buffer only has to be published under MOVING coverage —
+        // that is the mode whose band verifier demands it, and the mode
+        // `collect_live_oop_homes` gates its frame-slot homes on.
+        crate::x64::set_moving_young_override(Some(true));
+
+        const STAGED: [i32; 3] = [64, 72, 80];
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = STAGED.to_vec();
+
+        let homes = c.collect_live_oop_homes();
+        for off in STAGED {
+            assert!(
+                homes.contains(&ShadowHome::Frame(off)),
+                "staged arg at [rbp-{off}] is named by the oop map's Stage 3 but \
+                 was not published on the shadow stack; homes={homes:?}"
+            );
+        }
+
+        // The list the map will consume must still be intact: this collection
+        // READS it, and taking it here would silently empty Stage 3.
+        assert_eq!(
+            c.pending_staged_arg_oops, STAGED,
+            "collect_live_oop_homes must not consume the staged-arg list"
+        );
+
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// The control. Non-moving coverage keeps the conservative frame scan, which
+    /// already finds a staged slot on the stack, so publishing it would only
+    /// over-pin — the hazard `collect_live_oop_homes` documents as the bt18
+    /// small-heap OOM. Without this, the test above would pass just as well if
+    /// the homes were published unconditionally.
+    #[test]
+    fn a_staged_invoke_argument_is_not_published_when_nothing_moves() {
+        crate::x64::set_moving_young_override(Some(false));
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = vec![64];
+        let homes = c.collect_live_oop_homes();
+        assert!(
+            !homes.contains(&ShadowHome::Frame(64)),
+            "the non-moving path must not publish staged args; homes={homes:?}"
+        );
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// A bare `Compiler` with no locals, no operand stack and no register
+    /// assignments, so `collect_live_oop_homes` returns exactly what the staged
+    /// buffer contributes and nothing else can be mistaken for it.
+    fn staged_arg_test_compiler() -> Compiler {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "staged-arg-shadow-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with all-integer
+            // fields, so an all-zero bit pattern is a valid value. Nothing here
+            // dereferences a helper pointer.
+            unsafe { std::mem::zeroed() },
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    }
+
     /// Spot-check two concrete encodings against the ISA so the property test
     /// above cannot pass a self-consistent but wrong rule.
     #[test]
@@ -1445,4 +1587,17 @@ mod tests {
         // 49 81 FC — cmp r12, imm32
         assert_eq!(cmp_r64_imm32_opcode(R12), [0x49, 0x81, 0xFC]);
     }
+}
+
+/// `CRATONVM_JIT_NO_STAGED_ARG_SHADOW=1` — stop publishing the staged
+/// invoke-argument buffer on the shadow stack, restoring the state in which it
+/// was named by the oop map alone.
+///
+/// The bisect lever for that repair, default-ON. Latched: it is a codegen
+/// decision and must not change under a running process.
+fn staged_arg_shadow_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STAGED_ARG_SHADOW").is_none()
+    })
 }
