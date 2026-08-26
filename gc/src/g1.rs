@@ -78,7 +78,7 @@ fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
 /// so — fourteen call sites made that assumption silently.
 ///
 /// The rename is the whole of option **C** in
-/// `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4: no runtime cost, no behaviour change, and fourteen silent assumptions
 /// become fourteen readable ones. A caller that *does* hold region geometry
 /// should use [`for_each_flat_object_reference_capped`] with
@@ -144,7 +144,7 @@ fn for_each_flat_object_reference_capped(
                  SLOT_SIZE over {} elements of array payload and decoded each as a `Value`. \
                  Every caller pre-branches on kind, so this is a kind confusion, not an \
                  intended array walk; see \
-                 internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
+                 fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
                 obj_ptr as usize,
                 header.class_id.as_u32(),
                 header.element_type(),
@@ -415,7 +415,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// comparison, on a tag already loaded.
 ///
 /// This is option **D** of
-/// `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4, paired with option C (the `_trusting_header` rename). **Expected to be
 /// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
 /// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
@@ -21492,7 +21492,7 @@ mod tests {
     }
     // -----------------------------------------------------------------------
     // The flat 16-byte-slot walk refuses an ARRAY header (option D of
-    // `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
+    // `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
     // -----------------------------------------------------------------------
 
     /// Build a legacy-layout body of `slots` `Value::Object` cells behind a
