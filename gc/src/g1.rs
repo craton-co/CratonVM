@@ -419,8 +419,8 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// §4, paired with option C (the `_trusting_header` rename). **Expected to be
 /// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
 /// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
-/// measured with the walk proved engaged — 67 young evacuation pauses,
-/// 2,220,704 objects copied, every one of them enumerated through this helper
+/// measured with the walk proved engaged — 66 young evacuation pauses,
+/// 2,202,360 objects copied, every one of them enumerated through this helper
 /// or its callers' array arm.
 pub static FLAT_WALK_REFUSED_ARRAY: AtomicUsize = AtomicUsize::new(0);
 

@@ -215,7 +215,10 @@ reliable zero/non-zero test on any run log.
 
 `regression-suite/run.sh` against the branch binary
 (`cratonvm-walker-20260826.exe`), each arm a full pass with HotSpot as the
-output oracle:
+output oracle. Everything in this section is the **post-merge** run — the whole
+set was re-run after merging 31 commits of `dev`, because a green arm taken
+before a merge says nothing about after it. The pre-merge run agreed
+(72/72 × 3, 67 pauses, 2,220,704 objects, zero refusals):
 
 | arm | collector | result | `REFUSED an ARRAY header` lines |
 |---|---|---|---|
@@ -231,7 +234,7 @@ at this arm *was* that vacuous green: the six GC vectors under
 `flat_walk_refused_array=0` **and no `[GC-SUMMARY]` line at all** — G1 had never
 collected. Re-run at `--Xmx 64m` and `--Xmx 128m`, where they do:
 
-* **12 runs, 67 young evacuation pauses, 2,220,704 objects copied.**
+* **12 runs, 66 young evacuation pauses, 2,202,360 objects copied.**
 * Every run `PASS`, every run `[GC] g1 flat_walk_refused_array=0`.
 * The sibling guards on the same line are zero too: `evac_ref_rejected=0
   evac_holder_rejected=0 evac_holder_clamped=0 source_walk_desync=0
@@ -247,8 +250,8 @@ Stated rather than glossed.
 
 ### Unit tests
 
-`cargo test -p cratonvm-gc --release --lib`: **1689 passed**, plus the three new
-ones by name —
+`cargo test -p cratonvm-gc --release --lib`: **1690 passed, 0 failed**, the
+three new ones among them —
 
 ```
 test g1::tests::flat_walk_refuses_an_array_header_and_counts_it ... ok
@@ -256,11 +259,12 @@ test g1::tests::flat_walk_still_visits_a_legacy_objects_reference_cells ... ok
 test g1::tests::capped_walk_bounds_a_legacy_object_below_its_claimed_slot_count ... ok
 ```
 
-One failure, in `gen_heap::published_bounds_ownership` / `zgc::tests`, is a
-**pre-existing test-isolation flake and not a regression**: unmodified `dev`
-fails the same assertion in 4 runs out of 5 (the tests assert on a process-wide
-JIT read-bounds table that siblings in the same binary write concurrently; each
-passes in isolation). Filed separately.
+Earlier passes of the same command failed one test in
+`gen_heap::published_bounds_ownership` / `zgc::tests`. That is a **pre-existing
+test-isolation flake, not a regression**: unmodified `dev` fails the same
+assertion in 4 runs out of 5, and each test passes in isolation — they assert on
+a process-wide JIT read-bounds table that siblings in the same binary write
+concurrently. Filed separately.
 
 The twelve `gc::tests::gc_*` semi-space tests — which are what exercise §6's
 three rewritten scan arms, since they allocate through `alloc_object(ClassId, n)`
