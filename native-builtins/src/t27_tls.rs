@@ -15080,11 +15080,7 @@ fn jsse_owns_endpoint_identification(
             chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
         }
         // JSSE's OWN default trust manager is an `X509ExtendedTrustManager`,
-        // and on HotSpot it is the thing that identifies the endpoint. On
-        // THIS VM its `checkServerTrusted` is served by a native shim
-        // (`x509_manager::do_check_trusted`) which validates the chain and
-        // nothing else — it never sees the `SSLEngine`, so it cannot read
-        // `SSLParameters.getEndpointIdentificationAlgorithm()`.
+        // and on HotSpot it is the thing that identifies the endpoint.
         //
         // A predicate must mirror the dispatch it guards. Answering "the
         // application owns identification" for a class whose identification
@@ -15092,6 +15088,21 @@ fn jsse_owns_endpoint_identification(
         // `testClientHostnameValidationFail` handshakes a client that dialled
         // `localhost` against `notlocalhost_server.pem` and asserts the
         // handshake FAILS; it completed.
+        //
+        // UPDATED 2026-08-26. The reason this arm gave — that the native shim
+        // for `checkServerTrusted` "never sees the `SSLEngine`" — was true of
+        // the shim and NOT of the call: this file's own loop passes the engine
+        // to the three-argument overload, and the shim simply ignored it.
+        // `x509_manager::check_server_trusted_extended` now reads
+        // `SSLParameters.getEndpointIdentificationAlgorithm()` off it and runs
+        // the name check, which is what closed the netty OpenSSL hole
+        // (`fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`).
+        //
+        // This arm STAYS `true` regardless. The shim identifies only when it
+        // can find a host on the peer, and this VM's own `SSLEngine` object
+        // need not carry a handshake session; the two checks reach the same
+        // verdict when both run, and dropping this one would make that
+        // "need not" into a hole.
         if name.as_deref() == Some("sun/security/ssl/X509TrustManagerImpl") {
             if dbg {
                 eprintln!(
