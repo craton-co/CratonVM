@@ -250,6 +250,30 @@ each reporter caps itself at 12. Three PRE runs and three POST runs differed on
 it while naming completely different holders — noise dressed as signal, and it
 is written down here because it nearly went into this page as evidence.
 
+On the multi-face evidence above, this A/B should not be expected to close the
+stall outright either — only to remove one of three producers.
+
+First 21 runs (11 unfixed / 10 fixed, interleaved, 600m):
+
+| arm | runs | `NoSuchMethodError java/lang/Object` | guard frames naming `properties_sidetable` |
+|---|---:|---:|---:|
+| unfixed | 11 | 1 | **0** |
+| fixed | 10 | 0 | **0** |
+
+**That is not yet evidence for the fix, and it would be easy to present as if
+it were.** The one catch in the unfixed arm is the `checkClientTrusted` face —
+a producer this fix does not touch — and the fixed arm's zero is one run of a
+1-in-33 event. More to the point, `properties_sidetable` appears in NEITHER
+arm's backtraces over those 21 runs, so the site the fix changes did not fire
+at all: the two arms cannot have differed because of it. The run that named
+that site (`hunt7` run 33) remains the only observation of that face.
+
+What this A/B can eventually show is a difference in the total
+`NoSuchMethodError java/lang/Object` rate across enough runs to see a 1-in-33
+event move. Until then the fix stands on the capture that named its holder and
+on the code being wrong on its own terms — a raw `ObjectRef` live across a call
+that allocates — not on this table.
+
 ### Other holders the same captures name, not yet investigated
 
 The stripped backtraces of those runs also name, repeatedly and outside the
