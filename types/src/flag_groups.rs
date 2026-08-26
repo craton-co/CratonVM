@@ -1062,6 +1062,24 @@ pub const INVENTORY: &[E] = &[
     // BigEndianHeapByteBufTest against 736 for the native shadow), and
     // interlocked with `sp-ic-deopt-check` the same way.
     E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // Serve `new`'s JVMS 5.5 initialization check from `class_init_memo`
+    // instead of `ensure_class_initialized_shared`, as getstatic/putstatic
+    // already do. Default-ON; the opt-out is the same-binary A/B, and its OFF
+    // position is the older, correct, slower path.
+    E { group: Group::JIT, token: "new-class-init-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO"), off_word: None },
+    // The unevidenced CharSequence-length blind guard: 6.5x on the value
+    // loop and 3.8x on the name loop, deopt census 263 502 -> 18.
+    // Default-OFF (its reader answers `false` when unset), so this is an
+    // opt-in `on_key`.
+    E { group: Group::JIT, token: "charseq-string-intrinsic", on_key: Some("CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC"), off_key: None, off_word: Some("0") },
+    // How far past a de-spec'd bci a site may keep trapping before the
+    // claim is treated as wrong. Carries a NUMBER (default 2), tunable so
+    // the factor can be swept against the deopt count without a rebuild.
+    E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
+    // Receiver-type de-speculation, default-ON; `=0` restores the old
+    // behaviour. Written for a class taking 1.67 `ReceiverTypeChanged`
+    // deopts per loop iteration.
+    E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
