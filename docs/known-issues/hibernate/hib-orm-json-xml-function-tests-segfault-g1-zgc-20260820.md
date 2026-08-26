@@ -183,6 +183,12 @@ correlation is a property of the *reader*, not of the collector's barriers.
 
 ## 2.2 The producer is still open, and the guard does not touch it
 
+> **WRONG — corrected in §2.7.1.** The producer was closed on 2026-08-22, before
+> this section was written; it was a wrong-KIND read (an array read through the
+> flat-object path), not a stale reference, and not a GC defect. This section is
+> left in place because it is what the guard's own comment said and the mistake
+> was to repeat it without checking.
+
 Worth stating plainly, because it is easy to misread the above as a fix:
 screening the read does **not** repair whatever writes two heap pointers into a
 16-byte cell. That producer — a live object reclaimed and its storage re-served —
@@ -354,6 +360,81 @@ And as with §2.5: this is not a demonstration that this walk produced the eight
 crash that arrives through the same helper, plus the removal of one more way a
 G1 walk can read past an object.
 
+## 2.7 CORRECTION: the producer is FIXED, and `0x5B == 91` has a candidate
+
+Two of this page's standing open items move, and one of them corrects §2.2.
+
+### 2.7.1 §2.2 is wrong: the producer was closed on 2026-08-22
+
+§2.2 said the producer — whatever writes two heap pointers into a 16-byte
+`Value` cell — "is a separate, still-open defect". It is not open, and it was
+already closed when §2.2 was written; the section simply repeated
+`heap.rs`'s comment without checking.
+
+`internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`
+closed it, **and it is not a GC defect at all.** The VM-side half of the guard
+(`CRATONVM_DBG_CORRUPT_CELL`, which can see the Java frame the collector cannot)
+named the receiver in one run:
+
+```text
+obj=0x20040a803f8  slot_index=0
+raw0=0x0000020040775828  raw1=0x0000020040797b78
+receiver_class=java/lang/String   receiver_kind=Array   receiver_fields=2
+holder=frame#69 Metadata$MetadataItemCondition.withDefaultValue pc=36 local[1]
+```
+
+`receiver_kind=Array`. The 16 bytes were never a `Value` because they were never
+a *flat object's slot* — they were **array payload**, read through the
+flat-object path. The reference was not stale; the read was of the wrong kind.
+
+That also retires §0.4's remaining puzzle. §0.4 said the always-G1-or-ZGC
+pattern "is real and still needs explaining" and proposed a `Value` read unique
+to those collectors. §2.1 already showed the correlation is a property of the
+*reader* (Generational screened since HIB-CV-32, the others did not). With the
+producer identified as a kind confusion rather than anything collector-specific,
+there is nothing left for a collector-specific mechanism to explain.
+
+### 2.7.2 `0x5B == 91` — a candidate, from the same fact
+
+§0.5 item 2 noted `0x5B == 91` in `rbx`/`r8`/`r13` and called it "the right size
+for a slot index or field count". There is a specific reason a *wrong-kind* read
+produces exactly that:
+
+**`NUM_SLOTS_OFFSET == ARRAY_LENGTH_OFFSET == 4`** — they are the same `shape`
+dword, asserted in `types/src/heap_types.rs`
+(`the_shape_word_took_over_the_identity_hash_offset`).
+
+So when an array is read as a flat object, `header.num_slots()` does not return
+garbage. It returns the **array's length**. On the reading in §2.7.1 — an array
+misread as an object — a `num_slots` of 91 is an `array_length` of 91, and the
+walk then strides `SLOT_SIZE` (16) across payload whose real element stride is
+8, 2 or 1, running off the object at roughly twice to sixteen times the rate the
+header implies.
+
+**This is inference, not attribution.** No binary survives, so it cannot be
+confirmed against these files, and 91 could still be a field count or an
+unrelated index. What has changed is that `0x5B` is no longer unexplained: there
+is a documented mechanism that produces exactly a plausible mid-sized count from
+a header that was never a flat object's, and it is the same mechanism as the
+identified producer.
+
+### 2.7.3 What this page still owns
+
+* Not the producer (2.7.1), not the reader guards (§2.3), not the marker's
+  extent (§2.5), not the recorded `record_outgoing_rset_edges` crash (§2.6).
+* Still open: **these eight `hs_err` files have never been attributed.** Every
+  fix above is a mechanism removed, not this crash reproduced, and §0.4's
+  finding stands that symbolization is impossible without the binaries.
+* Still open as a *design* matter, now with its own page:
+  fourteen callers of the flat walk remain unbounded —
+  [what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md](../gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md).
+  A census (`FLAT_WALK_GIVEN_ARRAY`) now counts how often that walk is handed an
+  array, which is the number §5 of that page needs to decide the question. It
+  counts and warns; it deliberately does not refuse.
+
+**This page is now close to retirable.** What holds it open is one honest gap —
+eight unattributed crash files — and not any known-live defect.
+
 ## 2.4 What is left for whoever reopens this
 
 1. The producer (§2.2) — the stale-receiver defect that puts two heap pointers
@@ -365,7 +446,8 @@ G1 walk can read past an object.
 3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
    slot count?) is answered for the concurrent marker in **§2.5** — yes, by
    TOCTOU on the header, now fixed — and in **§2.6** for `g1::for_each_flat_object_reference`'s
-   crash-path caller; its other fourteen callers remain unaudited. `0x5B == 91` from the register dump remains unexplained.
+   crash-path caller; its other fourteen callers remain unaudited. `0x5B == 91` has a candidate explanation in §2.7.2 (an array's length, read
+   through the `shape` dword that `num_slots` and `array_length` share).
 
 # 1. The 2026-08-21 not-reproducible investigation, preserved
 
