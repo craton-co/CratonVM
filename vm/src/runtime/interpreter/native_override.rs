@@ -7192,6 +7192,32 @@ pub fn report_stub_door_tally_at_exit() {
 /// comparison chain rather than one `str` equality call per entry.
 #[inline]
 fn real_protected_stub_class_common(class_name: &str) -> bool {
+    // `java/util/ArrayList` is the ONE conditional member of this list, and it
+    // sits here rather than in the `matches!` below because of it. The reason
+    // the class is allow-listed at all is in the comment down there, with its
+    // measurements; the reason it needs a condition is this:
+    //
+    // `force_native_over_real_jdk_bytecode`'s ArrayList entry says a
+    // `Map.values()` view IS a plain `java/util/ArrayList` that stashes its
+    // source map in the last capacity slot of its element array and must
+    // re-sync against it on read. That stopped being true on 2026-08-13 —
+    // views are minted under `MAP_VIEW_CARRIERS`, which are NOT on this list
+    // and ARE force-listed, so they keep their natives — and that is what makes
+    // allow-listing `java/util/ArrayList` safe. But `alloc_view_carrier` still
+    // has a last-resort arm that degrades to `java/util/ArrayList` when the
+    // carrier class cannot be had at all. A view minted THERE, served by real
+    // `ArrayList` bytecode, returns whatever its source held at creation: the
+    // `Schema.getAllSequences()` shape (H2 `TestAlter`).
+    //
+    // So that arm publishes, and this asks. Default is "no such view exists",
+    // i.e. the yield is ON — the opposite default was built first and measured
+    // INERT, because a program that never calls `values()` never publishes
+    // anything and the answer is memoized per call site as each site warms.
+    // `cratonvm_types::arraylist_view` states the residual this leaves, and why
+    // it is not reachable on any image a JDK ships.
+    if class_name == "java/util/ArrayList" {
+        return !cratonvm_types::arraylist_view::arraylist_classed_view_possible();
+    }
     matches!(
         class_name,
         "java/util/concurrent/locks/ReentrantLock"
@@ -7245,7 +7271,11 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             // `#[track_caller]` tally on this predicate shows this class asked
             // at all three virtual doors) and the yield always worked; only the
             // instrument was blind. Score this class by TIME.
-            | "java/util/ArrayList"
+            //
+            // The entry itself is NOT here: it is the guarded early return at
+            // the top of this function, because it is the one member of this
+            // list that is conditional. See there, and see
+            // `cratonvm_types::arraylist_view`.
             // JDK-ONLY-WAVE2, 2026-08-06. `native_es_execute` (retagged
             // `SyntheticStub` in `native-builtins/src/util_concurrent_ext.rs`)
             // is the compatibility stand-in for CratonVM's synthetic 2-field
@@ -8990,6 +9020,7 @@ mod intercept_shape_tests {
 #[cfg(test)]
 mod force_list_deliberate_absences_tests {
     use super::force_native_over_real_jdk_bytecode as force;
+    use super::real_protected_stub_class_common;
 
     /// MEASURED 2026-08-17 (`target-rel2`, `--jdk-only`, vs HotSpot
     /// 25.0.3+9-LTS): all five readers are registered `Bridge` by
@@ -9071,5 +9102,36 @@ mod force_list_deliberate_absences_tests {
             "iterator",
             "()Ljava/util/Iterator;"
         ));
+    }
+
+    /// `java/util/ArrayList` is allow-listed by default and REVOKED by a
+    /// fallback view mint, and the FORCE list is untouched in either state.
+    ///
+    /// Both directions are asserted from one test because the latch is a
+    /// process-global: splitting them would make the pair order-dependent under
+    /// the default parallel harness.
+    #[test]
+    fn arraylist_is_allow_listed_until_a_fallback_view_is_minted() {
+        cratonvm_types::arraylist_view::reset_for_test();
+        assert!(
+            real_protected_stub_class_common("java/util/ArrayList"),
+            "the default licenses the yield — see cratonvm_types::arraylist_view \
+             for why the opposite default measured INERT"
+        );
+
+        cratonvm_types::arraylist_view::note_arraylist_classed_view_minted();
+        assert!(
+            !real_protected_stub_class_common("java/util/ArrayList"),
+            "a view minted under java/util/ArrayList has to keep its native"
+        );
+        assert_eq!(
+            cratonvm_types::arraylist_view::arraylist_view_fallback_count(),
+            1
+        );
+
+        // The unconditional members are unaffected by the latch either way.
+        assert!(real_protected_stub_class_common("java/util/Objects"));
+        assert!(force("java/util/ArrayList", "size", "()I"));
+        cratonvm_types::arraylist_view::reset_for_test();
     }
 }
