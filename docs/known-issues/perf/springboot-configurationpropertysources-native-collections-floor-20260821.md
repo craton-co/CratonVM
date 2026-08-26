@@ -376,14 +376,60 @@ crossings is wrong.** The count was right (2 002 000 / 2 000 000, exact); the
 attribution was not. Removing the crossings does not remove the cost, so the
 crossings were the symptom.
 
-**The real next question is narrower and better posed:** why does the JIT never
-compile `java/util/ArrayList$Itr.next()` — a five-line accessor called two
-million times — when it compiles that class's `<init>`? Answer that and the
-retag above probably becomes a win rather than a regression; until then, do not
-re-apply it. Start with whether a registered native for the triple makes the
-compile door refuse it (the `might_have_method_descriptor` shape), since that
-would make "is a native registered" both the reason it is slow AND the reason
-the alternative is slow.
+### Why the JIT never compiles it — ANSWERED 2026-08-24
+
+**Registering a native for a method makes that method permanently
+un-compilable.** Not by a refusal in the compile door — by an omission in the
+call-site cache.
+
+The invocation counter that nominates a method for tier-up lives in exactly one
+place: the `CachedInvokeTarget::VirtualBytecode` arm of `dispatch_virtual`
+(`profile_store.increment_invocation` → `on_method_invocation_observed`). The
+**`VirtualNative` arm has no counter at all.** So a call site that resolves to a
+registered native is never counted, never nominated, never enqueued, and never
+compiled — no matter how hot. It is not that the compile was attempted and
+refused; it was never requested.
+
+Measured, `CRATONVM_DBG_JITC=1` on `probes/KeySetBench iterList` (2M calls each):
+
+```text
+[ir] admission   java/util/ArrayList$Itr.<init>(Ljava/util/ArrayList;)V: admitted
+[cratonvm-jitc]  full-compile java/util/ArrayList$Itr.<init>...
+                 …and NOTHING for next() or hasNext(), ever
+```
+
+`<init>` has no native registered and compiles. `next`/`hasNext` do, and never
+appear in the log in any form.
+
+**The converse confirms it.** `java/util/ArrayList.get`/`size` — which the fix
+above made YIELD to real bytecode — now read:
+
+```text
+[ir] admission   java/util/ArrayList.get(I)Ljava/lang/Object;: admitted to the optimizing pipeline
+[cratonvm-jitc]  full-compile java/util/ArrayList.get(I)Ljava/lang/Object; len=2526
+CRATONVM_DBG_JIT_COMPILED: put java/util/ArrayList.get(I)Ljava/lang/Object;
+```
+
+So the 11.1× that fix bought was not merely "skip the native". It was **making
+the method compilable at all** — the site flips from `VirtualNative` to
+`VirtualBytecode`, which is the arm that owns the counter.
+
+Two gates that are NOT the cause, checked and eliminated:
+`CRATONVM_JIT_VIRTUAL_TIERUP` is default-ON, and `ArrayList$Itr.next()` carries
+**no exception table** (`javap -c` on the real JDK class), so the
+`cached.exception_table.is_empty()` precondition passes.
+
+**What is still open, and it is now one question rather than a mystery.**
+Retagging the `Itr` natives `SyntheticStub` makes them yield, so the site
+*ought* to cache `VirtualBytecode` and tier up — and it measured 1.56× SLOWER
+with zero compiles. `ArrayList.get` yields and does compile. So for the `Itr`
+triples the yield is evidently happening on the SLOW path
+(`invoke_or_native`) rather than at cache-population time, leaving the site
+uncached: every call takes the generic dispatcher, which is both slower than the
+native AND still has no counter. **Yielding is not sufficient; the yield has to
+happen where the site is POPULATED.** Find why population declines for an
+`invokeinterface`-reached `Itr` triple where it accepts `ArrayList.get`, and the
+retag becomes the win the crossing count always suggested it should be.
 
 ### The fix: one allow-list entry, 11.1×
 
