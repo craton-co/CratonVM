@@ -294,34 +294,55 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                     },
                 );
             } else {
-                // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24`
-                // plausibility bound `old_gen_mark_candidate_plausible`/
-                // `gen_object_total_size` apply to a header's `num_slots` —
-                // "no real object has this many fields" — so a corrupted
-                // value cannot stride this loop into unmapped memory.
-                let num_slots = (header.num_slots() as usize).min(1 << 24);
+                // The slot count is DERIVED from the extent this scan already
+                // validated, not re-read from the header. `total_size` came from
+                // `object_total_size(header)`, and the guard above required
+                // `scan_cursor + total_size <= to_space.used()` — so those bytes are
+                // inside to-space, and inverting the same arithmetic leaves this walk
+                // unable to outrun them by construction.
+                //
+                // It replaces `header.num_slots().min(1 << 24)` (HIB-DCAST-LATEPHASE.1),
+                // which is a PLAUSIBILITY clamp and not an extent: 16 M slots is 256 MB
+                // of stride, and it was a SECOND load of a header only the FIRST load
+                // had been checked in. That is the identical defect
+                // `concurrent_mark::scan_object` was fixed for on 2026-08-24, with the
+                // identical fix — the semi-space collector is the reader that pass
+                // missed. The `1 << 24` bound is unchanged in effect: it is enforced
+                // inside `object_total_size`, which yields a size the guard above
+                // rejects.
+                let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;
                 for slot_idx in 0..num_slots {
-                // SAFETY: slot_idx < num_slots, so the offset is within the object.
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                // SAFETY: slot_ptr points to a valid Value-sized region.
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if from_space.contains(ref_ptr) {
-                        let new_ref_ptr = forward_object(
-                            from_space,
-                            to_space,
-                            ref_ptr,
-                            &mut objects_copied,
-                            &mut pointer_map,
-                        );
-                        // SAFETY: new_ref_ptr is a valid object pointer in to-space.
-                        let new_value =
-                            Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
-                        // SAFETY: slot_ptr is a valid Value slot within the copied object.
-                        unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
+                    // SAFETY: slot_idx * SLOT_SIZE stays inside the validated extent.
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    // Discriminant-screened, like every other legacy-cell reader since the
+                    // corrupt-`Value`-cell work: an unchecked transmute of a swept-and-
+                    // reused cell yields a `Value` with an out-of-range tag, and the
+                    // `if let` below compiles to a jump-table load `[table + disc*4]` with
+                    // no bounds check, because Rust guarantees an in-range discriminant.
+                    // A corrupt cell decodes to `Value::Object(None)` and is skipped.
+                    let value = unsafe {
+                        crate::heap::read_value_cell_checked(
+                            slot_ptr as *const Value,
+                            "gc::cheney_scan",
+                        )
+                    };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if from_space.contains(ref_ptr) {
+                            let new_ref_ptr = forward_object(
+                                from_space,
+                                to_space,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                            );
+                            // SAFETY: new_ref_ptr is a valid object pointer in to-space.
+                            let new_value =
+                                Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
+                            // SAFETY: slot_ptr names a Value cell inside the copied object.
+                            unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
+                        }
                     }
-                }
                 }
             }
         }
@@ -759,28 +780,34 @@ pub fn collect_with_finalizers(
                     },
                 );
             } else {
-                // HIB-DCAST-LATEPHASE.1: see the matching cap above.
-                let num_slots = (header.num_slots() as usize).min(1 << 24);
+                // Extent-derived count and screened decode: see the matching
+                // scan arm in `collect`.
+                let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;
                 for slot_idx in 0..num_slots {
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if from_space.contains(ref_ptr) {
-                        let new_ref_ptr = forward_object(
-                            from_space,
-                            to_space,
-                            ref_ptr,
-                            &mut objects_copied,
-                            &mut pointer_map,
-                        );
-                        let new_value =
-                            Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
-                        unsafe {
-                            std::ptr::write(slot_ptr as *mut Value, new_value);
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    let value = unsafe {
+                        crate::heap::read_value_cell_checked(
+                            slot_ptr as *const Value,
+                            "gc::cheney_scan",
+                        )
+                    };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if from_space.contains(ref_ptr) {
+                            let new_ref_ptr = forward_object(
+                                from_space,
+                                to_space,
+                                ref_ptr,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                            );
+                            let new_value =
+                                Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
+                            unsafe {
+                                std::ptr::write(slot_ptr as *mut Value, new_value);
+                            }
                         }
                     }
-                }
                 }
             }
         }
@@ -923,28 +950,35 @@ pub fn collect_with_finalizers(
                         },
                     );
                 } else {
-                    // HIB-DCAST-LATEPHASE.1: see the matching cap above.
-                    let num_slots = (header.num_slots() as usize).min(1 << 24);
+                    // Extent-derived count and screened decode: see the matching
+                    // scan arm in `collect`.
+                    let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;
                     for slot_idx in 0..num_slots {
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                    let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                    if let Value::Object(Some(ref_obj)) = value {
-                        let ref_ptr = ref_obj.as_ptr();
-                        if from_space.contains(ref_ptr) {
-                            let new_ref_ptr = forward_object(
-                                from_space,
-                                to_space,
-                                ref_ptr,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                            );
-                            let new_value =
-                                Value::Object(Some(unsafe { ObjectRef::from_raw(new_ref_ptr) }));
-                            unsafe {
-                                std::ptr::write(slot_ptr as *mut Value, new_value);
+                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                        let value = unsafe {
+                            crate::heap::read_value_cell_checked(
+                                slot_ptr as *const Value,
+                                "gc::cheney_scan",
+                            )
+                        };
+                        if let Value::Object(Some(ref_obj)) = value {
+                            let ref_ptr = ref_obj.as_ptr();
+                            if from_space.contains(ref_ptr) {
+                                let new_ref_ptr = forward_object(
+                                    from_space,
+                                    to_space,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                let new_value = Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(new_ref_ptr)
+                                }));
+                                unsafe {
+                                    std::ptr::write(slot_ptr as *mut Value, new_value);
+                                }
                             }
                         }
-                    }
                     }
                 }
             }
