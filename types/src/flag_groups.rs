@@ -1114,6 +1114,11 @@ pub const INVENTORY: &[E] = &[
     // innermost-frame mirror after an inline-cache hit by default, and this key
     // restores the stale-mirror behaviour so one binary has both arms. See
     // `ir_lower::emit_call_cached_entry`.
+    // Declared 2026-08-26. An OPT-OUT: the staged invoke-argument buffer is
+    // published on the SHADOW stack by default, not merely named in the oop
+    // map. The band verifier consults only the shadow stack. See
+    // `x64::safepoint::collect_live_oop_homes`.
+    E { group: Group::JIT, token: "staged-arg-shadow", on_key: None, off_key: Some("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"), off_word: None },
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
@@ -1262,6 +1267,11 @@ pub const INVENTORY: &[E] = &[
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
+    // Elide the SB-CRASH-04 full-GPR blind spill at a direct call whose caller
+    // frame is provably oop-clean. Multi-valued, not a boolean: `0` never
+    // elides (the pre-2026-08-26 behaviour), `args`/`2` and the default `3`
+    // widen it -- so `off_word` is `0` and the token carries the mode.
+    E { group: Group::JIT, token: "call-spill-elision", on_key: Some("CRATONVM_JIT_CALL_SPILL_ELISION"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
