@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-490 tokens.
+492 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -211,6 +211,7 @@ export inherited from a parent shell.
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
+| `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
 | `gcphase` | `CRATONVM_DBG_GCPHASE` |
 | `gcwrite` | `CRATONVM_DBG_GCWRITE` |
@@ -219,6 +220,7 @@ export inherited from a parent shell.
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
 | `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
+| `native-entry` | `CRATONVM_DBG_NATIVE_ENTRY` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
 | `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
@@ -556,7 +558,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-227 tokens.
+229 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -667,6 +669,7 @@ export inherited from a parent shell.
 | `metrics-ring` | `CRATONVM_JIT_METRICS_RING` |
 | `mic-exc-table-publish` | `CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH` |
 | `direct-exc-table-publish` | `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` |
+| `new-class-init-memo` | `CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO` |
 | `mic-rust-entry-cache` | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` |
 | `my-scratch-flush` | `CRATONVM_JIT_MY_SCRATCH_FLUSH` |
 | `my-selfcall-proof` | `CRATONVM_JIT_MY_SELFCALL_PROOF` |
@@ -760,6 +763,7 @@ export inherited from a parent shell.
 | `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
 | `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
+| `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -790,7 +794,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-74 tokens.
+76 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -830,6 +834,7 @@ export inherited from a parent shell.
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `cm-id-pairing` | `CRATONVM_GC_NO_CM_ID_PAIRING` |
 | `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
@@ -868,6 +873,7 @@ export inherited from a parent shell.
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
+| `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
 
 ## `CRATONVM_REAL`
 

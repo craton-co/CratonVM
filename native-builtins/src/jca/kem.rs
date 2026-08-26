@@ -234,6 +234,17 @@ fn illegal_state(msg: &str) -> MethodCallFailed {
 fn kem_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Static method: args[0] is the algorithm name (no `this`).
     let alg = read_string(ctx, args, 0);
+    // `kem_algo_idx` already spells the three ML-KEM OIDs bare; HotSpot
+    // registers each one TWICE, bare and `OID.`-prefixed, and the prefixed
+    // spelling is what the three measured rows use. Resolve through the
+    // registry rather than growing the match arm a second time.
+    let alg = crate::jca::provider_chain::canonical_if_unrecognised(
+        crate::jca::provider_chain::provider_arg_name(ctx, args, 1).as_deref(),
+        "KEM",
+        &alg,
+        &|name| mlkem_spi_class(kem_algo_idx(name)).is_some(),
+    )
+    .unwrap_or(alg);
     let idx = kem_algo_idx(&alg);
     let spi_class = match mlkem_spi_class(idx) {
         Some(c) => c,

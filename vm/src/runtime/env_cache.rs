@@ -1864,6 +1864,88 @@ pub fn jit_scalar_new() -> bool {
 /// MEASUREMENT configuration (`CRATONVM_JIT=-native-shadow-caller-seal`) for
 /// pricing the seal's ceiling before anyone rebuilds it per-site; a run with it
 /// off may misbehave and must never ship.
+/// `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN=1` — let the NON-BLOCKING root
+/// snapshot deposit skip `scan_active_jit_frames`.
+///
+/// MEASUREMENT LEVER, DEFAULT OFF. This is a GC-safety-relevant switch and it
+/// must earn its default with stress, not with an argument.
+///
+/// What it is for. `deposit_root_snapshot_inner` runs the JIT conservative scan
+/// on BOTH its paths — the flag-raising one (a thread about to block) and the
+/// no-flag one (`deposit_root_snapshot_no_flag`: the wake path, and
+/// `NativeContext::refresh_root_snapshot`, which the synthetic-stream drain
+/// loops call). The scan's expensive half is the A5 unregistered-frame probe, a
+/// raw word walk of `[scanner_sp, stack_high)`. `CRATONVM_DBG_ROOTPROF=1` on a
+/// `StackWalker.walk` over a 120-frame stack, 8000 walks, on dev
+/// `ccdafa676`:
+///
+/// ```text
+/// scan_active_jit_frames by caller: gc-roots=0 safepoint=0 blocked-deposit=39,521
+/// jitprobe calls=39,496 words=255,087,460
+/// ```
+///
+/// 255 million words — 2 GB of native stack read — with EVERY scan attributed
+/// to the deposit path and NONE to the two the A5 block's own comment claims it
+/// is gated to ("only on the GC root-scan path").
+///
+/// Why it is not obviously safe, and why it is off. `xt_root_scan`'s module doc
+/// states the opposite obligation for a peer that is executing JIT code: "its
+/// only coverage is the snapshot it published at its last object-returning
+/// native call — and if its JIT slots advanced past that snapshot, the collector
+/// is blind to the new roots and the non-moving sweep reclaims a still-live
+/// object." A no-flag deposit IS such a publish. Two things argue it is
+/// nevertheless redundant there, and neither is a measurement:
+///
+///   * a thread on the no-flag path is a COUNTED mutator (the flag is what
+///     excludes it), so a peer STW waits for it to arrive at a safepoint, where
+///     `update_root_snapshot` runs the same scan — or freezes it via
+///     `xt_root_scan`, which conservatively scans its registers and stack
+///     directly and is a superset of what this contributes;
+///   * the A5 hit's other effect, `mark_moving_young_coverage_incomplete`, is
+///     reset per cycle by `begin_moving_young_coverage_cycle`, so a hit recorded
+///     at deposit time — before any cycle — is cleared before the collection
+///     that would consume it.
+///
+/// The hole in both: `CRATONVM_XT_JIT_ROOT_SCAN=0` disables the first, and a
+/// peer whose `Rip` is in a JIT *helper* rather than pure JIT code is resumed
+/// rather than taken over.
+///
+/// # MEASURED 2026-08-26: it engages completely and buys NOTHING. Route closed.
+///
+/// So the safety question above never has to be answered. In-binary ABBA on
+/// `probes/StackWalkerFindFirstProbe.java`, 2000 iterations, medians of 6, with
+/// `CRATONVM_DBG_JIT_SCAN_PROF`'s exit-time `scans=` as the engagement counter:
+///
+/// | arm | `scans` | depth 40 full-drain | depth 120 full-drain |
+/// |---|---:|---:|---:|
+/// | keep (default) | 8,495 | 512 ms | 1,421 ms |
+/// | skip | **0** | 510 ms | 1,462 ms |
+///
+/// The early-match control does not move either (154 -> 145 ms at depth 40,
+/// 411 -> 348 at depth 120, both inside the spread).
+///
+/// This is NOT the "changed a call site that never runs" failure the sibling
+/// `quartz-stackwalker` page records four times. The skip fires COMPLETELY —
+/// 8,495 scans to zero, removing all 255 million words (2 GB) of native stack
+/// the deposit path reads over 8000 walks. It is inert because that work is
+/// genuinely cheap: the band is ~52 KB of hot, cached stack walked
+/// sequentially with a per-word range check, which is ~0.5 ns/word and ~2% of
+/// the run at most. A big BYTE count is not a big TIME cost, and 2 GB of L2-resident
+/// sequential reads is the case where the two come apart.
+///
+/// Kept, default off, for the same reason `jit_native_shadow_caller_seal` is
+/// kept: the lever plus its number is what stops the next person spending a day
+/// re-deriving that the deposit reads gigabytes, concluding it must be the
+/// bottleneck, and then having to reason about `collect_all_root_snapshots`
+/// consuming every alive thread's snapshot in order to remove it.
+pub fn noflag_deposit_skips_jit_scan() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN")
+            .is_ok_and(|v| v != "0" && v != "false")
+    })
+}
+
 pub fn jit_native_shadow_caller_seal() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

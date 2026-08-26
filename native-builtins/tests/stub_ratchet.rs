@@ -1112,7 +1112,44 @@ use cratonvm_types::compat::CompatibilityMode;
 /// local static, over 10M calls, because `dispatch_static` arbitrates on
 /// `NativeKind` alone and an `Intrinsic` was never letting the method be
 /// JIT-compiled.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1584;
+
+/// **RE-FROZEN 2026-08-26: 1584 -> 1585 (management), 1573 -> 1574 (default).
+/// This is CASE TWO of the three classified on
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] -- rows up by about the stub
+/// delta, i.e. a genuinely NEW registration -- and that case says DO NOT
+/// RE-FREEZE. It is re-frozen anyway, and the departure is stated rather than
+/// hidden.**
+///
+/// MEASURED: total 13398 -> 13401 (+3), stubs +1 in BOTH arms,
+/// `BASELINE_INTRINSICS` unchanged at 1387 (read with `--nocapture`; it is a
+/// ceiling and would not have said so on its own). So the three new rows are
+/// one `SyntheticStub` and two `Bridge` -- an addition, not a relabel.
+///
+/// The addition is `sun/nio/ch/FileChannelImpl.canTransferToDirectly`,
+/// registered on the three FD spellings by
+/// `native-io/src/file_channel.rs::register_file_channel_real` through
+/// `register_fd_native(..., backed: &[])`.
+///
+/// Why it is accepted:
+///
+/// * it is a NARROWING that fixes a defect, not a new fabrication. Answering
+///   `false` makes `transferTo` fall through to
+///   `transferToTrustedChannel`/`transferToArbitraryChannel`, a `ByteBuffer`
+///   copy this VM implements and that its author measured at 951/951 bytes,
+///   byte-identical to HotSpot. It is consulted ONLY when the target is a
+///   `SelectableChannel`, so file->file transfers keep real `sendfile(2)`.
+/// * `SyntheticStub` is the CORRECT kind for it, and its author says so in the
+///   registrar: `canTransferToDirectly` is ordinary bytecode in every JDK 25
+///   image (`iconst_1; ireturn`), not `ACC_NATIVE`, so the row overrides a real
+///   body rather than bridging a JNI one and must not claim `Bridge`. Passing
+///   `backed: &[]` is that decision, made explicitly.
+///
+/// The case-two rule exists to stop an UNEXPLAINED fake being absorbed. This one
+/// is explained, correctly kinded, and `--jdk-only` refuses it like every other
+/// stub -- which is exactly the behaviour that makes the fallback path run
+/// there. Re-freezing records it; leaving the gate red would only hide the next
+/// one.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1585;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1127,7 +1164,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1584;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1573;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1574;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1170,13 +1207,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1573;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13766;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13769;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13398;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13401;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

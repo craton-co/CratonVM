@@ -416,6 +416,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jni-localref", on_key: Some("CRATONVM_DBG_JNI_LOCALREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
@@ -429,6 +430,10 @@ pub const INVENTORY: &[E] = &[
     // Tally every `real_protected_stub_class` question and its answer, so the
     // stub door can be priced rather than argued about.
     E { group: Group::DBG, token: "stub-door", on_key: Some("CRATONVM_DBG_STUB_DOOR"), off_key: None, off_word: None },
+    // Companion to `stub-door`: that one says which doors ASK the SyntheticStub
+    // arbitration, this one tallies which code path actually INVOKES the native
+    // funnel, by call site.
+    E { group: Group::DBG, token: "native-entry", on_key: Some("CRATONVM_DBG_NATIVE_ENTRY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
@@ -1109,6 +1114,11 @@ pub const INVENTORY: &[E] = &[
     // innermost-frame mirror after an inline-cache hit by default, and this key
     // restores the stale-mirror behaviour so one binary has both arms. See
     // `ir_lower::emit_call_cached_entry`.
+    // Declared 2026-08-26. An OPT-OUT: the staged invoke-argument buffer is
+    // published on the SHADOW stack by default, not merely named in the oop
+    // map. The band verifier consults only the shadow stack. See
+    // `x64::safepoint::collect_live_oop_homes`.
+    E { group: Group::JIT, token: "staged-arg-shadow", on_key: None, off_key: Some("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"), off_word: None },
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
@@ -1257,6 +1267,11 @@ pub const INVENTORY: &[E] = &[
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
+    // Elide the SB-CRASH-04 full-GPR blind spill at a direct call whose caller
+    // frame is provably oop-clean. Multi-valued, not a boolean: `0` never
+    // elides (the pre-2026-08-26 behaviour), `args`/`2` and the default `3`
+    // widen it -- so `off_word` is `0` and the token carries the mode.
+    E { group: Group::JIT, token: "call-spill-elision", on_key: Some("CRATONVM_JIT_CALL_SPILL_ELISION"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
@@ -1360,6 +1375,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
     E { group: Group::GC, token: "format-arg-pin", on_key: None, off_key: Some("CRATONVM_NO_FORMAT_ARG_PIN"), off_word: None },
+    // Declared 2026-08-24. An OPT-OUT: the JIT entry chain moves the compile-id
+    // mirror together with the RBP mirror by default. This key restores the
+    // behaviour where only the RBP half was reset on push and restored on pop,
+    // which left the pair naming two different frames. See
+    // `conservative_roots::reload_top_rbp_cache`.
+    E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
     // built it, instead of giving up whenever that method is not the chain
@@ -1672,6 +1693,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the

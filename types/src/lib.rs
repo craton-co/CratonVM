@@ -8,6 +8,7 @@
 //! and error types.
 
 pub mod access_flags;
+pub mod arraylist_view;
 mod class_id;
 pub mod compact_value;
 pub mod compat;

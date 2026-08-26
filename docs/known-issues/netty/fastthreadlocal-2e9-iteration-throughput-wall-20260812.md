@@ -196,6 +196,21 @@ ftl ns/op=226.2  fullLoopSec=486   advanced=5000000
 holding. HotSpot on the same host: 8.4-47.5 ns/op, i.e. 18-102 s for the whole
 loop.
 
+## The per-call spill, narrowed 2026-08-26
+
+Not this page's allocation cost, but the other half of the same wall, and
+recorded here because this is the family page. `emit_pre_safepoint_spill`
+blind-copied the whole GPR file — 14 stores — into frame slots at EVERY
+GC-capable call; it is now elided where the caller frame is provably oop-clean
+(`CRATONVM_JIT_CALL_SPILL_ELISION`, default on), which is **1.4-2.2x on every
+shape of compiled call** in `probes/CallArgCostProbe.java`. It does NOT fire on
+reference-manipulating frames: 100% of the refusals on both netty exhaustive
+loops are the single clause `ref-local-in-reg`, with the operand-stack,
+scratch-survivor and moving-young clauses all zero. The next lever there is to
+NARROW the spill to the registers that can hold an oop rather than elide it. See
+[`../perf/per-call-blind-gpr-spill-20260826.md`](../perf/per-call-blind-gpr-spill-20260826.md).
+
+
 ## Repro
 
 ```bash
