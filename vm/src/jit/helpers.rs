@@ -7372,11 +7372,34 @@ unsafe fn jit_getfield_impl(
                 let payload32 = std::ptr::read_unaligned(
                     ptr.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32,
                 );
+                // THE DECIDING BIT: is this object actually COMPACT?
+                //
+                // Reaching here means `jit_compact_field_slot` returned None,
+                // so the VM read the body as legacy 16-byte cells. If the
+                // object's own `GC_FLAG_COMPACT` header bit is nevertheless
+                // SET, the body is packed and those "cells" are packed field
+                // bytes reinterpreted — the tag/payload triple is then garbage
+                // by construction and there is no punned WRITE to find, only a
+                // layout disagreement to fix.
+                //
+                // This distinction is why the writer hunt kept coming up empty:
+                // measured 2026-08-24, a store-side watch on this class fired
+                // 6879 times for slot 2 and ZERO times for slot 1, and the
+                // single-pass backend does not even inline primitive putfields
+                // (they all go through `putfield_int` -> `heap.set_field`, i.e.
+                // through that watch). "Nothing ever writes slot 1" and "slot 1
+                // holds Int(1)" cannot both be true of the same bytes unless
+                // the bytes are not the cell anyone thinks they are.
+                let gc_flags = std::ptr::read_unaligned(
+                    (obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_BYTE_OFFSET),
+                );
+                let compact_bit = gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0;
                 eprintln!(
                     "[punned-ref] class_id={} num_slots={} field_index={field_index} \
                      tag={tag} payload32={payload32:#x} payload64={payload64:#x} \
-                     decoded={val:?} (payload64 is the word that would have been \
-                     dereferenced)",
+                     decoded={val:?} compact_flag={compact_bit} gc_flags={gc_flags:#x} \
+                     (payload64 is the word that would have been dereferenced; \
+                     compact_flag=true means this was read at the WRONG offsets)",
                     hdr.class_id,
                     hdr.num_slots(),
                 );
