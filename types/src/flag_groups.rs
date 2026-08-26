@@ -426,6 +426,9 @@ pub const INVENTORY: &[E] = &[
     // the analysis had at each deopt bci and whether the depth / oop-mark
     // agreement checks accepted it.
     E { group: Group::DBG, token: "stack-kinds", on_key: Some("CRATONVM_DBG_STACK_KINDS"), off_key: None, off_word: None },
+    // Tally every `real_protected_stub_class` question and its answer, so the
+    // stub door can be priced rather than argued about.
+    E { group: Group::DBG, token: "stub-door", on_key: Some("CRATONVM_DBG_STUB_DOOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
@@ -1063,6 +1066,11 @@ pub const INVENTORY: &[E] = &[
     // BigEndianHeapByteBufTest against 736 for the native shadow), and
     // interlocked with `sp-ic-deopt-check` the same way.
     E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // Serve `new`'s JVMS 5.5 initialization check from `class_init_memo`
+    // instead of `ensure_class_initialized_shared`, as getstatic/putstatic
+    // already do. Default-ON; the opt-out is the same-binary A/B, and its OFF
+    // position is the older, correct, slower path.
+    E { group: Group::JIT, token: "new-class-init-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO"), off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
@@ -1239,6 +1247,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "strict-jit-roots", on_key: Some("CRATONVM_STRICT_JIT_ROOTS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "threshold", on_key: Some("CRATONVM_JIT_THRESHOLD"), off_key: None, off_word: None },
+    // The CharSequence->String intrinsic. DEFAULT-OFF as of 2026-08-24, so a
+    // plain opt-in row rather than a kill switch.
+    E { group: Group::JIT, token: "charseq-string-intrinsic", on_key: Some("CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC"), off_key: None, off_word: None },
+    // Receiver de-speculation. DEFAULT-ON, so a KILL SWITCH: `=0` restores the
+    // old behaviour. Same `off_word` shape as `osr-coverage-shadow` and
+    // `xt-jit-coverage-handshake`, which are the other two default-ON rows.
+    E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
+    // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
+    // `threshold` above -- the token carries a number, not an on/off.
+    E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
@@ -1660,6 +1678,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the

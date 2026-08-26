@@ -103,6 +103,27 @@ fn for_each_flat_object_reference_capped(
     max_slots: usize,
     mut visit: impl FnMut(*mut u8, usize, bool),
 ) {
+    // Census only — see `FLAT_WALK_GIVEN_ARRAY`. Deliberately does not change
+    // what the walk then does: several of this helper's fifteen callers do not
+    // visibly pre-branch on kind, and skipping an array here would drop
+    // marking work if any of them depends on this path to reach one.
+    if header.kind() == ObjectKind::Array {
+        let n = FLAT_WALK_GIVEN_ARRAY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] flat 16-byte-slot walk was handed an ARRAY header (#{n}): \
+                 obj=0x{:x} class_id={} element_type={:?} array_length={} — `num_slots` and \
+                 `array_length` share the `shape` dword, so this walk will stride SLOT_SIZE \
+                 over {} elements of array payload and decode each as a `Value`. Counted, not \
+                 refused; see known-issues/gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md",
+                obj_ptr as usize,
+                header.class_id.as_u32(),
+                header.element_type(),
+                header.array_length(),
+                header.array_length(),
+            );
+        }
+    }
     if cratonvm_types::is_compact_object(header) {
         // Borrowing accessor: only `field_offsets` / `is_ref` are read here.
         // `visit` is caller-supplied and may re-enter the layout cache (G1's
@@ -325,6 +346,30 @@ pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
 /// i.e. how many headers claimed more reference slots than could physically be
 /// there. Expected to be ZERO.
 pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the legacy 16-byte-slot walk was handed a header whose kind
+/// is `Array`.
+///
+/// The flat walk has no array branch: it strides `SLOT_SIZE` (16) over what an
+/// array stores as 8-byte (or 2-byte, or 1-byte) elements, and decodes each as
+/// a `Value`. It also takes its element count from `header.num_slots()`, and
+/// `NUM_SLOTS_OFFSET == ARRAY_LENGTH_OFFSET` — the same `shape` dword — so an
+/// array handed to this walk yields not a garbage count but the array's own
+/// LENGTH, a plausible positive integer of unbounded size.
+///
+/// That is not a hypothetical pairing: the corrupt-`Value`-cell producer closed
+/// on 2026-08-22 was exactly this kind confusion, identified as
+/// `receiver_class=java/lang/String receiver_kind=Array`
+/// (`fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
+///
+/// **Counted, not refused.** Refusing would be a behaviour change, and this
+/// helper has fifteen call sites of which several do not visibly pre-branch on
+/// kind — if any of them relies on this walk to reach an array's references,
+/// skipping would silently drop marking work, which is a worse defect than the
+/// one being guarded. The number is the evidence needed to decide;
+/// `docs/known-issues/gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md`
+/// §5 is the decision it feeds. **Expected to be ZERO.**
+pub static FLAT_WALK_GIVEN_ARRAY: AtomicUsize = AtomicUsize::new(0);
 
 /// How many unresolved-kept SEEDS the post-evacuation-failure rset recording
 /// refused to walk because their header did not look like a live object.
