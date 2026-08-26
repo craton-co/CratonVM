@@ -46,6 +46,65 @@
 > and below its midpoint. Take the CratonVM column — HotSpot's own swings 7.5x
 > across four passes at this load, exactly as § Measuring this at all says.
 >
+> ## Re-verified 2026-08-26 on `origin/dev` `ccdafa676`, four merges later
+>
+> The closing measurements above were taken on the fix branch at `origin/dev`
+> `5a760532c`. dev has advanced four merges since — the `--jdk-only` JUL slot
+> models, the collections/G1 store work, the netty `CharSequence` loop deopt and
+> the concurrent-marker slot extent — and a merge is a new tree. Re-run on a
+> fat-LTO build of `ccdafa676`, nothing from this branch applied on top:
+>
+> | | recorded at retirement | re-run on `ccdafa676` |
+> |---|---|---|
+> | `testBug57700` / `testDeploy` | PASS / PASS | **PASS / PASS** |
+> | `TestManagerWebapp` whole class | `Tests run: 4, Failures: 2` | **identical — same two names** |
+> | which two fail | `testJsps`, `testServlets` | **`testJsps`, `testServlets`** |
+> | deploy of `/bug57700` | 15 506 / 16 618 ms | **12 038 / 13 957 ms** |
+>
+> Criterion 1 therefore holds on a tree this branch never saw, and the two
+> failures are still the JMX-proxy and manager-JSP ones that are not this
+> page's — reproduced by name and by count, not by argument.
+>
+> ### Criterion 2, with the load objection removed
+>
+> The 23.4–23.7 reading above is inside the band but is a number this page's own
+> § Measuring this at all would not accept: *any number taken at load > 10 is
+> noise*. The host would not go below ~18 (it is shared), so the answer is
+> passes rather than quiet: **one discarded warm-up and eight counted passes**,
+> HotSpot every pass, arm order reversed on even passes, µs/class:
+>
+> | pass | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | mean |
+> |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+> | CratonVM | 647.8 | 617.3 | 618.0 | 740.7 | 720.0 | 327.1 | 544.7 | 596.7 | **601.5** |
+> | HotSpot | 4.2 | 5.5 | 101.9 | 5.0 | 14.7 | 42.1 | 35.3 | 28.3 | 29.6 |
+>
+> **Every one of the eight is inside the 813.5 µs/class band**, the worst at
+> 740.7, and the mean is 601.5 — below the 718.5 recorded above rather than
+> above it. The warm-up matters and is the reason it is discarded by
+> construction: an earlier four-pass run without one put pass 1 at **1157.5**
+> against 594–738 for the other three, which reads as a band excursion and is
+> only a cold start.
+>
+> HotSpot's column swings **24x** across the same eight passes (4.2 → 101.9).
+> Take the CratonVM column, exactly as § Measuring this at all says — the
+> cross-VM ratio here is a property of the host, not of either VM.
+>
+> ### The `CoyoteInputStream` page, same run
+>
+> Both classes re-run on `ccdafa676` with the read doors armed
+> (`CRATONVM_DBG=straystack`):
+>
+> | class | page recorded | re-run |
+> |---|---:|---:|
+> | `TestDefaultServletRfc9110Section13` | 16 hits | **0**, `rc=0` |
+> | `TestWebdavServletOptionsUnknown` | 8 hits | **0**, `rc=0` |
+>
+> One caveat stated rather than glossed: a zero from a counter is only evidence
+> if the counter can be non-zero, and this run had no known-OOB access to prove
+> that on this binary. What makes the zero causal is the fix commit's own
+> before/after on the *same command* (16 → 0, 8 → 0); this run adds that it is
+> still zero four merges later, which is the question it was run to answer.
+
 > ## Criterion 3 — the real work. HANDED OFF, not abandoned.
 >
 > `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
