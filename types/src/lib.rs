@@ -14,6 +14,8 @@ pub mod compat;
 pub mod error;
 pub mod fdlibm;
 pub mod field_layout;
+
+pub mod ffm_epoch;
 pub mod field_watch;
 pub mod flag_groups;
 pub mod flags;

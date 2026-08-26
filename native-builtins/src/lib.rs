@@ -4154,6 +4154,7 @@ fn native_wildfly_security_manager_get_property_privileged(
 /// sites here; `docs/security/capability-wiring.md` records which of the audit
 /// rows in `docs/security/native-capabilities.md` they close.
 pub mod capability_gate;
+pub mod ffm_fast;
 pub mod case_map;
 /// Descriptor-safe instance-field readers.
 ///

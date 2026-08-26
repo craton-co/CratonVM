@@ -1002,6 +1002,87 @@ pub(super) fn compile_osr_artifact(
                         }
                     }
 
+                    // ===== INTRINSIC REGION BEGIN: FFM_SEGMENT =====
+                    // `MemorySegment.getAtIndex`/`setAtIndex` on the OSR /
+                    // direct-bind door.
+                    //
+                    // Registered HERE as well as in the single-pass scan
+                    // because an intrinsic registered in one door is inert in
+                    // the others — the lesson this file already records for the
+                    // `Thread.currentThread` and String binds. An engagement
+                    // counter is what caught it: `publishes=4000001
+                    // fast_hits=0` said the native was publishing verdicts on
+                    // every element and compiled code was never asking, because
+                    // the only door that ran was this one.
+                    //
+                    // `invoke_kind` 0/2 (virtual/interface), unlike the
+                    // `try_resolve_intrinsic` block above which is
+                    // `invokestatic`-only: these accessors are interface calls.
+                    // No receiver class-id guard is needed or wanted — the
+                    // helper asks the native for a verdict rather than
+                    // speculating on a receiver class, and DECLINES into this
+                    // site's ordinary dispatch for anything it does not
+                    // recognise.
+                    if matches!(invoke_kind, 0 | 2)
+                        && target_class == "java/lang/foreign/MemorySegment"
+                        && matches!(mn, "getAtIndex" | "setAtIndex")
+                        && cratonvm_jit::ffm_kind_for_descriptor(desc).is_some()
+                    {
+                        let entry = if mn == "getAtIndex" {
+                            cratonvm_jit::JitIntrinsic::FfmSegmentGetAtIndex.as_entry()
+                        } else {
+                            cratonvm_jit::JitIntrinsic::FfmSegmentSetAtIndex.as_entry()
+                        };
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                            eprintln!(
+                                "[ffm] REGISTERED(bridge) {target_class}.{mn}{desc} @pc={pc} kind={invoke_kind}"
+                            );
+                        }
+                        // The site's own dispatch info. REQUIRED, not
+                        // incidental: the emitted fast path DECLINES into this
+                        // exact dispatch for any carrier it does not recognise,
+                        // and the emitter also reads the descriptor back off it
+                        // to recover the element kind. Without it the emitter
+                        // refuses the site (`info=false`) and nothing is gained.
+                        let class_box: Box<str> = target_class.to_string().into_boxed_str();
+                        let method_box: Box<str> = mn.to_string().into_boxed_str();
+                        let desc_box: Box<str> = desc.to_string().into_boxed_str();
+                        let class_ref = &*class_box as *const str;
+                        let method_ref = &*method_box as *const str;
+                        let desc_ref = &*desc_box as *const str;
+                        owned_jit_strings2.push(class_box);
+                        owned_jit_strings2.push(method_box);
+                        owned_jit_strings2.push(desc_box);
+                        // SAFETY: the three `Box<str>` were just pushed to
+                        // `owned_jit_strings2`, which outlives the JitInvokeInfo
+                        // and the code compiled against it.
+                        let info = Box::new(crate::jit::JitInvokeInfo {
+                            class_name: unsafe { &*class_ref },
+                            method_name: unsafe { &*method_ref },
+                            descriptor: unsafe { &*desc_ref },
+                            // Receiver-INCLUDED, unlike `JitDirectCall.num_params`.
+                            num_jit_args: param_count + 1,
+                            return_type: cratonvm_jit::return_type(desc),
+                            invoke_kind,
+                            declaring_class_id: class_id.as_u32(),
+                        });
+                        let info_ptr: *const _ = &*info;
+                        owned_jit_invoke_infos2.push(info);
+                        invoke_info.push((pc, info_ptr));
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: false,
+                                num_params: param_count,
+                                return_type: cratonvm_jit::return_type(desc),
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // ===== INTRINSIC REGION END: FFM_SEGMENT =====
+
                     // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
                     if invoke_kind == 3
                         && target_class == "java/lang/Math"
@@ -7832,6 +7913,31 @@ fn resolve_inline_site_from(
             0xb8 => 3,
             _ => return None,
         };
+        // REFUSE the whole splice when the callee makes an FFM element access.
+        //
+        // `try_emit_inline_body`'s invoke arm lowers every call in a spliced
+        // body to an ordinary dispatch — the intrinsic ladder does NOT run
+        // inside an inlined body. So splicing a method that contains a
+        // `MemorySegment.getAtIndex`/`setAtIndex` silently converts that site
+        // from the ~11 ns/element fast path back to the ~1158 ns/element native
+        // dispatch, and those accessors live in exactly the one-line wrappers
+        // (`TornadoMemorySegment.getShortAtIndex`, `ShortArray.get`) an inliner
+        // takes every time.
+        //
+        // Measured: with these still spliced, kfusion showed `fast_hits=0` and
+        // no `getAtIndex` emitted at all; refusing the splice took the same run
+        // to 40.4M hits against 6.0M misses. The trade is ONE compiled-to-
+        // compiled call per element — a few nanoseconds — to keep a ~100x fast
+        // path, and it is only taken for a descriptor the fast path will
+        // actually emit (`ffm_kind_for_descriptor`, the same gate the emitter
+        // asks), so a float carrier keeps being inlined as before.
+        if matches!(opcode, 0xb6 | 0xb9)
+            && target_class == "java/lang/foreign/MemorySegment"
+            && matches!(target_name, "getAtIndex" | "setAtIndex")
+            && cratonvm_jit::ffm_kind_for_descriptor(target_desc).is_some()
+        {
+            no!("ffm-accessor-keeps-its-own-fast-path");
+        }
         // Receiver-included, one slot per parameter regardless of category —
         // the count `JitInvokeInfo::num_jit_args` carries and the count the
         // emitter pops, since the JIT operand stack holds one i64 per value.

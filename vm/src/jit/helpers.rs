@@ -22379,6 +22379,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // the helper ABI is append-only and its slot is `RequiredPtr`; nothing
         // calls it.
         ldc_string_cp: jit_ldc_string_cp as *const () as usize,
+        // FFM element accessors. Always wired in production; a hand-built test
+        // table that leaves these 0 simply emits no fast path, and every site
+        // keeps the native dispatch it has today.
+        ffm_segment_get: jit_ffm_segment_get as *const () as usize,
+        ffm_segment_set: jit_ffm_segment_set as *const () as usize,
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by
@@ -23725,4 +23730,268 @@ unsafe fn const_thunk_self_test(
         "thunk-self-test",
     );
     (rc as i32) == expected // Cast: the Java value is the low half
+}
+
+// ===========================================================================
+// FFM element-accessor fast path
+// ===========================================================================
+//
+// `MemorySegment.getAtIndex`/`setAtIndex` are the FFM ELEMENT accessors, driven
+// one element at a time by any segment-backed array. Through the ordinary
+// native dispatch funnel they measure ~1158 ns/element, against ~0.8 ns for a
+// `short[]` element and ~303 ns for `Unsafe.getShort(long)` — a maximally lean
+// native through the SAME funnel. So ~300 ns is the funnel and ~850 ns is the
+// segment native's ~10 `NativeContext` round-trips for scope liveness, address
+// and size.
+//
+// These two helpers replace BOTH costs on the hot shape: a direct call from
+// compiled code (no dispatch, no `Vec<Value>` marshalling, no registry lookup)
+// into a body that does a handful of loads.
+//
+// # What makes this safe
+//
+// The helpers do NOT re-implement the segment liveness model. That model spans
+// two synthetic classes owned by two different files, and this repository has
+// already been bitten once by a second copy of one of its slot indices (the
+// W7-89 note on `PE_ARENA_CLASS`: the duplicate made the check silently DEAD).
+// Instead:
+//
+//   * the NATIVE publishes a verdict (`ffm_fast::note_validated`) at the point
+//     where it has already proven the carrier is a plain 6-slot native segment
+//     with a live scope, and, for writes, that the write was permitted;
+//   * these helpers only ask `ffm_fast::is_validated`, and decline otherwise.
+//
+// A decline returns 0 and the caller falls through to the unchanged native
+// dispatch, so every case this does not positively recognise keeps today's
+// behaviour — including every exception, which the native raises exactly as
+// before.
+//
+// The verdict is keyed by `(carrier address, epoch)`; freeing native memory and
+// every GC cycle bump the epoch, which is what lets an address stand in for
+// object identity in between. See `cratonvm_native_builtins::ffm_fast`.
+//
+// The carrier's `ptr`/`size`/`offset` are RE-READ here on every call rather
+// than cached, so a slot rewrite cannot leave a stale address behind.
+
+/// Layout kind codes shared with the JIT's intrinsic resolver. Derived at
+/// compile time from the call site's DESCRIPTOR, which names the `ValueLayout`
+/// subtype (`getAtIndex:(Ljava/lang/foreign/ValueLayout$OfShort;J)S`), so the
+/// element width is a compile-time constant and never a runtime layout probe.
+pub const FFM_KIND_BYTE: i64 = 0;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_SHORT: i64 = 1;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_CHAR: i64 = 2;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_INT: i64 = 3;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_LONG: i64 = 4;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_FLOAT: i64 = 5;
+/// See [`FFM_KIND_BYTE`].
+pub const FFM_KIND_DOUBLE: i64 = 6;
+
+/// Byte width of a kind code, or `None` for one this fast path does not decode.
+#[inline]
+fn ffm_kind_width(kind: i64) -> Option<i64> {
+    Some(match kind {
+        FFM_KIND_BYTE => 1,
+        FFM_KIND_SHORT | FFM_KIND_CHAR => 2,
+        FFM_KIND_INT | FFM_KIND_FLOAT => 4,
+        FFM_KIND_LONG | FFM_KIND_DOUBLE => 8,
+        _ => return None,
+    })
+}
+
+/// The CratonVM-minted native carrier's slots, as `native-builtins` writes
+/// them. Pinned against that crate's own constants by
+/// `ffm_carrier_slots_match_native_builtins`.
+const FFM_SLOT_PTR: usize = 0;
+/// See [`FFM_SLOT_PTR`].
+const FFM_SLOT_SIZE: usize = 1;
+/// See [`FFM_SLOT_PTR`].
+const FFM_SLOT_OFFSET: usize = 5;
+/// The only carrier shape this fast path decodes — matched by the publish gate
+/// in `native-builtins`' `ffm_publish_verdict`.
+const FFM_CARRIER_SLOTS: u32 = 6;
+
+/// Read one LEGACY 16-byte `Value` cell of `obj_ptr` as an `i64`, or `None` if
+/// the slot does not hold a `Long`.
+///
+/// Deliberately legacy-only: a COMPACT instance is declined by the caller, so
+/// this never has to guess a packed offset for a class that declares no fields.
+///
+/// # Safety
+/// `obj_ptr` must be a live object with more than `index` slots.
+#[inline]
+unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
+    let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + index * SLOT_SIZE);
+    match cratonvm_types::read_value_atomic(ptr as *const Value) {
+        Value::Long(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Shared prologue: decline unless `seg` is a carrier this fast path may
+/// decode, returning `(base_address, byte_size)` on success.
+///
+/// # Safety
+/// Called from compiled code with `seg` an object reference or 0.
+#[inline]
+unsafe fn ffm_resolve_carrier(seg: i64, want_write: bool) -> Option<(u64, i64)> {
+    if !cratonvm_types::plausible_heap_pointer(seg as u64) {
+        return None;
+    }
+    // The verdict. Everything the native checked — carrier shape, scope
+    // liveness, and for a write that the write was permitted — is condensed
+    // here, and none of it is re-derived.
+    if !cratonvm_native_builtins::ffm_fast::is_validated(seg as u64, want_write) {
+        return None;
+    }
+    // Defence in depth, one load each. The verdict was published for a 6-slot
+    // LEGACY carrier; re-assert both rather than trust that nothing re-shaped
+    // the object, because the alternative to a mismatch is decoding slots that
+    // mean something else.
+    let num_slots =
+        std::ptr::read((seg as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
+    if num_slots != FFM_CARRIER_SLOTS {
+        return None;
+    }
+    let gc_flags = std::ptr::read((seg as *const u8).add(cratonvm_types::GC_FLAGS_BYTE_OFFSET));
+    if gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0 {
+        return None;
+    }
+    // RE-READ, never cached: these are ordinary mutable slots.
+    let ptr = ffm_read_long_slot(seg, FFM_SLOT_PTR)?;
+    let size = ffm_read_long_slot(seg, FFM_SLOT_SIZE)?;
+    let offset = ffm_read_long_slot(seg, FFM_SLOT_OFFSET)?;
+    if size <= 0 {
+        return None;
+    }
+    // `segment_address` is `[0] + [5]`; mirror it exactly.
+    let base = (ptr as u64).checked_add(offset as u64)?;
+    if base == 0 {
+        return None;
+    }
+    Some((base, size))
+}
+
+/// Bounds-check `index` for `width` bytes against `size`, returning the byte
+/// offset. Mirrors the native's `0 <= offset && offset + width <= size` with the
+/// same overflow guard; anything it would refuse is declined here instead, so
+/// the native raises the exception.
+#[inline]
+fn ffm_checked_offset(index: i64, width: i64, size: i64) -> Option<i64> {
+    if index < 0 {
+        return None;
+    }
+    let offset = index.checked_mul(width)?;
+    let end = offset.checked_add(width)?;
+    if end > size {
+        return None;
+    }
+    Some(offset)
+}
+
+/// FFM element READ fast path. Returns 1 and writes `*out` when handled, 0 to
+/// decline (the caller then runs the unchanged native dispatch).
+///
+/// # Safety
+/// Called from JIT-compiled code. `seg` is an object reference or 0; `out` must
+/// point to a writable `i64`.
+pub unsafe extern "C" fn jit_ffm_segment_get(
+    seg: i64,
+    index: i64,
+    kind: i64,
+    out: *mut i64,
+) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache.
+    crate::jit::conservative_roots::note_jit_boundary();
+    let Some(width) = ffm_kind_width(kind) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    let Some((base, size)) = ffm_resolve_carrier(seg, false) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    let Some(offset) = ffm_checked_offset(index, width, size) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    let addr = base + offset as u64;
+    // SAFETY: `addr` lies inside the carrier's block — `base` came from the
+    // carrier's own address slots and `offset + width <= size` was just checked
+    // — and the block is live, which is what the verdict asserts.
+    //
+    // Widths and signedness match `pe_segment_get_impl` exactly: byte and short
+    // sign-extend, char zero-extends, float and double return raw bits for the
+    // caller to move into an XMM register.
+    let value: i64 = match kind {
+        FFM_KIND_BYTE => i64::from(*(addr as *const i8)),
+        FFM_KIND_SHORT => i64::from(std::ptr::read_unaligned(addr as *const i16)),
+        FFM_KIND_CHAR => i64::from(std::ptr::read_unaligned(addr as *const u16)),
+        FFM_KIND_INT => i64::from(std::ptr::read_unaligned(addr as *const i32)),
+        FFM_KIND_LONG => std::ptr::read_unaligned(addr as *const i64),
+        FFM_KIND_FLOAT => i64::from(std::ptr::read_unaligned(addr as *const u32)),
+        FFM_KIND_DOUBLE => std::ptr::read_unaligned(addr as *const i64),
+        _ => {
+            cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+            return 0;
+        }
+    };
+    *out = value;
+    cratonvm_native_builtins::ffm_fast::note_fast_consult(true);
+    1
+}
+
+/// FFM element WRITE fast path. Returns 1 when handled, 0 to decline.
+///
+/// `value` carries the raw bits: the integral kinds in their low bytes, float
+/// and double as `to_bits()`, matching what `pe_segment_set_impl` writes.
+///
+/// # Safety
+/// Called from JIT-compiled code. `seg` is an object reference or 0.
+pub unsafe extern "C" fn jit_ffm_segment_set(
+    seg: i64,
+    index: i64,
+    kind: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let Some(width) = ffm_kind_width(kind) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    // `want_write`: only a carrier the native has actually completed a write on
+    // is eligible, so a read-only carrier can never be written here.
+    let Some((base, size)) = ffm_resolve_carrier(seg, true) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    let Some(offset) = ffm_checked_offset(index, width, size) else {
+        cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+        return 0;
+    };
+    let addr = base + offset as u64;
+    // SAFETY: as `jit_ffm_segment_get`, plus a verdict that the native
+    // completed a WRITE to this carrier at this epoch.
+    match kind {
+        FFM_KIND_BYTE => std::ptr::write_unaligned(addr as *mut u8, value as u8),
+        FFM_KIND_SHORT | FFM_KIND_CHAR => {
+            std::ptr::write_unaligned(addr as *mut u16, value as u16)
+        }
+        FFM_KIND_INT | FFM_KIND_FLOAT => {
+            std::ptr::write_unaligned(addr as *mut u32, value as u32)
+        }
+        FFM_KIND_LONG | FFM_KIND_DOUBLE => {
+            std::ptr::write_unaligned(addr as *mut i64, value)
+        }
+        _ => {
+            cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
+            return 0;
+        }
+    }
+    cratonvm_native_builtins::ffm_fast::note_fast_consult(true);
+    1
 }

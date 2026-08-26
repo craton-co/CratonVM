@@ -234,6 +234,7 @@ pub struct E {
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "a5-census", on_key: Some("CRATONVM_DBG_A5_CENSUS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ffm", on_key: Some("CRATONVM_DBG_FFM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
     // Declared 2026-08-06: these nine were read by `runtime_var`/`runtime_var_os`
     // but named nowhere, so each was served by a live `getenv` instead of the
@@ -1165,6 +1166,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
+    E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
     // Default-ON kill switch, hence `off_key` only:
