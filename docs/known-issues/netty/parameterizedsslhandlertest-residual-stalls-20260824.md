@@ -320,13 +320,17 @@ HANDED BACK was already stale: this is not "a native forgot to pin", it is
 
 ### Three ways that can happen, and the instrument for each
 
-1. **The pin slot was never remapped.** `native_pin_roots` is rewritten in two
-   places, both keyed on a `pointer_map`: `update_all_roots`, which takes ONE
-   `&mut JvmThread` and is called only by the thread that RUNS the collection;
-   and `check_post_block_gc_refs`, for a thread waking from a blocked region.
-   A thread that is a running mutator when a PEER's STW stops it at an
-   interpreter safepoint goes through neither. **Not yet checked** — and the
-   netty case is many event loops, where most collections are a peer's.
+1. ~~**The pin slot was never remapped**~~ — **REFUTED by inspection.** There
+   are THREE paths, not the two an earlier revision of this page listed, and
+   all three remap `native_pin_roots`:
+   `update_all_roots` (the thread that RUNS the collection),
+   `check_post_block_gc_refs` (a thread waking from a blocked region), and
+   `apply_pointer_map_to_thread` (a running mutator that a PEER's STW stopped
+   at an interpreter safepoint — `safepoint_check`'s own comment calls that
+   site "the only site where the deposit's promise holds, because a thread
+   that reaches this line resumes through `apply_pointer_map_to_thread` and
+   remaps its own frames"). The peer-safepoint gap this page suspected does
+   not exist.
 2. **The forward was never recorded**, so no remap could have applied. The
    `[gcpart]` ring answers this and is armed.
 3. **Pin-stack imbalance.** `read_native_pin` silently falls back to the RAW
@@ -336,8 +340,37 @@ HANDED BACK was already stale: this is not "a native forgot to pin", it is
    `CRATONVM_DBG=blockgc` / `unpin-ring`. Measured at 190 lines on a
    whole-class run, so arming it is practical; `huntloop.sh` now does.
 
-These are three different fixes and the page does not pick between them. What
-is established is the holder and that its pin did not hold.
+Two remain, they need different fixes, and the page does not pick between
+them. What is established is the holder and that its pin did not hold.
+
+### The fix A/B is INCONCLUSIVE, and the reason is worth more than the table
+
+Second attempt, 61 unfixed / 61 fixed runs interleaved at 600m:
+
+| arm | runs | `NoSuchMethodError java/lang/Object` |
+|---|---:|---:|
+| unfixed | 61 | **0** |
+| fixed | 61 | **0** |
+
+**Neither arm reproduced the defect at all**, so the comparison is empty — this
+is not "the fix worked". Set against the same week's other numbers, the event
+rate is not a rate at all: 1 run in 5 (`hunt8`), 1 in 11 (`fixab1`'s unfixed
+arm), 1 in 33 (`hunt7`), 1 in ~230 (`hunt5`), and now 0 in 122. The runs that
+caught were at load 20-27; these 122 ran mostly at load 3-7.
+
+Two consequences, both of which cost time here:
+
+* **an A/B on this event cannot work while the rate swings this far.** Sample
+  sizes that would settle a 1-in-33 event say nothing about a 1-in-230 one,
+  and the arms cannot be held at a fixed rate because the rate is the host's;
+* **the binary is not the dominant variable.** `hunt8` caught in FIVE runs on a
+  binary carrying both pin fixes, while the unfixed arm above caught nothing in
+  61. Any story of the form "the fixed binary is cleaner" has to survive that,
+  and this one does not.
+
+So the two pin fixes stand on the captures that named their holders and on the
+code being wrong on its own terms — a raw `ObjectRef` live across a call that
+allocates — and this page does not offer the A/B as evidence for either.
 
 ### Other holders the same captures name, not yet investigated
 
