@@ -187,7 +187,7 @@ priced:
   `CallArgCostProbe`. `HttpStatusClassLoopRate` does not move (106.5–121.2 vs
   105.8–112.1 ns/iter, three interleaved rounds each), and the counter says why:
   `elided=1 ... ref-local-in-reg=46`, every refusal the same clause. See
-  `performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
+  [`../perf/per-call-blind-gpr-spill-20260826.md`](../perf/per-call-blind-gpr-spill-20260826.md).
 * **`MAX_INLINE_MERGE_DEPTH` (4) and `MAX_INLINE_NEST_DEPTH` (3)**, neither of
   which has been tuned against anything. Cheap to sweep, and the arm census
   (`nested-splice-refused`, `outer-splice-rolled-back`) says immediately whether

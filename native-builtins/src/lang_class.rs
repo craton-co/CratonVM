@@ -1722,7 +1722,10 @@ fn public_member_class_is_reachable(ctx: &mut dyn NativeContext, declaring_cid: 
 /// runs anyway) вЂ” we use the stable proxy class id instead. The returned name
 /// is already dotted and MUST be used verbatim: it intentionally contains a `/`
 /// (before `0x`) that the usual internalв†’dotted `/`в†’`.` rewrite would corrupt.
-fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option<String> {
+pub(crate) fn lambda_proxy_class_name(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+) -> Option<String> {
     // Fast reject for ordinary classes (avoids the `lambda_proxies` read lock on
     // the hot getName path): lambda proxy ids are always >= 0x8000_0000.
     if class_id.as_u32() < 0x8000_0000 {
@@ -4659,12 +4662,35 @@ pub(crate) fn native_class_get_simple_name(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Lambda proxies: HotSpot's `getSimpleName()` returns the whole hidden-class
-    // name (`Host$$Lambda/0x..`), NOT a `$`/`/`-split tail. Return the same
-    // synthesized name as `getName()` so it isn't sliced to "0x..". bug-06 fam5 #1.
+    // Lambda proxies: HotSpot's `getSimpleName()` keeps the hidden-class tail
+    // (`$$Lambda/0x..`) and does NOT split on `$` or `/` -- slicing on those
+    // gives "0x..", which is bug-06 fam5 #1 and is why this branch exists.
+    //
+    // It DOES still strip the package, though, and the original spelling of this
+    // branch returned `getName()` verbatim and so kept it. That is the ordinary
+    // top-level rule -- `getName().substring(lastIndexOf('.') + 1)` -- and the
+    // `/0x<id>` tail carries no `.`, so taking the segment after the last one is
+    // exactly it. MEASURED on HotSpot 25 (`probes/LambdaSimpleNameProbe.java`),
+    // both cases, which is why the old comment read as correct:
+    //
+    //     host in the default package
+    //       getName       = SimpleNameProbe$$Lambda/0x..3f040210
+    //       getSimpleName = SimpleNameProbe$$Lambda/0x..3f040210   (no change)
+    //     host in a package
+    //       getName       = java.util.function.Predicate$$Lambda/0x..3f000ae8
+    //       getSimpleName = Predicate$$Lambda/0x..3f000ae8         (package GONE)
+    //
+    // CratonVM answered the fully-qualified name in both, so anything rendering a
+    // lambda by its simple name carried the package. Spring's
+    // `DefaultRetryPolicy.toString()` does `predicate.getClass().getSimpleName()`
+    // and asserts `predicate=Predicate..Lambda..`
+    // (`core.retry.RetryPolicyTests.predicatesCombined`).
     if let Some(class_id) = mirror_class_id(ctx, this) {
         if let Some(lname) = lambda_proxy_class_name(ctx, class_id) {
-            let result = ctx.create_string(&lname);
+            // `rsplit` yields the whole string when there is no `.`, which is
+            // the default-package case above -- so this is one rule, not two.
+            let simple = lname.rsplit('.').next().unwrap_or(&lname);
+            let result = ctx.create_string(simple);
             return Ok(Some(Value::Object(Some(result))));
         }
     }

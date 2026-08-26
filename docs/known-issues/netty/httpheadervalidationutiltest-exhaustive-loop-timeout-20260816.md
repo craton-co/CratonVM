@@ -155,7 +155,7 @@ still actionable here:
    that keeps a receiver in a register-homed local cannot use the elision, and
    the next lever is to NARROW the spill to the registers that can hold an oop
    rather than to elide it. See
-   `performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
+   [`../perf/per-call-blind-gpr-spill-20260826.md`](../perf/per-call-blind-gpr-spill-20260826.md).
 
 5. **The inline chain does not reach this loop, and cannot.**
    `compile_osr_artifact` hands the backend an EMPTY `inline_sites` map, so an
