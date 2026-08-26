@@ -157,6 +157,7 @@ fn maybe_dump_shutdown_reports() {
     // activity" is not a reading that silence can support. See
     // `runtime::interpreter::report_lambda_census_at_exit`.
     cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+    cratonvm_vm::runtime::interpreter::report_stub_door_tally_at_exit();
 
     // The map-view rebuild-elision census, on `CRATONVM_DBG=map-view-cache`.
     // `resync_skipped` is the ENGAGEMENT counter for the keySet-view fast path:
