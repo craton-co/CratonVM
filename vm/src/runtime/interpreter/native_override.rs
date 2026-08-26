@@ -7067,9 +7067,74 @@ pub(crate) fn dbg_stub_yield() -> bool {
 /// What must ultimately replace this list: `NativeKind` alone. Under
 /// `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
 /// protecting from one and the entire list becomes dead.
+#[track_caller]
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
-    crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
-        || real_protected_stub_class_common(class_name)
+    let v = crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
+        || real_protected_stub_class_common(class_name);
+    // DIAGNOSTIC (diag/which-door-arbitrates-20260824).
+    //
+    // Two attempts at making `java/util/ArrayList.get` yield to real bytecode
+    // both ended with `invocations` unchanged at 127, in the JIT arm and under
+    // `--nojit` alike, with every precondition satisfied. That is only possible
+    // if the arbitration is never REACHED for this triple, and there are six
+    // call sites that could reach it -- two on the static path, two in
+    // `dispatch_virtual`, one inside the yield predicate itself, and one in
+    // `vm_exec`.
+    //
+    // `#[track_caller]` rather than six hand-placed trace lines: one edit, and
+    // the report cannot drift out of sync with the call sites it describes. A
+    // door that never appears in this output is a door that never asks.
+    if dbg_stub_door() {
+        let l = std::panic::Location::caller();
+        stub_door_note(l.file(), l.line(), class_name, v);
+    }
+    v
+}
+
+/// `CRATONVM_DBG_STUB_DOOR` — tally every `real_protected_stub_class` question
+/// by CALL SITE and class, dumped at exit.
+///
+/// A tally, not a print-per-call: this predicate is on the dispatch path and
+/// `ArrayList.get` alone asks it thousands of times, so a line per call would
+/// change the thing it measures and bury the one row that matters.
+pub(crate) fn dbg_stub_door() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_DOOR").is_some())
+}
+
+type StubDoorKey = (&'static str, u32, String, bool);
+static STUB_DOOR_TALLY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<StubDoorKey, u64>>,
+> = std::sync::OnceLock::new();
+
+fn stub_door_note(file: &'static str, line: u32, class_name: &str, verdict: bool) {
+    let m = STUB_DOOR_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut g) = m.lock() {
+        *g.entry((file, line, class_name.to_string(), verdict))
+            .or_insert(0) += 1;
+    }
+}
+
+/// Print the [`dbg_stub_door`] tally. Called from the same exit path as the
+/// other census dumps.
+pub fn report_stub_door_tally_at_exit() {
+    if !dbg_stub_door() {
+        return;
+    }
+    let Some(m) = STUB_DOOR_TALLY.get() else {
+        eprintln!("[STUB-DOOR] no call recorded — the predicate was never asked at all");
+        return;
+    };
+    let Ok(g) = m.lock() else { return };
+    if g.is_empty() {
+        eprintln!("[STUB-DOOR] no call recorded — the predicate was never asked at all");
+        return;
+    }
+    eprintln!("[STUB-DOOR] real_protected_stub_class questions, by call site:");
+    for ((file, line, class, verdict), n) in g.iter() {
+        eprintln!("[STUB-DOOR]   {file}:{line}  {class}  -> {verdict}  x{n}");
+    }
 }
 
 /// The classes **both** dispatch paths yield to real bytecode.
@@ -7105,6 +7170,34 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             // 203.5 -> 47.2 ns, hashCode 174.1 -> 47.8, requireNonNull
             // 124.3 -> 48.6, isNull 91.8 -> 24.6.
             | "java/util/Objects"
+            // `java/util/ArrayList`, for `get`/`size`/`isEmpty` -- whose natives
+            // are already `SyntheticStub` (the census says so; the ambient
+            // `set_category(Bridge)` around their registration is NOT what
+            // lands, because `register` adjudicates the kind itself). Like the
+            // `Objects` entry above, the motive is throughput: the native cost
+            // 11x its own JDK bytecode, because pinning the native also pins
+            // the method out of the JIT.
+            //
+            // MEASURED, `probes/KeySetBench idxList` (1000 `list.get(i)` calls
+            // per row), us/call, three interleaved rounds, against the same
+            // binary with this one entry removed:
+            //
+            //     idxList        752 -> 68     11.1x
+            //     toArrHoisted   110 -> 96      1.15x   (a bonus; Spring's door)
+            //     rawArr          19 -> 18      flat    (control: no collection)
+            //     iterList       987 -> 971     flat    (the iterator does not
+            //                                            go through `get`)
+            //
+            // Two earlier attempts concluded this "did not engage" and were
+            // reverted. Both were wrong, and both were wrong for the same
+            // reason: they were scored on the native census's `invocations`,
+            // which SATURATES -- it reads the same 127 at 5 000 and 50 000
+            // iterations, and prints `invocations_complete: false` beside the
+            // number to say so. The arbitration was always reached (a
+            // `#[track_caller]` tally on this predicate shows this class asked
+            // at all three virtual doors) and the yield always worked; only the
+            // instrument was blind. Score this class by TIME.
+            | "java/util/ArrayList"
             // JDK-ONLY-WAVE2, 2026-08-06. `native_es_execute` (retagged
             // `SyntheticStub` in `native-builtins/src/util_concurrent_ext.rs`)
             // is the compatibility stand-in for CratonVM's synthetic 2-field
