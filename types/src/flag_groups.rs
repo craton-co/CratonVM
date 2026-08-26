@@ -426,6 +426,11 @@ pub const INVENTORY: &[E] = &[
     // the analysis had at each deopt bci and whether the depth / oop-mark
     // agreement checks accepted it.
     E { group: Group::DBG, token: "stack-kinds", on_key: Some("CRATONVM_DBG_STACK_KINDS"), off_key: None, off_word: None },
+    // Tally every `real_protected_stub_class` question by CALL SITE and
+    // class, dumped at exit. A tally and not a print-per-call: the predicate
+    // is on the dispatch path, so a line per call would change what it
+    // measures. A door absent from the output is a door that never asks.
+    E { group: Group::DBG, token: "stub-door", on_key: Some("CRATONVM_DBG_STUB_DOOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
