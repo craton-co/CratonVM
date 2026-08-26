@@ -1000,19 +1000,135 @@ merits, and a measured null here against an engagement counter). All three were
 about generated code restoring the mirror. The defect was in the *chain
 bookkeeping* that generated code hands off to.
 
+
+## Follow-up 2026-08-26 (second): `UNPUBLISHED_FRAME_OOP`, censused
+
+### First, a correction: the indy-bridge attribution no longer holds
+
+§Status bisected this reason to `CRATONVM_JIT_INDY_BRIDGE` on 2026-08-24 (28 → 5
+per 76 collections). **Re-taken on today's `dev`, on an idle host, that
+separation is gone:**
+
+| arm | `unpub` | proven | rc |
+|---|---:|---:|---|
+| indy bridge on | 30 | 20 | 0 |
+| indy bridge off | 28 | 23 | 0 |
+| indy bridge on | 27 | 23 | 0 |
+| indy bridge off | 33 | 19 | 0 |
+
+The tree moved twice underneath that bisect — most of all the mirror-pairing
+repair in §"Follow-up 2026-08-26", which changed *which frames reach the band
+verifier at all* (`no_map` went from hundreds to ~1). Quote the 08-24 number as
+history, not as a live attribution. `TestKillProcessWhileWriting` also passes
+4/4 on plain `dev` now.
+
+### What the unpublished words actually are
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` runs `report_unpublished_band_words`, which
+names the method and the frame REGION of every word the verifier objects to.
+One `TestKillProcessWhileWriting` run on `dev`:
+
+| region | words |
+|---|---:|
+| **`java-local`** | **64** |
+| `operand-spill` | 17 |
+| `reserved-locals-tail` | 2 |
+
+and by method, 64 of the 83 are in **one**:
+
+```
+64  org/h2/mvstore/MVStore.closeStore:(ZI)V
+12  org/h2/mvstore/MVStore$Builder.open:()Lorg/h2/mvstore/MVStore;
+ 2  org/h2/mvstore/MVStore.hasUnsavedChanges:()Z
+ 2  org/h2/mvstore/FileStore.clearCaches:()V
+```
+
+A representative line — note the same object in three consecutive local slots:
+
+```
+[moving-young-band] org/h2/mvstore/MVStore.closeStore:(ZI)V off=72 region=java-local
+  value=0x2004f4d3e28 published=8 live_hi=Some(144)
+  layout=FrameLayout { java_locals_hi: 80, … locals_hi: 128, spill_lo: 128, … }
+```
+
+`off=56/64/72` are locals 6, 7 and 8, all holding `0x2004f4d3e28`, none of them
+in the 8 values the shadow stack published at that safepoint.
+
+**This is a liveness question, and it forks two ways.** If the dataflow says
+those locals are LIVE at that pc, `collect_live_oop_homes`'s oop-locals loop —
+which publishes exactly `local_oop_mask_at_current_pc()` — has a mask gap, and
+that is a codegen defect. If it says they are DEAD, then not publishing them is
+CORRECT and the slot merely holds a stale reference nothing will read; the band
+verifier cannot tell the two apart, so it refuses, and the repair belongs on the
+verifier's side (a liveness bound it can consult, or zeroing dead ref slots).
+Nobody has asked which. That is the next measurement, and `closeStore` is a
+one-method target for it.
+
+### The staged invoke-argument buffer: a real gap, fixed, and why it does not move `unpub`
+
+`a51077342` added the staged buffer to the oop MAP (`emit_oop_map_for_safepoint`
+Stage 3) and stopped there. `collect_live_oop_homes` — which decides what
+`emit_shadow_push` publishes — enumerates the simulated operand stack and the
+oop locals, and by construction neither can see these: they were popped off the
+operand stack before the call, the same reason the map needed a Stage 3.
+
+The two are different channels. The map makes a slot a precise root for
+MARKING; the shadow stack is the REWRITABLE channel, and it is the only one
+`moving_young_unpublished_frame_oop_present` consults. Fixed, gated on moving
+coverage like the frame-slot homes beside it, `CRATONVM_JIT_NO_STAGED_ARG_SHADOW=1`
+as the A/B.
+
+**It does exactly what it targets and nothing more** — same class, same run
+shape, band census on each binary:
+
+| region | `dev` | with the fix |
+|---|---:|---:|
+| `java-local` | 64 | 65 |
+| **`operand-spill`** | **17** | **7** |
+| `reserved-locals-tail` | 2 | 4 |
+
+And it does **not** move the per-cycle refusal count:
+
+| arm | `unpub`/cycles | proven | arm | `unpub`/cycles | proven |
+|---|---:|---:|---|---:|---:|
+| on | 24/51 | 26 | off | 31/51 | 19 |
+| on | 23/51 | 27 | off | 33/52 | 19 |
+| on | 28/51 | 23 | off | 25/51 | 26 |
+
+That null is **explained, not mysterious**: `unpub` counts COLLECTIONS, and a
+collection refuses if ANY word in any band is unpublished. While `java-local`
+still contributes 64 words to the same cycles, removing 10 `operand-spill` words
+cannot change a single cycle's verdict. The fix is kept on that basis — it is
+correct, it is measurably effective on its own category, and it cannot show a
+cycle-level win until the dominant category is closed.
+
+Two honest caveats on it:
+
+* On `TestMVStoreTool` the `unpub`-per-cycle RATE went the wrong way (0.57 and
+  0.82 with, against 0.47 and 0.50 without). That class's runs vary from 10 to
+  38 collections and 62 s to 356 s, so this is not a measurement I would defend;
+  it is recorded because publishing more shadow homes has a documented over-pin
+  hazard (the bt18 small-heap OOM `collect_live_oop_homes` warns about) and
+  somebody should re-take it on a quiet host.
+* Two unit tests pin it and both DISCRIMINATE — with the kill switch the
+  publish assertion fails with `homes=[]`, while the non-moving control passes
+  in both arms, so neither can pass vacuously.
+
 ## Still open
 
 Ordered by what a next session should pick up first.
 
-* **The `invokedynamic` bridge's compiled frames do not publish their live oops
-  to the shadow stack.** Bisected to `CRATONVM_JIT_INDY_BRIDGE=0` on one binary
-  — see the table under §Status: it takes `compiled-frame-oop-not-published`
-  from 28 back to 5 per 76 collections, where none of the other four 2026-08-24
-  switches moves it below 21. The feature is `2cc02f7d3` and its own WIP commit
-  `a51077342` names "the indy bridge's staged-arg oop-map gap", so this is
-  most likely already known to its author. Left for them; recorded here because
-  it is what makes this class fail on `dev` today, and because the counter that
-  found it is now on the `[jitroots]` line for anyone else.
+* **`UNPUBLISHED_FRAME_OOP` is 64/83 `java-local` words in ONE method,
+  `MVStore.closeStore:(ZI)V`** — censused with
+  `CRATONVM_MOVING_YOUNG_BAND_DBG=1`, see §"Follow-up 2026-08-26 (second)".
+  One object in three consecutive local slots, none of them among the 8 the
+  shadow stack published at that safepoint. The question nobody has asked is
+  whether the dataflow calls those locals LIVE at that pc: if yes, the
+  oop-locals loop in `collect_live_oop_homes` has a mask gap and it is a
+  codegen defect; if no, not publishing them is correct and the repair is on
+  the verifier's side. `closeStore` is a one-method target.
+  **The 2026-08-24 attribution of this reason to `CRATONVM_JIT_INDY_BRIDGE`
+  no longer reproduces** — 30/28 vs 27/33, re-taken on an idle host.
 * **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
   bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
   proven cycles 13 against 24. None of the five switches covers it. Almost
