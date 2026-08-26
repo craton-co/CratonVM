@@ -580,10 +580,14 @@ fn register_entry_value_semantics(r: &mut NativeMethodRegistry, cls: &'static st
         // Compare against ANY Map.Entry, as the contract requires — via the
         // interface accessors, not by reaching into the other object's slots,
         // which would assume it has this class's layout.
+        // `getKey()` is arbitrary Java and can move `other` before
+        // `getValue()` below dereferences it.
+        let other_pin = ctx.pin_native_root(other);
         let ok = match ctx.invoke_virtual(other, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => v,
             _ => return Ok(Some(Value::Int(0))),
         };
+        let other = ctx.read_native_pin(other_pin, other);
         let ov = match ctx.invoke_virtual(other, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => v,
             _ => return Ok(Some(Value::Int(0))),

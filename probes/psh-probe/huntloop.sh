@@ -29,10 +29,14 @@ export CRATONVM_DBG_VACATED_FRAMES=1
 # Names the mutator an STW takeover is waiting for. Printed only once a
 # takeover has already been stuck 64 rounds, so a healthy run is silent.
 export CRATONVM_DBG_STW_CENSUS=1
+# Keeps the last 8 relocation pointer maps so a stale-ref capture can say
+# whether the forward was RECORDED and the slot missed the remap, or never
+# recorded at all. Debug-gated; the ring is empty without it.
+export CRATONVM_DBG_GCPART=1
 for i in $(seq 1 "$N"); do
   L="$D/run-$i.log"
   t0=$(date +%s); la=$(cut -d' ' -f1 /proc/loadavg)
-  timeout -k 20 900 "$EXE" --java-home "$JDK" --Xmx 1500m @/data/nres/ossl.args \
+  timeout -k 20 900 "$EXE" --java-home "$JDK" --Xmx ${NRES_XMX:-1500m} @/data/nres/ossl.args \
       -XX:+UseG1GC -Djunit.jupiter.execution.timeout.mode=disabled \
       PerTestProgressRunner "$CLS" > "$L" 2>&1
   rc=$?
@@ -40,8 +44,8 @@ for i in $(seq 1 "$N"); do
   nsme=$(grep -ac "NoSuchMethodError" "$L")
   stw=$(grep -ac "still waiting for cooperative mutators" "$L")
   st=PASS; [ "$rc" -eq 97 ] && st=HANG; { [ "$rc" -ne 0 ] && [ "$rc" -ne 97 ]; } && st=OTHER
-  printf "%-3s %-5s rc=%-4s wall=%-5s load0=%-7s nsme=%-3s stw=%s\n" \
-     "$i" "$st" "$rc" "$wall" "$la" "$nsme" "$stw" >> "$SUM"
+  printf "%-3s %-5s rc=%-4s wall=%-5s load0=%-7s xmx=%-6s nsme=%-3s stw=%s\n" \
+     "$i" "$st" "$rc" "$wall" "$la" "${NRES_XMX:-1500m}" "$nsme" "$stw" >> "$SUM"
   if [ "$st" = HANG ] || [ "$nsme" -gt 0 ] || [ "$stw" -gt 0 ]; then
     echo "CAUGHT at run $i (rc=$rc nsme=$nsme stw=$stw) — stopping so the evidence stays put" >> "$SUM"
     break

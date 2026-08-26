@@ -1262,10 +1262,13 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         // and the JDK's own default here is English.
         let (dl, dc) = match display_locale {
             Some(loc) => {
+                // `getLanguage()` can move `loc` before `getCountry()` reads it.
+                let loc_pin = ctx.pin_native_root(loc);
                 let l = match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[])? {
                     Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 };
+                let loc = ctx.read_native_pin(loc_pin, loc);
                 let c = match ctx.invoke_virtual(loc, "getCountry", "()Ljava/lang/String;", &[])? {
                     Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),

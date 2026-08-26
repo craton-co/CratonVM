@@ -71,6 +71,36 @@ fn for_each_flat_object_reference(
     obj_ptr: *const u8,
     header: &ObjectHeader,
     first_index: usize,
+    visit: impl FnMut(*mut u8, usize, bool),
+) {
+    // Uncapped: the legacy walk trusts `header.num_slots()`. A caller that holds
+    // region geometry should prefer the `_capped` form below — see its doc.
+    for_each_flat_object_reference_capped(obj_ptr, header, first_index, usize::MAX, visit)
+}
+
+/// [`for_each_flat_object_reference`], with the legacy 16-byte-slot walk
+/// bounded by `max_slots`.
+///
+/// The uncapped form derives its end purely from `header.num_slots()`, which a
+/// *plausible* header does not bound: `candidate_header_is_plausible` validates
+/// alignment, arena/region membership, and that both header tag bytes decode to
+/// defined enums — none of which implies `HEADER_SIZE + num_slots * SLOT_SIZE`
+/// lands inside the region. That is the identical argument this file already
+/// makes about `array_length` where it calls `holder_walkable_slots`; the array
+/// path there was clamped and the flat path beside it was not, even though a
+/// 16-byte `SLOT_SIZE` stride leaves a region twice as fast as the array path's
+/// 8-byte one.
+///
+/// Not hypothetical: the crash recorded at `record_outgoing_rset_edges` —
+/// `collect_garbage` -> `retry_after_evacuation_failure` ->
+/// `record_outgoing_rset_edges` -> `for_each_flat_object_reference`, faulting
+/// on a 4 MiB-aligned address well past the committed arena — came through this
+/// walk.
+fn for_each_flat_object_reference_capped(
+    obj_ptr: *const u8,
+    header: &ObjectHeader,
+    first_index: usize,
+    max_slots: usize,
     mut visit: impl FnMut(*mut u8, usize, bool),
 ) {
     if cratonvm_types::is_compact_object(header) {
@@ -100,7 +130,10 @@ fn for_each_flat_object_reference(
             },
         );
     } else {
-        for index in first_index..header.num_slots() as usize {
+        // `max_slots` is the caller's region-derived bound; `usize::MAX` from
+        // the uncapped entry point leaves the old behaviour exactly as it was.
+        let end = (header.num_slots() as usize).min(max_slots);
+        for index in first_index..end {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
             // Discriminant-screened: see `heap::read_value_cell_checked`. An
             // unchecked transmute here turns a swept-and-reused cell into a
@@ -3127,9 +3160,19 @@ impl G1Collector {
         let walkable_elements = if header.kind() == ObjectKind::Array
             && header.element_type() == ArrayElementType::Reference
         {
-            self.holder_walkable_slots(regions, obj_ptr, header.array_length() as usize)
+            self.holder_walkable_slots(regions, obj_ptr, header.array_length() as usize, 8)
         } else {
             0
+        };
+        // Same clamp, same reason, for the NON-array holder. The comment above
+        // argues `array_length` is not bounded by a plausible header — that is
+        // equally true of `num_slots`, whose 16-byte `SLOT_SIZE` stride leaves
+        // the region twice as fast, and the flat walk was the one in the
+        // recorded crash path. Computed here for the same borrow reason.
+        let walkable_slots = if header.kind() == ObjectKind::Array {
+            0
+        } else {
+            self.holder_walkable_slots(regions, obj_ptr, header.num_slots() as usize, SLOT_SIZE)
         };
         // G1AUD-5: GC-internal edges are stamped with the pause's generation,
         // exactly like the mutator barrier's.
@@ -3153,7 +3196,9 @@ impl G1Collector {
                 record(raw as usize);
             }
         } else {
-            for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
+            for_each_flat_object_reference_capped(obj_ptr, header, 0, walkable_slots, |_, raw, _| {
+                record(raw)
+            });
         }
         true
     }
@@ -5397,11 +5442,19 @@ impl G1Collector {
     /// corrupt-header case, not a large-object case: a genuinely large array is
     /// humongous and its continuation slices are physically contiguous, so the
     /// span below covers them.
+    /// `stride` is the byte size of one walked element: `8` for a reference
+    /// array's compact pointers, [`SLOT_SIZE`] for a legacy object's 16-byte
+    /// `Value` slots. It was hard-coded to `8`, which quietly made this clamp
+    /// unusable for the flat-object walk that needs it just as much —
+    /// `num_slots` is no more bounded by a plausible header than `array_length`
+    /// is, and its stride is twice as long, so it leaves the region twice as
+    /// fast.
     fn holder_walkable_slots(
         &self,
         regions: &[G1Region],
         obj_ptr: *mut u8,
         declared: usize,
+        stride: usize,
     ) -> usize {
         let addr = obj_ptr as usize;
         let region_size = self.config.region_size;
@@ -5426,7 +5479,7 @@ impl G1Collector {
         if end <= addr + HEADER_SIZE {
             return 0;
         }
-        let room = (end - addr - HEADER_SIZE) / 8;
+        let room = (end - addr - HEADER_SIZE) / stride.max(1);
         if room >= declared {
             return declared;
         }
@@ -5681,7 +5734,7 @@ impl G1Collector {
                 // against the region — so one wrong header walks into the next
                 // region's base. The collector knows the bound; use it.
                 let declared = header.array_length() as usize;
-                let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                let len = self.holder_walkable_slots(regions, obj_ptr, declared, 8);
                 for i in 0..len {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
@@ -5920,7 +5973,7 @@ impl G1Collector {
             if header.kind() == ObjectKind::Array {
                 if header.element_type() == ArrayElementType::Reference {
                     let declared = header.array_length() as usize;
-                    let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                    let len = self.holder_walkable_slots(regions, obj_ptr, declared, 8);
                     for i in 0..len {
                         let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                         let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };

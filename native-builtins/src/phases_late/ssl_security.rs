@@ -757,7 +757,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(spi) = mac_delegate_spi(ctx, this) {
+            // `engineDoFinal` allocates the result array; it can move `spi`.
+            let spi_pin = ctx.pin_native_root(spi);
             let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            let spi = ctx.read_native_pin(spi_pin, spi);
             ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
             return Ok(out);
         }
@@ -821,7 +824,10 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                     &[Value::Object(Some(*a)), Value::Int(0), Value::Int(len)],
                 )?;
             }
+            // `engineDoFinal` allocates the result array; it can move `spi`.
+            let spi_pin = ctx.pin_native_root(spi);
             let out = ctx.invoke_virtual(spi, "engineDoFinal", "()[B", &[])?;
+            let spi = ctx.read_native_pin(spi_pin, spi);
             ctx.invoke_virtual(spi, "engineReset", "()V", &[])?;
             return Ok(out);
         }

@@ -10078,10 +10078,14 @@ fn extract_temporal_fields(
                 };
                 Ok(epoch(zoned_fields(ctx, None, millis)))
             } else if is_a(ctx, "java/util/Calendar") {
+                // `obj` is passed to `zoned_fields` below, after this call has
+                // had its chance to collect and move it.
+                let obj_pin = ctx.pin_native_root(obj);
                 let millis = match ctx.invoke_virtual(obj, "getTimeInMillis", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
+                let obj = ctx.read_native_pin(obj_pin, obj);
                 // The Calendar's OWN zone, not the default: measured on
                 // HotSpot 25, `%tc` of a `Calendar.getInstance(TimeZone
                 // .getTimeZone("Asia/Tokyo"))` set to 1699999999000 is
@@ -10089,10 +10093,14 @@ fn extract_temporal_fields(
                 // `user.timezone` is.
                 Ok(epoch(zoned_fields(ctx, Some(obj), millis)))
             } else if is_a(ctx, "java/time/Instant") {
+                // Two sequential accessors on `obj` in the SAME arm; the first
+                // can move it before the second reads it.
+                let obj_pin = ctx.pin_native_root(obj);
                 let sec = match ctx.invoke_virtual(obj, "getEpochSecond", "()J", &[])? {
                     Some(Value::Long(v)) => v,
                     _ => 0,
                 };
+                let obj = ctx.read_native_pin(obj_pin, obj);
                 let nano = match ctx.invoke_virtual(obj, "getNano", "()I", &[])? {
                     Some(Value::Int(v)) => v,
                     _ => 0,
