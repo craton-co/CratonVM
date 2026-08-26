@@ -4841,17 +4841,23 @@ fn huc_get_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let joined: Option<String> = if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| {
-            let vals: Vec<String> = r
-                .headers
+            // The LAST matching value, not a join. MEASURED on HotSpot
+            // 25.0.3+9 (`probes/HucAccessors.java`): after
+            // `setRequestProperty("X-A","2"); addRequestProperty("X-A","3")`,
+            // `getRequestProperty("X-A")` answers `"3"`, while
+            // `getRequestProperties()` answers `[2, 3]`. The comma-joined form
+            // belongs to the PLURAL accessor and to response headers; the
+            // singular one is `MessageHeader.findValue`, which yields one value.
+            //
+            // The synthetic arm below already did this -- it overwrites `found`
+            // as it scans, so it keeps the last. Only this arm joined, so the
+            // two halves of one function disagreed and the half that runs on a
+            // REAL JDK image was the wrong one.
+            r.headers
                 .iter()
                 .filter(|(k, _)| k.eq_ignore_ascii_case(&key))
                 .map(|(_, v)| v.clone())
-                .collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.join(", "))
-            }
+                .next_back()
         })
     } else if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_REQ_HEADERS) {
         let len = ctx.array_length(arr);
@@ -4914,9 +4920,27 @@ fn huc_get_request_properties(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn huc_set_do_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-    // Real carrier: doInput defaults true and is not consulted by our perform;
-    // never write a synthetic slot on a real object (it corrupts a real field).
     if is_real_carrier(ctx, this) {
+        // Mirror onto the real `URLConnection.doInput` field, for exactly the
+        // reason `huc_set_do_output` below gives for `doOutput`: `getDoInput()`
+        // is declared on `URLConnection`, is not overridden here, and is one
+        // `getfield` -- so it answers from the REAL field and never consults a
+        // per-class native of ours. Dropping the write left
+        // `setDoInput(false); getDoInput()` answering `true` forever (MEASURED:
+        // `probes/HucAccessors.java`, wrong in BOTH modes, right on HotSpot).
+        //
+        // The comment this replaces said "never write a synthetic slot on a
+        // real object (it corrupts a real field)". That rule is right and is
+        // not what this does: `set_field_by_name` resolves the REAL `doInput`
+        // slot in the receiver's own hierarchy. Writing HUC_DO_INPUT --- a
+        // synthetic INDEX --- is what would corrupt one, which is why that
+        // write stays in the synthetic arm below.
+        //
+        // No `RealReq` entry: `perform` genuinely does not consult doInput, so
+        // the field is the whole fix. `getInputStream()`'s own
+        // `ProtocolException("Cannot read from URLConnection if doInput=false")`
+        // guard reads that field, and could never fire while it was stale.
+        ctx.set_field_by_name(this, "doInput", Value::Int(v));
         return Ok(None);
     }
     ctx.set_field(this, HUC_DO_INPUT, Value::Int(v));
