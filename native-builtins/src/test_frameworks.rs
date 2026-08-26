@@ -2652,12 +2652,15 @@ fn native_ecj_compiler_requestor_accept_result(
         _ => return Ok(None),
     };
 
+    // `hasErrors()` can move `result` before `getFileName()` below reads it.
+    let result_pin = ctx.pin_native_root(result);
     if matches!(
         ctx.invoke_virtual(result, "hasErrors", "()Z", &[])?,
         Some(Value::Int(v)) if v != 0
     ) {
         return Ok(None);
     }
+    let result = ctx.read_native_pin(result_pin, result);
 
     let source_file = match ctx.invoke_virtual(result, "getFileName", "()[C", &[])? {
         Some(Value::Object(Some(chars))) => char_array_to_string(ctx, chars),
@@ -3564,10 +3567,13 @@ pub(crate) fn native_surefire_forkedbooter_acknowledged_exit(
     );
 
     if let Value::Object(Some(event_channel)) = ev {
+        // `bye()` can move `event_channel` before `onJvmExit()` reads it.
+        let ch_pin = ctx.pin_native_root(event_channel);
         surefire_ignore(
             "eventChannel.bye",
             ctx.invoke_virtual(event_channel, "bye", "()V", &[]),
         );
+        let event_channel = ctx.read_native_pin(ch_pin, event_channel);
         surefire_ignore(
             "eventChannel.onJvmExit",
             ctx.invoke_virtual(event_channel, "onJvmExit", "()V", &[]),
