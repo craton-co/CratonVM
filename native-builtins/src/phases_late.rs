@@ -3294,6 +3294,10 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // report, naming whichever failure came first.
             let close_failure =
                 cratonvm_native_api::print_error_state::ERROR_MANAGER_CLOSE_FAILURE;
+            // The comment above already keeps the absorbed THROWABLE off a local
+            // across `close()`. `stream` itself is still held across the flush
+            // and its error reporting, both of which are arbitrary Java.
+            let stream_pin = ctx.pin_native_root(stream);
             let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
             let flush_failed = match cratonvm_native_api::print_error_state::take_absorbed(
                 &*ctx,
@@ -3311,6 +3315,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 }
                 None => false,
             };
+            let stream = ctx.read_native_pin(stream_pin, stream);
             let closed = ctx.invoke_virtual(stream, "close", "()V", &[]);
             if let Some(ex) = cratonvm_native_api::print_error_state::take_absorbed(
                 &*ctx,

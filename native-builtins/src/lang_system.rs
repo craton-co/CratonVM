@@ -4730,10 +4730,43 @@ pub(crate) fn native_system_init_phase1(
             Ok(cid) => cid,
             Err(_) => return,
         };
-        let cs_fields = ctx.class_num_total_fields(cs_class).max(1);
-        let cs_obj = ctx.alloc_object(cs_class, cs_fields);
-        let name = ctx.create_string("UTF-8");
-        ctx.set_field(cs_obj, 0, Value::Object(Some(name)));
+        // Prefer the REAL charset. `java/nio/charset/Charset` is ABSTRACT, so a
+        // hand-allocated instance of it has no `newEncoder()` body and every
+        // caller that encodes through this stream dies with
+        // `AbstractMethodError` rather than the NPE this helper exists to
+        // prevent -- a worse error, one frame further from the cause. See
+        // `docs/known-issues/jdk-only/bug-printstream-charset-answers-the-abstract-base-20260825.md`.
+        //
+        // This runs during `initPhase1`, which is why the hand-allocated stub
+        // was reached for in the first place, so the real call is attempted
+        // defensively and the stub stays as the fallback: bootstrap ordering
+        // decides which one lands, and neither outcome is worse than today's.
+        // `PrintStream.charset()` repairs a stub survivor on first read.
+        let cs_obj = {
+            let want = ctx.create_string("UTF-8");
+            match ctx.invoke(
+                "java/nio/charset/Charset",
+                "forName",
+                "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+                &[Value::Object(Some(want))],
+            ) {
+                Ok(Some(Value::Object(Some(real))))
+                    if !matches!(
+                        ctx.class_name_of_id(ctx.class_id_of_object(real)).as_deref(),
+                        Some("java/nio/charset/Charset")
+                    ) =>
+                {
+                    real
+                }
+                _ => {
+                    let cs_fields = ctx.class_num_total_fields(cs_class).max(1);
+                    let stub = ctx.alloc_object(cs_class, cs_fields);
+                    let name = ctx.create_string("UTF-8");
+                    ctx.set_field(stub, 0, Value::Object(Some(name)));
+                    stub
+                }
+            }
+        };
         // Use field-by-name so we hit the real-JDK `charset` slot (its
         // declared index differs from any synthetic ordering).
         ctx.set_field_by_name(stream, "charset", Value::Object(Some(cs_obj)));

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-489 tokens.
+490 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -218,6 +218,7 @@ export inherited from a parent shell.
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
+| `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
 | `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
@@ -555,7 +556,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-223 tokens.
+227 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -657,6 +658,7 @@ export inherited from a parent shell.
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
 | `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
+| `varhandle-cas-funnel-fast` | `CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |
@@ -755,6 +757,9 @@ export inherited from a parent shell.
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
+| `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
+| `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
+| `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |

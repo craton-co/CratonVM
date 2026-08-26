@@ -1,11 +1,17 @@
 # `VarHandle` writes and CAS have no fast path — 35-303x, and it is most of `java.util.concurrent`
 
 ## Status
-**PARTIALLY FIXED (2026-08-24).** Two of the three steps are done: `set` is
-bound (698 000 native dispatches eliminated, 246.5 ns -> 64.8 ns) and the
-per-call global mutex is gone (**10.9x at 24 threads**, and the anti-scaling
-with it). `compareAndSet` is still on the generic funnel, which is why the
-CAS-dominated composition workload has moved only ~9.5%. The defect was a
+**FIXED for the VarHandle path itself (2026-08-24), and the downstream premise
+is REFUTED.** All three steps are done: `set` is bound (698 000 native
+dispatches -> 0, 246.5 -> 64.8 ns), the per-call global mutex is gone (**10.9x
+at 24 threads**, and the anti-scaling with it), and the CAS is served inside the
+funnel (**4 396 000 served, 0 declined**, 1.27-1.39x).
+
+What this page got WRONG: it predicted the CAS was "the only thing between this
+and the 872x" composition gap. With the CAS fast path serving 3.84 M calls on
+that workload, composition does not move — 4 CAS per chain at ~65 ns saved is
+0.5% of a 54 us chain. `CompletableFuture` composition is not VarHandle-bound,
+and where its 872x lives is now an open question. The defect was a
 gap in an existing optimisation rather than a bug: `VARHANDLE_READ_DIRECT_FNS`
 bound READS of PRIMITIVE fields and nothing else.
 
@@ -192,23 +198,100 @@ too (plain field store 15.7 -> 19.8 ns, `AtomicInteger` 6.4 -> 10.7 ns), i.e.
 the box was ~1.5x busier. Only back-to-back comparisons on the same binary pair
 are usable here; the scaling table above is one.
 
-## What is left: bind `compareAndSet`
+## The CAS is served inside the funnel now (2026-08-24), and it does NOT fix composition
 
-The only remaining step, and now the only thing between this page and the 872x
-composition gap. The helper is `(vm_ptr, vh, receiver, expected, new)` — five
-words against Windows' four `ARG_REGS`, so unlike `set` it needs the
-stack-argument setup (`emit_stack_arg_setup`, which the direct-call path
-already has). The store half can reuse `vm_exec::compare_and_swap_field`, which
-already does the hardware CAS with the SATB pre-barrier on `expected` and the
-post `write_barrier` on success.
+### The two directions were not symmetric, and that was the whole cost
 
-Bind it at BOTH doors. A single-pass-only bind reads as "bound" and moves
-nothing — see the census note under step 1.
+Decomposing the funnel by arity with the two kill switches, on one binary:
 
-Beyond that, the scaling curve is now FLAT rather than rising, so a second
-shared bottleneck is waiting behind the one that was removed. The volatile
-store's stripe lock and `java_identity_hash` are the two candidates, and
-`HibfixVarHandleScale` is the instrument.
+| | bound | funnelled | funnel cost |
+|---|---:|---:|---:|
+| `get int` (1 coordinate) | 46.2 ns | 94.8 ns | **~49 ns** |
+| `set` (2 arguments) | 64.8 ns | 246.5 ns | **~182 ns** |
+
+A funnelled READ is cheap because it never reaches the native:
+`try_varhandle_instance_field_read` catches it inside `jit_invoke_dispatch`.
+There was no write or CAS equivalent, so a funnelled CAS ran the whole
+`varhandle_compare_and_set` — its segment-handle probe, its FFM-layout probe,
+its byte-view probe and its array probe — before reaching the instance-field
+case.
+
+`try_varhandle_instance_field_cas` is that missing twin. It needs no codegen,
+no stack-argument setup and no ABI work, and unlike a compile-time bind it also
+covers the sites the JIT declines and every interpreter dispatch.
+
+`VmExec::compare_and_swap_field` was extracted into
+`compare_and_swap_field_shared` so both routes call one implementation — the
+same argument the read path makes for `varhandle_instance_field_read_bits`, and
+a CAS has more to get wrong: the SATB pre-barrier fires on `expected` BEFORE the
+store and the post `write_barrier` only on success.
+
+| | fast path off | on |
+|---|---:|---:|
+| `field CAS in-funnel` | `served=0 declined=0` | **`served=4 396 000 declined=0`** |
+| `VarHandle.CAS int` | 232.4 ns | **167.6 ns** (1.39x) |
+| `VarHandle.CAS reference` | 363.1 ns | **285.3 ns** (1.27x) |
+
+Every CAS served, zero declines, references included; correctly inert when
+switched off; baselines stable at 15.9 / 15.7 ns. 2099 jit tests, 71/71
+regression vectors.
+
+### The census could NOT verify this one, unlike the `set` bind
+
+`--dump-native-registry` reports the SAME `VarHandle.compareAndSet` count with
+the fast path on and off — 4 396 000 either way — because a served CAS still
+calls `count_jit_native_dispatch`, exactly as a served read does. The `set`
+bind was verifiable that way (698 000 -> 0) precisely because a thin direct call
+never enters the funnel at all. Here the hit/decline pair is the only
+instrument, and it had to be wired into the shutdown report before any of the
+above could be claimed.
+
+### It does not speed up composition, and that refutes what this page predicted
+
+An earlier revision said the CAS was "the only thing between this and the 872x".
+It is not. Interleaved on a quiet box:
+
+| arm | composition | CAS served |
+|---|---:|---:|
+| off | 47 149 ms | 0 |
+| on | 51 346 ms | 3 839 190 |
+| off | 57 630 ms | 0 |
+| on | 51 700 ms | 3 839 196 |
+
+The fast path engages FULLY on composition — 3.84 M CAS served, zero declined —
+and composition does not move. The arithmetic says why: 3 839 190 CAS over
+960 000 chains is **4 CAS per chain**, saving ~65 ns each, or ~260 ns against a
+chain that costs ~54 us. **0.5%.**
+
+So `CompletableFuture` composition is not VarHandle-bound, and the 872x is
+somewhere else entirely. The 34%-in-`tryPushStack` profile reading that
+motivated this did not survive the kill switch: a Java-frame sampler attributes
+the whole of a native call to the Java frame that made it, so "34% in
+tryPushStack" was never evidence about which part of that call was expensive.
+
+(The off arm alone spans 47.1 s to 57.6 s — a 22% spread — so a 2% effect is
+not measurable on this host regardless. Any future composition claim needs many
+runs, not two.)
+
+### Where the 872x actually is: FOUND, and it is not VarHandle at all
+
+A native profile settled it: composition runs INTERPRETED (92.35% in the VM
+binary, **0.32% in JIT code**), because `CompletableFuture.complete` is a
+registered native and every method calling it is sealed from compilation. On
+the current binary `--nojit` is marginally FASTER than JIT, which is what "never
+compiled" looks like. See
+[`native-shadow-seal-keeps-completablefuture-interpreted-20260824.md`](native-shadow-seal-keeps-completablefuture-interpreted-20260824.md).
+
+That is why every fix on this page moved the primitive and not the workload.
+The old text below is kept as written:
+
+What is now excluded: the global mutex (removed, 10.9x on scaling), the CAS
+funnel (served in full, 0.5%), the `set` funnel (bound, 698 000 dispatches
+eliminated), `thenCompose` relay correctness and the Vert.x bridge (both clean
+at volume). `HibfixComposeProbe2` is still a deterministic 412 ms vs 359 s
+reproducer with no database and no flake, and profiling it by Java frame has now
+been shown to mislead — the next attempt needs a NATIVE profile.
+
 ## Repro
 
 ```bash
