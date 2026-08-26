@@ -8324,7 +8324,19 @@ impl Compiler {
                         // the interpreter, which reproduces the NPE exactly.
                         if !intrinsic_handled {
                             // (delta_imm, return_post_add, delta_is_arg)
-                            let plan: Option<(i32, bool, bool)> = if callee_entry
+                            //
+                            // `AtomicIntGet` is the one arm with no delta at
+                            // all: it reads the same slot the RMW forms address
+                            // and returns it. Everything before the final
+                            // instruction -- null check, class guard, the
+                            // per-object COMPACT/LEGACY branch, the deopt stub
+                            // -- is shared, which is the whole reason it belongs
+                            // in this block rather than beside it.
+                            let is_load =
+                                callee_entry == crate::JitIntrinsic::AtomicIntGet.as_entry();
+                            let plan: Option<(i32, bool, bool)> = if is_load {
+                                Some((0, false, false))
+                            } else if callee_entry
                                 == crate::JitIntrinsic::AtomicIntGetAndIncrement.as_entry()
                             {
                                 Some((1, false, false))
@@ -8388,14 +8400,16 @@ impl Compiler {
                                     // EDX = delta (kept for the *AndGet fixup,
                                     // since XADD overwrites its source with the
                                     // pre-add value).
-                                    match delta_slot {
-                                        Some(slot) => self.load_slot_to_reg(RDX, slot),
-                                        None => {
-                                            self.buf.emit(&[0xBA]); // MOV EDX, imm32
-                                            self.buf.emit(&delta_imm.to_le_bytes());
+                                    if !is_load {
+                                        match delta_slot {
+                                            Some(slot) => self.load_slot_to_reg(RDX, slot),
+                                            None => {
+                                                self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                                                self.buf.emit(&delta_imm.to_le_bytes());
+                                            }
                                         }
+                                        self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
                                     }
-                                    self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
 
                                     // Per-object layout branch.
                                     self.emit_test_mem8_imm8(
@@ -8404,14 +8418,29 @@ impl Compiler {
                                         cratonvm_types::GC_FLAG_COMPACT,
                                     );
                                     let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
-                                                                                  // LOCK XADD [RAX + compact], ECX
-                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
-                                    self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    if is_load {
+                                        // MOV ECX, [RAX + compact]. A plain load
+                                        // is the correct volatile/acquire read on
+                                        // x86-64: loads are not reordered with
+                                        // older loads, so nothing is owed here.
+                                        self.buf.emit(&[0x8B, 0x88]);
+                                        self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    } else {
+                                        // LOCK XADD [RAX + compact], ECX
+                                        self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                        self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    }
                                     let done = self.emit_jmp_rel32_patch();
                                     self.patch_rel32_to_here(legacy);
-                                    // LOCK XADD [RAX + legacy], ECX
-                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
-                                    self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    if is_load {
+                                        // MOV ECX, [RAX + legacy]
+                                        self.buf.emit(&[0x8B, 0x88]);
+                                        self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    } else {
+                                        // LOCK XADD [RAX + legacy], ECX
+                                        self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                        self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    }
                                     self.patch_rel32_to_here(done);
 
                                     // ECX now holds the PRE-add value.
