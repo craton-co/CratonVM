@@ -158,6 +158,7 @@ fn maybe_dump_shutdown_reports() {
     // `runtime::interpreter::report_lambda_census_at_exit`.
     cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
     cratonvm_vm::runtime::interpreter::report_stub_door_tally_at_exit();
+    cratonvm_vm::runtime::interpreter::report_native_entry_tally_at_exit();
 
     // The map-view rebuild-elision census, on `CRATONVM_DBG=map-view-cache`.
     // `resync_skipped` is the ENGAGEMENT counter for the keySet-view fast path:
@@ -274,6 +275,18 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" "),
             cratonvm_jit::metrics::despec_escalations_spared()
+        );
+        // The per-call safepoint blind spill, and how often the oop-clean-frame
+        // proof let a direct call publish the safepoint id alone instead of
+        // copying the whole GPR file into the frame. `elided` is the engagement
+        // counter; the two refusal rows say why the others did not.
+        eprintln!(
+            "[cratonvm] direct-call spill: {}",
+            cratonvm_jit::metrics::call_spill_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every

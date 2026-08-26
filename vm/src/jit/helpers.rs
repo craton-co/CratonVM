@@ -4708,6 +4708,53 @@ fn dbg_tlabmiss(reason: usize) {
     }
 }
 
+/// Stash the pending exception for a `<clinit>` that failed under a JIT `new`.
+///
+/// Extracted so the memoized and un-memoized arms of the check cannot drift in
+/// what they report -- the difference between them is meant to be *when* the
+/// authoritative check runs, and nothing else. The caller then returns the
+/// `0`/null sentinel, which the codegen's existing `emit_post_alloc_oom_check()`
+/// guard already routes through the method's exception table.
+fn stash_new_class_init_failure(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    class_id_raw: i64,
+) {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => {
+            set_jit_pending_exception(thread, exc);
+        }
+        MethodCallFailed::InternalError(vm_err) => {
+            let msg = format!("JIT new class_id {class_id_raw} failed to initialize: {vm_err}");
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/InternalError",
+                Some(&msg),
+            ) {
+                set_jit_pending_exception(thread, exc);
+            }
+        }
+    }
+}
+
+/// A/B lever for the `new`-path class-init memo.
+///
+/// `CRATONVM_JIT=-new-class-init-memo` takes every allocation back through
+/// `ensure_class_initialized_shared`. The OFF position is the pre-2026-08-25
+/// behaviour: correct, and slower. It exists because what this change buys is a
+/// RATE, and a rate measured across two binaries built minutes apart on a shared
+/// host is not a measurement -- the arms have to interleave inside one
+/// executable.
+fn new_class_init_memo_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO").is_none()
+    })
+}
+
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -4753,26 +4800,39 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // (`self.scalar_replaced` in `jit/src/x64.rs`'s 0xbb codegen) elides the
     // call to this helper entirely and is NOT covered by this fix -- flagged
     // as a residual in CRATONVM-SPRING-GENUINE-BUGLIST.
-    if let Some((thread, _guard)) = jit_thread_mut() {
-        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
-            use crate::error::MethodCallFailed;
-            match err {
-                MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(thread, exc);
+    //
+    // Behind `class_init_memo`, exactly as `jit_getstatic` and
+    // `jit_putstatic_object` already are. The check is required on the FIRST
+    // allocation of a class and is pure overhead on every one after it:
+    // initialization is monotonic (JVMS §5.5 -- a class that has completed
+    // initialization never returns to an uninitialized state, and redefinition
+    // does not re-run `<clinit>`), so a confirmed "yes" needs no invalidation.
+    //
+    // What the memo saves is larger here than at `getstatic`, because this call
+    // site pays for the answer twice over: `ensure_class_initialized_shared`
+    // needs a `class_manager.read()` to reach the per-class atomic, and this
+    // site needs a `jit_thread_mut()` acquire merely to have a thread to hand
+    // it. The memo skips BOTH. `is_class_initialized_via_manager` +
+    // `ensure_class_initialized_shared` were 12.2% of a whole-process profile
+    // of an allocation loop -- see `fixed-suite-bugs/netty/`
+    // `osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
+    if new_class_init_memo_enabled() {
+        if !class_init_memo::is_initialized(vm.vm_identity, class_id_raw as u32) {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+                    stash_new_class_init_failure(vm, thread, err, class_id_raw);
+                    return 0;
                 }
-                MethodCallFailed::InternalError(vm_err) => {
-                    let msg =
-                        format!("JIT new class_id {class_id_raw} failed to initialize: {vm_err}");
-                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                        vm,
-                        thread,
-                        "java/lang/InternalError",
-                        Some(&msg),
-                    ) {
-                        set_jit_pending_exception(thread, exc);
-                    }
-                }
+                // Only a CONFIRMED success is memoized. A failed `<clinit>`
+                // leaves the class in the erroneous state, and every later
+                // attempt must throw from the real check rather than be waved
+                // through by a stale bit.
+                class_init_memo::mark_initialized(vm.vm_identity, class_id_raw as u32);
             }
+        }
+    } else if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+            stash_new_class_init_failure(vm, thread, err, class_id_raw);
             return 0;
         }
     }

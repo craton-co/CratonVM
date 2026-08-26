@@ -67,7 +67,27 @@ fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
 /// Enumerate reference fields of a non-humongous object under either body
 /// layout. `slot` points at the writable on-heap representation; `compact`
 /// selects an 8-byte raw pointer versus a legacy 16-byte `Value` cell.
-fn for_each_flat_object_reference(
+///
+/// # The name is the contract (option C)
+///
+/// This entry point takes its element count from `header.num_slots()` and bounds
+/// it by nothing. It cannot: it is handed a raw pointer and a `&ObjectHeader`,
+/// and knows neither the region, the arena, nor the object's allocated size, so
+/// `HEADER_SIZE + num_slots * SLOT_SIZE` is an address it has no way to check.
+/// **It trusts its caller**, and until 2026-08-26 nothing in its signature said
+/// so — fourteen call sites made that assumption silently.
+///
+/// The rename is the whole of option **C** in
+/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// §4: no runtime cost, no behaviour change, and fourteen silent assumptions
+/// become fourteen readable ones. A caller that *does* hold region geometry
+/// should use [`for_each_flat_object_reference_capped`] with
+/// `holder_walkable_slots`, which is strictly stronger than trusting the count.
+///
+/// The trust does **not** extend to the object's KIND — see the refusal at the
+/// top of [`for_each_flat_object_reference_capped`], which both entry points go
+/// through.
+fn for_each_flat_object_reference_trusting_header(
     obj_ptr: *const u8,
     header: &ObjectHeader,
     first_index: usize,
@@ -78,7 +98,7 @@ fn for_each_flat_object_reference(
     for_each_flat_object_reference_capped(obj_ptr, header, first_index, usize::MAX, visit)
 }
 
-/// [`for_each_flat_object_reference`], with the legacy 16-byte-slot walk
+/// [`for_each_flat_object_reference_trusting_header`], with the legacy 16-byte-slot walk
 /// bounded by `max_slots`.
 ///
 /// The uncapped form derives its end purely from `header.num_slots()`, which a
@@ -93,7 +113,7 @@ fn for_each_flat_object_reference(
 ///
 /// Not hypothetical: the crash recorded at `record_outgoing_rset_edges` —
 /// `collect_garbage` -> `retry_after_evacuation_failure` ->
-/// `record_outgoing_rset_edges` -> `for_each_flat_object_reference`, faulting
+/// `record_outgoing_rset_edges` -> `for_each_flat_object_reference_trusting_header`, faulting
 /// on a 4 MiB-aligned address well past the committed arena — came through this
 /// walk.
 fn for_each_flat_object_reference_capped(
@@ -103,19 +123,28 @@ fn for_each_flat_object_reference_capped(
     max_slots: usize,
     mut visit: impl FnMut(*mut u8, usize, bool),
 ) {
-    // Census only — see `FLAT_WALK_GIVEN_ARRAY`. Deliberately does not change
-    // what the walk then does: several of this helper's fifteen callers do not
-    // visibly pre-branch on kind, and skipping an array here would drop
-    // marking work if any of them depends on this path to reach one.
+    // OPTION D — refuse, and count the refusal. See `FLAT_WALK_REFUSED_ARRAY`
+    // for why refusing is safe here and why the earlier census-only form was
+    // wrong to hedge: all fifteen call sites of this helper pre-branch on
+    // `header.kind() == ObjectKind::Array` and run their own 8-byte element
+    // walk in that arm, so no caller reaches this walk for an array ON PURPOSE.
+    // An `Array` arriving here therefore means the kind the caller read and the
+    // kind this header reports are not the same kind — a torn or rewritten
+    // header, i.e. the exact kind confusion §3 of the page describes — and
+    // walking it flat would stride SLOT_SIZE over array payload for
+    // `array_length` iterations, because `num_slots` and `array_length` are the
+    // same `shape` dword.
     if header.kind() == ObjectKind::Array {
-        let n = FLAT_WALK_GIVEN_ARRAY.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = FLAT_WALK_REFUSED_ARRAY.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
             tracing::warn!(
-                "[g1] flat 16-byte-slot walk was handed an ARRAY header (#{n}): \
+                "[g1] flat 16-byte-slot walk REFUSED an ARRAY header (#{n}): \
                  obj=0x{:x} class_id={} element_type={:?} array_length={} — `num_slots` and \
-                 `array_length` share the `shape` dword, so this walk will stride SLOT_SIZE \
-                 over {} elements of array payload and decode each as a `Value`. Counted, not \
-                 refused; see known-issues/gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md",
+                 `array_length` share the `shape` dword, so this walk would have strided \
+                 SLOT_SIZE over {} elements of array payload and decoded each as a `Value`. \
+                 Every caller pre-branches on kind, so this is a kind confusion, not an \
+                 intended array walk; see \
+                 fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
                 obj_ptr as usize,
                 header.class_id.as_u32(),
                 header.element_type(),
@@ -123,6 +152,7 @@ fn for_each_flat_object_reference_capped(
                 header.array_length(),
             );
         }
+        return;
     }
     if cratonvm_types::is_compact_object(header) {
         // Borrowing accessor: only `field_offsets` / `is_ref` are read here.
@@ -347,8 +377,8 @@ pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
 /// there. Expected to be ZERO.
 pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 
-/// How many times the legacy 16-byte-slot walk was handed a header whose kind
-/// is `Array`.
+/// How many times the legacy 16-byte-slot walk was handed — and REFUSED — a
+/// header whose kind is `Array`.
 ///
 /// The flat walk has no array branch: it strides `SLOT_SIZE` (16) over what an
 /// array stores as 8-byte (or 2-byte, or 1-byte) elements, and decodes each as
@@ -360,16 +390,44 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// That is not a hypothetical pairing: the corrupt-`Value`-cell producer closed
 /// on 2026-08-22 was exactly this kind confusion, identified as
 /// `receiver_class=java/lang/String receiver_kind=Array`
-/// (`docs/internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
+/// (`fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
 ///
-/// **Counted, not refused.** Refusing would be a behaviour change, and this
-/// helper has fifteen call sites of which several do not visibly pre-branch on
-/// kind — if any of them relies on this walk to reach an array's references,
-/// skipping would silently drop marking work, which is a worse defect than the
-/// one being guarded. The number is the evidence needed to decide;
-/// `docs/known-issues/gc/what-should-a-walker-do-with-an-unvalidated-header-count-20260824.md`
-/// §5 is the decision it feeds. **Expected to be ZERO.**
-pub static FLAT_WALK_GIVEN_ARRAY: AtomicUsize = AtomicUsize::new(0);
+/// # Why refusing is safe, and why the census-only form was wrong to hedge
+///
+/// The first version of this counter (2026-08-24) counted without refusing, on
+/// the stated grounds that "several of this helper's fifteen callers do not
+/// visibly pre-branch on kind" and that skipping could drop marking work. That
+/// premise was never checked. It is false: **all fifteen call sites pre-branch
+/// on `header.kind() == ObjectKind::Array`** and run their own 8-byte element
+/// walk in that arm. In file order: `process_object`, `seed_source_region`,
+/// `record_outgoing_rset_edges` (the capped one), `scan_and_evacuate_refs`,
+/// `scan_source_region_for_cset_refs`, `collect_outgoing_cross_region_edges`,
+/// `rset_completeness_counts`, `verify_no_dangling_into_cset_within`,
+/// `dbg_verify_no_unrewritten_forward`, `dbg_scan_for_zeroed_refs`,
+/// `dbg_verify_reachable_integrity`, `debug_assert_no_reference_into_spans`,
+/// `update_object_refs`, and `assert_rset_covers_every_cross_region_edge`.
+///
+/// So no caller reaches the flat walk for an array on purpose, and refusing
+/// drops no marking work any caller was relying on. An `Array` arriving here
+/// means the kind the caller read and the kind this header now reports disagree
+/// — a torn or concurrently-rewritten header — and in that case the flat walk is
+/// wrong whatever it does; not doing it is the cheap correct answer. One tag
+/// comparison, on a tag already loaded.
+///
+/// This is option **D** of
+/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// §4, paired with option C (the `_trusting_header` rename). **Expected to be
+/// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
+/// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
+/// measured with the walk proved engaged — 66 young evacuation pauses,
+/// 2,202,360 objects copied, every one of them enumerated through this helper
+/// or its callers' array arm.
+pub static FLAT_WALK_REFUSED_ARRAY: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`FLAT_WALK_REFUSED_ARRAY`].
+pub fn flat_walks_refused_for_array() -> usize {
+    FLAT_WALK_REFUSED_ARRAY.load(Ordering::Relaxed)
+}
 
 /// How many unresolved-kept SEEDS the post-evacuation-failure rset recording
 /// refused to walk because their header did not look like a live object.
@@ -928,7 +986,7 @@ impl<'a> SharedEvac<'a> {
             // each 16 bytes as a `Value`, i.e. it assumed the LEGACY uniform
             // cell layout for every object. Every other reference walk in this
             // file — the serial evacuator, the Phase-4 remap, the mark scan,
-            // the V7b verifier — goes through `for_each_flat_object_reference`,
+            // the V7b verifier — goes through `for_each_flat_object_reference_trusting_header`,
             // which dispatches on `is_compact_object` and walks the registered
             // `CompactLayout::field_offsets`. The parallel evacuator did not,
             // and that is a real divergence, not a stylistic one:
@@ -954,7 +1012,7 @@ impl<'a> SharedEvac<'a> {
             // `alloc_object(ClassId, n)` with no layout registered, so their
             // objects are legacy-layout and this loop was accidentally correct
             // for every one of them.
-            for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+            for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
                 let ref_ptr = raw as *mut u8;
                 if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
                     if self.cset.contains(&ridx) {
@@ -1079,7 +1137,7 @@ impl<'a> SharedEvac<'a> {
                 // remembered-set source whose CSet-bound edges are never
                 // rewritten at all.
                 let header = &*(obj_ptr as *const ObjectHeader);
-                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
                     let ref_ptr = raw as *mut u8;
                     if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
                         if self.cset.contains(&ridx) {
@@ -3174,7 +3232,7 @@ impl G1Collector {
         // / `array_length`, and the walks below then read past the region — the
         // measured H2 crash was exactly this: `collect_garbage` ->
         // `retry_after_evacuation_failure` -> `record_outgoing_rset_edges` ->
-        // `for_each_flat_object_reference` faulting on a 4 MiB-aligned address
+        // `for_each_flat_object_reference_trusting_header` faulting on a 4 MiB-aligned address
         // well past the committed arena.
         //
         // Same screen the ref-scan sibling applies to its own holders, and the
@@ -5836,7 +5894,7 @@ impl G1Collector {
                 }
             }
         } else {
-            for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+            for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
                 if !self.evacuation_candidate_is_an_object(
                     regions,
                     "worklist-scan[object]",
@@ -6059,7 +6117,7 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
                     if !self.evacuation_candidate_is_an_object(
                         regions,
                         "rset-source-scan[object]",
@@ -6437,7 +6495,7 @@ impl G1Collector {
                 }
             }
         } else {
-            for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+            for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
                 if let Some(j) = self.lookup_region_for_addr(raw) {
                     note(j);
                 }
@@ -6581,7 +6639,7 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| check(raw));
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| check(raw));
                 }
                 offset += size;
             }
@@ -6721,7 +6779,7 @@ impl G1Collector {
                     }
                 } else {
                     let mut found = 0u64;
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
                         if is_dangling(raw) {
                             found += 1;
                             self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
@@ -6940,7 +6998,7 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
                         check(obj_ptr as usize, "field", raw);
                     });
                 }
@@ -7038,7 +7096,7 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
                         report(obj_ptr as usize, Some(ridx), "field", raw);
                     });
                 }
@@ -7227,7 +7285,7 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference(addr as *mut u8, header, 0, |_, raw, _| {
+                for_each_flat_object_reference_trusting_header(addr as *mut u8, header, 0, |_, raw, _| {
                     check_push(raw, addr, "field", 0, &mut stack, &mut seen, &mut bad);
                 });
             }
@@ -7270,16 +7328,29 @@ impl G1Collector {
                             }
                         }
                     } else {
-                        for s in 0..h.num_slots() as usize {
-                            let v =
-                                unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
-                            if let Value::Object(Some(o)) = v {
-                                let a2 = o.as_ptr() as usize;
-                                if self.lookup_region_for_addr(a2).is_some() && rseen.insert(a2) {
-                                    rstack.push(a2);
+                        // Was a hand-rolled sixteenth copy of the flat walk, and
+                        // it had all three defects the helper does not: it
+                        // ignored `GC_FLAG_COMPACT` and strode a compact
+                        // object's PACKED body at the legacy 16-byte pitch (the
+                        // same COMPACT-LAYOUT PARITY divergence G1-9 fixed in
+                        // the parallel evacuator), it transmuted each cell to a
+                        // `Value` unchecked, and it took its count straight from
+                        // `num_slots` with no screen at all — so a census over a
+                        // torn header walked as far as the header said. Routed
+                        // through the one helper instead; a census is exactly the
+                        // kind of caller that should not be growing its own copy.
+                        for_each_flat_object_reference_trusting_header(
+                            a as *const u8,
+                            h,
+                            0,
+                            |_, raw, _| {
+                                if self.lookup_region_for_addr(raw).is_some()
+                                    && rseen.insert(raw)
+                                {
+                                    rstack.push(raw);
                                 }
-                            }
-                        }
+                            },
+                        );
                     }
                 }
                 if rseen.len() > 1000 {
@@ -7287,10 +7358,17 @@ impl G1Collector {
                     // Diagnostic slot peek: for SteadyChurn-shaped objects,
                     // slot 1 is the `seq` int — identifies WHICH node/payload
                     // anchors the subgraph (ancient seq ⟹ stale root).
-                    let slot1 = if h.num_slots() >= 2 {
+                    // Legacy layout only: on a compact object the second
+                    // 16-byte cell is not a slot at all (fields are packed by
+                    // declared width), so the peek would print bytes from two
+                    // different fields, and on a two-reference-field compact
+                    // object it reads past the body. Screened decode for the
+                    // same reason every other legacy-cell reader has one.
+                    let slot1 = if !cratonvm_types::is_compact_object(h) && h.num_slots() >= 2 {
                         let v = unsafe {
-                            std::ptr::read(
-                                (addr as *const u8).add(HEADER_SIZE + SLOT_SIZE) as *const Value
+                            crate::heap::read_value_cell_checked(
+                                (addr as *const u8).add(HEADER_SIZE + SLOT_SIZE) as *const Value,
+                                "g1::dbg_root_census",
                             )
                         };
                         format!("{v:?}")
@@ -9096,7 +9174,7 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
                         offend(raw, "a surviving object");
                     });
                 }
@@ -9490,6 +9568,16 @@ impl G1Collector {
         eprintln!(
             "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
             evacuation_source_walk_desyncs(),
+        );
+        // The remaining two "expected to be ZERO" guard counters, on the same
+        // terms and for the same reason. Both had public accessors and no
+        // consumer anywhere in the tree, which makes their zero unciteable: a
+        // run cannot be quoted as evidence for a guard that nothing prints. See
+        // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
+        eprintln!(
+            "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
+            flat_walks_refused_for_array(),
+            kept_seeds_rejected(),
         );
         let Some(s) = self.pause_summary() else {
             return;
@@ -11150,7 +11238,7 @@ impl G1Collector {
         // `is_compact_object(header)` is the per-object header bit, read
         // independently of the registry, and is exactly how this collector's
         // own walkers already separate the two cases — see
-        // `for_each_flat_object_reference` and the concurrent mark's object
+        // `for_each_flat_object_reference_trusting_header` and the concurrent mark's object
         // arm, both of which then simply skip the object when
         // `with_class_layout` misses. An accessor cannot skip, so it degrades
         // as this function's neighbouring guards do: benign null read, loud
@@ -12961,7 +13049,7 @@ fn update_object_refs(
             }
         }
     } else {
-        for_each_flat_object_reference(obj_ptr, header, 0, |slot, raw, compact| {
+        for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot, raw, compact| {
             if let Some(&new_addr) = pointer_map.get(&raw) {
                 write_flat_object_reference(slot, new_addr, compact);
             }
@@ -13490,7 +13578,7 @@ mod tests {
     /// That is the measured H2 crash (`TestKillProcessWhileWriting`,
     /// `TestRandomMapOps`, both SIGSEGV at `addr=0x20084400000` with the fault
     /// PC symbolizing to `collect_garbage -> retry_after_evacuation_failure ->
-    /// record_outgoing_rset_edges -> for_each_flat_object_reference`). Here the
+    /// record_outgoing_rset_edges -> for_each_flat_object_reference_trusting_header`). Here the
     /// fabricated header is deliberately *readable* so the pre-fix behaviour is
     /// an observable wrong rset edge rather than a process-killing fault.
     #[test]
@@ -16410,7 +16498,7 @@ mod tests {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| check(raw));
+                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| check(raw));
                 }
                 offset += size;
             }
@@ -21401,5 +21489,137 @@ mod tests {
         assert!(text.contains("young=MOVING"), "{text}");
         assert!(text.contains("[GC] g1 cycle"), "{text}");
         assert!(text.contains("kind=young"), "{text}");
+    }
+    // -----------------------------------------------------------------------
+    // The flat 16-byte-slot walk refuses an ARRAY header (option D of
+    // `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
+    // -----------------------------------------------------------------------
+
+    /// Build a legacy-layout body of `slots` `Value::Object` cells behind a
+    /// header, and return the backing store plus the object pointer. The store
+    /// must outlive the pointer; the caller keeps it alive.
+    fn legacy_body_with_object_cells(
+        header: ObjectHeader,
+        slots: usize,
+        target: *mut u8,
+    ) -> (Vec<u64>, *mut u8) {
+        // `u64` backing => 8-byte alignment, which is what both `ObjectHeader`
+        // and `Value` require.
+        let mut store = vec![0u64; (HEADER_SIZE + slots * SLOT_SIZE) / 8];
+        let base = store.as_mut_ptr() as *mut u8;
+        // SAFETY: `store` is sized for the header plus `slots` cells, and every
+        // write below stays inside it.
+        unsafe {
+            std::ptr::write(base as *mut ObjectHeader, header);
+            for i in 0..slots {
+                let slot = base.add(HEADER_SIZE + i * SLOT_SIZE);
+                value_to_unaligned_ptr(Value::Object(Some(ObjectRef::from_raw(target))), slot);
+            }
+        }
+        (store, base)
+    }
+
+    #[test]
+    fn flat_walk_refuses_an_array_header_and_counts_it() {
+        // A header whose kind is `Array` and whose `shape` dword therefore
+        // means LENGTH, not `num_slots` — the two share offset 4. The body
+        // below is deliberately large enough to hold every cell the unrefused
+        // walk would visit, so a regression fails this assertion instead of
+        // reading off the end of the allocation.
+        const LEN: u32 = 8;
+        let mut target = [0u8; HEADER_SIZE];
+        let header = ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Array,
+            ArrayElementType::Reference,
+            LEN,
+            0,
+        );
+        assert_eq!(
+            header.num_slots(),
+            LEN,
+            "the premise of the whole guard: an Array's length IS what \
+             `num_slots()` returns, because they are the same `shape` dword"
+        );
+        let (_store, obj) =
+            legacy_body_with_object_cells(header, LEN as usize, target.as_mut_ptr());
+        let header_ref = unsafe { &*(obj as *const ObjectHeader) };
+
+        let before = flat_walks_refused_for_array();
+        let mut visited = 0usize;
+        for_each_flat_object_reference_trusting_header(obj, header_ref, 0, |_, _, _| {
+            visited += 1;
+        });
+
+        assert_eq!(
+            visited, 0,
+            "the flat walk must not stride SLOT_SIZE over array payload: every \
+             one of its fifteen call sites pre-branches on kind and handles \
+             arrays itself, so an Array arriving here is a kind confusion"
+        );
+        assert!(
+            flat_walks_refused_for_array() > before,
+            "the refusal must be counted — the number is what makes \
+             `FLAT_WALK_REFUSED_ARRAY` evidence rather than an anecdote"
+        );
+    }
+
+    #[test]
+    fn flat_walk_still_visits_a_legacy_objects_reference_cells() {
+        // The refusal must be narrow: a non-array legacy object still walks
+        // every cell. Without this, "refuse arrays" could silently become
+        // "refuse everything" and no other test in this file would notice,
+        // because the collector tests allocate through the real heap.
+        const SLOTS: u32 = 5;
+        let mut target = [0u8; HEADER_SIZE];
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            SLOTS,
+        );
+        let (_store, obj) =
+            legacy_body_with_object_cells(header, SLOTS as usize, target.as_mut_ptr());
+        let header_ref = unsafe { &*(obj as *const ObjectHeader) };
+
+        let mut visited = 0usize;
+        for_each_flat_object_reference_trusting_header(obj, header_ref, 0, |_, raw, compact| {
+            assert!(!compact, "no CompactLayout is registered for ClassId(0)");
+            assert_eq!(raw, target.as_mut_ptr() as usize);
+            visited += 1;
+        });
+        assert_eq!(visited, SLOTS as usize);
+
+        // `first_index` still skips a prefix.
+        let mut skipped = 0usize;
+        for_each_flat_object_reference_trusting_header(obj, header_ref, 2, |_, _, _| skipped += 1);
+        assert_eq!(skipped, SLOTS as usize - 2);
+    }
+
+    #[test]
+    fn capped_walk_bounds_a_legacy_object_below_its_claimed_slot_count() {
+        // The other half of the page: a caller that DOES hold geometry passes a
+        // bound, and the walk stops there even though the header claims more.
+        const SLOTS: u32 = 6;
+        let mut target = [0u8; HEADER_SIZE];
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            SLOTS,
+        );
+        let (_store, obj) =
+            legacy_body_with_object_cells(header, SLOTS as usize, target.as_mut_ptr());
+        let header_ref = unsafe { &*(obj as *const ObjectHeader) };
+
+        let mut visited = 0usize;
+        for_each_flat_object_reference_capped(obj, header_ref, 0, 2, |_, _, _| visited += 1);
+        assert_eq!(
+            visited, 2,
+            "a region-derived cap must win over `num_slots()`; that is the \
+             whole point of the `_capped` entry point"
+        );
     }
 }

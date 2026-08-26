@@ -180,6 +180,14 @@ priced:
   splicing at the top level, which the OSR door cannot do and which the
   measurement above says would not pay even if it could. This is the same wall
   as [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md).
+
+  **Narrowed 2026-08-26, and measured NOT to help this class.** The per-call
+  14-store full-GPR blind spill is now elided where the caller frame is provably
+  oop-clean, worth 1.4–2.2x on every shape of compiled call in
+  `CallArgCostProbe`. `HttpStatusClassLoopRate` does not move (106.5–121.2 vs
+  105.8–112.1 ns/iter, three interleaved rounds each), and the counter says why:
+  `elided=1 ... ref-local-in-reg=46`, every refusal the same clause. See
+  `performance/per-call-blind-gpr-spill-elided-on-oop-clean-frames-20260826.md`.
 * **`MAX_INLINE_MERGE_DEPTH` (4) and `MAX_INLINE_NEST_DEPTH` (3)**, neither of
   which has been tuned against anything. Cheap to sweep, and the arm census
   (`nested-splice-refused`, `outer-splice-rolled-back`) says immediately whether
