@@ -571,47 +571,81 @@ fn vm_internal_allocation_shapes_stay_off_the_dispatch_branch() {
     );
 }
 
-/// A fabricated class whose NAME is one of the generated families is reported
-/// as what generated it, not as a compatibility substitution — the same answer
-/// `classify_defined_origin` gives when those names arrive with real bytes.
+/// A fabricated class whose NAME merely LOOKS generated is a compatibility
+/// stub; only the three exact VM identities survive as `VmInternal`.
 ///
-/// Neither path may report the same class differently depending on whether it
-/// happened to be fabricated. Measured on a strict boot and both jdk-only
-/// probes: none of these fires in practice, which is why this is a
-/// classification guard rather than a bug fix.
+/// This test used to assert the opposite — that `com/example/Owner$$Lambda$17`
+/// and friends are reported as what generated them — on the symmetry argument
+/// that "neither path may report the same class differently depending on
+/// whether it happened to be fabricated". `fabricated_origin_for_name`'s doc
+/// rebuts that argument directly, and the rebuttal is the reason this file now
+/// reads the other way:
+///
+///   * the discriminator is STRUCTURAL, not lexical. A genuine
+///     `LambdaMetafactory` / `$ProxyN` / accessor class HAS BYTES and is
+///     classified by `classify_defined_origin`, which still carries all three
+///     name arms unchanged. This door is reached only after
+///     `get_loaded_class_id` answered `None` AND `find_class_bytes_delegated`
+///     failed — the name resolves to nothing, in any loader, on any classpath
+///     entry. Having real bytes is *precisely* what separates a generated class
+///     from a stand-in, so the two paths are not looking at the same class and
+///     the symmetry argument inverted the question;
+///   * the lexical arm was a measured hole, not a hypothetical one. Because the
+///     `--jdk-only` refusal is gated on `origin.is_compatibility_stub()`, a
+///     strict run CREATED `java/util/function/Predicate$$Lambda$And` — a
+///     compatibility stand-in — while refusing its infix-less sibling
+///     `java/util/function/Consumer$AndThen` at the door. Same species,
+///     opposite verdicts, decided by a substring.
+///
+/// The refusal itself is asserted by
+/// `class_manager.rs::a_generated_looking_name_does_not_buy_a_jdk_only_exemption`,
+/// which owns that property and carries the measurement. This test is the
+/// integration-level half: it goes through the public
+/// `try_ensure_synthetic_class` door and checks the ORIGIN the class store ends
+/// up holding, including the three identities that legitimately survive.
 #[test]
-fn fabricated_generated_names_are_not_compatibility_stubs() {
+fn fabricated_generated_names_are_compatibility_stubs() {
     let mut mgr = ClassManager::new(&[], &[], &[]);
-    for (name, expected) in [
-        (
-            "com/example/Owner$$Lambda$17",
-            ClassOrigin::GeneratedLambda { host: None },
-        ),
-        (
-            "com/example/$Proxy42",
-            ClassOrigin::GeneratedProxy {
-                interfaces: Arc::from(Vec::new()),
-            },
-        ),
-        (
-            "jdk/internal/reflect/GeneratedMethodAccessor3",
-            ClassOrigin::ReflectionAccessor { host: None },
-        ),
-        (
-            "java/lang/reflect/Proxy$Instance",
-            ClassOrigin::VmInternal,
-        ),
+
+    // Generated-LOOKING, no bytes anywhere: stand-ins, whatever the name.
+    for name in [
+        "com/example/Owner$$Lambda$17",
+        "com/example/$Proxy42",
+        "jdk/internal/reflect/GeneratedMethodAccessor3",
     ] {
         let id = mgr.try_ensure_synthetic_class(name, 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let class = mgr.class_store.get(id).expect("just created");
-        assert_eq!(class.origin, expected, "{name} got the wrong origin");
+        let origin = &mgr.class_store.get(id).expect("just created").origin;
         assert!(
-            !class.origin.is_compatibility_stub(),
+            origin.is_compatibility_stub(),
+            "{name} arrived with no bytes on any classpath entry in any \
+             loader; a generated-looking name must not relabel it"
+        );
+        assert!(
+            !origin.allowed_in(CompatibilityMode::JdkOnly),
+            "{name}: a generated-looking name must not buy a --jdk-only \
+             exemption the same stand-in without the infix does not get"
+        );
+    }
+
+    // The three that DO survive, and why they are allowed to: each is an exact
+    // identity nothing but this VM can mint — two exact names in packages no
+    // other party may define into, and this VM's own reserved prefix — not a
+    // name SHAPE a caller could fall into.
+    for name in [
+        "java/lang/reflect/Proxy$Instance",
+        "java/lang/annotation/AnnotationProxy",
+        "CratonVM$SomeInternalCarrier",
+    ] {
+        let id = mgr.try_ensure_synthetic_class(name, 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let origin = &mgr.class_store.get(id).expect("just created").origin;
+        assert_eq!(*origin, ClassOrigin::VmInternal, "{name} got the wrong origin");
+        assert!(
+            !origin.is_compatibility_stub(),
             "{name} is a VM generation artefact; counting it as a \
              compatibility substitution over-reports the stub backlog"
         );
         assert!(
-            class.origin.allowed_in(CompatibilityMode::JdkOnly),
+            origin.allowed_in(CompatibilityMode::JdkOnly),
             "{name} is legal in strict mode (contract §1 item 6)"
         );
     }
