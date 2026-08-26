@@ -16140,6 +16140,12 @@ fn alloc_view_carrier(
         };
         return Ok(ctx.alloc_object(cid, n));
     }
+    // THE LAST-RESORT ARM, and the only surviving producer of a view whose
+    // class is exactly `java/util/ArrayList`. Announce it: `java/util/ArrayList`
+    // is on `real_protected_stub_class_common` precisely BECAUSE no view wears
+    // that class any more, and this arm is the one exception. Sticky — once a
+    // run has minted one, `ArrayList`'s natives win for the rest of it.
+    cratonvm_types::arraylist_view::note_arraylist_classed_view_minted();
     try_alloc_synthetic(ctx, "java/util/ArrayList", fallback)
 }
 
