@@ -5187,6 +5187,9 @@ fn check_server_trusted_extended(
     args: &[Value],
 ) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
+    if crate::nbflags().x509_tm_no_identify_server {
+        return Ok(None);
+    }
     check_extended_tm_endpoint_identity(ctx, args, false)
 }
 
@@ -5203,6 +5206,9 @@ fn check_client_trusted_extended(
     args: &[Value],
 ) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
+    if crate::nbflags().x509_tm_no_identify_client {
+        return Ok(None);
+    }
     check_extended_tm_endpoint_identity(ctx, args, true)
 }
 
@@ -5235,12 +5241,50 @@ fn classify_extended_tm_peer(
     None
 }
 
-/// `x.getSSLParameters().getEndpointIdentificationAlgorithm()`, or `None` when
-/// the peer has none (which means "do not identify", exactly as in the JDK).
+/// The peer's endpoint identification algorithm, or `None` for "do not
+/// identify" — which is what a null or empty one means in the JDK.
+///
+/// **This does NOT call `getSSLParameters()` on a netty OpenSSL engine, and
+/// that is the whole point.** These handlers run inside BoringSSL's certificate
+/// callback whenever netty is configured `setUseTasks(false)`, i.e. Java has
+/// re-entered from inside the tcnative `SSL_do_handshake` native.
+/// `ReferenceCountedOpenSslEngine.getSSLParameters()` is `synchronized` and
+/// itself re-enters tcnative — `SSL.getOptions(ssl)`, and `SSL.getCiphers(ssl)`
+/// by way of `super.getSSLParameters()` -> `getEnabledCipherSuites()` — on the
+/// very `SSL*` BoringSSL is inside. Doing that loses the client's TLSv1.3
+/// `Certificate` flight: the server ends the handshake with
+/// `PEER_DID_NOT_RETURN_A_CERTIFICATE`.
+///
+/// MEASURED, `probes/OpenSslTls13ClientCertProbe.java`, one run per binary:
+/// HotSpot 8/8, CratonVM before the endpoint-identification fix 8/8, CratonVM
+/// with the `getSSLParameters()` call 2 FAIL — and the two are exactly
+/// `TLSv1.3 x useTasks=false`, on BOTH loopback families, so it is not the
+/// transport. Full record:
+/// `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`
+///
+/// The field read below runs no Java, allocates nothing and enters no native,
+/// so on a netty engine this function costs what it cost before the fix — which
+/// matters most in the common case, where the algorithm is null and the whole
+/// call exists only to discover that. Engines with no such field (the JDK's own
+/// `SSLEngineImpl`, whose `getSSLParameters()` is pure Java and re-enters
+/// nothing) keep the method route.
+///
+/// `CRATONVM_X509_TM_PARAMS_VIA_METHOD` forces the method route back on, so the
+/// attribution above stays a one-run A/B.
 fn extended_tm_identification_algorithm(
     ctx: &mut dyn NativeContext,
     peer: ObjectRef,
 ) -> Option<String> {
+    if !crate::nbflags().x509_tm_params_via_method && peer_is_netty_openssl_engine(ctx, peer) {
+        // `Object(None)` here is "the field is null", not "no such field": the
+        // class check above already established the field exists. A null one is
+        // netty's own default and means no identification, so answering `None`
+        // is the answer and not a fallback.
+        return match ctx.get_field_by_name(peer, "endpointIdentificationAlgorithm") {
+            Value::Object(Some(s)) => ctx.read_string(s).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+    }
     let params = match ctx.invoke_virtual(
         peer,
         "getSSLParameters",
@@ -5259,6 +5303,30 @@ fn extended_tm_identification_algorithm(
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|s| !s.is_empty()),
         _ => None,
     }
+}
+
+/// Is `peer` one of netty's OpenSSL engines — i.e. does it declare the
+/// `endpointIdentificationAlgorithm` field the fast path above reads?
+///
+/// Walked by NAME up the superclass chain rather than resolved through
+/// `ensure_class_initialized`, deliberately: this runs on every extended trust
+/// check in the VM, including in processes that have never heard of netty, and
+/// asking the class manager to resolve a netty class there is both a cost and a
+/// way to run a `<clinit>` nobody asked for. The walk is bounded for the reason
+/// `t27_tls::jsse_owns_endpoint_identification` gives — a corrupted
+/// `superclass_of` must not hang a TLS handshake.
+fn peer_is_netty_openssl_engine(ctx: &mut dyn NativeContext, peer: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(peer));
+    for _ in 0..16 {
+        let Some(c) = cid else { return false };
+        if ctx.class_name_of_id(c).as_deref()
+            == Some("io/netty/handler/ssl/ReferenceCountedOpenSslEngine")
+        {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
 }
 
 /// The handshake session, if the peer has one.
@@ -5458,7 +5526,7 @@ fn check_extended_tm_endpoint_identity(
         // Throwing here would break every TLS handshake that VM stack makes in
         // order to close a hole it does not have. Recorded rather than silent.
         tracing::debug!(
-            "endpoint identification requested ({algorithm}) but the peer reports no host;              skipping the name check"
+            "endpoint identification requested ({algorithm}) but the peer reports              no host; skipping the name check"
         );
         return Ok(None);
     };

@@ -27,3 +27,45 @@
 # class was first characterized. 600s is generous rather than marginal on purpose.
 # See fixed-suite-bugs/netty/dnsnameresolvertest-windows-only-aborts-CONFIRMED-20260819.md
 io.netty.resolver.dns.DnsNameResolverTest	600	-
+
+# -----------------------------------------------------------------------------
+# The `SSLEngineTest` family. Five classes, 821 to 4 088 `@ParameterizedTest`
+# cases each, every one driving a real in-JVM TLS handshake over a
+# protocol x cipher x delegate x useTasks x useTickets matrix.
+#
+# THE CAP IS NOT A CRATONVM QUESTION FOR THESE. Measured on HOTSPOT 25 on the
+# Windows dev host, `common.args`, ZERO failures in all five:
+#
+#     JdkSslEngineTest                     821 tests    192 s   (1.07x the cap)
+#     OpenSslEngineTest                  3 992 tests    567 s   (3.15x)
+#     OpenSslJdkSslEngineInteroptTest    2 645 tests    702 s   (3.90x)
+#     JdkOpenSslEngineInteroptTest       2 309 tests    744 s   (4.13x)
+#     ReferenceCountedOpenSslEngineTest  4 088 tests    952 s   (5.29x)
+#
+# So no run of these can fit the flat 180s cap on any host, and every one was
+# recorded HANG -- which threw away the PASSes and, worse, the real assertion
+# failures the raw log had already printed. Two genuine VM defects (a v4-only
+# wildcard bind and a TrustManager that skipped hostname verification) sat
+# inside that HANG for two weeks. See
+# fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md
+#
+# THE NUMBERS BELOW, and how they were chosen. CratonVM costs about 2.0 s per
+# case on this family against HotSpot's ~0.14 s -- measured, not assumed: 720
+# cases of `OpenSslEngineTest` summed to 2 758 s of in-test time with a 2.02 s
+# mean over the passing ones. `JdkSslEngineTest` is a direct measurement,
+# 1 363 s wall for 821 cases with five forks in flight. The rest are that rate
+# times the case count, plus the wall the still-open TLSv1.3 failures burn on
+# their 10-120 s waits, rounded UP hard. They are floors, not budgets: a class
+# that finishes sooner costs nothing.
+#
+# THAT IS EXPENSIVE AND IT SHOULD BE SAID. A four-hour floor on a class is a
+# real change to a suite whose whole 657-class run was 178 minutes. It buys the
+# per-class ok/failed breakdown that a HANG destroys. The cost is dominated by
+# the VM's ~14x per-case slowdown on TLS handshakes, which is a performance
+# item and not a harness one; lowering these numbers is a downstream benefit of
+# fixing that, not a thing to do by editing this table.
+io.netty.handler.ssl.JdkSslEngineTest	3600	-
+io.netty.handler.ssl.OpenSslEngineTest	14400	-
+io.netty.handler.ssl.OpenSslJdkSslEngineInteroptTest	10800	-
+io.netty.handler.ssl.JdkOpenSslEngineInteroptTest	10800	-
+io.netty.handler.ssl.ReferenceCountedOpenSslEngineTest	14400	-
