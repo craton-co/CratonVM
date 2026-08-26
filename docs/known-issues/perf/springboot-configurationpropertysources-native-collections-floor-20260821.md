@@ -306,6 +306,53 @@ asked at **all three** virtual doors on a plain `ListYieldProbe` run:
 
 `-> false` only because the class was not allow-listed. Arm it, and it yields.
 
+### The iterator: two native crossings per element, and the arbitration cannot reach it
+
+Measured 2026-08-24, and this one is an EXACT count rather than an estimate.
+`probes/KeySetBench iterList` walks 2000 × 1000 elements; `--dump-native-registry`
+reports:
+
+```text
+java/util/ArrayList$Itr.hasNext   kind=bridge  invocations=2002000  complete=true
+java/util/ArrayList$Itr.next      kind=bridge  invocations=2000000  complete=true
+java/util/Iterator.hasNext        kind=bridge  invocations=0
+java/util/Iterator.next           kind=bridge  invocations=0
+```
+
+2 000 000 = exactly one `next` per element, and one `hasNext` per element plus
+one per loop. **The iterator's whole cost is two native crossings per element**,
+which at this VM's funnel price is the ~1 µs/element the original Term 2
+measured. It is not the map view, not the JDK's `Itr` logic, and not the
+`java/util/Iterator` interface fallback — that fallback (registered for
+"synthetic iterator wrappers") is entered **zero** times and can be ignored.
+
+**A read on `invocations_complete` this page got wrong once:** it is PER ROW.
+These `Itr` rows say `true` and are exact; the `ArrayList.get` row says `false`
+and saturates at 127. The field is trustworthy — it just has to be read.
+
+**The allow-list does NOT fix this one, and the instrument says why.** Arming
+`java/util/ArrayList$Itr` exactly as `ArrayList.get` was armed moved nothing
+(`iterList` 1823/1724/1853 → 1723/1776/1850, interleaved, noise). With
+`CRATONVM_DBG_STUB_DOOR=1`, `java/util/ArrayList$Itr` **never appears at any of
+the six doors** — under `--nojit` as well as compiled, where the natives still
+serve 20 020/20 000 calls. `ArrayList.get` was asked x3/x9/x381; the iterator is
+asked zero times.
+
+So the arbitration is genuinely not reached here, and this time that is measured
+rather than inferred from a saturating counter. The difference is the CALL
+SHAPE: `list.get(i)` is a virtual call on `java/util/ArrayList`, while
+`it.hasNext()` is an **`invokeinterface` on `java/util/Iterator`** whose
+receiver-class native (`ArrayList$Itr.hasNext`) is resolved and cached without
+anyone asking `real_protected_stub_class`.
+
+**Next step, and it is not another allow-list entry.** Find the path that
+resolves an `invokeinterface` to a receiver-class native and give it the same
+three-term test the other six doors already spell. `CRATONVM_DBG_STUB_DOOR=1`
+is the check: the fix is working when `java/util/ArrayList$Itr` starts appearing
+in that tally. Worth roughly what `ArrayList.get` was worth — the iterator is
+~14× the cost of the now-fixed indexed access on the same 1000 elements — and
+it is the single biggest remaining number on this page.
+
 ### The fix: one allow-list entry, 11.1×
 
 `java/util/ArrayList` joins `real_protected_stub_class_common`. MEASURED on one
