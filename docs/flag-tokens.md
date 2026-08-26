@@ -218,6 +218,7 @@ export inherited from a parent shell.
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
+| `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
 | `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
@@ -552,7 +553,6 @@ export inherited from a parent shell.
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
-| `stub-door` | `CRATONVM_DBG_STUB_DOOR` |
 
 ## `CRATONVM_JIT`
 
@@ -757,6 +757,9 @@ export inherited from a parent shell.
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
+| `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
+| `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
+| `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -784,9 +787,6 @@ export inherited from a parent shell.
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
-| `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
-| `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
-| `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
 
 ## `CRATONVM_GC`
 

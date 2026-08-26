@@ -1281,7 +1281,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_RANGE_SCAN_LEGACY` | JIT | `CRATONVM_JIT=range-scan-legacy` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` | JIT | `CRATONVM_JIT=real-new-site-flags` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_REASSOC` | JIT | `CRATONVM_JIT=reassoc` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_RECEIVER_DESPEC` | JIT | `CRATONVM_JIT=receiver-despec` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_RECEIVER_DESPEC` | JIT | `CRATONVM_JIT=receiver-despec` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_POLLS` | JIT | `CRATONVM_JIT=safepoint-polls` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_REG_SPILL` | JIT | `CRATONVM_JIT=safepoint-reg-spill` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SCALAR_NEW` | JIT | `CRATONVM_JIT=scalar-new` | opt-in | off | behaviour | snapshot | vm |
