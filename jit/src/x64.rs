@@ -206,7 +206,7 @@ mod driver;
 pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
-mod bytecode_walk;
+pub mod bytecode_walk;
 /// Test-only view of the E27-1 N2b compile-time needle screen.
 ///
 /// The screen decides which `String.indexOf(int)` sites the backend will

@@ -4849,9 +4849,17 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
-                let field_index = match self.graph.nodes[offset_node as usize].op {
-                    Op::Const(v) => v,
-                    _ => 0,
+                // `lower_inner` refuses the graph unless every field access's
+                // offset edge is a `Const`, so the `None` arm is unreachable.
+                // It deopts rather than falling back to slot `0`, which is what
+                // it used to do: slot 0 is a DIFFERENT field of the same
+                // receiver, read or written with no trace of the substitution.
+                // A deopt is the one answer that is always correct here — the
+                // interpreter re-executes the access against the real layout —
+                // and it costs nothing on a path nothing reaches.
+                let Op::Const(field_index) = self.graph.nodes[offset_node as usize].op else {
+                    self.emit_unconditional_deopt(node.bytecode_pc.unwrap_or(0));
+                    return;
                 };
                 // Guarded inline read of a compact field, with the checked
                 // helper as the slow path — the same trade the single-pass
@@ -4949,9 +4957,11 @@ fn reloc_emit_enabled() -> bool {
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
                 let value = node.inputs[4];
-                let field_index = match self.graph.nodes[offset_node as usize].op {
-                    Op::Const(v) => v,
-                    _ => 0,
+                // Unreachable for the same reason the `Op::Load` arm's is, and
+                // deopts for the same reason — see there.
+                let Op::Const(field_index) = self.graph.nodes[offset_node as usize].op else {
+                    self.emit_unconditional_deopt(node.bytecode_pc.unwrap_or(0));
+                    return;
                 };
                 let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
@@ -6258,6 +6268,21 @@ fn reloc_emit_enabled() -> bool {
         // Continue (skip deopt) when the tested value is NON-zero — `JNZ` (the
         // near-Jcc second byte 0x85). Deopt when zero (ZF=1, JNZ not taken).
         self.emit_deopt_unless(0x85, bci, reason);
+    }
+
+    /// Leave for the interpreter unconditionally at `bci`.
+    ///
+    /// `XOR EAX, EAX` sets ZF, so the `JNZ` [`emit_deopt_if_zero`] emits is
+    /// never taken and control always reaches the deopt stub. Callers must
+    /// `return` immediately: nothing after this executes, and the node's result
+    /// slot (if it has one) is never read because no consumer runs.
+    ///
+    /// Used where a lowering discovers it has no correct encoding to emit. The
+    /// alternative — emitting SOMETHING and continuing — is how a wrong field
+    /// slot becomes a punned heap cell that faults somewhere else entirely.
+    fn emit_unconditional_deopt(&mut self, bci: usize) {
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX  (sets ZF)
+        self.emit_deopt_if_zero(bci, DeoptReason::UnreachedCode);
     }
 
     /// Emit a guard that deopts at `bci` UNLESS the just-set flags satisfy
@@ -9784,6 +9809,34 @@ pub(crate) fn lower_inner_with_scopes(
         if missing {
             return None;
         }
+    }
+    // Every field access carries its slot index as a `Const` offset input, and
+    // both lowerings read that index out of the node the edge points at. If it
+    // is not a `Const`, neither has an index to use — and both used to fall
+    // back to a silent `0`, i.e. to accessing SOME OTHER FIELD of the receiver.
+    //
+    // A silent `0` is the worst available answer for exactly the defect family
+    // this lane keeps meeting: a store lands in a slot the class declares a
+    // reference, the cell then holds a primitive under a reference's name, and
+    // the fault appears much later in whatever dereferences it — a compiled
+    // `arraylength` on `Int(1)`, faulting at `addr=0x5`
+    // (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+    // Nothing in the report points back here, because a wrong-slot write leaves
+    // no trace of having chosen the wrong slot.
+    //
+    // The builder only ever emits `iconst(field_index)` into this edge, so this
+    // is unreachable today and refusing costs nothing measurable. That is the
+    // point: it closes the hazard while it is still unreachable, rather than
+    // after some later optimisation makes the offset node non-constant and the
+    // fallback starts silently corrupting objects.
+    if graph.nodes.iter().any(|n| {
+        matches!(n.op, Op::Load(_) | Op::Store(_))
+            && n.inputs
+                .get(3)
+                .and_then(|&o| graph.nodes.get(o as usize))
+                .map_or(true, |o| !matches!(o.op, Op::Const(_)))
+    }) {
+        return None;
     }
 
     // ── Resource bounds, decided before anything is reserved ─────────
