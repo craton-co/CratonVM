@@ -7642,6 +7642,61 @@ unsafe fn jit_getfield_impl(
                     hdr.num_slots(),
                     current_jit_callee(),
                 );
+                // EVERY cell of the object, not just the punned one.
+                //
+                // The punned cell alone cannot tell an isolated scribble from a
+                // SHIFT. `org.apache.derby.iapi.types.SQLChar` declares
+                // `value`(0), `rawData`(1), `rawLength`(2), and its
+                // `readExternalFromArray` writes `rawLength` and `rawData` on
+                // adjacent lines -- so `Int(1)` in `rawData` is exactly what a
+                // `rawLength = 1` landing one slot low would leave. If that is
+                // what happened, slot 2 holds the `char[]` and slot 0 holds the
+                // old `rawData`; if it is an isolated scribble, the neighbours
+                // are untouched. One line of output decides between two
+                // completely different searches.
+                for i in 0..hdr.num_slots() as usize {
+                    // SAFETY: `i < num_slots` and the object is legacy-laid-out
+                    // (established above), so each 16-byte cell is inside the
+                    // allocation.
+                    let cell = (obj_ptr as *const u8)
+                        .add(cratonvm_types::HEADER_SIZE + i * cratonvm_types::SLOT_SIZE);
+                    let t = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32,
+                    );
+                    let p32 = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32,
+                    );
+                    let p64 = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
+                    );
+                    eprintln!(
+                        "[punned-ref]   slot {i}: tag={t} payload32={p32:#x} payload64={p64:#x}"
+                    );
+                }
+                // TRANSIENT or PERMANENT? The two have completely different
+                // writers. A cell that is whole again a millisecond later was
+                // never written wrong -- it was READ mid-write, and the search
+                // is for the missing publication order. A cell that is still
+                // punned is a store that put the wrong bytes at the right
+                // address, and the search is for that store.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                for i in 0..hdr.num_slots() as usize {
+                    // SAFETY: as above.
+                    let cell = (obj_ptr as *const u8)
+                        .add(cratonvm_types::HEADER_SIZE + i * cratonvm_types::SLOT_SIZE);
+                    let t = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32,
+                    );
+                    let p32 = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32,
+                    );
+                    let p64 = std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
+                    );
+                    eprintln!(
+                        "[punned-ref] +2ms slot {i}: tag={t} payload32={p32:#x} payload64={p64:#x}"
+                    );
+                }
             }
         }
         return 0;

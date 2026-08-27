@@ -166,6 +166,13 @@ fn maybe_dump_shutdown_reports() {
     // ran at all.
     cratonvm_vm::report_map_view_cache_at_exit();
 
+    // The punned-cell watch census, on `CRATONVM_DBG_WATCH_PUN=<class>:<slot>`.
+    // `accessor_reads` / `accessor_stores` are the ENGAGEMENT counters: the
+    // experiment this watch exists for turns the JIT off, which also removes
+    // every compiled read and write of the slot, so a zero numerator without
+    // them cannot be told from "nobody looked".
+    cratonvm_vm::report_punned_watch_at_exit();
+
     // The notification-credit census, on `CRATONVM_DBG=monitor-notify`.
     // `credits_consumed` is the engagement counter for the `Object.wait()`
     // lost-wakeup fix: a run with no stalls says nothing about whether the

@@ -70,6 +70,11 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 /// dependency on `cratonvm-native-collections`.
 pub use cratonvm_native_collections::report_map_view_cache_at_exit;
 
+/// The `CRATONVM_DBG_WATCH_PUN` census, re-exported for the same reason. Its
+/// two DENOMINATORS are why it exists: a watch that reports no punned cell has
+/// said nothing until it also says how many times it looked.
+pub use cratonvm_gc::zgc::report_punned_watch_at_exit;
+
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim
 // ---------------------------------------------------------------------------
