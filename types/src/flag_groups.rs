@@ -1264,6 +1264,7 @@ pub const INVENTORY: &[E] = &[
     // old behaviour. Same `off_word` shape as `osr-coverage-shadow` and
     // `xt-jit-coverage-handshake`, which are the other two default-ON rows.
     E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
@@ -1310,6 +1311,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-const-probe", on_key: Some("CRATONVM_JIT_LAMBDA_CONST_PROBE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "fjp-subclass-blocklist", on_key: Some("CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
@@ -1384,6 +1386,12 @@ pub const INVENTORY: &[E] = &[
     // behaviour where only the RBP half was reset on push and restored on pop,
     // which left the pair naming two different frames. See
     // `conservative_roots::reload_top_rbp_cache`.
+    // Declared 2026-08-26. An OPT-OUT: in the regions the abstract interpreter
+    // MODELS (java locals, operand spill), the band verifier treats a slot the
+    // ACTIVE safepoint map does not name as DEAD rather than demanding it be
+    // published. This key restores the stricter reading. See
+    // `conservative_roots::band_slot_is_verifiable_with_map`.
+    E { group: Group::GC, token: "band-map-liveness", on_key: None, off_key: Some("CRATONVM_GC_NO_BAND_MAP_LIVENESS"), off_word: None },
     E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
