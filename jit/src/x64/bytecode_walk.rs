@@ -8389,6 +8389,10 @@ impl Compiler {
                             });
                             match (info_ptr, kind) {
                                 (Some(info), Some(kind)) if helper != 0 && !info.is_null() => {
+                                    // SAFETY: the pointee is owned by this
+                                    // compile's `_jit_invoke_infos` arena and
+                                    // outlives the code being emitted.
+                                    let ret_tag = unsafe { (*info).return_type };
                                     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
                                         eprintln!("[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}");
                                     }
@@ -8499,8 +8503,17 @@ impl Compiler {
                                     self.emit_pre_safepoint_spill();
                                     self.emit_call_absolute(self.helpers.invoke_dispatch);
                                     self.emit_oop_map_for_safepoint();
+                                    // The site's REAL return tag, not `b'I'`.
+                                    // `emit_post_invoke_exception_check` has a
+                                    // separate arm for `J`/`D`/`F` because the
+                                    // pending-exception sentinel is `i64::MIN`,
+                                    // which is also a LEGITIMATE value for those
+                                    // widths — `-0.0` as a double is exactly
+                                    // that word. Passing `b'I'` took the plain
+                                    // `CMP RAX, i64::MIN; JE bail` arm and would
+                                    // have mistaken such a value for a throw.
                                     self.emit_post_invoke_exception_check(if is_get {
-                                        b'I'
+                                        ret_tag
                                     } else {
                                         b'V'
                                     });
@@ -8513,7 +8526,20 @@ impl Compiler {
                                     self.next_spill_offset =
                                         out_base.unwrap_or(args_base).min(args_base);
                                     if is_get {
-                                        self.push_from_rax();
+                                        // Both arms converge with the value's
+                                        // RAW BITS in RAX — the helper returns
+                                        // them that way and `invoke_dispatch`
+                                        // already did — so one push serves the
+                                        // fast path and the decline edge. A
+                                        // float/double has to reach an XMM
+                                        // stack slot, which is the same
+                                        // `MOVQ XMM0, RAX` the generic dispatch
+                                        // emits for those return types.
+                                        if matches!(ret_tag, b'F' | b'D') {
+                                            self.push_from_rax_as_xmm0();
+                                        } else {
+                                            self.push_from_rax();
+                                        }
                                     }
                                     intrinsic_handled = true;
                                 }

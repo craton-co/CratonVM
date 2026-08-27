@@ -677,6 +677,22 @@ struct Args {
     )]
     enable_native_access: Option<String>,
 
+    /// What to do when a RESTRICTED method is called without a native-access
+    /// grant (mirrors JDK `--illegal-native-access=allow|warn|deny`).
+    ///
+    /// Default `warn`, which is what a JDK 25 launcher does — measured on
+    /// Adoptium 25.0.4, `MemorySegment.reinterpret` succeeds with four WARNING
+    /// lines and throws only under `deny`. CratonVM used to deny
+    /// unconditionally with no way to ask for anything else, which is why this
+    /// flag arrives together with the default change: the strict behaviour is
+    /// still available, it is just no longer the only behaviour.
+    #[arg(
+        long = "illegal-native-access",
+        value_name = "MODE",
+        default_value = "warn"
+    )]
+    illegal_native_access: String,
+
     /// Enable preview features (mirrors JDK `--enable-preview`).
     ///
     /// A class file whose `minor_version` is 65535 at the running JVM's major
@@ -3611,6 +3627,27 @@ fn run() -> Result<()> {
     // gate once the user opted in.
     if args.enable_native_access.is_some() {
         cratonvm_native_builtins::panama::set_native_access_enabled(true);
+    }
+
+    // --illegal-native-access: what a RESTRICTED method does without a grant.
+    // Set beside the gate above and for the same reason — both must be in place
+    // before any bytecode runs, since the first restricted call may come from a
+    // static initialiser whose failure JVMS 5.5 makes permanent.
+    {
+        use cratonvm_native_builtins::panama::IllegalNativeAccess as Ina;
+        let mode = match args.illegal_native_access.as_str() {
+            "allow" => Ina::Allow,
+            "deny" => Ina::Deny,
+            "warn" => Ina::Warn,
+            other => {
+                eprintln!(
+                    "Error: Value '{other}' not recognised for --illegal-native-access; \
+                     expected one of allow, warn, deny"
+                );
+                std::process::exit(1);
+            }
+        };
+        cratonvm_native_builtins::panama::set_illegal_native_access(mode);
     }
 
     // --enable-preview: JVMS 4.1 preview class files (`minor_version == 65535`

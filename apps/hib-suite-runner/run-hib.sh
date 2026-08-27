@@ -110,6 +110,12 @@ USE_OVERRIDES=1                     # --no-overrides disables the table (A/B)
 # with --pg-worker-base 0: all its shards fell through to the resolver's
 # always-worker=1 default and collided on hibernate_orm_test_1 concurrently.
 PG_WORKER_BASE="${PG_WORKER_BASE:-}"
+# --mysql-worker-base <N>: same mechanism as --pg-worker-base above, for the
+# MySQL-in-Docker setup (hibernate.properties now points at
+# jdbc:mysql://localhost/hibernate_orm_test_$worker -- see
+# hibernate-orm/hibernate-core/target/resources/test/hibernate.properties).
+# Empty string = disabled, same non-zero-sentinel reasoning as PG_WORKER_BASE.
+MYSQL_WORKER_BASE="${MYSQL_WORKER_BASE:-}"
 
 CATEGORY="passed"
 JITMODE="on"
@@ -138,6 +144,8 @@ OPTIONS:
   --no-overrides               ignore class-overrides.tsv entirely (A/B checks)
   --no-sysprops                do not inject required-sysprops.tsv entries (A/B checks)
   --shards <N>                 parallel forks per mode (default: 6)
+  --pg-worker-base <N>          per-shard Postgres worker DB isolation (see comment at definition)
+  --mysql-worker-base <N>       per-shard MySQL worker DB isolation, same mechanism as above
   --bin <path>                 cratonvm.exe (default: $CV_BIN env or hibtest release)
   --out <dir>                  output root (default: ./runs)
   -h | --help
@@ -366,6 +374,7 @@ while [ $# -gt 0 ]; do
     --timeout)  TIMEOUT="$2"; shift 2;;
     --shards)   SHARDS="$2"; shift 2;;
     --pg-worker-base) PG_WORKER_BASE="$2"; shift 2;;
+    --mysql-worker-base) MYSQL_WORKER_BASE="$2"; shift 2;;
     --bin)      CV_BIN="$2"; shift 2;;
     --out)      OUTROOT="$2"; shift 2;;
     --list)     EXPLICIT_LIST="$2"; shift 2;;
@@ -427,12 +436,18 @@ run_shard() {
     PG_URL_FLAG=(-Dhibernate.connection.url="jdbc:postgresql://localhost/hibernate_orm_test_${worker_n}?preparedStatementCacheQueries=0&escapeSyntaxCallMode=callIfNoReturn")
     echo "[pg-worker] shard $SHARD_IDX -> hibernate_orm_test_${worker_n}" >> "$RAW"
   fi
+  local -a MYSQL_URL_FLAG=()
+  if [ -n "$MYSQL_WORKER_BASE" ]; then
+    local myworker_n=$((MYSQL_WORKER_BASE + SHARD_IDX + 1))
+    MYSQL_URL_FLAG=(-Dhibernate.connection.url="jdbc:mysql://localhost/hibernate_orm_test_${myworker_n}?allowPublicKeyRetrieval=true&useSSL=false")
+    echo "[mysql-worker] shard $SHARD_IDX -> hibernate_orm_test_${myworker_n}" >> "$RAW"
+  fi
   while IFS= read -r cls; do
     [ -z "$cls" ] && continue
     # --- per-class accommodation (class-overrides.tsv) ------------------------
     # timeout is a floor: a run that already asks for longer keeps its own value.
     local cls_to cls_fl eff_to f
-    local -a eff_flags=("${VMFLAGS_BASE[@]}" "${PG_URL_FLAG[@]}")
+    local -a eff_flags=("${VMFLAGS_BASE[@]}" "${PG_URL_FLAG[@]}" "${MYSQL_URL_FLAG[@]}")
     cls_to="${CLASS_TIMEOUT_OVERRIDE[$cls]:-}"
     cls_fl="${CLASS_FLAGS_OVERRIDE[$cls]:-}"
     eff_to="$TIMEOUT"

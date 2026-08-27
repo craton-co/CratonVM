@@ -9021,12 +9021,15 @@ pub fn ffm_kind_for_descriptor(descriptor: &str) -> Option<i64> {
             3 // FFM_KIND_INT
         } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfLong;") {
             4 // FFM_KIND_LONG
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfFloat;") {
+            5 // FFM_KIND_FLOAT
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfDouble;") {
+            6 // FFM_KIND_DOUBLE
         } else {
-            // `$OfFloat` / `$OfDouble` are deliberately absent. Their result has
-            // to land in an XMM stack slot rather than through `push_from_rax`,
-            // which is a separate change; until it lands they keep the ordinary
-            // native dispatch, which is correct, only not faster. They must be
-            // refused HERE rather than in the emitter — see above.
+            // `$OfBoolean` and `$OfAddress` stay absent: the first has a domain
+            // narrower than its byte (the JDK reads the byte and compares it to
+            // zero) and the second returns a fresh zero-length segment, which is
+            // an allocation and not a load.
             return None;
         },
     )
