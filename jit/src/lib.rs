@@ -14305,6 +14305,43 @@ fn escape_analysis_from_ir(
         id_map[i] = ea_id;
     }
 
+    // Block side table (`escape_analysis::Graph::blocks`). Only the ops whose
+    // control is pinned at input 0 get an entry, and only when that input names
+    // a real control node — a compact or malformed node contributes nothing and
+    // is then simply not eligible for the one-block dominance proof.
+    //
+    // `Op::Guard` is deliberately absent from the "is this a block boundary"
+    // question: it produces no control token (`ir::Op::is_control`), so a null
+    // or bounds check does not end a block and the accesses either side of it
+    // still name the same control node.
+    for i in 0..ir_node_count {
+        let ir_node = &ir_graph.nodes[i];
+        if !matches!(
+            ir_node.op,
+            ir::Op::Load(_)
+                | ir::Op::Store(_)
+                | ir::Op::ArrayLoad(_)
+                | ir::Op::ArrayStore(_)
+                | ir::Op::New { .. }
+                | ir::Op::NewArray { .. }
+        ) {
+            continue;
+        }
+        let Some(&ctrl) = ir_node.inputs.first() else {
+            continue;
+        };
+        let Some(ctrl_node) = ir_graph.nodes.get(ctrl as usize) else {
+            continue;
+        };
+        if !ctrl_node.op.is_control() {
+            continue;
+        }
+        let (ea_id, ea_ctrl) = (id_map[i], id_map[ctrl as usize]);
+        if ea_id != usize::MAX && ea_ctrl != usize::MAX {
+            ea.blocks.insert(ea_id, ea_ctrl);
+        }
+    }
+
     // Second pass: wire inputs (skip Start/Return whose inputs are already set).
     for i in 0..ir_node_count {
         let ir_id = i as ir::NodeId;

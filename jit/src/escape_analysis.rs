@@ -259,6 +259,34 @@ pub struct Graph {
     /// escape point, together with the materialization sites it would need
     /// ([`PartialEscapeInfo::escape_sites`]).
     pub cold_nodes: HashSet<NodeId>,
+    /// For each memory-accessing node, the **basic block** it executes in,
+    /// named by the IR control node it is pinned to (mapped into EA ids).
+    ///
+    /// # Why the analysis needs this
+    ///
+    /// The bridge drops the control and memory edges (see the module header),
+    /// so [`program_order_proves_dominance`] can only answer the *whole graph*
+    /// question — "is there any branch anywhere?" — and a hot loop always
+    /// answers no. That refused every allocation in every loop body, including
+    /// ones whose allocation, stores and loads sit next to each other in one
+    /// straight-line block.
+    ///
+    /// This carries back the one fact that makes the local question decidable,
+    /// and nothing else: which block each access is in. Ascending [`NodeId`] is
+    /// execution order *within* a block, because a block is straight-line by
+    /// definition.
+    ///
+    /// **Empty by default.** A graph with no entries behaves exactly as it did
+    /// before this existed: only the graph-wide stand-in is available, and an
+    /// allocation in a branchy graph is refused. Fail-closed in the direction
+    /// that matters — a missing entry costs an optimisation, never correctness.
+    ///
+    /// Only nodes whose IR op pins control at input 0 *and* whose control input
+    /// is a real control node get an entry. In particular a `Guard` is
+    /// deliberately NOT a block boundary: it produces no control token
+    /// ([`ir::Op::is_control`] excludes it), so a bounds or null check leaves
+    /// its block intact and the accesses either side of it still compare equal.
+    pub blocks: HashMap<NodeId, NodeId>,
 }
 
 impl Graph {
@@ -279,6 +307,7 @@ impl Graph {
             entry: 0,
             exit: 1,
             cold_nodes: HashSet::new(),
+            blocks: HashMap::new(),
         }
     }
 
@@ -386,6 +415,60 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
 }
 
 // ── Program order as a dominance stand-in ───────────────────────────────
+
+/// Whether ascending [`NodeId`] is a sound stand-in for dominance *for one
+/// allocation*, on the strength of every access to it being in one basic block.
+///
+/// [`program_order_proves_dominance`] asks the whole-graph question and a hot
+/// loop always fails it: the loop's own back-edge is a `Merge`. But the object
+/// this analysis wants to delete is usually allocated, filled and read inside a
+/// single straight-line block of that loop, and for such an object the ordering
+/// question is decidable without any dominator tree.
+///
+/// # The argument
+///
+/// Let *B* be the block. Require the allocation and **every** field access this
+/// candidate folds — every store in `stores`, every load in `loads` — to be in
+/// *B*, and require the reference to have no φ alias (`transparent` is just the
+/// allocation itself, so no copy of it leaves *B*).
+///
+/// 1. A block is straight-line, so within *B* ascending `NodeId` — which is
+///    creation order, which is program order — **is** execution order.
+/// 2. The allocation is itself in *B*, so each execution of *B* produces a
+///    *fresh* object. A store executed in an earlier execution of *B* (an
+///    earlier loop iteration) wrote an earlier object, not this one. This is
+///    the clause that makes the rule safe in a loop, and it is exactly what
+///    fails when the allocation is hoisted out of the loop: then one object is
+///    reused across iterations and a load can see the previous iteration's
+///    store.
+/// 3. The use walk in [`find_scalar_replacements`] is exhaustive — it visits
+///    every use of the allocation and refuses the object outright at anything
+///    it cannot classify — so `stores` is *every* store to this object's
+///    fields. With (1) and (2), the latest store preceding a load in *B* is the
+///    value that load reads.
+///
+/// Returns `false` whenever any access has no recorded block (see
+/// [`Graph::blocks`]) or the blocks are not all equal — a missing fact is never
+/// read as agreement.
+fn one_block_proves_dominance(
+    graph: &Graph,
+    alloc: NodeId,
+    transparent: &HashSet<NodeId>,
+    stores: &[Vec<FieldStore>],
+    loads: &[NodeId],
+) -> bool {
+    // A φ copy carries the reference to a merge, which is by construction not
+    // this block. Refuse rather than reason about it.
+    if transparent.len() != 1 {
+        return false;
+    }
+    let block = match graph.blocks.get(&alloc) {
+        Some(&b) => b,
+        None => return false,
+    };
+    let same = |n: &NodeId| graph.blocks.get(n) == Some(&block);
+    stores.iter().flatten().all(|fs| same(&fs.store)) && loads.iter().all(same)
+}
 
 /// Whether ascending [`NodeId`] is a sound stand-in for *dominance* in this
 /// graph — i.e. whether "store id < load id" really means "the store executed
@@ -699,9 +782,11 @@ pub struct ScalarReplacementInfo {
     pub load_values: Vec<(NodeId, LoadResolution)>,
     /// Stores that were eliminated.
     pub eliminated_stores: Vec<NodeId>,
-    /// Whether program order was a sound dominance stand-in for this graph —
-    /// [`program_order_proves_dominance`]. Recorded per candidate so a consumer
-    /// can see *why* a field with stores resolved to `Unknown`.
+    /// Whether program order was a sound dominance stand-in **for this
+    /// candidate** — either [`program_order_proves_dominance`] for the whole
+    /// graph, or [`one_block_proves_dominance`] for this object alone.
+    /// Recorded per candidate so a consumer can see *why* a field with stores
+    /// resolved to `Unknown`.
     pub dominance_proved: bool,
 }
 
@@ -1711,6 +1796,19 @@ fn find_scalar_replacements(
                     }
                 }
             }
+
+            // Program order is dominance for this object either because the
+            // whole graph is branch-free, or because every access to it is in
+            // one basic block — see `one_block_proves_dominance`. The second
+            // is what a hot loop needs; the first cannot be true inside one.
+            let dominance_proved = dominance_proved
+                || one_block_proves_dominance(
+                    graph,
+                    id,
+                    &transparent,
+                    &field_stores,
+                    &replaced_loads,
+                );
 
             // ── Positional load resolution ───────────────────────────
             //
