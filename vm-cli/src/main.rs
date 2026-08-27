@@ -158,6 +158,7 @@ fn maybe_dump_shutdown_reports() {
     // `runtime::interpreter::report_lambda_census_at_exit`.
     cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
     cratonvm_vm::runtime::interpreter::report_stub_door_tally_at_exit();
+    cratonvm_vm::runtime::interpreter::report_native_entry_tally_at_exit();
 
     // The map-view rebuild-elision census, on `CRATONVM_DBG=map-view-cache`.
     // `resync_skipped` is the ENGAGEMENT counter for the keySet-view fast path:
@@ -210,6 +211,22 @@ fn maybe_dump_shutdown_reports() {
              dereferenced: {})",
             cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot(),
             cratonvm_vm::jit::helpers::jit_getfield_punned_ref_nonzero()
+        );
+        // G1 parallel-evacuation CAS losses, i.e. how often a worker found
+        // another worker had already forwarded the object it was copying and
+        // adopted that target. Until 2026-08-26 that arm returned the target
+        // WITHOUT recording `old -> target` in this cycle's `pointer_map`, so
+        // no root naming `old` could be remapped and it dangled once the
+        // region was reused -- the rare `java/lang/Object`.
+        //
+        // Printed even when zero, for the reason the counter above it is: a
+        // fix to an arm nothing reaches is a no-op dressed as a repair, and
+        // this arm needs TWO WORKERS RACING ON ONE OBJECT, so a quiet run
+        // means the race did not happen, not that the fix is inert.
+        eprintln!(
+            "[cratonvm] G1 evacuation CAS losses (forwards this VM would have \
+             dropped before the 2026-08-26 fix): {}",
+            cratonvm_vm::g1_evacuate_cas_loser_forwards()
         );
         // The `validate_code_ptr` memo's engagement, on the same switch and for
         // the same reason as every counter above it. The memo replaced a global
@@ -274,6 +291,18 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" "),
             cratonvm_jit::metrics::despec_escalations_spared()
+        );
+        // The per-call safepoint blind spill, and how often the oop-clean-frame
+        // proof let a direct call publish the safepoint id alone instead of
+        // copying the whole GPR file into the frame. `elided` is the engagement
+        // counter; the two refusal rows say why the others did not.
+        eprintln!(
+            "[cratonvm] direct-call spill: {}",
+            cratonvm_jit::metrics::call_spill_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every

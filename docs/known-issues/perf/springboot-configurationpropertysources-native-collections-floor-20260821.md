@@ -306,6 +306,180 @@ asked at **all three** virtual doors on a plain `ListYieldProbe` run:
 
 `-> false` only because the class was not allow-listed. Arm it, and it yields.
 
+### The iterator: two native crossings per element, and the arbitration cannot reach it
+
+Measured 2026-08-24, and this one is an EXACT count rather than an estimate.
+`probes/KeySetBench iterList` walks 2000 × 1000 elements; `--dump-native-registry`
+reports:
+
+```text
+java/util/ArrayList$Itr.hasNext   kind=bridge  invocations=2002000  complete=true
+java/util/ArrayList$Itr.next      kind=bridge  invocations=2000000  complete=true
+java/util/Iterator.hasNext        kind=bridge  invocations=0
+java/util/Iterator.next           kind=bridge  invocations=0
+```
+
+2 000 000 = exactly one `next` per element, and one `hasNext` per element plus
+one per loop. **The iterator's whole cost is two native crossings per element**,
+which at this VM's funnel price is the ~1 µs/element the original Term 2
+measured. It is not the map view, not the JDK's `Itr` logic, and not the
+`java/util/Iterator` interface fallback — that fallback (registered for
+"synthetic iterator wrappers") is entered **zero** times and can be ignored.
+
+**A read on `invocations_complete` this page got wrong once:** it is PER ROW.
+These `Itr` rows say `true` and are exact; the `ArrayList.get` row says `false`
+and saturates at 127. The field is trustworthy — it just has to be read.
+
+**The allow-list does NOT fix this one, and the instrument says why.** Arming
+`java/util/ArrayList$Itr` exactly as `ArrayList.get` was armed moved nothing
+(`iterList` 1823/1724/1853 → 1723/1776/1850, interleaved, noise). With
+`CRATONVM_DBG_STUB_DOOR=1`, `java/util/ArrayList$Itr` **never appears at any of
+the six doors** — under `--nojit` as well as compiled, where the natives still
+serve 20 020/20 000 calls. `ArrayList.get` was asked x3/x9/x381; the iterator is
+asked zero times.
+
+So the arbitration is genuinely not reached here, and this time that is measured
+rather than inferred from a saturating counter. The difference is the CALL
+SHAPE: `list.get(i)` is a virtual call on `java/util/ArrayList`, while
+`it.hasNext()` is an **`invokeinterface` on `java/util/Iterator`** whose
+receiver-class native (`ArrayList$Itr.hasNext`) is resolved and cached without
+anyone asking `real_protected_stub_class`.
+
+**~~Next step, and it is not another allow-list entry~~ — DONE 2026-08-24, and
+the answer was not a dispatch bug. It was the KIND again, and closing it made
+things WORSE.**
+
+There is no missing arbitration on the interface path. `resolve_native_site`
+(the JIT's native site cache) already refuses to cache a `SyntheticStub`,
+explicitly because those "are subject to the `real_protected_stub_class` /
+`has_real` yield-to-bytecode arbitration … which this path does not reproduce".
+`ArrayList$Itr.hasNext`/`next` are **`Bridge`**, so they are cached and served
+without any of that — and term 1 of the yield predicate is
+`kind != SyntheticStub → refuse`, which is why the earlier allow-list-only arm
+did nothing and why `java/util/ArrayList$Itr` never appeared at a door. The
+allow-list is term 2; term 1 had already refused.
+
+Retagging both to `SyntheticStub` and allow-listing the class does engage: the
+census kind flips, and native crossings fall from ~300 000 to ~1 000 on the same
+walk. **And `iterList` gets 1.56× SLOWER** — 1192.5/1219.0/1166.0 → 1830.5/
+1808.0/1936.5, interleaved, every other rung flat (`hoisted`, `iterSet`,
+`idxList`, `toArrHoisted`, `rawArr` all within noise).
+
+**Why, in one line:** `CRATONVM_DBG_JIT_COMPILED` counts **zero** compiles of
+`ArrayList$Itr.next`/`hasNext` in either arm — `<init>` compiles, the two hot
+methods never do. So the yield trades one native crossing per element for one
+*interpreted* method invocation per element, which is worse. The change was
+reverted rather than shipped.
+
+**So the earlier claim on this page that the iterator's cost IS its two native
+crossings is wrong.** The count was right (2 002 000 / 2 000 000, exact); the
+attribution was not. Removing the crossings does not remove the cost, so the
+crossings were the symptom.
+
+### Why the JIT never compiles it — ANSWERED 2026-08-24
+
+**Registering a native for a method makes that method permanently
+un-compilable.** Not by a refusal in the compile door — by an omission in the
+call-site cache.
+
+The invocation counter that nominates a method for tier-up lives in exactly one
+place: the `CachedInvokeTarget::VirtualBytecode` arm of `dispatch_virtual`
+(`profile_store.increment_invocation` → `on_method_invocation_observed`). The
+**`VirtualNative` arm has no counter at all.** So a call site that resolves to a
+registered native is never counted, never nominated, never enqueued, and never
+compiled — no matter how hot. It is not that the compile was attempted and
+refused; it was never requested.
+
+Measured, `CRATONVM_DBG_JITC=1` on `probes/KeySetBench iterList` (2M calls each):
+
+```text
+[ir] admission   java/util/ArrayList$Itr.<init>(Ljava/util/ArrayList;)V: admitted
+[cratonvm-jitc]  full-compile java/util/ArrayList$Itr.<init>...
+                 …and NOTHING for next() or hasNext(), ever
+```
+
+`<init>` has no native registered and compiles. `next`/`hasNext` do, and never
+appear in the log in any form.
+
+**The converse confirms it.** `java/util/ArrayList.get`/`size` — which the fix
+above made YIELD to real bytecode — now read:
+
+```text
+[ir] admission   java/util/ArrayList.get(I)Ljava/lang/Object;: admitted to the optimizing pipeline
+[cratonvm-jitc]  full-compile java/util/ArrayList.get(I)Ljava/lang/Object; len=2526
+CRATONVM_DBG_JIT_COMPILED: put java/util/ArrayList.get(I)Ljava/lang/Object;
+```
+
+So the 11.1× that fix bought was not merely "skip the native". It was **making
+the method compilable at all** — the site flips from `VirtualNative` to
+`VirtualBytecode`, which is the arm that owns the counter.
+
+Two gates that are NOT the cause, checked and eliminated:
+`CRATONVM_JIT_VIRTUAL_TIERUP` is default-ON, and `ArrayList$Itr.next()` carries
+**no exception table** (`javap -c` on the real JDK class), so the
+`cached.exception_table.is_empty()` precondition passes.
+
+### The iterator: 6.2× is REAL and MEASURED, and one thing blocks it
+
+**Population never declined. The previous two arms were both mis-measured, one
+of them by an editing mistake of mine.**
+
+* *allow-list alone* — no effect, because term 1 of the yield predicate is
+  `kind != SyntheticStub → refuse` and these natives are `Bridge`.
+* *"retag + allow-list", reported as a 1.56× PESSIMISATION* — that arm's
+  allow-list entry had landed in `redefine_immune_synthetic_collection_native`
+  instead of `real_protected_stub_class_common`, forty lines of `matches!`
+  away, by a mis-anchored edit. **It was measuring the retag alone**, and the
+  retag alone is exactly a pessimisation: `resolve_native_site` refuses to cache
+  ANY `SyntheticStub`, so the site drops out of the JIT's native cache onto the
+  generic path — still running the native, by the expensive route. Confirmed
+  with `CRATONVM_DBG_NATIVE_ENTRY=1`: 599 065 funnel entries moved from
+  `jit/helpers.rs` to `vm_exec.rs` and the count did not fall.
+
+With the entry in the RIGHT function, both halves together do exactly what the
+crossing count predicted. One binary, `CRATONVM_ITR_BYTECODE` as the A/B,
+interleaved, µs/call:
+
+| rung | OFF (`Bridge`, today) | ON | HotSpot |
+|---|---:|---:|---:|
+| `iterList` | 944.0/972.5/965.0 | **150.0/159.0/153.0** | 6.0 |
+| `hoisted` (map-view itr) | 618.5/589.5/593.0 | 622.0/622.5/608.0 | 8.5 |
+| `iterSet` (HashSet itr) | 637.5/640.0/675.5 | 656.5/655.5/738.0 | 11.5 |
+| `idxList` | 82.0/69.5/72.0 | 67.5/67.5/83.5 | 6.0 |
+| `rawArr` (**control**) | 17.5/17.5/17.5 | 20.0/18.0/21.0 | 3.5 |
+
+**6.2×**, controls flat, and `ArrayList$Itr.hasNext`/`next` go from never
+appearing in `CRATONVM_DBG_JITC` to `admitted … full-compile`. It is also more
+CORRECT: `probes/ItrYieldProbe` (new, 39 rows — fail-fast, the `lastRet`
+contract, `remove()` interop, sublists, `Arrays.asList`, COW snapshot
+semantics, map views) is byte-identical to HotSpot with it ON, while **today's
+`Bridge` arm gets `cmeClear` wrong** — iterating while calling `list.clear()`
+does not throw `ConcurrentModificationException`.
+
+### What blocks it, exactly
+
+`for (String v : map.values())` throws a **spurious
+`ConcurrentModificationException`** from `ArrayList$Itr.checkForComodification`.
+The cause is already documented in `native-collections`: a `MAP_VIEW_CARRIERS`
+receiver **has no `modCount` slot**. It extends `AbstractCollection`, not
+`AbstractList`, so `AbstractList`'s resolved index names the carrier's own first
+declared field — `HashMap$Values.this$0` and friends, all REFERENCES. The native
+cursor tolerated that; the real one reads it as an int and compares it to
+`expectedModCount`.
+
+A values view hands out an `ArrayList$Itr`, the same class an ordinary list
+does, so a class-name allow-list cannot separate the two cases. **The enabling
+change is to mint a distinct iterator class for view carriers** (the
+`VALUES_ITR_CARRIERS` machinery already exists for the values families) so that
+`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its
+own. Do that and this 6.2× is available.
+
+**A coverage note worth acting on independently:** `regression-suite/run.sh`
+passed **72/72 on the broken binary**. A change that makes
+`for (v : map.values())` throw on the first element is invisible to the suite;
+`probes/MapViewBehaviourProbe` caught it immediately. That gap is worth a vector
+regardless of what happens to this fix.
+
 ### The fix: one allow-list entry, 11.1×
 
 `java/util/ArrayList` joins `real_protected_stub_class_common`. MEASURED on one
