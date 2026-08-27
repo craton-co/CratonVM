@@ -559,7 +559,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-234 tokens.
+235 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -769,6 +769,7 @@ export inherited from a parent shell.
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
 | `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
+| `spill-args-published` | `CRATONVM_JIT_SPILL_ARGS_PUBLISHED` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -884,11 +885,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-28 tokens.
+29 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
+| `itr-bytecode` | `CRATONVM_ITR_BYTECODE` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
 | `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
 | `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |

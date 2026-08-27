@@ -1279,6 +1279,14 @@ pub const INVENTORY: &[E] = &[
     // DEFAULT-ON, so a KILL SWITCH: `=0` restores the full-GPR spill. Same
     // off_word shape as `call-spill-elision` beside it.
     E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
+    // A call site's argument staging IS the publication of its argument oops,
+    // so the pre-safepoint spill of those registers is a duplicate. DEFAULT-ON,
+    // hence a KILL SWITCH: `=0` restores the full selection at the staged sites.
+    // Opt-in PER SITE in the compiler, never globally -- an allocation site, a
+    // safepoint poll, or an invoke shape that did not stage keeps the full spill
+    // because it has not published anything. Declared here after
+    // `flag_declaration_guard` caught it reading through a live `getenv`.
+    E { group: Group::JIT, token: "spill-args-published", on_key: Some("CRATONVM_JIT_SPILL_ARGS_PUBLISHED"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
@@ -1514,6 +1522,12 @@ pub const INVENTORY: &[E] = &[
     // accessors re-validate, which is the pre-"validate once" behaviour.
     E { group: Group::GC, token: "validate-once", on_key: None, off_key: Some("CRATONVM_GC_NO_VALIDATE_ONCE"), off_word: None },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
+    // `ArrayList$Itr.hasNext`/`next` are registered `SyntheticStub` rather than
+    // `Bridge` so the yield predicate can reach them and the REAL JDK cursor
+    // runs -- which is what lets the JIT compile it at all, since a registered
+    // native pins its method out of tier-up entirely. DEFAULT-ON, hence a KILL
+    // SWITCH: `=0` restores `Bridge` and is the one-binary A/B for the 6.8x.
+    E { group: Group::REAL, token: "itr-bytecode", on_key: Some("CRATONVM_ITR_BYTECODE"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
     // It already was a comma-separated token list before this refactor —
