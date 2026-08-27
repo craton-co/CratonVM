@@ -2300,15 +2300,24 @@ mod tests {
 
     #[test]
     fn every_token_is_unique() {
+        // Uniqueness is on the PAIR. The same token in two different groups is
+        // deliberate and has its own test
+        // (`a_token_shared_between_groups_stays_two_keys`), so a bare token
+        // count would condemn 13 legitimate rows.
         let mut seen: Vec<(Group, &str)> = INVENTORY.iter().map(|e| (e.group, e.token)).collect();
-        let before = seen.len();
         seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(
-            before,
-            seen.len(),
-            "two entries claim the same (group, token); merge them into one \
-             entry carrying both an on_key and an off_key instead"
+        let dups: Vec<String> = seen
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| format!("{:?}/{}", w[0].0, w[0].1))
+            .collect();
+        assert!(
+            dups.is_empty(),
+            "these (group, token) pairs are claimed twice: {}. Merge each into \
+             ONE entry carrying both an on_key and an off_key, or delete the \
+             duplicate — two sessions declaring the same knob independently is \
+             how this happens, and the row is usually verbatim-identical.",
+            dups.join(", ")
         );
     }
 
@@ -2318,14 +2327,16 @@ mod tests {
             .iter()
             .flat_map(|e| [e.on_key, e.off_key].into_iter().flatten())
             .collect();
-        let before = keys.len();
         keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(
-            before,
-            keys.len(),
-            "a legacy variable is claimed by more than one token, so its \
-             canonical spelling is ambiguous"
+        let dups: Vec<&str> = keys
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| w[0])
+            .collect();
+        assert!(
+            dups.is_empty(),
+            "these legacy variables are claimed by more than one token, so \
+             their canonical spelling is ambiguous: {dups:?}"
         );
         for s in SCALARS {
             assert!(
