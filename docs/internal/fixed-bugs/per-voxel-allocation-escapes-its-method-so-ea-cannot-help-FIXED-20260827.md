@@ -18,6 +18,15 @@ Same binary, flag A/B, `probes/VoxelAlloc2.java` at 64³ voxels, steady state:
 | **both** | **43.9 ns/voxel** | 39.2 | 4.9 |
 | *real HotSpot 25, same probe* | *1.4* | *1.4* | *0.5* |
 
+And on Windows, which is the platform the original measurement was taken on:
+
+| arm | `volume` | `rawseg` (the CONTROL) | `array` |
+|---|---:|---:|---:|
+| neither flag | 549.1 ns/voxel | 39.7 | 2.8 |
+| **both** | **30.6 ns/voxel** | 28.6 | 2.7 |
+
+`volume - rawseg`: 509 ns to **2.0 ns**.
+
 Checksum `268171424` in every row of every arm, by construction, so a transform
 that broke the read would show up as a wrong number rather than as a fast one.
 
