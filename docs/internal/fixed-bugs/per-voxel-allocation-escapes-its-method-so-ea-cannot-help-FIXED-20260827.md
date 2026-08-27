@@ -52,6 +52,47 @@ Two rounds, two allocations, nothing left.
 **Both flags are still opt-in**, and the table says why that matters: neither
 one alone does anything much. See [What is still gated](#what-is-still-gated).
 
+## Independently re-measured, 2026-08-27, second session
+
+Own build off `17c80e2da`, own run, Windows, both flags, `-Dvoxel.reps=3`:
+
+| arm | ns/voxel |
+|---|---:|
+| `volume` | 24.5 / 25.4 / 26.0 |
+| `rawseg` (the CONTROL) | 25.7 / 28.8 / 25.1 |
+| `array` (the floor) | 2.4 / 2.7 / 2.9 |
+
+`volume - rawseg` lands between **-1.4 and +4.6 ns and CHANGES SIGN run to run**,
+which is what "converged onto its control" looks like when it is real. Checksum
+`268171424` in every row. The instrument agrees:
+
+```
+[cratonvm-scalarnew] VoxelAlloc2.sweepVolume(...): scalar-replaced 1/2 alloc(s)
+[cratonvm-scalarnew] VoxelAlloc2.sweepVolume(...): scalar-replaced 1/1 alloc(s)
+```
+
+**The first attempt to reproduce this FAILED, and the probe's own default is
+why.** At the checked-in `voxel.warmiters=300` the three sweeps were never
+compiled at all on this host — no `[ir] admission` line for any of them — so
+every arm reported its interpreted cost (`volume` ~400 ns, `array` ~200 ns) and
+the run read as though neither flag did anything. Measured threshold here: 300
+too low, 1000 enough. The default is now 2000, and the probe **refuses to let a
+cold run pass as a result**: the allocation-free `array` arm is the tell (it
+should be single-digit nanoseconds and neither flag touches it), so a reading
+above 20 ns/voxel prints
+
+```
+*** NOT WARM: the allocation-free `array` arm cost 185.5 ns/voxel, so the sweeps
+are interpreted and no number above is about the optimizer.
+```
+
+The trap was already documented in [Reproducing](#reproducing) — but a trap the
+DEFAULT falls into is one every reader hits before they read about it, and the
+number it hands them is wrong in the direction of "the fix does nothing". Each
+rep now also prints `volume - rawseg` directly, since that difference is the
+quantity the page reasons about and subtracting two noisy absolutes by eye is
+how a reader gets it wrong.
+
 ## What the page had wrong, and how the instrument said so
 
 The page's open question was "**why** EA reports `0/2` on the merged graph is not
@@ -297,7 +338,10 @@ CRATONVM_JIT_IR_INLINE=1 CRATONVM_SCALAR_DEOPT=1 CRATONVM_DBG_SCALAR_NEW=1 \
 `voxel.warmiters` is load-bearing and is the one trap in this probe: with too
 few warm invocations the arm method is only ever reached through the **OSR**
 door, which does not go through IR admission at all — no splice, no escape
-analysis, and the `[ir] admission` line for it simply never appears. That is
+analysis, and the `[ir] admission` line for it simply never appears. The default
+is 2000 (300 was below the threshold on Windows) and the probe now says so out
+loud when it happens rather than reporting an interpreter number — see
+[Independently re-measured](#independently-re-measured-2026-08-27-second-session). That is
 [Open 3](#still-open) below, and it is not a probe artifact: a per-frame
 integration loop in the real workload has the same shape.
 
