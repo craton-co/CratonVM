@@ -55,7 +55,7 @@ cratonvm.exe --java-home <jdk25> --Xmx 1500m -XX:+UseZGC @common.args -Dcraton.b
 ```
 
 This class already has a CLOSED investigation
-(`docs/internal/fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`,
+(`fixed-suite-bugs/netty-brotli-huge-decompress-not-a-hang-FIXED-20260812.md`,
 Azure Linux): 10 of 11 tests pass in 4.2s, only `testHugeDecompress` doesn't
 finish, and the process is confirmed CPU-bound at 100% (a plain interpreter
 throughput wall building a 256MB buffer one byte at a time — not a native
