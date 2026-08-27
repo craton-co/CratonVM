@@ -7285,6 +7285,11 @@ pub static JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT: std::sync::atomic::AtomicU64 =
 pub static JIT_GETFIELD_PUNNED_REF_NONZERO: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// How many punned reference loads have been REPORTED, bounding the per-run
+/// dump independently of the dangerous-payload count.
+pub static JIT_GETFIELD_PUNNED_REF_REPORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Snapshot of [`JIT_GETFIELD_PUNNED_REF_NONZERO`].
 pub fn jit_getfield_punned_ref_nonzero() -> u64 {
     JIT_GETFIELD_PUNNED_REF_NONZERO.load(std::sync::atomic::Ordering::Relaxed)
@@ -7520,12 +7525,46 @@ unsafe fn jit_getfield_impl(
             ptr.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
         );
         if payload64 != 0 {
-            let n = JIT_GETFIELD_PUNNED_REF_NONZERO
+            JIT_GETFIELD_PUNNED_REF_NONZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // WHAT TO REPORT, and why the payload word can no longer decide it.
+        //
+        // The report used to fire only when `payload64 != 0`, on the argument
+        // that a zero payload is the benign case — a never-assigned reference
+        // cell of a freshly allocated object, still zero-filled, decoding as
+        // `Int(0)` and reading back as the correct null. That argument held only
+        // while `write_value_atomic` could leave the payload word as stack
+        // padding, which made "non-zero" a decent proxy for "somebody WROTE this
+        // cell". `value_words` now writes the unused half as a hard zero, so a
+        // genuinely punned `Int(1)` cell has `payload64 == 0` as well, and the
+        // old gate would hide precisely the writes that fix was made to expose.
+        //
+        // But dropping the gate outright is not the answer either: the benign
+        // zero-fill case is the overwhelming majority — this counter reaches the
+        // millions on a PASSING workload — so an unfiltered dump spends its
+        // 32-line budget on noise and never reaches the one event worth seeing.
+        //
+        // So the filter moved from the payload to the CLASS.
+        // `CRATONVM_DBG_PUNNED_REF=1` keeps the historical behaviour (report the
+        // dangerous-payload subset); `CRATONVM_DBG_PUNNED_REF=<substring>`
+        // reports every pun on a class whose name contains that substring,
+        // whatever its payload. One is for "is anything about to be
+        // dereferenced", the other for "is THIS field the one reading null".
+        let want = cratonvm_types::flags::runtime_var("CRATONVM_DBG_PUNNED_REF").ok();
+        let class_filter = want.as_deref().filter(|w| {
+            let w = w.trim();
+            !w.is_empty() && w != "1" && !w.eq_ignore_ascii_case("true")
+        });
+        let hdr = &*(obj_ptr as *const cratonvm_types::ObjectHeader);
+        let interesting = match class_filter {
+            Some(sub) => cratonvm_gc::collector::class_name_for_diagnostics(hdr.class_id.as_u32())
+                .contains(sub.trim()),
+            None => want.is_some() && payload64 != 0,
+        };
+        if interesting {
+            let n = JIT_GETFIELD_PUNNED_REF_REPORTS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 32
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PUNNED_REF").is_some()
-            {
-                let hdr = &*(obj_ptr as *const cratonvm_types::ObjectHeader);
+            if n < 32 {
                 // The whole cell, not just the word that would have been
                 // dereferenced. `Value::Int` keeps its payload at
                 // FIELD_CELL_PAYLOAD32_OFFSET, so a non-zero payload64 under an
