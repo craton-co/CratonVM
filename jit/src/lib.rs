@@ -19666,16 +19666,17 @@ fn try_compile_inner(
         // and the pcs of elidable `<init>()V` invokespecials. Without it, the
         // builder bails on `new`/`invokespecial`, so allocation-bearing methods
         // stay on the single-pass backend exactly as before (inert default).
+        // Was any `new` site DEFERRED rather than merely unresolvable? That
+        // distinction is what makes an IR bail worth retrying: a deferred class
+        // is one nothing has loaded YET, and the very next thing to run is
+        // usually its constructor. Read again after `IrBuilder::build`, so the
+        // retry is recorded only when the build actually LOST the method.
+        let mut any_deferred_new = false;
         if let (Some(elidable_resolver), Some(new_resolver)) =
             (cp_elidable_init_resolver, cp_new_resolver)
         {
             if !scan.new_ops.is_empty() {
                 let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
-                // Was any site DEFERRED rather than merely unresolvable? That
-                // distinction is what makes the bail below worth retrying: a
-                // deferred class is one nothing has loaded YET, and the very
-                // next thing to run is usually its constructor.
-                let mut any_deferred_new = false;
                 for &(pc, cp_idx) in &scan.new_ops {
                     // A `Deferred` site has no compile-time class id or field
                     // count, so it gets no map entry: the IR builder's 0xbb arm
@@ -19694,18 +19695,6 @@ fn try_compile_inner(
                         Some(JitNewSite::Deferred { .. }) => any_deferred_new = true,
                         _ => {}
                     }
-                }
-                // Remembered for ONE retry, and only when this compile is about
-                // to lose the method to the single-pass backend for a reason
-                // that will not hold next time. Recorded here rather than at
-                // the bail because this is where the resolver's verdict is in
-                // hand; `take_deferred_new_retry` clears it.
-                if any_deferred_new {
-                    note_deferred_new_bail(
-                        &cached.class_name,
-                        &cached.method_name,
-                        &cached.method_descriptor,
-                    );
                 }
                 let mut trivial_init_pcs = std::collections::HashSet::new();
                 for &(pc, cp_idx, opcode) in &scan.invoke_ops {
@@ -20826,6 +20815,17 @@ fn try_compile_inner(
         // replacement could not fire on it — the signal that the IR builder is
         // missing an opcode the method uses (this is how the `astore` gap, which
         // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        // Remembered for ONE retry, and only now that the build has actually
+        // lost the method: a deferred site the builder never reached (dead
+        // code) would otherwise have cost a wasted C2 attempt.
+        // `take_deferred_new_retry` clears it.
+        if built.is_none() && any_deferred_new {
+            note_deferred_new_bail(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         if built.is_none() && ir_stage_reporting() {
             eprintln!(
                 "[ir] IrBuilder::build returned None for {}.{}{} — no IR body",
