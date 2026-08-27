@@ -2380,7 +2380,46 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "Ed25519" | "Ed448" | "EdDSA" => "SunEC",
         a if a.ends_with("DSA") || a.starts_with("ML-DSA") => "SUN",
         a if a.contains("RSA") => "SunRsaSign",
-        _ => return Ok(Some(Value::Object(None))),
+        // ...and for a name this engine has no INDEX for, ask the registry
+        // instead of answering null.
+        //
+        // `signature_name_is_offered` is a disjunction: a name this module
+        // indexes, OR a name some provider advertises. The second arm is
+        // why `Signature.getInstance("MD2withRSA")` succeeds while
+        // `algo_name(idx)` has nothing to say about it — and the match
+        // above is keyed on exactly that index, so every offered-but-not-
+        // indexed name fell through to `null`.
+        //
+        // MEASURED against HotSpot 25 over the 583 names the five JDK
+        // providers reach by alias or canonical: 71 of them answer a
+        // provider there and answered `null` here, including every
+        // `*withECDSA` but `SHA256withECDSA` and every OID spelling of a
+        // signature algorithm. `sig.getProvider().getName()` is what
+        // bc-java writes, so each was a NullPointerException one call on.
+        //
+        // The registry is the right source and not a wider guess: it is the
+        // same table `getInstance` consulted to accept the name, it
+        // resolves aliases, and it walks the chain in order, so a caller
+        // provider that owns the name outranks the JDK one. A name nothing
+        // advertises still answers `null` rather than a fabricated owner.
+        _ => {
+            let requested = match ctx.get_field_by_name(this, "algorithm") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let owner = match requested.is_empty() {
+                true => None,
+                false => crate::jca::provider_chain::find_service_provider(
+                    "Signature",
+                    &requested,
+                ),
+            };
+            let Some(owner) = owner else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let p = crate::jca::make_named_provider(ctx, &owner)?;
+            return Ok(Some(Value::Object(Some(p))));
+        }
     };
     let p = crate::jca::make_named_provider(ctx, name)?;
     Ok(Some(Value::Object(Some(p))))

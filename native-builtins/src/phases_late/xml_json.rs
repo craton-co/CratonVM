@@ -1706,8 +1706,12 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             if let Some(root) = xml_parse(&xml_text) {
+                // The SAX callbacks are arbitrary Java; each can move `handler`.
+                let h_pin = ctx.pin_native_root(handler);
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
+                let handler = ctx.read_native_pin(h_pin, handler);
                 sax_walk(ctx, handler, &root)?;
+                let handler = ctx.read_native_pin(h_pin, handler);
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)
@@ -1731,8 +1735,12 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             };
             let xml_text = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(root) = xml_parse(&xml_text) {
+                // The SAX callbacks are arbitrary Java; each can move `handler`.
+                let h_pin = ctx.pin_native_root(handler);
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
+                let handler = ctx.read_native_pin(h_pin, handler);
                 sax_walk(ctx, handler, &root)?;
+                let handler = ctx.read_native_pin(h_pin, handler);
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)

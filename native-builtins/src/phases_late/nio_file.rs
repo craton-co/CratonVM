@@ -285,10 +285,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_field(uri, 0, Value::Object(Some(raw)));
             let scheme = ctx.create_string("file");
             ctx.set_field(uri, 1, Value::Object(Some(scheme)));
-            let path_str = ctx.create_string(&abs);
+            let path_str = ctx.create_string(&encoded);
             ctx.set_field(uri, 4, Value::Object(Some(path_str)));
         }
-        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&abs));
+        // `encoded`, not `abs`: the override is the RAW path component, and
+        // `uri_publish_named` derives `decodedPath` from it. Passing the decoded
+        // spelling here is what made `getRawPath()` answer an un-escaped path
+        // while `toString()` stayed correct -- see the note on that function.
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&encoded));
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -6756,7 +6760,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (`try (Writer w = out) { flushBuffer(); }`). Swallowing it is how
             // a full disk turns into a clean `try`-with-resources exit and a
             // truncated file nobody hears about.
+            // `flush()` can move `out` before `close()` dereferences it.
+            let out_pin = ctx.pin_native_root(out);
             ctx.invoke_virtual(out, "flush", "()V", &[])?;
+            let out = ctx.read_native_pin(out_pin, out);
             ctx.invoke_virtual(out, "close", "()V", &[])?;
             return Ok(None);
         }
@@ -6994,12 +7001,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let s = ctx.create_string(&uri_str);
             let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 0, Value::Object(Some(s)));
-            let path_s = ctx.create_string(slash_p);
+            let path_s = ctx.create_string(&encoded);
             let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 4, Value::Object(Some(path_s)));
         }
         let uri = ctx.read_native_pin(uri_pin, uri);
-        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(slash_p));
+        // `encoded`, not `slash_p`: the override is the RAW path component and
+        // `uri_publish_named` derives `decodedPath` from it, so handing it the
+        // decoded spelling made `getRawPath()` answer an un-escaped path while
+        // `toString()` stayed correct. This is the registration that actually
+        // runs -- `Path.toUri()` is registered in this file AND in the phase-57
+        // registrar above, and the later one wins -- which is why fixing only
+        // the other copy moved nothing. See `net_phase_e::uri_publish_named`.
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&encoded));
         let uri = ctx.read_native_pin(uri_pin, uri);
         ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
@@ -14227,14 +14241,60 @@ pub(crate) fn file_normalise_path_units(path: &[u16]) -> Vec<u16> {
         path
     };
     // Normalise forward slashes to Java's canonical Windows separator.
-    let mut normalized: Vec<u16> = body
+    let swapped: Vec<u16> = body
         .iter()
         .map(|&c| if c == slash { back } else { c })
         .collect();
-    // WinNTFileSystem.normalize also drops a redundant final separator (except
-    // the drive root): this is observable in Spring's config-tree location
-    // descriptions.
-    while normalized.len() > 3 && normalized.last() == Some(&back) {
+
+    // COLLAPSE RUNS OF SEPARATORS. `WinNTFileSystem.normalize` does this and
+    // this function did not, so `new File("a//b").getPath()` answered `a\\b`
+    // where HotSpot answers `a\b` (MEASURED: `probes/FilePathSweep.java`, 62
+    // differing lines against HotSpot 25.0.3+9, in BOTH modes). The `#[cfg(not(
+    // windows))]` sibling below has always collapsed runs, with a comment
+    // naming the Spring failure that forced it -- the two arms of one function
+    // simply disagreed, and the Windows one was the wrong half.
+    //
+    // A LEADING DOUBLE separator survives as exactly two: that is the UNC
+    // prefix (`\\server\share`), and collapsing it to one turns a network
+    // path into a drive-relative one. HotSpot keeps it, which is also why it
+    // answers `isAbsolute() == true` for `//`.
+    let unc = swapped.len() >= 2 && swapped[0] == back && swapped[1] == back;
+    let mut normalized: Vec<u16> = Vec::with_capacity(swapped.len());
+    if unc {
+        normalized.push(back);
+        normalized.push(back);
+    }
+    let mut prev_sep = unc;
+    for &c in swapped.iter().skip(usize::from(unc) * 2) {
+        let is_sep = c == back;
+        if !(is_sep && prev_sep) {
+            normalized.push(c);
+        }
+        prev_sep = is_sep;
+    }
+
+    // DROP A REDUNDANT TRAILING SEPARATOR, but never turn a ROOT into the empty
+    // string or into a bare drive letter. The roots are `\`, `X:\` and the UNC
+    // prefix `\\`. The previous guard was `len() > 3`, which protects `C:\`
+    // (len 3) but ALSO protects every short relative path -- so `new File("a/")`
+    // kept its separator, and that one surviving character made `getName()`
+    // answer "", `getParent()` answer "a", and
+    // `new File("a/").equals(new File("a"))` answer FALSE where HotSpot says
+    // true. A File that is not equal to itself-without-a-slash breaks any code
+    // using it as a map key.
+    let is_root = match normalized.len() {
+        0 => true,
+        1 => normalized[0] == back,
+        2 => unc || normalized[1] == u16::from(b':'),
+        3 => {
+            normalized[1] == u16::from(b':')
+                && normalized[2] == back
+                && char::from_u32(u32::from(normalized[0]))
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+        }
+        _ => false,
+    };
+    if !is_root && normalized.last() == Some(&back) {
         normalized.pop();
     }
     normalized
@@ -14283,6 +14343,76 @@ pub(crate) fn file_normalise_path_units(path: &[u16]) -> Vec<u16> {
 mod file_normalise_tests {
     use super::file_normalise_path;
 
+    /// The Windows arm, against HotSpot 25.0.3+9 measured with
+    /// `probes/FilePathSweep.java`. Every row here was a DIFFERING line
+    /// before 2026-08-26: the arm collapsed no separator runs, and its
+    /// trailing-separator guard (`len() > 3`) protected short relative
+    /// paths as well as the drive root it was aimed at.
+    /// `File(String parent, String child)` with an EMPTY parent, and
+    /// `File.isAbsolute()` on a UNC root. Both were differing lines against
+    /// HotSpot 25.0.3+9 in `probes/FilePathSweep.java` before 2026-08-26.
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_parent_and_unc_absolute() {
+        use super::{file_is_absolute, file_join_parent_child_units};
+        let u = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let j = |a: &str, b: &str| -> String {
+            String::from_utf16_lossy(&file_join_parent_child_units(&u(a), &u(b)))
+        };
+        // empty parent is the DEFAULT parent, not 'no parent'
+        assert_eq!(j("", "kid"), "\\kid");
+        assert_eq!(j("", "/kid"), "\\kid");
+        // an ordinary parent still joins normally
+        assert_eq!(j("a", "kid"), "a\\kid");
+        assert_eq!(j("a/", "kid"), "a\\kid");
+        // an empty CHILD yields the normalised parent, unchanged by this fix
+        assert_eq!(j("a/", ""), "a");
+        // a ROOT parent keeps its separator instead of being stripped
+        assert_eq!(j("//", "kid"), "\\\\kid");
+        assert_eq!(j("///", "kid"), "\\\\kid");
+        assert_eq!(j("C:/", "kid"), "C:\\kid");
+        assert_eq!(j("/", "kid"), "\\kid");
+        assert_eq!(j("//server/share", "kid"), "\\\\server\\share\\kid");
+        // WinNTFileSystem.isAbsolute: UNC yes, drive-rooted yes,
+        // driveless-rooted no, drive-relative no
+        assert!(file_is_absolute("\\\\"));
+        assert!(file_is_absolute("\\\\server\\share"));
+        assert!(file_is_absolute("C:\\"));
+        assert!(file_is_absolute("C:\\x"));
+        assert!(!file_is_absolute("\\foo"));
+        assert!(!file_is_absolute("C:foo"));
+        assert!(!file_is_absolute("a\\b"));
+        assert!(!file_is_absolute(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_normalise_matches_winntfilesystem() {
+        // runs of separators collapse
+        assert_eq!(file_normalise_path("a//b"), "a\\b");
+        assert_eq!(file_normalise_path("a/./b"), "a\\.\\b");
+        assert_eq!(file_normalise_path("x///y//z"), "x\\y\\z");
+        // a trailing separator goes, at ANY length -- this is the `a/` bug
+        assert_eq!(file_normalise_path("a/"), "a");
+        assert_eq!(file_normalise_path("a\\\\"), "a");
+        assert_eq!(file_normalise_path("trailing/"), "trailing");
+        assert_eq!(file_normalise_path("a/b/"), "a\\b");
+        // ... but a ROOT keeps its separator and never becomes empty
+        assert_eq!(file_normalise_path("/"), "\\");
+        assert_eq!(file_normalise_path("C:/"), "C:\\");
+        assert_eq!(file_normalise_path("C:\\"), "C:\\");
+        // the UNC prefix survives as exactly two, and collapses beyond that
+        assert_eq!(file_normalise_path("//"), "\\\\");
+        assert_eq!(file_normalise_path("///"), "\\\\");
+        assert_eq!(file_normalise_path("//server/share"), "\\\\server\\share");
+        assert_eq!(file_normalise_path("////server//share"), "\\\\server\\share");
+        // the leading-slash-before-drive rule this function already had
+        assert_eq!(file_normalise_path("/C:/foo"), "C:\\foo");
+        // degenerate inputs
+        assert_eq!(file_normalise_path(""), "");
+        assert_eq!(file_normalise_path("a"), "a");
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn unix_normalise_matches_unixfilesystem() {
@@ -14310,6 +14440,42 @@ pub(crate) fn file_join_parent_child(parent: &str, child: &str) -> String {
 }
 
 /// [`file_join_parent_child`] in code units — the implementation of both.
+/// `java.io.File.isAbsolute()`, by the JDK's rule rather than Rust's.
+///
+/// `std::path::Path::is_absolute` is NOT the same predicate.
+/// `WinNTFileSystem.isAbsolute` is
+///
+/// ```text
+/// int pl = getPrefixLength();
+/// return ((pl == 2) && path.charAt(0) == slash) || (pl == 3);
+/// ```
+///
+/// i.e. a UNC path (prefix `\\`) is absolute and a bare drive-relative
+/// `C:foo` is not. Rust wants a prefix AND a root, so it answered FALSE for a
+/// UNC root -- `new File("//").isAbsolute()` was `false` against HotSpot's
+/// `true` (MEASURED: `probes/FilePathSweep.java`), which then fabricated a
+/// drive letter into `toURI()` (`file:/C://` against HotSpot `file:////`).
+///
+/// Deliberately NOT shared with `p57_win_is_absolute`, which serves
+/// `java.nio.file.Path`: the two classes genuinely disagree here, and
+/// `Path.isAbsolute` requires a root AND a drive.
+pub(crate) fn file_is_absolute(path: &str) -> bool {
+    let u: Vec<u16> = path.encode_utf16().collect();
+    if cfg!(windows) {
+        // prefix length 2, starting with a separator -> UNC
+        if u.len() >= 2 && u_is_sep(u[0]) && u_is_sep(u[1]) {
+            return true;
+        }
+        // prefix length 3 -> `X:` followed by a separator
+        u.len() >= 3
+            && char::from_u32(u32::from(u[0])).is_some_and(|c| c.is_ascii_alphabetic())
+            && u[1] == u16::from(b':')
+            && u_is_sep(u[2])
+    } else {
+        !u.is_empty() && u_is_sep(u[0])
+    }
+}
+
 pub(crate) fn file_join_parent_child_units(parent: &[u16], child: &[u16]) -> Vec<u16> {
     let mut cs = 0;
     let mut ce = child.len();
@@ -14324,14 +14490,35 @@ pub(crate) fn file_join_parent_child_units(parent: &[u16], child: &[u16]) -> Vec
         return file_normalise_path_units(parent);
     }
     if parent.is_empty() {
-        return file_normalise_path_units(child_trim);
+        // An EMPTY BUT NON-NULL parent is not "no parent". The JDK resolves
+        // `File(String parent, String child)` as
+        // `fs.resolve(fs.getDefaultParent(), fs.normalize(child))`, and
+        // `getDefaultParent()` is `\` on Windows and `/` on Unix -- so
+        // `new File("", "kid")` is `\kid`, ROOTED, not the relative `kid`
+        // this returned. (MEASURED against HotSpot 25.0.3+9,
+        // `probes/FilePathSweep.java`.) The `parent == null` case never reaches
+        // here: that is the one-argument constructor's overload.
+        let mut rooted: Vec<u16> = Vec::with_capacity(child_trim.len() + 1);
+        rooted.push(u16::from(if cfg!(windows) { b'\\' } else { b'/' }));
+        rooted.extend_from_slice(child_trim);
+        return file_normalise_path_units(&rooted);
     }
-    let mut pe = parent.len();
-    while pe > 0 && u_is_sep(parent[pe - 1]) {
-        pe -= 1;
+    // NORMALISE THE PARENT FIRST, then decide whether it needs a separator.
+    // Stripping the parent's trailing separators unconditionally destroys a
+    // ROOT: for parent `\\\\` (the UNC prefix) it stripped both and left
+    // nothing, so `new File("//", "kid")` came out `\\kid` where HotSpot says
+    // `\\\\kid` -- a network path demoted to a driveless-rooted one.
+    //
+    // A normalised path ends in a separator ONLY when it is a root (`\\`,
+    // `X:\\`, `\\\\`); `file_normalise_path_units` has just removed every
+    // other trailing separator. So "ends in a separator" IS the root test, and
+    // the rule is simply: append a separator unless the parent already supplies
+    // one. That also covers `C:\\` + `kid` -> `C:\\kid` rather than `C:\\\\kid`.
+    let parent_norm = file_normalise_path_units(parent);
+    let mut joined: Vec<u16> = parent_norm.clone();
+    if !parent_norm.last().is_some_and(|&c| u_is_sep(c)) {
+        joined.push(u16::from(b'/'));
     }
-    let mut joined: Vec<u16> = parent[..pe].to_vec();
-    joined.push(u16::from(b'/'));
     joined.extend_from_slice(child_trim);
     file_normalise_path_units(&joined)
 }
@@ -15371,8 +15558,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let abs = std::path::Path::new(&path).is_absolute();
-        Ok(Some(Value::Int(if abs { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(file_is_absolute(&path)))))
     });
 
     // --- Metadata (existence, type, permissions) ---

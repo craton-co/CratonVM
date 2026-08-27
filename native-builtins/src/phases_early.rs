@@ -5640,7 +5640,13 @@ fn enum_declaring_class_from_object(
     ctx: &mut dyn NativeContext,
     elem: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::ObjectRef> {
-    match ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]) {
+    // `elem` is a PARAMETER, which is exactly as unrooted as a local -- the
+    // blind spot recorded in the audit page. The fallback arm below runs AFTER
+    // `getDeclaringClass()` has already had its chance to collect and move it.
+    let elem_pin = ctx.pin_native_root(elem);
+    let declaring = ctx.invoke_virtual(elem, "getDeclaringClass", "()Ljava/lang/Class;", &[]);
+    let elem = ctx.read_native_pin(elem_pin, elem);
+    match declaring {
         Ok(Some(Value::Object(Some(class)))) => Some(class),
         _ => match ctx.invoke_virtual(elem, "getClass", "()Ljava/lang/Class;", &[]) {
             Ok(Some(Value::Object(Some(class)))) => Some(class),
@@ -15914,29 +15920,44 @@ pub(crate) fn drive_real_cipher(
         };
         let skpin = ctx.pin_native_root(secret_key);
 
-        // IvParameterSpec(iv)
-        let iv_arr = make_byte_array(ctx, iv_bytes);
-        let ivapin = ctx.pin_native_root(iv_arr);
-        let iv_arr_r = ctx.read_native_pin(ivapin, iv_arr);
-        let iv_spec = match ctx.new_object_initialized(
-            "javax/crypto/spec/IvParameterSpec",
-            "([B)V",
-            &[Value::Object(Some(iv_arr_r))],
-        )? {
-            Some(Value::Object(Some(o))) => o,
-            _ => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "IvParameterSpec construction failed".into(),
+        // IvParameterSpec(iv) — or NO parameters at all.
+        //
+        // ECB takes no IV, and SunJCE's own `engineInit` REFUSES one in that
+        // mode (`InvalidAlgorithmParameterException: ECB mode cannot use IV`).
+        // An empty `iv_bytes` is exactly the IV-less case: `auto_generated_iv_len`
+        // returns `None` for ECB and for the key-wrap/RSA/RC4 families, so
+        // nothing upstream minted one. Passing an EMPTY `IvParameterSpec` here
+        // is not the same as passing none, and it is what stopped
+        // `DESede/ECB/*` from being routable at all.
+        let iv_pinned = if iv_bytes.is_empty() {
+            None
+        } else {
+            let iv_arr = make_byte_array(ctx, iv_bytes);
+            let ivapin = ctx.pin_native_root(iv_arr);
+            let iv_arr_r = ctx.read_native_pin(ivapin, iv_arr);
+            let iv_spec = match ctx.new_object_initialized(
+                "javax/crypto/spec/IvParameterSpec",
+                "([B)V",
+                &[Value::Object(Some(iv_arr_r))],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "IvParameterSpec construction failed".into(),
+                    }
+                    .into())
                 }
-                .into())
-            }
+            };
+            Some((ctx.pin_native_root(iv_spec), iv_spec))
         };
-        let ivpin = ctx.pin_native_root(iv_spec);
 
         // engineInit(opmode, key, params, null)
         let spi_r = ctx.read_native_pin(pin, spi);
         let sk_r = ctx.read_native_pin(skpin, secret_key);
-        let iv_r = ctx.read_native_pin(ivpin, iv_spec);
+        let iv_value = match iv_pinned {
+            Some((ivpin, iv_spec)) => Value::Object(Some(ctx.read_native_pin(ivpin, iv_spec))),
+            None => Value::Object(None),
+        };
         ctx.invoke_virtual(
             spi_r,
             "engineInit",
@@ -15944,7 +15965,7 @@ pub(crate) fn drive_real_cipher(
             &[
                 Value::Int(opmode),
                 Value::Object(Some(sk_r)),
-                Value::Object(Some(iv_r)),
+                iv_value,
                 Value::Object(None),
             ],
         )?;

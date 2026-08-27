@@ -5098,11 +5098,15 @@ pub(crate) fn p72_inet_from_socket_address(
     ctx: &mut dyn NativeContext,
     socket_addr: ObjectRef,
 ) -> MethodCallResult {
+    // `socket_addr` is a parameter used by all three accessors below; each is
+    // real Java that can collect and move it.
+    let sa_pin = ctx.pin_native_root(socket_addr);
     if let Ok(Some(Value::Object(Some(addr)))) =
         ctx.invoke_virtual(socket_addr, "getAddress", "()Ljava/net/InetAddress;", &[])
     {
         return Ok(Some(Value::Object(Some(addr))));
     }
+    let socket_addr = ctx.read_native_pin(sa_pin, socket_addr);
 
     let host = match ctx.invoke_virtual(socket_addr, "getHostString", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),

@@ -183,6 +183,12 @@ correlation is a property of the *reader*, not of the collector's barriers.
 
 ## 2.2 The producer is still open, and the guard does not touch it
 
+> **WRONG — corrected in §2.7.1.** The producer was closed on 2026-08-22, before
+> this section was written; it was a wrong-KIND read (an array read through the
+> flat-object path), not a stale reference, and not a GC defect. This section is
+> left in place because it is what the guard's own comment said and the mistake
+> was to repeat it without checking.
+
 Worth stating plainly, because it is easy to misread the above as a fix:
 screening the read does **not** repair whatever writes two heap pointers into a
 16-byte cell. That producer — a live object reclaimed and its storage re-served —
@@ -224,6 +230,233 @@ dereferences as an `ObjectHeader` — a memory-safety hole `concurrent_mark.rs`'
 own comment already worried about for the *tearing* case while leaving the
 *invalid-tag* case open.
 
+## 2.5 §0.5 item 2 is ANSWERED for the concurrent marker: yes, via TOCTOU on the header
+
+§2.4 left item 2's audit question open — *can a G1/ZGC reader visit slot `n` of
+an object whose real slot count is below `n`?* For
+`concurrent_mark::scan_object` the answer is **yes**, and the route is not a
+missing bound but a second read of a racy header.
+
+The function does validate an extent. `concurrent_mark_object_size` reads a
+`ConcurrentMarkHeaderSnapshot`, cross-validates kind tag / element tag /
+gc-flag universe / size arithmetic, and returns
+`total_size = HEADER_SIZE + num_slots * SLOT_SIZE`; `scan_object` then requires
+
+```rust
+old_gen.contains(obj_ptr + total_size - 1)      // last byte is inside old-gen
+```
+
+and bails otherwise. That is a real check. **`total_size` is then never used
+again.** The slot loop re-read the header:
+
+```rust
+let num_slots = (header.num_slots() as usize).min(1 << 24);   // BEFORE
+for slot_idx in 0..num_slots { /* read a 16-byte Value */ }
+```
+
+So the count that was validated and the count that was walked are two separate
+loads of a header this very module treats as untrustworthy — the snapshot
+reader exists *because* a header can be torn or garbage, and
+`ConcurrentMarkHeaderSnapshot::read` deliberately uses unaligned per-field
+loads for that reason. Nothing makes the second load agree with the first. If
+it is the larger of the two, the loop reads slots beyond the bytes
+`old_gen.contains` approved, and `min(1 << 24)` does not help: it is a
+plausibility clamp with a reach of 16 M slots — 256 MB — not an extent.
+
+Fixed by inverting the arithmetic that was already validated, so the walk
+cannot outrun the checked bytes by construction:
+
+```rust
+let num_slots = total_size.saturating_sub(HEADER_SIZE) / SLOT_SIZE;   // AFTER
+```
+
+The `1 << 24` clamp is unchanged in effect — it is enforced inside
+`concurrent_mark_object_size`, which returns `None` for anything larger and so
+exits through the guard above. `cargo test -p cratonvm-gc --release`: **1687
+passed, 0 failed.**
+
+### What this does and does not settle
+
+It removes a mechanism by which the marker could read past an object and hand
+whatever it found to `read_value_cell_checked` — which, since §2.3, screens the
+discriminant, so the pairing is now "bounded read, screened decode" rather than
+"unbounded read, unchecked transmute". Those two changes are complementary and
+neither subsumes the other.
+
+It is **not** a demonstration that this is what produced the eight `hs_err`
+files. No reproduction exists (§1), the crashing binaries are gone (§0.4), and
+the faulting instruction is a multi-arm jump table that none of the sites
+touched here contains. It is one concrete answer to one of §0.5's audit
+questions, on one of the three readers.
+
+**Still unanswered from §0.5 item 2:** `g1::for_each_flat_object_reference`
+iterates `first_index..header.num_slots()` with no validation *in the function
+at all* — it is a helper that trusts its caller, and its callers have not been
+audited. That is the obvious next piece of the same audit, and it was left
+alone here rather than changed blind. The `0x5B == 91` constant in
+`rbx`/`r8`/`r13` also remains unexplained.
+
+> **CLOSED 2026-08-26.** All fifteen callers have now been audited, the helper
+> refuses an `Array` header outright, and its uncapped entry point is named
+> `for_each_flat_object_reference_trusting_header` so the fourteen that still
+> trust the count say so. See
+> `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+>
+> That work also found the reader THIS section's pass missed: the semi-space
+> collector (`gc/src/gc.rs`) had the identical validated-then-re-read TOCTOU in
+> three scan arms, with an unchecked `Value` transmute beside it. Both are fixed
+> with the identical fix — see §6 of that page. `0x5B == 91` is still
+> unexplained; §2.7.2 has the only candidate.
+
+## 2.6 §0.5 item 2, second reader: `g1` clamped the array walk and left the flat walk beside it unclamped
+
+§2.5 answered the audit question for the concurrent marker and left
+`g1::for_each_flat_object_reference` open, because it validates nothing itself
+and its 15 callers had not been read. They have been now, and one of them
+already contains the argument for the fix — applied to the wrong half.
+
+`record_outgoing_rset_edges` is hardened. It screens its seed with
+`candidate_header_is_plausible`, and then clamps the walk:
+
+```rust
+// `array_length` is a u32 bounded only by `i32::MAX`, so `HEADER_SIZE + len * 8`
+// is not implied to be inside the region by the header being plausible.
+let walkable_elements = /* holder_walkable_slots(..) */;
+```
+
+That reasoning is correct and it is **not array-specific**. `num_slots` is a
+header field of the same kind, bounded by nothing a plausible header
+guarantees, and the legacy walk strides `SLOT_SIZE` = 16 bytes — so it leaves
+the region **twice as fast** as the array path that was thought to need the
+clamp. The array branch got it; the `else` branch one screen below handed the
+object to the uncapped `for_each_flat_object_reference` and walked
+`0..header.num_slots()`.
+
+This is the reader in the crash this file records two dozen lines above:
+
+```
+collect_garbage -> retry_after_evacuation_failure -> record_outgoing_rset_edges
+  -> for_each_flat_object_reference   (faulting on a 4 MiB-aligned address
+                                       well past the committed arena)
+```
+
+The clamp existed, in the same function, guarding the sibling branch.
+
+### The fix
+
+* `holder_walkable_slots` computed `room = (end - addr - HEADER_SIZE) / 8` — a
+  hard-coded 8-byte stride, which is why it could not serve the flat walk at
+  all. It now takes a `stride`; its three existing call sites pass `8` and are
+  unchanged in behaviour.
+* `for_each_flat_object_reference_capped` bounds the legacy loop by
+  `max_slots`. The original entry point delegates with `usize::MAX`, so the
+  other **14** call sites are byte-for-byte identical — this deliberately does
+  not re-bound walks whose callers have not been audited.
+* `record_outgoing_rset_edges`'s `else` branch now derives its bound exactly as
+  its array sibling does, with `SLOT_SIZE` as the stride.
+
+`cargo test -p cratonvm-gc --release`: **1687 passed, 0 failed.**
+
+### Scope, stated honestly
+
+One caller of fifteen is now bounded — the one with a recorded crash. The other
+fourteen still walk on `header.num_slots()` alone, and most of them do not hold
+region geometry, so bounding them is a larger design question (what does a
+walker without a region do with an implausible count?) rather than a
+mechanical edit. They were left alone on purpose; `usize::MAX` through the
+delegating entry point makes that a *visible* default rather than an implicit
+one.
+
+> **2026-08-26.** That design question was answered. The delegating entry point
+> is now spelled `for_each_flat_object_reference_trusting_header` (grep for the
+> old name and you will find only this page's history), the shared body refuses
+> an `Array` header outright, and the fourteen stay uncapped as a written-down
+> decision rather than an omission —
+> `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+
+And as with §2.5: this is not a demonstration that this walk produced the eight
+`hs_err` files in this page's title. It is the fix for a *different*, recorded,
+crash that arrives through the same helper, plus the removal of one more way a
+G1 walk can read past an object.
+
+## 2.7 CORRECTION: the producer is FIXED, and `0x5B == 91` has a candidate
+
+Two of this page's standing open items move, and one of them corrects §2.2.
+
+### 2.7.1 §2.2 is wrong: the producer was closed on 2026-08-22
+
+§2.2 said the producer — whatever writes two heap pointers into a 16-byte
+`Value` cell — "is a separate, still-open defect". It is not open, and it was
+already closed when §2.2 was written; the section simply repeated
+`heap.rs`'s comment without checking.
+
+`internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`
+closed it, **and it is not a GC defect at all.** The VM-side half of the guard
+(`CRATONVM_DBG_CORRUPT_CELL`, which can see the Java frame the collector cannot)
+named the receiver in one run:
+
+```text
+obj=0x20040a803f8  slot_index=0
+raw0=0x0000020040775828  raw1=0x0000020040797b78
+receiver_class=java/lang/String   receiver_kind=Array   receiver_fields=2
+holder=frame#69 Metadata$MetadataItemCondition.withDefaultValue pc=36 local[1]
+```
+
+`receiver_kind=Array`. The 16 bytes were never a `Value` because they were never
+a *flat object's slot* — they were **array payload**, read through the
+flat-object path. The reference was not stale; the read was of the wrong kind.
+
+That also retires §0.4's remaining puzzle. §0.4 said the always-G1-or-ZGC
+pattern "is real and still needs explaining" and proposed a `Value` read unique
+to those collectors. §2.1 already showed the correlation is a property of the
+*reader* (Generational screened since HIB-CV-32, the others did not). With the
+producer identified as a kind confusion rather than anything collector-specific,
+there is nothing left for a collector-specific mechanism to explain.
+
+### 2.7.2 `0x5B == 91` — a candidate, from the same fact
+
+§0.5 item 2 noted `0x5B == 91` in `rbx`/`r8`/`r13` and called it "the right size
+for a slot index or field count". There is a specific reason a *wrong-kind* read
+produces exactly that:
+
+**`NUM_SLOTS_OFFSET == ARRAY_LENGTH_OFFSET == 4`** — they are the same `shape`
+dword, asserted in `types/src/heap_types.rs`
+(`the_shape_word_took_over_the_identity_hash_offset`).
+
+So when an array is read as a flat object, `header.num_slots()` does not return
+garbage. It returns the **array's length**. On the reading in §2.7.1 — an array
+misread as an object — a `num_slots` of 91 is an `array_length` of 91, and the
+walk then strides `SLOT_SIZE` (16) across payload whose real element stride is
+8, 2 or 1, running off the object at roughly twice to sixteen times the rate the
+header implies.
+
+**This is inference, not attribution.** No binary survives, so it cannot be
+confirmed against these files, and 91 could still be a field count or an
+unrelated index. What has changed is that `0x5B` is no longer unexplained: there
+is a documented mechanism that produces exactly a plausible mid-sized count from
+a header that was never a flat object's, and it is the same mechanism as the
+identified producer.
+
+### 2.7.3 What this page still owns
+
+* Not the producer (2.7.1), not the reader guards (§2.3), not the marker's
+  extent (§2.5), not the recorded `record_outgoing_rset_edges` crash (§2.6).
+* Still open: **these eight `hs_err` files have never been attributed.** Every
+  fix above is a mechanism removed, not this crash reproduced, and §0.4's
+  finding stands that symbolization is impossible without the binaries.
+* ~~Still open as a *design* matter, now with its own page: fourteen callers
+  of the flat walk remain unbounded.~~ **ANSWERED 2026-08-26** —
+  `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+  The census the note here described (`FLAT_WALK_GIVEN_ARRAY`, "counts and warns;
+  it deliberately does not refuse") rested on a premise that turned out to be
+  false — every one of the fifteen callers DOES pre-branch on kind — so the walk
+  now REFUSES an array header and counts the refusal (`FLAT_WALK_REFUSED_ARRAY`,
+  observed zero). The fourteen remain unbounded by decision, written down, and
+  visibly so at each call site.
+
+**This page is now close to retirable.** What holds it open is one honest gap —
+eight unattributed crash files — and not any known-live defect.
+
 ## 2.4 What is left for whoever reopens this
 
 1. The producer (§2.2) — the stale-receiver defect that puts two heap pointers
@@ -233,10 +466,14 @@ own comment already worried about for the *tearing* case while leaving the
    slot address and both raw words. §0.5 item 1 still stands and is still the
    single most valuable thing to do — **keep the binary next to the `hs_err`**.
 3. §0.5 item 2's audit question (can a G1/ZGC reader walk past an object's real
-   slot count?) is NOT answered by this section. The `num_slots` bound in
-   `concurrent_mark.rs` is still only a `min(1 << 24)` plausibility clamp, not a
-   real extent check, and `0x5B == 91` from the register dump remains
-   unexplained.
+   slot count?) is answered for the concurrent marker in **§2.5** — yes, by
+   TOCTOU on the header, now fixed — and in **§2.6** for `g1::for_each_flat_object_reference`'s
+   crash-path caller. Its other fourteen callers were audited on 2026-08-26 and
+   the question is closed for all of them, plus for the semi-space collector
+   this page's own pass had skipped:
+   `internal/fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`.
+   `0x5B == 91` has a candidate explanation in §2.7.2 (an array's length, read
+   through the `shape` dword that `num_slots` and `array_length` share).
 
 # 1. The 2026-08-21 not-reproducible investigation, preserved
 

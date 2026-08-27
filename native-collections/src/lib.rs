@@ -16140,6 +16140,12 @@ fn alloc_view_carrier(
         };
         return Ok(ctx.alloc_object(cid, n));
     }
+    // THE LAST-RESORT ARM, and the only surviving producer of a view whose
+    // class is exactly `java/util/ArrayList`. Announce it: `java/util/ArrayList`
+    // is on `real_protected_stub_class_common` precisely BECAUSE no view wears
+    // that class any more, and this arm is the one exception. Sticky — once a
+    // run has minted one, `ArrayList`'s natives win for the rest of it.
+    cratonvm_types::arraylist_view::note_arraylist_classed_view_minted();
     try_alloc_synthetic(ctx, "java/util/ArrayList", fallback)
 }
 
@@ -52432,6 +52438,25 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(None)
 }
 
+/// `Set.add` / `Set.addAll` on a MAP KEY-SET VIEW: always
+/// `UnsupportedOperationException`.
+///
+/// A keySet view has no value to associate with a new key, so the JDK's
+/// `AbstractCollection.add` default stands and every map's keySet refuses.
+/// CratonVM mirrors the `TreeSet` native surface onto
+/// `java/util/TreeMap$KeySet` because the view is a TreeSet-SHAPED object whose
+/// state lives in the same side-table -- correct for every method except this
+/// one pair, where the two contracts are opposites.
+fn native_view_add_unsupported(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Err(RuntimeError::UnsupportedOperationException {
+        message: "add is not supported on a key-set view".to_string(),
+    }
+    .into())
+}
+
 fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -54324,7 +54349,28 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)V",
             native_ts_init_collection,
         );
-        registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        // `add`/`addAll` are the ONE place the two carriers' contracts diverge,
+        // so they are the one place the surface must not be identical. A
+        // `TreeSet` may be added to; a `TreeMap$KeySet` is a VIEW and
+        // `Set.add` on it throws `UnsupportedOperationException` -- there is no
+        // mapping to invent a value for. Sharing `native_ts_add` let
+        // `treeMap.keySet().add("z")` SUCCEED, inserting a key into the view's
+        // side-table that the backing map never learned about (MEASURED against
+        // HotSpot 25.0.3+9, `probes/IoSystemSweep.java`, both modes).
+        //
+        // `remove` deliberately stays shared: removing THROUGH a keySet view is
+        // legal and writes through, which is exactly what `native_ts_remove`
+        // does over the shared side-table.
+        //
+        // This is the `CopyOnWriteArraySet`/`HashSet` shape recorded in
+        // `a-vm-collection-can-share-a-native-surface-with-the-opposite-contract`:
+        // a view class sharing a native surface with a class whose contract is
+        // the opposite on one method.
+        if c == "java/util/TreeMap$KeySet" {
+            registry.register(c, "add", "(Ljava/lang/Object;)Z", native_view_add_unsupported);
+        } else {
+            registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        }
         registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
         // Serialization: drive the stream from `ts_state` so a native TreeSet
         // round-trips byte-correct (the inherited real methods go through the
@@ -54425,7 +54471,19 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
             native_ts_sub_set_inclusive,
         );
-        registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        if c == "java/util/TreeMap$KeySet" {
+            // See the `add` note above: `addAll` on a keySet view is the same
+            // refusal, and the JDK reaches it through `AbstractCollection
+            // .addAll` calling `add`.
+            registry.register(
+                c,
+                "addAll",
+                "(Ljava/util/Collection;)Z",
+                native_view_add_unsupported,
+            );
+        } else {
+            registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        }
         registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
         // `spliterator()` for the same reason `stream()` is here: both classes
         // declare it, and the JDK body goes through `TreeMap.keySpliteratorFor`

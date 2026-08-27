@@ -10446,9 +10446,19 @@ pub fn register_essential_natives_with_shims(
         "getProperty",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
+            // `System.getProperty(null)` throws NPE; it does not answer null.
+            // Answering null turned a caller's programming error into a silent
+            // "property not set", which is the failure this whole override
+            // exists to avoid on the OTHER side. MEASURED against HotSpot
+            // 25.0.3+9, `probes/IoSystemSweep.java`, both modes.
             let key_obj = match args.first() {
                 Some(Value::Object(Some(k))) => *k,
-                _ => return Ok(Some(Value::Object(None))),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("key can't be null".to_string()),
+                    }
+                    .into())
+                }
             };
             let key = property_key_from_java_string(ctx, key_obj);
             match ctx
@@ -11543,9 +11553,33 @@ pub fn register_essential_natives_with_shims(
                 crate::lang_class::array_descriptor_for(ctx, this).replace('/', ".")
             } else {
                 let class_id = ctx.class_id_of_object(this);
-                ctx.class_name_of_id(class_id)
-                    .unwrap_or_default()
-                    .replace('/', ".")
+                // A LAMBDA receiver has no entry in the class store -- its
+                // identity lives in `lambda_proxies`, keyed by an id from the
+                // reserved `>= 0x8000_0000` range -- so `class_name_of_id`
+                // answers `None` here. `unwrap_or_default()` then rendered the
+                // EMPTY string and the whole class name vanished, silently:
+                //
+                //     HotSpot:  Probe$$Lambda/0x0000000086040210@7344699f
+                //     CratonVM: @4af
+                //
+                // and `Class.getName()` was right the whole time, which is what
+                // made it read as a formatting quirk rather than a missing case.
+                // Anything that prints a lambda -- string concat, `String.valueOf`,
+                // `println`, `%s`, a collection's own `toString` -- got a nameless
+                // object; Spring's `DefaultRetryPolicy.toString()` is how it
+                // surfaced (`core.retry.RetryPolicyTests.predicatesCombined`).
+                //
+                // `lambda_proxy_class_name` is the SAME helper the reflection
+                // name natives use, so `toString` and `getName` cannot drift.
+                // Its result is already dotted and carries a `/0x<id>` tail that
+                // the `/`->`.` rewrite below would corrupt, so it is used verbatim.
+                match crate::lang_class::lambda_proxy_class_name(ctx, class_id) {
+                    Some(lambda_name) => lambda_name,
+                    None => ctx
+                        .class_name_of_id(class_id)
+                        .unwrap_or_default()
+                        .replace('/', "."),
+                }
             };
             // JDK `Object.toString` is `getName() + "@" + Integer.toHexString(hashCode())`
             // where `hashCode()` is a VIRTUAL call. A receiver that overrides
@@ -13558,7 +13592,23 @@ pub fn register_essential_natives_with_shims(
             let Some(Value::Object(Some(this))) = args.first() else {
                 return Ok(None);
             };
-            let name = args.get(1).cloned().unwrap_or(Value::Object(None));
+            // `Thread.setName`'s first statement is
+            // `if (name == null) throw new NullPointerException("name cannot be
+            // null")`. Accepting the null was TWO defects, not one: the throw
+            // never happened, and the null was then written into `name`, so
+            // `getName()` answered null afterwards -- a Thread whose name is
+            // null is a state the JDK's own API cannot produce. MEASURED:
+            // `probes/ReflectBufferSweep.java`, the single difference in 316
+            // assertions across four families, in BOTH modes.
+            let name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => v.clone(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("name cannot be null".to_string()),
+                    }
+                    .into())
+                }
+            };
             if ctx.object_num_fields(*this) > 0 {
                 ctx.set_field(*this, 0, name.clone());
             }
@@ -26136,6 +26186,19 @@ fn object_to_string_dotted_name(
     }
     // Miss: derive the dotted form (single `replace` or `Arc::from` clone if
     // the name has no `/`) and insert under the write lock.
+    // Lambda proxies first, for the reason spelled out on the `Object.toString`
+    // closure above: they are absent from the class store, so the by-id lookup
+    // below cannot name them. `java/lang/Object.toString` is registered TWICE in
+    // this crate (here via `native_object_to_string`, and as a closure earlier in
+    // the file); whichever registrar runs last wins, and the two used to render an
+    // unknown class differently -- "?" here against "" there. Keeping the lambda
+    // case identical in both means the answer no longer depends on that order.
+    if let Some(lambda_name) = crate::lang_class::lambda_proxy_class_name(ctx, class_id) {
+        // Already dotted, and its `/0x<id>` tail must survive verbatim.
+        let arc: Arc<str> = Arc::from(lambda_name);
+        cache.write().insert(key, Arc::clone(&arc));
+        return arc;
+    }
     let slashed = ctx
         .class_name_of_id(class_id)
         .unwrap_or_else(|| "?".to_string());
@@ -35476,17 +35539,43 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 _ => {
                     // No receiver — still hand back a usable UTF-8 Charset
                     // rather than null so callers never NPE.
-                    let cs = charset_alloc(ctx, "UTF-8")?;
+                    let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
                     return Ok(Some(Value::Object(Some(cs))));
                 }
             };
             // Honour an already-set charset (e.g. a PrintStream constructed
-            // with an explicit charset, or one stamped by install_charset).
+            // with an explicit charset, or one stamped by install_charset) --
+            // but ONLY if it is concrete. `install_charset` runs at bootstrap,
+            // before `Charset.forName` is safe to call, so it stamps a
+            // hand-allocated `java/nio/charset/Charset`, and that class is
+            // ABSTRACT: `newEncoder()` on it has no `Code` attribute. Returning
+            // it here is what made `new OutputStreamWriter(System.err)` die with
+            // `AbstractMethodError` (MEASURED: `probes/PrintStreamCharset.java`,
+            // System.out and System.err in BOTH modes). Repair it instead --
+            // this accessor runs lazily, long after bootstrap, so asking the
+            // real `Charset.forName` is safe HERE even though it is not there.
             if let Value::Object(Some(cs)) = ctx.get_field_by_name(this, "charset") {
-                return Ok(Some(Value::Object(Some(cs))));
+                let cid = ctx.class_id_of_object(cs);
+                if !matches!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some("java/nio/charset/Charset")
+                ) {
+                    return Ok(Some(Value::Object(Some(cs))));
+                }
+                // Abstract stand-in: replace it, and write the repair back so
+                // the direct `getfield charset` that real `PrintStream` bytecode
+                // performs sees the concrete one too.
+                let fixed = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+                ctx.set_field_by_name(this, "charset", Value::Object(Some(fixed)));
+                return Ok(Some(Value::Object(Some(fixed))));
             }
-            // Field missing or null: synthesize UTF-8 and write it back.
-            let cs = charset_alloc(ctx, "UTF-8")?;
+            // Field missing or null: resolve UTF-8 and write it back. This must
+            // be a CONCRETE charset: the caller's next move is almost always
+            // `new OutputStreamWriter(this)`, which asks a `PrintStream` for its
+            // charset and then calls `newEncoder()` on it — abstract on the
+            // fabricated base, so a stand-in here trades the NPE this override
+            // exists to prevent for an `AbstractMethodError` one call later.
+            let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
             ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
             Ok(Some(Value::Object(Some(cs))))
         },
@@ -35662,6 +35751,51 @@ pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
     register_charset_natives(registry);
     register_tomcat_jni_natives(registry);
     register_netty_internal_tcnative_natives(registry);
+}
+
+/// A **concrete** `Charset` for `name`, preferring the real JDK's own.
+///
+/// [`charset_alloc`] fabricates `java/nio/charset/Charset` itself, which is
+/// ABSTRACT — so `newEncoder()`/`newDecoder()` on the result have no `Code`
+/// attribute and every caller that encodes dies with `AbstractMethodError`.
+/// That is the same class-is-abstract trap `panama::CRATON_SEGMENT_CLASS` and
+/// `CRATON_BUFFER_POOL_CLASS` are named for.
+///
+/// MEASURED 2026-08-25, `probes/PrintStreamCharset.java`, before this helper:
+///
+/// ```text
+///   System.out.charset()             -> java.nio.charset.Charset   [abstract]
+///   System.out.charset().newEncoder()-> AbstractMethodError
+///   new PrintStream(baos,true,"UTF-8").charset() -> sun.nio.cs.UTF_8   [ok]
+/// ```
+///
+/// The explicit-charset constructor was already right, which is the tell: the
+/// real `Charset.forName` returns a concrete `sun.nio.cs.*` on a real image, so
+/// there is a good answer available and the fabrication was reaching for it
+/// unnecessarily. Ask the JDK first; fall back to the stand-in only when there
+/// is no real class library to ask (a synthetic-JDK image), where an abstract
+/// carrier is still better than a null.
+fn charset_concrete_or_synthetic(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arg = ctx.create_string(name);
+    if let Ok(Some(Value::Object(Some(cs)))) = ctx.invoke(
+        "java/nio/charset/Charset",
+        "forName",
+        "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        &[Value::Object(Some(arg))],
+    ) {
+        // Only accept it if it is NOT the abstract base — `Charset.forName` is
+        // itself shimmed by `native_charset_for_name`, which calls
+        // `charset_alloc`, so a bare `java/nio/charset/Charset` coming back here
+        // means the shim answered and we have gained nothing.
+        let cid = ctx.class_id_of_object(cs);
+        if !matches!(ctx.class_name_of_id(cid).as_deref(), Some("java/nio/charset/Charset")) {
+            return Ok(cs);
+        }
+    }
+    charset_alloc(ctx, name)
 }
 
 fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {

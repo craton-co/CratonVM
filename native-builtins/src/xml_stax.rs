@@ -1234,17 +1234,23 @@ fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) 
     if depth > 256 {
         return String::new();
     }
+    // `node` is a parameter read by every arm below, and each intervening call
+    // is real DOM Java that can collect. Pin once; re-derive before each use.
+    let node_pin = ctx.pin_native_root(node);
     let ntype = match ctx.invoke_virtual(node, "getNodeType", "()S", &[]) {
         Ok(Some(v)) => v.as_int().unwrap_or(0),
         _ => 0,
     };
+    let node = ctx.read_native_pin(node_pin, node);
     match ntype {
         1 => {
             // ELEMENT
             let mut tag = dom_str(ctx, node, "getTagName");
+            let node = ctx.read_native_pin(node_pin, node);
             if tag.is_empty() {
                 tag = dom_str(ctx, node, "getNodeName");
             }
+            let node = ctx.read_native_pin(node_pin, node);
             if tag.is_empty() {
                 return String::new();
             }
@@ -1300,15 +1306,23 @@ fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) 
             out
         }
         // TEXT / CDATA
-        3 | 4 => xml_escape_text(&dom_str(ctx, node, "getNodeValue")),
+        3 | 4 => {
+            let node = ctx.read_native_pin(node_pin, node);
+            xml_escape_text(&dom_str(ctx, node, "getNodeValue"))
+        }
         // DOCUMENT: serialize element children
         9 => {
             let mut out = String::new();
+            let node = ctx.read_native_pin(node_pin, node);
             if let Ok(Some(Value::Object(Some(nl)))) =
                 ctx.invoke_virtual(node, "getChildNodes", "()Lorg/w3c/dom/NodeList;", &[])
             {
+                // `nl` is held across `getLength` and every `item(i)`.
+                let nl_pin = ctx.pin_native_root(nl);
                 let cn = dom_int(ctx, nl, "getLength");
+                let mut nl = nl;
                 for i in 0..cn {
+                    nl = ctx.read_native_pin(nl_pin, nl);
                     if let Ok(Some(Value::Object(Some(child)))) =
                         ctx.invoke_virtual(nl, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
                     {

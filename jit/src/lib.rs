@@ -8761,6 +8761,14 @@ pub enum JitIntrinsic {
     //
     // Variant ordering within this region is local and not externally observed.
     AtomicIntGetAndIncrement,  // getAndIncrement()I  -> old
+    /// `get()I` / `getPlain()I` / `getAcquire()I` -- a plain aligned load.
+    ///
+    /// On x86-64 TSO an ordinary `MOV` IS a correct volatile/acquire load:
+    /// loads are not reordered with older loads, so no fence is owed. The
+    /// weaker two are no stronger than `get`, so one emitter arm serves all
+    /// three. (`set` is deliberately NOT here: a volatile STORE owes
+    /// StoreLoad, which is an `XCHG`/`MFENCE`, not a `MOV`.)
+    AtomicIntGet,
     AtomicIntGetAndDecrement,  // getAndDecrement()I  -> old
     AtomicIntIncrementAndGet,  // incrementAndGet()I  -> old + 1
     AtomicIntDecrementAndGet,  // decrementAndGet()I  -> old - 1
@@ -10961,6 +10969,9 @@ pub fn try_resolve_atomic_intrinsic(
     }
     // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
     let hit: Option<(JitIntrinsic, usize)> = match (name, descriptor) {
+        ("get", "()I") => Some((JitIntrinsic::AtomicIntGet, 0)),
+        ("getPlain", "()I") => Some((JitIntrinsic::AtomicIntGet, 0)),
+        ("getAcquire", "()I") => Some((JitIntrinsic::AtomicIntGet, 0)),
         ("getAndIncrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndIncrement, 0)),
         ("getAndDecrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndDecrement, 0)),
         ("incrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntIncrementAndGet, 0)),
@@ -10984,6 +10995,71 @@ pub fn try_resolve_atomic_intrinsic(
         );
     }
     Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+}
+
+#[cfg(test)]
+mod atomic_accessor_intrinsic_tests {
+    use super::*;
+
+    /// The emitter dispatches on `callee_entry == JitIntrinsic::X.as_entry()`,
+    /// so two variants sharing an entry value would silently mis-emit one as
+    /// the other — a `LOCK XADD` where a `MOV` belongs, or the reverse.
+    /// `as_entry` is `usize::MAX - (self as usize)`, which is injective only
+    /// while the discriminants are, and adding a variant in the middle of the
+    /// enum is exactly when that stops being obvious.
+    #[test]
+    fn every_atomic_int_intrinsic_has_a_distinct_entry() {
+        let entries = [
+            JitIntrinsic::AtomicIntGet.as_entry(),
+            JitIntrinsic::AtomicIntGetAndIncrement.as_entry(),
+            JitIntrinsic::AtomicIntGetAndDecrement.as_entry(),
+            JitIntrinsic::AtomicIntIncrementAndGet.as_entry(),
+            JitIntrinsic::AtomicIntDecrementAndGet.as_entry(),
+            JitIntrinsic::AtomicIntGetAndAdd.as_entry(),
+            JitIntrinsic::AtomicIntAddAndGet.as_entry(),
+        ];
+        let mut sorted = entries.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            entries.len(),
+            "two AtomicInteger intrinsics share an `as_entry` value; the codegen \
+             tells them apart by that number alone"
+        );
+    }
+
+    /// `get`, `getPlain` and `getAcquire` must all map to the SAME intrinsic,
+    /// because ONE emitter arm serves them: on x86-64 TSO a plain `MOV` is a
+    /// correct load for all three (loads are not reordered with older loads),
+    /// and the two weaker forms are no stronger than `get`.
+    ///
+    /// A source witness rather than a call to `try_resolve_atomic_intrinsic`,
+    /// whose other half -- `AtomicIntFieldLayout::new` -- needs a registered
+    /// class layout that a unit test has no heap to provide.
+    #[test]
+    fn the_three_plain_accessors_share_one_intrinsic() {
+        let src = include_str!("lib.rs");
+        for name in ["get", "getPlain", "getAcquire"] {
+            let row = format!("(\"{name}\", \"()I\") => Some((JitIntrinsic::AtomicIntGet, 0)),");
+            assert!(
+                src.contains(&row),
+                "`{name}` is not mapped to AtomicIntGet. A plain accessor that                  falls out of that table goes back to the registered native,                  which measured 317-431 ns/op against 0.9 for the intrinsic."
+            );
+        }
+    }
+
+    /// `set` must NOT ride this arm. A volatile STORE owes StoreLoad ordering,
+    /// which is an `XCHG` or an `MFENCE`; emitting the plain `MOV` the load arm
+    /// uses would be a memory-model bug no single-threaded test can see.
+    #[test]
+    fn set_does_not_ride_the_load_arm() {
+        let src = include_str!("lib.rs");
+        assert!(
+            !src.contains("(\"set\", \"(I)V\") => Some((JitIntrinsic::AtomicIntGet"),
+            "`set` was mapped onto the LOAD intrinsic. If intrinsifying it is              deliberate it needs its own arm with StoreLoad ordering."
+        );
+    }
 }
 
 /// Speculate a `java/lang/String` receiver at a `java/lang/CharSequence`-declared
@@ -15160,6 +15236,31 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
     }
 }
 
+/// Record why a compile was refused BEFORE the jit crate was ever entered.
+///
+/// The jit crate's own refusals already reach the stats table: every exit in
+/// `try_compile_with_invokespecial_resolver` funnels through
+/// `take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0))`, so even
+/// a siteless bail names the stage. The VM-side pipeline has no such funnel —
+/// `try_jit_compile_callee_slow` has NINE `return None` exits, none of which
+/// record anything, and a method refused at one of them is retried three times
+/// by the background worker and then retired as
+/// `compile-failed reason=unrecorded`.
+///
+/// That label is worse than no label: `compile-failed` says the compiler was
+/// asked and refused, which sends the reader into the backend, when the truth
+/// may be that the backend was never reached. Measured on
+/// `HibfixComposeProbe2`: `CompletableFuture$UniCompose.tryFire` (97 716
+/// invocations) and `UniRelay.tryFire` (58 612) both retired this way, and they
+/// ARE `CompletableFuture` composition.
+pub fn record_compile_refusal(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    why: &'static str,
+) {
+    record_jit_bail_reason(class_name, method_name, descriptor, (why, 0, 0));
+}
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()

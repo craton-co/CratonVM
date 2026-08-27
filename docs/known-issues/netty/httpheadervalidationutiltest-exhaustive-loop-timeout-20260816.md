@@ -143,6 +143,20 @@ still actionable here:
    of them works, and the budget for the whole iteration is 21. This is
    [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)'s
    subject, not this page's.
+
+   **Narrowed 2026-08-26, and measured NOT to help this class.** The 14-store
+   full-GPR blind spill `emit_pre_safepoint_spill` emits at every GC-capable
+   call is now elided where the caller frame is provably oop-clean
+   (`CRATONVM_JIT_CALL_SPILL_ELISION`, default on), which is worth **1.4-2.2x
+   on every shape of compiled call** in `CallArgCostProbe`. On THIS class it
+   does nothing — three interleaved rounds each, quiet host, `652-685` vs
+   `684-718` ns/iter on the value loop — and the counter says why in one line:
+   `elided=1 ... ref-local-in-reg=116`, every refusal the same clause. A frame
+   that keeps a receiver in a register-homed local cannot use the elision, and
+   the next lever is to NARROW the spill to the registers that can hold an oop
+   rather than to elide it. See
+   [`../perf/per-call-blind-gpr-spill-20260826.md`](../perf/per-call-blind-gpr-spill-20260826.md).
+
 5. **The inline chain does not reach this loop, and cannot.**
    `compile_osr_artifact` hands the backend an EMPTY `inline_sites` map, so an
    OSR artifact splices nothing — ever — and a `@Test` body invoked once has no

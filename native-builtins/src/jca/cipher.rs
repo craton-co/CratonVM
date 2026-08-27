@@ -1634,25 +1634,50 @@ fn classify_transformation(transformation: &str) -> TransformVerdict {
             (None, None) => TransformVerdict::Serviceable(family),
             _ => TransformVerdict::NoSuchAlgorithm,
         },
-        // CBC only, and the mode must be SPELLED. `cipher_do_final_impl`'s
-        // route table hardcodes `"CBC"` for this family whatever the caller
-        // wrote, so admitting `DESede/ECB/PKCS5Padding` would serve CBC under
-        // an ECB name — the mode-substitution twin of the algorithm
-        // substitution this lane is fixing. The bare `DESede` form defaults to
-        // ECB on SunJCE and is refused here for exactly that reason.
-        CipherFamily::DesFamily => {
-            let (Some(m), Some(p)) = (mode_u.as_deref(), pad_u.as_deref()) else {
-                return TransformVerdict::NoSuchAlgorithm;
-            };
-            if m != "CBC" {
-                return TransformVerdict::NoSuchAlgorithm;
+        // CBC and ECB, and the route table below is widened in the same change
+        // — which is the condition the previous version of this arm set.
+        //
+        // It admitted CBC only, and said why: the route table hardcoded `"CBC"`
+        // for this family whatever the caller wrote, so admitting an ECB name
+        // would have served CBC under it. That reasoning was right, and the
+        // answer it chose (refuse) was right while the route was fixed. Both
+        // move together here: `cipher_do_final_impl` now forwards the parsed
+        // mode to `engineSetMode`, so ECB is served BY ECB.
+        //
+        // MEASURED on HotSpot 25, SunJCE, one 8-byte block under a fixed
+        // 24-byte key:
+        //
+        // ```text
+        // DESede                    ct=61db204ee34fb78a8f45b5be23f16c4e  iv=none
+        // DESede/ECB/PKCS5Padding   ct=61db204ee34fb78a8f45b5be23f16c4e  iv=none
+        // DESede/ECB/NoPadding      ct=61db204ee34fb78a
+        // DESede/CBC/PKCS5Padding   ct=61db204ee34fb78a942288836d960969  iv=0*8
+        // ```
+        //
+        // The algorithm-only form is byte-identical to ECB/PKCS5Padding, which
+        // is what makes `(None, None)` admissible: `parse_transformation`
+        // already defaults an unspelled mode to ECB, so the bare name reaches
+        // the route as ECB without a special case. `auto_generated_iv_len`
+        // returns `None` for ECB, so no IV is minted and `getIV()` stays null
+        // as HotSpot's does.
+        //
+        // One token spelled and not the other is NOT admitted: that form was
+        // not measured, and an unmeasured verdict is how a wrong answer gets
+        // in. Same reason `AES_128/KWP/...` is asserted neither way.
+        CipherFamily::DesFamily => match (mode_u.as_deref(), pad_u.as_deref()) {
+            (None, None) => TransformVerdict::Serviceable(family),
+            (Some(m), Some(p)) => {
+                if m != "CBC" && m != "ECB" {
+                    return TransformVerdict::NoSuchAlgorithm;
+                }
+                if p == "NOPADDING" || p == "PKCS5PADDING" {
+                    TransformVerdict::Serviceable(family)
+                } else {
+                    TransformVerdict::NoSuchPadding(named_padding)
+                }
             }
-            if p == "NOPADDING" || p == "PKCS5PADDING" {
-                TransformVerdict::Serviceable(family)
-            } else {
-                TransformVerdict::NoSuchPadding(named_padding)
-            }
-        }
+            _ => TransformVerdict::NoSuchAlgorithm,
+        },
         // `RSACipher.engineSetMode` (JDK 25 source) is
         // `if (!mode.equalsIgnoreCase("ECB")) throw new NoSuchAlgorithmException`,
         // so ECB — or the algorithm-only form, which defaults to it — is the
@@ -2044,12 +2069,38 @@ const SPI_INIT_PLAIN: &str = "(ILjava/security/Key;Ljava/security/SecureRandom;)
 /// the transformation, and only when it CANNOT does the named provider get a
 /// turn; if that provider does not own the service either, the original
 /// refusal is raised unchanged.
+/// Resolve an ALIAS spelling onto the transformation the provider's own table
+/// names, before `classify_transformation` ever sees it.
+///
+/// Seeding `Alg.Alias.Cipher.<oid>` is necessary and not sufficient. The alias
+/// table gets a caller past `check_provider_ownership`, which reads
+/// `get_service_entry`; this engine then decides what it can COMPUTE from the
+/// transformation STRING, and `2.16.840.1.101.3.4.1.42` does not parse as
+/// `AES_256/CBC/NoPadding` however many registry rows point at it.
+///
+/// MEASURED: with the 264 measured alias rows seeded and nothing else, 212 of
+/// them resolved and 52 did not — 43 Cipher, 6 KeyAgreement, 3 KEM. Those are
+/// exactly the engines that gate on a hand-written name table without asking
+/// the registry first, which is what this closes for Cipher.
+///
+/// Returns `None` when the name is already one this engine recognises, so a
+/// spelled-out transformation never takes a registry lookup.
+fn canonical_transformation(provider: Option<&str>, algo: &str) -> Option<String> {
+    crate::jca::provider_chain::canonical_if_unrecognised(provider, "Cipher", algo, &|name| {
+        !matches!(classify_transformation(name), TransformVerdict::NoSuchAlgorithm)
+    })
+}
+
 fn cipher_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     algo_str: &str,
 ) -> MethodCallResult {
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
+    // An alias spelling becomes the transformation it names here, once,
+    // ahead of every reader below. See `canonical_transformation`.
+    let canonical = canonical_transformation(requested_provider.as_deref(), algo_str);
+    let algo_str: &str = canonical.as_deref().unwrap_or(algo_str);
     if let Some(provider) = requested_provider.as_deref() {
         // Asked about EVERY name the transformation may be registered under,
         // not just the bare algorithm: a provider may own only the fuller form
@@ -3713,16 +3764,29 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "OFB") => {
                     Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB"))
                 }
-                // These two hardcode `"CBC"` whatever the caller wrote, which
-                // is sound ONLY because `classify_transformation` admits no
-                // other mode for this family. Widening the admission table
-                // without widening this line would serve CBC under another
-                // mode's name — the same substitution, one field over.
-                (Some(CipherFamily::DesFamily), _) if cn.eq_ignore_ascii_case("DES") => {
+                // These used to hardcode `"CBC"` whatever the caller wrote,
+                // sound only because `classify_transformation` admitted no
+                // other mode for this family, and carrying a note that
+                // widening the admission table without widening this line
+                // would serve CBC under another mode's name. The admission
+                // table is widened to ECB in the same change, so this line is
+                // widened with it: the mode is MATCHED here rather than
+                // assumed, and every arm names the mode it forwards.
+                //
+                // No wildcard arm: a mode this match does not name falls to
+                // `_ => None` and takes the no-route path, so the pairing
+                // cannot silently drift again.
+                (Some(CipherFamily::DesFamily), "CBC") if cn.eq_ignore_ascii_case("DES") => {
                     Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC"))
                 }
-                (Some(CipherFamily::DesFamily), _) => {
+                (Some(CipherFamily::DesFamily), "ECB") if cn.eq_ignore_ascii_case("DES") => {
+                    Some(("com/sun/crypto/provider/DESCipher", "DES", "ECB"))
+                }
+                (Some(CipherFamily::DesFamily), "CBC") => {
                     Some(("com/sun/crypto/provider/DESedeCipher", "DESede", "CBC"))
+                }
+                (Some(CipherFamily::DesFamily), "ECB") => {
+                    Some(("com/sun/crypto/provider/DESedeCipher", "DESede", "ECB"))
                 }
                 _ => None,
             }
@@ -4558,6 +4622,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
+            // The anonymous overload resolves aliases too, against the
+            // chain rather than one named provider.
+            let algo_str = canonical_transformation(None, &algo_str).unwrap_or(algo_str);
             match check_transformation_supported(ctx, &algo_str, GetInstanceForm::Anonymous) {
                 Ok(_) => {
                     // This engine can compute the transformation, but the
@@ -6480,8 +6547,33 @@ mod tests {
             "AES/PCBC/PKCS5Padding",
             "AES/CFB8/NoPadding",
             "AES/CCM/NoPadding",
-            "DESede/ECB/PKCS5Padding",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
+        }
+        // `DESede` and `DESede/ECB/PKCS5Padding` were on this list until
+        // 2026-08-27 and are now COMPUTED, by the same rule that put
+        // `AES/KWP/NoPadding` on the other side: the admission table and
+        // `cipher_do_final_impl`'s route were widened together, so ECB is
+        // served by ECB rather than by CBC under an ECB name. Asserted here
+        // rather than only below, so whoever reads this list sees the move.
+        for t in [
             "DESede",
+            "DESede/ECB/PKCS5Padding",
+            "DESede/ECB/NoPadding",
+            "DESede/CBC/PKCS5Padding",
+        ] {
+            assert!(
+                transformation_is_serviceable(t),
+                "{t} must be served at getInstance"
+            );
+        }
+        // Still refused, and these are the forms that were NOT measured or
+        // that name a mode with no route: one token spelled and not the other,
+        // and any mode outside {CBC, ECB}.
+        for t in [
+            "DESede/CFB/PKCS5Padding",
+            "DESede/OFB/PKCS5Padding",
+            "DESede/CTR/NoPadding",
         ] {
             assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
         }

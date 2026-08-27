@@ -13,11 +13,13 @@ neither explained, neither with a rate. Since then:
   promise, or a selector defect.** The server's TLS handshake dies on a
   `NoSuchMethodError` naming **`java.lang.Object`** as the receiver class, so
   no alert is produced and the thing that would complete the promise never
-  runs. The root cause is one line of `jni.rs`: **a JNI LOCAL ref is a raw
-  heap pointer**, so a handle netty-tcnative holds across a G1 evacuation
-  comes back naming from-space, and an evacuated header reads as `ClassId(0)`
-  — which is `java.lang.Object`. Two candidate fixes are costed below;
-  neither is a tail-of-session change and this page stays OPEN for them;
+  runs. **A third catch, with the tracer armed, measures where the receiver
+  goes stale — and it is NOT the JNI local-ref path this page asserted on
+  2026-08-24. That claim is WITHDRAWN; see "The measured stale receiver"
+  below.** The receiver reaches virtual dispatch naming an address the
+  collector moved out from under it, `class_id_of` reads a dead base,
+  `ClassId(0)` is `java.lang.Object`, and the dispatch raises
+  `NoSuchMethodError`;
 * a SECOND reproduction, on the same netty frame, is a different failure — a
   reactor that never returns from the tcnative `SSL_write` native at all,
   with the VM's own "STW … still waiting for cooperative mutators
@@ -55,7 +57,10 @@ Every link after the first is conditional on the first.
 
 Here the trust-manager call never reaches the test's `checkClientTrusted` at
 all: dispatch resolves the receiver's class as **`java.lang.Object`** and
-raises `NoSuchMethodError`. That is a `LinkageError`, not the
+raises `NoSuchMethodError`. **One of its three known producers is now named
+and fixed** (`native_properties_equals`, an unpinned native local); the other
+two are not, and this page says which is which rather than generalising from
+the one that was solved. That is a `LinkageError`, not the
 `CertificateException` the engine is prepared to convert, so **no alert is
 produced** — the server just closes. The client sees a plain close, its
 `exceptionCaught` never fires, `promise.trySuccess(null)` is never reached,
@@ -108,68 +113,397 @@ exactly this and stops on the first catch:
 
 Both are terminal-path only, so a healthy run pays nothing for them.
 
-## Root cause of the alert-test face: a JNI LOCAL REF is a raw heap pointer
+## The measured stale receiver — and the claim this page withdraws
 
-`vm/src/native/jni.rs::jobject_to_obj` splits on the handle's low bit:
+**WITHDRAWN, 2026-08-25.** An earlier revision of this page asserted the root
+cause was `jni.rs::jobject_to_obj` handing back a stale LOCAL ref (it resolves
+a global ref through a locked table and a local ref as *"a raw heap pointer"*,
+and its own comment says such a ref can be stale from-space under a moving
+collector). That is a true property of the code and it remains worth fixing,
+but it was derived by READING the source, not by measuring, and the next catch
+does not support it as the cause of this stall.
 
-* a **global** ref resolves through `natives.jni_global_refs`, a locked table;
-* a **local** ref is *"a raw heap pointer"* — the function's own words — and is
-  validated with `heap.is_heap_addr` and nothing else.
+**What the next catch actually measured.** `hunt5` run 233, whole class,
+`CRATONVM_DBG_CCE_BT=1` and `CRATONVM_DBG_VACATED_FRAMES=1` armed. Same
+`NoSuchMethodError java/lang/Object.…` signature, a different method:
 
-Its own comment already names the consequence: *"a local ref held across a GC
-safepoint could be a stale from-space pointer under the moving/generational
-collector."* `is_heap_addr` does not catch that: a from-space address in a
-region the collector has not yet reused is a perfectly valid heap address.
+```
+NoSuchMethodError method="java/lang/Object.address()J"
+  caller="io/netty/util/internal/CleanerJava25.allocate(I)… @pc=11"
 
-`jni_call_instance` then does, in order:
-
-```rust
-let oref = jobject_to_obj(obj)?;                       // may be from-space
-let obj_class_id = shared.mem.heap.class_id_of(oref);  // reads a vacated header
+CCE-BT-STK[21] io/netty/util/internal/CleanerJava25.allocate            pc=11
+CCE-BT-STK[20] io/netty/util/internal/PlatformDependent.allocateDirect  pc=40
 …
-invoke_on_class_shared(shared, thread, obj_class_id, &method_name, …)
+CCE-BT-STK[7]  io/netty/buffer/AbstractByteBufAllocator.directBuffer    pc=7
+
+NSME-RECV addr=0x20084404c50 tid=1847 blocked=false epoch=11
+NSME-RECV SHAPE kind=Object num_fields=6 mirror_of=<not a registered mirror>
+          [0]=Long(2202733641728) [1]=Long(131072) [2]=Object(…) [3]=Int(0)
 ```
 
-An evacuated object's from-copy reads back an all-zero header, and the class
-manager names `ClassId(0)` **`java.lang.Object`**. The dispatch terminal has a
-retarget for a receiver that moved *during* the lookup, and it deliberately
-excludes `ClassId::new(0)` — correctly, since retargeting to `Object` would be
-worse — so a stale local ref falls straight through to
-`NoSuchMethodError java/lang/Object.<method>`.
+Not a TLS path at all — netty's `CleanerJava25` calling `MemorySegment.address()`
+on the FFM allocation path, through a MethodHandle. The receiver's fields are
+a plausible `MemorySegment` (a base address, a 131 072-byte length, a scope),
+so this is the intended object read at a dead address, not junk.
 
-Which is the line the reproduction opens with.
+And the collector says so itself, on the same address, twice:
 
-This is the same shape, at the JNI boundary, that
-`known-issues/gc/unpinned-native-locals-audit-20260824.md` audits inside
-`native-builtins`: *"the caller's operand slot is a root and gets remapped; the
-native's copy is not… the next read sees an all-zero header — which the class
-manager names `java.lang.Object`."* That page fixed eight in-tree natives with
-`pin_native_root` / `read_native_pin` and names 34 more candidates. **A handle
-handed out to a foreign `.so` cannot be fixed that way** — netty-tcnative holds
-the reference, not this VM — so the JNI local-ref path needs its own answer,
-and this is an independent witness of that family reaching it.
+```
+ERROR cratonvm::gc::guard: a dereference of an address that is NOT a live
+  object base was swallowed into a default …
+  site="kind_of" obj="0x20084404c50" moved_to="0x200849c12d0" was_vacated=true
+```
 
-### Two candidate fixes, with what each costs
+`was_vacated` is the exact ledger — `gc_quiescence::note_allocated` removes
+re-issued addresses, so a hit is proof rather than suspicion. The object was
+moved to `0x200849c12d0` and the holder was never repaired.
 
-1. **Table-backed local refs.** Give local refs the treatment global refs
-   already have: a per-thread frame of slots the collector scans and REMAPS,
-   `obj_to_jobject` allocating a slot, `jobject_to_obj` resolving through it,
-   `DeleteLocalRef`/`PopLocalFrame` freeing. This is what the JNI spec
-   describes and what a real `libjvm` does, and the global-ref table is the
-   model to copy. It touches every JNI entry point and every handle producer.
+### Why the read barrier did not save it
 
-2. **Pin on hand-out.** `obj_to_jobject` takes a native pin for the life of the
-   current native call, so the raw address it returns cannot go stale because
-   the object cannot move. Much smaller, and it reuses machinery this tree
-   already has — but it costs a pin per handle created, on a path that is hot
-   for JNI-heavy workloads, and pinning perturbs evacuation.
+`VmHeap::load_and_forward` is the software read barrier, and `invoke_virtual`
+calls it on every receiver before reading its class. On G1 it is a **no-op for
+exactly this case**:
 
-Neither is a tail-of-session change, and neither should be taken without its
-own measurement; both are recorded here so the next reader starts from a
-choice rather than from a hunt. What is NOT yet established is that the
-composite test's face (below) has the same cause — the frozen reactor never
-returns from the native at all, which is a different failure than returning
-with a stale handle.
+```rust
+if !pre_validated && self.is_object_address(obj.as_ptr() as usize).is_none() {
+    #[cfg(feature = "zgc")] … h.forwarded_after_slide(…) …   // ZGC only
+    return (obj, false);                                     // G1: stale, unchanged
+}
+```
+
+The barrier repairs by reading a forwarding word **at the old address**, which
+requires the old address to still be a live object base. G1 frees the
+from-region, and Phase 5 (`free_or_keep_cset`) deliberately zeroes
+`forwarding_ptr` for a freed region, so there is nothing left to read. ZGC has
+a relocation table (`forwarded_after_slide`) for precisely this; **G1 has no
+equivalent**, so every caller that treats `load_and_forward` as the repair —
+`invoke_virtual`, `invoke_virtual_bytecode_only`, `forward_boundary_args`, the
+H2 natives — is unprotected under G1 for a reference that went stale before
+the call. The function's own doc names ZGC as the unprotected collector; that
+G1 is unprotected too, for a different reason, is new here.
+
+### ANSWERED, and the holder is named: `native_properties_equals`
+
+`hunt7` run 33 — the 600m arm, with `CRATONVM_DBG_GCPART` finally armed. The
+run **passed** and still carried the defect, which is why the loop stops on the
+`NoSuchMethodError` count rather than on a hang:
+
+```
+NoSuchMethodError method="java/lang/Object.entrySet()Ljava/util/Set;"
+  caller="io/netty/handler/ssl/JdkSslContext.<init>(…)"
+
+ERROR cratonvm::gc::guard: a dereference of an address that is NOT a live
+  object base …  site="class_id_of" obj="0x2002c100180"
+  moved_to="0x2002ba00260" was_vacated=true
+    1: class_id_of                gc/src/vm_heap.rs:502
+    2: invoke_virtual             vm/src/vm/vm_exec.rs:10647
+    3: native_properties_equals   native-builtins/src/properties_sidetable.rs:3287
+```
+
+`properties_sidetable.rs` was **the only application-level holder in all
+sixteen dead-base dereferences of that run**; every other frame in those
+backtraces is downstream of it (`class_id_of`, `invoke_on_class_shared`, and
+the NSME tracer itself re-reading the bad address).
+
+`java.security.Provider extends Properties`, so `JdkSslContext.<init>` touching
+a provider map reaches `Properties.equals` → this native → `entrySet()` on
+`this`. The `entrySet` in the error and the holder in the backtrace are the
+same call.
+
+**The fork above resolves to the first branch.** `was_vacated` carries a
+`moved_to`, so the forward WAS recorded; what failed is that the holder is a
+raw Rust local in a native, which no `pointer_map`-keyed remap covers. The
+`[gcpart]` ring reported `moved_to=None` for epochs 20–26 and
+`appears_as_dest=true` at 25 — the move itself was epoch 27, the current cycle,
+whose map is not in the ring yet.
+
+### The fix
+
+`native_properties_equals` already pinned `it`, `entry` and (late) `other`, and
+its own comment said why. It did **not** pin:
+
+* **`this`** — read from `args[0]` and used at `entrySet()` AFTER two
+  `invoke_virtual` calls that can allocate and collect. This is the one the
+  capture caught;
+* **`other`** — pinned only at the loop head, so the `size()` call before that
+  was unprotected;
+* **`key`** — from `getKey()`, passed to `get()` AFTER `getValue()`;
+* **`value`** — from `getValue()`, used as a receiver AFTER `get()`.
+
+All four now use the tree's own idiom (`pin_native_root` / `read_native_pin`,
+~4900 uses), with the per-iteration pins released at the bottom of the loop so
+a large map does not grow `native_pin_roots` by three entries per entry. This
+is an instance the `unpinned-native-locals` audit's search did not reach.
+
+`cargo test --release`: native-builtins **4167 passed, 0 failed**; vm **2623
+passed, 0 failed**.
+
+**The A/B is IN FLIGHT and this page will not claim the stall closed until it
+reads.** Two binaries — the one that caught and the same tree plus the fix —
+interleaved run by run at the 600m heap the catch came from, because this
+host's load average has swung 6–148 today and a sequential before/after here
+would be comparing two machines. The metric is the `NoSuchMethodError
+java/lang/Object` count and the number of guard events naming
+`properties_sidetable`, NOT the raw `was_vacated` line count: that counts every
+stale-reference reporter in the process, from several unrelated holders, and
+each reporter caps itself at 12. Three PRE runs and three POST runs differed on
+it while naming completely different holders — noise dressed as signal, and it
+is written down here because it nearly went into this page as evidence.
+
+On the multi-face evidence above, this A/B should not be expected to close the
+stall outright either — only to remove one of three producers.
+
+First 21 runs (11 unfixed / 10 fixed, interleaved, 600m):
+
+| arm | runs | `NoSuchMethodError java/lang/Object` | guard frames naming `properties_sidetable` |
+|---|---:|---:|---:|
+| unfixed | 11 | 1 | **0** |
+| fixed | 10 | 0 | **0** |
+
+**That is not yet evidence for the fix, and it would be easy to present as if
+it were.** The one catch in the unfixed arm is the `checkClientTrusted` face —
+a producer this fix does not touch — and the fixed arm's zero is one run of a
+1-in-33 event. More to the point, `properties_sidetable` appears in NEITHER
+arm's backtraces over those 21 runs, so the site the fix changes did not fire
+at all: the two arms cannot have differed because of it. The run that named
+that site (`hunt7` run 33) remains the only observation of that face.
+
+What this A/B can eventually show is a difference in the total
+`NoSuchMethodError java/lang/Object` rate across enough runs to see a 1-in-33
+event move. Until then the fix stands on the capture that named its holder and
+on the code being wrong on its own terms — a raw `ObjectRef` live across a call
+that allocates — not on this table.
+
+### The `checkClientTrusted` face: holder named, and the JNI hypothesis is dead
+
+`hunt9`'s predecessor `hunt8` caught at run 5 with `CRATONVM_DBG=jni-localref`
+armed — the instrument built specifically to test whether this face arrives
+through a stale JNI local ref. **It does not.** The audit fired 24 times and
+named real JNI entry points (`jni_get_direct_buffer_address`,
+`jni_new_object_a/v`, `jni_new_global_ref`), and **none of them is the failing
+receiver.** That receiver's holder is a CratonVM native:
+
+```
+site="class_id_of" obj=0x2002344e480 moved_to="0x2002b0261c0" was_vacated=true
+  1: class_id_of                     gc/src/vm_heap.rs:502
+  2: tm_is_extended                  native-builtins/src/t27_tls.rs:15025
+  3: engine_consult_trust_managers   native-builtins/src/t27_tls.rs:14822
+  4: engine_run_trust_check          native-builtins/src/t27_tls.rs:14679
+  5: do_unwrap                       native-builtins/src/t27_tls.rs:17843
+  6: unwrap_single                   native-builtins/src/t27_tls.rs:17073
+```
+
+So the JNI-local-ref hypothesis — asserted from source-reading, withdrawn on
+one face's evidence, revived as "live again for THIS face" — is now **refuted
+by measurement on the face it was revived for**. The local-ref hazard in
+`jobject_to_obj` is real and still worth fixing on its own terms; it is not
+what stalls this test. Three assertions, one measurement: the measurement wins.
+
+### And this one is NOT an unpinned local — the PIN was stale
+
+That distinction matters, because it is a different and worse defect.
+`engine_consult_trust_managers` does the right thing already:
+
+```rust
+let tm_pins: Vec<usize> = trust_managers.iter().map(|tm| ctx.pin_native_root(*tm)).collect();
+…
+let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
+let engine_now = engine_pin.map(|(pin, e)| ctx.read_native_pin(pin, e));   // no allocation
+match engine_now { Some(engine) if tm_is_extended(ctx, tm_now) => …
+```
+
+`tm_now` is re-derived from its pin on the line before the read that faulted,
+and nothing between them can collect. `tm_is_extended` is clean too — its
+first statement is the `class_id_of_object` that faulted. So the value the pin
+HANDED BACK was already stale: this is not "a native forgot to pin", it is
+"the pin did not hold".
+
+### Four ways that can happen, and where each one stands
+
+1. ~~**The pin slot was never remapped**~~ — **REFUTED by inspection.** There
+   are THREE paths, not the two an earlier revision of this page listed, and
+   all three remap `native_pin_roots`:
+   `update_all_roots` (the thread that RUNS the collection),
+   `check_post_block_gc_refs` (a thread waking from a blocked region), and
+   `apply_pointer_map_to_thread` (a running mutator that a PEER's STW stopped
+   at an interpreter safepoint — `safepoint_check`'s own comment calls that
+   site "the only site where the deposit's promise holds, because a thread
+   that reaches this line resumes through `apply_pointer_map_to_thread` and
+   remaps its own frames"). The peer-safepoint gap this page suspected does
+   not exist.
+2. **The forward was never recorded**, so no remap could have applied.
+   A real instance of this shape WAS found — the CAS-loser arm, below — and
+   its engagement on this workload measured **0**. So the shape exists in the
+   collector and is now closed, but it is not this stall.
+3. **Pin-stack imbalance.** `read_native_pin` silently falls back to the RAW
+   `fallback` address when its handle is past the pin stack — a callee
+   truncated below this caller's pins. The tree already has the diagnostic
+   (`PIN-DANGLING`, plus a ring naming the truncator) behind
+   `CRATONVM_DBG=blockgc` / `unpin-ring`. **0 hits across 78 armed
+   whole-class runs** — all of which PASSED, so this is not yet a negative for
+   a stalling run. Inspection agrees so far: every `pin_base` in `vm/src` is
+   `native_pin_roots.len()` captured at entry, which is the correct
+   discipline.
+4. **A discarded fixup at native-unblock.** A thread that a peer's collection
+   stopped while it was inside a blocking native cannot have its `JvmThread`
+   touched by the collector, so the map is folded into the shared
+   `gc_block_state.fixup` instead. `check_post_block_gc_refs` APPLIES that
+   fixup (including to `native_pin_roots`); `mark_native_thread_unblocked`
+   CLEARS it, with a debug line that says so outright —
+   `"[blockgc] native-unblock DISCARDS {} fixups"`. A thread leaving through
+   `VmNativeThreadBlocker::leave_blocked` takes the second path.
+   **0 DISCARDS lines across the same 78 armed runs**, i.e. the fixup was
+   always already empty there — so on healthy runs `check_post_block_gc`
+   drains it first, as intended. Same caveat: no stalling run has been caught
+   with this armed.
+
+So of four, one is refuted by inspection, one is found-and-closed but
+measured inert on this workload, and two are unmeasured ON A STALLING RUN
+while reading zero on 78 healthy ones. What is established is the holder and
+that its pin did not hold; which mechanism explains it is still open, and the
+page does not pick.
+
+The next catch decides it: `huntloop.sh` arms `PIN-DANGLING`, the
+`DISCARDS` line, the `[gcpart]` ring and the CAS-loser counter together, so a
+single stalling run answers all four at once.
+
+### A second unrecorded-forward hole, found by inspection — and its engagement is ZERO
+
+Mechanism 2 above ("the forward was never recorded") turns out to have a real
+instance, and it is the same shape as one already fixed. `evacuate`'s parallel
+path can return a forwarding address three ways, and only two of them recorded
+it in `forwards` — which becomes the cycle's `pointer_map`:
+
+| path | recorded? |
+|---|---|
+| fast path: already forwarded when we looked | yes — DEFECT-2 part 1 |
+| we won the CAS and copied | yes |
+| **we LOST the CAS to another worker** | **no** |
+
+The third arm returned the winner's target and dropped `old_ptr -> target`,
+which is verbatim what DEFECT-2 part 1 fixed for the first — and that fix's own
+comment names the symptom it leaves: *"no root naming `old_ptr` could be
+remapped … it dangled when the region was reused (the rare
+`java/lang/Object`)."* It also has the right shape for the load dependence this
+page has recorded since 2026-08-24 and never explained: losing that CAS needs
+TWO WORKERS RACING ON ONE OBJECT, so it gets commoner exactly as parallelism
+rises.
+
+That is a good story, and **the counter shipped with the fix refuses it.**
+`CRATONVM_DBG=jit-method-stats` prints the arm's hit count at exit:
+
+```
+[cratonvm] G1 evacuation CAS losses (forwards this VM would have dropped
+           before the 2026-08-26 fix): 0
+```
+
+**Zero, on a full clean whole-class run at 600m** — 63 tests, the same
+configuration the catches come from. So the hole is real and worth closing, but
+on this workload the arm is not reached and it **cannot be what stalls this
+test**. The fix is landed as a latent defect, not as this page's answer.
+
+What the zero does NOT settle: a clean run is not a stalling one, and the arm
+needs the race that load produces. `huntloop.sh` now prints the counter on
+every run, so the next CATCH carries its own answer for the run that failed.
+
+### The fix A/B is INCONCLUSIVE, and the reason is worth more than the table
+
+Second attempt, 61 unfixed / 61 fixed runs interleaved at 600m:
+
+| arm | runs | `NoSuchMethodError java/lang/Object` |
+|---|---:|---:|
+| unfixed | 61 | **0** |
+| fixed | 61 | **0** |
+
+**Neither arm reproduced the defect at all**, so the comparison is empty — this
+is not "the fix worked". Set against the same week's other numbers, the event
+rate is not a rate at all: 1 run in 5 (`hunt8`), 1 in 11 (`fixab1`'s unfixed
+arm), 1 in 33 (`hunt7`), 1 in ~230 (`hunt5`), and now 0 in 122. The runs that
+caught were at load 20-27; these 122 ran mostly at load 3-7.
+
+Two consequences, both of which cost time here:
+
+* **an A/B on this event cannot work while the rate swings this far.** Sample
+  sizes that would settle a 1-in-33 event say nothing about a 1-in-230 one,
+  and the arms cannot be held at a fixed rate because the rate is the host's;
+* **the binary is not the dominant variable.** `hunt8` caught in FIVE runs on a
+  binary carrying both pin fixes, while the unfixed arm above caught nothing in
+  61. Any story of the form "the fixed binary is cleaner" has to survive that,
+  and this one does not.
+
+So the two pin fixes stand on the captures that named their holders and on the
+code being wrong on its own terms — a raw `ObjectRef` live across a call that
+allocates — and this page does not offer the A/B as evidence for either.
+
+### Other holders the same captures name, not yet investigated
+
+The stripped backtraces of those runs also name, repeatedly and outside the
+reporter's own frames: `native-collections/src/lib.rs:15086`, `:16335`,
+`:16577`, and several interpreter sites. Whether those are holders of the same
+shape or ordinary frames on the path has NOT been checked — they are recorded
+so the next pass has a list rather than a hunt.
+
+### The question that decided the fix
+
+### The one question that decides the fix, and it is not yet answered
+
+The remaining fork is whether that forward reached `pointer_map`:
+
+* **in the map** — the forward WAS recorded, and some holding slot missed the
+  remap. `update_thread_objs_after_gc` remaps `native_pin_roots`, handle
+  slots, `native_pending_return` and the JIT caches, all keyed on
+  `pointer_map`; the fix would be at whichever slot is not in that list;
+* **not in the map** — the forward was never recorded, no remap could have
+  fixed any slot, and the fix is in G1's recording. `evacuate`'s parallel
+  fast path had exactly this hole and it was fixed as DEFECT-2 part 1 (its
+  comment names "the rare `java/lang/Object`" as the symptom); this binary
+  carries that fix, so a hit here would be a SECOND hole.
+
+**Those need opposite changes and must not be guessed between.**
+`gcpart_probe` answers it in one line and the tracer already calls it — the
+ring is simply never populated unless `CRATONVM_DBG_GCPART` is set, which is
+why the catch above printed no `[gcpart]` lines. It is armed in `huntloop.sh`
+now.
+
+### The isolated reproducer does NOT reproduce — recorded as a negative
+
+Catching this in netty costs about five hours a hit (1 whole-class run in
+100-230), which is not a loop anyone can iterate a fix in, so
+`probes/MhStaleReceiverProbe.java` tries to build the shape directly: a
+six-field receiver constructed immediately before the call, invoked **through a
+MethodHandle** (so it routes through `mh_dispatch` rather than an ordinary
+`invokevirtual`), with heavy allocation in the window between the two.
+
+| arm | rounds | heap | result |
+|---|---:|---|---|
+| single-threaded | 1 500 000 | 256m | 0 caught, **0** `was_vacated` events |
+| 6 workers + a dedicated GC-pressure thread | 2 000 000 | 256m | 0 caught, **0** `was_vacated` events |
+
+Both with `CRATONVM_DBG_VACATED_FRAMES`, `CRATONVM_DBG_GCPART` and
+`CRATONVM_DBG_CCE_BT` armed. **Zero** vacated-reference events means the ledger
+never even saw a stale reference, not merely that no dispatch failed — so the
+three ingredients this probe has are NOT sufficient:
+
+* a MethodHandle virtual invoke through `mh_dispatch`;
+* a receiver allocated immediately before the call;
+* young evacuations forced by a PEER thread rather than by the caller.
+
+Whatever else the netty path contributes — JIT-compiled callers around the
+dispatch, the FFM/`Arena` allocation itself, the `invokedynamic` bridge, a
+deopt in the window — is load-bearing, and the next probe should add those
+rather than repeat these. Until then the netty loop is the only capture, and it
+is what `huntloop.sh` runs.
+
+### Where this belongs
+
+This is the `ClassId(0)` / stale-receiver family, not a netty defect:
+the retired `unpinned-native-locals-audit` write-up (whose 48 fixes landed on
+`dev` on 2026-08-25, while this was in flight) describes the same
+signature (*"the next read sees an all-zero header — which the class manager
+names `java.lang.Object`"*) and fixes the in-tree native instances with
+`pin_native_root` / `read_native_pin`. The catch above is a witness that the
+family survives that idiom under G1, because the idiom's re-read
+(`read_native_pin`) is keyed on the same `pointer_map` remap.
 
 ## The SECOND reproduction is a DIFFERENT shape, on the same netty frame
 

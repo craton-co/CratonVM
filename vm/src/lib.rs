@@ -37,6 +37,14 @@ pub mod config;
 #[cfg(feature = "experimental-debug")]
 pub mod debug;
 pub mod dispatch_trace;
+/// G1 parallel-evacuation CAS losses — see
+/// [`cratonvm_gc::g1::evacuate_cas_loser_forwards`]. Re-exported so `vm-cli`
+/// can print it beside the other exit counters without taking a direct
+/// dependency on the gc crate for one number.
+pub fn g1_evacuate_cas_loser_forwards() -> u64 {
+    cratonvm_gc::g1::evacuate_cas_loser_forwards()
+}
+
 pub mod error;
 pub mod jck_capture;
 pub mod jit;

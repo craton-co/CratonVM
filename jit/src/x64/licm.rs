@@ -1772,6 +1772,104 @@ pub(super) fn safepoint_reg_spill_all() -> bool {
     })
 }
 
+/// Elide the SB-CRASH-04 full-GPR blind spill at a DIRECT call to a compiled
+/// callee whose caller frame is provably oop-clean there
+/// (`CRATONVM_JIT_CALL_SPILL_ELISION`; default `1`).
+///
+///  * `0` — never elide: every call keeps the unconditional 14-store spill.
+///    This is the pre-2026-08-26 behaviour.
+///  * `1` — direct calls to a compiled callee only, and only when no argument
+///    of the call is a reference.
+///  * `args` / `2` — also the `jit_invoke_dispatch` helper site,
+///    and reference arguments are admitted whenever they are frame-resident at
+///    the `CALL`: the direct sites copy every argument into the callee-sentinel
+///    service slots, and the dispatch site stages them into the helper's args
+///    buffer and NAMES the oops among them in the safepoint map
+///    (`pending_staged_arg_oops`). An argument oop that is only in an ABI
+///    register still refuses.
+///  * `mic` / `3` (**default**) — additionally the MIC/PIC inline-dispatch
+///    cascade, whose hoisted spill dominates both the inline-hit and the slow
+///    path and pairs with a single shared post-safepoint reload. Both halves of
+///    that pairing survive the elision: the predicate requires `precise_maps`
+///    and refuses any register-homed reference local, so the shared
+///    `emit_post_safepoint_reload` — which walks `local_oop_masks[pc]`, oops
+///    only — has nothing to reload. This is the arm that reaches
+///    `invokevirtual`/`invokeinterface`, i.e. most of the call traffic in real
+///    code; `CallArgCostProbe`'s `virtRef` is 11.66 → 7.50 ns over control on
+///    it.
+///
+/// Why this exists: the spill is 14 `mov [rbp-off], reg` at EVERY GC-capable
+/// call, and `probes/CallArgCostProbe.java` prices a compiled static call at
+/// ~4 ns against HotSpot's ~0. A disassembly of its `armInt1` arm
+/// (`CRATONVM_DBG_JIT_DISASM=CallArgCostProbe.armInt1`) shows 26 instructions
+/// of call overhead on the hot path, 14 of them this spill — in a loop whose
+/// frame contains no reference at all.
+///
+/// The proof it reuses is `can_elide_self_call_register_spill`'s, and nothing
+/// in that proof is about the callee: it establishes that every live oop in
+/// THIS frame is frame-resident, so a conservative register copy publishes
+/// nothing new. The one call-site-specific hazard is an oop ARGUMENT, which is
+/// staged in an ABI register at the CALL and is not covered by the caller-frame
+/// proof — hence the argument clause, and hence mode `1` refusing outright.
+pub(super) fn call_spill_elision_mode() -> u8 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u8> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALL_SPILL_ELISION") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => 0,
+                "1" => 1,
+                "args" | "2" => 2,
+                _ => 3,
+            },
+            Err(_) => 3,
+        }
+    })
+}
+
+/// Narrow the SB-CRASH-04 blind GPR spill at a GC-capable safepoint to the
+/// registers that can hold an oop, instead of copying all fourteen
+/// (`CRATONVM_JIT_SPILL_NARROW`, **default-ON; `=0` restores the full copy**).
+///
+/// The spill exists so the conservative `[scanner_sp, entry_sp)` scan can see a
+/// register-resident root, and `=all` (the full file, not just the callee-saved
+/// subset) was required for one stated reason: "a receiver/args staged into
+/// ARG_REGS immediately before a GC-capable call ... sit in caller-saved/
+/// argument registers, which the callee-saved-only spill never covers"
+/// (`Compiler::new`). That reason names a POPULATION, and the population is
+/// nameable: RAX and `ARG_REGS`, plus the register homes of reference-capable
+/// locals, plus whatever the operand stack is holding in a register right now.
+/// A register that hosts a primitive local, or hosts nothing this method ever
+/// wrote, is a store per safepoint for nothing.
+///
+/// What the narrowing gives up is the pure defence-in-depth tail — "a value the
+/// per-slot oop tracker fails to tag" — for the scratch registers (R10/R11 on
+/// SysV) and for local homes the method-wide reference mask says are primitive.
+/// That mask is conservative in the safe direction: `find_reference_locals`
+/// ORs in every `aload`/`astore` across the whole method, so javac's cross-scope
+/// slot reuse only makes it name MORE locals, never fewer.
+///
+/// Fails closed: no publish plan (the legacy `compile` test wrapper), more than
+/// 64 locals (the mask's unrepresented tail), or an explicit
+/// `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` all keep the full fourteen stores.
+/// The slot LAYOUT is unchanged either way — `emit_blind_reg_spill` indexes by
+/// position in `ALL_SPILL_GPRS` — so a skipped store leaves a stale slot, which
+/// the scanner re-validates through `heap.is_object_address` and which can
+/// therefore only over-retain, never under-report.
+pub(super) fn narrow_safepoint_spill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_NARROW") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 /// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
 /// full-GPR safepoint register spill (see the call site in `Compiler::new`).
 /// `precise_maps` has been default-on since 2026-07-07, but its own

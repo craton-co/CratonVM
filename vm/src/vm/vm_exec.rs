@@ -3310,12 +3310,28 @@ fn forward_boundary_args<'a>(
     }
 }
 
+#[track_caller]
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    // DIAGNOSTIC (perf/invokeinterface-native-arbitration-20260824).
+    //
+    // `java/util/ArrayList$Itr.hasNext`/`next` are entered 2 000 000 times on a
+    // 2000x1000 walk and NEVER appear at any of the six
+    // `real_protected_stub_class` doors -- while `cratonvm/internal/
+    // UnmodifiableListItr`, also an iterator reached by `invokeinterface`, DOES
+    // appear at two of them. So "interface calls bypass the arbitration" is not
+    // the rule, and the next question is which of this function's 77 callers
+    // actually invokes the Itr natives.
+    //
+    // `#[track_caller]` again rather than 77 hand-placed traces.
+    if crate::runtime::interpreter::dbg_native_entry() {
+        let l = std::panic::Location::caller();
+        crate::runtime::interpreter::native_entry_note(l.file(), l.line());
+    }
     safe_native_call_impl(shared, thread, callback, args, false)
 }
 
@@ -3323,12 +3339,21 @@ pub fn safe_native_call(
 /// `Value::Object` against this VM's heap. It preserves ordinary native-call
 /// pinning and all return/exception handling while avoiding a duplicate heap
 /// membership search for each argument.
+#[track_caller]
 pub(crate) fn safe_native_call_prevalidated_objects(
     shared: &SharedVm,
     thread: &mut JvmThread,
     callback: NativeCallback,
     args: &[Value],
 ) -> MethodCallResult {
+    // Same tally as `safe_native_call`. This variant is the one the HOT paths
+    // use -- the first pass instrumented only the other wrapper and saw ~10 000
+    // entries where the probe makes 600 000 native calls, which is how this
+    // split came to light.
+    if crate::runtime::interpreter::dbg_native_entry() {
+        let l = std::panic::Location::caller();
+        crate::runtime::interpreter::native_entry_note(l.file(), l.line());
+    }
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
@@ -6712,7 +6737,15 @@ impl<'a> NativeContextImpl<'a> {
         // ReferenceQueue.remove), false positives are filtered by
         // `is_object_address`, and they can only over-retain (the young sweep
         // runs non-moving while any thread is in JIT, so nothing is relocated).
-        if !moving_young_precise_only {
+        // MEASUREMENT LEVER (`CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN=1`,
+        // default OFF): the no-flag deposit is a republish by a thread that is
+        // still RUNNING, and this scan's stated obligation is to a thread that
+        // has PARKED — see `env_cache::noflag_deposit_skips_jit_scan` for the
+        // measurement, the argument, and the two holes in the argument that
+        // keep it off by default.
+        let skip_jit_scan = !raise_blocked_flag
+            && crate::runtime::env_cache::noflag_deposit_skips_jit_scan();
+        if !moving_young_precise_only && !skip_jit_scan {
             let jit_scan_start = snapshot.len();
             crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
             crate::jit::conservative_roots::scan_active_jit_frames(
@@ -13947,203 +13980,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         expected: Value,
         new_val: Value,
     ) -> bool {
-        // An `int`-to-`int` CAS goes to the hardware, for the same reason
-        // `atomic_fetch_add_int` does: `AtomicInteger.compareAndSet` and a
-        // compiled `LOCK XADD` must be atomic against each other, and a
-        // lock-based read-compare-write is not. No SATB pre-barrier and no
-        // write barrier here — the payload is primitive, so no reference is
-        // overwritten and none escapes.
-        let fwd = self.shared.mem.heap.load_and_forward(obj);
-        match (expected, new_val) {
-            (Value::Int(exp), Value::Int(new)) => {
-                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Int) {
-                    // SAFETY: see `atomic_fetch_add_int`.
-                    let cell = unsafe { hw_atomic_i32(addr) };
-                    return cell
-                        .compare_exchange(
-                            exp,
-                            new,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_ok();
-                }
-            }
-            (Value::Long(exp), Value::Long(new)) => {
-                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Long) {
-                    // SAFETY: see `atomic_fetch_add_int`.
-                    let cell = unsafe { hw_atomic_i64(addr) };
-                    return cell
-                        .compare_exchange(
-                            exp,
-                            new,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_ok();
-                }
-            }
-            (Value::Object(exp), Value::Object(new)) => {
-                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Reference)
-                {
-                    // The payload word of a reference cell IS the raw pointer,
-                    // zero for a JVM null, and `values_equal_for_cas` compares
-                    // references by exactly that pointer — so a bit-level CAS
-                    // keeps the lock path's semantics.
-                    let exp_raw = exp.map_or(0usize, |r| r.as_ptr() as usize);
-                    let new_raw = new.map_or(0usize, |r| r.as_ptr() as usize);
-                    // SATB pre-barrier BEFORE the store, preserving (pre,
-                    // store, post) ordering. Firing it on `expected` rather
-                    // than on a re-read is what HotSpot does for a CAS: on
-                    // success `expected` IS the overwritten value, and on
-                    // failure the extra enqueue only over-approximates the
-                    // live set, which SATB is allowed to do.
-                    self.shared.mem.heap.satb_barrier(expected);
-                    // SAFETY: see `atomic_fetch_add_int`.
-                    let cell = unsafe { hw_atomic_usize(addr) };
-                    let swapped = cell
-                        .compare_exchange(
-                            exp_raw,
-                            new_raw,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_ok();
-                    if swapped {
-                        self.shared.mem.heap.write_barrier(fwd, new_val);
-                    }
-                    return swapped;
-                }
-            }
-            _ => {}
-        }
-        // T19_H6: descriptor-aware CAS read+write so a long instance field
-        // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
-        let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
-        let class_id = self.shared.mem.heap.class_id_of(obj);
-        let descriptor = if is_array {
-            None
-        } else {
-            resolve_field_descriptor_byte_cached(self.shared, class_id, index)
-        };
-        let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
-            // The CAS mutex provides the operation's per-object
-            // linearization point, but ordinary volatile readers and writers
-            // use the collector's stripe lock to prevent tearing the 16-byte
-            // `Value` slot.  Hold that stripe once across the whole
-            // read/compare/write rather than calling `get_field_volatile_as`
-            // and `set_field_volatile_as`, which acquire it twice and insert
-            // four SeqCst fences for one successful Unsafe CAS.  The single
-            // pair of fences below retains the full volatile/CAS ordering, and
-            // the shared stripe keeps this raw slot access atomic with every
-            // non-CAS volatile access.
-            let volatile_guard =
-                (!is_array).then(|| cratonvm_gc::collector::volatile_stripe_lock(obj, index));
-            if volatile_guard.is_some() {
-                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            }
-            let current = if is_array {
-                self.shared
-                    .mem
-                    .heap
-                    .get_array_element(obj, index)
-                    .unwrap_or(Value::Object(None))
-            } else if let Some(desc) = descriptor {
-                self.shared.mem.heap.get_field_as(obj, index, desc)
-            } else {
-                self.shared.mem.heap.get_field(obj, index)
-            };
-            let swapped = if values_equal_for_cas(&current, &expected) {
-                // Task #42 (deferred from #25): SATB pre-barrier on
-                // the CAS-putfield / CAS-aastore path.  Without it,
-                // a successful CAS that overwrites an old ref slot
-                // between G1 initial-mark and remark would silently
-                // drop the old reference from the live closure —
-                // the same lost-object scenario the interpreter's
-                // putfield/aastore paths already guard against. We
-                // dispatch through `VmHeap::satb_barrier` (the
-                // available API on this branch); `satb_barrier`
-                // short-circuits on null and on non-Object payloads,
-                // so primitive `Unsafe.compareAndSwapInt/Long` and
-                // null→x CAS pays effectively nothing.  Fires
-                // strictly BEFORE the store to preserve SATB
-                // (pre, store, post) ordering. On a non-G1
-                // generational backend the call is also a cheap
-                // tag-test no-op.
-                self.shared.mem.heap.satb_barrier(current);
-                if is_array {
-                    let _ = self.shared.mem.heap.set_array_element(obj, index, new_val);
-                } else if let Some(desc) = descriptor {
-                    self.shared.mem.heap.set_field_as(obj, index, new_val, desc);
-                } else {
-                    self.shared.mem.heap.set_field(obj, index, new_val);
-                }
-                true
-            } else {
-                false
-            };
-            if volatile_guard.is_some() {
-                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            }
-            swapped
-        });
-        if swapped {
-            if crate::runtime::env_cache::dbg_loader_trace() {
-                if let Value::Object(Some(o)) = new_val {
-                    let new_cid = self.shared.mem.heap.class_id_of(o);
-                    let cn = self
-                        .shared
-                        .classes
-                        .class_manager
-                        .read()
-                        .get_class(new_cid)
-                        .map(|c| c.name.to_string())
-                        .unwrap_or_default();
-                    if cn.contains("RootReference") {
-                        let holder_cid = self.shared.mem.heap.class_id_of(obj);
-                        let holder_cn = self
-                            .shared
-                            .classes
-                            .class_manager
-                            .read()
-                            .get_class(holder_cid)
-                            .map(|c| c.name.to_string())
-                            .unwrap_or_default();
-                        eprintln!(
-                            "[LOADER-TRACE] compare_and_swap_field SUCCESS holder_obj={:p} holder_class={} slot={} new_obj={:p} new_class={} new_cid={}",
-                            obj.as_ptr(), holder_cn, index, o.as_ptr(), cn, new_cid.as_u32()
-                        );
-                    }
-                }
-            }
-            self.shared.mem.heap.write_barrier(obj, new_val);
-        }
-        // T19.H7 diag: count CAS failures so we can spot a livelock.
-        // Static counter gated to ~5 emissions then 1 every 1M.
-        // Feature-gated (off by default) вЂ” see vm/Cargo.toml
-        // `experimental-t19-diag`. Re-enable with
-        // `--features experimental-t19-diag`.
-        #[cfg(feature = "experimental-t19-diag")]
-        if !swapped {
-            static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n % 1_000_000 == 0 {
-                let cn = self
-                    .shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_class(class_id)
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_else(|| format!("cid={}", class_id.as_u32()));
-                tracing::debug!(
-                    target: "cratonvm::t19_h7_cas",
-                    "CAS FAIL #{n} class={cn} slot={index} desc={:?} expected={:?} new={:?}",
-                    descriptor.map(|b| b as char), expected, new_val,
-                );
-            }
-        }
-        swapped
+        // Body lives in `compare_and_swap_field_shared` so the JIT funnel's
+        // CAS fast path reuses it verbatim. See that function.
+        compare_and_swap_field_shared(self.shared, obj, index, expected, new_val)
     }
 
     fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
@@ -32679,4 +32518,217 @@ mod real_protected_stub_single_predicate_witness {
              possible homes for one predicate."
         );
     }
+}
+
+
+/// The field compare-and-swap, as a free function over `&SharedVm`.
+///
+/// Extracted from `VmExec::compare_and_swap_field` so the JIT funnel's
+/// `try_varhandle_instance_field_cas` can serve a `VarHandle.compareAndSet`
+/// without a second copy of the barrier ordering. The read path already works
+/// this way -- both of its routes call `varhandle_instance_field_read_bits` so
+/// they cannot drift on what they consider servable -- and a CAS has more to
+/// get wrong: the SATB pre-barrier fires on `expected` BEFORE the store, and
+/// the post `write_barrier` only on success.
+pub(crate) fn compare_and_swap_field_shared(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    index: usize,
+    expected: Value,
+    new_val: Value,
+) -> bool {
+    // An `int`-to-`int` CAS goes to the hardware, for the same reason
+    // `atomic_fetch_add_int` does: `AtomicInteger.compareAndSet` and a
+    // compiled `LOCK XADD` must be atomic against each other, and a
+    // lock-based read-compare-write is not. No SATB pre-barrier and no
+    // write barrier here — the payload is primitive, so no reference is
+    // overwritten and none escapes.
+    let fwd = shared.mem.heap.load_and_forward(obj);
+    match (expected, new_val) {
+        (Value::Int(exp), Value::Int(new)) => {
+            if let Some(addr) = hw_atomic_addr(shared, fwd, index, HwAtomicKind::Int) {
+                // SAFETY: see `atomic_fetch_add_int`.
+                let cell = unsafe { hw_atomic_i32(addr) };
+                return cell
+                    .compare_exchange(
+                        exp,
+                        new,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+            }
+        }
+        (Value::Long(exp), Value::Long(new)) => {
+            if let Some(addr) = hw_atomic_addr(shared, fwd, index, HwAtomicKind::Long) {
+                // SAFETY: see `atomic_fetch_add_int`.
+                let cell = unsafe { hw_atomic_i64(addr) };
+                return cell
+                    .compare_exchange(
+                        exp,
+                        new,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+            }
+        }
+        (Value::Object(exp), Value::Object(new)) => {
+            if let Some(addr) = hw_atomic_addr(shared, fwd, index, HwAtomicKind::Reference)
+            {
+                // The payload word of a reference cell IS the raw pointer,
+                // zero for a JVM null, and `values_equal_for_cas` compares
+                // references by exactly that pointer — so a bit-level CAS
+                // keeps the lock path's semantics.
+                let exp_raw = exp.map_or(0usize, |r| r.as_ptr() as usize);
+                let new_raw = new.map_or(0usize, |r| r.as_ptr() as usize);
+                // SATB pre-barrier BEFORE the store, preserving (pre,
+                // store, post) ordering. Firing it on `expected` rather
+                // than on a re-read is what HotSpot does for a CAS: on
+                // success `expected` IS the overwritten value, and on
+                // failure the extra enqueue only over-approximates the
+                // live set, which SATB is allowed to do.
+                shared.mem.heap.satb_barrier(expected);
+                // SAFETY: see `atomic_fetch_add_int`.
+                let cell = unsafe { hw_atomic_usize(addr) };
+                let swapped = cell
+                    .compare_exchange(
+                        exp_raw,
+                        new_raw,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+                if swapped {
+                    shared.mem.heap.write_barrier(fwd, new_val);
+                }
+                return swapped;
+            }
+        }
+        _ => {}
+    }
+    // T19_H6: descriptor-aware CAS read+write so a long instance field
+    // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
+    let is_array = shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let descriptor = if is_array {
+        None
+    } else {
+        resolve_field_descriptor_byte_cached(shared, class_id, index)
+    };
+    let swapped = shared.threads.monitors.with_cas_lock(obj, || {
+        // The CAS mutex provides the operation's per-object
+        // linearization point, but ordinary volatile readers and writers
+        // use the collector's stripe lock to prevent tearing the 16-byte
+        // `Value` slot.  Hold that stripe once across the whole
+        // read/compare/write rather than calling `get_field_volatile_as`
+        // and `set_field_volatile_as`, which acquire it twice and insert
+        // four SeqCst fences for one successful Unsafe CAS.  The single
+        // pair of fences below retains the full volatile/CAS ordering, and
+        // the shared stripe keeps this raw slot access atomic with every
+        // non-CAS volatile access.
+        let volatile_guard =
+            (!is_array).then(|| cratonvm_gc::collector::volatile_stripe_lock(obj, index));
+        if volatile_guard.is_some() {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        }
+        let current = if is_array {
+            shared
+                .mem
+                .heap
+                .get_array_element(obj, index)
+                .unwrap_or(Value::Object(None))
+        } else if let Some(desc) = descriptor {
+            shared.mem.heap.get_field_as(obj, index, desc)
+        } else {
+            shared.mem.heap.get_field(obj, index)
+        };
+        let swapped = if values_equal_for_cas(&current, &expected) {
+            // Task #42 (deferred from #25): SATB pre-barrier on
+            // the CAS-putfield / CAS-aastore path.  Without it,
+            // a successful CAS that overwrites an old ref slot
+            // between G1 initial-mark and remark would silently
+            // drop the old reference from the live closure —
+            // the same lost-object scenario the interpreter's
+            // putfield/aastore paths already guard against. We
+            // dispatch through `VmHeap::satb_barrier` (the
+            // available API on this branch); `satb_barrier`
+            // short-circuits on null and on non-Object payloads,
+            // so primitive `Unsafe.compareAndSwapInt/Long` and
+            // null→x CAS pays effectively nothing.  Fires
+            // strictly BEFORE the store to preserve SATB
+            // (pre, store, post) ordering. On a non-G1
+            // generational backend the call is also a cheap
+            // tag-test no-op.
+            shared.mem.heap.satb_barrier(current);
+            if is_array {
+                let _ = shared.mem.heap.set_array_element(obj, index, new_val);
+            } else if let Some(desc) = descriptor {
+                shared.mem.heap.set_field_as(obj, index, new_val, desc);
+            } else {
+                shared.mem.heap.set_field(obj, index, new_val);
+            }
+            true
+        } else {
+            false
+        };
+        if volatile_guard.is_some() {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        }
+        swapped
+    });
+    if swapped {
+        if crate::runtime::env_cache::dbg_loader_trace() {
+            if let Value::Object(Some(o)) = new_val {
+                let new_cid = shared.mem.heap.class_id_of(o);
+                let cn = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(new_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if cn.contains("RootReference") {
+                    let holder_cid = shared.mem.heap.class_id_of(obj);
+                    let holder_cn = shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(holder_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[LOADER-TRACE] compare_and_swap_field SUCCESS holder_obj={:p} holder_class={} slot={} new_obj={:p} new_class={} new_cid={}",
+                        obj.as_ptr(), holder_cn, index, o.as_ptr(), cn, new_cid.as_u32()
+                    );
+                }
+            }
+        }
+        shared.mem.heap.write_barrier(obj, new_val);
+    }
+    // T19.H7 diag: count CAS failures so we can spot a livelock.
+    // Static counter gated to ~5 emissions then 1 every 1M.
+    // Feature-gated (off by default) вЂ” see vm/Cargo.toml
+    // `experimental-t19-diag`. Re-enable with
+    // `--features experimental-t19-diag`.
+    #[cfg(feature = "experimental-t19-diag")]
+    if !swapped {
+        static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 1_000_000 == 0 {
+            let cn = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| format!("cid={}", class_id.as_u32()));
+            tracing::debug!(
+                target: "cratonvm::t19_h7_cas",
+                "CAS FAIL #{n} class={cn} slot={index} desc={:?} expected={:?} new={:?}",
+                descriptor.map(|b| b as char), expected, new_val,
+            );
+        }
+    }
+    swapped
 }

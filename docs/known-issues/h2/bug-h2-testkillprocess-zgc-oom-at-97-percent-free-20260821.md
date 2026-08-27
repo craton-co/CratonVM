@@ -17,10 +17,18 @@ collections**. What actually blocked it was two defects one level below, both
 found by counting what the aggregate `map_coverage=N` counter would not say —
 see §"Follow-up 2026-08-24".
 
-Still open, and now on a different obligation entirely: `TestMVStoreTool` and
-`org.h2.test.jdbc.TestCachedQueryResults` reach the same fragmentation wall
-because their collections refuse on `ACTIVE_FRAME_MAP` — the innermost compiled
-frame cannot be *located*, not disbelieved. See §"Still open".
+**The `ACTIVE_FRAME_MAP` residual is CLOSED as of 2026-08-26.** The two
+innermost-frame mirrors — the RBP and the compile id — were not moving together
+across a JIT entry-chain push or pop, so the pair named two different frames and
+the proof read the wrong method's slot offset. `no_map` is **0 in all five
+`on` arms and 9–601 in all five `off` arms** of the same-binary A/B, and
+`TestKillProcessWhileWriting` passes 2/2 with it against 2/2 failing without.
+See §"Follow-up 2026-08-26".
+
+Still open: `TestMVStoreTool` and `org.h2.test.jdbc.TestCachedQueryResults`
+reach the same fragmentation wall on TWO other obligations —
+`compiled-frame-oop-not-published` (the `invokedynamic` bridge, bisected below)
+and `xt-helper-window-conservative-scan`. See §"Still open".
 
 > ### Read this before quoting the "FIXED" above
 >
@@ -888,35 +896,336 @@ frame without passing its call site's republish.
   §Status) is present in every arm above — 67, 81, 166, 195, 85 refusals — so it
   remains a second, independent reason these collections decline.
 * 2 096 jit + 581 types + 1 687 gc + 2 610 vm unit tests pass with the fix.
+
+## Follow-up 2026-08-26: the cause — the two frame-record mirrors were not moving together
+
+`ACTIVE_FRAME_MAP` / `frame_cov=(… no_map=N …)` is **fixed**. The innermost
+compiled frame could not be located because the pair that names it was allowed
+to describe two different frames.
+
+### The rule, and where the entry chain broke it
+
+`top_cm_id_mirror_read`'s own doc states it: the two innermost-frame mirrors —
+the RBP and the compile id — are written together by generated code, and
+
+> restoring one without the other is how the identity becomes actively wrong
+> rather than merely absent
+
+because the scan cannot detect it: both halves still read consistently out of
+the mirrors. The JIT entry chain broke that rule in **both** directions:
+
+* `push_entry_full` snapshots both halves into the outgoing top entry, then
+  calls `top_rbp_set(0)` for the incoming one — and never zeroed the identity.
+  A fresh entry's rbp was paired with the method of the entry *below* it from
+  its first instruction.
+* `reload_top_rbp_cache` — commented "mirror now tracks the entry that became
+  top again" — restored only `exact_rbp` from the snapshot, leaving the identity
+  at whatever last ran.
+
+And the coverage proof feeds itself the bad pair:
+`refresh_moving_young_coverage_for_current_thread` calls
+`prune_returned_jit_entries` **first**, which lands in `reload_top_rbp_cache`
+whenever it pruned anything, and then immediately stamps
+
+```rust
+info.exact_rbp   = top_rbp_get();          // correct
+info.exact_cm_id = published_compile_id(); // whatever nothing moved
+```
+
+`moving_young_frame_coverage_complete` then reads
+`[rbp − wrong_method.sp_id_slot_off]`, matches no map, and refuses the cycle.
+
+That is exactly the signature §7 recorded and could not explain: ONE rbp with
+one saved return address, claimed across collections by four different methods
+— `MVMap.put`, `MVStore.openMap`, `MVStore$Builder.autoCommitDisabled`, and
+`RootReference.isLocked`, the last with `maps=0`, a method that emits no
+safepoint and therefore cannot be the frame at a collection at all. At most one
+could be right. The rbp was right every time; the identity was the half nobody
+moved.
+
+### Measured, one binary, `CRATONVM_GC_NO_CM_ID_PAIRING=1` as the control
+
+| class | arm | `no_map` | `active-safepoint-map-incomplete` | cycles | compactions | rc |
+|---|---|---:|---:|---:|---:|---|
+| `TestMVStoreTool` | on | **0** | 0 | 44 | 0 | 1 |
+| | off | 9 | 7 | 40 | 7 | 1 |
+| | on | **0** | 0 | 18 | 7 | 1 |
+| | off | 11 | 0 | 44 | 0 | 1 |
+| | on | **0** | 0 | 44 | 0 | 1 |
+| | off | 2 | 2 | 8 | 3 | 1 |
+| `TestKillProcessWhileWriting` | on | **0** | 0 | **52** | **21** | **0 PASS** |
+| | off | 601 | 601 | 886 | 12 | 1 |
+| | on | **0** | 0 | **52** | **16** | **0 PASS** |
+| | off | 105 | 104 | 148 | 8 | 1 |
+
+**Zero in all five `on` arms, nonzero in all five `off` arms**, and the reason
+code tracks the counter exactly. `TestKillProcessWhileWriting` passes 2/2 with
+the pairing and fails 2/2 without it, `oom=0 arena=0` against `oom=4 arena=7–10`
+— and the death spiral this page opened on (886 and 148 collections) collapses
+to 52.
+
+### What this does NOT close
+
+`TestMVStoreTool` still fails, with `oom=4–6`. Its `no_map` obligation is gone;
+what refuses now is `compiled-frame-oop-not-published` (the
+`CRATONVM_JIT_INDY_BRIDGE` blocker bisected under §Status) and
+`xt-helper-window-conservative-scan`. Those are independent obligations and
+this repair does not touch them — one `on` arm above spent all 44 of its cycles
+refusing on the helper window alone.
+
+Note also that zero is the *honest* value when a top entry carries no snapshot:
+it means "nothing published", which routes `published_innermost_method` to the
+stack decode and, failing that, fails closed. A wrong id does not fail closed —
+it resolves confidently to another method's oop map, which
+`remap_active_jit_frames` would then have used to rewrite that frame's slots.
+So this was a latent corruption hazard, not only a lost compaction.
+
+### Pinned
+
+`both_frame_record_mirrors_move_together_across_a_jit_boundary` asserts the
+invariant through the public push/pop entry points, because it is about what a
+JIT boundary leaves behind rather than about one function. It **discriminates**:
+with `CRATONVM_GC_NO_CM_ID_PAIRING=1` it fails with the incoming entry's rbp
+paired with `0xABCD1234`, the outer entry's identity. Its sibling,
+`the_rbp_mirror_half_is_restored_regardless_of_the_pairing_switch`, asserts only
+the half that was always correct, so a future change there cannot hide behind
+the switch.
+
+### Three hypotheses that were wrong, kept because they cost runs
+
+Recorded so nobody re-derives them: the spliced-call path (§7), publishing the
+mirror at every safepoint (§7, reverted), and the optimizing tier's inline-cache
+republish (§"Follow-up 2026-08-24 (second)", a real gap, fixed on its own
+merits, and a measured null here against an engagement counter). All three were
+about generated code restoring the mirror. The defect was in the *chain
+bookkeeping* that generated code hands off to.
+
+
+## Follow-up 2026-08-26 (second): `UNPUBLISHED_FRAME_OOP`, censused
+
+### First, a correction: the indy-bridge attribution no longer holds
+
+§Status bisected this reason to `CRATONVM_JIT_INDY_BRIDGE` on 2026-08-24 (28 → 5
+per 76 collections). **Re-taken on today's `dev`, on an idle host, that
+separation is gone:**
+
+| arm | `unpub` | proven | rc |
+|---|---:|---:|---|
+| indy bridge on | 30 | 20 | 0 |
+| indy bridge off | 28 | 23 | 0 |
+| indy bridge on | 27 | 23 | 0 |
+| indy bridge off | 33 | 19 | 0 |
+
+The tree moved twice underneath that bisect — most of all the mirror-pairing
+repair in §"Follow-up 2026-08-26", which changed *which frames reach the band
+verifier at all* (`no_map` went from hundreds to ~1). Quote the 08-24 number as
+history, not as a live attribution. `TestKillProcessWhileWriting` also passes
+4/4 on plain `dev` now.
+
+### What the unpublished words actually are
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` runs `report_unpublished_band_words`, which
+names the method and the frame REGION of every word the verifier objects to.
+One `TestKillProcessWhileWriting` run on `dev`:
+
+| region | words |
+|---|---:|
+| **`java-local`** | **64** |
+| `operand-spill` | 17 |
+| `reserved-locals-tail` | 2 |
+
+and by method, 64 of the 83 are in **one**:
+
+```
+64  org/h2/mvstore/MVStore.closeStore:(ZI)V
+12  org/h2/mvstore/MVStore$Builder.open:()Lorg/h2/mvstore/MVStore;
+ 2  org/h2/mvstore/MVStore.hasUnsavedChanges:()Z
+ 2  org/h2/mvstore/FileStore.clearCaches:()V
+```
+
+A representative line — note the same object in three consecutive local slots:
+
+```
+[moving-young-band] org/h2/mvstore/MVStore.closeStore:(ZI)V off=72 region=java-local
+  value=0x2004f4d3e28 published=8 live_hi=Some(144)
+  layout=FrameLayout { java_locals_hi: 80, … locals_hi: 128, spill_lo: 128, … }
+```
+
+`off=56/64/72` are locals 6, 7 and 8, all holding `0x2004f4d3e28`, none of them
+in the 8 values the shadow stack published at that safepoint.
+
+**This is a liveness question, and it forks two ways.** If the dataflow says
+those locals are LIVE at that pc, `collect_live_oop_homes`'s oop-locals loop —
+which publishes exactly `local_oop_mask_at_current_pc()` — has a mask gap, and
+that is a codegen defect. If it says they are DEAD, then not publishing them is
+CORRECT and the slot merely holds a stale reference nothing will read; the band
+verifier cannot tell the two apart, so it refuses, and the repair belongs on the
+verifier's side (a liveness bound it can consult, or zeroing dead ref slots).
+Nobody has asked which. That is the next measurement, and `closeStore` is a
+one-method target for it.
+
+### The staged invoke-argument buffer: a real gap, fixed, and why it does not move `unpub`
+
+`a51077342` added the staged buffer to the oop MAP (`emit_oop_map_for_safepoint`
+Stage 3) and stopped there. `collect_live_oop_homes` — which decides what
+`emit_shadow_push` publishes — enumerates the simulated operand stack and the
+oop locals, and by construction neither can see these: they were popped off the
+operand stack before the call, the same reason the map needed a Stage 3.
+
+The two are different channels. The map makes a slot a precise root for
+MARKING; the shadow stack is the REWRITABLE channel, and it is the only one
+`moving_young_unpublished_frame_oop_present` consults. Fixed, gated on moving
+coverage like the frame-slot homes beside it, `CRATONVM_JIT_NO_STAGED_ARG_SHADOW=1`
+as the A/B.
+
+**It does exactly what it targets and nothing more** — same class, same run
+shape, band census on each binary:
+
+| region | `dev` | with the fix |
+|---|---:|---:|
+| `java-local` | 64 | 65 |
+| **`operand-spill`** | **17** | **7** |
+| `reserved-locals-tail` | 2 | 4 |
+
+And it does **not** move the per-cycle refusal count:
+
+| arm | `unpub`/cycles | proven | arm | `unpub`/cycles | proven |
+|---|---:|---:|---|---:|---:|
+| on | 24/51 | 26 | off | 31/51 | 19 |
+| on | 23/51 | 27 | off | 33/52 | 19 |
+| on | 28/51 | 23 | off | 25/51 | 26 |
+
+That null is **explained, not mysterious**: `unpub` counts COLLECTIONS, and a
+collection refuses if ANY word in any band is unpublished. While `java-local`
+still contributes 64 words to the same cycles, removing 10 `operand-spill` words
+cannot change a single cycle's verdict. The fix is kept on that basis — it is
+correct, it is measurably effective on its own category, and it cannot show a
+cycle-level win until the dominant category is closed.
+
+Two honest caveats on it:
+
+* On `TestMVStoreTool` the `unpub`-per-cycle RATE went the wrong way (0.57 and
+  0.82 with, against 0.47 and 0.50 without). That class's runs vary from 10 to
+  38 collections and 62 s to 356 s, so this is not a measurement I would defend;
+  it is recorded because publishing more shadow homes has a documented over-pin
+  hazard (the bt18 small-heap OOM `collect_live_oop_homes` warns about) and
+  somebody should re-take it on a quiet host.
+* Two unit tests pin it and both DISCRIMINATE — with the kill switch the
+  publish assertion fails with `homes=[]`, while the non-moving control passes
+  in both arms, so neither can pass vacuously.
+
+
+## Follow-up 2026-08-27: `UNPUBLISHED_FRAME_OOP` was refusing on DEAD slots
+
+The fork §"Follow-up 2026-08-26 (second)" left open is closed, and it went the
+second way: the dataflow, the oop map and the shadow push all agreed with each
+other. Only the band scan objected, and it was objecting to words nothing would
+ever read.
+
+### The measurement that decided it
+
+`report_unpublished_band_words` now also prints the frame's `sp_id` and whether
+the ACTIVE safepoint's oop map names the slot. On one
+`TestKillProcessWhileWriting` run, **all 74** unpublished words report
+`in_map=false` — not one is a slot the map calls live:
+
+```
+68  region=java-local           in_map=Some(false)
+ 4  region=operand-spill        in_map=Some(false)
+ 2  region=reserved-locals-tail in_map=Some(false)
+```
+
+and the dominant method resolves completely:
+
+```
+MVStore.closeStore:(ZI)V off=72/64/56/48 region=java-local
+  value=0x2004f4c5c88 (the SAME object in all four) published=8
+  sp_id=Some(174) in_map=Some(false) live_hi=Some(144)
+```
+
+Offsets 48/56/64/72 are locals 5..8. `closeStore`'s `LocalVariableTable` scopes
+slot 5 (`map`) to bci **149..170**, so at `sp_id=174` it is already out of
+scope, and 6..8 are javac's loop/`finally` copies of it — the method's
+`astore 6/7/8` all sit at bci 370/404/424, in the duplicated `finally` tails.
+Four slots, one dead object, one refusal per collection.
+
+### The repair, and how narrow it is
+
+The band scan cannot tell live from dead on its own, so it demanded that every
+movable word in a java-local or operand-spill slot be published on the shadow
+stack. For the regions the abstract interpreter MODELS that is stricter than the
+collector itself needs: the safepoint's map already states which of those slots
+hold live references at that pc.
+
+`band_slot_is_verifiable_with_map` now treats a word in a modelled region that
+the active map does not name as dead. `region_is_dataflow_modelled` admits only
+java locals and operand spill; **LICM hoist slots, scalar-replacement fields, the
+reserved-locals tail and the register images are untouched**, because covering
+exactly what the map cannot describe is the whole reason this scan exists (see
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`).
+And `None` — no sp-id, or no map for it — keeps every word verifiable, which is
+the fail-closed direction. `CRATONVM_GC_NO_BAND_MAP_LIVENESS=1` is the A/B.
+
+### Measured, one binary, arms interleaved
+
+| class | arm | `unpub` | compacting | of cycles | rc |
+|---|---|---:|---:|---:|---|
+| `TestKillProcessWhileWriting` | on | **4** | **46** | 51 | 0 |
+| | off | 24 | 28 | 52 | 0 |
+| | on | **3** | **45** | 51 | 0 |
+| | off | 22 | 29 | 51 | 0 |
+| | on | **1** | **48** | 51 | 0 |
+| | off | 25 | 25 | 51 | 0 |
+
+`unpub` 1–4 against 22–25, no overlap. Compacting collections go from **49–57 %
+to 88–94 %** of all cycles. Corruption canary — this change lets collections
+RELOCATE that previously refused, so it is the measurement that had to be taken
+— `org.h2.test.db.TestMultiThread` ×4, all `rc=0`, no SIGSEGV, no
+`ClassCastException`, with 62–66 k objects actually relocated in three of them.
+
+### What it does NOT fix, and what it costs
+
+`TestMVStoreTool` still fails with `oom=4`: it OOMs after only 7–14 collections,
+so it dies before a higher compaction rate can help it. Its `unpub` is already
+1–4 in both arms. That class needs its own answer.
+
+And the cost is real and worth stating: for java locals and operand spill this
+scan **was** a backstop against a wrong oop map — refusing the moving cycle
+meant a wrong map could not corrupt anything, because nothing moved. That
+defence is now gone for those two regions, deliberately, because it was
+suppressing ~half of all compaction to hedge against a map defect nobody has
+demonstrated. The right instrument for that hedge is the map-completeness
+oracle already listed under §"Still open"
+(`CRATONVM_DBG_VERIFY_OOP_MAPS`'s `never_mapped (while_covered=N)`), which asks
+the question directly instead of paying for it on every collection — and which
+that item notes should now be re-taken against `fully_shadow_covered`.
+
 ## Still open
 
 Ordered by what a next session should pick up first.
 
-* **The `invokedynamic` bridge's compiled frames do not publish their live oops
-  to the shadow stack.** Bisected to `CRATONVM_JIT_INDY_BRIDGE=0` on one binary
-  — see the table under §Status: it takes `compiled-frame-oop-not-published`
-  from 28 back to 5 per 76 collections, where none of the other four 2026-08-24
-  switches moves it below 21. The feature is `2cc02f7d3` and its own WIP commit
-  `a51077342` names "the indy bridge's staged-arg oop-map gap", so this is
-  most likely already known to its author. Left for them; recorded here because
-  it is what makes this class fail on `dev` today, and because the counter that
-  found it is now on the `[jitroots]` line for anyone else.
+* **`TestMVStoreTool` OOMs after 7–14 collections, before compaction can
+  help it.** Its `UNPUBLISHED_FRAME_OOP` obligation is CLOSED with everything
+  else's (§"Follow-up 2026-08-27": `unpub` 1–4 in both arms now), and
+  `TestKillProcessWhileWriting` compacts on 88–94 % of cycles. This class
+  still fails with `oom=4` and needs its own answer — it is not short of
+  compaction, it is short of TIME to compact.
+* **The band scan no longer backstops a wrong oop map for java locals and
+  operand spill.** Given up deliberately (§"Follow-up 2026-08-27") because it
+  was suppressing about half of all compaction to hedge against a map defect
+  nobody has demonstrated. The direct instrument for that hedge is the
+  `while_covered` oracle two items below, which should be re-taken against
+  `fully_shadow_covered`.
 * **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
   bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
   proven cycles 13 against 24. None of the five switches covers it. Almost
   certainly the same question as the `no_map` residual below.
-* **`TestMVStoreTool` and `TestCachedQueryResults` — the innermost frame cannot
-  be LOCATED, and THREE hypotheses are now dead.** Read §"Follow-up 2026-08-24
-  (second)" before picking this up: the spliced-call path, a missing publish at
-  the safepoint, and the optimizing tier's inline caches have each been tested
-  and each changed nothing, the last of them against a working engagement
-  counter (`ic_fr_sites` 3 695–3 730 vs 0). Every JIT->JIT return path now
-  republishes and the Rust dispatch bracket covers both directions, so what is
-  left is a path that returns WITHOUT passing any of them — the OSR trampoline's
-  exit, the deopt / callee-deopt service bail, or an exception unwind. Note also
-  that this class is now FLAKY on `dev` (`rc=0` once, `rc=1` five times, same
-  binary, same flags) and that its wall clock swings 5x at host load 45–65, so
-  the next arm needs a measured base rate before it means anything.
+* **`TestMVStoreTool`'s remaining blockers are the indy bridge and the
+  cross-thread helper window.** Its `ACTIVE_FRAME_MAP` / `no_map`
+  obligation is CLOSED — see §"Follow-up 2026-08-26" — but the class still
+  fails with `oom=4–6`, refusing on `compiled-frame-oop-not-published` and
+  `xt-helper-window-conservative-scan`. Those are the two items above this
+  one, and neither is touched by that repair.
 * **`TestCachedQueryResults` shows `incomplete=5`** — the first time anywhere
   that a map refuses on its OWN claim rather than being unlocatable. Different
   obligation from `no_map`, never investigated, and it sits alongside 9 962

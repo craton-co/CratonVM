@@ -7067,9 +7067,122 @@ pub(crate) fn dbg_stub_yield() -> bool {
 /// What must ultimately replace this list: `NativeKind` alone. Under
 /// `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
 /// protecting from one and the entire list becomes dead.
+#[track_caller]
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
-    crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
-        || real_protected_stub_class_common(class_name)
+    let v = crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
+        || real_protected_stub_class_common(class_name);
+    // DIAGNOSTIC (diag/which-door-arbitrates-20260824).
+    //
+    // Two attempts at making `java/util/ArrayList.get` yield to real bytecode
+    // both ended with `invocations` unchanged at 127, in the JIT arm and under
+    // `--nojit` alike, with every precondition satisfied. That is only possible
+    // if the arbitration is never REACHED for this triple, and there are six
+    // call sites that could reach it -- two on the static path, two in
+    // `dispatch_virtual`, one inside the yield predicate itself, and one in
+    // `vm_exec`.
+    //
+    // `#[track_caller]` rather than six hand-placed trace lines: one edit, and
+    // the report cannot drift out of sync with the call sites it describes. A
+    // door that never appears in this output is a door that never asks.
+    if dbg_stub_door() {
+        let l = std::panic::Location::caller();
+        stub_door_note(l.file(), l.line(), class_name, v);
+    }
+    v
+}
+
+/// `CRATONVM_DBG_STUB_DOOR` — tally every `real_protected_stub_class` question
+/// by CALL SITE and class, dumped at exit.
+///
+/// A tally, not a print-per-call: this predicate is on the dispatch path and
+/// `ArrayList.get` alone asks it thousands of times, so a line per call would
+/// change the thing it measures and bury the one row that matters.
+pub(crate) fn dbg_stub_door() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_DOOR").is_some())
+}
+
+type StubDoorKey = (&'static str, u32, String, bool);
+static STUB_DOOR_TALLY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<StubDoorKey, u64>>,
+> = std::sync::OnceLock::new();
+
+fn stub_door_note(file: &'static str, line: u32, class_name: &str, verdict: bool) {
+    let m = STUB_DOOR_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut g) = m.lock() {
+        *g.entry((file, line, class_name.to_string(), verdict))
+            .or_insert(0) += 1;
+    }
+}
+
+/// `CRATONVM_DBG_NATIVE_ENTRY` — tally native-funnel entries by CALL SITE.
+///
+/// Companion to [`dbg_stub_door`]: that one says which doors ASK the
+/// `SyntheticStub` arbitration, this one says which code path actually INVOKES
+/// a native. A triple entered millions of times that appears at no door at all
+/// is a dispatch path with no arbitration in it — which is the shape both were
+/// built to hunt.
+///
+/// It earned its keep immediately. Instrumenting only `safe_native_call` showed
+/// ~10 000 entries where the probe makes 600 000 native calls; the hot paths
+/// use `safe_native_call_prevalidated_objects`, and once that was counted too
+/// the answer was one line: `vm/src/jit/helpers.rs` x598 302, i.e. the JIT's
+/// site-cached native dispatch serves essentially all of it.
+pub(crate) fn dbg_native_entry() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NATIVE_ENTRY").is_some())
+}
+
+static NATIVE_ENTRY_TALLY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, u32), u64>>,
+> = std::sync::OnceLock::new();
+
+pub fn native_entry_note(file: &'static str, line: u32) {
+    let m =
+        NATIVE_ENTRY_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(mut g) = m.lock() {
+        *g.entry((file, line)).or_insert(0) += 1;
+    }
+}
+
+/// Print the [`dbg_native_entry`] tally, busiest call site first.
+pub fn report_native_entry_tally_at_exit() {
+    if !dbg_native_entry() {
+        return;
+    }
+    let Some(m) = NATIVE_ENTRY_TALLY.get() else {
+        return;
+    };
+    let Ok(g) = m.lock() else { return };
+    let mut v: Vec<_> = g.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("[NATIVE-ENTRY] native-funnel entries, by call site:");
+    for ((file, line), n) in v.into_iter().take(12) {
+        eprintln!("[NATIVE-ENTRY]   {file}:{line}  x{n}");
+    }
+}
+
+/// Print the [`dbg_stub_door`] tally. Called from the same exit path as the
+/// other census dumps.
+pub fn report_stub_door_tally_at_exit() {
+    if !dbg_stub_door() {
+        return;
+    }
+    let Some(m) = STUB_DOOR_TALLY.get() else {
+        eprintln!("[STUB-DOOR] no call recorded — the predicate was never asked at all");
+        return;
+    };
+    let Ok(g) = m.lock() else { return };
+    if g.is_empty() {
+        eprintln!("[STUB-DOOR] no call recorded — the predicate was never asked at all");
+        return;
+    }
+    eprintln!("[STUB-DOOR] real_protected_stub_class questions, by call site:");
+    for ((file, line, class, verdict), n) in g.iter() {
+        eprintln!("[STUB-DOOR]   {file}:{line}  {class}  -> {verdict}  x{n}");
+    }
 }
 
 /// The classes **both** dispatch paths yield to real bytecode.
@@ -7079,6 +7192,32 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
 /// comparison chain rather than one `str` equality call per entry.
 #[inline]
 fn real_protected_stub_class_common(class_name: &str) -> bool {
+    // `java/util/ArrayList` is the ONE conditional member of this list, and it
+    // sits here rather than in the `matches!` below because of it. The reason
+    // the class is allow-listed at all is in the comment down there, with its
+    // measurements; the reason it needs a condition is this:
+    //
+    // `force_native_over_real_jdk_bytecode`'s ArrayList entry says a
+    // `Map.values()` view IS a plain `java/util/ArrayList` that stashes its
+    // source map in the last capacity slot of its element array and must
+    // re-sync against it on read. That stopped being true on 2026-08-13 —
+    // views are minted under `MAP_VIEW_CARRIERS`, which are NOT on this list
+    // and ARE force-listed, so they keep their natives — and that is what makes
+    // allow-listing `java/util/ArrayList` safe. But `alloc_view_carrier` still
+    // has a last-resort arm that degrades to `java/util/ArrayList` when the
+    // carrier class cannot be had at all. A view minted THERE, served by real
+    // `ArrayList` bytecode, returns whatever its source held at creation: the
+    // `Schema.getAllSequences()` shape (H2 `TestAlter`).
+    //
+    // So that arm publishes, and this asks. Default is "no such view exists",
+    // i.e. the yield is ON — the opposite default was built first and measured
+    // INERT, because a program that never calls `values()` never publishes
+    // anything and the answer is memoized per call site as each site warms.
+    // `cratonvm_types::arraylist_view` states the residual this leaves, and why
+    // it is not reachable on any image a JDK ships.
+    if class_name == "java/util/ArrayList" {
+        return !cratonvm_types::arraylist_view::arraylist_classed_view_possible();
+    }
     matches!(
         class_name,
         "java/util/concurrent/locks/ReentrantLock"
@@ -7105,6 +7244,38 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             // 203.5 -> 47.2 ns, hashCode 174.1 -> 47.8, requireNonNull
             // 124.3 -> 48.6, isNull 91.8 -> 24.6.
             | "java/util/Objects"
+            // `java/util/ArrayList`, for `get`/`size`/`isEmpty` -- whose natives
+            // are already `SyntheticStub` (the census says so; the ambient
+            // `set_category(Bridge)` around their registration is NOT what
+            // lands, because `register` adjudicates the kind itself). Like the
+            // `Objects` entry above, the motive is throughput: the native cost
+            // 11x its own JDK bytecode, because pinning the native also pins
+            // the method out of the JIT.
+            //
+            // MEASURED, `probes/KeySetBench idxList` (1000 `list.get(i)` calls
+            // per row), us/call, three interleaved rounds, against the same
+            // binary with this one entry removed:
+            //
+            //     idxList        752 -> 68     11.1x
+            //     toArrHoisted   110 -> 96      1.15x   (a bonus; Spring's door)
+            //     rawArr          19 -> 18      flat    (control: no collection)
+            //     iterList       987 -> 971     flat    (the iterator does not
+            //                                            go through `get`)
+            //
+            // Two earlier attempts concluded this "did not engage" and were
+            // reverted. Both were wrong, and both were wrong for the same
+            // reason: they were scored on the native census's `invocations`,
+            // which SATURATES -- it reads the same 127 at 5 000 and 50 000
+            // iterations, and prints `invocations_complete: false` beside the
+            // number to say so. The arbitration was always reached (a
+            // `#[track_caller]` tally on this predicate shows this class asked
+            // at all three virtual doors) and the yield always worked; only the
+            // instrument was blind. Score this class by TIME.
+            //
+            // The entry itself is NOT here: it is the guarded early return at
+            // the top of this function, because it is the one member of this
+            // list that is conditional. See there, and see
+            // `cratonvm_types::arraylist_view`.
             // JDK-ONLY-WAVE2, 2026-08-06. `native_es_execute` (retagged
             // `SyntheticStub` in `native-builtins/src/util_concurrent_ext.rs`)
             // is the compatibility stand-in for CratonVM's synthetic 2-field
@@ -8849,6 +9020,7 @@ mod intercept_shape_tests {
 #[cfg(test)]
 mod force_list_deliberate_absences_tests {
     use super::force_native_over_real_jdk_bytecode as force;
+    use super::real_protected_stub_class_common;
 
     /// MEASURED 2026-08-17 (`target-rel2`, `--jdk-only`, vs HotSpot
     /// 25.0.3+9-LTS): all five readers are registered `Bridge` by
@@ -8930,5 +9102,36 @@ mod force_list_deliberate_absences_tests {
             "iterator",
             "()Ljava/util/Iterator;"
         ));
+    }
+
+    /// `java/util/ArrayList` is allow-listed by default and REVOKED by a
+    /// fallback view mint, and the FORCE list is untouched in either state.
+    ///
+    /// Both directions are asserted from one test because the latch is a
+    /// process-global: splitting them would make the pair order-dependent under
+    /// the default parallel harness.
+    #[test]
+    fn arraylist_is_allow_listed_until_a_fallback_view_is_minted() {
+        cratonvm_types::arraylist_view::reset_for_test();
+        assert!(
+            real_protected_stub_class_common("java/util/ArrayList"),
+            "the default licenses the yield — see cratonvm_types::arraylist_view \
+             for why the opposite default measured INERT"
+        );
+
+        cratonvm_types::arraylist_view::note_arraylist_classed_view_minted();
+        assert!(
+            !real_protected_stub_class_common("java/util/ArrayList"),
+            "a view minted under java/util/ArrayList has to keep its native"
+        );
+        assert_eq!(
+            cratonvm_types::arraylist_view::arraylist_view_fallback_count(),
+            1
+        );
+
+        // The unconditional members are unaffected by the latch either way.
+        assert!(real_protected_stub_class_common("java/util/Objects"));
+        assert!(force("java/util/ArrayList", "size", "()I"));
+        cratonvm_types::arraylist_view::reset_for_test();
     }
 }
