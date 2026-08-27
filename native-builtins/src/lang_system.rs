@@ -2961,6 +2961,32 @@ pub(crate) fn native_runtime_get_runtime(
         // rather than reporting that it is missing.
         Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/Runtime", 8)?,
     };
+    // `Runtime.getRuntime()` MUST answer the same object every time -- the real
+    // class is `private static final Runtime currentRuntime = new Runtime()`
+    // and `getRuntime()` is a bare `getstatic`. Allocating a fresh object per
+    // call made `Runtime.getRuntime() == Runtime.getRuntime()` FALSE (MEASURED
+    // against HotSpot 25.0.3+9, `probes/TailFamilySweep.java`, both modes).
+    //
+    // That is not a cosmetic identity: `addShutdownHook` and
+    // `removeShutdownHook` are instance methods, so a hook registered on one
+    // instance is invisible to every later caller's instance, and any code that
+    // caches the Runtime and compares it later disagrees with itself.
+    //
+    // Reading and writing the REAL `currentRuntime` static rather than a
+    // Rust-side cache means the object this hands back is the same one the
+    // JDK's own bytecode sees, and it is rooted by the class rather than needing
+    // a global root of ours.
+    if let Some(idx) = ctx.static_field_index_by_name(class_id, "currentRuntime") {
+        if let Value::Object(Some(existing)) = ctx.get_static_field(class_id, idx) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        let obj = ctx.alloc_object(class_id, 0);
+        ctx.set_static_field(class_id, idx, Value::Object(Some(obj)));
+        return Ok(Some(Value::Object(Some(obj))));
+    }
+    // No such static (a synthetic-JDK image): fall back to the previous
+    // behaviour rather than inventing a side table for a shape that has no
+    // `currentRuntime` to be consistent with.
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
 }
