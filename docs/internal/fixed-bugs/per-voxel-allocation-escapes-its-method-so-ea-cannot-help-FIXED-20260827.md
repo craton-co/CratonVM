@@ -213,7 +213,9 @@ already shared the OUTGOING convention, so this is its read side. The refusal
 test became a test that the arguments ARRIVE: it calls the lowered body with
 cap+1..cap+3 distinct arguments and asserts the one it reads back, which is the
 same guarantee proved the other way round. `probes/EntryAbiArgSlotProbe.java`
-passes `bad=0/300000` on all ten shapes.
+passes `bad=0/300000` on all ten shapes, on Win64 as well as SysV -- and Win64
+is the interesting one, because with a four-register file `i4`, `i5`, `i6`,
+`s5` and `s6` all take the new stack path.
 
 **A `new` whose class was not loaded yet cost the method its optimizing tier
 permanently.** `resolve_jit_new_site` never runs a user `ClassLoader.loadClass`

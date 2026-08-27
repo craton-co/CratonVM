@@ -50,9 +50,9 @@ shard run produces — measured **1452-1456 s** each in one batch and
 **1486-1496 s** in a second. The page's headline number is what this class costs
 under shard concurrency, compared against a HotSpot number that was not.
 
-This is the failure mode
-[`a-contended-host-inverts-an-ab`] exists for: the two rows of that table were
-not taken under the same conditions, and the ratio between them was the finding.
+The two rows of the page's table were not taken under the same conditions, and
+the ratio between them was the finding. A contended arm against an uncontended
+one is not an A/B.
 
 ## Residual 2 — 21 failures in 104, and 0 in 1352
 
@@ -64,9 +64,17 @@ They still have not, because they have not appeared:
 | dev `fc51560b6` | 1 | serial | 104 ok, 0 failed |
 | dev `fc51560b6` | 6 | six-way, fresh schema each | 104 ok, 0 failed (×6) |
 | dev `fc51560b6` | 6 | six-way, fresh schema each | 104 ok, 0 failed (×6) |
+| **dev `9411c21aa`** — the page's own commit | 6 | six-way, fresh schema each | 104 ok, 0 failed (×6) |
 
-**13 runs, 1352 tests, zero `@@TESTFAIL` lines.** Every run on a database
+**19 runs, 1976 tests, zero `@@TESTFAIL` lines.** Every run on a database
 created for it and dropped after.
+
+The last row is the one that rules out the obvious alternative. `9411c21aa` is
+the merge that carries this page — a binary built from the exact tree it was
+written against — so "something on dev fixed it since" is not what happened.
+Six runs of the page's own binary find nothing either, and they take
+1488-1500 s, the same as current dev. Whatever produced `83 ok, 21 failed` was
+not in that commit.
 
 A single green run would prove nothing here — this class is on record as
 nondeterministic twice over (`run-astparser-witness.sh` exists because of an
