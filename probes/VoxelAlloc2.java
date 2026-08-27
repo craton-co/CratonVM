@@ -199,7 +199,20 @@ public final class VoxelAlloc2 {
         int n = Integer.getInteger("voxel.n", 64);
         int reps = Integer.getInteger("voxel.reps", 5);
         int warmN = Integer.getInteger("voxel.warm", 8);
-        int warmIters = Integer.getInteger("voxel.warmiters", 300);
+        // 300 was NOT enough, and the failure is silent: on Windows the three
+        // sweeps were never compiled at all at that count -- no `[ir] admission`
+        // line for any of them -- so every arm reported its INTERPRETED cost
+        // (volume ~400 ns, array ~200 ns) and the probe read as though the
+        // optimizer had done nothing. Measured threshold on that host: 300 too
+        // low, 1000 enough. 2000 leaves headroom without making the warm-up a
+        // meaningful part of the run (it sweeps 8^3, not 64^3).
+        //
+        // `array` is the tell. It allocates nothing and neither flag touches it,
+        // so it should sit near 2-3 ns on any tier-up that happened; a reading in
+        // the hundreds means the sweeps are interpreted and NO number in that run
+        // is about escape analysis. `assertWarm` below refuses to let that pass
+        // as a result.
+        int warmIters = Integer.getInteger("voxel.warmiters", 2000);
 
         try (Arena arena = Arena.ofConfined()) {
             // Warm on a small volume so compilation is not inside the timed window.
@@ -244,6 +257,27 @@ public final class VoxelAlloc2 {
                         (t3 - t2) / (double) voxels, a, b, c);
                 if (a != b || b != c) {
                     System.out.println("*** CHECKSUM MISMATCH -- an arm read the wrong data");
+                }
+                // `volume - rawseg` is the quantity this probe exists to
+                // measure: the two arms perform the same two segment element
+                // reads and differ ONLY in whether a `Short2` is built to carry
+                // them, so the control is self-calibrating and the host's load
+                // cancels out of the difference. Printing it stops the next
+                // reader from having to subtract two noisy absolute numbers in
+                // their head.
+                System.out.printf(Locale.ROOT, "       volume-rawseg=%.1f ns/voxel%n",
+                        ((t1 - t0) - (t2 - t1)) / (double) voxels);
+                // The floor arm allocates nothing. If it is not near the
+                // single-digit nanoseconds a compiled `short[]` loop costs, the
+                // sweeps were never compiled and every other number in this run
+                // is an interpreter measurement wearing an optimizer's label.
+                double arrayNs = (t3 - t2) / (double) voxels;
+                if (arrayNs > 20.0) {
+                    System.out.printf(Locale.ROOT,
+                            "*** NOT WARM: the allocation-free `array` arm cost %.1f ns/voxel, so the"
+                                    + " sweeps are interpreted and no number above is about the"
+                                    + " optimizer. Raise -Dvoxel.warmiters (default %d).%n",
+                            arrayNs, warmIters);
                 }
             }
         }
