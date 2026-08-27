@@ -5766,7 +5766,10 @@ fn call_site_is_hot(
 /// method by being RETURNED (`loadFromArray` ends in `areturn`), and per-method
 /// EA cannot scalar-replace an escaping object however good its tier. Killing
 /// it needs the accessor chain INLINED into the consuming loop first, then EA
-/// on the merged graph — which is a capability, not a gate. See
+/// on the merged graph — which is a capability, not a gate, and which landed on
+/// 2026-08-27 (`CRATONVM_JIT_IR_INLINE`). It is still not THIS gate that pays:
+/// the win is measured in the CALLER, whose own bytecode contains no `new` and
+/// which therefore never needed this lift at all. See
 /// `c2_alloc_upgrade_enabled` for the regression mechanism that keeps this off
 /// by default.
 ///
@@ -6131,13 +6134,20 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// Whether the optimizing tier may splice callee bodies into the graph it
 /// builds. `CRATONVM_JIT_IR_INLINE=1`.
 ///
-/// Opt-in, and the shipped default is OFF for the same reason
-/// `CRATONVM_JIT_C2_ALLOC_UPGRADE` is: the allocation this exists to delete is
-/// only HALF deleted until array scalar replacement lands beside it (a
-/// `Short2` keeps its two shorts in a `short[2]`, and `escape_analysis` can
-/// scalar-replace `Op::New` but not `Op::NewArray`). A capability that only
-/// sometimes pays should be priced on the gauntlet before it becomes what every
-/// compile does.
+/// Opt-in, and the shipped default is OFF — but NOT for the reason this comment
+/// used to give. It said the allocation is "only HALF deleted until array
+/// scalar replacement lands beside it"; array scalar replacement landed on
+/// 2026-08-27 and the allocation is fully deleted now (`volume` 478 ->
+/// 43.9 ns/voxel, converging on its own no-wrapper control at 39.2; see
+/// `docs/internal/fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
+///
+/// What keeps it off is the ordinary flag-flip discipline: the trades it makes
+/// — more nodes per compile, a spliced body's surviving calls losing their
+/// profile seed, compile time — are still priced on one probe and the
+/// regression suite (72/72 green with this on), not on the
+/// kafka/spring/tomcat/hibernate gauntlet. Note also that on its own it buys
+/// 2.1x here and only reaches 10.9x alongside `CRATONVM_SCALAR_DEOPT=1`, which
+/// has a soak debt of its own, so the two want pricing together.
 pub fn ir_inline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
