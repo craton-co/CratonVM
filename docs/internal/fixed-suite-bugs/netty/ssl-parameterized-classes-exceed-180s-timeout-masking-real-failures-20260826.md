@@ -306,6 +306,7 @@ section after this one explains why that qualifier is load-bearing:
 | --- | --- | --- | --- |
 | `testMutualAuthDiffCerts` | **0 / 48** | 36 / 48 | **48 / 48** |
 | `testClientHostnameValidationFail` | **0 / 48** | 48 / 48 | **48 / 48** |
+| `testClientHostnameValidationSuccess` | 48 / 48 | — | **48 / 48** |
 | `testMutualAuthSameCertChain` | 47 / 48 * | 28 / 48 | **48 / 48** |
 | `mustCallResumeTrustedOnSessionResumption` | 36 / 48 | 36 / 48 | 36 / 48 |
 | the other 13 methods | — | 48 / 48 | **48 / 48** |
@@ -315,6 +316,17 @@ section after this one explains why that qualifier is load-bearing:
 before the bind fix it reached the server over IPv4 and Defect 1 never bit it.
 That is worth knowing, because it is also what made an early reading of the
 residual blame the IPv6 transport.
+
+`testClientHostnameValidationSuccess` is on that table as the POSITIVE control
+for Defect 2's fix, and it is there because it nearly was not. A whole-class run
+showed it taking **~28 minutes per invocation** and failing one — on a lightly
+loaded box, with a 120 s JUnit cap configured that was plainly not firing. Run on
+its own it is **48/48 in 44 s on the fixed binary and 48/48 in 48 s on the
+pre-fix one**, against HotSpot's 16.6 s. So the stall is real but intermittent
+and belongs to neither defect on this page; what it is NOT is this fix rejecting
+a certificate it should accept, which is the thing a positive control exists to
+rule out. `probes/OpenSslTls13ClientCertProbe.java`'s two `identify=HTTPS` rows
+check the same property in two seconds and pass.
 
 `mustCallResumeTrustedOnSessionResumption` is unchanged by any of this and is
 the one real failure left in the class: **the same twelve invocations fail on
