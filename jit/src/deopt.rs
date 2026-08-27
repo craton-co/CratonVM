@@ -347,6 +347,20 @@ impl fmt::Display for EliminatedValue {
 /// State of a scalar-replaced object that needs heap materialization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirtualObjectState {
+    /// `Some(atype)` when this describes a scalar-replaced **array** rather
+    /// than an object: the JVM `newarray` atype of its elements, and
+    /// [`Self::num_fields`] is its LENGTH. `None` for an ordinary object.
+    ///
+    /// The materializer needs the distinction because the two are allocated by
+    /// different calls -- an object by class id and field count, an array by
+    /// element type and length -- and because an array's slots are elements,
+    /// stored through the array accessor rather than the field accessor.
+    /// [`Self::class_id`] is meaningless when this is `Some` and is not read.
+    ///
+    /// Only primitive element types reach here (atype 4..=11); a reference
+    /// array is refused upstream in `escape_analysis`, so a materialized
+    /// element never needs a reference store barrier.
+    pub array_element_type: Option<u8>,
     /// Identity of this scalar-replaced object within its deopt frame. Distinct
     /// objects have distinct ids; `FrameValue::VirtualObjectRef(id)` edges (and
     /// the materializer's shell map) resolve against it, which is what lets the
@@ -2252,7 +2266,7 @@ mod deopt_stash_root_tests {
     /// Interleaved with non-reference slots of every width, and with a null
     /// (`Object(0)`) slot, both of which must be left strictly alone.
     fn frame_with_one_object_per_container(base: u64) -> ReconstructedFrame {
-        let nested = FrameValue::VirtualObject(VirtualObjectState {
+        let nested = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 2,
             class_id: 9,
             num_fields: 1,
@@ -2271,7 +2285,7 @@ mod deopt_stash_root_tests {
             stack: vec![
                 FrameValue::Double(0x4059_0000_0000_0000),
                 FrameValue::Object(base + 0x2000),
-                FrameValue::VirtualObject(VirtualObjectState {
+                FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                     id: 1,
                     class_id: 8,
                     num_fields: 2,
@@ -5459,7 +5473,7 @@ mod deopt_metadata_tests {
     #[test]
     fn slot_naming_a_removed_node_is_rejected() {
         let mut p = good_point();
-        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 17, // IR node 17
             class_id: 5,
             num_fields: 1,
@@ -5540,7 +5554,7 @@ mod deopt_metadata_tests {
     fn virtual_object_graph_integrity_is_checked() {
         // Field count disagreement.
         let mut p = good_point();
-        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 3,
             class_id: 1,
             num_fields: 2,
@@ -5577,7 +5591,7 @@ mod deopt_metadata_tests {
         // is legal — the materializer allocates every shell before wiring.
         let mut p3 = good_point();
         p3.frame_state.locals[0] = FrameValue::VirtualObjectRef(4);
-        p3.frame_state.stack[0] = FrameValue::VirtualObject(VirtualObjectState {
+        p3.frame_state.stack[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -5587,7 +5601,7 @@ mod deopt_metadata_tests {
 
         // Defining the same object twice in one scope is not.
         let mut p4 = good_point();
-        let vo = FrameValue::VirtualObject(VirtualObjectState {
+        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -5816,7 +5830,7 @@ mod deopt_metadata_tests {
         let fs = FrameState {
             method_key: M.to_string(),
             bci: 0,
-            locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+            locals: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 2,
@@ -6201,7 +6215,7 @@ mod deopt_metadata_soundness_tests {
         ] {
             let mut p = plain_point();
             // A defining occurrence for the `VirtualObjectRef` case.
-            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                 id: 9,
                 class_id: 3,
                 num_fields: 0,
@@ -7083,7 +7097,7 @@ mod tests {
 
     #[test]
     fn virtual_object_state_fields() {
-        let vo = VirtualObjectState {
+        let vo = VirtualObjectState { array_element_type: None,
             id: 0,
             class_id: 42,
             num_fields: 2,
@@ -7106,7 +7120,7 @@ mod tests {
                               // Stand-in native frame: a StackSlot(off) reads *(rbp + off) as i64.
         let buf: [i64; 4] = [0, 111, 0xBEEFi64, 0];
         let rbp = buf.as_ptr() as u64;
-        let vo = FrameValue::VirtualObject(VirtualObjectState {
+        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 9,
             class_id: 7,
             num_fields: 4,
@@ -7567,7 +7581,7 @@ mod tests {
             method_key: "M".to_string(),
             bci: 0,
             locals: vec![
-                FrameValue::VirtualObject(VirtualObjectState {
+                FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                     id: 0,
                     class_id: 1,
                     num_fields: 1,
@@ -7575,7 +7589,7 @@ mod tests {
                 }),
                 FrameValue::Int(5),
             ],
-            stack: vec![FrameValue::VirtualObject(VirtualObjectState {
+            stack: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 0,
@@ -8155,7 +8169,7 @@ mod frame_state_interning_tests {
 
         // a duplicate virtual-object definition
         let mut p = good_point();
-        let vo = FrameValue::VirtualObject(VirtualObjectState {
+        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -8358,7 +8372,7 @@ mod frame_state_interning_tests {
         // A poisoned virtual-object field poisons the slot, chunked or not.
         let poisoned = owned(
             0,
-            vec![FrameValue::VirtualObject(VirtualObjectState {
+            vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 2,

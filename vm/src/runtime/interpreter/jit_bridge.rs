@@ -7094,6 +7094,28 @@ pub(super) fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
+    // The eager first-call door's half of the deferred-`new` retry. This door
+    // reaches the backend directly and produces no `CompileOutcome`, so the
+    // worker-loop route in `compile_one_task` never sees a method compiled
+    // here -- which is every method the interpreter hands over on its own,
+    // `RJitGc.make` among them. The one-shot memo is consumed here exactly as
+    // it is there, so the two doors together still produce at most one extra
+    // compile per method.
+    if crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        )
+    {
+        shared.jit.tiered_manager.request_deferred_new_retry(
+            &crate::jit::tiered::MethodKey::new(
+                &*cached.class_name,
+                &*cached.method_name,
+                &*cached.method_descriptor,
+            ),
+        );
+    }
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -7497,6 +7519,7 @@ pub(super) fn background_compile_task(
             // OSR artifacts serve loop entry; the invocation path re-tiers
             // separately, so an OSR task never seeds a C2 upgrade.
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             // A codegen attempt actually ran here; a non-publish is a real
             // failure, not a policy verdict.
             declined_permanently: false,
@@ -7547,7 +7570,21 @@ pub(super) fn background_compile_task(
     // loop enqueues a Low-priority C2 recompile after it records this C1
     // publish. Evaluated only on a successful non-optimized publish — the
     // scan + predicate are cheap and run once per method.
-    let c2_upgrade_candidate = published
+    // A method whose IR build bailed on a `new` whose class was not loaded YET
+    // is owed ONE more optimizing attempt. Note the absence of `!optimized`:
+    // that bail happens INSIDE a C2 task, which then falls through to the
+    // single-pass backend — so the C1->C2 promotion below, which is only for a
+    // C1 publish, is not the door this can use. `take_deferred_new_retry`
+    // consumes the memo, so a class still not loaded on the retry settles on
+    // single-pass exactly as before.
+    let deferred_new_retry = published
+        && crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        );
+    let c2_upgrade_candidate = (published
         && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
@@ -7567,7 +7604,7 @@ pub(super) fn background_compile_task(
                 crate::runtime::env_cache::jit_ir_call_virtual(),
             )
         })
-        .unwrap_or(false);
+        .unwrap_or(false));
     // A `None` above is not one thing. The comment on `published` already lists
     // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
     // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt
@@ -7610,6 +7647,7 @@ pub(super) fn background_compile_task(
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
+        deferred_new_retry,
         declined_permanently,
     }
 }

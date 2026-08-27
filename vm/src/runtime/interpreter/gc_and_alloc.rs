@@ -4229,7 +4229,7 @@ pub(super) fn tlab_alloc_array(
 /// spill the request into old space.  This matches `alloc_object_shared`'s
 /// object path.  Retrying young-only here used to report OOM for a tiny array
 /// while most of the heap was available as old-generation headroom.
-pub(super) fn gc_alloc_array(
+pub(crate) fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
     class_id: ClassId,
