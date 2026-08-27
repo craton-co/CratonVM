@@ -1264,7 +1264,6 @@ pub const INVENTORY: &[E] = &[
     // old behaviour. Same `off_word` shape as `osr-coverage-shadow` and
     // `xt-jit-coverage-handshake`, which are the other two default-ON rows.
     E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
-    E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },

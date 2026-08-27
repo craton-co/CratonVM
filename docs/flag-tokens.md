@@ -558,7 +558,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-231 tokens.
+232 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -763,7 +763,6 @@ export inherited from a parent shell.
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
 | `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
 | `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
-| `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
 | `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
@@ -798,7 +797,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-76 tokens.
+77 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -838,6 +837,7 @@ export inherited from a parent shell.
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `band-map-liveness` | `CRATONVM_GC_NO_BAND_MAP_LIVENESS` |
 | `cm-id-pairing` | `CRATONVM_GC_NO_CM_ID_PAIRING` |
 | `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
