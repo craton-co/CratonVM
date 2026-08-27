@@ -644,6 +644,9 @@ pub(super) fn compile_osr_artifact(
                     };
                     let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let type_tag = *descriptor.as_bytes().first()?;
+                    if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                        return None;
+                    }
                     static_field_info.push((
                         pc,
                         field.declaring_class_id.as_u32(),
@@ -686,6 +689,9 @@ pub(super) fn compile_osr_artifact(
                     };
                     let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let type_tag = *descriptor.as_bytes().first()?;
+                    if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                        return None;
+                    }
                     field_info.push((pc, field.field_index, type_tag));
                     if compact_fields {
                         let slot = cratonvm_types::compact_field_slot(
@@ -861,13 +867,33 @@ pub(super) fn compile_osr_artifact(
                     let target_class = class.constant_pool.get_class_name(ref_class_idx)?;
                     let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let param_count = crate::jit::count_param_slots(desc);
-                    let invoke_kind = match opcode {
+                    let mut invoke_kind = match opcode {
                         0xb6 => 0u8,
                         0xb7 => 1,
                         0xb9 => 2,
                         0xb8 => 3,
                         _ => continue,
                     };
+                    // JVMS 5.4.6 — an `invokevirtual` naming a PRIVATE method is
+                    // not a dispatch site. The OSR door reaches
+                    // `x64::compile_with_param_slots` directly, so like the
+                    // eager first-call door it has to make the reclassification
+                    // itself rather than inheriting `try_compile`'s. See
+                    // `invoke::invokevirtual_site_targets_private`.
+                    if invoke_kind == 0
+                        && super::invoke::invokevirtual_site_targets_private(
+                            &cm_lock,
+                            class_id,
+                            target_class,
+                            mn,
+                            desc,
+                        )
+                    {
+                        invoke_kind = 1;
+                        cratonvm_jit::PRIVATE_INVOKEVIRTUAL_PINNED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let invoke_kind = invoke_kind;
                     let is_recursive_call = target_class == class_name.as_str()
                         && mn == method_name.as_str()
                         && desc == method_descriptor.as_str();
@@ -4096,6 +4122,71 @@ pub(super) fn try_jit_upgrade(
     try_jit_upgrade_with_gate(shared, cached, gate)
 }
 
+
+/// How many compiled field sites were refused because the field the resolver
+/// FOUND does not have the descriptor the constant pool NAMED.
+pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Does the resolved field's own descriptor agree with the one the constant
+/// pool's `NameAndType` spells for this site?
+///
+/// # Why this has to be asked at all
+///
+/// JVMS §5.4.3.2 resolves a field by **name and descriptor**. This VM's field
+/// resolution — `MemberResolver::locate_field`, `ClassFile::find_own_field` and
+/// `find_field_recursive` underneath it — matches on the **name alone** and
+/// returns the first field of that name it meets walking the class, its
+/// superinterfaces and its superclass chain.
+///
+/// For the interpreter that is almost always harmless: it reads and writes a
+/// dynamically-tagged 16-byte cell, so landing on a same-named field of another
+/// type produces a wrong value, not a wrong SHAPE.
+///
+/// For the JIT it is not harmless, because the two halves of a compiled field
+/// site come from two different places. The **slot index** comes from that
+/// name-only search; the **type tag** comes from the constant-pool descriptor,
+/// which the search never consulted. When they name different fields the
+/// compiler emits the tag of one field at the slot of the other — and a `putfield`
+/// whose CP descriptor says `I` at a slot whose class declares `[C` writes a
+/// `Value::Int` into a reference cell. That is the punned-cell shape exactly:
+/// `SQLChar.rawData` (`[C`, slot 1) found holding `Int(1)`, dereferenced by a
+/// compiled `arraylength` as the pointer `1`
+/// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+///
+/// Refusing the site is the conservative answer: the method falls back to a
+/// tier that reads the cell's own tag, so the disagreement costs compilation
+/// rather than correctness. Fixing the resolver to match on the descriptor too
+/// is the larger change this guard makes safe to defer — and the counter says
+/// whether it is ever needed.
+///
+/// A `desc_byte` of 0 means the resolver had no descriptor to report (an empty
+/// descriptor string); that is a missing observation, not a disagreement, so it
+/// is admitted unchanged.
+/// Snapshot of [`JIT_FIELD_TAG_DISAGREEMENTS`], for the end-of-run report.
+pub fn jit_field_tag_disagreements() -> u64 {
+    JIT_FIELD_TAG_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool {
+    if field.desc_byte == 0 || field.desc_byte == cp_tag {
+        return true;
+    }
+    let n = JIT_FIELD_TAG_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 32 {
+        tracing::warn!(
+            target: "cratonvm::jit",
+            cp_index = cp_idx,
+            declaring_class_id = field.declaring_class_id.as_u32(),
+            field_index = field.field_index,
+            resolved_desc = %(field.desc_byte as char),
+            cp_desc = %(cp_tag as char),
+            "refusing a compiled field site: name-only field resolution found a field whose descriptor differs from the one the constant pool names, so the site's slot index and its type tag describe different fields",
+        );
+    }
+    false
+}
+
 /// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
 /// [`RedefineGate`] so the JIT entry inherits the same staleness binding
 /// as the bytecode entry it's replacing.  Saves one
@@ -4341,6 +4432,9 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         // `None` ⇒ no genuine compact slot for this field (class has no
         // registered `CompactLayout`, or the index falls outside it).
         // Fabricating a `(0, false)` placeholder here poisoned the JIT's
@@ -4372,6 +4466,9 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         Some((
             field.declaring_class_id.as_u32(),
             field.field_index,
@@ -4411,7 +4508,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // rule needs. Returns `None` (no override) whenever the redirect does
     // not apply, which is the overwhelming majority of `invokespecial` sites
     // (constructors, private methods, ordinary direct-superclass supers).
-    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+    let invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -4428,7 +4525,43 @@ pub(super) fn try_jit_upgrade_with_gate(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+        // method selects exactly that method: no override lookup, no walk up
+        // from the receiver. javac emits 0xb6 for a call to a private instance
+        // method from Java 11 on (JEP 181 nestmates), where it used to emit
+        // `invokespecial` -- so this is now the ordinary encoding of
+        // `this.somePrivateHelper()`, including the
+        // constructor-calls-its-own-`init()` shape that
+        // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+        // `HttpClientOptions` all use, one per level of the same chain.
+        //
+        // Answering here reclassifies the site as a DIRECT bind at the
+        // declaring class, which is what stops the compiled dispatchers
+        // resolving it from the receiver and landing on the most-derived
+        // same-named private method.
+        //
+        // Access control makes the answer precise rather than a guess: a
+        // private method is invocable only from the class that declares it, so
+        // the constant pool's owner name is this compiling class itself and no
+        // loader-blind name lookup is in play.
+        if opcode == 0xb6 {
+            let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
+            let store = cm.class_store();
+            let (method, declaring_id) = crate::classloading::find_method_recursive(
+                cp_class_id,
+                method_name,
+                descriptor,
+                store,
+            )?;
+            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return None;
+            }
+            return store.get(declaring_id).map(|c| c.name.to_string());
+        }
+        if opcode != 0xb7 {
+            return None;
+        }
         let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(
@@ -4874,6 +5007,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
+                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                    return None;
+                }
                 // `None` ⇒ no genuine compact slot — do NOT fabricate
                 // `(0, false)` (see the sibling resolver's comment).
                 Some((
@@ -4899,6 +5035,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
+                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                    return None;
+                }
                 Some((
                     field.declaring_class_id.as_u32(),
                     field.field_index,
@@ -4935,7 +5074,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // `try_compile`'s doc comment. `callee_cid` is the class whose
             // bytecode is being compiled here (the eagerly-compiled callee),
             // i.e. the calling class for every invoke site in ITS bytecode.
-            let c_invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+            let c_invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -4952,7 +5091,43 @@ pub(super) fn try_jit_upgrade_with_gate(
                     _ => return None,
                 };
                 let target_class = class.constant_pool.get_class_name(class_idx)?;
-                let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+                // method selects exactly that method: no override lookup, no walk up
+                // from the receiver. javac emits 0xb6 for a call to a private instance
+                // method from Java 11 on (JEP 181 nestmates), where it used to emit
+                // `invokespecial` -- so this is now the ordinary encoding of
+                // `this.somePrivateHelper()`, including the
+                // constructor-calls-its-own-`init()` shape that
+                // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+                // `HttpClientOptions` all use, one per level of the same chain.
+                //
+                // Answering here reclassifies the site as a DIRECT bind at the
+                // declaring class, which is what stops the compiled dispatchers
+                // resolving it from the receiver and landing on the most-derived
+                // same-named private method.
+                //
+                // Access control makes the answer precise rather than a guess: a
+                // private method is invocable only from the class that declares it, so
+                // the constant pool's owner name is this compiling class itself and no
+                // loader-blind name lookup is in play.
+                if opcode == 0xb6 {
+                    let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
+                    let store = cm.class_store();
+                    let (method, declaring_id) = crate::classloading::find_method_recursive(
+                        cp_class_id,
+                        method_name,
+                        descriptor,
+                        store,
+                    )?;
+                    if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                        return None;
+                    }
+                    return store.get(declaring_id).map(|c| c.name.to_string());
+                }
+                if opcode != 0xb7 {
+                    return None;
+                }
                 let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
                 let store = cm.class_store();
                 let start = crate::classloading::invokespecial_selection_start(
@@ -5097,11 +5272,31 @@ pub(super) fn try_jit_upgrade_with_gate(
                         // test the `get_utf8_wide` guard above pairs with -- a
                         // lone-surrogate literal cannot be pooled on a Rust `String`
                         // and stays uncompilable, exactly as before.
+                        //
+                        // `callee_cid`, NOT `class_id`. This resolver reads the
+                        // CALLEE's constant pool -- `cm.get_class(callee_cid)`
+                        // three lines up, and `cp_idx` is an index into that
+                        // pool. Pairing it with the CALLER's class id hands the
+                        // runtime helper a (class, index) pair whose two halves
+                        // come from different constant pools, and the helper
+                        // then reads whatever the CALLER happens to hold at
+                        // that index. The `ClassReference` arm immediately
+                        // below always used `callee_cid`; this one did not.
+                        //
+                        // The visible failure is the benign half. Compiling
+                        // `SqlClientPool.newConnection`, which inlines
+                        // `SqlClientConnection.<init>`, baked
+                        // (SqlClientPool, cp#47) for a literal that lives at
+                        // cp#47 of SqlClientConnection; cp#47 of SqlClientPool
+                        // is a ClassReference, so the helper raised
+                        // InternalError. Had the caller held a String there
+                        // instead, compiled code would have pushed the WRONG
+                        // LITERAL and said nothing.
                         class
                             .constant_pool
                             .get_utf8(*string_index)
                             .map(|_| cratonvm_jit::JitLdcConstant::String {
-                                holder_class_id: class_id.as_u32(),
+                                holder_class_id: callee_cid.as_u32(),
                                 cp_idx,
                             })
                     }
@@ -6295,6 +6490,9 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         // `None` ⇒ no genuine compact slot for this field (class has no
         // registered `CompactLayout`, or the index falls outside it).
         // Fabricating a `(0, false)` placeholder here poisoned the JIT's
@@ -6326,6 +6524,9 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         Some((
             field.declaring_class_id.as_u32(),
             field.field_index,
@@ -6361,7 +6562,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // `invokespecial_owner_resolver` above / `try_compile`'s doc comment.
     // `cid` is this callee's own declaring class, i.e. the calling class for
     // every invoke site scanned in its bytecode.
-    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+    let invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -6378,7 +6579,43 @@ pub(super) fn try_jit_compile_callee_slow(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+        // method selects exactly that method: no override lookup, no walk up
+        // from the receiver. javac emits 0xb6 for a call to a private instance
+        // method from Java 11 on (JEP 181 nestmates), where it used to emit
+        // `invokespecial` -- so this is now the ordinary encoding of
+        // `this.somePrivateHelper()`, including the
+        // constructor-calls-its-own-`init()` shape that
+        // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+        // `HttpClientOptions` all use, one per level of the same chain.
+        //
+        // Answering here reclassifies the site as a DIRECT bind at the
+        // declaring class, which is what stops the compiled dispatchers
+        // resolving it from the receiver and landing on the most-derived
+        // same-named private method.
+        //
+        // Access control makes the answer precise rather than a guess: a
+        // private method is invocable only from the class that declares it, so
+        // the constant pool's owner name is this compiling class itself and no
+        // loader-blind name lookup is in play.
+        if opcode == 0xb6 {
+            let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
+            let store = cm.class_store();
+            let (method, declaring_id) = crate::classloading::find_method_recursive(
+                cp_class_id,
+                method_name,
+                descriptor,
+                store,
+            )?;
+            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return None;
+            }
+            return store.get(declaring_id).map(|c| c.name.to_string());
+        }
+        if opcode != 0xb7 {
+            return None;
+        }
         let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(
