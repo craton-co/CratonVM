@@ -318,6 +318,127 @@ impl NativeAccessPolicy {
 static NATIVE_ACCESS_POLICY: std::sync::RwLock<NativeAccessPolicy> =
     std::sync::RwLock::new(NativeAccessPolicy::None);
 
+/// What to do when a RESTRICTED method is called by a module that was not
+/// granted native access — JDK's `--illegal-native-access`.
+///
+/// The default is [`Warn`](IllegalNativeAccess::Warn) because that is what a
+/// JDK 25 launcher does, MEASURED rather than assumed
+/// (`probes/RestrictedFfmPolicyProbe.java`, Adoptium 25.0.4):
+///
+/// ```text
+/// java              …  reinterpret -> OK, byteSize=128   (+4 WARNING lines)
+/// java --illegal-native-access=deny
+///                   …  reinterpret -> IllegalCallerException
+/// ```
+///
+/// CratonVM denied unconditionally, so any library calling a restricted method
+/// from a static initialiser died with `ExceptionInInitializerError` — which
+/// JVMS 5.5 makes permanent for that class. Infinispan's
+/// `OffHeapMemoryAllocator` does exactly that, taking three Spring Boot
+/// `CacheAutoConfigurationTests` cases with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IllegalNativeAccess {
+    /// Permit silently.
+    Allow,
+    /// Permit, and warn once — the JDK 25 default, and ours.
+    Warn,
+    /// Throw `IllegalCallerException`, as `--illegal-native-access=deny` does.
+    Deny,
+}
+
+/// 0 = Allow, 1 = Warn, 2 = Deny. Plain integer rather than a lock: this is
+/// read on every restricted call and written once, before any bytecode runs.
+static ILLEGAL_NATIVE_ACCESS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(1);
+
+/// Set the `--illegal-native-access` mode. Called from the launcher before the
+/// VM starts.
+pub fn set_illegal_native_access(mode: IllegalNativeAccess) {
+    let v = match mode {
+        IllegalNativeAccess::Allow => 0,
+        IllegalNativeAccess::Warn => 1,
+        IllegalNativeAccess::Deny => 2,
+    };
+    ILLEGAL_NATIVE_ACCESS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current `--illegal-native-access` mode.
+pub fn illegal_native_access() -> IllegalNativeAccess {
+    match ILLEGAL_NATIVE_ACCESS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => IllegalNativeAccess::Allow,
+        2 => IllegalNativeAccess::Deny,
+        _ => IllegalNativeAccess::Warn,
+    }
+}
+
+/// HotSpot prints its restricted-method warning ONCE per calling module, and
+/// the only module we can attribute to is the unnamed one, so this fires once
+/// per process.
+static RESTRICTED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The gate for a genuinely RESTRICTED method (`reinterpret`, `libraryLookup`,
+/// downcalls, upcalls) — the ones the JDK annotates `@Restricted`.
+///
+/// Distinct from [`require_native_access`], which guards the raw-address
+/// ACCESSORS. The difference is the JDK's, not ours: a missing grant makes a
+/// restricted method warn, while the accessors are not restricted at all.
+///
+/// The host-policy and capability rows run in every arm, granted or not — they
+/// are a separate axis from the JDK flag, and dropping them here would turn a
+/// policy question into a flag question.
+fn restricted_method_check(
+    ctx: &mut dyn NativeContext,
+    method: &str,
+) -> Result<(), MethodCallFailed> {
+    if !native_access_enabled() {
+        // `untrusted_code` is NOT the JDK flag and must not be relaxed by it.
+        // `native_access_enabled()` already returns false in that mode, so
+        // without this the new `Warn` default would let a restricted call
+        // through where the old unconditional refusal stopped it — the one
+        // place this change could have weakened something rather than aligned
+        // it. Sandbox first, JDK policy second.
+        if cratonvm_types::flags::flags().io.untrusted_code {
+            return Err(RuntimeError::IllegalCallerException {
+                message: "Native access is not enabled for this module                           (untrusted-code mode)"
+                    .into(),
+            }
+            .into());
+        }
+        match illegal_native_access() {
+            IllegalNativeAccess::Deny => {
+                // Message shape follows the JDK's `deny` text rather than the
+                // old CratonVM wording, so a caller matching on it sees what
+                // HotSpot emits.
+                return Err(RuntimeError::IllegalCallerException {
+                    message: "Illegal native access from an unnamed module".into(),
+                }
+                .into());
+            }
+            IllegalNativeAccess::Warn => {
+                if !RESTRICTED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "WARNING: A restricted method in java.lang.foreign.MemorySegment has been called"
+                    );
+                    eprintln!(
+                        "WARNING: java.lang.foreign.MemorySegment::{method} has been called by code in an unnamed module"
+                    );
+                    eprintln!(
+                        "WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module"
+                    );
+                    eprintln!(
+                        "WARNING: Restricted methods will be blocked in a future release unless native access is enabled"
+                    );
+                }
+            }
+            IllegalNativeAccess::Allow => {}
+        }
+    }
+    crate::security_manager::check_host_native_access_or_throw(ctx, "foreign")?;
+    crate::capability_gate::gate_raw_memory_named(&*ctx, method)?;
+    Ok(())
+}
+
 /// Replace the process native-access policy wholesale.
 fn store_policy(policy: NativeAccessPolicy) {
     if let Ok(mut guard) = NATIVE_ACCESS_POLICY.write() {
@@ -1651,28 +1772,21 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
             };
-            // Gate raw-address wrapping behind native access: turning an
-            // arbitrary caller-supplied long into an addressable segment is
-            // equivalent to arbitrary process-memory access once paired with
-            // reinterpret/get/set. Refuse unless native access is enabled.
+            // `ofAddress` is NOT restricted, and the JDK does not gate it —
+            // measured on Adoptium 25.0.4, it answers a segment even under
+            // `--illegal-native-access=deny`, which is the strictest setting
+            // the launcher has:
             //
-            // EXCEPTION: address 0 (`MemorySegment.NULL`, a zero-length
-            // segment that can never be dereferenced) is always permitted,
-            // matching real JDK. `MemorySegment`'s own <clinit> builds `NULL`
-            // via `ofAddress(0)` before any user code runs and before any
-            // module has had a chance to request native access; gating that
-            // internal bootstrap call poisons the class forever (a <clinit>
-            // failure is a permanent NoClassDefFoundError for every
-            // subsequent use, per JVMS 5.5) even though HotSpot never denies
-            // access to the harmless null segment.
-            if addr != 0 && !native_access_enabled() {
-                return Err(RuntimeError::IllegalCallerException {
-                    message: "Native access is not enabled for this module \
-                              (MemorySegment.ofAddress denied)"
-                        .into(),
-                }
-                .into());
-            }
+            //     java                                 ofAddress -> OK, byteSize=0
+            //     java --illegal-native-access=deny    ofAddress -> OK, byteSize=0
+            //
+            // The safety is structural rather than a flag: the segment it
+            // returns has length ZERO, so every access through it is an
+            // IndexOutOfBoundsException. Widening it needs `reinterpret`, and
+            // THAT is the restricted call — which is where the check now lives.
+            // The refusal that used to sit here had no counterpart in the JDK
+            // at any setting, and the `addr != 0` carve-out it needed for
+            // `MemorySegment.NULL`'s own <clinit> was the tell.
             let seg = alloc_segment_carrier(ctx, 6)?;
             ctx.set_field(seg, 0, Value::Long(addr));
             ctx.set_field(seg, 1, Value::Long(0)); // unknown size
@@ -6733,18 +6847,13 @@ pub(crate) fn pe_segment_reinterpret(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Gate size-stamping behind native access: reinterpret can grant an
-    // arbitrary access window over a (possibly raw) address, which is
-    // the second half of the arbitrary-memory primitive. Refuse unless
-    // native access is enabled.
-    if !native_access_enabled() {
-        return Err(RuntimeError::IllegalCallerException {
-            message: "Native access is not enabled for this module \
-                      (MemorySegment.reinterpret denied)"
-                .into(),
-        }
-        .into());
-    }
+    // `reinterpret` IS `@Restricted` in the JDK — it grants an arbitrary access
+    // window over a possibly-raw address. But restricted does not mean refused:
+    // a JDK 25 launcher warns and proceeds unless `--illegal-native-access=deny`
+    // (measured, see [`IllegalNativeAccess`]). Refusing unconditionally is a
+    // policy CratonVM invented, and it is load-bearing in the worst place — a
+    // static initialiser, where the throw is permanent for the class.
+    restricted_method_check(ctx, "reinterpret")?;
     let new_size = match args.get(1) {
         Some(Value::Long(n)) => *n,
         _ => 0,
