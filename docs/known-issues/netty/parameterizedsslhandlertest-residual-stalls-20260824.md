@@ -318,7 +318,7 @@ first statement is the `class_id_of_object` that faulted. So the value the pin
 HANDED BACK was already stale: this is not "a native forgot to pin", it is
 "the pin did not hold".
 
-### Three ways that can happen, and the instrument for each
+### Four ways that can happen, and where each one stands
 
 1. ~~**The pin slot was never remapped**~~ — **REFUTED by inspection.** There
    are THREE paths, not the two an earlier revision of this page listed, and
@@ -331,17 +331,80 @@ HANDED BACK was already stale: this is not "a native forgot to pin", it is
    that reaches this line resumes through `apply_pointer_map_to_thread` and
    remaps its own frames"). The peer-safepoint gap this page suspected does
    not exist.
-2. **The forward was never recorded**, so no remap could have applied. The
-   `[gcpart]` ring answers this and is armed.
+2. **The forward was never recorded**, so no remap could have applied.
+   A real instance of this shape WAS found — the CAS-loser arm, below — and
+   its engagement on this workload measured **0**. So the shape exists in the
+   collector and is now closed, but it is not this stall.
 3. **Pin-stack imbalance.** `read_native_pin` silently falls back to the RAW
    `fallback` address when its handle is past the pin stack — a callee
    truncated below this caller's pins. The tree already has the diagnostic
-   (`PIN-DANGLING`, plus a ring naming the truncator), gated behind
-   `CRATONVM_DBG=blockgc` / `unpin-ring`. Measured at 190 lines on a
-   whole-class run, so arming it is practical; `huntloop.sh` now does.
+   (`PIN-DANGLING`, plus a ring naming the truncator) behind
+   `CRATONVM_DBG=blockgc` / `unpin-ring`. **0 hits across 78 armed
+   whole-class runs** — all of which PASSED, so this is not yet a negative for
+   a stalling run. Inspection agrees so far: every `pin_base` in `vm/src` is
+   `native_pin_roots.len()` captured at entry, which is the correct
+   discipline.
+4. **A discarded fixup at native-unblock.** A thread that a peer's collection
+   stopped while it was inside a blocking native cannot have its `JvmThread`
+   touched by the collector, so the map is folded into the shared
+   `gc_block_state.fixup` instead. `check_post_block_gc_refs` APPLIES that
+   fixup (including to `native_pin_roots`); `mark_native_thread_unblocked`
+   CLEARS it, with a debug line that says so outright —
+   `"[blockgc] native-unblock DISCARDS {} fixups"`. A thread leaving through
+   `VmNativeThreadBlocker::leave_blocked` takes the second path.
+   **0 DISCARDS lines across the same 78 armed runs**, i.e. the fixup was
+   always already empty there — so on healthy runs `check_post_block_gc`
+   drains it first, as intended. Same caveat: no stalling run has been caught
+   with this armed.
 
-Two remain, they need different fixes, and the page does not pick between
-them. What is established is the holder and that its pin did not hold.
+So of four, one is refuted by inspection, one is found-and-closed but
+measured inert on this workload, and two are unmeasured ON A STALLING RUN
+while reading zero on 78 healthy ones. What is established is the holder and
+that its pin did not hold; which mechanism explains it is still open, and the
+page does not pick.
+
+The next catch decides it: `huntloop.sh` arms `PIN-DANGLING`, the
+`DISCARDS` line, the `[gcpart]` ring and the CAS-loser counter together, so a
+single stalling run answers all four at once.
+
+### A second unrecorded-forward hole, found by inspection — and its engagement is ZERO
+
+Mechanism 2 above ("the forward was never recorded") turns out to have a real
+instance, and it is the same shape as one already fixed. `evacuate`'s parallel
+path can return a forwarding address three ways, and only two of them recorded
+it in `forwards` — which becomes the cycle's `pointer_map`:
+
+| path | recorded? |
+|---|---|
+| fast path: already forwarded when we looked | yes — DEFECT-2 part 1 |
+| we won the CAS and copied | yes |
+| **we LOST the CAS to another worker** | **no** |
+
+The third arm returned the winner's target and dropped `old_ptr -> target`,
+which is verbatim what DEFECT-2 part 1 fixed for the first — and that fix's own
+comment names the symptom it leaves: *"no root naming `old_ptr` could be
+remapped … it dangled when the region was reused (the rare
+`java/lang/Object`)."* It also has the right shape for the load dependence this
+page has recorded since 2026-08-24 and never explained: losing that CAS needs
+TWO WORKERS RACING ON ONE OBJECT, so it gets commoner exactly as parallelism
+rises.
+
+That is a good story, and **the counter shipped with the fix refuses it.**
+`CRATONVM_DBG=jit-method-stats` prints the arm's hit count at exit:
+
+```
+[cratonvm] G1 evacuation CAS losses (forwards this VM would have dropped
+           before the 2026-08-26 fix): 0
+```
+
+**Zero, on a full clean whole-class run at 600m** — 63 tests, the same
+configuration the catches come from. So the hole is real and worth closing, but
+on this workload the arm is not reached and it **cannot be what stalls this
+test**. The fix is landed as a latent defect, not as this page's answer.
+
+What the zero does NOT settle: a clean run is not a stalling one, and the arm
+needs the race that load produces. `huntloop.sh` now prints the counter on
+every run, so the next CATCH carries its own answer for the run that failed.
 
 ### The fix A/B is INCONCLUSIVE, and the reason is worth more than the table
 

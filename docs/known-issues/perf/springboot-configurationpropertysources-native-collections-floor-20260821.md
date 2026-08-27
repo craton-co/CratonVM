@@ -469,10 +469,32 @@ cursor tolerated that; the real one reads it as an int and compares it to
 
 A values view hands out an `ArrayList$Itr`, the same class an ordinary list
 does, so a class-name allow-list cannot separate the two cases. **The enabling
-change is to mint a distinct iterator class for view carriers** (the
-`VALUES_ITR_CARRIERS` machinery already exists for the values families) so that
-`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its
-own. Do that and this 6.2× is available.
+change is to mint a distinct iterator class for view carriers** so that
+`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its own.
+
+**CENSUSED 2026-08-24, and it is two receivers, not a family of them.**
+`probes/ItrClassProbe` (new) prints `iterator().getClass().getName()` for 35
+receivers. Almost everything already has its own cursor — every map view of
+`HashMap`, `LinkedHashMap`, `TreeMap` and `Hashtable`, plus sublists,
+`Arrays.asList`, COW and `LinkedList`. Only six land on the shared
+`ArrayList$Itr`, and four of those are fine:
+
+| receiver | CratonVM | verdict |
+|---|---|---|
+| `arrayList` | `ArrayList$Itr` | correct — a real list |
+| `synchList` | `ArrayList$Itr` | **safe**, and matches HotSpot: `SynchronizedCollection.iterator()` returns the backing list's own |
+| `vector`, `stack` | `ArrayList$Itr` | **safe** for this purpose — `Vector` extends `AbstractList`, so it HAS a `modCount` (HotSpot says `Vector$Itr`; a separate, cosmetic divergence) |
+| `chm.values` | `ArrayList$Itr` | **BLOCKER** — `ConcurrentHashMap$ValuesView` extends `CollectionView`/`AbstractCollection`, no `modCount` |
+| `priorityQueue` | `ArrayList$Itr` | **BLOCKER** — `PriorityQueue` extends `AbstractQueue`/`AbstractCollection`, no `modCount` |
+
+So the enabling work is **two entries, not a redesign**: add
+`ConcurrentHashMap$ValuesView → ConcurrentHashMap$ValueIterator` to
+`VALUES_ITR_CARRIERS` (which already carries the other four values families),
+and give `PriorityQueue` its own `PriorityQueue$Itr`. Both are also
+HotSpot-parity fixes in their own right — the census diff shows CratonVM naming
+`ArrayList$Itr` where HotSpot names `ConcurrentHashMap$ValueIterator` and
+`PriorityQueue$Itr`. Do those two and the 6.2× plus the `cmeClear` correctness
+fix are both available.
 
 **A coverage note worth acting on independently:** `regression-suite/run.sh`
 passed **72/72 on the broken binary**. A change that makes

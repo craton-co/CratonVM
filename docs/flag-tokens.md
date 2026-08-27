@@ -558,7 +558,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-229 tokens.
+231 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -688,6 +688,7 @@ export inherited from a parent shell.
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
+| `staged-arg-shadow` | `CRATONVM_JIT_NO_STAGED_ARG_SHADOW` |
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
@@ -762,8 +763,10 @@ export inherited from a parent shell.
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
 | `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
 | `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
+| `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
+| `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
