@@ -18,6 +18,17 @@ import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509ExtendedTrustManager;
+import java.net.Socket;
+import java.security.KeyStore;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.io.FileInputStream;
+
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.Arrays;
@@ -81,6 +92,22 @@ public final class OpenSslTls13ClientCertProbe {
             run(r, localhostCert, localhostCert, "localhost", "TLSv1.3", false, "HTTPS");
             run(r, localhostCert, localhostCert, "localhost", "TLSv1.3", true, "HTTPS");
         }
+
+        // THE REPRODUCER, run last and scored separately. A trust manager that
+        // re-enters tcnative from inside BoringSSL's callback is the open
+        // defect; on HotSpot these two rows PASS, on CratonVM the
+        // `useTasks=false` one is expected to fail with
+        // PEER_DID_NOT_RETURN_A_CERTIFICATE. It is reported, never counted into
+        // `failures`, because this probe's exit status is about the VM's own
+        // fixes and not about a defect it is only demonstrating.
+        int before = failures;
+        run(0, serverCert, clientCert, "127.0.0.1", "TLSv1.3", false, null, true);
+        run(0, serverCert, clientCert, "127.0.0.1", "TLSv1.3", true, null, true);
+        int reproduced = failures - before;
+        failures = before;
+        System.out.println("@@REPRO reentrant-trust-manager rows_failed=" + reproduced
+                + " (HotSpot: 0; a VM with the open re-entrancy defect: 1, the useTasks=false row)");
+
         System.out.println("@@PROBE failures=" + failures);
         if (failures != 0) {
             System.exit(1);
@@ -90,6 +117,12 @@ public final class OpenSslTls13ClientCertProbe {
     private static void run(int round, SelfSignedCertificate serverCert,
             SelfSignedCertificate clientCert, String host, String protocol, boolean useTasks,
             String identificationAlgorithm) throws Exception {
+        run(round, serverCert, clientCert, host, protocol, useTasks, identificationAlgorithm, false);
+    }
+
+    private static void run(int round, SelfSignedCertificate serverCert,
+            SelfSignedCertificate clientCert, String host, String protocol, boolean useTasks,
+            String identificationAlgorithm, boolean reenterFromCallback) throws Exception {
         String cipher = "TLSv1.3".equals(protocol)
                 ? "TLS_AES_128_GCM_SHA256" : "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256";
 
@@ -103,7 +136,9 @@ public final class OpenSslTls13ClientCertProbe {
                 .build();
         SslContext clientCtx = SslContextBuilder.forClient()
                 .keyManager(clientCert.certificate(), clientCert.privateKey())
-                .trustManager(serverCert.cert())
+                .trustManager(reenterFromCallback
+                        ? new ReentrantTrustManager(trustManagerFor(serverCert.certificate()))
+                        : trustManagerFor(serverCert.certificate()))
                 .sslProvider(SslProvider.OPENSSL)
                 .protocols(protocol)
                 .ciphers(Arrays.asList(cipher), IdentityCipherSuiteFilter.INSTANCE)
@@ -176,6 +211,7 @@ public final class OpenSslTls13ClientCertProbe {
                     + " protocol=" + protocol
                     + " useTasks=" + useTasks
                     + " identify=" + identificationAlgorithm
+                    + " reenter=" + reenterFromCallback
                     + " connect=" + ccf.isSuccess()
                     + " clientHandshake=" + clientOk[0]
                     + " serverHandshake=" + serverOk[0]
@@ -192,6 +228,102 @@ public final class OpenSslTls13ClientCertProbe {
             sg.shutdownGracefully();
             cg.shutdownGracefully();
         }
+    }
+
+    /**
+     * A trust manager that makes the offending call ITSELF.
+     *
+     * This is the reproducer for
+     * `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`,
+     * and it lives here rather than behind a VM flag on purpose. The defect is
+     * "Java re-enters tcnative from inside BoringSSL's certificate callback",
+     * so a trust manager calling `engine.getSSLParameters()` from that callback
+     * IS the defect — no switch in the shipped VM is needed to arm it, and a
+     * shipped VM should not carry one that can weaken or break TLS.
+     *
+     * `getSSLParameters()` on netty's `ReferenceCountedOpenSslEngine` is
+     * `synchronized` and re-enters tcnative for `SSL.getOptions` and, through
+     * `super.getSSLParameters()` -> `getEnabledCipherSuites()`, `SSL.getCiphers`
+     * — on the very `SSL*` BoringSSL is inside. The result is read and thrown
+     * away: what matters is that the call was made, not what it answered.
+     */
+    static final class ReentrantTrustManager extends X509ExtendedTrustManager {
+        private final X509ExtendedTrustManager delegate;
+
+        ReentrantTrustManager(X509ExtendedTrustManager delegate) {
+            this.delegate = delegate;
+        }
+
+        private static void reenter(SSLEngine engine) {
+            try {
+                engine.getSSLParameters().getEndpointIdentificationAlgorithm();
+            } catch (RuntimeException ignored) {
+                // The call being MADE is the experiment; its answer is not.
+            }
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] c, String a, SSLEngine e)
+                throws CertificateException {
+            reenter(e);
+            delegate.checkServerTrusted(c, a, e);
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] c, String a, SSLEngine e)
+                throws CertificateException {
+            reenter(e);
+            delegate.checkClientTrusted(c, a, e);
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] c, String a) throws CertificateException {
+            delegate.checkServerTrusted(c, a);
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] c, String a) throws CertificateException {
+            delegate.checkClientTrusted(c, a);
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] c, String a, Socket s)
+                throws CertificateException {
+            delegate.checkServerTrusted(c, a, s);
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] c, String a, Socket s)
+                throws CertificateException {
+            delegate.checkClientTrusted(c, a, s);
+        }
+
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return delegate.getAcceptedIssuers();
+        }
+    }
+
+    /** The default JDK trust manager over a single trusted certificate. */
+    private static X509ExtendedTrustManager trustManagerFor(java.io.File certFile) throws Exception {
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+        ks.load(null, null);
+        try (FileInputStream in = new FileInputStream(certFile)) {
+            int i = 0;
+            for (java.security.cert.Certificate c : cf.generateCertificates(in)) {
+                ks.setCertificateEntry("ca" + i++, c);
+            }
+        }
+        TrustManagerFactory tmf =
+                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(ks);
+        for (TrustManager tm : tmf.getTrustManagers()) {
+            if (tm instanceof X509ExtendedTrustManager) {
+                return (X509ExtendedTrustManager) tm;
+            }
+        }
+        throw new IllegalStateException("no X509ExtendedTrustManager");
     }
 
     private static void setUseTasks(SslContext ctx, boolean useTasks) {

@@ -5733,16 +5733,68 @@ fn call_site_is_hot(
 ///    switched off, the IR is back to paying the helper per call and the
 ///    original rejection is still the right answer.
 ///
-/// ALLOCATION-bearing methods remain excluded, unchanged: the IR's allocation
-/// lowering differs from the single-pass inline-TLAB bump, and the IR call
-/// eligibility loop requires `new_ops.is_empty()` anyway, so an
-/// allocation-bearing method's invokes would bail the builder.
+/// # Allocation-bearing methods: excluded until 2026-08-27, and why that ended
+///
+/// This predicate used to refuse any method containing a `new`, on two stated
+/// grounds. The second — "the IR call eligibility loop requires
+/// `new_ops.is_empty()` anyway, so an allocation-bearing method's invokes would
+/// bail the builder" — was already FALSE when it was written down: cov-04
+/// increment 2 deleted that conjunct (`call_eligible` is now
+/// `scan.anewarray_ops.is_empty()` alone) with the note that "the term outlived
+/// its reason". A live run says the same thing out loud:
+/// `invoke-plan VolumeShort2.loadFromArray: new_ops=1 ... call_eligible=true`.
+///
+/// The first ground — that the IR lowers an allocation through the shared
+/// `jit_new_object` stub where single-pass emits an inline TLAB bump — is real,
+/// but it is an argument about a SURVIVING allocation. The allocations this
+/// gate kept out are exactly the ones escape analysis exists to DELETE, and EA
+/// runs only at C2. So the gate was self-defeating: an allocation-bearing
+/// method could never reach the tier that removes its allocations.
+///
+/// Measured on kfusion's per-voxel `Short2` (`VolumeShort2.loadFromArray`, one
+/// `new` per voxel, 16.7M voxels a frame): the method was pinned at C1 and its
+/// allocation survived at ~708 ns/voxel of the 755 ns total, against ~2 ns on
+/// HotSpot, whose EA scalar-replaces the same object.
+///
+/// `anewarray` and `indy` stay excluded and keep their own reasons:
+/// `IrBuilder::build` has no `0xbd` arm at all, and `ir_compatible` refuses
+/// `indy` a stage earlier.
+///
+/// The refusal is therefore LIFTABLE, but lifting it is opt-in
+/// (`CRATONVM_JIT_C2_ALLOC_UPGRADE=1`) rather than default: doing so measured
+/// neutral on the kfusion voxel probe, because that allocation escapes its
+/// method by being RETURNED (`loadFromArray` ends in `areturn`), and per-method
+/// EA cannot scalar-replace an escaping object however good its tier. Killing
+/// it needs the accessor chain INLINED into the consuming loop first, then EA
+/// on the merged graph — which is a capability, not a gate. See
+/// `c2_alloc_upgrade_enabled` for the regression mechanism that keeps this off
+/// by default.
 ///
 /// This predicate deliberately stays a cheap, scan-only approximation (it
 /// cannot resolve a constant pool), so it can admit a method the IR later
 /// bails on — e.g. a constructor whose `invokespecial` is an `<init>` super
 /// call. That costs a wasted optimizing compile whose result is discarded in
 /// favour of the single-pass body; it is never a correctness risk.
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` — let an allocation-bearing method take
+/// the C1->C2 supersede. OPT-IN, deliberately.
+///
+/// The refusal it lifts is stale (see [`c2_upgrade_would_engage`]), but lifting
+/// it was measured NEUTRAL on the workload that motivated it, and it has a real
+/// regression mechanism that has NOT been priced: at C2 a surviving allocation
+/// lowers through the shared `jit_new_object` stub, where the single-pass body
+/// emits an inline TLAB bump. A method whose allocations escape therefore trades
+/// a cheaper allocation for a more optimized body, and nothing measured here
+/// says which way that lands.
+///
+/// So this ships as a lever to price the trade on the gauntlet, not as a
+/// default. Turning it on is the A arm; leaving it off is every prior build.
+fn c2_alloc_upgrade_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+    })
+}
+
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -5754,7 +5806,10 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
+    if !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
+        return false;
+    }
+    if !scan.new_ops.is_empty() && !c2_alloc_upgrade_enabled() {
         return false;
     }
     if !scan.invoke_ops.is_empty() {
