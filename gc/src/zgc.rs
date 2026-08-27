@@ -7906,118 +7906,32 @@ impl ZgcRealHeap {
         work: &mut Vec<usize>,
         skip_index: Option<usize>,
     ) {
-        let header = self.header_mut(base);
-        match header.kind() {
-            ObjectKind::Object => {
-                if cratonvm_types::is_compact_object(header) {
-                    // Borrowing accessor: this walk only reads `field_offsets` /
-                    // `is_ref` and drops the handle, so it need not pay the
-                    // `Arc` clone/drop that `class_layout_for_fields` implies.
-                    let _ = cratonvm_types::with_class_layout(
-                        header.class_id.as_u32(),
-                        header.num_slots(),
-                        |layout| {
-                            for (index, (&offset, &is_ref)) in layout
-                                .field_offsets
-                                .iter()
-                                .zip(layout.is_ref.iter())
-                                .enumerate()
-                            {
-                                if !is_ref || skip_index == Some(index) {
-                                    continue;
-                                }
-                                // SAFETY: `offset` comes from this object's own
-                                // registered layout — the layout its body was
-                                // sized with at allocation — so the field lies
-                                // inside the allocation, and `read_ref_slot`
-                                // reads exactly `ref_field_size()` bytes of it.
-                                //
-                                // WHY NOT `std::ptr::read(slot as *const u64)`:
-                                // that is what stood here, and it was wrong
-                                // under compressed oops. `ref_field_size()` is
-                                // 4 when narrow oops are on, so an
-                                // unconditional 8-byte load reads one field
-                                // plus half of the next and calls the result a
-                                // pointer. Every compact reference field then
-                                // traces to garbage — silently refused by the
-                                // registry/`is_in_heap` screen, so nothing
-                                // looks wrong — and the real referent is never
-                                // traced at all: a live object collected.
-                                //
-                                // It was LATENT, never live, and only because
-                                // of a gate in another crate:
-                                // `vm/src/vm/vm_init.rs` (the
-                                // `gc_backend != GcBackend::Generational`
-                                // branch, ~line 1397) refuses compressed oops
-                                // for every backend except `Generational`, so
-                                // ZGC has never seen a narrow slot. THAT GATE
-                                // MUST NOT BE RELAXED PER-BACKEND WITHOUT
-                                // AUDITING EVERY REFERENCE-SLOT READ IN THE
-                                // COLLECTOR BEING ENABLED. `gc/src/g1.rs` was
-                                // audited on 2026-08-07 and still carries the
-                                // same wide-read pattern, held off by the same
-                                // gate; `gen_heap.rs`, the one collector the
-                                // gate admits, is clean.
-                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
-                                let raw =
-                                    unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
-                                if raw != 0 {
-                                    work.push(raw as usize);
-                                }
-                            }
-                        },
-                    );
-                } else {
-                    // The legacy arm is NOT narrow-oop territory and must not be
-                    // "fixed" to match the compact arm above. A legacy field is a
-                    // whole 16-byte `Value` cell (`SLOT_SIZE`, heap_types.rs:171)
-                    // whose object payload is an 8-byte raw pointer at
-                    // `FIELD_CELL_PAYLOAD64_OFFSET` (heap_types.rs:230). Both are
-                    // plain constants: neither narrows when compressed oops are
-                    // on, so the widths here are already right in both configs.
-                    let n = header.num_slots() as usize;
-                    for i in 0..n {
-                        if skip_index == Some(i) {
-                            continue;
-                        }
-                        // SAFETY: i < num_slots so the slot is within the object.
-                        let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
-                        let val = unsafe { std::ptr::read(slot as *const Value) };
-                        if let Value::Object(Some(r)) = val {
-                            work.push(r.as_ptr() as usize);
-                        }
-                    }
-                }
-            }
-            ObjectKind::Array => {
-                if header.element_type() == ArrayElementType::Reference {
-                    let len = header.array_length() as usize;
-                    // This arm was ALREADY narrow-correct and is deliberately
-                    // left calling `read_prim_element`: its `Reference` case
-                    // (gc/src/heap.rs, `ArrayElementType::Reference`) strides by
-                    // `cratonvm_types::ref_element_size()` and loads through
-                    // `narrow_oop::read_ref_slot`, exactly like the two sibling
-                    // walkers in this file. The SAFETY note here used to cite
-                    // `REF_ELEMENT_SIZE` (heap_types.rs:176) as the stride; that
-                    // is the WIDE 8-byte constant and is the wrong stride under
-                    // narrow oops, so do not reintroduce it — the code was
-                    // right, only the comment was.
-                    //
-                    // SAFETY: data area begins at base + ARRAY_DATA_OFFSET; each
-                    // ref element is `ref_element_size()` bytes and `i < len`.
-                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
-                    for i in 0..len {
-                        let val =
-                            unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
-                        if let Value::Object(Some(r)) = val {
-                            work.push(r.as_ptr() as usize);
-                        }
-                    }
-                }
-                // Primitive arrays have no out-edges.
-            }
-            ObjectKind::HumongousFiller => {}
-        }
+        // ONE implementation, not two. Until 2026-08-26 this function and
+        // `visit_strong_refs_at` were separate copies of the same walk, and the
+        // copies had drifted: this one still transmuted a whole `Value` out of
+        // each legacy cell, still had no `num_slots` screen, still ran an array
+        // element through `read_prim_element`'s null-degrade, and still dropped
+        // an unresolvable compact object's out-edges in silence — four defects
+        // its twin had already been fixed for.
+        //
+        // The fork's stated justification was SHAPE: this one fills a
+        // `&mut Vec<usize>` while `mark::ZMarkContext::visit_refs` needs a
+        // `&mut dyn FnMut(u64)` so the engine can push into its own striped
+        // work-stealing stack, and funnelling that through a `Vec` would
+        // allocate per object on every mark worker. That is a real constraint
+        // and it is satisfied here: the callback form is the implementation and
+        // the `Vec` form is this closure, which allocates nothing.
+        //
+        // The screens are the same screen. `visit_strong_refs_at` reads
+        // `num_slots > (1 << 24)` on the legacy arm, `with_class_layout(..)
+        // .is_some()` on the compact arm, and deliberately screens the array arm
+        // not at all; this function was brought to exactly those three rather
+        // than to the stronger `Self::alloc_size`, because `alloc_size` refuses
+        // an array past `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28) while `alloc_array`
+        // admits up to `i32::MAX` — and for a MARKER, refusing a legal array is
+        // a live object collected. Same screen, same reads, so the merge changes
+        // no behaviour on either path.
+        self.visit_strong_refs_at(base, skip_index, &mut |raw| work.push(raw as usize));
     }
 
     /// Bounds-and-sanity check shared by `get_field`/`set_field`. Returns the
@@ -8708,9 +8622,10 @@ impl ZgcRealHeap {
 
     /// Report every **strong** reference out-edge of the object at `base`.
     ///
-    /// # This is a FORK of [`Self::enumerate_references`], and why
+    /// # This WAS a fork of [`Self::enumerate_references`]; it is now the shared
+    /// implementation of both
     ///
-    /// It is not a wrapper for two reasons, one of shape and one historical:
+    /// It was not a wrapper for two reasons, one of shape and one historical:
     ///
     /// * **Shape.** `enumerate_references` pushes into a `&mut Vec<usize>`;
     ///   [`mark::ZMarkContext::visit_refs`] hands each child to a
@@ -8734,6 +8649,35 @@ impl ZgcRealHeap {
     ///   `enumerate_references` now uses the same
     ///   `narrow_oop::read_ref_slot` load this fork does, so the two arms agree
     ///   and this bullet records why the fork exists, not a live divergence.
+    ///
+    /// # The fork is GONE (2026-08-26). This body is the only copy.
+    ///
+    /// Only the shape bullet above ever survived scrutiny, and it is one closure
+    /// wide: [`ZgcRealHeap::enumerate_references`] is now
+    /// `self.visit_strong_refs_at(base, skip_index, &mut |raw| work.push(raw as usize))`,
+    /// which satisfies the `Vec`-versus-`FnMut` constraint without allocating.
+    ///
+    /// **The screens are the same screen, and that is what made the merge safe.**
+    /// An earlier draft had `enumerate_references` screening with
+    /// [`ZgcRealHeap::alloc_size`], which is stronger, and unifying onto it would
+    /// have been a REGRESSION rather than a hardening: `alloc_size` refuses an
+    /// array past `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28 elements) while `alloc_array`
+    /// admits up to `ZGC_REAL_MAX_ARRAY_LENGTH` (`i32::MAX`), so a legal
+    /// reference array between those bounds would have had its elements left
+    /// untraced — a live object collected. `MAX_PLAUSIBLE_ARRAY_LEN`'s own doc
+    /// states the trade; it is right for the SWEEP that reads it, where refusing
+    /// means "do not free", and wrong for a MARKER, where it means "do not
+    /// trace". So `enumerate_references` was brought DOWN to this function's
+    /// three screens — `num_slots > (1 << 24)` on the legacy arm,
+    /// `with_class_layout(..).is_some()` on the compact arm, and nothing at all
+    /// on the array arm — rather than this function being brought up to
+    /// `alloc_size`. `both_reference_enumerators_report_the_same_edges_for_every
+    /// _header_shape` is the test that keeps them one walk.
+    ///
+    /// The third fork, `census::reference_slots`, is a different matter and
+    /// stays: it keeps nulls, reports every slot with its tag whatever the tag
+    /// is, and has no `skip_index`, because it counts SLOTS rather than edges.
+    /// Merging it would make the marker carry census metadata per slot.
     ///
     /// The legacy arm also differs deliberately: it reads the cell's `u32` tag
     /// and `u64` payload directly instead of `std::ptr::read`ing a whole
@@ -8822,7 +8766,7 @@ impl ZgcRealHeap {
                         tracing::debug!(
                             target: "zgc",
                             num_slots = n,
-                            "zgc concurrent mark: suspect header, out-edges omitted"
+                            "zgc reference walk: suspect header, out-edges omitted"
                         );
                         return;
                     }
@@ -14693,6 +14637,123 @@ pub(crate) mod tests {
             walked, 0,
             "reference_slots strided {walked} element(s) of a 500M-element array in a \\
              1 MiB heap — this is the read that leaves the arena"
+        );
+    }
+
+    /// **The two reference enumerators are ONE walk, and report the same edges.**
+    ///
+    /// `enumerate_references` and `visit_strong_refs_at` were separate copies of
+    /// the same walk until 2026-08-26, and the copies had drifted: one still
+    /// transmuted a whole `Value` out of each legacy cell, had no `num_slots`
+    /// screen, ran array elements through `read_prim_element`'s null-degrade,
+    /// and dropped an unresolvable compact object's edges in silence. They are
+    /// now one implementation with a closure for the shape difference.
+    ///
+    /// This asserts the property that makes the merge safe and keeps it safe:
+    /// for every header shape, both entry points report the SAME multiset of
+    /// out-edges. It is written against a matrix rather than one object because
+    /// the drift that made the merge necessary was per-ARM — the compact arm was
+    /// fixed in one copy and not the other, twice.
+    ///
+    /// It also pins the two screens, which are now the same screen: a legacy
+    /// header past `1 << 24` slots is refused, and an array length is NOT
+    /// screened at all. The second is deliberate and is the one an earlier draft
+    /// of this change got wrong — `alloc_size` refuses past
+    /// `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28) while `alloc_array` admits up to
+    /// `i32::MAX`, and refusing a legal array in a MARKER is a live object
+    /// collected. `a_clobbered_array_length_is_refused_by_both_the_sizer_and_the
+    /// _walker` covers the sizer and the census, which are the consumers where
+    /// refusing IS right.
+    #[test]
+    fn both_reference_enumerators_report_the_same_edges_for_every_header_shape() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+
+        // Both entry points, over the same object, into comparable shapes.
+        let via_vec = |base: *mut u8, skip: Option<usize>| -> Vec<usize> {
+            let mut v = Vec::new();
+            heap.enumerate_references(base, &mut v, skip);
+            v.sort_unstable();
+            v
+        };
+        let via_callback = |base: *mut u8, skip: Option<usize>| -> Vec<usize> {
+            let mut v = Vec::new();
+            heap.visit_strong_refs_at(base, skip, &mut |raw| v.push(raw as usize));
+            v.sort_unstable();
+            v
+        };
+        let agree = |base: *mut u8, skip: Option<usize>, label: &str| -> Vec<usize> {
+            let a = via_vec(base, skip);
+            let b = via_callback(base, skip);
+            assert_eq!(a, b, "{label}: the two enumerators disagree");
+            a
+        };
+
+        // --- legacy object, reference cells ---------------------------------
+        let target_a = heap.alloc_object(ClassId::new(9), 0);
+        let target_b = heap.alloc_object(ClassId::new(9), 0);
+        let legacy = heap.alloc_object(ClassId::new(1), 3);
+        heap.set_field(legacy, 0, Value::Object(Some(target_a)));
+        heap.set_field(legacy, 1, Value::Int(7)); // not an edge
+        heap.set_field(legacy, 2, Value::Object(Some(target_b)));
+        let mut want = vec![target_a.as_ptr() as usize, target_b.as_ptr() as usize];
+        want.sort_unstable();
+        assert_eq!(
+            agree(legacy.as_ptr(), None, "legacy object"),
+            want,
+            "a legacy object must report exactly its non-null reference cells — the              `Value::Int` cell is not an edge and must not be one"
+        );
+
+        // `skip_index` is the `java.lang.ref.Reference` referent hole.
+        assert_eq!(
+            agree(legacy.as_ptr(), Some(0), "legacy object, skip_index"),
+            vec![target_b.as_ptr() as usize],
+            "skip_index must hide exactly the slot it names"
+        );
+
+        // --- legacy object with an implausible slot count --------------------
+        // The one screen both arms share. Clobbered and restored, because the
+        // sweep sizes this object when the heap drops.
+        let saved = unsafe { (*(legacy.as_ptr() as *const ObjectHeader)).num_slots() };
+        unsafe {
+            (*(legacy.as_ptr() as *mut ObjectHeader)).set_num_slots((1 << 24) + 1);
+        }
+        assert!(
+            agree(legacy.as_ptr(), None, "legacy object, clobbered num_slots").is_empty(),
+            "a header claiming more than 1<<24 slots must be refused, not strided —              that walk leaves the arena"
+        );
+        unsafe {
+            (*(legacy.as_ptr() as *mut ObjectHeader)).set_num_slots(saved);
+        }
+        assert_eq!(
+            agree(legacy.as_ptr(), None, "legacy object, restored").len(),
+            2,
+            "and restoring the count must restore the edges, or the fixture proved              nothing about the screen"
+        );
+
+        // --- reference array -------------------------------------------------
+        let arr = heap.alloc_array(ClassId::new(2), ArrayElementType::Reference, 3);
+        heap.set_array_element(arr, 0, Value::Object(Some(target_a)))
+            .expect("in-bounds store");
+        heap.set_array_element(arr, 2, Value::Object(Some(target_b)))
+            .expect("in-bounds store");
+        assert_eq!(
+            agree(arr.as_ptr(), None, "reference array"),
+            want,
+            "a reference array must report its non-null elements; the untouched              element is null and is not an edge"
+        );
+
+        // --- primitive array: no out-edges ------------------------------------
+        let prim = heap.alloc_array(ClassId::new(3), ArrayElementType::Int, 8);
+        assert!(
+            agree(prim.as_ptr(), None, "primitive array").is_empty(),
+            "a primitive array has no reference elements to report"
+        );
+
+        // --- an object with no reference fields --------------------------------
+        let empty = heap.alloc_object(ClassId::new(4), 0);
+        assert!(
+            agree(empty.as_ptr(), None, "zero-slot object").is_empty(),
+            "a zero-slot object has no out-edges"
         );
     }
 
