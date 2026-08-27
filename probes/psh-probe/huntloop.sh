@@ -24,6 +24,15 @@ CLS=io.netty.handler.ssl.ParameterizedSslHandlerTest
 D=/data/nres/$TAG; mkdir -p "$D"
 SUM="$D/SUMMARY.txt"; : > "$SUM"
 cd /data/cratonvm/apps/netty-suite-runner || { echo "GAVEUP no runner dir" >> "$SUM"; exit 2; }
+# Hold the load band the catches come from. Every catch so far was at load
+# 20-27; 200 runs at load 3-7 caught nothing. Spinners are owned and reaped
+# here — never a broad pkill, other agents share this box.
+SPIN=${NRES_SPIN:-0}
+SPIN_PIDS=()
+spin_cleanup() { for sp in "${SPIN_PIDS[@]:-}"; do [ -n "$sp" ] && kill "$sp" 2>/dev/null; done; }
+trap spin_cleanup EXIT
+for _s in $(seq 1 "$SPIN"); do ( while :; do :; done ) & SPIN_PIDS+=("$!"); done
+[ "$SPIN" -gt 0 ] && echo "spinners=$SPIN pids=${SPIN_PIDS[*]}" >> "$SUM"
 export CRATONVM_DBG_CCE_BT=1
 export CRATONVM_DBG_VACATED_FRAMES=1
 # Names the mutator an STW takeover is waiting for. Printed only once a
@@ -33,10 +42,11 @@ export CRATONVM_DBG_STW_CENSUS=1
 # whether the forward was RECORDED and the slot missed the remap, or never
 # recorded at all. Debug-gated; the ring is empty without it.
 export CRATONVM_DBG_GCPART=1
-# Names a stale LOCAL jobject at the JNI boundary, which is the one place
-# the checkClientTrusted face could be coming from and the one holder no
-# guard has ever reported.
-export CRATONVM_DBG_JNI_LOCALREF=1
+# CRATONVM_DBG_JNI_LOCALREF is deliberately NOT armed here any more. It
+# refuted the JNI hypothesis (hunt8 run 5: the holder was a VM native, not a
+# handle), and it probes the gcpart ring on every local-ref resolution, which
+# measured ~1.7x on whole-class wall clock. Arm it only to re-ask that
+# question.
 # PIN-DANGLING: read_native_pin falls back to the RAW address when its
 # handle is past the pin stack, which hands back a stale ref silently.
 # The ring names the callee that truncated below the caller pins.

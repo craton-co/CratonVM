@@ -2868,6 +2868,58 @@ pub const CALL_SPILL_SURVIVOR_IN_SCRATCH: usize = 5;
 /// here (analysis incomplete, or the live-oop home set is non-empty).
 pub const CALL_SPILL_MOVING_UNPUBLISHABLE: usize = 6;
 
+/// Per-safepoint blind-spill WIDTH census, index-parallel with
+/// `SPILL_WIDTH_COUNTS`.
+///
+/// `stores-emitted` against `stores-if-full` is the whole result: the ratio is
+/// how much of the 14-store blind copy survives narrowing on this workload, and
+/// it is a compile-time count, so it is readable on a loaded host where the
+/// clock is not. `full-refused` counts safepoints that fell back to the
+/// complete copy (no publish plan, >64 locals, or an explicit `=all`), which is
+/// the difference between "narrowing is off" and "narrowing ran and kept
+/// everything".
+pub const SPILL_WIDTH_NAMES: [&str; 3] =
+    ["stores-emitted", "stores-if-full", "full-refused"];
+
+static SPILL_WIDTH_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`SPILL_WIDTH_NAMES`]: blind-spill stores actually emitted.
+pub const SPILL_WIDTH_EMITTED: usize = 0;
+/// Index: stores the same safepoints would have emitted unnarrowed.
+pub const SPILL_WIDTH_IF_FULL: usize = 1;
+/// Index: safepoints that fell back to the full copy.
+pub const SPILL_WIDTH_FULL_REFUSED: usize = 2;
+
+/// Record one blind spill: `emitted` stores against `if_full` had it not been
+/// narrowed, and whether the narrowing refused outright.
+#[inline]
+pub fn note_spill_width(emitted: u64, if_full: u64, refused: bool) {
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_EMITTED].fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_IF_FULL].fetch_add(if_full, std::sync::atomic::Ordering::Relaxed);
+    if refused {
+        SPILL_WIDTH_COUNTS[SPILL_WIDTH_FULL_REFUSED]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for the blind-spill width census, INCLUDING zeros.
+pub fn spill_width_counts() -> Vec<(&'static str, u64)> {
+    SPILL_WIDTH_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                SPILL_WIDTH_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
 /// Bump one [`CALL_SPILL_NAMES`] counter.
 #[inline]
 pub fn note_call_spill(index: usize) {

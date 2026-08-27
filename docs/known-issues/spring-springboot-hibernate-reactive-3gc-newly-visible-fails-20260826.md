@@ -1,12 +1,26 @@
 # Spring Framework, Spring Boot, and Hibernate Reactive 3-GC full-suite runs (2026-08-24/25): re-triaged 2026-08-27
 
 ## Status
-**MOSTLY RESOLVED.** Of the 38 classes this page listed, **2 functional
-defects remain**, plus 2 throughput items that are not failures. 5 were fixed
-here, 25 already passed by the time they were re-run, and 5 fail identically on
-HotSpot. The one mechanism this page root-caused —
+**MOSTLY RESOLVED.** The one mechanism this page root-caused —
 `Class.getDeclaredMethods()` ordering — **has been falsified as the cause of
 anything listed here**, by measurement rather than by argument.
+
+Two independent re-runs happened on 2026-08-27 and agree. Both are kept, because
+each covers what the other does not:
+
+* a **broad sweep** of the full non-passed union (27 Spring Framework, 18 Spring
+  Boot, 11 Hibernate Reactive), ZGC only, serial — recovering 24/27, 11/18 and
+  10/11. It retracted the root cause but left *why* open, and took no HotSpot
+  control;
+* a **narrow re-triage** of the 38 classes this page names, with a HotSpot
+  control for every CratonVM failure and all three GC arms for Hibernate
+  Reactive. It settles the root cause by measurement, fixes 5 classes, and
+  reclassifies 5 more as "fails identically on HotSpot" — which a sweep without
+  a control necessarily counts as remaining CratonVM failures.
+
+Combined: **3 functional defects remain**, plus 3 throughput items that are not
+functional failures. 5 fixed here, 25 of the 38 already passed when re-run, and
+5 fail identically on HotSpot.
 
 The re-run is on `origin/dev` at `cdab6441d` and later, one class per process,
 with a HotSpot control taken for every CratonVM failure.
@@ -56,6 +70,13 @@ each VM, against the real `org.springframework.test.web.Person` fixture:
 order. Neither reads `getDeclaredMethods()` order, and **both emit byte-identical
 JSON on the two VMs with the divergent method order in place.** That is the
 decisive fact: the divergence is present and the output does not move.
+
+The broad sweep reached the same retraction from the other direction: the
+method-order divergence is still present against a fresh binary, and no
+Jackson / property-order / reflection-ordering fix landed in the window, yet the
+failures are gone. That left an either/or — "a coincidental correlation, or
+Jackson does not read that order". The table above closes it: **Jackson does not
+read that order.**
 
 The failing assertion is therefore CratonVM producing *Jackson 2's* answer where
 HotSpot produces *Jackson 3's*. Converter selection was checked too and is also
@@ -122,8 +143,13 @@ not fix it — the asserted string has no `@hash`, so it never came from
 **Not a CratonVM bug (1).** `aot.nativex.FileNativeConfigurationWriterTests` —
 HotSpot fails identically, as this page already recorded.
 
-**Neither is a functional failure (2).** Both are throughput, and both were
-already known:
+**Open, from the broad sweep rather than this page's own list (1).**
+`test.context.aot.AotIntegrationTests` — FAIL, triaged in neither pass and not
+among the 18 classes this page enumerates. Carried here so it is not lost along
+with the sweep it came from.
+
+**Neither of the other two is a functional failure.** Both are throughput, and
+both were already known:
 
 * `beans.factory.aot.BeanRegistrationsAotContributionTests` — **PASSES, 14/14**,
   in **1 297 s (21.6 min)**. It is scored a timeout by the suite because it
@@ -200,6 +226,10 @@ postmaster exit` — which reads exactly like a VM/GC defect and is not one. The
 re-run swept between classes and logged the container count beside every result,
 so "the host was clean" is a recorded measurement rather than an assumption.
 
+The broad sweep covered 11 Hibernate Reactive classes rather than these 5,
+recovered 10, and left one: `MultithreadedInsertionWithLazyConnectionTest` — a
+HANG, already tracked as a performance-family residual and not new here.
+
 This also settles the reconciliation this page asked for.
 `DatabaseHibernateReactiveTest` does NOT need a second cause distinct from the
 Windows-locale one in
@@ -210,17 +240,20 @@ a reopening — it passes.
 
 ## What is actually left
 
-Two functional defects, neither of them this page's original mechanism:
+Three functional defects, none of them this page's original mechanism:
 
 1. `CacheAutoConfigurationTests` — 3 Infinispan contexts fail to start.
 2. `JerseyWebEndpointManagementContextConfigurationTests` — `ObjectProvider<PathMapper>` unsatisfied.
+3. `AotIntegrationTests` — untriaged, and from the broad sweep rather than this
+   page's own list.
 
-And two throughput items that are NOT failures, both pre-existing and both
-already tracked elsewhere — listed so they are not re-triaged as defects:
+And three throughput items that are NOT functional failures, all pre-existing —
+listed so they are not re-triaged as defects:
 
-3. `BeanRegistrationsAotContributionTests` — passes 14/14 in 21.6 min; scored a
+4. `BeanRegistrationsAotContributionTests` — passes 14/14 in 21.6 min; scored a
    timeout by the harness cap alone.
-4. `WebClientIntegrationTests` — 1/170, reactive-throughput residual.
+5. `WebClientIntegrationTests` — 1/170, reactive-throughput residual.
+6. `MultithreadedInsertionWithLazyConnectionTest` — HANG, tracked perf family.
 
 ## Method note — why a two-day-old suite list needs re-running before it is triaged
 
@@ -235,6 +268,12 @@ on top of the list. Two cheap habits would have caught both errors on this page:
   differing is not a mechanism. One probe printing the serializer's actual
   output next to the ordering would have refuted it in a single run, which is
   what eventually happened.
+* **Take the HotSpot control before calling something a remaining failure.**
+  Five classes counted as still-failing fail identically on HotSpot, with
+  matching counts. A sweep without a control cannot separate "our defect" from
+  "this test passes nowhere", and here that is 5 of the residual list —
+  including three of the four micrometer/loader classes the broad sweep left
+  open.
 
 ## Reproduction
 
