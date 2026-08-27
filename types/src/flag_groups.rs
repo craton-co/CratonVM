@@ -249,6 +249,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "watch-pun", on_key: Some("CRATONVM_DBG_WATCH_PUN"), off_key: None, off_word: None },
+    // Name the receiver, slot and compiled method for a field store the JIT
+    // helper family discarded (implausible receiver, or slot past num_slots).
+    // The counters are always on; this is the per-event dump.
+    E { group: Group::DBG, token: "dropped-putfield", on_key: Some("CRATONVM_DBG_DROPPED_PUTFIELD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "refdisc", on_key: Some("CRATONVM_DBG_REFDISC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "site-alias", on_key: Some("CRATONVM_DBG_SITE_ALIAS"), off_key: None, off_word: None },
@@ -872,6 +876,11 @@ pub const INVENTORY: &[E] = &[
     // and the "0" off-word rather than an `off_key`.
     E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
+    // A/B lever, never a supported configuration: restore the pre-fix
+    // substitution of "slot 0, tagged int" for a field site the VM-side
+    // resolver declined. Declared so the arm can be spelled, and so that
+    // `flags` reports it as SET when somebody leaves it on by accident.
+    E { group: Group::JIT, token: "unresolved-field-substitute", on_key: Some("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-inline-mega", on_key: Some("CRATONVM_JIT_SP_INLINE_MEGA"), off_key: None, off_word: None },
@@ -1186,6 +1195,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None },
+    E { group: Group::JIT, token: "c2-alloc-upgrade", on_key: Some("CRATONVM_JIT_C2_ALLOC_UPGRADE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
     // Default-ON kill switch, hence `off_key` only:

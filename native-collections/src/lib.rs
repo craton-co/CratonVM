@@ -6994,8 +6994,16 @@ fn alloc_arraylist_iterator_as(
         }
     }
     let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    // The split that lets `java/util/ArrayList$Itr` mean "a real `modCount`".
+    // See [`itr_backing_has_real_mod_count`]; the layout and slot triple are
+    // identical either way, so every `al_itr_*` native reads both the same.
+    let itr_class = if itr_backing_has_real_mod_count(&*ctx, list) {
+        "java/util/ArrayList$Itr"
+    } else {
+        AL_VIEW_ITR_CLASS
+    };
     let roots_base = ctx.pin_native_root(list);
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields)?;
+    let itr = try_alloc_synthetic(ctx, itr_class, n_fields)?;
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let list = ctx.read_native_pin(roots_base, list);
@@ -18382,7 +18390,65 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // for it by construction. Construction of the view is unaffected —
     // `make_view_set_of` populates the backing through `native_map_put` and
     // never comes through here.
-    if view_backing_source(ctx, backing).is_some() {
+    if let Some(view_source) = view_backing_source(ctx, backing) {
+        // ONE VIEW IS ADDABLE, and it is the exception the JDK documents.
+        // `ConcurrentHashMap$EntrySetView.add(Entry)` is supported -- it does
+        // `map.putVal(e.getKey(), e.getValue(), false)` -- unlike every other
+        // map's entrySet, which inherits `AbstractCollection.add`'s bare throw.
+        // Refusing it here was the OPPOSITE-POLARITY twin of the
+        // `TreeMap$KeySet.add` defect fixed the day before: there a view
+        // accepted what the JDK refuses, here a view refused what the JDK
+        // accepts. MEASURED against HotSpot 25.0.3+9,
+        // `probes/ViewFamilySweep.java`, both modes -- the other four entrySet
+        // carriers matched, and only this one differed.
+        let recv_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        if recv_class == "java/util/concurrent/ConcurrentHashMap$EntrySetView" {
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                // `add(null)` on CHM's entrySet dereferences the entry, so it
+                // is an NPE rather than a silent false.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
+            };
+            // Pin across each invoke: `getKey`/`getValue` are Java calls and a
+            // moving young generation would relocate the entry and the backing
+            // behind us. Same discipline as `map_entries_of`.
+            let backing_pin = ctx.pin_native_root(view_source);
+            let entry_pin = ctx.pin_native_root(entry);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let key = ctx
+                .invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let key_pin = pin_value(ctx, key);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let value = ctx
+                .invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let value_pin = pin_value(ctx, value);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            // Put into the SOURCE map, not the view's own backing. Putting
+            // into `backing` is exactly what the refusal comment above warns
+            // about -- "the key landed in the VIEW's backing and not in `m`, so
+            // the caller was left holding a view that disagrees with the map it
+            // is a view of". MEASURED: the first version of this fix did that,
+            // so `add` reported success and the entry never reached the map
+            // (`entrySet is LIVE after put` stayed 4 against HotSpot's 5).
+            let src = ctx.read_native_pin(backing_pin, view_source);
+            let prev = native_map_put(ctx, &[Value::Object(Some(src)), key, value])?;
+            ctx.unpin_native_roots(backing_pin);
+            // `Set.add` reports whether the set CHANGED. CHM's own body returns
+            // `putVal(..) == null`, i.e. true when there was no previous
+            // mapping.
+            let changed = matches!(prev, None | Some(Value::Object(None)));
+            return Ok(Some(Value::Int(i32::from(changed))));
+        }
         return Err(
             cratonvm_types::error::RuntimeError::UnsupportedOperationException {
                 // HotSpot's is message-less; `thrownDetail` prints a message
@@ -19244,6 +19310,45 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 // Iterators — ArrayList$Itr and HashMap$KeyItr
 // ===========================================================================
+
+/// The class an `ArrayList`-shaped cursor is minted as when its backing object
+/// does NOT carry a real `modCount`.
+///
+/// `java/util/ArrayList$Itr` is shared by every ArrayList-shaped receiver in the
+/// VM, and they are not all alike: a map VIEW carrier has no `modCount` slot at
+/// all (it extends `AbstractCollection`, so `AbstractList`'s resolved index
+/// names its own first declared REFERENCE field). While the two share a class,
+/// the class cannot be allowed to run the real JDK cursor -- HotSpot's
+/// `checkForComodification` reads that reference as an int and throws a
+/// spurious `ConcurrentModificationException`.
+///
+/// Splitting them at MINT time is what makes `java/util/ArrayList$Itr` mean
+/// "over something with a real `modCount`", which is the precondition the
+/// bytecode yield needs and cannot express any other way: the yield is a
+/// per-(call site, receiver CLASS) decision, so a per-INSTANCE fact has to be
+/// encoded in the class or it cannot be consulted at all.
+const AL_VIEW_ITR_CLASS: &str = "cratonvm/internal/ArrayListViewItr";
+
+/// Does `list` carry a real `modCount` — i.e. is it something HotSpot's own
+/// `ArrayList$Itr` could legally iterate?
+///
+/// `ArrayList` and `Vector` both extend `AbstractList` and declare one.
+/// Everything else — a `MAP_VIEW_CARRIERS` carrier, a bare `Object`
+/// placeholder, an unnamed synthetic — does not, and gets
+/// [`AL_VIEW_ITR_CLASS`] instead.
+///
+/// Deliberately a WHITELIST. The failure this exists to stop is silent (a
+/// plausible wrong answer from a reference field read as an int), and the
+/// population of ArrayList-shaped receivers has repeatedly turned out to be
+/// wider than an audit predicted — `LinkedBlockingQueue.iterator()` mints this
+/// class with the snapshot ARRAY in slot 0, a third layout again. A new shape
+/// must therefore default to the safe side without anyone remembering to add it.
+fn itr_backing_has_real_mod_count(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    matches!(
+        al_slots_and_layout_for(ctx, list).1,
+        AlLayout::ArrayList | AlLayout::Vector
+    )
+}
 
 /// Widest a genuine `java.util.ArrayList$Itr` can be: `cursor`, `lastRet`,
 /// `expectedModCount`, `this$0`. Anything wider that reaches the `al_itr_*`
@@ -20131,24 +20236,71 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     // which the census shows minting its own `IdentityHashMap$ValueIterator`,
     // still arrived here and threw. The class a receiver mints in isolation is
     // not the class it reaches this native with.
-    r.register(
-        "java/util/ArrayList$Itr",
-        "hasNext",
-        "()Z",
-        native_al_itr_has_next,
-    );
-    r.register(
-        "java/util/ArrayList$Itr",
-        "next",
-        "()Ljava/lang/Object;",
-        native_al_itr_next,
-    );
+    // `hasNext`/`next` are `SyntheticStub`, not `Bridge`, so the yield predicate
+    // can reach them and the real JDK cursor runs -- which is what lets the JIT
+    // compile it AT ALL. A registered native pins its method out of the JIT
+    // entirely: the tier-up counter lives only in the `VirtualBytecode` arm of
+    // `dispatch_virtual`, so a site serving a `VirtualNative` target is never
+    // counted, nominated or compiled. `ArrayList$Itr.next` was entered 2 000 000
+    // times on a 2000x1000 walk and never appeared in `CRATONVM_DBG_JITC`.
+    //
+    // This is sound ONLY because [`itr_backing_has_real_mod_count`] now splits
+    // the mint: a backing without a real `modCount` gets [`AL_VIEW_ITR_CLASS`]
+    // instead, so this class name is a genuine guarantee rather than a wish.
+    // Removing that split re-opens the spurious-CME hazard on every
+    // `for (v : map.values())`.
+    //
+    // Pairs with `java/util/ArrayList$Itr` on `real_protected_stub_class_common`
+    // -- both halves are required, and each alone is useless or worse.
+    //
+    // `remove` stays `Bridge`: not on the hot path, and it is the one of the
+    // three that writes through to the backing list, so it keeps the native
+    // `propagate_list_removal` understands. Real-bytecode `next`/`hasNext`
+    // beside a native `remove` is what `probes/ItrYieldProbe`'s `lastRet` and
+    // cursor-rewind rows exercise.
+    //
+    // `CRATONVM_ITR_BYTECODE=0` restores `Bridge`: the one-binary A/B and the
+    // kill switch.
+    let itr_kind = if cratonvm_types::flags::runtime_var("CRATONVM_ITR_BYTECODE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        cratonvm_native_api::NativeKind::Bridge
+    } else {
+        cratonvm_native_api::NativeKind::SyntheticStub
+    };
+    r.with_category(itr_kind, |r| {
+        r.register(
+            "java/util/ArrayList$Itr",
+            "hasNext",
+            "()Z",
+            native_al_itr_has_next,
+        );
+        r.register(
+            "java/util/ArrayList$Itr",
+            "next",
+            "()Ljava/lang/Object;",
+            native_al_itr_next,
+        );
+    });
     r.register(
         "java/util/ArrayList$Itr",
         "remove",
         "()V",
         native_al_itr_remove,
     );
+    // The same three bodies on [`AL_VIEW_ITR_CLASS`], the cursor minted for a
+    // backing with no real `modCount`. Same layout, same slot triple, same
+    // natives -- the ONLY thing the separate class buys is that it is not
+    // `java/util/ArrayList$Itr`, so the bytecode yield cannot reach it.
+    r.register(AL_VIEW_ITR_CLASS, "hasNext", "()Z", native_al_itr_has_next);
+    r.register(
+        AL_VIEW_ITR_CLASS,
+        "next",
+        "()Ljava/lang/Object;",
+        native_al_itr_next,
+    );
+    r.register(AL_VIEW_ITR_CLASS, "remove", "()V", native_al_itr_remove);
     // The per-family values iterators (`VALUES_ITR_CARRIERS`). They need the
     // SAME three bodies for the same reason the `MAP_KEY_ITR_CARRIERS` classes
     // do: their snapshot lives past the class's own declared fields, so the

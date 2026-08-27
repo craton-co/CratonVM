@@ -6752,9 +6752,20 @@ fn re2_bind_listener(
     })?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
-    let actual_host = local_addr
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|| ip.to_string());
+    // A wildcard bind reports the address the CALLER asked for, not the one the
+    // dual-stack socket landed on. HotSpot's `new ServerSocket(0).getInetAddress()`
+    // answers `0.0.0.0` even though the socket underneath is AF_INET6 with
+    // `IPV6_V6ONLY` cleared (`probes/WildcardBindFamilyProbe.java` prints both),
+    // because `ServerSocket` keeps the requested `InetAddress.anyLocalAddress()`.
+    // Taking `local_addr()` here would answer `::` and change a getter that has
+    // nothing to do with this fix.
+    let actual_host = if ip.is_unspecified() {
+        ip.to_string()
+    } else {
+        local_addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| ip.to_string())
+    };
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {
         s.port = actual_port;
@@ -6796,16 +6807,30 @@ fn re2_bind_listener(
 /// silently lost the request: the getter read the fresh listener back and
 /// answered `false`. Build the socket by hand through `socket2` when there is a
 /// retained option to apply, and fall back to the plain path otherwise.
+///
+/// A WILDCARD address additionally binds **dual-stack** — AF_INET6 with
+/// `IPV6_V6ONLY` cleared — because that is what `new ServerSocket(0)` gives on
+/// HotSpot: `probes/WildcardBindFamilyProbe.java` measures `::1` reaching a
+/// HotSpot `new ServerSocket(0)` and being refused by CratonVM's. Same defect
+/// and same fix as the `ServerSocketChannel` half in
+/// `native-io/src/socket_channel.rs::bind_wildcard_listener`; an address that
+/// NAMES a family still keeps that family.
 fn re2_bind_with_pending_options(
     ctx: &dyn NativeContext,
     this: ObjectRef,
     addr: SocketAddr,
 ) -> std::io::Result<TcpListener> {
     let side = ss_get(ctx, this);
+    let wildcard = addr.ip().is_unspecified();
     if side.reuse_address < 0 && side.recv_buffer_size <= 0 {
-        return TcpListener::bind(addr);
+        return if wildcard {
+            cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(addr.port(), side.backlog)
+        } else {
+            TcpListener::bind(addr)
+        };
     }
     let domain = match addr {
+        _ if wildcard => socket2::Domain::IPV6,
         SocketAddr::V4(_) => socket2::Domain::IPV4,
         SocketAddr::V6(_) => socket2::Domain::IPV6,
     };
@@ -6815,6 +6840,17 @@ fn re2_bind_with_pending_options(
     }
     if side.recv_buffer_size > 0 {
         socket.set_recv_buffer_size(side.recv_buffer_size as usize)?;
+    }
+    // The retained-options arm has to make the same dual-stack choice as the
+    // plain one above, or `setReuseAddress(true)` would silently re-introduce
+    // the v4-only listener this fix removes.
+    let addr = if wildcard {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, addr.port()))
+    } else {
+        addr
+    };
+    if wildcard {
+        socket.set_only_v6(false)?;
     }
     socket.bind(&addr.into())?;
     // `backlog` here is the OS listen queue; the Java-level value is recorded

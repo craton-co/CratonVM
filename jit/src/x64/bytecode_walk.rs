@@ -13,6 +13,78 @@
 
 use super::*;
 
+/// How many compiles the single-pass backend refused because a field site had
+/// no resolved layout. Read by the `jit-method-stats` report.
+pub static UNRESOLVED_FIELD_SITE_BAILS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Refuse the compile: a `getfield`/`putfield`/`getstatic`/`putstatic` site has
+/// no entry in the resolved field tables, so this backend has no slot index and
+/// no type tag for it. Returns `false`, the walker's "stay interpreted" answer.
+///
+/// # Why a refusal and not a default
+///
+/// These four sites each used to substitute `(pc, 0, b'I')` — **slot 0, tagged
+/// `int`** — and carry on emitting. That is not a conservative default; it is a
+/// write to a DIFFERENT field of the receiver, under a type the field does not
+/// have, with nothing in the generated code or in any counter recording that a
+/// substitution happened.
+///
+/// It has already been caught doing exactly that once. When the OSR compile
+/// path shipped without populating `field_info`, every instance-field write in
+/// an OSR-compiled method took this default: `HashtableOfInt.rehash()` (Eclipse
+/// JDT BatchCompiler boot) stored its new `int[]` into slot 0 as
+/// `Value::Int(low32_of_ptr)`, and the next `put()` read that back and died at
+/// `arraylength` with "expected object reference, got int(N)". The fix then was
+/// to populate the table for that one path — the default that turned a missing
+/// entry into a corrupt heap cell was left in place for every other path.
+///
+/// It is the same shape as the punned `SQLChar.rawData` cell — a `[C` slot
+/// holding `Int(1)`, dereferenced by a compiled `arraylength` as the pointer
+/// `1` — and the reason that investigation could not name a writer is that a
+/// substituted slot leaves no trace of having been substituted
+/// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+///
+/// A missing entry means the VM-side resolver declined the site (the field's
+/// class is not loadable at compile time, or the constant-pool entry is
+/// malformed). Declining the METHOD costs one interpreted method and is always
+/// correct; guessing a slot is never correct. The counter says how often it
+/// happens, so "this refusal is expensive" stays a measurement rather than a
+/// worry.
+/// `CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE=1` — restore the pre-fix
+/// behaviour: substitute slot 0 tagged `int` for an unresolved field site and
+/// carry on emitting, instead of refusing the compile.
+///
+/// # Why a switch for a behaviour nobody wants
+///
+/// The refusal is a correctness fix, and a correctness fix that UNBLOCKS a
+/// workload has no A/B: the old binary cannot run the shape that the new one
+/// fixed, so "it passes now" and "it passes today" are indistinguishable on a
+/// workload whose base rate nobody measured. Comparing two BINARIES does not
+/// close that — a cross-binary A/B varies everything that landed between them.
+///
+/// One binary and one variable does close it. Arming this restores exactly the
+/// substitution and nothing else, so a workload that fails with it and passes
+/// without it has been attributed, not merely observed to have stopped failing.
+/// It is not a supported configuration and must never be set outside an arm.
+fn substitute_unresolved_field_sites() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE").is_some()
+    })
+}
+
+/// Snapshot of [`UNRESOLVED_FIELD_SITE_BAILS`], for the end-of-run report.
+pub fn unresolved_field_site_bails() -> u64 {
+    UNRESOLVED_FIELD_SITE_BAILS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn unresolved_field_site(pc: usize, opcode: u8) -> bool {
+    UNRESOLVED_FIELD_SITE_BAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::note_jit_bail_site_at("unresolved-field-site", pc, opcode);
+    false
+}
+
 /// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
 /// instruction is a constant push.
 ///
@@ -4386,11 +4458,19 @@ impl Compiler {
                 // note there.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = match self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    {
+                        Some(v) => v,
+                        None => {
+                            if !substitute_unresolved_field_sites() {
+                                return unresolved_field_site(pc, 0xb2);
+                            }
+                            (pc, 0, 0, b'I', false)
+                        }
+                    };
 
                     // Direct load, no helper CALL — the structural fix this
                     // opcode's long bail comment above describes. It emits the
@@ -4468,11 +4548,19 @@ impl Compiler {
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = match self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    {
+                        Some(v) => v,
+                        None => {
+                            if !substitute_unresolved_field_sites() {
+                                return unresolved_field_site(pc, 0xb3);
+                            }
+                            (pc, 0, 0, b'I', false)
+                        }
+                    };
 
                     let val_slot = self.pop_stack();
 
@@ -4511,11 +4599,19 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb4);
+                                }
+                                (pc, 0, b'I')
+                            }
+                        };
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
                         let field_off =
@@ -4569,11 +4665,19 @@ impl Compiler {
                         // {tag,partial-pointer} word that SIGSEGVs when later
                         // dereferenced/called. For a legacy receiver we take the
                         // uniform `index * SLOT_SIZE` 16-byte-cell path inline.
-                        let (_, field_index, type_tag) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb4);
+                                }
+                                (pc, 0, b'I')
+                            }
+                        };
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
                         let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
                                                                                               // GUARDED (default) vs RAW (CRATONVM_JIT_INLINE_GETFIELD):
@@ -5016,11 +5120,19 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, _type_tag) = self
+                        let (_, field_index, _type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb5);
+                                }
+                                (pc, 0, b'I')
+                            }
+                        };
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -5038,11 +5150,19 @@ impl Compiler {
                     } else {
                         self.flush_scratch_registers();
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb5);
+                                }
+                                (pc, 0, b'I')
+                            }
+                        };
                         let receiver_mark_index = self.stack_oop_marks.len().checked_sub(2);
                         let receiver_is_trusted_oop = !self.method_key.is_empty()
                             && self.stack_oop_marks_exact
@@ -7461,7 +7581,14 @@ impl Compiler {
                             ) {
                                 self.emit_safepoint_metadata_only();
                             } else {
-                                self.emit_pre_safepoint_spill();
+                                // ARG_REGS only, and only if the service slots
+                                // were actually reserved: the copy above stages
+                                // through R11, so RAX is untouched here and its
+                                // contents are unpublished.
+                                self.emit_pre_safepoint_spill_args_published(
+                                    service_args_base.is_some(),
+                                    false,
+                                );
                             }
                             // Emit direct CALL to callee entry point
                             self.emit_call_absolute(callee_entry);
@@ -7618,7 +7745,12 @@ impl Compiler {
                         if self.can_elide_direct_call_register_spill(&arg_oops, true, 2) {
                             self.emit_safepoint_metadata_only();
                         } else {
-                            self.emit_pre_safepoint_spill();
+                            // Every argument is in the helper's args buffer and
+                            // the oops among them are named in the map below;
+                            // ARG_REGS carry the helper ABI (heap/info/buf/count),
+                            // never a Java oop. RAX is published only when the
+                            // staging loop -- which writes through RAX -- ran.
+                            self.emit_pre_safepoint_spill_args_published(true, n > 0);
                         }
                         self.emit_call_absolute(self.helpers.invoke_dispatch);
                         // T1.1.2 — invoke dispatch is a full safepoint:
@@ -10024,7 +10156,12 @@ impl Compiler {
                             ) {
                                 self.emit_safepoint_metadata_only();
                             } else {
-                                self.emit_pre_safepoint_spill();
+                                // See the invokestatic twin: R11 stages, so only
+                                // ARG_REGS are published, and only with slots.
+                                self.emit_pre_safepoint_spill_args_published(
+                                    service_args_base.is_some(),
+                                    false,
+                                );
                             }
                             self.emit_call_absolute(callee_entry);
                             self.emit_post_call_rbp_republish();
@@ -10241,7 +10378,10 @@ impl Compiler {
                                 if self.can_elide_direct_call_register_spill(&arg_oops, true, 3) {
                                     self.emit_safepoint_metadata_only();
                                 } else {
-                                    self.emit_pre_safepoint_spill();
+                                    // Args are in the buffer and their oops are
+                                    // named in the map at `.done`; RAX only when
+                                    // the staging loop ran. See the dispatch twin.
+                                    self.emit_pre_safepoint_spill_args_published(true, n > 0);
                                 }
                             }
 

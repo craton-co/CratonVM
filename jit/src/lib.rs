@@ -5733,16 +5733,68 @@ fn call_site_is_hot(
 ///    switched off, the IR is back to paying the helper per call and the
 ///    original rejection is still the right answer.
 ///
-/// ALLOCATION-bearing methods remain excluded, unchanged: the IR's allocation
-/// lowering differs from the single-pass inline-TLAB bump, and the IR call
-/// eligibility loop requires `new_ops.is_empty()` anyway, so an
-/// allocation-bearing method's invokes would bail the builder.
+/// # Allocation-bearing methods: excluded until 2026-08-27, and why that ended
+///
+/// This predicate used to refuse any method containing a `new`, on two stated
+/// grounds. The second — "the IR call eligibility loop requires
+/// `new_ops.is_empty()` anyway, so an allocation-bearing method's invokes would
+/// bail the builder" — was already FALSE when it was written down: cov-04
+/// increment 2 deleted that conjunct (`call_eligible` is now
+/// `scan.anewarray_ops.is_empty()` alone) with the note that "the term outlived
+/// its reason". A live run says the same thing out loud:
+/// `invoke-plan VolumeShort2.loadFromArray: new_ops=1 ... call_eligible=true`.
+///
+/// The first ground — that the IR lowers an allocation through the shared
+/// `jit_new_object` stub where single-pass emits an inline TLAB bump — is real,
+/// but it is an argument about a SURVIVING allocation. The allocations this
+/// gate kept out are exactly the ones escape analysis exists to DELETE, and EA
+/// runs only at C2. So the gate was self-defeating: an allocation-bearing
+/// method could never reach the tier that removes its allocations.
+///
+/// Measured on kfusion's per-voxel `Short2` (`VolumeShort2.loadFromArray`, one
+/// `new` per voxel, 16.7M voxels a frame): the method was pinned at C1 and its
+/// allocation survived at ~708 ns/voxel of the 755 ns total, against ~2 ns on
+/// HotSpot, whose EA scalar-replaces the same object.
+///
+/// `anewarray` and `indy` stay excluded and keep their own reasons:
+/// `IrBuilder::build` has no `0xbd` arm at all, and `ir_compatible` refuses
+/// `indy` a stage earlier.
+///
+/// The refusal is therefore LIFTABLE, but lifting it is opt-in
+/// (`CRATONVM_JIT_C2_ALLOC_UPGRADE=1`) rather than default: doing so measured
+/// neutral on the kfusion voxel probe, because that allocation escapes its
+/// method by being RETURNED (`loadFromArray` ends in `areturn`), and per-method
+/// EA cannot scalar-replace an escaping object however good its tier. Killing
+/// it needs the accessor chain INLINED into the consuming loop first, then EA
+/// on the merged graph — which is a capability, not a gate. See
+/// `c2_alloc_upgrade_enabled` for the regression mechanism that keeps this off
+/// by default.
 ///
 /// This predicate deliberately stays a cheap, scan-only approximation (it
 /// cannot resolve a constant pool), so it can admit a method the IR later
 /// bails on — e.g. a constructor whose `invokespecial` is an `<init>` super
 /// call. That costs a wasted optimizing compile whose result is discarded in
 /// favour of the single-pass body; it is never a correctness risk.
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` — let an allocation-bearing method take
+/// the C1->C2 supersede. OPT-IN, deliberately.
+///
+/// The refusal it lifts is stale (see [`c2_upgrade_would_engage`]), but lifting
+/// it was measured NEUTRAL on the workload that motivated it, and it has a real
+/// regression mechanism that has NOT been priced: at C2 a surviving allocation
+/// lowers through the shared `jit_new_object` stub, where the single-pass body
+/// emits an inline TLAB bump. A method whose allocations escape therefore trades
+/// a cheaper allocation for a more optimized body, and nothing measured here
+/// says which way that lands.
+///
+/// So this ships as a lever to price the trade on the gauntlet, not as a
+/// default. Turning it on is the A arm; leaving it off is every prior build.
+fn c2_alloc_upgrade_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+    })
+}
+
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -5754,7 +5806,10 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
+    if !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
+        return false;
+    }
+    if !scan.new_ops.is_empty() && !c2_alloc_upgrade_enabled() {
         return false;
     }
     if !scan.invoke_ops.is_empty() {
@@ -15704,6 +15759,23 @@ pub fn osr_entry_reject_count() -> usize {
     osr_entry_rejects().read().len()
 }
 
+/// Compiled call sites reclassified from `invokevirtual` to a direct,
+/// non-dispatching bind because the constant pool resolved them to a **private**
+/// method (JVMS 5.4.6; javac has emitted `invokevirtual` for such calls since
+/// Java 11 / JEP 181).
+///
+/// This is the ENGAGEMENT counter for that reclassification. Without it, "the
+/// probe passes now" cannot be told apart from "no site on this workload was
+/// one" — and the shape is common enough that a zero on a large workload would
+/// itself be the finding.
+pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`PRIVATE_INVOKEVIRTUAL_PINNED`].
+pub fn private_invokevirtual_pinned() -> u64 {
+    PRIVATE_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
 /// `None` = disabled.
 ///
@@ -16690,7 +16762,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // returns `None` for a given site — the overwhelmingly common case)
     // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
     // `classloading::invokespecial_selection_start` for the algorithm.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
@@ -17996,7 +18068,7 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     // See `try_compile_with_invokespecial_resolver`.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
@@ -19236,9 +19308,24 @@ fn try_compile_inner(
                         // method on single-pass — the builder bails on an invoke
                         // with no `invoke_info` entry.
                         let is_static = opcode == 0xb8;
-                        let is_special = opcode == 0xb7;
-                        let is_virtual = opcode == 0xb6;
+                        // JVMS 5.4.6 — an `invokevirtual` resolving to a PRIVATE
+                        // method is not a dispatch site; see the matching note
+                        // in the single-pass invoke loop below. The optimizing
+                        // tier has to make the same reclassification, and make
+                        // it HERE, before `is_virtual`/`is_special` feed the
+                        // direct-bind decision and the baked `invoke_kind`.
+                        let private_virtual_owner: Option<String> = if opcode == 0xb6 {
+                            cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode))
+                        } else {
+                            None
+                        };
+                        let is_special = opcode == 0xb7 || private_virtual_owner.is_some();
+                        let is_virtual = opcode == 0xb6 && private_virtual_owner.is_none();
                         let is_interface = opcode == 0xb9;
+                        if private_virtual_owner.is_some() {
+                            PRIVATE_INVOKEVIRTUAL_PINNED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if !((is_static && ir_emit_calls)
                             || (is_special && ir_emit_special_calls)
                             || ((is_virtual || is_interface) && ir_emit_virtual_calls))
@@ -19527,10 +19614,10 @@ fn try_compile_inner(
                         // check exists to catch.
                         let mut direct_target_is_thin_helper = false;
                         if ir_direct && (is_static || is_special) && !is_self_recursive {
-                            let special_owner: Option<String> = if is_special {
-                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
+                            let special_owner: Option<String> = if opcode == 0xb7 {
+                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode))
                             } else {
-                                None
+                                private_virtual_owner.clone()
                             };
                             let direct_class: &str =
                                 special_owner.as_deref().unwrap_or(cn.as_str());
@@ -20909,12 +20996,48 @@ fn try_compile_inner(
             let Some((class_name, method_name, descriptor)) = resolver(cp_idx) else {
                 jitc_bail!("invoke_resolve")
             };
-            let invoke_kind = match opcode {
+            let mut invoke_kind = match opcode {
                 0xb6 => 0u8,
                 0xb7 => 1,
                 0xb9 => 2,
                 _ => 3,
             };
+            // JVMS 5.4.6: an `invokevirtual` that RESOLVES TO A PRIVATE METHOD
+            // selects that method, with no override lookup at all.
+            //
+            // javac has emitted `invokevirtual` for a call to a private instance
+            // method since Java 11 (JEP 181 nestmates) — before that it emitted
+            // `invokespecial`. The opcode changed; the semantics did not. Every
+            // dispatcher downstream of `invoke_kind == 0` resolves by walking up
+            // from the RECEIVER's class, so on such a site it finds the
+            // most-derived same-named private method and calls THAT.
+            //
+            // The shape is ordinary and common: a class whose constructor calls
+            // its own `private void init()`, subclassed by a class that does the
+            // same. `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+            // `HttpClientOptions` are three such levels in one chain, and the
+            // consequence is that constructing a `WebClientOptions` runs
+            // `HttpClientOptions.init()` three times and `TCPSSLOptions.init()`
+            // never — leaving `transportOptions` null, which surfaces much later
+            // as a null `other` in `TcpConfig`'s copy constructor
+            // (`known-issues/jit/bg-compile-off-nulls-a-reference-argument-…`).
+            //
+            // A private target is not a dispatch site, so it takes the same
+            // route `invokespecial` does: bind exactly, at the resolved owner.
+            let class_name = if invoke_kind == 0 {
+                match cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode)) {
+                    Some(owner) => {
+                        invoke_kind = 1;
+                        PRIVATE_INVOKEVIRTUAL_PINNED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        owner
+                    }
+                    None => class_name,
+                }
+            } else {
+                class_name
+            };
+            let invoke_kind = invoke_kind;
             if dbg_intrinsic_enabled() {
                 eprintln!(
                     "[cratonvm-intrinsic] single-pass site {class_name}.{method_name}{descriptor} @pc={pc} kind={invoke_kind}"
@@ -20928,9 +21051,9 @@ fn try_compile_inner(
             // recursive-call check, inlining, direct-callee compile, and the
             // `JitInvokeInfo` baked into the compiled code), so a wrong
             // target is never baked into any of them.
-            let class_name = if invoke_kind == 1 {
+            let class_name = if invoke_kind == 1 && opcode == 0xb7 {
                 cp_invokespecial_owner_resolver
-                    .and_then(|r| r(cp_idx))
+                    .and_then(|r| r(cp_idx, opcode))
                     .unwrap_or(class_name)
             } else {
                 class_name
