@@ -249,6 +249,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "watch-pun", on_key: Some("CRATONVM_DBG_WATCH_PUN"), off_key: None, off_word: None },
+    // Name the receiver, slot and compiled method for a field store the JIT
+    // helper family discarded (implausible receiver, or slot past num_slots).
+    // The counters are always on; this is the per-event dump.
+    E { group: Group::DBG, token: "dropped-putfield", on_key: Some("CRATONVM_DBG_DROPPED_PUTFIELD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "refdisc", on_key: Some("CRATONVM_DBG_REFDISC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "site-alias", on_key: Some("CRATONVM_DBG_SITE_ALIAS"), off_key: None, off_word: None },

@@ -231,12 +231,33 @@ fn maybe_dump_shutdown_reports() {
         //   only while `CRATONVM_DBG_WATCH_PUN` is armed; it is `<not armed>`
         //   otherwise rather than `0`, because those are different facts.
         eprintln!(
-            "[cratonvm] unresolved field sites refused: {} | field sites refused for a              descriptor disagreement: {} | compiled primitive stores into a              declared-reference slot: {}",
+            "[cratonvm] unresolved field sites refused: {} | field sites refused \
+             for a descriptor disagreement: {} | compiled primitive stores into \
+             a declared-reference slot: {}",
             cratonvm_jit::x64::bytecode_walk::unresolved_field_site_bails(),
             cratonvm_vm::runtime::interpreter::jit_field_tag_disagreements(),
             cratonvm_vm::jit::helpers::jit_putfield_primitive_into_ref_slot()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "<not armed>".to_string()),
+        );
+        // Compiled field stores the helper family DISCARDED. Both drops are
+        // right in isolation -- writing through an implausible receiver, or
+        // past the end of the object, corrupts the neighbouring allocation
+        // instead. What they lacked is visibility: a dropped store leaves the
+        // field exactly as it was, and for a field assigned once in a
+        // constructor that is the zero-filled cell a reference `getfield` reads
+        // back as an ordinary `null`. The defect then surfaces arbitrarily far
+        // away as "this reference cannot be null", with nothing connecting it
+        // to a store that did not happen.
+        //
+        // Printed even when zero, because zero is the useful reading: it rules
+        // the whole mechanism out for a run, which is what a null-reference
+        // investigation needs before it starts looking anywhere else.
+        // `CRATONVM_DBG_DROPPED_PUTFIELD=1` names the receiver, the slot and
+        // the compiled method for the first 32 of each.
+        let (dropped_recv, dropped_oob) = cratonvm_vm::jit::helpers::jit_putfield_dropped_stores();
+        eprintln!(
+            "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );
         // G1 parallel-evacuation CAS losses, i.e. how often a worker found
         // another worker had already forwarded the object it was copying and

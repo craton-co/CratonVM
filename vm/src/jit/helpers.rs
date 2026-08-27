@@ -7643,6 +7643,85 @@ unsafe fn jit_getfield_impl(
     result
 }
 
+/// Compiled field stores DROPPED because the receiver was not a plausible
+/// heap pointer.
+///
+/// The helper returns without writing and without raising, so the field keeps
+/// whatever it held — for a freshly allocated object, the zero-filled cell that
+/// a reference `getfield` reads back as **null**.
+pub static JIT_PUTFIELD_DROPPED_BAD_RECEIVER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Compiled field stores DROPPED because `field_index` fell outside the
+/// receiver's declared `num_slots`. Same consequence as the counter above.
+pub static JIT_PUTFIELD_DROPPED_OUT_OF_BOUNDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the two dropped-store counters, `(bad_receiver, out_of_bounds)`.
+pub fn jit_putfield_dropped_stores() -> (u64, u64) {
+    (
+        JIT_PUTFIELD_DROPPED_BAD_RECEIVER.load(std::sync::atomic::Ordering::Relaxed),
+        JIT_PUTFIELD_DROPPED_OUT_OF_BOUNDS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Count — and under `CRATONVM_DBG_DROPPED_PUTFIELD`, report — a compiled field
+/// store this helper family is about to discard.
+///
+/// # Why a dropped store needs a counter at all
+///
+/// Both drops are deliberate and both are the right call in isolation: writing
+/// through an implausible receiver, or past the end of the object, corrupts the
+/// neighbouring allocation instead (that is how a JIT-compiled
+/// `Catalina.setParentClassLoader` produced a delayed SIGSEGV). Dropping is the
+/// containment.
+///
+/// What was missing is that the containment is INVISIBLE. A dropped store
+/// leaves the field exactly as it was, and for a field assigned once in a
+/// constructor that means the zero-filled cell — which a reference `getfield`
+/// reads back as a perfectly ordinary `null`. The defect then surfaces
+/// arbitrarily far away as "this reference is null and cannot be", with nothing
+/// anywhere connecting it to a store that did not happen.
+///
+/// That is the shape of `TCPSSLOptions.getTransportOptions()` returning null
+/// under `CRATONVM_BG_COMPILE=0`, which reaches
+/// `TcpConfig.<init>` as a null `other` and throws roughly nine seconds into
+/// `TechEmpowerTest` (`known-issues/jit/bg-compile-off-nulls-a-reference-
+/// argument-…`). A zero here rules the whole mechanism out in one run; a
+/// non-zero names the receiver, the slot and the compiled method.
+///
+/// # Safety
+/// `obj_ptr` is only dereferenced on the reporting path, and only after
+/// `plausible_heap_pointer` has accepted it.
+#[cold]
+unsafe fn note_dropped_putfield(obj_ptr: i64, field_index: i64, why: &str, plausible: bool) {
+    let n = if plausible {
+        JIT_PUTFIELD_DROPPED_OUT_OF_BOUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        JIT_PUTFIELD_DROPPED_BAD_RECEIVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    if n >= 32 || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_PUTFIELD").is_none() {
+        return;
+    }
+    let (class, num_slots) = if plausible {
+        let class_id = std::ptr::read(obj_ptr as *const u32);
+        let num_slots = std::ptr::read(
+            (obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32,
+        );
+        (
+            cratonvm_gc::collector::class_name_for_diagnostics(class_id),
+            num_slots as i64,
+        )
+    } else {
+        ("<implausible receiver>".to_string(), -1)
+    };
+    eprintln!(
+        "[dropped-putfield] why={why} class={class} num_slots={num_slots}          field_index={field_index} obj=0x{:x} jit_callee={}",
+        obj_ptr as u64,
+        current_jit_callee(),
+    );
+}
+
 /// Bounds-check a JIT putfield slot against the receiver's declared
 /// `num_slots` (read directly from the object header at offset 16 — the same
 /// `num_slots` field `VmHeap::num_fields` returns; see the header layout in
@@ -7681,6 +7760,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        note_dropped_putfield(obj_ptr, field_index, "implausible-receiver", false);
         return;
     }
     // DIAGNOSTIC (gated by CRATONVM_DBG_JIT_PUTFIELD, one-shot, zero release
@@ -7706,6 +7786,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         }
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        note_dropped_putfield(obj_ptr, field_index, "slot-out-of-bounds", true);
         return;
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
@@ -7751,9 +7832,11 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        note_dropped_putfield(obj_ptr, field_index, "implausible-receiver", false);
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        note_dropped_putfield(obj_ptr, field_index, "slot-out-of-bounds", true);
         return;
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
@@ -7786,9 +7869,11 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        note_dropped_putfield(obj_ptr, field_index, "implausible-receiver", false);
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        note_dropped_putfield(obj_ptr, field_index, "slot-out-of-bounds", true);
         return;
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
@@ -7822,9 +7907,11 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        note_dropped_putfield(obj_ptr, field_index, "implausible-receiver", false);
         return;
     }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        note_dropped_putfield(obj_ptr, field_index, "slot-out-of-bounds", true);
         return;
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
@@ -7866,6 +7953,7 @@ pub unsafe extern "C" fn jit_putfield_object(
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        note_dropped_putfield(obj_ptr, field_index, "implausible-receiver", false);
         return;
     }
     let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
@@ -7888,6 +7976,7 @@ pub unsafe extern "C" fn jit_putfield_object(
     // route lands on the same header word at several times the cost, and
     // this helper runs once per reference field store.
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        note_dropped_putfield(obj_ptr, field_index, "slot-out-of-bounds", true);
         return;
     }
     if crate::runtime::env_cache::jit_pfo_trace() {
@@ -7982,6 +8071,10 @@ pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i
     // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    //
+    // Not counted as a dropped STORE: this helper records a card, it does not
+    // write the field. The store itself was made (or dropped, and counted) by
+    // whichever `jit_putfield_*` ran before this.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return;
     }
