@@ -242,6 +242,48 @@ pub(super) fn helpful_npe_opcode_message_parts(
     helpful_npe::combine_opt(action, expr.as_ref())
 }
 
+/// Does an `invokevirtual` (0xb6) site name a **private** method?
+///
+/// JVMS 5.4.6 selects a private method as the one the constant pool resolved,
+/// with no override lookup at all. javac has emitted `invokevirtual` for a call
+/// to a private instance method since Java 11 (JEP 181 nestmates), where it
+/// used to emit `invokespecial` — the opcode changed, the semantics did not.
+///
+/// Every compiled dispatcher resolves an `invoke_kind == 0` site by walking up
+/// from the RECEIVER's class, so on such a site it finds the most-derived
+/// same-named private method and calls THAT. The shape is ordinary — a class
+/// whose constructor calls its own `private void init()`, subclassed by a class
+/// that does the same — and `io/vertx/core/net/TCPSSLOptions`,
+/// `ClientOptionsBase` and `HttpClientOptions` are three such levels in one
+/// chain. The interpreter has pinned these correctly since
+/// [`resolved_private_invokevirtual_target`] below; the compile doors had no
+/// equivalent, and each classifies invoke sites for itself.
+///
+/// This is the COMPILE-TIME form of that question, answered while the caller
+/// already holds the class-manager read guard. A `true` means the site must be
+/// classified as a direct, non-dispatching bind (`invoke_kind == 1`) rather
+/// than as virtual dispatch. The class name needs no substitution: JVM access
+/// control makes a private method invocable only from the class that declares
+/// it, so the constant pool's owner already IS the declaring class.
+pub(crate) fn invokevirtual_site_targets_private(
+    cm: &crate::classloading::ClassManager,
+    current_class_id: ClassId,
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let Some(cp_class_id) = cm.find_class_by_name_for_class(target_class, current_class_id) else {
+        return false;
+    };
+    let store = cm.class_store();
+    let Some((method, _declaring_id)) =
+        crate::classloading::find_method_recursive(cp_class_id, method_name, descriptor, store)
+    else {
+        return false;
+    };
+    method.access_flags.contains(MethodAccessFlags::PRIVATE)
+}
+
 /// Resolve a Java 11+ private-method call encoded as `invokevirtual`.
 ///
 /// Private methods are not virtual dispatch targets even when modern classfiles
