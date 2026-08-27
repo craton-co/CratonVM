@@ -285,6 +285,14 @@ fn maybe_dump_shutdown_reports() {
             "[cratonvm] field resolutions that fell back from (name, descriptor)              to name-only: {}",
             cratonvm_vm::runtime::resolve::field_resolution_descriptor_fallbacks()
         );
+        // And the number that says whether applying the descriptor CHANGED an
+        // answer. Every one of these is a field access that used to reach a
+        // same-named field of another type -- and in compiled code, to pair
+        // that field's slot index with the constant pool's type tag.
+        eprintln!(
+            "[cratonvm] field resolutions the descriptor key answered differently              from the name-only key: {}",
+            cratonvm_vm::runtime::resolve::field_resolution_descriptor_corrections()
+        );
         eprintln!(
             "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );

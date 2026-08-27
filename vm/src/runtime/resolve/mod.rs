@@ -610,6 +610,26 @@ pub fn field_resolution_descriptor_fallbacks() -> u64 {
     FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many field resolutions the JVMS §5.4.3.2 key answered **differently**
+/// from the name-only key this VM used before 2026-08-27.
+///
+/// This is the ENGAGEMENT counter for the fix itself, and it is the only number
+/// that separates "the descriptor key is now applied" from "the descriptor key
+/// changed an answer". Every one of these is a field access that used to reach
+/// a same-named field of another type — and, in compiled code, to pair that
+/// field's slot index with the constant pool's type tag.
+///
+/// A `0` on a workload means the fix is inert there, not that it is unnecessary:
+/// the shape needs a class declaring two fields of one name, or a subclass
+/// shadowing an inherited field name with a different type.
+pub static FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS`].
+pub fn field_resolution_descriptor_corrections() -> u64 {
+    FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<'a> MemberResolver<'a> {
     /// Bind a resolver to `shared`.
     ///
@@ -1104,6 +1124,17 @@ impl<'a> MemberResolver<'a> {
         if let Some(class) = cm.get_class(owner_id) {
             let mut static_idx = 0usize;
             let mut instance_idx = 0usize;
+            // What the name-only key WOULD have answered on this class, so a
+            // changed answer can be counted rather than assumed. Computed only
+            // when a descriptor was supplied, and only on this cold
+            // resolution-cache-miss path.
+            let name_only_here: Option<&str> = descriptor.and_then(|_| {
+                class
+                    .fields
+                    .iter()
+                    .find(|f| &*f.name == field_name)
+                    .map(|f| &*f.descriptor)
+            });
             for f in &class.fields {
                 // JVMS §5.4.3.2 — name AND descriptor. `descriptor: None` is
                 // the historical name-only key, kept for callers that own the
@@ -1111,6 +1142,10 @@ impl<'a> MemberResolver<'a> {
                 if &*f.name == field_name
                     && descriptor.is_none_or(|d| &*f.descriptor == d)
                 {
+                    if name_only_here.is_some_and(|d| d != &*f.descriptor) {
+                        FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let (index, is_static) = if f.is_static() {
                         (static_idx, true)
                     } else {
@@ -1167,6 +1202,21 @@ impl<'a> MemberResolver<'a> {
                 d,
                 cm.class_store(),
             )
+            .inspect(|(_, field, declaring)| {
+                // Did the full key land somewhere the name-only key would not?
+                // Counted, not assumed — see
+                // `FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS`.
+                if let Some((_, name_field, name_declaring)) =
+                    find_field_recursive(owner_id, field_name, cm.class_store())
+                {
+                    if name_declaring != *declaring
+                        || &*name_field.descriptor != &*field.descriptor
+                    {
+                        FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
             .or_else(|| {
                 let name_only = find_field_recursive(owner_id, field_name, cm.class_store());
                 if name_only.is_some() {
