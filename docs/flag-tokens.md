@@ -763,6 +763,7 @@ export inherited from a parent shell.
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
 | `charseq-string-intrinsic` | `CRATONVM_JIT_CHARSEQ_STRING_INTRINSIC` |
 | `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
+| `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
 | `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
