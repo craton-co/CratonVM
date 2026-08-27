@@ -1386,6 +1386,12 @@ pub const INVENTORY: &[E] = &[
     // behaviour where only the RBP half was reset on push and restored on pop,
     // which left the pair naming two different frames. See
     // `conservative_roots::reload_top_rbp_cache`.
+    // Declared 2026-08-26. An OPT-OUT: in the regions the abstract interpreter
+    // MODELS (java locals, operand spill), the band verifier treats a slot the
+    // ACTIVE safepoint map does not name as DEAD rather than demanding it be
+    // published. This key restores the stricter reading. See
+    // `conservative_roots::band_slot_is_verifiable_with_map`.
+    E { group: Group::GC, token: "band-map-liveness", on_key: None, off_key: Some("CRATONVM_GC_NO_BAND_MAP_LIVENESS"), off_word: None },
     E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
