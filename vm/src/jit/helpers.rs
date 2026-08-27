@@ -5423,21 +5423,50 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
     // Cold, once per site: re-read the literal. Owned before the lock is
     // dropped, because `create_java_string` allocates and must not run under
     // the class-manager read lock (`create_exception_object` re-enters it).
-    let text = {
+    // Three different failures used to share one message, and the message named
+    // only the one that cannot happen. The compile-time resolver has already
+    // proved this entry IS a readable string literal in this class, so a
+    // failure here is never "the constant pool says otherwise" — it is the
+    // class id no longer naming the class it named at compile time, or naming
+    // nothing at all. Reporting them apart is the difference between "the
+    // constant pool is wrong" (it is not) and "this artifact is being run
+    // against a class store that does not hold its holder".
+    let (text, why) = {
         let cm = vm.classes.class_manager.read();
-        cm.get_class(holder)
-            .and_then(|class| match class.constant_pool.get(idx) {
+        match cm.get_class(holder) {
+            None => (None, "no class is loaded at that class id".to_string()),
+            Some(class) => match class.constant_pool.get(idx) {
                 Some(cratonvm_reader::constant_pool::ConstantPoolEntry::StringReference {
                     string_index,
-                }) => class.constant_pool.get_utf8(*string_index).map(str::to_owned),
-                _ => None,
-            })
+                }) => match class.constant_pool.get_utf8(*string_index) {
+                    Some(t) => (Some(t.to_owned()), String::new()),
+                    None => (
+                        None,
+                        format!(
+                            "class {} holds a StringReference at that index whose utf8                              entry #{string_index} is unreadable",
+                            class.name
+                        ),
+                    ),
+                },
+                other => (
+                    None,
+                    format!(
+                        "class {} holds {} at that index, not a StringReference",
+                        class.name,
+                        match other {
+                            Some(e) => format!("{e:?}"),
+                            None => "no entry".to_string(),
+                        },
+                    ),
+                ),
+            },
+        }
     };
     let Some(text) = text else {
         return jit_cp_alloc_internal_error(
             vm,
             &format!(
-                "JIT ldc: cp#{idx} of class id {} is not a readable string literal",
+                "JIT ldc: cp#{idx} of class id {}: {why} (this site was resolved at                  compile time, so the constant pool has not changed under it)",
                 holder.as_u32()
             ),
         );
