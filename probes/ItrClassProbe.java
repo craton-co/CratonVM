@@ -38,6 +38,35 @@ public class ItrClassProbe {
         Map<String,String> chm = new java.util.concurrent.ConcurrentHashMap<>(hm);
         c("chm.keySet", chm.keySet()); c("chm.values", chm.values()); c("chm.entrySet", chm.entrySet());
 
+        // Families the first cut of this census MISSED, which is how an
+        // `IdentityHashMap` values view -- still on the shared `ArrayList$Itr`
+        // -- got past it and threw a spurious CME the moment the yield was
+        // switched on. A census is only as good as its receiver list.
+        Map<String,String> idm = new IdentityHashMap<>(); idm.put("k","v");
+        c("idm.keySet", idm.keySet()); c("idm.values", idm.values()); c("idm.entrySet", idm.entrySet());
+        Map<String,String> whm = new WeakHashMap<>(); whm.put("k","v");
+        c("whm.keySet", whm.keySet()); c("whm.values", whm.values()); c("whm.entrySet", whm.entrySet());
+        Map<java.time.DayOfWeek,String> em = new EnumMap<>(java.time.DayOfWeek.class);
+        em.put(java.time.DayOfWeek.MONDAY, "v");
+        c("em.keySet", em.keySet()); c("em.values", em.values()); c("em.entrySet", em.entrySet());
+        Properties pr = new Properties(); pr.setProperty("k","v");
+        c("props.keySet", pr.keySet()); c("props.values", pr.values()); c("props.entrySet", pr.entrySet());
+        Map<String,String> cslm = new java.util.concurrent.ConcurrentSkipListMap<>(); cslm.put("k","v");
+        c("cslm.keySet", cslm.keySet()); c("cslm.values", cslm.values()); c("cslm.entrySet", cslm.entrySet());
+        c("cslSet", new java.util.concurrent.ConcurrentSkipListSet<>(al));
+        c("copyOnWriteSet", new java.util.concurrent.CopyOnWriteArraySet<>(al));
+        c("linkedBlockingQueue", new java.util.concurrent.LinkedBlockingQueue<>(al));
+        c("arrayBlockingQueue", new java.util.concurrent.ArrayBlockingQueue<>(4, false, al));
+        c("concurrentLinkedQueue", new java.util.concurrent.ConcurrentLinkedQueue<>(al));
+        c("linkedBlockingDeque", new java.util.concurrent.LinkedBlockingDeque<>(al));
+        c("treeMapDescKeys", new TreeMap<>(hm).descendingMap().keySet());
+        c("subMapKeys", new TreeMap<>(hm).headMap("zzz").keySet());
+        c("synchMapKeys", Collections.synchronizedMap(hm).keySet());
+        c("synchSet", Collections.synchronizedSet(new HashSet<>(al)));
+        c("singletonSet", Collections.singleton("x"));
+        c("emptySet", Collections.emptySet());
+        c("emptyMapKeys", Collections.<String,String>emptyMap().keySet());
+
         c("hashSet", new HashSet<>(al));
         c("linkedHashSet", new LinkedHashSet<>(al));
         c("treeSet", new TreeSet<>(al));

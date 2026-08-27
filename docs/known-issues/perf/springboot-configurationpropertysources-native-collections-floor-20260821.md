@@ -487,14 +487,38 @@ receivers. Almost everything already has its own cursor — every map view of
 | `chm.values` | `ArrayList$Itr` | **BLOCKER** — `ConcurrentHashMap$ValuesView` extends `CollectionView`/`AbstractCollection`, no `modCount` |
 | `priorityQueue` | `ArrayList$Itr` | **BLOCKER** — `PriorityQueue` extends `AbstractQueue`/`AbstractCollection`, no `modCount` |
 
-So the enabling work is **two entries, not a redesign**: add
-`ConcurrentHashMap$ValuesView → ConcurrentHashMap$ValueIterator` to
-`VALUES_ITR_CARRIERS` (which already carries the other four values families),
-and give `PriorityQueue` its own `PriorityQueue$Itr`. Both are also
-HotSpot-parity fixes in their own right — the census diff shows CratonVM naming
-`ArrayList$Itr` where HotSpot names `ConcurrentHashMap$ValueIterator` and
-`PriorityQueue$Itr`. Do those two and the 6.2× plus the `cmeClear` correctness
-fix are both available.
+**ATTEMPTED 2026-08-27. One of the two was right, the other was wrong, and the
+yield is STILL NOT SAFE — for a reason that invalidates the criterion I was
+using.**
+
+* `ConcurrentHashMap$ValuesView → ConcurrentHashMap$ValueIterator` **landed**.
+  A HotSpot-parity fix on its own: census divergences go 21 → 20 of 66, and the
+  one row that changes is exactly that one.
+* **`PriorityQueue` was never a blocker**, and adding it would have
+  reintroduced a known bug. `native_pq_iterator` deliberately returns an
+  `ArrayList$Itr` over an ArrayList-shaped **wrapper** holding a heap-order
+  snapshot, so its `this$0` IS a genuine `ArrayList` with a real `modCount`.
+  Its own comment records what minting a real `PriorityQueue$Itr` did: slot 0
+  is `cursor:int`, so the snapshot array stored there was coerced away and
+  iteration saw zero elements. The entry was written, caught, and removed.
+
+**And the yield still throws.** With `ArrayList$Itr` retagged, `IdentityHashMap`'s
+values view throws a spurious `ConcurrentModificationException` from
+`checkForComodification`. `ItrClassProbe` says `idm.values` mints its own
+`IdentityHashMap$ValueIterator`, matching HotSpot — and it reached
+`ArrayList$Itr` anyway.
+
+**So a class-name census is NOT a sufficient safety criterion**, which is the
+real result of this attempt. The class a receiver mints *in isolation* is not
+the class it reaches the `al_itr_*` natives with; a hoisted view that is
+resynced, or reached through a `Collection`-typed parameter, can arrive on the
+shared class regardless. Any future attempt needs a runtime assertion — refuse
+the yield unless the iterator's `this$0` actually has a `modCount` — not a
+static list of receivers.
+
+The prize is unchanged and still measured: **6.2× on `iterList`** (944/972/965 →
+150/159/153, one binary, controls flat) plus the `cmeClear` fail-fast fix. What
+it needs is a receiver-shape check at the point of dispatch.
 
 **A coverage note worth acting on independently:** `regression-suite/run.sh`
 passed **72/72 on the broken binary**. A change that makes
