@@ -757,6 +757,18 @@ struct Lowerer<'a> {
     /// whenever profiling is off) ⇒ every `Op::If` keeps its historical layout
     /// byte-for-byte.
     branch_hints: &'a HashMap<usize, bool>,
+    /// IR-tier inlining: `(start, end, invoke_bci)` for each relocated callee
+    /// region in the combined bytecode buffer `IrBuilder` walked, in increasing
+    /// `start` order and non-overlapping.
+    ///
+    /// A node inside a region carries its COMBINED-buffer pc, because that is
+    /// what keys its own compact-field row, direct-call entry and inline cache.
+    /// That pc names no instruction in THIS method, so wherever a bci is handed
+    /// to the interpreter — a throw site checked against the exception table's
+    /// `[start_pc, end_pc)` ranges, or the resume bci of a null/bounds guard —
+    /// [`Lowerer::resume_bci`] maps it back to the enclosing `invoke`. Empty on
+    /// every compile that splices nothing, where `resume_bci` is the identity.
+    spliced_ranges: &'a [(usize, usize, usize)],
     /// Guard-surviving scalar replacement: metadata for each scalar-replaced
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
@@ -869,6 +881,7 @@ impl<'a> Lowerer<'a> {
         slot_plan: &'a SlotPlan,
         helpers: &JitRuntimeHelpers,
         branch_hints: &'a HashMap<usize, bool>,
+        spliced_ranges: &'a [(usize, usize, usize)],
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
@@ -1135,6 +1148,7 @@ impl<'a> Lowerer<'a> {
             },
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
+            spliced_ranges,
             sr_map,
             inline_scopes,
             // Off by default; `lower_inner_with_scopes` installs a plan when
@@ -3433,7 +3447,9 @@ fn reloc_emit_enabled() -> bool {
     /// exit can reach the stub without a throw-site bci — the defect the stub's
     /// own doc comment describes.
     fn push_call_exc_patch(&mut self, patch: usize) {
-        let bci = self.cur_bci;
+        // `cur_bci` is the node's own pc, which inside a spliced region is a
+        // combined-buffer pc — see `resume_bci`.
+        let bci = self.resume_bci(self.cur_bci);
         self.call_exc_patches.push((patch, bci));
     }
 
@@ -4548,6 +4564,23 @@ fn reloc_emit_enabled() -> bool {
                     length_slot,
                     self.frame_record,
                 );
+                // The reload that PAIRS with the map above. Its absence was not
+                // a missed optimisation: `emit_shadow_push` bumps the thread's
+                // shadow top and `emit_shadow_reload` is what retracts it, so an
+                // array allocation with any live reference around it leaked one
+                // frame's worth of shadow slots per execution. The
+                // `shadow_pushes != shadow_reloads` check at the end of
+                // `lower_inner` caught it and refused the whole method — which
+                // is why every C2 candidate containing `newarray` alongside a
+                // live oop silently lost its optimized body, `Short2.<init>()V`
+                // (`2 shadow pushes vs 1 reloads`) included.
+                //
+                // `Op::New` needs no counterpart: it emits no map, so it takes
+                // no push. Placed exactly where `Op::ConstString` /
+                // `Op::ConstClass` put theirs — after the stub, before the
+                // zero test — because the reload uses RCX and never RAX, so the
+                // returned (possibly relocated) pointer is untouched.
+                self.emit_shadow_reload();
 
                 self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
                 self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
@@ -5800,7 +5833,10 @@ fn reloc_emit_enabled() -> bool {
             Op::Throw => {
                 let exc = node.inputs[2];
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
-                let bci = node.bytecode_pc.unwrap_or(0);
+                // `athrow` is refused inside a spliced body today; translating
+                // anyway keeps the rule "a bci handed to the interpreter goes
+                // through `resume_bci`" without an exception to remember.
+                let bci = self.resume_bci(node.bytecode_pc.unwrap_or(0));
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[1], bci as u64);
                 self.emit_mov_reg_imm64(RAX, self.throw_exception as u64);
                 self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
@@ -6101,6 +6137,30 @@ fn reloc_emit_enabled() -> bool {
     /// is what binds the snapshot to its inlined scope
     /// ([`InlineScopeTable::snapshot_scope`]), so the search is a `position`
     /// rather than a `find`.
+    /// The bci to hand the INTERPRETER for a node whose `bytecode_pc` may be a
+    /// combined-buffer pc inside a relocated callee body.
+    ///
+    /// Identity outside a spliced region, and identity on every compile that
+    /// splices nothing. Inside one it answers the enclosing `invoke`'s bci,
+    /// which is the only pc in this method that describes where execution is:
+    /// the call has not taken effect, so re-executing it re-runs the callee.
+    ///
+    /// Both consumers need this for correctness, not tidiness. A throw-site bci
+    /// is range-checked against this method's own exception table
+    /// (`jit_set_throw_bci` → `route_jit_exception_through_method`), and a pc
+    /// past the end of the bytecode falls outside every `[start_pc, end_pc)` —
+    /// which silently drops a `catch`-all, the exact defect that helper exists
+    /// to fix. A guard's resume bci is worse: the interpreter would be parked at
+    /// an instruction that does not exist.
+    fn resume_bci(&self, bci: usize) -> usize {
+        for &(start, end, invoke_bci) in self.spliced_ranges {
+            if bci >= start && bci < end {
+                return invoke_bci;
+            }
+        }
+        bci
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
         match self.graph.safepoints.iter().position(|s| s.bci == bci) {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
@@ -6292,6 +6352,9 @@ fn reloc_emit_enabled() -> bool {
     /// `DEOPT_ARG0`. Generalises `emit_deopt_if_zero` so a bounds check can
     /// continue on `JB` (unsigned index < length) and deopt otherwise.
     fn emit_deopt_unless(&mut self, jcc_continue: u8, bci: usize, reason: DeoptReason) {
+        // A guard inside a spliced body resumes at the enclosing `invoke`, whose
+        // snapshot is the caller's state before the call — see `resume_bci`.
+        let bci = self.resume_bci(bci);
         let frame_state = self.resolve_frame_state_for_bci(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
@@ -9444,6 +9507,7 @@ pub fn lower(
         num_locals,
         helpers,
         &empty,
+        &[],
         None,
         &no_direct,
         &no_ic,
@@ -9474,6 +9538,7 @@ pub fn lower_with_branch_hints(
         num_locals,
         helpers,
         branch_hints,
+        &[],
         None,
         &no_direct,
         &no_ic,
@@ -9506,6 +9571,7 @@ pub fn lower_with_scalar_deopt(
         num_locals,
         helpers,
         &empty,
+        &[],
         sr_map,
         &no_direct,
         &no_ic,
@@ -9545,6 +9611,7 @@ pub(crate) fn lower_inner(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
+    spliced_ranges: &[(usize, usize, usize)],
     sr_map: Option<&ScalarReplacementMap>,
     direct_calls: &HashMap<usize, (usize, bool)>,
     ic_slots: &HashMap<usize, (usize, usize)>,
@@ -9560,6 +9627,7 @@ pub(crate) fn lower_inner(
         num_locals,
         helpers,
         branch_hints,
+        spliced_ranges,
         sr_map,
         direct_calls,
         ic_slots,
@@ -9586,6 +9654,7 @@ pub(crate) fn lower_inner_with_scopes(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
+    spliced_ranges: &[(usize, usize, usize)],
     sr_map: Option<&ScalarReplacementMap>,
     // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)` for
     // every statically-bound call site whose callee was eagerly compiled. Empty
@@ -9910,6 +9979,7 @@ pub(crate) fn lower_inner_with_scopes(
         &slot_plan,
         helpers,
         branch_hints,
+        &[],
         sr_map,
         direct_calls,
         ic_slots,
@@ -9945,7 +10015,24 @@ pub(crate) fn lower_inner_with_scopes(
     // `ir_lower_refuses_more_incoming_slots_than_abi_registers` pins the pair
     // together so the two cannot drift apart again.
     if num_params + usize::from(lowerer.needs_context) > incoming_abi_reg_capacity() {
-        return None;
+        // Named, where it used to be a bare `None`. This is the commonest
+        // whole-method refusal an ordinary accessor hits and it said nothing at
+        // all: `VolumeShort2.getIndex(III)I` is `this` + three ints = four
+        // incoming slots, and touching one field turns `needs_context` on, which
+        // is the fifth. Two separate investigations reached this line by
+        // bisecting the lowerer rather than by reading a log.
+        return refuse(Bailout::with_context(
+            BailoutReason::UnsupportedShape("incoming arg slots exceed the entry ABI registers"),
+            format!(
+                "{num_params} param slot(s){} > {} entry register(s)",
+                if lowerer.needs_context {
+                    " + the VM context"
+                } else {
+                    ""
+                },
+                incoming_abi_reg_capacity(),
+            ),
+        ));
     }
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
@@ -11402,6 +11489,7 @@ mod tests {
             2,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &no_direct,
             ic,
@@ -11472,6 +11560,7 @@ mod tests {
             1,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &direct,
             &no_ic,
@@ -11640,6 +11729,7 @@ mod tests {
             2,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -12295,6 +12385,7 @@ mod tests {
             3,
             &no_helpers(),
             &HashMap::new(),
+            &[],
             None,
             &HashMap::new(),
             &HashMap::new(),
@@ -13220,6 +13311,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -13956,6 +14048,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -14186,6 +14279,7 @@ mod tests {
                 &plan,
                 &helpers,
                 &empty,
+                &[],
                 None,
                 &no_direct,
                 &no_ic,
@@ -14348,6 +14442,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -16020,6 +16115,7 @@ mod tests {
             plan,
             helpers,
             empty,
+            &[],
             None,
             no_direct,
             no_ic,

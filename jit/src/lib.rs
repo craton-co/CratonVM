@@ -6089,7 +6089,31 @@ pub struct InlineSite {
     /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
     /// is empty at the deepest admitted level, which terminates the recursion.
     pub nested_sites: Vec<NestedInlineSite>,
+    /// IR-tier only: resolved `new` sites in the callee body,
+    /// `(callee_pc, class_id, num_fields)`.
+    ///
+    /// Empty for every site the single-pass emitter plans — its resolver
+    /// refuses a body containing `new` outright, because `try_emit_inline_body`
+    /// has no arm for one. `IrBuilder` does, and it is the arm that matters: an
+    /// accessor that allocates is exactly the body escape analysis has to see
+    /// inside its caller. Filled by `resolve_ir_inline_site` only, and a
+    /// `Deferred` target refuses the whole splice rather than leaving a row out
+    /// — a missing row bails the METHOD, not the site.
+    pub ir_new_info: Vec<(usize, u32, usize)>,
 }
+
+/// How many levels of splice-inside-a-splice the OPTIMIZING tier's resolver
+/// will plan — deeper than [`MAX_INLINE_NEST_DEPTH`], and for a reason the
+/// single-pass number does not have.
+///
+/// A partly-inlined allocation chain is worth nothing: the moment the object is
+/// passed to a call the graph cannot see through, it escapes, and escape
+/// analysis reports `scalar-replaced 0/N` exactly as it did with no inlining at
+/// all. kfusion's own chain is four levels before the allocation's last use is
+/// visible (`VolumeShort2.get` → `loadFromArray` → `Short2.<init>()V` →
+/// `Short2.<init>([S)V`), so a budget of three would have stopped one short and
+/// measured as no change.
+pub const MAX_IR_INLINE_NEST_DEPTH: usize = 6;
 
 /// How many levels of splice-inside-a-splice the resolver will plan.
 ///
@@ -6103,6 +6127,212 @@ pub struct InlineSite {
 /// (`assertEquals(int,int)` -> `assertEquals(Object,Object)` ->
 /// `objectsAreEqual`), which is the shape that motivated nesting.
 pub const MAX_INLINE_NEST_DEPTH: usize = 3;
+
+/// Whether the optimizing tier may splice callee bodies into the graph it
+/// builds. `CRATONVM_JIT_IR_INLINE=1`.
+///
+/// Opt-in, and the shipped default is OFF for the same reason
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE` is: the allocation this exists to delete is
+/// only HALF deleted until array scalar replacement lands beside it (a
+/// `Short2` keeps its two shorts in a `short[2]`, and `escape_analysis` can
+/// scalar-replace `Op::New` but not `Op::NewArray`). A capability that only
+/// sometimes pays should be priced on the gauntlet before it becomes what every
+/// compile does.
+pub fn ir_inline_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Total appended bytecode one compile may splice, across every site and every
+/// nesting level.
+///
+/// Not a code-size budget — it bounds the WALK. Every appended byte is bytecode
+/// `IrBuilder` visits and turns into nodes, and the node count is what
+/// `ir_optimize`'s GVN and the escape-analysis connection graph scale in. Four
+/// times [`MAX_INLINE_BYTECODE_SIZE`] is room for a full accessor chain at
+/// several call sites without letting a resolver defect expand a method without
+/// limit.
+const IR_INLINE_MAX_TOTAL_BYTES: usize = 4 * MAX_INLINE_BYTECODE_SIZE;
+
+/// Distinct caller call sites one compile may splice at.
+const IR_INLINE_MAX_SITES: usize = 24;
+
+/// Append one resolved callee body — and, recursively, its own spliced callees
+/// — to `combined`, recording every side-table row the relocated body needs.
+///
+/// `caller_pc` is the pc of the `invoke` this body replaces, already in
+/// COMBINED-buffer coordinates: the compiling method's own code for a top-level
+/// site, the enclosing relocated body for a nested one. Both spaces are the
+/// same space, which is what lets one function serve both.
+///
+/// Returns `false` when the site's data is inconsistent with itself, when a
+/// nested site needs a guard the IR tier cannot emit, or when the walk budget
+/// is spent. The caller rolls `combined` back — a half-added body is worse than
+/// none, because `tables.sites` would then name a body whose `field_info` rows
+/// are missing and the builder would bail the whole METHOD at its first
+/// `getfield`.
+#[allow(clippy::too_many_arguments)]
+fn append_ir_inline_site(
+    mut site: InlineSite,
+    caller_pc: usize,
+    combined: &mut Vec<u8>,
+    tables: &mut ir::IrInlineTables,
+    owned_strings: &mut Vec<Box<str>>,
+    owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+    direct_callee_entries: &mut Vec<usize>,
+    budget: &mut usize,
+    // `(combined pc, num_jit_args)` for each virtual/interface call the spliced
+    // bodies leave behind. The planner gives each its own MIC/PIC — without one
+    // a surviving call falls back to a blind name resolution, and that trade
+    // costs far more than the frame the splice removed (measured: 47 ns to
+    // 11 000 ns per element on the `VoxelAlloc2` control arm).
+    virtual_call_sites: &mut Vec<(usize, usize)>,
+    // Rebased compact-layout rows for the spliced bodies' field accesses; goes
+    // to `ir_lower`, not to the builder, which is why it is not in
+    // `IrInlineTables`.
+    compact_fields_out: &mut HashMap<usize, (u32, bool, u8)>,
+) -> bool {
+    let code_len = site.callee_code_len;
+    if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
+        return false;
+    }
+    let (arg_local_slots, _span) =
+        compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let Some((desc_args, ret)) = static_call_shape(&site.descriptor) else {
+        return false;
+    };
+    let num_args = desc_args + usize::from(!site.callee_is_static);
+    // `compute_param_jvm_slots` counts one entry per VALUE and `static_call_shape`
+    // counts one arg per value, so these agree unless the descriptor was parsed
+    // two different ways — which is exactly the disagreement that would install
+    // an argument in the wrong local.
+    if arg_local_slots.len() != num_args {
+        return false;
+    }
+    if arg_local_slots.iter().any(|&s| s >= site.callee_max_locals) {
+        return false;
+    }
+
+    let base = combined.len();
+    combined.extend_from_slice(&site.callee_code[..code_len]);
+    *budget -= code_len;
+
+    tables.sites.insert(
+        caller_pc,
+        ir::IrInlineSite {
+            base,
+            code_len,
+            num_args,
+            max_locals: site.callee_max_locals,
+            arg_local_slots: arg_local_slots.iter().map(|&s| s as u32).collect(),
+            returns_value: ret != b'V',
+        },
+    );
+    for &(cpc, field_index, type_tag) in &site.field_info {
+        tables.field_info.insert(base + cpc, (field_index, type_tag));
+    }
+    // The compact byte offset for each of those fields, rebased the same way.
+    // Without it `ir_lower` routes every spliced field access through the
+    // checked `jit_getfield` helper — a boundary note, a region walk and a
+    // 16-byte atomic cell read per access, which the single-pass backend
+    // measured at 4.7x. The descriptor tag comes from the `field_info` row
+    // above, so the two cannot disagree about what kind of field this is; a
+    // compact row with no matching `field_info` row is dropped rather than
+    // guessed.
+    for &(cpc, byte_offset, is_ref) in &site.compact_field_info {
+        if let Some(&(_, _, type_tag)) = site.field_info.iter().find(|(fpc, _, _)| *fpc == cpc) {
+            compact_fields_out.insert(base + cpc, (byte_offset, is_ref, type_tag));
+        }
+    }
+    for &(cpc, class_id, num_fields) in &site.ir_new_info {
+        tables.new_info.insert(base + cpc, (class_id, num_fields));
+    }
+    // The resolver PROVED these bodies are no-ops, which is what
+    // `object_init_pcs` means — elidable on any receiver, not only on a fresh
+    // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
+    // `super()` on `this` every constructor starts with.
+    for &cpc in &site.elided_invoke_pcs {
+        tables.object_init_pcs.insert(base + cpc);
+    }
+
+    // Nested splices first, so their callee pcs are known before the remaining
+    // invokes are interned as ordinary calls. A pc carries BOTH a nested site
+    // and an `invoke_targets` entry — the resolver records them additively so
+    // the single-pass emitter can fall back mid-body. `IrBuilder` has no such
+    // fallback: it checks `inline_sites` first and never consults `invoke_info`
+    // for that pc, so installing both would leave a dead row, and installing
+    // the call instead of the splice would leave the allocation escaping.
+    let nested = std::mem::take(&mut site.nested_sites);
+    let mut nested_pcs: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(nested.len());
+    for n in nested {
+        // A guarded nested site needs a receiver class-id compare the IR tier
+        // has no node for. `resolve_ir_inline_site` never produces one (it
+        // routes every kind through the statically-bound arm and refuses a
+        // target that is not provably monomorphic); refuse rather than splice
+        // it unguarded, which would be silent wrong code at an overriding site.
+        if n.guard_class_id != 0 {
+            return false;
+        }
+        nested_pcs.insert(n.callee_pc);
+        if !append_ir_inline_site(
+            n.site,
+            base + n.callee_pc,
+            combined,
+            tables,
+            owned_strings,
+            owned_invoke_infos,
+            direct_callee_entries,
+            budget,
+            virtual_call_sites,
+            compact_fields_out,
+        ) {
+            return false;
+        }
+    }
+
+    // The calls the body makes that stay calls. Interned into THIS compile's
+    // arenas by the same routine the single-pass path uses, so the `&'static
+    // str` names and the baked `*const JitInvokeInfo` have identical lifetime
+    // rules on both paths.
+    intern_inline_invoke_targets(
+        &mut site,
+        owned_strings,
+        owned_invoke_infos,
+        direct_callee_entries,
+    );
+    for r in &site.resolved_invoke_infos {
+        if nested_pcs.contains(&r.callee_pc) {
+            continue;
+        }
+        tables
+            .invoke_info
+            .insert(base + r.callee_pc, (r.info_addr, r.num_jit_args, r.return_type));
+        // `invoke_kind` lives on the resolver-side target, not on the interned
+        // row; 0 = virtual, 2 = interface are the two the inline-cache cascade
+        // serves.
+        if site
+            .invoke_targets
+            .iter()
+            .any(|(pc, t)| *pc == r.callee_pc && matches!(t.invoke_kind, 0 | 2))
+        {
+            virtual_call_sites.push((base + r.callee_pc, r.num_jit_args));
+        }
+    }
+    true
+}
+
+/// Merge one top-level site's rows into the compile's plan. Split out so the
+/// roll-back path has something to NOT call.
+fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTables) {
+    into.sites.extend(from.sites);
+    into.field_info.extend(from.field_info);
+    into.invoke_info.extend(from.invoke_info);
+    into.new_info.extend(from.new_info);
+    into.object_init_pcs.extend(from.object_init_pcs);
+}
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
 /// `*const JitInvokeInfo`s its emitter can bake, interning the names into the
@@ -7233,6 +7463,7 @@ mod profile_guided_inlining_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
@@ -8009,6 +8240,7 @@ mod inline_selection_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
@@ -16727,6 +16959,10 @@ pub fn try_compile(
         cp_invokedynamic_descriptor_resolver,
         None,
         None,
+        // No IR-tier inline resolver either: `try_compile`'s callers are this
+        // crate's own tests, which have no class manager to resolve a callee
+        // body against. `None` keeps `IrBuilder` splicing nothing.
+        None,
         // No VM in scope here. The latch is what this wrapper's callers (this
         // crate's tests, and any VM site not yet threading a policy) have
         // always read, and no test latches it, so they keep reading
@@ -16882,6 +17118,14 @@ pub fn try_compile_with_invokespecial_resolver(
     // answer — refuses the speculation; it never falls back to the other
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
+    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
+    // VM). Separate from `inline_resolver` because the two answer different
+    // questions: that one resolves what the single-pass emitter can splice,
+    // which refuses `new`, array access and `arraylength` — the three shapes an
+    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
+    // splices nothing, which is byte-identical to the pre-inlining IR path.
+    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
     // JDK-only execution policy for THIS VM's compilations.
     //
     // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
@@ -17013,6 +17257,7 @@ pub fn try_compile_with_invokespecial_resolver(
         cp_invokedynamic_descriptor_resolver,
         class_id_name_resolver,
         receiver_inline_resolver,
+        ir_inline_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
         &admission,
@@ -17067,6 +17312,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 cp_invokedynamic_descriptor_resolver,
                 class_id_name_resolver,
                 receiver_inline_resolver,
+                ir_inline_resolver,
                 &mut retry_backend_attempted,
                 self_call_identity_stable,
                 &admission,
@@ -18120,6 +18366,14 @@ fn try_compile_inner(
     // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
     // See `try_compile`.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
+    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
+    // VM). Separate from `inline_resolver` because the two answer different
+    // questions: that one resolves what the single-pass emitter can splice,
+    // which refuses `new`, array access and `arraylength` — the three shapes an
+    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
+    // splices nothing, which is byte-identical to the pre-inlining IR path.
+    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -19977,13 +20231,156 @@ fn try_compile_inner(
                 }
             }
         }
+        // ── IR-tier inlining ────────────────────────────────────────────
+        //
+        // Resolve a body for each admitted call site and relocate it into a
+        // COMBINED buffer that `build` walks: the compiling method's code
+        // first, then one copy of each spliced body after it. The builder jumps
+        // `pc` into a body at its `invoke` and back out at its return; JVM
+        // branch offsets are relative, so a whole body moves without rewriting.
+        //
+        // This is the missing first half of deleting a short-lived wrapper. An
+        // accessor that `areturn`s a fresh object shows escape analysis an
+        // object that leaves its own method, and `scalar-replaced 0/N` is the
+        // only answer per-method EA can give — at any tier, however good.
+        // Inlining the chain into its consuming loop first is what lets the
+        // object die where it is used. See `ir::IrInlineSite`.
+        let mut ir_combined: Option<Vec<u8>> = None;
+        // `(start, end, invoke_bci)` per relocated region, for `ir_lower`'s
+        // `resume_bci`. A top-level site's own body and every body nested inside
+        // it are appended contiguously (`append_ir_inline_site` writes its own
+        // code, then recurses), so one range covers the whole chain.
+        let mut ir_spliced_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        if ir_inline_enabled() {
+            if let (Some(ir_resolver), Some(invoke_resolver)) =
+                (ir_inline_resolver, cp_invoke_resolver)
+            {
+                let mut combined: Vec<u8> = code[..code_len.min(code.len())].to_vec();
+                let mut tables = ir::IrInlineTables::default();
+                let mut budget = IR_INLINE_MAX_TOTAL_BYTES;
+                let mut sites_planned = 0usize;
+                for &(pc, cp_idx, _opcode) in &scan.invoke_ops {
+                    if sites_planned >= IR_INLINE_MAX_SITES || budget == 0 {
+                        break;
+                    }
+                    let Some((cn, mn, desc)) = invoke_resolver(cp_idx) else {
+                        continue;
+                    };
+                    let Some(site) = ir_resolver(&cn, &mn, &desc) else {
+                        continue;
+                    };
+                    // Per-site all-or-nothing. `combined` is truncated and the
+                    // budget restored on refusal, and the site's rows go into a
+                    // scratch table that is simply dropped — so a body that does
+                    // not fit leaves the plan exactly as it was, rather than
+                    // leaving `sites` naming a body with no `field_info`.
+                    let mark = combined.len();
+                    let budget_mark = budget;
+                    let mut sub = ir::IrInlineTables::default();
+                    let mut sub_vcalls: Vec<(usize, usize)> = Vec::new();
+                    let mut sub_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+                    let ok = append_ir_inline_site(
+                        site,
+                        pc,
+                        &mut combined,
+                        &mut sub,
+                        &mut ir_call_strings,
+                        &mut ir_call_infos,
+                        &mut ir_direct_callee_entries,
+                        &mut budget,
+                        &mut sub_vcalls,
+                        &mut sub_compact,
+                    );
+                    if ok {
+                        merge_ir_inline_tables(&mut tables, sub);
+                        // Same gate the caller's own rows are behind, so
+                        // the spliced bodies and the method around them cannot
+                        // disagree about whether compact offsets are in play.
+                        if cratonvm_types::compact_ref_fields_enabled() {
+                            ir_compact_fields.extend(sub_compact);
+                        }
+                        // One inline cache per surviving virtual call. Keyed by
+                        // the call's own combined-buffer pc, which is why the
+                        // spliced nodes keep those pcs — see `ir::IrInlineSite`.
+                        // No profile seed: receiver counts are recorded against
+                        // the bci of the method that was EXECUTING, and a
+                        // relocated pc is not one of those. The first dispatch
+                        // rings the helper, which installs the target, and the
+                        // guard hits from then on.
+                        for (vpc, num_args) in sub_vcalls {
+                            if helpers.invoke_virtual_mic != 0
+                                && num_args >= 1
+                                && num_args + 1 <= ir_entry_abi_reg_count()
+                            {
+                                let mic = Box::new(JitMICSlot::new_at(vpc));
+                                let pic = Box::new(JitPICSlot::new_at(vpc));
+                                pic.seed_from_mic(&mic, false);
+                                let mic_addr = &*mic as *const JitMICSlot as usize;
+                                let pic_addr = &*pic as *const JitPICSlot as usize;
+                                ir_mic_boxes.push(mic);
+                                ir_pic_boxes.push(pic);
+                                ir_ic_slots.insert(vpc, (mic_addr, pic_addr));
+                            }
+                        }
+                        ir_spliced_ranges.push((mark, combined.len(), pc));
+                        sites_planned += 1;
+                    } else {
+                        combined.truncate(mark);
+                        budget = budget_mark;
+                    }
+                }
+                if sites_planned > 0 {
+                    // The call at a spliced pc is not emitted, so its
+                    // direct-call entry and its inline-cache pair describe
+                    // nothing. Dropping them keeps `_direct_callee_entries` —
+                    // which `prepare_for_publication` pins and refuses to publish
+                    // an unresolvable entry from — free of targets this artifact
+                    // never calls.
+                    for &pc in tables.sites.keys() {
+                        if pc < code_len {
+                            ir_direct_calls.remove(&pc);
+                            ir_ic_slots.remove(&pc);
+                        }
+                    }
+                    // `resume_bci` scans these linearly and assumes increasing
+                    // starts. They are pushed in plan order, which is already
+                    // increasing, but sorting makes that a property of the data
+                    // rather than of the loop above.
+                    ir_spliced_ranges.sort_unstable();
+                    if ir_stage_reporting() {
+                        eprintln!(
+                            "[ir] inline-plan {}.{}{}: {} site(s), {} spliced bod{}, {} bytes appended",
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
+                            sites_planned,
+                            tables.sites.len(),
+                            if tables.sites.len() == 1 { "y" } else { "ies" },
+                            combined.len() - code_len,
+                        );
+                    }
+                    // Two sentinel bytes, exactly as a method's own bytecode
+                    // carries: the last relocated body ends in a 1-byte return,
+                    // but a reader that peeks past the final instruction must
+                    // land on zeroes rather than on whatever follows the Vec.
+                    combined.push(0);
+                    combined.push(0);
+                    builder.apply_inline_tables(tables);
+                    ir_combined = Some(combined);
+                }
+            }
+        }
+
         // Phase 2 (build). `nodes_built` is recorded straight after, so the
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
         note_jit_pipeline_stage(JIT_STAGE_BUILD);
     let metrics_build = metrics.phase(metrics::Phase::Build);
-        let built = builder.build(code, code_len);
+        // `code_len` stays the COMPILING method's length whichever buffer this
+        // is: everything past it is relocated callee code, unreachable from pc
+        // 0 and walked only through a splice.
+        let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
         drop(metrics_build);
         if let Some(g) = built.as_ref() {
             metrics.set_nodes_built(g.nodes.len());
@@ -20334,6 +20731,7 @@ fn try_compile_inner(
                         cached.max_locals as usize,
                         helpers,
                         &ir_branch_hints,
+                        &ir_spliced_ranges,
                         sr_map.as_ref(),
                         &ir_direct_calls,
                         &ir_ic_slots,
