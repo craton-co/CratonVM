@@ -2173,18 +2173,27 @@ fn seed_direct_native_engine_services() {
         "Blowfish",
         "ChaCha20",
         "ChaCha20-Poly1305",
-        // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
-        // carries the mode set in a `SupportedModes` attribute. The divergence
-        // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
-        // the bare name defaults to ECB — so advertising `DESede` would name a
-        // transformation `getInstance` refuses. Every entry in this list is one
-        // the engine computes; that invariant is worth more than matching
-        // HotSpot's grouping, and it is what
-        // `every_advertised_sunjce_cipher_is_serviceable` pins.
-        "DES/CBC/NoPadding",
-        "DES/CBC/PKCS5Padding",
-        "DESede/CBC/NoPadding",
-        "DESede/CBC/PKCS5Padding",
+        // The bare names, as HotSpot lists them, carrying their mode set in a
+        // `SupportedModes` attribute rather than in the service name.
+        //
+        // These were spelled in full until 2026-08-27, deliberately, and the
+        // reason was recorded here: this engine routed only CBC to the real
+        // SunJCE SPI and the bare name defaults to ECB, so advertising
+        // `DESede` would have named a transformation `getInstance` refuses.
+        // That precondition is gone — `classify_transformation` admits ECB for
+        // this family and `cipher_do_final_impl` forwards the parsed mode — so
+        // the bare form is now both advertised and computed, which is the
+        // invariant `every_advertised_sunjce_cipher_is_serviceable` pins and
+        // the shape HotSpot actually has.
+        //
+        // The fully-spelled `DESede/CBC/PKCS5Padding` is still SERVED: the
+        // `Cipher` arm of `check_provider_ownership` splits a transformation on
+        // `/` and asks about the base name, so one bare service covers every
+        // admitted mode/padding of it. It is no longer separately ADVERTISED,
+        // which is what `Security.getAlgorithms("Cipher")` reports, and there
+        // HotSpot lists two names where this list used to produce four.
+        "DES",
+        "DESede",
         "RSA",
         "PBEWithHmacSHA1AndAES_128",
         "PBEWithHmacSHA1AndAES_256",
@@ -2236,7 +2245,19 @@ fn seed_direct_native_engine_services() {
     put_alias(JCE, "Cipher", "AESWrap_128", "AES_128/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
-    put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
+    // `Alg.Alias.Cipher.TripleDES = DESede` on SunJCE — the BARE name,
+    // measured, not the expanded transformation this row used to carry.
+    //
+    // The expansion was wrong crypto, not merely a wrong spelling: bare
+    // `DESede` is ECB/PKCS5Padding on SunJCE and this row named CBC, so
+    // once the alias registry started being consulted by
+    // `canonical_transformation` (2026-08-26), `getInstance("TripleDES")`
+    // returned a CBC cipher with a random IV where HotSpot returns ECB
+    // with none — different ciphertext, silently. That is exactly the
+    // mode substitution `classify_transformation`'s DesFamily arm and
+    // `cipher_do_final_impl`'s route table each carry a comment about;
+    // the alias reached the engine around both of them.
+    put_alias(JCE, "Cipher", "TripleDES", "DESede");
     // `Alg.Alias.Cipher.RC4 = ARCFOUR` on SunJCE. Measured on HotSpot 25: both
     // spellings resolve, both answer `getProvider()=SunJCE`, and both encrypt
     // the same 16-byte plaintext to `27ca482b161e3ab93f812659b904df95` — while
