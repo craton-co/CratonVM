@@ -8392,16 +8392,27 @@ impl Compiler {
                                     self.load_slot_to_reg(ARG_REGS[0], recv_slot);
                                     self.load_slot_to_reg(ARG_REGS[1], index_slot);
                                     self.emit_mov_imm32_sx(ARG_REGS[2], kind as i32);
-                                    match (is_get, out_base, value_slot) {
-                                        (true, Some(out), _) => {
+                                    // arg3 is the out-pointer for a get and the
+                                    // value for a set. `is_get` already pinned
+                                    // which of the two is `Some`, but this file
+                                    // routes every recoverable case through a
+                                    // bail rather than a panic (see the
+                                    // `deny(...)` header) — so a shape that
+                                    // cannot arise fails the COMPILE, which
+                                    // drops the method to the interpreter.
+                                    match (out_base, value_slot) {
+                                        (Some(out), _) => {
                                             self.emit_lea_frame_slot(ARG_REGS[3], out)
                                         }
-                                        (false, _, Some(v)) => {
+                                        (None, Some(v)) => {
                                             self.load_slot_to_reg(ARG_REGS[3], v)
                                         }
-                                        _ => unreachable!(
-                                            "is_get pins which of out_base / value_slot is Some"
-                                        ),
+                                        (None, None) => {
+                                            self.fail(
+                                                "singlepass-codegen/ffm-missing-arg3-operand",
+                                            );
+                                            return false;
+                                        }
                                     }
                                     self.emit_call_absolute(helper);
                                     self.emit_test_r64_r64(RAX);

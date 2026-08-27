@@ -23824,6 +23824,9 @@ const FFM_CARRIER_SLOTS: u32 = 6;
 /// # Safety
 /// `obj_ptr` must be a live object with more than `index` slots.
 #[inline]
+// SAFETY: the caller has established `obj_ptr` is a live carrier and that
+// `index` is below its `num_slots`, so the 16-byte cell at
+// `HEADER_SIZE + index * SLOT_SIZE` lies inside the allocation.
 unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + index * SLOT_SIZE);
     match cratonvm_types::read_value_atomic(ptr as *const Value) {
@@ -23838,6 +23841,10 @@ unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
 /// # Safety
 /// Called from compiled code with `seg` an object reference or 0.
 #[inline]
+// SAFETY: every dereference below is guarded first. `plausible_heap_pointer`
+// rejects null and any non-heap word; the header reads that follow sit at fixed
+// offsets inside the header it just established; and slot reads happen only
+// after `num_slots` confirms the 6-slot carrier shape.
 unsafe fn ffm_resolve_carrier(seg: i64, want_write: bool) -> Option<(u64, i64)> {
     if !cratonvm_types::plausible_heap_pointer(seg as u64) {
         return None;
