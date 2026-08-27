@@ -2566,13 +2566,37 @@ pub fn execute(
                                 };
                             // Count JIT arg slots (receiver + params for virtual, just params for static)
                             let param_count = crate::jit::count_param_slots(descriptor_ref);
-                            let invoke_kind = match opcode {
+                            let mut invoke_kind = match opcode {
                                 0xb6 => 0u8, // invokevirtual
                                 0xb7 => 1,   // invokespecial
                                 0xb9 => 2,   // invokeinterface
                                 0xb8 => 3,   // invokestatic
                                 _ => continue,
                             };
+                            // JVMS 5.4.6 — an `invokevirtual` naming a PRIVATE
+                            // method is not a dispatch site. This door reaches
+                            // the backend WITHOUT going through
+                            // `cratonvm_jit::try_compile`, so it does not
+                            // inherit the reclassification made there and has to
+                            // make the same one itself. See
+                            // `invoke::invokevirtual_site_targets_private`; it is
+                            // this door, reached only under
+                            // `CRATONVM_BG_COMPILE=0`, that kept
+                            // `TCPSSLOptions.init()` from ever running.
+                            if invoke_kind == 0
+                                && crate::runtime::interpreter::invoke::invokevirtual_site_targets_private(
+                                    &cm_lock,
+                                    class_id,
+                                    target_class,
+                                    method_name_ref,
+                                    descriptor_ref,
+                                )
+                            {
+                                invoke_kind = 1;
+                                cratonvm_jit::PRIVATE_INVOKEVIRTUAL_PINNED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let invoke_kind = invoke_kind;
                             let is_recursive_call = target_class == &*class_name_str
                                 && method_name_ref == method_name
                                 && descriptor_ref == method_descriptor;

@@ -11703,10 +11703,18 @@ impl ZgcRealHeap {
             );
             return;
         }
+        // `write_value_atomic`, not `ptr::write`, for two reasons that both
+        // matter on THIS collector: the concurrent marker scans field slots
+        // while the mutator writes them (a plain 16-byte `ptr::write` racing
+        // the marker's read is formally UB and can splice two stores into a
+        // garbage pointer), and `ptr::write` of a narrow variant commits the
+        // `Value`'s PADDING to the cell's 64-bit payload word — the word a
+        // compiled reference `getfield` dereferences. See `value_words`.
+        // `g1` and `gen_heap` already write field cells this way.
         // SAFETY: index validated < num_slots, so the slot is within bounds.
         unsafe {
             let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
-            std::ptr::write(ptr as *mut Value, value);
+            cratonvm_types::write_value_atomic(ptr as *mut Value, value);
         }
     }
 }

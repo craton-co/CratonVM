@@ -154,6 +154,18 @@ pub enum Op {
     },
     NewArray {
         element_type: u8,
+        /// The array's length, when the producer proved it a compile-time
+        /// constant; `None` otherwise.
+        ///
+        /// This is what makes an array a scalar-replacement candidate at all:
+        /// an array of constant length N maps onto
+        /// [`ScalarReplacementInfo::field_values`] exactly the way an N-field
+        /// object does, and a constant index is exactly a field index. Without
+        /// a length there is no slot count, so there is nothing to map onto.
+        ///
+        /// `None` is the fail-closed default: a hand-built or future-produced
+        /// node that does not fill it is simply never a candidate.
+        length: Option<usize>,
     },
     Call,
     MonitorEnter,
@@ -259,6 +271,34 @@ pub struct Graph {
     /// escape point, together with the materialization sites it would need
     /// ([`PartialEscapeInfo::escape_sites`]).
     pub cold_nodes: HashSet<NodeId>,
+    /// For each memory-accessing node, the **basic block** it executes in,
+    /// named by the IR control node it is pinned to (mapped into EA ids).
+    ///
+    /// # Why the analysis needs this
+    ///
+    /// The bridge drops the control and memory edges (see the module header),
+    /// so [`program_order_proves_dominance`] can only answer the *whole graph*
+    /// question — "is there any branch anywhere?" — and a hot loop always
+    /// answers no. That refused every allocation in every loop body, including
+    /// ones whose allocation, stores and loads sit next to each other in one
+    /// straight-line block.
+    ///
+    /// This carries back the one fact that makes the local question decidable,
+    /// and nothing else: which block each access is in. Ascending [`NodeId`] is
+    /// execution order *within* a block, because a block is straight-line by
+    /// definition.
+    ///
+    /// **Empty by default.** A graph with no entries behaves exactly as it did
+    /// before this existed: only the graph-wide stand-in is available, and an
+    /// allocation in a branchy graph is refused. Fail-closed in the direction
+    /// that matters — a missing entry costs an optimisation, never correctness.
+    ///
+    /// Only nodes whose IR op pins control at input 0 *and* whose control input
+    /// is a real control node get an entry. In particular a `Guard` is
+    /// deliberately NOT a block boundary: it produces no control token
+    /// ([`ir::Op::is_control`] excludes it), so a bounds or null check leaves
+    /// its block intact and the accesses either side of it still compare equal.
+    pub blocks: HashMap<NodeId, NodeId>,
 }
 
 impl Graph {
@@ -279,6 +319,7 @@ impl Graph {
             entry: 0,
             exit: 1,
             cold_nodes: HashSet::new(),
+            blocks: HashMap::new(),
         }
     }
 
@@ -378,14 +419,70 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
         .iter()
         .all(|&a| match graph.nodes.get(a).map(|n| &n.op) {
             Some(Op::New { num_fields, .. }) => field < *num_fields,
-            // Arrays have no statically-known field count here; treat any index as
-            // out-of-range so array stores take the conservative escape path.
-            Some(Op::NewArray { .. }) => false,
+            // An array's "fields" are its elements, so a constant length is a
+            // slot count and a constant index is a field index. An array whose
+            // length the producer could not prove constant still answers
+            // `false`, which keeps its accesses on the conservative path.
+            Some(Op::NewArray { length, .. }) => length.is_some_and(|n| field < n),
             _ => false,
         })
 }
 
 // ── Program order as a dominance stand-in ───────────────────────────────
+
+/// Whether ascending [`NodeId`] is a sound stand-in for dominance *for one
+/// allocation*, on the strength of every access to it being in one basic block.
+///
+/// [`program_order_proves_dominance`] asks the whole-graph question and a hot
+/// loop always fails it: the loop's own back-edge is a `Merge`. But the object
+/// this analysis wants to delete is usually allocated, filled and read inside a
+/// single straight-line block of that loop, and for such an object the ordering
+/// question is decidable without any dominator tree.
+///
+/// # The argument
+///
+/// Let *B* be the block. Require the allocation and **every** field access this
+/// candidate folds — every store in `stores`, every load in `loads` — to be in
+/// *B*, and require the reference to have no φ alias (`transparent` is just the
+/// allocation itself, so no copy of it leaves *B*).
+///
+/// 1. A block is straight-line, so within *B* ascending `NodeId` — which is
+///    creation order, which is program order — **is** execution order.
+/// 2. The allocation is itself in *B*, so each execution of *B* produces a
+///    *fresh* object. A store executed in an earlier execution of *B* (an
+///    earlier loop iteration) wrote an earlier object, not this one. This is
+///    the clause that makes the rule safe in a loop, and it is exactly what
+///    fails when the allocation is hoisted out of the loop: then one object is
+///    reused across iterations and a load can see the previous iteration's
+///    store.
+/// 3. The use walk in [`find_scalar_replacements`] is exhaustive — it visits
+///    every use of the allocation and refuses the object outright at anything
+///    it cannot classify — so `stores` is *every* store to this object's
+///    fields. With (1) and (2), the latest store preceding a load in *B* is the
+///    value that load reads.
+///
+/// Returns `false` whenever any access has no recorded block (see
+/// [`Graph::blocks`]) or the blocks are not all equal — a missing fact is never
+/// read as agreement.
+fn one_block_proves_dominance(
+    graph: &Graph,
+    alloc: NodeId,
+    transparent: &HashSet<NodeId>,
+    stores: &[Vec<FieldStore>],
+    loads: &[NodeId],
+) -> bool {
+    // A φ copy carries the reference to a merge, which is by construction not
+    // this block. Refuse rather than reason about it.
+    if transparent.len() != 1 {
+        return false;
+    }
+    let block = match graph.blocks.get(&alloc) {
+        Some(&b) => b,
+        None => return false,
+    };
+    let same = |n: &NodeId| graph.blocks.get(n) == Some(&block);
+    stores.iter().flatten().all(|fs| same(&fs.store)) && loads.iter().all(same)
+}
 
 /// Whether ascending [`NodeId`] is a sound stand-in for *dominance* in this
 /// graph — i.e. whether "store id < load id" really means "the store executed
@@ -699,9 +796,20 @@ pub struct ScalarReplacementInfo {
     pub load_values: Vec<(NodeId, LoadResolution)>,
     /// Stores that were eliminated.
     pub eliminated_stores: Vec<NodeId>,
-    /// Whether program order was a sound dominance stand-in for this graph —
-    /// [`program_order_proves_dominance`]. Recorded per candidate so a consumer
-    /// can see *why* a field with stores resolved to `Unknown`.
+    /// `Some(atype)` when the replaced allocation is an [`Op::NewArray`], and
+    /// the elements rather than fields are what `field_values` describes;
+    /// `None` for an ordinary object.
+    ///
+    /// The IR-side applier reads this to know whether it is looking for
+    /// `Op::Load`/`Op::Store` or `Op::ArrayLoad`/`Op::ArrayStore`, and the
+    /// deopt-descriptor producer reads it to know it cannot describe the
+    /// allocation with a `class_id`.
+    pub array_element_type: Option<u8>,
+    /// Whether program order was a sound dominance stand-in **for this
+    /// candidate** — either [`program_order_proves_dominance`] for the whole
+    /// graph, or [`one_block_proves_dominance`] for this object alone.
+    /// Recorded per candidate so a consumer can see *why* a field with stores
+    /// resolved to `Unknown`.
     pub dominance_proved: bool,
 }
 
@@ -738,6 +846,99 @@ pub struct PartialEscapeInfo {
 }
 
 /// Full result of escape analysis on a graph.
+/// The largest constant array length scalar replacement will take on.
+///
+/// Replacing an array trades one allocation for one live value per element, and
+/// the register allocator pays for every one of them. Small wrapper arrays --
+/// the `short[2]` behind a `Short2`, a `float[3]` behind a vector type -- are
+/// the shape this exists for, and they are the shape where the trade is
+/// obviously good. A long array turns a single allocation into dozens of
+/// simultaneously-live values and spills, which is a pessimisation dressed as
+/// an optimisation.
+///
+/// Eight is chosen to cover the vector/tuple wrappers (2, 3, 4, 8 elements) and
+/// stop well short of anything a loop would index.
+pub const MAX_SCALAR_ARRAY_LEN: usize = 8;
+
+/// Why [`find_scalar_replacements`] refused one allocation.
+///
+/// # Why this exists
+///
+/// `scalar-replaced 0/2` is a count, and a count cannot be acted on. The
+/// per-voxel `Short2` page spent three rounds guessing at a `0/N` — twice
+/// wrongly — because the analysis reported how many objects it kept and never
+/// which fact stopped it. Each variant below is one `continue`/`break` in
+/// `find_scalar_replacements`, so the report and the control flow cannot drift.
+///
+/// Purely informational: nothing acts on a refusal, and producing one is not a
+/// decision. It is emitted under `CRATONVM_DBG_SCALAR_NEW`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScalarRefusal {
+    /// Not `NoEscape` — the reachability fact (fact 1) does not hold.
+    Escapes(EscapeState),
+    /// A live node observes the object's address (fact 3).
+    IdentityObserved,
+    /// The object is published into another object's field, so it escapes
+    /// through the heap.
+    StoredIntoAnotherObject,
+    /// A field op names this allocation as its holder with an index that is not
+    /// a field of it (or a malformed operand layout).
+    FieldIndexOutOfRange,
+    /// A φ carrying this reference could not be proved to be a transparent copy
+    /// of exactly this allocation.
+    PhiNotTransparentCopy,
+    /// A monitor operation names the object.
+    MonitorOperation,
+    /// A use this walk has no rule for — a `Call` argument, a `Return`, a
+    /// `Throw`, an `Op::Other`. The catch-all.
+    OpaqueUse,
+    /// A value written into one of the object's own fields may BE the object,
+    /// so a reference to it can be recovered through a load this walk never
+    /// visits.
+    SelfReference,
+    /// A surviving load of a field that HAS stores, in a graph where program
+    /// order is not dominance (`program_order_proves_dominance` is false —
+    /// any branch, join or multi-input φ). Fact 2 is unprovable, not false.
+    ///
+    /// This is the refusal a hot loop hits: the loop body's own branches deny
+    /// the whole graph the ordering stand-in, even for a store and a load that
+    /// sit next to each other in one block.
+    LoadNotAnswerable,
+    /// `Op::NewArray`. Array scalar replacement handles a constant-length
+    /// array whose every index is a constant in range; anything else — a
+    /// non-constant length, a non-constant or out-of-range index — is refused
+    /// here rather than guessed at.
+    ArrayNotReplaceable(ArrayRefusal),
+}
+
+/// Why an `Op::NewArray` was not scalar-replaced. See
+/// [`ScalarRefusal::ArrayNotReplaceable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArrayRefusal {
+    /// The length operand is not a compile-time constant, so the array has no
+    /// statically-known number of slots to map onto scalars.
+    LengthNotConstant,
+    /// The constant length is larger than [`MAX_SCALAR_ARRAY_LEN`]. Replacing a
+    /// long array trades one allocation for a large number of live values, and
+    /// the register allocator pays for every one of them.
+    LengthTooLarge(usize),
+    /// An element access whose index is not a compile-time constant. Which slot
+    /// it names is unknown, so neither a load nor a store can be attributed.
+    IndexNotConstant,
+    /// A constant index outside `0..len`. The access throws
+    /// `ArrayIndexOutOfBoundsException` at run time, and deleting the array
+    /// deletes the throw.
+    IndexOutOfRange,
+    /// The array's elements are references (`anewarray`). See the refusal
+    /// site: the applier has no spelling for a `null` zero default.
+    ReferenceElements,
+    /// `Op::ArrayLength` names this array. The length IS a compile-time
+    /// constant and could be folded to it, but no applier arm does that today,
+    /// so replacing the array would leave a live node reading a deleted one.
+    /// Refused rather than half-applied.
+    LengthReadNotFolded,
+}
+
 pub struct EscapeAnalysisResult {
     /// Escape states for all allocation sites.
     ///
@@ -788,6 +989,12 @@ pub struct EscapeAnalysisResult {
     /// informational — it exists so a fail-closed answer is *reportable* rather
     /// than invisible.
     pub lock_refusals: Vec<(NodeId, LockRefusal)>,
+    /// Every allocation [`find_scalar_replacements`] refused, with the reason.
+    ///
+    /// Sorted by node id and deduplicated; one entry per refused allocation
+    /// (the walk stops at the first refusal, so an object has one reason).
+    /// Informational only — see [`ScalarRefusal`].
+    pub scalar_refusals: Vec<(NodeId, ScalarRefusal)>,
     /// Allocations whose every escape site is cold, with those sites.
     /// Informational: nothing acts on it yet.
     pub partial_escapes: Vec<PartialEscapeInfo>,
@@ -1314,8 +1521,14 @@ pub fn find_identity_observations(cg: &ConnectionGraph, graph: &Graph) -> Vec<(N
 // ── Phase 3b: Find scalar replacement candidates ────────────────────────
 
 /// Identify allocations that can be decomposed into scalar field values.
-fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarReplacementInfo> {
+fn find_scalar_replacements(
+    cg: &ConnectionGraph,
+    graph: &Graph,
+) -> (Vec<ScalarReplacementInfo>, Vec<(NodeId, ScalarRefusal)>) {
     let mut results = Vec::new();
+    // One reason per refused allocation. The walk below stops at its
+    // first refusal, so an object never accumulates two.
+    let mut refusals: Vec<(NodeId, ScalarRefusal)> = Vec::new();
 
     // Program order is only dominance in a branch-free graph; see
     // `program_order_proves_dominance`. Computed once — it is a property of the
@@ -1332,12 +1545,61 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
         .collect();
 
     for (id, node) in graph.nodes.iter().enumerate() {
-        if let Op::New {
-            class_id,
-            num_fields,
-        } = &node.op
-        {
-            if cg.get_escape(id) != EscapeState::NoEscape {
+        // An object contributes its field count; an array of proven constant
+        // length contributes its element count, which is the same thing for
+        // every question below. `class_id` is meaningless for an array and is
+        // never read for one -- `array_element_type` is what the consumers ask.
+        let shape: Option<(u32, usize, Option<u8>)> = match &node.op {
+            Op::New {
+                class_id,
+                num_fields,
+            } => Some((*class_id, *num_fields, None)),
+            Op::NewArray {
+                element_type,
+                length,
+            } if *element_type == 0 => {
+                // `anewarray`: a REFERENCE array (the bridge writes
+                // `element_type = 0` for it; JVM atypes start at 4). Refused,
+                // and not for want of a length. A never-stored slot of one has
+                // to be answered with `null`, and the applier's zero default is
+                // a numeric constant -- an `Int`-typed zero forwarded where a
+                // reference belongs is the silent-null shape this codebase has
+                // paid for more than once. Primitive element types have an
+                // honest zero; a reference does not, here.
+                let _ = length;
+                refusals.push((
+                    id,
+                    ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::ReferenceElements),
+                ));
+                None
+            }
+            Op::NewArray {
+                element_type,
+                length,
+            } => match length {
+                Some(n) if *n <= MAX_SCALAR_ARRAY_LEN => Some((0, *n, Some(*element_type))),
+                Some(n) => {
+                    refusals.push((
+                        id,
+                        ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthTooLarge(*n)),
+                    ));
+                    None
+                }
+                None => {
+                    refusals.push((
+                        id,
+                        ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthNotConstant),
+                    ));
+                    None
+                }
+            },
+            _ => None,
+        };
+        if let Some((class_id, num_fields, array_element_type)) = shape {
+            let (class_id, num_fields) = (&class_id, &num_fields);
+            let state = cg.get_escape(id);
+            if state != EscapeState::NoEscape {
+                refusals.push((id, ScalarRefusal::Escapes(state)));
                 continue;
             }
             // IDENTITY GATE. Checked before anything else so a `synchronized`
@@ -1345,6 +1607,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             // observation reached through an alias this loop does not classify
             // as transparent would otherwise slip past the use walk below.
             if identity_observed.contains(&id) {
+                refusals.push((id, ScalarRefusal::IdentityObserved));
                 continue;
             }
 
@@ -1365,6 +1628,8 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             let mut load_fields: Vec<usize> = Vec::new();
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
+            // Set beside every `can_replace = false` so the two cannot drift.
+            let mut refusal: Option<ScalarRefusal> = None;
 
             // WIDENED ACCEPTED SHAPE (increment 1):
             //
@@ -1467,10 +1732,12 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                         } else if is_value {
                             // Published into another object's field -> escapes;
                             // cannot scalar-replace.
+                            refusal = Some(ScalarRefusal::StoredIntoAnotherObject);
                             can_replace = false;
                             break;
                         } else {
                             // Holder role but out-of-range / malformed field.
+                            refusal = Some(ScalarRefusal::FieldIndexOutOfRange);
                             can_replace = false;
                             break;
                         }
@@ -1484,6 +1751,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                             replaced_loads.push(use_id);
                             load_fields.push(*field_idx);
                         } else {
+                            refusal = Some(ScalarRefusal::FieldIndexOutOfRange);
                             can_replace = false;
                             break;
                         }
@@ -1534,6 +1802,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                                 worklist.push(u);
                             }
                         } else {
+                            refusal = Some(ScalarRefusal::PhiNotTransparentCopy);
                             can_replace = false;
                             break;
                         }
@@ -1560,16 +1829,32 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     Op::MonitorEnter
                     | Op::MonitorExit
                     | Op::MonitorWait
-                    | Op::MonitorNotify
-                    | Op::RefCompare
-                    | Op::IdentityHash => {
+                    | Op::MonitorNotify => {
+                        refusal = Some(ScalarRefusal::MonitorOperation);
                         can_replace = false;
                         break;
                     }
-                    // ArrayLength on a non-escaping object is fine -- the
-                    // length is known statically. Other uses prevent SR.
-                    Op::ArrayLength => {}
+                    Op::RefCompare | Op::IdentityHash => {
+                        refusal = Some(ScalarRefusal::IdentityObserved);
+                        can_replace = false;
+                        break;
+                    }
+                    // `arraylength` cannot name an ordinary object, so for one
+                    // this arm is unreachable and skipping it is harmless. For
+                    // an ARRAY candidate it is a live node that would be left
+                    // reading the array this pass is about to delete, and
+                    // nothing folds it to the constant length -- so refuse.
+                    Op::ArrayLength => {
+                        if array_element_type.is_some() {
+                            refusal = Some(ScalarRefusal::ArrayNotReplaceable(
+                                ArrayRefusal::LengthReadNotFolded,
+                            ));
+                            can_replace = false;
+                            break;
+                        }
+                    }
                     _ => {
+                        refusal = Some(ScalarRefusal::OpaqueUse);
                         can_replace = false;
                         break;
                     }
@@ -1603,12 +1888,26 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                 'self_ref: for stores in field_stores.iter() {
                     for fs in stores {
                         if fs.value == id || cg.resolve_points_to(fs.value).contains(&id) {
+                            refusal = Some(ScalarRefusal::SelfReference);
                             can_replace = false;
                             break 'self_ref;
                         }
                     }
                 }
             }
+
+            // Program order is dominance for this object either because the
+            // whole graph is branch-free, or because every access to it is in
+            // one basic block — see `one_block_proves_dominance`. The second
+            // is what a hot loop needs; the first cannot be true inside one.
+            let dominance_proved = dominance_proved
+                || one_block_proves_dominance(
+                    graph,
+                    id,
+                    &transparent,
+                    &field_stores,
+                    &replaced_loads,
+                );
 
             // ── Positional load resolution ───────────────────────────
             //
@@ -1627,6 +1926,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     let resolution =
                         resolve_field_load(&field_stores[field], load, dominance_proved);
                     if resolution == LoadResolution::Unknown {
+                        refusal = Some(ScalarRefusal::LoadNotAnswerable);
                         can_replace = false;
                         break;
                     }
@@ -1644,13 +1944,22 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     replaced_loads,
                     load_values,
                     eliminated_stores,
+                    array_element_type,
                     dominance_proved,
                 });
+            } else {
+                // Every `can_replace = false` above sets `refusal`; the
+                // `unwrap_or` is the belt-and-braces answer for a future arm
+                // that forgets, and is deliberately the least specific reason
+                // rather than a silent omission.
+                refusals.push((id, refusal.unwrap_or(ScalarRefusal::OpaqueUse)));
             }
         }
     }
 
-    results
+    refusals.sort_unstable();
+    refusals.dedup();
+    (results, refusals)
 }
 
 /// Resolve one field load against the field's positional store record.
@@ -2621,7 +2930,7 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
     let mut cg = build_connection_graph(graph);
     propagate_escape_states(&mut cg, graph);
 
-    let scalar_replaceable = find_scalar_replacements(&cg, graph);
+    let (scalar_replaceable, scalar_refusals) = find_scalar_replacements(&cg, graph);
     let (lock_elisions, mut lock_refusals) = find_lock_elision_plans(&cg, graph);
     let (lock_coarsening, coarsening_refusals) = find_lock_coarsening_plans(&cg, graph);
     lock_refusals.extend(coarsening_refusals);
@@ -2707,6 +3016,7 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
         lock_elisions,
         lock_coarsening,
         lock_refusals,
+        scalar_refusals,
         partial_escapes,
         identity_observations,
         stats,
@@ -3396,7 +3706,7 @@ mod tests {
     #[test]
     fn test_array_returned_global_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 10 }, vec![]);
+        let arr = g.add_node(Op::NewArray { element_type: 10, length: None }, vec![]);
         g.nodes[1].inputs.push(arr);
         g.nodes[arr].uses.push(1);
         let result = analyze_escapes(&g);
@@ -3409,7 +3719,7 @@ mod tests {
     #[test]
     fn test_array_local_no_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 5 }, vec![]);
+        let arr = g.add_node(Op::NewArray { element_type: 5, length: None }, vec![]);
         let _len = g.add_node(Op::ArrayLength, vec![arr]);
         let result = analyze_escapes(&g);
         assert_eq!(result.escape_states.get(&arr), Some(&EscapeState::NoEscape));
@@ -3507,6 +3817,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Value(c10))],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: true,
         };
 
@@ -3683,6 +3994,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Value(c42))],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: true,
         };
 
@@ -3736,13 +4048,210 @@ mod tests {
     }
 
     #[test]
-    fn test_new_array_local_scalar_not_replaced() {
-        // NewArray cannot be scalar-replaced (only New can).
+    fn test_new_array_without_constant_length_not_replaced() {
+        // A `newarray` whose length the producer could not prove constant has no
+        // slot count, so there is nothing to map onto `field_values`. It is
+        // still NoEscape -- the refusal is about VALUE, not reachability.
         let mut g = Graph::new();
-        let _arr = g.add_node(Op::NewArray { element_type: 4 }, vec![]);
+        let _arr = g.add_node(
+            Op::NewArray {
+                element_type: 4,
+                length: None,
+            },
+            vec![],
+        );
         let result = analyze_escapes(&g);
         assert!(result.scalar_replaceable.is_empty());
         assert_eq!(result.stats.no_escape, 1);
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                2,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthNotConstant)
+            )],
+            "the refusal must name the missing length, not a generic bail"
+        );
+    }
+
+    /// The `Short2` shape: a `short[2]`, both slots stored then both read.
+    ///
+    /// This is the half of the per-voxel wrapper that `Op::New` scalar
+    /// replacement could never reach -- `docs/known-issues/jit/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-20260827.md`
+    /// recorded it as `test_new_array_local_scalar_not_replaced`.
+    #[test]
+    fn test_constant_length_array_is_scalar_replaced() {
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9, // short
+                length: Some(2),
+            },
+            vec![],
+        );
+        let v0 = g.add_node(Op::Const(7), vec![]);
+        let v1 = g.add_node(Op::Const(9), vec![]);
+        g.add_node(Op::Store(0), vec![arr, v0]);
+        g.add_node(Op::Store(1), vec![arr, v1]);
+        let l0 = g.add_node(Op::Load(0), vec![arr]);
+        let l1 = g.add_node(Op::Load(1), vec![arr]);
+        g.add_node(Op::Add, vec![l0, l1]);
+
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|i| i.alloc_node == arr)
+            .expect("a two-slot array with constant indices is replaceable");
+        assert_eq!(info.array_element_type, Some(9));
+        assert_eq!(info.num_fields, 2);
+        assert_eq!(info.field_values, vec![Some(v0), Some(v1)]);
+        assert_eq!(info.load_value(l0), LoadResolution::Value(v0));
+        assert_eq!(info.load_value(l1), LoadResolution::Value(v1));
+    }
+
+    #[test]
+    fn test_array_longer_than_the_cap_is_refused_by_length() {
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 10,
+                length: Some(MAX_SCALAR_ARRAY_LEN + 1),
+            },
+            vec![],
+        );
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthTooLarge(
+                    MAX_SCALAR_ARRAY_LEN + 1
+                ))
+            )],
+        );
+    }
+
+    #[test]
+    fn test_reference_array_is_refused() {
+        // `anewarray` -> element_type 0. A never-stored slot would have to be
+        // answered with `null`, and the applier's zero default is numeric.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 0,
+                length: Some(2),
+            },
+            vec![],
+        );
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::ReferenceElements)
+            )],
+        );
+    }
+
+    #[test]
+    fn test_array_index_out_of_range_refuses_the_array() {
+        // A constant index outside `0..len` throws `ArrayIndexOutOfBounds` at
+        // run time; deleting the array would delete the throw.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9,
+                length: Some(2),
+            },
+            vec![],
+        );
+        let v = g.add_node(Op::Const(1), vec![]);
+        g.add_node(Op::Store(5), vec![arr, v]);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(arr, ScalarRefusal::FieldIndexOutOfRange)],
+        );
+    }
+
+    #[test]
+    fn test_arraylength_on_a_replaced_array_is_refused() {
+        // Nothing folds `arraylength` to the constant, so replacing the array
+        // would leave a live node reading a deleted one.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9,
+                length: Some(2),
+            },
+            vec![],
+        );
+        g.add_node(Op::ArrayLength, vec![arr]);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthReadNotFolded)
+            )],
+        );
+    }
+
+    /// The refusal instrument is only worth having if it names the fact that
+    /// actually stopped the object. This is the shape the per-voxel page hit:
+    /// a graph with a branch, an object whose accesses are all in one block.
+    #[test]
+    fn test_one_block_dominance_answers_a_load_a_branchy_graph_could_not() {
+        // Build a graph with a branch somewhere else entirely, so
+        // `program_order_proves_dominance` is false for the whole graph.
+        let build = |same_block: bool| {
+            let mut g = Graph::new();
+            let block = g.add_node(Op::Merge, vec![]);
+            let other = g.add_node(Op::Merge, vec![]);
+            let obj = g.add_node(
+                Op::New {
+                    class_id: 1,
+                    num_fields: 1,
+                },
+                vec![],
+            );
+            let v = g.add_node(Op::Const(42), vec![]);
+            let st = g.add_node(Op::Store(0), vec![obj, v]);
+            let ld = g.add_node(Op::Load(0), vec![obj]);
+            g.add_node(Op::Add, vec![ld, ld]);
+            g.blocks.insert(obj, block);
+            g.blocks.insert(st, block);
+            g.blocks.insert(ld, if same_block { block } else { other });
+            (g, obj, v, ld)
+        };
+
+        let (g, obj, v, ld) = build(true);
+        assert!(
+            !program_order_proves_dominance(&g),
+            "precondition: the graph has a Merge, so the whole-graph stand-in fails"
+        );
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|i| i.alloc_node == obj)
+            .expect("every access is in one block, so the load is answerable");
+        assert!(info.dominance_proved);
+        assert_eq!(info.load_value(ld), LoadResolution::Value(v));
+
+        // Move the load to another block and the proof must fail closed.
+        let (g, obj, _, _) = build(false);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(obj, ScalarRefusal::LoadNotAnswerable)],
+            "a load in another block is not ordered by program order"
+        );
     }
 
     #[test]
@@ -4244,7 +4753,7 @@ mod tests {
         let mut cg = build_connection_graph(&g);
         escalate_all_to_global(&mut cg, &g);
         assert!(
-            find_scalar_replacements(&cg, &g).is_empty(),
+            find_scalar_replacements(&cg, &g).0.is_empty(),
             "no allocation may be scalar-replaced after escalation"
         );
         assert!(
@@ -4498,6 +5007,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Unknown)],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: false,
         };
         apply_scalar_replacement(&mut g, &info);

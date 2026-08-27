@@ -391,19 +391,82 @@ fix and this page does not present them as one. `this` is already stale when
 argument handling, or `unwrap_single`/`wrap_single`. That is where the next
 capture should look, and `PIN-STALE` now points at it.
 
+### ANSWERED: `native_pin_roots` entries miss remaps
+
+There were two canaries around the pin table, answering opposite questions —
+`PIN-STALE` at pin time ("the caller handed us an already-dead address") and
+`PIN-TABLE-STALE` at read time ("the table entry missed a remap"). Both asked
+`debug_forwarded_target`, which reads the forwarding word AT THE OLD ADDRESS,
+and G1 zeroes that when it frees the from-region. **Both were blind, and their
+silence was being read as information.** Corrected to also consult
+`gc_quiescence::was_vacated` — the exact ledger — and both fire immediately:
+
+```
+[blockgc] PIN-TABLE-STALE tid=5 handle=11 len=13 0x2001db77e00->0x20030455730
+          (pin-table entry missed a remap) reader:
+    1: {closure#5}                      t27_tls.rs:14820
+    3: engine_consult_trust_managers    t27_tls.rs:14820
+    4: engine_run_trust_check           t27_tls.rs:14679
+    5: do_wrap
+```
+
+`handle=11 len=13` — the handle is **well in range**, and the slot still names
+an address the ledger says was moved. Five occurrences across three threads in
+one launch (tid 3 handle=4/len=5, tid 5 handle=11/len=13, tid 6 handles
+12,13,18 of len 14,14,19), all in range.
+
+**So the pin table itself is not reliably remapped**, and this reframes
+everything above it:
+
+* the natives were doing the right thing. `engine_consult_trust_managers`
+  pins and re-derives correctly; so, after this page's fixes, do `do_wrap` and
+  `do_unwrap`. They read stale values from a table that was not updated;
+* which is exactly why three pin fixes moved the rate from 3/6 to 4/6 —
+  **no fix in native code can repair this**, and that null result was the
+  clue rather than a failure;
+* and it means `PIN-STALE`'s "the caller pinned an already-dead address" is
+  the SAME defect one call earlier: the address the caller held came out of a
+  pin table that had already missed a remap.
+
+### The refutation this overturns, and the lesson in it
+
+An earlier revision of this page struck out "the pin slot was never remapped"
+as **REFUTED by inspection**, on the grounds that all three remap paths —
+`update_all_roots`, `check_post_block_gc_refs`, `apply_pointer_map_to_thread`
+— demonstrably iterate `native_pin_roots`. Every word of that inspection was
+correct and the conclusion was wrong.
+
+**Reading that a remap EXISTS is not evidence that it RAN.** The measurement
+says entries with in-range handles still hold pre-move addresses, so for those
+collections none of the three paths reached that thread's table. Which path,
+and why, is the open question — but it is now a question about remap coverage,
+not about native code, and it has an instrument that answers in seconds.
+
+### What to do next
+
+`PIN-TABLE-STALE` fires on the reproducer within one launch, so the next step
+is to make it say WHICH collection was missed: stamp each pin-table entry with
+the collection count at pin time and print that beside the epoch at read time.
+The gap between the two names the collection whose remap did not reach this
+thread, and from there the path is a matter of reading one code path rather
+than four.
+
 ### Four ways that can happen, and where each one stands
 
-1. ~~**The pin slot was never remapped**~~ — **REFUTED by inspection.** There
-   are THREE paths, not the two an earlier revision of this page listed, and
-   all three remap `native_pin_roots`:
-   `update_all_roots` (the thread that RUNS the collection),
-   `check_post_block_gc_refs` (a thread waking from a blocked region), and
-   `apply_pointer_map_to_thread` (a running mutator that a PEER's STW stopped
-   at an interpreter safepoint — `safepoint_check`'s own comment calls that
-   site "the only site where the deposit's promise holds, because a thread
-   that reaches this line resumes through `apply_pointer_map_to_thread` and
-   remaps its own frames"). The peer-safepoint gap this page suspected does
-   not exist.
+1. **The pin slot was never remapped** — **CONFIRMED by measurement, after
+   being wrongly refuted by inspection.** `PIN-TABLE-STALE` (once given the
+   exact ledger) reports table entries with IN-RANGE handles still holding
+   pre-move addresses, five times across three threads in one launch. See
+   "ANSWERED" above.
+
+   The inspection that struck this out was accurate about the code and wrong
+   about the world: there ARE three paths that iterate `native_pin_roots` —
+   `update_all_roots` (the thread RUNNING the collection),
+   `check_post_block_gc_refs` (a blocked-region wake) and
+   `apply_pointer_map_to_thread` (a running mutator a PEER's STW stopped at an
+   interpreter safepoint). All three exist. For the collections that produce
+   this defect, none of them reached the affected thread's table. **Which one
+   should have, and why it did not, is the open question.**
 2. **The forward was never recorded**, so no remap could have applied.
    A real instance of this shape WAS found — the CAS-loser arm, below — and
    its engagement on this workload measured **0**. So the shape exists in the
