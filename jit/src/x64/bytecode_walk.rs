@@ -7581,7 +7581,14 @@ impl Compiler {
                             ) {
                                 self.emit_safepoint_metadata_only();
                             } else {
-                                self.emit_pre_safepoint_spill();
+                                // ARG_REGS only, and only if the service slots
+                                // were actually reserved: the copy above stages
+                                // through R11, so RAX is untouched here and its
+                                // contents are unpublished.
+                                self.emit_pre_safepoint_spill_args_published(
+                                    service_args_base.is_some(),
+                                    false,
+                                );
                             }
                             // Emit direct CALL to callee entry point
                             self.emit_call_absolute(callee_entry);
@@ -7738,7 +7745,12 @@ impl Compiler {
                         if self.can_elide_direct_call_register_spill(&arg_oops, true, 2) {
                             self.emit_safepoint_metadata_only();
                         } else {
-                            self.emit_pre_safepoint_spill();
+                            // Every argument is in the helper's args buffer and
+                            // the oops among them are named in the map below;
+                            // ARG_REGS carry the helper ABI (heap/info/buf/count),
+                            // never a Java oop. RAX is published only when the
+                            // staging loop -- which writes through RAX -- ran.
+                            self.emit_pre_safepoint_spill_args_published(true, n > 0);
                         }
                         self.emit_call_absolute(self.helpers.invoke_dispatch);
                         // T1.1.2 — invoke dispatch is a full safepoint:
@@ -10144,7 +10156,12 @@ impl Compiler {
                             ) {
                                 self.emit_safepoint_metadata_only();
                             } else {
-                                self.emit_pre_safepoint_spill();
+                                // See the invokestatic twin: R11 stages, so only
+                                // ARG_REGS are published, and only with slots.
+                                self.emit_pre_safepoint_spill_args_published(
+                                    service_args_base.is_some(),
+                                    false,
+                                );
                             }
                             self.emit_call_absolute(callee_entry);
                             self.emit_post_call_rbp_republish();
@@ -10361,7 +10378,10 @@ impl Compiler {
                                 if self.can_elide_direct_call_register_spill(&arg_oops, true, 3) {
                                     self.emit_safepoint_metadata_only();
                                 } else {
-                                    self.emit_pre_safepoint_spill();
+                                    // Args are in the buffer and their oops are
+                                    // named in the map at `.done`; RAX only when
+                                    // the staging loop ran. See the dispatch twin.
+                                    self.emit_pre_safepoint_spill_args_published(true, n > 0);
                                 }
                             }
 

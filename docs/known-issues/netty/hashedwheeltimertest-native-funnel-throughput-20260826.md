@@ -2,7 +2,7 @@
 
 ## Status
 **OPEN, root-caused, not fixed.** Pulled back from
-`docs/internal/fixed-suite-bugs/netty/hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`
+`fixed-suite-bugs/netty/hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`
 (full investigation, kept as the detailed record) — this page is the public-facing
 summary. Reproduces again in the 2026-08-26 complete-suite ZGC×4-shard run
 (`testExecutionOnTime`: "Timeout + 100000 delay 739 must be 125 < 650").
@@ -72,4 +72,4 @@ cratonvm.exe --java-home <jdk25> --Xmx 1500m -XX:+UseZGC @common.args -Dcraton.b
 ```
 
 ## Related
-- Full investigation: `docs/internal/fixed-suite-bugs/netty/hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`
+- Full investigation: `fixed-suite-bugs/netty/hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`

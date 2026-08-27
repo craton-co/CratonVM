@@ -3438,6 +3438,27 @@ pub(super) fn resolve_jit_new_site(
     let class = cm.get_class(holder_cid)?;
     let class_name = class.constant_pool.get_class_name(cp_idx)?;
     let Some(target_id) = cm.find_class_by_name_for_class(class_name, holder_cid) else {
+        // A `Deferred` site gets no `new_info` row, and the IR builder's 0xbb
+        // arm then bails the WHOLE method to single-pass — which also costs it
+        // escape analysis, so every allocation in it survives. Name the class
+        // that could not be resolved: "the method bailed" is not actionable,
+        // "Short2 was not found from VolumeShort2's loader" is.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some() {
+            // Separate the two ways this lookup fails: the holder has no loader
+            // id at all, versus the class simply not being visible from that
+            // loader. `find_class_by_name` is the context-free probe, so a hit
+            // there with a miss above means the LOADER SCOPE is the problem and
+            // not the class being unloaded.
+            let loader = cm.get_loader_id(holder_cid);
+            #[allow(deprecated)]
+            let anywhere = cm.find_class_by_name(class_name).is_some();
+            eprintln!(
+                "[ir] new-site DEFERRED: {class_name} holder={} loader={loader:?}                  loaded_anywhere={anywhere} cp_idx={cp_idx}",
+                cm.get_class(holder_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| format!("{holder_cid:?}")),
+            );
+        }
         return Some(JitNewSite::Deferred {
             holder_class_id: holder_cid.as_u32(),
             cp_idx,

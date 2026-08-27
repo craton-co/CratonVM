@@ -20,7 +20,7 @@ Every class below FAILed on either a `java.util.concurrent.TimeoutException`
 against a tolerance well inside what the test itself expects to need, or an
 `AssertionError`/array-length mismatch whose margin is thin enough that a
 contended host is the more likely explanation than a correctness defect. Each
-already has a FIXED/CLOSED/RESOLVED history in `docs/internal/fixed-suite-bugs/netty/`
+already has a FIXED/CLOSED/RESOLVED history in `fixed-suite-bugs/netty/`
 for a *different, specific* original failure — none of the excerpts below match
 those original signatures, which is the basis for reading this run's failures as
 contention rather than a regression of the original bug.
@@ -35,7 +35,7 @@ contention rather than a regression of the original bug.
 | `handler.codec.http2.Http2ConnectionRoundtripTest.flowControlProperlyChunksLargeMessage` | `assertTrue`: expected true, was false | — |
 | `handler.proxy.ProxyHandlerTest` (8 of 47 parameterizations) | `array lengths differ, expected: <0> but was: <1>` — one extra byte arrived in an AUTO_READ success-path check | `netty-stackwalker-option-clinit-nameless-constants-FIXED-20260813.md` (unrelated content, incidental classpath match) |
 | `handler.ssl.JdkSslRenegotiateTest.testRenegotiateServer` | timed out after 30000ms | `tls-client-windows-schannel-leaf-only-chain-20260817-FIXED-20260818.md` |
-| `handler.ssl.SslHandlerTest.testSessionTicketsWithTLSv12AndNoKey` | timed out after 5000ms | multiple, all a different SSL residual family — see `docs/internal/fixed-suite-bugs/netty/` |
+| `handler.ssl.SslHandlerTest.testSessionTicketsWithTLSv12AndNoKey` | timed out after 5000ms | multiple, all a different SSL residual family — see `fixed-suite-bugs/netty/` |
 | `test.udt.nio.NioUdtByteRendezvousChannelTest.basicEcho` | byte-count mismatch, expected 1964976 got 1932208 (~98% delivered) | `netty-jni-native-codec-sigsegv-FIXED-20260812.md` |
 | `util.RecyclerTest` (3 of 67 parameterizations) | `testThreadCanBeCollectedEvenIfHandledObjectIsReferenced` timed out | — |
 | `util.ResourceLeakDetectorTest.testConcurrentUsage` | timed out after 60000ms | `resourceleakdetector-concurrentusage-is-slow-not-hung-CLOSED-20260817.md` — **this class's own prior doc title is literally "slow, not hung"; a contended host is exactly what pushes "slow" over a 60s cap** |

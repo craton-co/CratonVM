@@ -853,6 +853,15 @@ const SC_OBJECT_SLOTS: usize = 6;
 /// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
 const FAMILY_UNIX: i32 = 1;
 
+/// `F_FAMILY` value for a channel opened with an EXPLICIT
+/// `StandardProtocolFamily.INET`.
+///
+/// `0` still means "unspecified", which covers both `open()` and `open(INET6)`:
+/// the JDK gives an AF_INET6 socket with `IPV6_V6ONLY` cleared for both, so only
+/// the explicit `INET` spelling has to be told apart — it is the one that must
+/// NOT take the dual-stack wildcard bind in `bind_wildcard_listener`.
+const FAMILY_INET: i32 = 2;
+
 // ---------------------------------------------------------------------------
 // Synthetic channel state — identity-hash side-table
 // ---------------------------------------------------------------------------
@@ -1185,10 +1194,15 @@ fn decode_protocol_family(ctx: &mut dyn NativeContext, args: &[Value], idx: usiz
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
     };
-    if name.as_deref() == Some("UNIX") {
-        FAMILY_UNIX
-    } else {
-        0
+    // INET is recorded as well as UNIX, because it is the one spelling that has
+    // to SUPPRESS the dual-stack wildcard bind: `ServerSocketChannel.open(INET)`
+    // is an AF_INET channel on HotSpot and must stay one here. `open()` and
+    // `open(INET6)` both give AF_INET6 with `IPV6_V6ONLY` cleared, so they share
+    // the unspecified `0` and need no spelling of their own.
+    match name.as_deref() {
+        Some("UNIX") => FAMILY_UNIX,
+        Some("INET") => FAMILY_INET,
+        _ => 0,
     }
 }
 
@@ -4579,8 +4593,8 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `ss_wrapper_bind`.) Rejecting it with an IOException broke the ordinary
     // "listen on an ephemeral port on every interface" idiom.
     let Some(sa) = obj_or_none(args, 1) else {
-        let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
-            .map_err(|e| map_err("0.0.0.0:0", e))?;
+        let listener =
+            bind_wildcard_listener(ctx, this, 0, backlog).map_err(|e| map_err("[::]:0", e))?;
         return ssc_finish_bind(ctx, this, listener, 0);
     };
 
@@ -4600,8 +4614,53 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     } else {
         single_bind_addr(&host, port).map_err(|e| map_err(&format!("{host}:{port}"), e))?
     };
-    let listener = TcpListener::bind(bind_addr).map_err(|e| map_err(&bind_addr.to_string(), e))?;
+    // A wildcard bind is DUAL-STACK, matching `sun.nio.ch.Net.serverSocket`;
+    // an address that names a family keeps that family. See
+    // `bind_wildcard_listener`.
+    let listener = if bind_addr.ip().is_unspecified() {
+        bind_wildcard_listener(ctx, this, bind_addr.port(), backlog)
+    } else {
+        TcpListener::bind(bind_addr)
+    }
+    .map_err(|e| map_err(&bind_addr.to_string(), e))?;
     ssc_finish_bind(ctx, this, listener, port as i32)
+}
+
+/// Bind the WILDCARD address for this channel, in the family HotSpot would use.
+///
+/// `sun.nio.ch.Net.serverSocket` opens AF_INET6 with `IPV6_V6ONLY` cleared
+/// whenever IPv6 is available and the channel carries no explicit
+/// `StandardProtocolFamily.INET`, so one listener accepts both families. This
+/// call site bound `0.0.0.0` instead — a genuine AF_INET listener — and every
+/// IPv6 client was refused with a RST.
+///
+/// **How that presented, and why it was not obviously a socket defect.**
+/// netty's `NetUtil.LOCALHOST` is the IPv6 loopback on a dual-stack Windows
+/// host, and `SSLEngineTest.mySetupMutualAuth` binds its server on the wildcard
+/// (`sb.bind(new InetSocketAddress(0))`) and then connects the client to
+/// `NetUtil.LOCALHOST`. `assertTrue(ccf.awaitUninterruptibly().isSuccess())`
+/// discards the future's cause, so all 48 parameterisations of
+/// `testMutualAuthDiffCerts` reported `expected: <true> but was: <false>` from
+/// inside a TLS test — in four `SSLEngineTest` subclasses at once, which is what
+/// made it look like a TLS or a delegated-task defect. `probes/SslMutualAuthConnectProbe.java`
+/// prints `ccf.cause()` instead and reads
+/// `AnnotatedConnectException: finishConnect: Connection refused: /[0:0:0:0:0:0:0:1]:P`
+/// against a `serverLocal=/0.0.0.0:P`, on a run where HotSpot binds `[::]` and
+/// connects. Full record:
+/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+///
+/// `FAMILY_INET` — an explicit `ServerSocketChannel.open(StandardProtocolFamily.INET)`
+/// — keeps the v4 wildcard, because that channel IS AF_INET on HotSpot.
+fn bind_wildcard_listener(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    port: u16,
+    backlog: i32,
+) -> Result<TcpListener, std::io::Error> {
+    if cf_get(ctx, this, F_FAMILY).as_int().unwrap_or(0) == FAMILY_INET {
+        return TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)));
+    }
+    cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(port, backlog)
 }
 
 /// Shared tail of every INET `ServerSocketChannel.bind`: apply the channel's

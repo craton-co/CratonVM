@@ -1195,8 +1195,19 @@ fn net_socket0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
 /// `BindException`.
 fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
-    // args[1] = preferIPv6, args[2] = useExclBind — advisory only, we always
-    // bind dual-stack via Rust std.
+    // args[2] = useExclBind — advisory here.
+    //
+    // args[1] = preferIPv6 is NOT advisory, and the comment that used to sit
+    // here ("we always bind dual-stack via Rust std") was simply false:
+    // `TcpListener::bind("0.0.0.0:p")` is an AF_INET listener and every `::1`
+    // client got a RST. `preferIPv6` is the JDK's own family decision for this
+    // fd — `Net.isIPv6Available()` at `socket0` time — so it is exactly the bit
+    // that says whether the wildcard should be dual-stack. See
+    // `bind_wildcard_listener` in `socket_channel.rs` for the channel half of
+    // the same defect and
+    // `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`
+    // for how it presented.
+    let prefer_ipv6 = int_arg(args, 1) != 0;
     let inet_addr = match args.get(3) {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -1224,7 +1235,12 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // for the Tribes auto-bind loop that breaks on.
     let target = crate::socket_channel::single_bind_addr(&addr_text, port.clamp(0, 65535) as u16)
         .map_err(|e| net_err(&bind_addr, e))?;
-    let listener = TcpListener::bind(target).map_err(|e| net_err(&bind_addr, e))?;
+    let listener = if target.ip().is_unspecified() && prefer_ipv6 {
+        cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(target.port(), 0)
+    } else {
+        TcpListener::bind(target)
+    }
+    .map_err(|e| net_err(&bind_addr, e))?;
 
     // C26 fix: do NOT write the resolved port into FileDescriptor.handle —
     // `handle` is the fd-id sentinel that `net_fd_from_descriptor` falls back

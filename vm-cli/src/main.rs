@@ -355,12 +355,13 @@ fn maybe_dump_shutdown_reports() {
         // ratio; `full-refused` separates "narrowing kept everything" from
         // "narrowing was off".
         eprintln!(
-            "[cratonvm] safepoint spill width: {}",
+            "[cratonvm] safepoint spill width: {} args-published={}",
             cratonvm_jit::metrics::spill_width_counts()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" "),
+            cratonvm_jit::metrics::spill_args_published_count()
         );
         // The per-call safepoint blind spill, and how often the oop-clean-frame
         // proof let a direct call publish the safepoint id alone instead of
