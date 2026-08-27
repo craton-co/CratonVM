@@ -11693,12 +11693,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // contain long-dead addresses). A hit here means the CALLER received
         // a stale value from upstream; the backtrace names it.
         if blockgc_dbg() {
-            if let Some(new) = self
+            // Two sources, deliberately. `debug_forwarded_target` reads the
+            // forwarding word at the old address, which G1 ZEROES when it frees
+            // the from-region — the same blind spot that makes
+            // `load_and_forward` a no-op on this collector. A zero from that
+            // alone is not evidence of a clean pin. `was_vacated` is the exact
+            // ledger (`note_allocated` removes re-issued addresses), so it sees
+            // what the forwarding word cannot; it costs nothing unless
+            // `CRATONVM_DBG=vacated-frames` armed it.
+            let forwarded = self
                 .shared
                 .mem
                 .heap
                 .debug_forwarded_target(obj.as_ptr() as usize)
-            {
+                .or_else(|| cratonvm_gc::gc_quiescence::was_vacated(obj.as_ptr() as usize));
+            if let Some(new) = forwarded {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     // Identify WHAT went stale: read the class off the
