@@ -195,6 +195,49 @@ actually deleting it.
 
 Regression suite, same binary, both arms: **72 passed, 0 failed**.
 
+## Two more of the page's residuals, closed on the way through
+
+Neither is on the voxel path — both are named in the page as coverage limits,
+and both were cheap once there was a reason to look.
+
+**`getIndex(III)I` could not be lowered at the IR tier at all.** An instance
+method with three parameters has four incoming slots, and touching one field
+turns `needs_context` on, which is the fifth — past the entry ABI's register
+file (four on Win64). `emit_prologue` read registers and nothing else, so
+`lower()` refused the whole method: on Win64 a three-argument getter was not
+lowerable at this tier, which is why the page called it "the commonest
+whole-method refusal an ordinary accessor hits". The prologue loads
+stack-resident arguments now, from the same place the single-pass prologue has
+loaded them since the ROUND-12 fix and by the same arithmetic — the two backends
+already shared the OUTGOING convention, so this is its read side. The refusal
+test became a test that the arguments ARRIVE: it calls the lowered body with
+cap+1..cap+3 distinct arguments and asserts the one it reads back, which is the
+same guarantee proved the other way round. `probes/EntryAbiArgSlotProbe.java`
+passes `bad=0/300000` on all ten shapes.
+
+**A `new` whose class was not loaded yet cost the method its optimizing tier
+permanently.** `resolve_jit_new_site` never runs a user `ClassLoader.loadClass`
+from inside a compile, so such a site reports `Deferred`, gets no `new_info`
+row, and the IR builder bails the whole method. The class loads moments later
+and nothing looked again — because the C1→C2 supersede door asks
+`c2_upgrade_would_engage`, which refuses any method containing a `new` without
+`CRATONVM_JIT_C2_ALLOC_UPGRADE`. Two independently reasonable gates compounding
+into a permanent one. Visible on `regression-suite/src/RJitGc.java`:
+
+```
+[ir] admission RJitGc.make(II)LRJitGc$Tree;: admitted to the optimizing pipeline
+[ir] new-site DEFERRED: RJitGc$Tree ... loaded_anywhere=false
+[ir] IrBuilder::build returned None for RJitGc.make(II)LRJitGc$Tree;
+...
+[ir] admission RJitGc$Tree.<init>(I)V: admitted to the optimizing pipeline
+```
+
+Five lines after `make` gave up, the class it could not resolve is being
+compiled. The bail is now remembered and consumed on use, so the method gets
+exactly ONE more attempt — the same treatment the code-buffer shortfall already
+had, and for the same reason: a measurement-like refusal the next attempt would
+not repeat.
+
 ## Reproducing
 
 `probes/VoxelAlloc2.java` reproduces the four-level accessor chain — a method
@@ -224,23 +267,13 @@ integration loop in the real workload has the same shape.
    admission gate, so it gets neither the splice nor escape analysis. This is
    the shape of a real per-frame sweep and is the largest remaining gap.
 
-2. **`getIndex(III)I` cannot be lowered at the IR tier standalone.** An instance
-   method with three parameters has four incoming slots, and touching one field
-   turns `needs_context` on, which is the fifth — past the entry ABI's register
-   file. The refusal is named now
-   (`unsupported shape: incoming arg slots exceed the entry ABI registers`)
-   rather than a bare `None`, and the single-pass backend already loads
-   stack-resident parameters (`x64/frames.rs`, the ROUND-12 fix), so the IR
-   prologue could too. It does not block this chain, because those methods are
-   spliced INTO a caller whose own arity fits.
-
-3. **`MemorySegment.getAtIndex` is a call-site intrinsic the IR tier cannot
+2. **`MemorySegment.getAtIndex` is a call-site intrinsic the IR tier cannot
    emit**, so `TSeg.getShortAtIndex` gets no IR body and is neither lowered nor
-   splice-able. That is the whole of the remaining `rawseg` floor (23.8 ns
-   against HotSpot's ~1.3), and it is tracked with the FFM element-accessor
-   work, not here.
+   splice-able. That is the whole of the remaining `rawseg` floor (39 ns against
+   HotSpot's 1.4), and it is tracked with the FFM element-accessor work, not
+   here.
 
-4. **A call left inside a spliced body is re-executed on a deopt**, and the
+3. **A call left inside a spliced body is re-executed on a deopt**, and the
    store-locality rule proves nothing about it. Unchanged from
    `docs/jit/ir-tier-inlining.md`.
 
