@@ -680,6 +680,10 @@ fn test_helpers() -> JitRuntimeHelpers {
         // rather than emit a null CALL. `ldc_string` above stays sentinel-wired
         // because its slot is `required` in `jit-api`; nothing calls it.
         ldc_string_cp: 0,
+        // 0 = not wired: this hand-built table emits no FFM fast path, so every
+        // accessor site in these tests keeps its ordinary native dispatch.
+        ffm_segment_get: 0,
+        ffm_segment_set: 0,
     }
 }
 

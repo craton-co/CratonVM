@@ -1211,6 +1211,24 @@ pub fn jit_lambda_capture_adapter() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=0` — stop forcing the interpreter for
+/// every method on a `ForkJoinTask` subclass (RFJP.1).
+///
+/// Default ON, and it is a CORRECTNESS workaround, not a tuning knob: with it
+/// off a deeply-recursive `RecursiveTask.compute()` miscompiles. It exists so
+/// the ceiling can be priced before anyone narrows the blocklist, because the
+/// blocklist's stated scope is wrong — `CompletableFuture$UniCompose` and
+/// `$UniRelay` DO extend `ForkJoinTask`, and they are the composition hot path.
+#[inline]
+pub fn jit_fjp_subclass_blocklist() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
 /// `CRATONVM_JIT_LAMBDA_CONST_PROBE` — screen SAM calls whose implementation
 /// body is a CONSTANT (`iconst_<n>/bipush/sipush` then `ireturn`) and report
 /// any call that observes a different value.

@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 8;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 9;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -685,6 +685,14 @@ helper_fn_slots! {
     // the row above. Same three-register shape, same `0 = pending exception`
     // convention. See `JitRuntimeHelpers::ldc_string_cp`.
     HelperFnLdcStringCp, ldc_string_cp, ldc_string_cp_fn, (i64, i64, i64) -> i64;
+    // `(seg, index, kind, out_ptr) -> 1 handled | 0 declined` — the FFM
+    // element READ fast path. A decline leaves the site's native dispatch to
+    // run unchanged, so every case it does not recognise keeps today's
+    // behaviour. See `JitRuntimeHelpers::ffm_segment_get`.
+    HelperFnFfmSegmentGet, ffm_segment_get, ffm_segment_get_fn, (i64, i64, i64, i64) -> i64;
+    // `(seg, index, kind, raw_value) -> 1 handled | 0 declined` — the WRITE
+    // twin. See `JitRuntimeHelpers::ffm_segment_set`.
+    HelperFnFfmSegmentSet, ffm_segment_set, ffm_segment_set_fn, (i64, i64, i64, i64) -> i64;
     // JVMS §6.5 aastore covariance check ONLY — (vm_ptr, array_ptr, val) ->
     // `i64::MIN` = refused (ArrayStoreException published) / `0` = proceed.
     // NOT the store: the caller keeps the inline MOV, the SATB pre-write
@@ -827,6 +835,8 @@ helper_field_table! {
     // both backends refuse a string-`ldc` site, exactly as an unwired
     // `ldc_class_cp` makes them refuse a class-`ldc` one.
     (ldc_string_cp,                  Function, false),
+    (ffm_segment_get,                Function, false),
+    (ffm_segment_set,                Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -847,7 +857,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 67,
+    NUM_HELPER_FIELDS == 69,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -855,7 +865,7 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 536,
+    JIT_HELPERS_ABI_SIZE == 552,
     "JitRuntimeHelpers size changed (expected 67 * 8 = 536) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
@@ -1019,6 +1029,8 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("read_bounds_addr", 512),
     ("local_handler_lookup", 520),
     ("ldc_string_cp", 528),
+    ("ffm_segment_get", 536),
+    ("ffm_segment_set", 544),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1143,6 +1155,17 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 8,
         num_fields: 67,
         size: 536,
+    },
+    // v9 -- appended `ffm_segment_get` / `ffm_segment_set`, the FFM ELEMENT
+    // accessor fast paths. `MemorySegment.getAtIndex`/`setAtIndex` are driven
+    // one element at a time by any segment-backed array and measured ~1158
+    // ns/element through the ordinary dispatch funnel, against ~0.8 ns for a
+    // `short[]` element. Optional: a zero slot emits no fast path and every
+    // site keeps the native dispatch it has today.
+    HelperAbiRevision {
+        version: 9,
+        num_fields: 69,
+        size: 552,
     },
 ];
 
@@ -1351,7 +1374,7 @@ const _: () = {
         }
         i += 1;
     }
-    assert!(functions == 57, "callable-slot count changed");
+    assert!(functions == 59, "callable-slot count changed");
     assert!(
         offsets == 4,
         "the number of displacement slots changed — an Offset slot is baked as \
@@ -1373,7 +1396,7 @@ const _: () = {
     // The runtime test below (`functions - required == 12`) was already on
     // the new number; this const was the only site still carrying 13.
     assert!(
-        optional_fns == 14,
+        optional_fns == 16,
         "the optional-callable count changed — every optional slot MUST have a \
          zero check at its emitter call site; confirm the new one does before \
          updating this number",
@@ -1721,6 +1744,8 @@ mod tests {
             ("read_bounds_addr", offset_of!(H, read_bounds_addr)),
             ("local_handler_lookup", offset_of!(H, local_handler_lookup)),
             ("ldc_string_cp", offset_of!(H, ldc_string_cp)),
+            ("ffm_segment_get", offset_of!(H, ffm_segment_get)),
+            ("ffm_segment_set", offset_of!(H, ffm_segment_set)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1751,15 +1776,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 536);
+        assert_eq!(core::mem::size_of::<H>(), 552);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 536);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 552);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 67);
-        assert_eq!(H::NUM_FIELDS, 67);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 57);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 8);
+        assert_eq!(NUM_HELPER_FIELDS, 69);
+        assert_eq!(H::NUM_FIELDS, 69);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 59);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 9);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1784,7 +1809,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "ldc_string_cp");
+        assert_eq!(last_name, "ffm_segment_set");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1797,9 +1822,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 8,
-                num_fields: 67,
-                size: 536,
+                version: 9,
+                num_fields: 69,
+                size: 552,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -1988,11 +2013,11 @@ mod tests {
             .filter(|d| d.kind == HelperKind::Constant)
             .count();
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
-        assert_eq!(functions, 57, "callable slots");
+        assert_eq!(functions, 59, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
         assert_eq!(constants, 6, "baked-address slots");
         assert_eq!(required, 43, "required slots");
-        assert_eq!(functions - required, 14, "optional callable slots");
+        assert_eq!(functions - required, 16, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
 
@@ -2146,13 +2171,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `ldc_string_cp`
-        // since the CP-indexed string `ldc` was appended.
-        h.ldc_string_cp = 2;
+        // The LAST field, whatever it currently is — `ffm_segment_set`
+        // since the FFM element accessors were appended.
+        h.ffm_segment_set = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 67);
+        assert_eq!(w.len(), 69);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

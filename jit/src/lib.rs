@@ -6157,8 +6157,41 @@ pub fn inline_site_expansion_cost(site: &InlineSite) -> Option<usize> {
 /// `site_is_hot == false` reproduces the pre-2026-07-26 decision exactly, which
 /// is why [`inline_site_expansion_cost`] simply delegates with `false`: an
 /// unprofiled compile is bit-for-bit unchanged.
+/// Does this body (or anything it splices) contain an FFM ELEMENT accessor?
+///
+/// A spliced body is emitted by `emit_inline_invoke`, which lowers every invoke
+/// it contains to an ordinary dispatch — the single-pass intrinsic ladder does
+/// NOT run inside an inlined body. So inlining a method that contains a
+/// `MemorySegment.getAtIndex`/`setAtIndex` site silently converts that site from
+/// the fast path back into the ~1158 ns/element native dispatch.
+///
+/// That is exactly the shape the accessors appear in: `ShortArray.get` and
+/// `TornadoMemorySegment.getShortAtIndex` are a few bytecodes each, so the
+/// inliner takes them every time and the intrinsic would never fire on the path
+/// that matters.
+///
+/// Refusing the splice keeps ONE compiled-to-compiled call per element — a few
+/// nanoseconds — in exchange for the accessor keeping its fast path. Checked
+/// transitively, because a nested splice is emitted into the same body.
+pub fn inline_site_contains_ffm_accessor(site: &InlineSite) -> bool {
+    site.invoke_targets.iter().any(|(_, t)| {
+        t.class_name == "java/lang/foreign/MemorySegment"
+            && matches!(t.method_name.as_str(), "getAtIndex" | "setAtIndex")
+            && ffm_kind_for_descriptor(&t.descriptor).is_some()
+    }) || site
+        .nested_sites
+        .iter()
+        .any(|n| inline_site_contains_ffm_accessor(&n.site))
+}
+
 pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -> Option<usize> {
     if site.callee_code_len == 0 {
+        return None;
+    }
+    // An FFM element accessor loses its fast path the moment it is spliced —
+    // see `inline_site_contains_ffm_accessor`. Refuse the body rather than
+    // trade ~1158 ns/element for the few nanoseconds the call would have cost.
+    if inline_site_contains_ffm_accessor(site) {
         return None;
     }
     let size_cap = if site_is_hot {
@@ -8910,7 +8943,93 @@ pub enum JitIntrinsic {
     // purpose, and a test pins that.
     DoubleToRawLongBits, // Double.doubleToRawLongBits(D)J
     LongBitsToDouble,    // Double.longBitsToDouble(J)D
-                         // ===== INTRINSIC REGION END: FP_BITS =====
+    // ===== INTRINSIC REGION END: FP_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: FFM_SEGMENT =====
+    // `MemorySegment.getAtIndex` / `setAtIndex` — the FFM ELEMENT accessors.
+    //
+    // Any segment-backed array drives these one element at a time
+    // (`ShortArray.get` -> `TornadoMemorySegment.getShortAtIndex` ->
+    // `MemorySegment.getAtIndex`), and through the ordinary native dispatch
+    // funnel they measure ~1158 ns/element against ~0.8 ns for a `short[]`
+    // element. `Unsafe.getShort(long)`, a maximally lean native through the
+    // SAME funnel, costs ~303 ns — so ~300 ns is the funnel and the remaining
+    // ~850 ns is the segment native's ~10 `NativeContext` round-trips for
+    // scope liveness, address and size.
+    //
+    // ONE variant per direction, not one per element kind: the element width
+    // comes from the call site's DESCRIPTOR, which names the `ValueLayout`
+    // subtype (`getAtIndex:(Ljava/lang/foreign/ValueLayout$OfShort;J)S`), and
+    // the emitter re-reads it from the site's `JitInvokeInfo`. Fourteen
+    // variants would encode the same fact twice.
+    //
+    // Lowered as a CALL to `JitRuntimeHelpers::ffm_segment_get`/`_set`, not as
+    // inline machine code, and that is deliberate. The segment liveness model
+    // spans two synthetic classes whose slot conventions are owned by two
+    // different files, and a second copy of one of its slot indices has
+    // already made that check silently DEAD once (the W7-89 note on
+    // `PE_ARENA_CLASS`). The helper asks the native for a verdict instead of
+    // re-deriving one; see `cratonvm_native_builtins::ffm_fast`. A helper that
+    // DECLINES returns 0 and the emitted code falls through to the unchanged
+    // native dispatch for the same site, so every unrecognised case — a
+    // heap-backed carrier, a closed scope, an out-of-bounds index — keeps
+    // today's behaviour and today's exceptions.
+    FfmSegmentGetAtIndex, // MemorySegment.getAtIndex(ValueLayout$OfX, J)X
+    FfmSegmentSetAtIndex, // MemorySegment.setAtIndex(ValueLayout$OfX, J, X)V
+                          // ===== INTRINSIC REGION END: FFM_SEGMENT =====
+}
+
+/// The element-kind code for an FFM accessor descriptor, or `None` if the
+/// descriptor is not one this fast path handles.
+///
+/// # This is the ONLY gate, and it has to be
+///
+/// Registration and emission must agree exactly. A site registered here but
+/// declined by the emitter leaves a `JitDirectCall` whose `entry` is an
+/// intrinsic SENTINEL (`usize::MAX - variant`), and the ordinary direct-call
+/// path then CALLS it: measured, `EXCEPTION_ACCESS_VIOLATION at
+/// pc=0xFFFFFFFFFFFFFFB1`, which is that sentinel. So the emitter must not
+/// carry a second, narrower filter — it asks this function and nothing else.
+///
+/// The codes are `cratonvm_vm::jit::helpers`' `FFM_KIND_*`, and the mapping is
+/// driven by the `ValueLayout` subtype the descriptor NAMES — which is what
+/// makes the element width a compile-time constant instead of a runtime layout
+/// probe. `ValueLayout$OfBoolean` and `$OfAddress` are deliberately absent: the
+/// first has a domain narrower than its byte (the JDK reads the byte and
+/// compares it to zero) and the second returns a fresh zero-length segment,
+/// which is an allocation and not a load.
+pub fn ffm_kind_for_descriptor(descriptor: &str) -> Option<i64> {
+    // `CRATONVM_JIT_NO_FFM_INTRINSIC=1` — keep every FFM element accessor on
+    // ordinary native dispatch. The B arm of an IN-BINARY A/B: cross-run wall
+    // time on this host is not a measurement (a concurrent build moved every
+    // absolute number by ~2x while this was being developed), and it is also
+    // the bisect lever if a miscompile is ever suspected. Consulted HERE, in
+    // the one gate both registration doors and the emitter share, so the switch
+    // cannot disable half the feature and leave a sentinel behind.
+    if ffm_intrinsic_disabled() {
+        return None;
+    }
+    // The layout type is the first parameter in both the get and set forms.
+    Some(
+        if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfByte;") {
+            0 // FFM_KIND_BYTE
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfShort;") {
+            1 // FFM_KIND_SHORT
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfChar;") {
+            2 // FFM_KIND_CHAR
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfInt;") {
+            3 // FFM_KIND_INT
+        } else if descriptor.starts_with("(Ljava/lang/foreign/ValueLayout$OfLong;") {
+            4 // FFM_KIND_LONG
+        } else {
+            // `$OfFloat` / `$OfDouble` are deliberately absent. Their result has
+            // to land in an XMM stack slot rather than through `push_from_rax`,
+            // which is a separate change; until it lands they keep the ordinary
+            // native dispatch, which is correct, only not faster. They must be
+            // refused HERE rather than in the emitter — see above.
+            return None;
+        },
+    )
 }
 
 
@@ -10811,6 +10930,13 @@ fn dbg_intrinsic_enabled() -> bool {
 /// on ordinary native dispatch. The kill switch for bisecting a suspected
 /// miscompile, and the B arm of an in-binary A/B (cross-run wall time on a
 /// shared host is not a measurement).
+/// `CRATONVM_JIT_NO_FFM_INTRINSIC=1` — the FFM element-accessor kill switch.
+/// See [`ffm_kind_for_descriptor`].
+fn ffm_intrinsic_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FFM_INTRINSIC").is_some())
+}
+
 fn atomic_intrinsic_disabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_INTRINSIC").is_some()
 }
@@ -15110,6 +15236,31 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
     }
 }
 
+/// Record why a compile was refused BEFORE the jit crate was ever entered.
+///
+/// The jit crate's own refusals already reach the stats table: every exit in
+/// `try_compile_with_invokespecial_resolver` funnels through
+/// `take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0))`, so even
+/// a siteless bail names the stage. The VM-side pipeline has no such funnel —
+/// `try_jit_compile_callee_slow` has NINE `return None` exits, none of which
+/// record anything, and a method refused at one of them is retried three times
+/// by the background worker and then retired as
+/// `compile-failed reason=unrecorded`.
+///
+/// That label is worse than no label: `compile-failed` says the compiler was
+/// asked and refused, which sends the reader into the backend, when the truth
+/// may be that the backend was never reached. Measured on
+/// `HibfixComposeProbe2`: `CompletableFuture$UniCompose.tryFire` (97 716
+/// invocations) and `UniRelay.tryFire` (58 612) both retired this way, and they
+/// ARE `CompletableFuture` composition.
+pub fn record_compile_refusal(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    why: &'static str,
+) {
+    record_jit_bail_reason(class_name, method_name, descriptor, (why, 0, 0));
+}
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
@@ -19231,7 +19382,21 @@ fn try_compile_inner(
                             || try_resolve_atomic_intrinsic(&cn, &mn, &desc, 0).is_some()
                             || cn == "java/util/concurrent/atomic/AtomicInteger"
                             || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
-                            || cn == "java/lang/String";
+                            || cn == "java/lang/String"
+                            // FFM element accessors. Registered by their OWN
+                            // arm in the single-pass scan rather than by
+                            // `try_resolve_intrinsic` (they carry a dispatch
+                            // info for the decline edge), so they have to be
+                            // named here too — this predicate is what routes a
+                            // method to the door that CAN emit an intrinsic,
+                            // and a site the IR tier admits becomes a plain
+                            // ~1158 ns/element dispatch. Found by an engagement
+                            // counter reading `publishes=4000001 fast_hits=0`:
+                            // the native was publishing verdicts and the
+                            // compiled code was never asking.
+                            || (cn == "java/lang/foreign/MemorySegment"
+                                && matches!(mn.as_str(), "getAtIndex" | "setAtIndex")
+                                && ffm_kind_for_descriptor(&desc).is_some());
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
@@ -22030,6 +22195,70 @@ fn try_compile_inner(
                         }
                     }
                 }
+                // ===== INTRINSIC REGION BEGIN: FFM_SEGMENT =====
+                // `MemorySegment.getAtIndex`/`setAtIndex` — the FFM ELEMENT
+                // accessors, ~1158 ns/element through the ordinary dispatch
+                // funnel against ~0.8 ns for a `short[]` element. See
+                // `JitIntrinsic::FfmSegmentGetAtIndex`.
+                //
+                // Registered with its OWN `JitInvokeInfo` for this same pc,
+                // because the emitted fast path DECLINES for every carrier it
+                // does not positively recognise and the decline edge runs this
+                // exact native dispatch — the same reason
+                // `ArraycopyPrimitive` registers one on the static path. No
+                // `guard_class_id`: the helper asks the native for a verdict
+                // rather than speculating on a receiver class, so there is no
+                // speculation here to guard or to de-speculate.
+                if class_name == "java/lang/foreign/MemorySegment"
+                    && matches!(method_name.as_str(), "getAtIndex" | "setAtIndex")
+                    && ffm_kind_for_descriptor(&descriptor).is_some()
+                {
+                    let entry = if method_name == "getAtIndex" {
+                        JitIntrinsic::FfmSegmentGetAtIndex.as_entry()
+                    } else {
+                        JitIntrinsic::FfmSegmentSetAtIndex.as_entry()
+                    };
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                        eprintln!(
+                            "[ffm] REGISTERED {class_name}.{method_name}{descriptor} @pc={pc} kind={invoke_kind}"
+                        );
+                    }
+                    let class_box: Box<str> = class_name.clone().into_boxed_str();
+                    let method_box: Box<str> = method_name.clone().into_boxed_str();
+                    let desc_box: Box<str> = descriptor.clone().into_boxed_str();
+                    let class_ref = &*class_box as *const str;
+                    let method_ref = &*method_box as *const str;
+                    let desc_ref = &*desc_box as *const str;
+                    owned_strings.push(class_box);
+                    owned_strings.push(method_box);
+                    owned_strings.push(desc_box);
+                    let info = Box::new(JitInvokeInfo {
+                        class_name: unsafe { &*class_ref },
+                        method_name: unsafe { &*method_ref },
+                        descriptor: unsafe { &*desc_ref },
+                        num_jit_args,
+                        return_type: ret_type,
+                        invoke_kind,
+                        declaring_class_id: cached.declaring_class_id.as_u32(),
+                    });
+                    let info_ptr: *const JitInvokeInfo = &*info;
+                    owned_invoke_infos.push(info);
+                    invoke_info.push((pc, info_ptr));
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret_type,
+                            guard_class_id: 0,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: FFM_SEGMENT =====
+
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)

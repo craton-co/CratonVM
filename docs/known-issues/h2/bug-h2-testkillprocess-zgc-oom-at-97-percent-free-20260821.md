@@ -1114,21 +1114,108 @@ Two honest caveats on it:
   publish assertion fails with `homes=[]`, while the non-moving control passes
   in both arms, so neither can pass vacuously.
 
+
+## Follow-up 2026-08-27: `UNPUBLISHED_FRAME_OOP` was refusing on DEAD slots
+
+The fork §"Follow-up 2026-08-26 (second)" left open is closed, and it went the
+second way: the dataflow, the oop map and the shadow push all agreed with each
+other. Only the band scan objected, and it was objecting to words nothing would
+ever read.
+
+### The measurement that decided it
+
+`report_unpublished_band_words` now also prints the frame's `sp_id` and whether
+the ACTIVE safepoint's oop map names the slot. On one
+`TestKillProcessWhileWriting` run, **all 74** unpublished words report
+`in_map=false` — not one is a slot the map calls live:
+
+```
+68  region=java-local           in_map=Some(false)
+ 4  region=operand-spill        in_map=Some(false)
+ 2  region=reserved-locals-tail in_map=Some(false)
+```
+
+and the dominant method resolves completely:
+
+```
+MVStore.closeStore:(ZI)V off=72/64/56/48 region=java-local
+  value=0x2004f4c5c88 (the SAME object in all four) published=8
+  sp_id=Some(174) in_map=Some(false) live_hi=Some(144)
+```
+
+Offsets 48/56/64/72 are locals 5..8. `closeStore`'s `LocalVariableTable` scopes
+slot 5 (`map`) to bci **149..170**, so at `sp_id=174` it is already out of
+scope, and 6..8 are javac's loop/`finally` copies of it — the method's
+`astore 6/7/8` all sit at bci 370/404/424, in the duplicated `finally` tails.
+Four slots, one dead object, one refusal per collection.
+
+### The repair, and how narrow it is
+
+The band scan cannot tell live from dead on its own, so it demanded that every
+movable word in a java-local or operand-spill slot be published on the shadow
+stack. For the regions the abstract interpreter MODELS that is stricter than the
+collector itself needs: the safepoint's map already states which of those slots
+hold live references at that pc.
+
+`band_slot_is_verifiable_with_map` now treats a word in a modelled region that
+the active map does not name as dead. `region_is_dataflow_modelled` admits only
+java locals and operand spill; **LICM hoist slots, scalar-replacement fields, the
+reserved-locals tail and the register images are untouched**, because covering
+exactly what the map cannot describe is the whole reason this scan exists (see
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`).
+And `None` — no sp-id, or no map for it — keeps every word verifiable, which is
+the fail-closed direction. `CRATONVM_GC_NO_BAND_MAP_LIVENESS=1` is the A/B.
+
+### Measured, one binary, arms interleaved
+
+| class | arm | `unpub` | compacting | of cycles | rc |
+|---|---|---:|---:|---:|---|
+| `TestKillProcessWhileWriting` | on | **4** | **46** | 51 | 0 |
+| | off | 24 | 28 | 52 | 0 |
+| | on | **3** | **45** | 51 | 0 |
+| | off | 22 | 29 | 51 | 0 |
+| | on | **1** | **48** | 51 | 0 |
+| | off | 25 | 25 | 51 | 0 |
+
+`unpub` 1–4 against 22–25, no overlap. Compacting collections go from **49–57 %
+to 88–94 %** of all cycles. Corruption canary — this change lets collections
+RELOCATE that previously refused, so it is the measurement that had to be taken
+— `org.h2.test.db.TestMultiThread` ×4, all `rc=0`, no SIGSEGV, no
+`ClassCastException`, with 62–66 k objects actually relocated in three of them.
+
+### What it does NOT fix, and what it costs
+
+`TestMVStoreTool` still fails with `oom=4`: it OOMs after only 7–14 collections,
+so it dies before a higher compaction rate can help it. Its `unpub` is already
+1–4 in both arms. That class needs its own answer.
+
+And the cost is real and worth stating: for java locals and operand spill this
+scan **was** a backstop against a wrong oop map — refusing the moving cycle
+meant a wrong map could not corrupt anything, because nothing moved. That
+defence is now gone for those two regions, deliberately, because it was
+suppressing ~half of all compaction to hedge against a map defect nobody has
+demonstrated. The right instrument for that hedge is the map-completeness
+oracle already listed under §"Still open"
+(`CRATONVM_DBG_VERIFY_OOP_MAPS`'s `never_mapped (while_covered=N)`), which asks
+the question directly instead of paying for it on every collection — and which
+that item notes should now be re-taken against `fully_shadow_covered`.
+
 ## Still open
 
 Ordered by what a next session should pick up first.
 
-* **`UNPUBLISHED_FRAME_OOP` is 64/83 `java-local` words in ONE method,
-  `MVStore.closeStore:(ZI)V`** — censused with
-  `CRATONVM_MOVING_YOUNG_BAND_DBG=1`, see §"Follow-up 2026-08-26 (second)".
-  One object in three consecutive local slots, none of them among the 8 the
-  shadow stack published at that safepoint. The question nobody has asked is
-  whether the dataflow calls those locals LIVE at that pc: if yes, the
-  oop-locals loop in `collect_live_oop_homes` has a mask gap and it is a
-  codegen defect; if no, not publishing them is correct and the repair is on
-  the verifier's side. `closeStore` is a one-method target.
-  **The 2026-08-24 attribution of this reason to `CRATONVM_JIT_INDY_BRIDGE`
-  no longer reproduces** — 30/28 vs 27/33, re-taken on an idle host.
+* **`TestMVStoreTool` OOMs after 7–14 collections, before compaction can
+  help it.** Its `UNPUBLISHED_FRAME_OOP` obligation is CLOSED with everything
+  else's (§"Follow-up 2026-08-27": `unpub` 1–4 in both arms now), and
+  `TestKillProcessWhileWriting` compacts on 88–94 % of cycles. This class
+  still fails with `oom=4` and needs its own answer — it is not short of
+  compaction, it is short of TIME to compact.
+* **The band scan no longer backstops a wrong oop map for java locals and
+  operand spill.** Given up deliberately (§"Follow-up 2026-08-27") because it
+  was suppressing about half of all compaction to hedge against a map defect
+  nobody has demonstrated. The direct instrument for that hedge is the
+  `while_covered` oracle two items below, which should be re-taken against
+  `fully_shadow_covered`.
 * **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
   bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
   proven cycles 13 against 24. None of the five switches covers it. Almost
