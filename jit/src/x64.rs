@@ -357,6 +357,14 @@ struct Compiler {
     /// `local_assignments` is final once `new` returns and is never mutated
     /// afterwards, so the plan cannot go stale.
     safepoint_publish: Option<super::regalloc::SafepointPublishPlan>,
+    /// Narrowed blind-spill selection captured at the safepoint that raised
+    /// `sink_alloc_blind_spill`, as a bitmask over `ALL_SPILL_GPRS` positions
+    /// (`None` = spill every register). The inline-TLAB `new` site splits its
+    /// blind spill across two program points; the deferred half must use the
+    /// SAME selection the safepoint used, or the union of the two halves would
+    /// not equal what one unsplit spill wrote. Recomputing at the slow-path
+    /// label would not do: the operand-stack model has moved on by then.
+    pending_narrow_spill: Option<u16>,
     /// Per-basic-block live-in local sets `(block_start_pc, live_in_bitset)`
     /// from the allocator — used to build per-OSR-entry-PC dead-local masks so
     /// the OSR trampoline skips loading locals dead at the entry (a dead local
@@ -2456,6 +2464,7 @@ impl Compiler {
             // Built by `compile_with_param_slots` (it has `code`/`param_oop_mask`,
             // which this constructor does not). `None` = conservative fallback.
             safepoint_publish: None,
+            pending_narrow_spill: None,
             osr_block_live_in,
             alloc_used_regs,
             xmm_assignments,
