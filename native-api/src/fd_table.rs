@@ -151,6 +151,64 @@ fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Erro
     Ok(socket.into())
 }
 
+/// Open a **dual-stack** TCP listener on the wildcard address: AF_INET6 with
+/// `IPV6_V6ONLY` off, so one listener accepts connections of both families.
+///
+/// This is the stream twin of [`open_udp_dual_stack_socket`], and it exists for
+/// the same reason. `sun.nio.ch.Net.serverSocket` opens AF_INET6 and clears
+/// `IPV6_V6ONLY` whenever IPv6 is available and the channel was not opened with
+/// an explicit `StandardProtocolFamily.INET`, so on HotSpot a wildcard
+/// `ServerSocketChannel.bind(new InetSocketAddress(0))` accepts an IPv6 client.
+/// CratonVM bound `0.0.0.0` — a real AF_INET listener — and every `::1` client
+/// got a RST.
+///
+/// That is not a corner case on Windows. netty's `NetUtil.LOCALHOST` prefers
+/// the IPv6 loopback on a dual-stack host, so `SSLEngineTest.mySetupMutualAuth`
+/// binds its server on the wildcard and then connects the client to `::1`:
+/// `assertTrue(ccf.awaitUninterruptibly().isSuccess())` (SSLEngineTest.java:1302)
+/// failed with `finishConnect: Connection refused` for EVERY parameterisation of
+/// `testMutualAuthDiffCerts` in four `SSLEngineTest` subclasses, and read as a
+/// TLS defect because `assertTrue` throws the future's cause away. See
+/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+///
+/// `backlog <= 0` asks for the same 128 `std::net::TcpListener::bind` uses, and
+/// `SO_REUSEADDR` is set on non-Windows only — again matching `TcpListener::bind`,
+/// so the caller's own `SO_REUSEADDR` handling is unaffected by this path.
+///
+/// Falls back to the v4 wildcard when this host has no usable IPv6 stack, which
+/// is also what the JDK does. The fallback covers SOCKET CREATION only: a failing
+/// `bind` (`EADDRINUSE`) propagates, because swallowing it would let a bind that
+/// HotSpot rejects succeed on a different family — the exact bug
+/// [`open_udp_dual_stack_socket`] records in its own comment.
+pub fn open_tcp_dual_stack_listener(
+    port: u16,
+    backlog: i32,
+) -> Result<std::net::TcpListener, io::Error> {
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .and_then(|s| s.set_only_v6(false).map(|()| s))
+    {
+        Ok(s) => s,
+        // No IPv6 stack. The v4 wildcard is the JDK's own fallback and this
+        // call site's pre-dual-stack behaviour.
+        Err(_) => {
+            return std::net::TcpListener::bind(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                port,
+            )))
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    socket.set_reuse_address(true)?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    socket.bind(&addr.into())?;
+    socket.listen(if backlog > 0 { backlog } else { 128 })?;
+    Ok(socket.into())
+}
+
 /// The port of a WILDCARD `host:port` spec, in either family's spelling, or
 /// `None` for a specific address.
 ///
@@ -4118,6 +4176,47 @@ mod tests {
         let client = std::net::TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, listener, server)
+    }
+
+    /// The wildcard TCP listener has to accept BOTH loopback families, and it
+    /// has to say so in `local_addr()`.
+    ///
+    /// The regression this pins is one line of behaviour, not one line of code:
+    /// `TcpListener::bind("0.0.0.0:0")` is an AF_INET listener, and a `::1`
+    /// client of one gets `Connection refused`. That is what all 48
+    /// parameterisations of `SSLEngineTest.testMutualAuthDiffCerts` hit, in four
+    /// netty SSL classes, once `NetUtil.LOCALHOST` resolved to the IPv6
+    /// loopback.
+    ///
+    /// Skipped rather than failed on a host with no IPv6 stack: the helper's
+    /// documented fallback is a v4 wildcard, and asserting the v6 half there
+    /// would be asserting the host's configuration.
+    #[test]
+    fn dual_stack_wildcard_listener_accepts_both_loopback_families() {
+        let listener = match open_tcp_dual_stack_listener(0, 0) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let local = listener.local_addr().expect("local_addr");
+        if local.is_ipv4() {
+            // No IPv6 on this host — the documented fallback. Nothing to assert.
+            return;
+        }
+        assert!(local.ip().is_unspecified(), "expected the wildcard, got {local}");
+        let port = local.port();
+
+        for host in ["127.0.0.1", "::1"] {
+            let target: std::net::SocketAddr = if host.contains(':') {
+                format!("[{host}]:{port}").parse().unwrap()
+            } else {
+                format!("{host}:{port}").parse().unwrap()
+            };
+            let client = std::net::TcpStream::connect(target)
+                .unwrap_or_else(|e| panic!("dual-stack listener refused {target}: {e}"));
+            let (server, _) = listener.accept().expect("accept");
+            drop(server);
+            drop(client);
+        }
     }
 
     #[test]

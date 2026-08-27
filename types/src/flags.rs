@@ -2007,6 +2007,7 @@ pub struct NativeFlags {
 
     /// `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` — [`parse::exactly_one`].
     pub use_wildfly_synth_bytecode: bool,
+
 }
 
 impl NativeFlags {
