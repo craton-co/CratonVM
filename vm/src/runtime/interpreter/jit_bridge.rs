@@ -4133,9 +4133,9 @@ fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool 
             cp_index = cp_idx,
             declaring_class_id = field.declaring_class_id.as_u32(),
             field_index = field.field_index,
-            resolved_desc = field.desc_byte as char,
-            cp_desc = cp_tag as char,
-            "refusing a compiled field site: name-only resolution found a field              whose descriptor differs from the one the constant pool names, so              the site's slot index and type tag describe different fields",
+            resolved_desc = %(field.desc_byte as char),
+            cp_desc = %(cp_tag as char),
+            "refusing a compiled field site: name-only field resolution found a field whose descriptor differs from the one the constant pool names, so the site's slot index and its type tag describe different fields",
         );
     }
     false
