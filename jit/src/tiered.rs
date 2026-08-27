@@ -789,6 +789,47 @@ impl CompilerCore {
     /// already queued, already at C2, has bailed out of C2, or has exhausted
     /// its compile retries. Called by the worker loop AFTER
     /// [`Self::complete_task`] cleared the C1 task's queued flag.
+    /// One more C2 attempt for a method whose IR build bailed on a `new` whose
+    /// class had not loaded yet.
+    ///
+    /// [`Self::request_c2_upgrade`] minus the `current_tier >= C2` clause, and
+    /// nothing else: `queued_for_compilation`, `c2_bailout`, `ineligible`, the
+    /// tier-failure budget and the hotness gate all still apply. Dropping that
+    /// one clause is the whole point — the method IS at C2, with a single-pass
+    /// body, because the C2 attempt fell through.
+    ///
+    /// Safe to call unconditionally because the caller has already consumed a
+    /// one-shot memo (`cratonvm_jit::take_deferred_new_retry`), so a method can
+    /// reach here at most once per process.
+    fn request_deferred_new_retry(&self, key: &MethodKey) {
+        {
+            let mut methods = self.methods.lock();
+            let Some(state) = methods.get_mut(key) else {
+                return;
+            };
+            if state.queued_for_compilation
+                || state.c2_bailout
+                || state.ineligible
+                || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
+            {
+                return;
+            }
+            let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
+            if gate != 0 && state.invocation_count < gate {
+                return;
+            }
+            state.queued_for_compilation = true;
+            state.queued_tier = Some(CompilationTier::C2);
+        }
+        self.enqueue(CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::Low,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        });
+    }
+
     fn request_c2_upgrade(&self, key: &MethodKey) {
         {
             let mut methods = self.methods.lock();
@@ -967,6 +1008,15 @@ pub struct CompileOutcome {
     /// publish the worker loop enqueues a Low-priority C2 recompile whose
     /// publish REPLACES the C1 body in the jit cache.
     pub c2_upgrade_candidate: bool,
+    /// This compile's IR build bailed on a `new` whose class was not loaded
+    /// yet, and the method is owed exactly one more optimizing attempt.
+    ///
+    /// Distinct from [`Self::c2_upgrade_candidate`], which is the C1->C2
+    /// promotion and is refused for a task that was ALREADY at an optimized
+    /// tier. This one has to survive that refusal: the bail it answers happens
+    /// *inside* a C2 task, which then falls through to the single-pass backend
+    /// and leaves the method recorded as done with C2.
+    pub deferred_new_retry: bool,
     /// The attempt did not publish because the VM *declined* the method on
     /// grounds that are fixed for the life of the process (skip list, OSR
     /// denial) — as opposed to a compile that ran and failed.
@@ -985,6 +1035,7 @@ impl CompileOutcome {
             compile_time_ms,
             published: false,
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             declined_permanently: false,
         }
     }
@@ -996,6 +1047,7 @@ impl CompileOutcome {
             compile_time_ms,
             published: false,
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             declined_permanently: true,
         }
     }
@@ -2196,6 +2248,16 @@ impl TieredCompilationManager {
                 && !tier_uses_optimized_backend(task.target_tier)
             {
                 core.request_c2_upgrade(&task.method_key);
+            }
+            // The deferred-`new` retry, which deliberately does NOT carry the
+            // "not already optimized" clause above: the bail it answers happens
+            // inside a C2 task that then fell through to the single-pass
+            // backend, so by the time we get here the method is recorded as
+            // done with C2 and `request_c2_upgrade` would refuse it for exactly
+            // that reason. Bounded by the one-shot memo in `lib.rs` — a method
+            // is armed once, and a class that never loads cannot re-arm it.
+            if outcome.published && outcome.deferred_new_retry && task.osr_bci.is_none() {
+                core.request_deferred_new_retry(&task.method_key);
             }
         }
     }
@@ -5646,6 +5708,7 @@ mod tests {
                     compile_time_ms: 7,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5745,6 +5808,7 @@ mod tests {
                     // Models the VM-side predicate: judged IR-eligible on the
                     // C1 pass; a C2 task never re-seeds an upgrade.
                     c2_upgrade_candidate: !tier_uses_optimized_backend(task.target_tier),
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5821,6 +5885,7 @@ mod tests {
                     compile_time_ms: 3,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5943,6 +6008,7 @@ mod tests {
                     compile_time_ms: 4,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))

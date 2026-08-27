@@ -7564,6 +7564,7 @@ pub(super) fn background_compile_task(
             // OSR artifacts serve loop entry; the invocation path re-tiers
             // separately, so an OSR task never seeds a C2 upgrade.
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             // A codegen attempt actually ran here; a non-publish is a real
             // failure, not a policy verdict.
             declined_permanently: false,
@@ -7615,21 +7616,20 @@ pub(super) fn background_compile_task(
     // publish. Evaluated only on a successful non-optimized publish — the
     // scan + predicate are cheap and run once per method.
     // A method whose IR build bailed on a `new` whose class was not loaded YET
-    // gets ONE more attempt regardless of the bytecode scan's verdict: that
-    // refusal was transient, and `c2_upgrade_would_engage` would refuse it a
-    // second time for containing a `new` at all. `take_deferred_new_retry`
-    // consumes the memo, so a class that is still not loaded settles on
+    // is owed ONE more optimizing attempt. Note the absence of `!optimized`:
+    // that bail happens INSIDE a C2 task, which then falls through to the
+    // single-pass backend — so the C1->C2 promotion below, which is only for a
+    // C1 publish, is not the door this can use. `take_deferred_new_retry`
+    // consumes the memo, so a class still not loaded on the retry settles on
     // single-pass exactly as before.
     let deferred_new_retry = published
-        && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && cratonvm_jit::take_deferred_new_retry(
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
         );
-    let c2_upgrade_candidate = deferred_new_retry
-        || (published
+    let c2_upgrade_candidate = (published
         && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
@@ -7692,6 +7692,7 @@ pub(super) fn background_compile_task(
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
+        deferred_new_retry,
         declined_permanently,
     }
 }

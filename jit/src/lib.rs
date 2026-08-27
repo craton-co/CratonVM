@@ -16191,10 +16191,16 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 ///
 /// Keyed like [`jit_bail_list`]. Bounded by [`MAX_DEFERRED_NEW_RETRIES`]
 /// entries so a pathological run cannot grow it without limit.
-fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
-    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
+///
+/// The value is the retry state, and it is what makes the grant ONE-SHOT rather
+/// than a loop: `0` means "one retry is owed", `1` means "already granted". A
+/// method whose class is STILL not loaded on the retry bails a second time and
+/// [`note_deferred_new_bail`] then declines to re-arm it, so a class that never
+/// loads cannot make the same method re-enter the optimizing pipeline forever.
+fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>> {
+    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>>> =
         std::sync::OnceLock::new();
-    SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+    SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
 /// How many methods may be remembered for a deferred-`new` retry at once.
@@ -16235,8 +16241,10 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
         cratonvm_types::ClassId::new(0),
     );
     let mut set = deferred_new_retries().write();
-    if set.len() < MAX_DEFERRED_NEW_RETRIES {
-        set.insert(h);
+    // `or_insert` and not `insert`: a method whose retry was already granted
+    // stays at `1` and is never re-armed.
+    if set.len() < MAX_DEFERRED_NEW_RETRIES || set.contains_key(&h) {
+        set.entry(h).or_insert(0);
     }
 }
 
@@ -16256,12 +16264,23 @@ pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: 
         descriptor,
         cratonvm_types::ClassId::new(0),
     );
-    deferred_new_retries().write().remove(&h)
+    let mut set = deferred_new_retries().write();
+    match set.get_mut(&h) {
+        Some(state @ 0) => {
+            *state = 1;
+            true
+        }
+        _ => false,
+    }
 }
 
-/// Number of methods currently holding a deferred-`new` retry. Diagnostics.
+/// Number of methods currently OWED a deferred-`new` retry. Diagnostics.
 pub fn deferred_new_retry_count() -> usize {
-    deferred_new_retries().read().len()
+    deferred_new_retries()
+        .read()
+        .values()
+        .filter(|&&v| v == 0)
+        .count()
 }
 
 /// Has `method_key` used up its [`MAX_CODE_BUFFER_RETRIES`] re-lowerings?
