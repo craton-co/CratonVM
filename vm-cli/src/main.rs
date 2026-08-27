@@ -256,6 +256,17 @@ fn maybe_dump_shutdown_reports() {
         // `CRATONVM_DBG_DROPPED_PUTFIELD=1` names the receiver, the slot and
         // the compiled method for the first 32 of each.
         let (dropped_recv, dropped_oob) = cratonvm_vm::jit::helpers::jit_putfield_dropped_stores();
+        // ENGAGEMENT counter for the JVMS 5.4.6 reclassification: how many
+        // compiled call sites were bound directly because their constant pool
+        // resolved to a PRIVATE method, instead of being dispatched from the
+        // receiver's class. Without it, "the workload passes now" cannot be
+        // told from "no site on this workload was one" -- and the shape (a
+        // constructor calling its own `private void init()`, subclassed) is
+        // common enough that a zero on a large workload is itself a finding.
+        eprintln!(
+            "[cratonvm] invokevirtual sites pinned to a private target: {}",
+            cratonvm_jit::private_invokevirtual_pinned()
+        );
         eprintln!(
             "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );

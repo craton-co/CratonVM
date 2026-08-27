@@ -867,13 +867,33 @@ pub(super) fn compile_osr_artifact(
                     let target_class = class.constant_pool.get_class_name(ref_class_idx)?;
                     let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let param_count = crate::jit::count_param_slots(desc);
-                    let invoke_kind = match opcode {
+                    let mut invoke_kind = match opcode {
                         0xb6 => 0u8,
                         0xb7 => 1,
                         0xb9 => 2,
                         0xb8 => 3,
                         _ => continue,
                     };
+                    // JVMS 5.4.6 — an `invokevirtual` naming a PRIVATE method is
+                    // not a dispatch site. The OSR door reaches
+                    // `x64::compile_with_param_slots` directly, so like the
+                    // eager first-call door it has to make the reclassification
+                    // itself rather than inheriting `try_compile`'s. See
+                    // `invoke::invokevirtual_site_targets_private`.
+                    if invoke_kind == 0
+                        && super::invoke::invokevirtual_site_targets_private(
+                            &cm_lock,
+                            class_id,
+                            target_class,
+                            mn,
+                            desc,
+                        )
+                    {
+                        invoke_kind = 1;
+                        cratonvm_jit::PRIVATE_INVOKEVIRTUAL_PINNED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let invoke_kind = invoke_kind;
                     let is_recursive_call = target_class == class_name.as_str()
                         && mn == method_name.as_str()
                         && desc == method_descriptor.as_str();
