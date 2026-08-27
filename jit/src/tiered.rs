@@ -801,7 +801,7 @@ impl CompilerCore {
     /// Safe to call unconditionally because the caller has already consumed a
     /// one-shot memo (`cratonvm_jit::take_deferred_new_retry`), so a method can
     /// reach here at most once per process.
-    fn request_deferred_new_retry(&self, key: &MethodKey) {
+    pub(crate) fn request_deferred_new_retry(&self, key: &MethodKey) {
         {
             let mut methods = self.methods.lock();
             let Some(state) = methods.get_mut(key) else {
@@ -1694,6 +1694,22 @@ impl TieredCompilationManager {
 
     /// Called on each back-edge (loop iteration) from the interpreter.
     /// May trigger OSR compilation.
+    /// Ask for the ONE extra optimizing attempt a method is owed after its IR
+    /// build bailed on a `new` whose class had not loaded yet.
+    ///
+    /// The worker loop reaches the same request through `CompileOutcome`, but
+    /// the worker is not the only compile door: the eager first-call door in
+    /// `jit_bridge` reaches the backend directly and produces no
+    /// `CompileOutcome` at all, so a method compiled there would never see its
+    /// memo spent. This is that door's route in.
+    ///
+    /// The one-shot memo (`cratonvm_jit::take_deferred_new_retry`) is what the
+    /// CALLER must consume before calling this, so both doors together can
+    /// still only produce one extra compile per method.
+    pub fn request_deferred_new_retry(&self, key: &MethodKey) {
+        self.core.request_deferred_new_retry(key);
+    }
+
     pub fn on_backedge(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
         if is_osr_denied(key) {
             return None;

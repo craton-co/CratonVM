@@ -7161,6 +7161,28 @@ pub(super) fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
+    // The eager first-call door's half of the deferred-`new` retry. This door
+    // reaches the backend directly and produces no `CompileOutcome`, so the
+    // worker-loop route in `compile_one_task` never sees a method compiled
+    // here -- which is every method the interpreter hands over on its own,
+    // `RJitGc.make` among them. The one-shot memo is consumed here exactly as
+    // it is there, so the two doors together still produce at most one extra
+    // compile per method.
+    if crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        )
+    {
+        shared.jit.tiered_manager.request_deferred_new_retry(
+            &crate::jit::tiered::MethodKey::new(
+                &*cached.class_name,
+                &*cached.method_name,
+                &*cached.method_descriptor,
+            ),
+        );
+    }
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
