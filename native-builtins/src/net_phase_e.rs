@@ -4108,12 +4108,38 @@ pub(crate) fn uri_publish_named(
     put_opt(ctx, "authority", &authority);
     put_opt(ctx, "query", &query);
     put_opt(ctx, "fragment", &fragment);
+    // `path` is the RAW component and `decodedPath` is its percent-decoded
+    // twin -- `getRawPath()` reads the first, `getPath()` the second. Writing
+    // one string to both made whichever accessor disagreed with it wrong, and
+    // silently: every path without an escape renders identically, so this only
+    // shows on a path that actually needs encoding.
+    //
+    // MEASURED (`probes/UriRawPathProbe.java`), a Path holding a space:
+    //
+    //     HotSpot   Path.toUri().getRawPath() = /tmp/junit-123/te%20st.jar
+    //     CratonVM                            = /tmp/junit-123/te st.jar
+    //
+    // while `toUri().toString()` and `new URI(s).getRawPath()` were both already
+    // right -- so the URI was self-inconsistent depending on how it was built.
+    // Spring Boot's `NestedPath.toUri()` concatenates `getRawPath()` into a new
+    // URI, so the un-escaped space came back as
+    // `URISyntaxException: Illegal character in path at index 40`
+    // (`boot.loader.nio.file.NestedPathTests.toUriWhenHasSpecialCharsReturnsEncodedUri`).
+    //
+    // Decoding here rather than asking callers for both forms keeps the eleven
+    // call sites unchanged: a caller that already passes a RAW override now gets
+    // a correct `decodedPath` for free, and one that passes an
+    // already-decoded override is no worse off than before (decoding a decoded
+    // path is a no-op unless it contains a literal `%`, which such a caller
+    // could not have represented correctly either way).
     if !path.is_empty() {
         put(ctx, "path", &path);
-        put(ctx, "decodedPath", &path);
+        let decoded_path = uri_percent_decode(&path);
+        put(ctx, "decodedPath", &decoded_path);
     }
     put(ctx, "schemeSpecificPart", &ssp);
-    put(ctx, "decodedSchemeSpecificPart", &ssp);
+    let decoded_ssp = uri_percent_decode(&ssp);
+    put(ctx, "decodedSchemeSpecificPart", &decoded_ssp);
     // `host`, `userInfo` and `port` come out of the authority, and a real
     // `java.net.URI` declares all three. Writing them keeps a receiver that
     // real bytecode reads directly consistent with what the accessors answer.
