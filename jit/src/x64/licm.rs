@@ -1870,6 +1870,52 @@ pub(super) fn narrow_safepoint_spill_enabled() -> bool {
     )
 }
 
+/// Treat a call site's own argument STAGING as the publication of its argument
+/// oops, so the safepoint spill need not copy `RAX` and `ARG_REGS`
+/// (`CRATONVM_JIT_SPILL_ARGS_PUBLISHED`, **default-ON; `=0` keeps copying
+/// them**).
+///
+/// This is the last of the three cuts into the 14-store blind spill, and the
+/// only one that touches the population the full-file spill was introduced for
+/// — "a receiver/args staged into ARG_REGS immediately before a GC-capable call
+/// … which the callee-saved-only spill never covers" (`Compiler::new`). It is
+/// admissible because at the four sites that opt in, that population has
+/// ALREADY been written to the frame by the site itself, before the spill runs:
+///
+/// * the two direct-call sites copy every argument into the callee-sentinel
+///   service slots (`reserve_direct_call_service_slots`), which live inside
+///   `[scanner_sp, entry_sp)` and are therefore read by the conservative walk.
+///   An oop argument there also sets `pending_staged_args_unmapped`, which
+///   fails the method's `fully_oop_covered` claim and so KEEPS that
+///   conservative backstop — the same state, with or without this change;
+/// * the dispatch-helper and MIC/PIC sites store every argument into the
+///   helper's args buffer and push the oops among them to
+///   `pending_staged_arg_oops`, so the safepoint map NAMES them. That is
+///   strictly stronger than a register copy the map never named.
+///
+/// What is dropped is therefore not root visibility but a duplicate of it. The
+/// registers still hold those values at the `CALL`; nothing reads the register
+/// copy that is no longer written, and the slot it would have written stays
+/// stale, which `heap.is_object_address` re-validates — over-retain only.
+///
+/// Opt in per site, never globally: the flag only enables the sites that call
+/// [`Compiler::emit_pre_safepoint_spill_args_published`]. An allocation site, a
+/// safepoint poll, or any invoke shape that did not stage keeps the full
+/// selection, because it has not published anything.
+pub(super) fn spill_args_published_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_ARGS_PUBLISHED") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 /// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
 /// full-GPR safepoint register spill (see the call site in `Compiler::new`).
 /// `precise_maps` has been default-on since 2026-07-07, but its own
