@@ -7614,7 +7614,22 @@ pub(super) fn background_compile_task(
     // loop enqueues a Low-priority C2 recompile after it records this C1
     // publish. Evaluated only on a successful non-optimized publish — the
     // scan + predicate are cheap and run once per method.
-    let c2_upgrade_candidate = published
+    // A method whose IR build bailed on a `new` whose class was not loaded YET
+    // gets ONE more attempt regardless of the bytecode scan's verdict: that
+    // refusal was transient, and `c2_upgrade_would_engage` would refuse it a
+    // second time for containing a `new` at all. `take_deferred_new_retry`
+    // consumes the memo, so a class that is still not loaded settles on
+    // single-pass exactly as before.
+    let deferred_new_retry = published
+        && !optimized
+        && crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        );
+    let c2_upgrade_candidate = deferred_new_retry
+        || (published
         && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
@@ -7634,7 +7649,7 @@ pub(super) fn background_compile_task(
                 crate::runtime::env_cache::jit_ir_call_virtual(),
             )
         })
-        .unwrap_or(false);
+        .unwrap_or(false));
     // A `None` above is not one thing. The comment on `published` already lists
     // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
     // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt

@@ -16187,6 +16187,83 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
         .map(|(measured, _)| measured.saturating_mul(2))
 }
 
+/// Methods whose IR build bailed on a `new` whose class was not loaded YET.
+///
+/// Keyed like [`jit_bail_list`]. Bounded by [`MAX_DEFERRED_NEW_RETRIES`]
+/// entries so a pathological run cannot grow it without limit.
+fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
+    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// How many methods may be remembered for a deferred-`new` retry at once.
+const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
+
+/// Record that this method's IR build bailed on a `new` site whose class was
+/// not loaded at the time — a TRANSIENT refusal, not a property of the class
+/// file.
+///
+/// `resolve_jit_new_site` deliberately never runs a user `ClassLoader.loadClass`
+/// from inside a compile, so a `new` of a class nothing has touched yet reports
+/// `JitNewSite::Deferred`, gets no `new_info` row, and the IR builder's `0xbb`
+/// arm bails the whole method. The class then loads moments later — often on
+/// the very next line of the compile log, because the constructor is the next
+/// thing to run — and nothing ever looked again:
+///
+/// ```text
+/// [ir] admission RJitGc.make(II)LRJitGc$Tree;: admitted to the optimizing pipeline
+/// [ir] new-site DEFERRED: RJitGc$Tree ... loaded_anywhere=false
+/// [ir] IrBuilder::build returned None for RJitGc.make(II)LRJitGc$Tree; — no IR body
+/// ...
+/// [ir] admission RJitGc$Tree.<init>(I)V: admitted to the optimizing pipeline   <- it is loaded now
+/// ```
+///
+/// `make` never appears again: one attempt, single-pass for the life of the
+/// process. That is the same shape as the code-buffer shortfall two functions
+/// up — a measurement-like refusal that the next attempt would not repeat — and
+/// it gets the same treatment.
+///
+/// The memo is consumed by [`take_deferred_new_retry`], so it grants exactly
+/// ONE extra attempt: a class that is still not loaded on the retry bails
+/// again, records nothing, and the method settles on single-pass as before.
+pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &str) {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let mut set = deferred_new_retries().write();
+    if set.len() < MAX_DEFERRED_NEW_RETRIES {
+        set.insert(h);
+    }
+}
+
+/// Take (clear) this method's one deferred-`new` retry, if it has one.
+///
+/// The C1->C2 supersede door asks this: a method here is admitted to one more
+/// optimizing attempt even though its bytecode contains a `new`, which
+/// [`c2_upgrade_would_engage`] otherwise refuses without
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE`. That refusal exists to avoid trading a
+/// cheap inline TLAB bump for a more optimized body on a method whose
+/// allocations escape anyway; it is not the right answer for a method that was
+/// never given a chance to have its allocation looked at.
+pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    deferred_new_retries().write().remove(&h)
+}
+
+/// Number of methods currently holding a deferred-`new` retry. Diagnostics.
+pub fn deferred_new_retry_count() -> usize {
+    deferred_new_retries().read().len()
+}
+
 /// Has `method_key` used up its [`MAX_CODE_BUFFER_RETRIES`] re-lowerings?
 ///
 /// `try_compile` exempts the code-buffer bail from the permanent bail list so
@@ -19594,6 +19671,11 @@ fn try_compile_inner(
         {
             if !scan.new_ops.is_empty() {
                 let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
+                // Was any site DEFERRED rather than merely unresolvable? That
+                // distinction is what makes the bail below worth retrying: a
+                // deferred class is one nothing has loaded YET, and the very
+                // next thing to run is usually its constructor.
+                let mut any_deferred_new = false;
                 for &(pc, cp_idx) in &scan.new_ops {
                     // A `Deferred` site has no compile-time class id or field
                     // count, so it gets no map entry: the IR builder's 0xbb arm
@@ -19601,14 +19683,29 @@ fn try_compile_inner(
                     // DOES compile the site (through the CP-indexed helper).
                     // That is strictly better than the pre-fix behaviour, where
                     // the site bailed BOTH backends.
-                    if let Some(JitNewSite::Resolved {
-                        class_id,
-                        num_fields,
-                        ..
-                    }) = new_resolver(cp_idx)
-                    {
-                        new_info_map.insert(pc, (class_id, num_fields));
+                    match new_resolver(cp_idx) {
+                        Some(JitNewSite::Resolved {
+                            class_id,
+                            num_fields,
+                            ..
+                        }) => {
+                            new_info_map.insert(pc, (class_id, num_fields));
+                        }
+                        Some(JitNewSite::Deferred { .. }) => any_deferred_new = true,
+                        _ => {}
                     }
+                }
+                // Remembered for ONE retry, and only when this compile is about
+                // to lose the method to the single-pass backend for a reason
+                // that will not hold next time. Recorded here rather than at
+                // the bail because this is where the resolver's verdict is in
+                // hand; `take_deferred_new_retry` clears it.
+                if any_deferred_new {
+                    note_deferred_new_bail(
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
                 }
                 let mut trivial_init_pcs = std::collections::HashSet::new();
                 for &(pc, cp_idx, opcode) in &scan.invoke_ops {
