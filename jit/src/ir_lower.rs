@@ -4912,20 +4912,14 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
-                // The builder emits a `Const` offset for every field access it
-                // constructs, so the `else` arm is unreachable today. It deopts
-                // rather than falling back to slot `0`, which is what it used to
-                // do: slot 0 is a DIFFERENT field of the same receiver, read or
-                // written with no trace of the substitution. A deopt is the one
-                // answer that is always correct here — the interpreter
-                // re-executes the access against the real layout — and it costs
-                // nothing on a path nothing reaches.
-                //
-                // There is NO graph-level refusal behind this. An earlier
-                // version of this comment said `lower_inner` refuses such a
-                // graph; no such check exists there. The arm below is the whole
-                // guarantee, which is why it has to stay a deopt rather than
-                // become an assertion with a zero behind it.
+                // `lower_inner` refuses the graph unless every field access's
+                // offset edge is a `Const`, so the `None` arm is unreachable.
+                // It deopts rather than falling back to slot `0`, which is what
+                // it used to do: slot 0 is a DIFFERENT field of the same
+                // receiver, read or written with no trace of the substitution.
+                // A deopt is the one answer that is always correct here — the
+                // interpreter re-executes the access against the real layout —
+                // and it costs nothing on a path nothing reaches.
                 let Op::Const(field_index) = self.graph.nodes[offset_node as usize].op else {
                     self.emit_unconditional_deopt(node.bytecode_pc.unwrap_or(0));
                     return;
@@ -9957,7 +9951,7 @@ pub(crate) fn lower_inner_with_scopes(
     // reference, the cell then holds a primitive under a reference's name, and
     // the fault appears much later in whatever dereferences it — a compiled
     // `arraylength` on `Int(1)`, faulting at `addr=0x5`
-    // (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+    // (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-caught-in-sqlchar-init-20260827.md`).
     // Nothing in the report points back here, because a wrong-slot write leaves
     // no trace of having chosen the wrong slot.
     //

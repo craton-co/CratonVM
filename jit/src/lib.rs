@@ -6139,7 +6139,7 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// scalar replacement lands beside it"; array scalar replacement landed on
 /// 2026-08-27 and the allocation is fully deleted now (`volume` 478 ->
 /// 43.9 ns/voxel, converging on its own no-wrapper control at 39.2; see
-/// `docs/internal/fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
+/// `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
 ///
 /// What keeps it off is the ordinary flag-flip discipline: the trades it makes
 /// — more nodes per compile, a spliced body's surviving calls losing their
