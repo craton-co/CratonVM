@@ -274,6 +274,17 @@ fn maybe_dump_shutdown_reports() {
             "[cratonvm] invokevirtual sites pinned to a private target: {}",
             cratonvm_jit::private_invokevirtual_pinned()
         );
+        // ENGAGEMENT counter for tightening field resolution to the strict
+        // JVMS 5.4.3.2 answer. Resolution now asks for (name, descriptor) and
+        // only falls back to the historical name-only match when the hierarchy
+        // contains no such pair. A `0` here means the fallback could be
+        // deleted -- and `NoSuchFieldError` raised, as the spec says -- with no
+        // behaviour change at all on this workload.
+        // `CRATONVM_DBG_FIELD_DESCRIPTOR=1` names each one.
+        eprintln!(
+            "[cratonvm] field resolutions that fell back from (name, descriptor)              to name-only: {}",
+            cratonvm_vm::runtime::resolve::field_resolution_descriptor_fallbacks()
+        );
         eprintln!(
             "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );

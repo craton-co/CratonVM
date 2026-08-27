@@ -947,19 +947,56 @@ impl Class {
 
     // ----- Field lookup ----------------------------------------------------
 
-    /// Find a field declared in **this** class by name.
+    /// Find a field declared in **this** class by name, ignoring its descriptor.
     ///
     /// Returns `(absolute_index, &field)` where `absolute_index` accounts for
     /// inherited fields (i.e. it equals `first_field_index + local_offset`).
     ///
     /// To search inherited fields, call this on the superclass via `ClassStore`.
+    ///
+    /// # A name is not a field's identity
+    ///
+    /// JVMS §4.5 forbids two fields in one class file sharing a name **and**
+    /// descriptor — it permits them to share a name alone. So this function's
+    /// key is not unique, and when it is not, it returns whichever such field
+    /// comes first in declaration order.
+    ///
+    /// That is fine for the callers that pass a name they own and know to be
+    /// unique (`"value"`, `"hash"`, `"coder"`, `"size"`). It is NOT fine for
+    /// resolving a `CONSTANT_Fieldref`, which JVMS §5.4.3.2 resolves by name
+    /// **and** descriptor: use [`Self::find_own_field_by_descriptor`] there.
+    /// Resolving a fieldref through this function selects a field of the wrong
+    /// type and hands the caller its slot index, which is how a compiled
+    /// `putfield` comes to write one field's tag at another field's slot.
     pub fn find_own_field(&self, name: &str) -> Option<(usize, &ClassFileField)> {
-        // For static fields, the index is the position among static fields.
-        // For instance fields, the index is first_field_index + position among instance fields.
+        self.find_own_field_matching(|f| &*f.name == name)
+    }
+
+    /// [`Self::find_own_field`] with the JVMS §5.4.3.2 key: name **and**
+    /// descriptor. This is the correct lookup for a `CONSTANT_Fieldref`.
+    pub fn find_own_field_by_descriptor(
+        &self,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(usize, &ClassFileField)> {
+        self.find_own_field_matching(|f| &*f.name == name && &*f.descriptor == descriptor)
+    }
+
+    /// The index arithmetic both lookups share.
+    ///
+    /// A static field's index is its position among the static fields; an
+    /// instance field's is `first_field_index + position among instance
+    /// fields`. `self.fields` holds both kinds interleaved in declaration
+    /// order, so neither counter can be derived from the loop index — see
+    /// [`Self::field_at_index`], which is the inverse of this mapping.
+    fn find_own_field_matching(
+        &self,
+        matches: impl Fn(&ClassFileField) -> bool,
+    ) -> Option<(usize, &ClassFileField)> {
         let mut static_idx = 0usize;
         let mut instance_idx = 0usize;
         for field in &self.fields {
-            if &*field.name == name {
+            if matches(field) {
                 let abs_idx = if field.is_static() {
                     static_idx
                 } else {
@@ -1798,39 +1835,78 @@ impl Default for ClassStore {
 // Convenience: look up a field by name walking the superclass chain
 // ---------------------------------------------------------------------------
 
-/// Find a field by name in the given class or any of its superclasses.
+/// Find a field by name in the given class or any of its superclasses,
+/// **ignoring its descriptor**.
 ///
 /// Returns `(absolute_index, &ClassFileField, ClassId)` where `ClassId` is the
 /// class that actually declares the field.
+///
+/// # This is not the fieldref key
+///
+/// JVMS §5.4.3.2 resolves a `CONSTANT_Fieldref` by name **and** descriptor, and
+/// JVMS §4.5 permits one class to declare several fields sharing a name. This
+/// function keys on the name alone, so where a hierarchy has more than one
+/// field of that name it returns whichever the search order meets first — which
+/// may be a field of an entirely different type from the one the constant pool
+/// named.
+///
+/// Keep using it for a name the caller owns and knows to be unique. For a
+/// fieldref, call [`find_field_recursive_by_descriptor`].
 pub fn find_field_recursive<'a>(
     class_id: ClassId,
     field_name: &str,
     store: &'a ClassStore,
 ) -> Option<(usize, &'a ClassFileField, ClassId)> {
-    // JVM spec §5.4.3.2: field resolution.
-    //   1. Look in C itself.
-    //   2. Otherwise, recursively search the direct superinterfaces of C.
-    //   3. Otherwise, recursively search the superclass of C.
-    //
-    // Phase 1+3: walk the superclass chain, checking own fields at each level.
-    //
-    // Perf: the per-level interface BFS reuses two scratch buffers
-    // (`queue`, `visited`) across superclass levels instead of
-    // allocating a fresh `Vec` + default-hasher `HashSet` per level.
-    // `visited` is an `FxHashSet` — the fx hasher is faster than the
-    // SipHash default and the `ClassId` keys are not attacker-keyed.
+    find_field_recursive_matching(class_id, store, |c| c.find_own_field(field_name))
+}
+
+/// [`find_field_recursive`] with the JVMS §5.4.3.2 key: name **and**
+/// descriptor.
+///
+/// Same search order — the class itself, then its superinterfaces, then its
+/// superclass, repeating — with the descriptor required to match at every step.
+/// `None` means no field of that exact name and descriptor exists anywhere in
+/// the hierarchy, which JVMS makes a `NoSuchFieldError`; callers that cannot
+/// afford to fail closed fall back to the name-only search and count it.
+pub fn find_field_recursive_by_descriptor<'a>(
+    class_id: ClassId,
+    field_name: &str,
+    descriptor: &str,
+    store: &'a ClassStore,
+) -> Option<(usize, &'a ClassFileField, ClassId)> {
+    find_field_recursive_matching(class_id, store, |c| {
+        c.find_own_field_by_descriptor(field_name, descriptor)
+    })
+}
+
+/// The JVMS §5.4.3.2 search ORDER, shared by both keys above.
+///
+///   1. Look in C itself.
+///   2. Otherwise, recursively search the direct superinterfaces of C.
+///   3. Otherwise, recursively search the superclass of C.
+///
+/// Perf: the per-level interface BFS reuses two scratch buffers (`queue`,
+/// `visited`) across superclass levels instead of allocating a fresh `Vec` +
+/// default-hasher `HashSet` per level. `visited` is an `FxHashSet` — the fx
+/// hasher is faster than the SipHash default and the `ClassId` keys are not
+/// attacker-keyed.
+fn find_field_recursive_matching<'a>(
+    class_id: ClassId,
+    store: &'a ClassStore,
+    own: impl Fn(&'a Class) -> Option<(usize, &'a ClassFileField)>,
+) -> Option<(usize, &'a ClassFileField, ClassId)> {
     let mut current_id = class_id;
     let mut queue: Vec<ClassId> = Vec::new();
     let mut visited: FxHashSet<ClassId> = FxHashSet::default();
     loop {
         let class = store.get(current_id)?;
-        if let Some((idx, field)) = class.find_own_field(field_name) {
+        if let Some((idx, field)) = own(class) {
             return Some((idx, field, current_id));
         }
         // Phase 2: at each level, also search the superinterfaces (BFS).
         // Per the spec, only static fields can be inherited from interfaces;
-        // we still return whatever matches by name and let the caller
-        // distinguish static vs. instance via the field flags.
+        // we still return whatever matches and let the caller distinguish
+        // static vs. instance via the field flags.
         queue.clear();
         visited.clear();
         queue.extend_from_slice(&class.interfaces);
@@ -1842,7 +1918,7 @@ pub fn find_field_recursive<'a>(
                 continue;
             }
             if let Some(iface) = store.get(iface_id) {
-                if let Some((idx, field)) = iface.find_own_field(field_name) {
+                if let Some((idx, field)) = own(iface) {
                     return Some((idx, field, iface_id));
                 }
                 queue.extend_from_slice(&iface.interfaces);
@@ -2196,6 +2272,15 @@ mod tests {
             access_flags: FieldAccessFlags::empty(),
             name: cratonvm_types::intern_arc(name),
             descriptor: cratonvm_types::intern_arc("I"),
+            attributes: vec![],
+        }
+    }
+
+    fn make_field_desc(name: &str, descriptor: &str) -> ClassFileField {
+        ClassFileField {
+            access_flags: FieldAccessFlags::empty(),
+            name: cratonvm_types::intern_arc(name),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         }
     }
@@ -2729,6 +2814,101 @@ mod tests {
         assert_eq!(idx, 4);
 
         assert!(class.find_own_field("missing").is_none());
+    }
+
+    /// JVMS §4.5 forbids two fields in one class file sharing a name **and**
+    /// descriptor. Sharing a NAME alone is legal, and this is the case the
+    /// name-only lookup answered wrongly: it returns whichever comes first in
+    /// declaration order, so a fieldref naming the OTHER one got that field's
+    /// slot index.
+    ///
+    /// Asserted as a DIFFERENCE between the two keys on the same class, not as
+    /// "the descriptor form works": a test that only checked the new function
+    /// would still pass if it silently ignored the descriptor.
+    #[test]
+    fn two_fields_may_share_a_name_and_only_the_descriptor_tells_them_apart() {
+        let id = ClassId::new(0);
+        let fields = vec![
+            make_field_desc("x", "Ljava/lang/Object;"),
+            make_field_desc("x", "I"),
+        ];
+        let class = make_class(id, "Shadow", None, vec![], fields, vec![], 0, 2);
+
+        // The name-only key cannot distinguish them and takes the first.
+        let (idx, field) = class.find_own_field("x").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(&*field.descriptor, "Ljava/lang/Object;");
+
+        // The JVMS key reaches either one.
+        let (idx0, f0) = class
+            .find_own_field_by_descriptor("x", "Ljava/lang/Object;")
+            .unwrap();
+        assert_eq!((idx0, &*f0.descriptor), (0, "Ljava/lang/Object;"));
+
+        let (idx1, f1) = class.find_own_field_by_descriptor("x", "I").unwrap();
+        assert_eq!(
+            (idx1, &*f1.descriptor),
+            (1, "I"),
+            "the second `x` is reachable only by descriptor, and it is the one a              fieldref with descriptor `I` names"
+        );
+
+        // A descriptor no field has matches nothing, rather than falling back
+        // to a same-named field of another type.
+        assert!(class.find_own_field_by_descriptor("x", "J").is_none());
+    }
+
+    /// The same distinction across a hierarchy: a subclass shadowing an
+    /// inherited field name with a different TYPE. `find_field_recursive` stops
+    /// at the subclass's field whatever the fieldref asked for; the descriptor
+    /// form walks past it to the one that matches.
+    #[test]
+    fn a_shadowing_subclass_field_does_not_capture_a_supertype_fieldref() {
+        let mut store = ClassStore::new();
+        let base_id = store.next_id();
+        store.add(make_class(
+            base_id,
+            "Base",
+            None,
+            vec![],
+            vec![make_field_desc("x", "Ljava/lang/String;")],
+            vec![],
+            0,
+            1,
+        ));
+        let sub_id = store.next_id();
+        store.add(make_class(
+            sub_id,
+            "Sub",
+            Some(base_id),
+            vec![],
+            vec![make_field_desc("x", "I")],
+            vec![],
+            1,
+            2,
+        ));
+
+        // Name only: the subclass's `int x` shadows, whatever was asked for.
+        let (idx, field, declaring) = find_field_recursive(sub_id, "x", &store).unwrap();
+        assert_eq!((idx, &*field.descriptor, declaring), (1, "I", sub_id));
+
+        // With the descriptor, a fieldref for `Base.x:Ljava/lang/String;`
+        // resolved from `Sub` reaches Base's field and Base's slot.
+        let (idx, field, declaring) =
+            find_field_recursive_by_descriptor(sub_id, "x", "Ljava/lang/String;", &store).unwrap();
+        assert_eq!(
+            (idx, &*field.descriptor, declaring),
+            (0, "Ljava/lang/String;", base_id),
+            "the descriptor key must walk PAST the shadowing field, not stop at it"
+        );
+
+        // And the subclass's own field is still reachable by its descriptor.
+        let (idx, _, declaring) =
+            find_field_recursive_by_descriptor(sub_id, "x", "I", &store).unwrap();
+        assert_eq!((idx, declaring), (1, sub_id));
+
+        // No field of that name and descriptor anywhere: `None`, not a
+        // same-named field of another type.
+        assert!(find_field_recursive_by_descriptor(sub_id, "x", "J", &store).is_none());
     }
 
     #[test]
