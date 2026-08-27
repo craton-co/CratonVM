@@ -238,7 +238,37 @@ Five lines after `make` gave up, the class it could not resolve is being
 compiled. The bail is now remembered and consumed on use, so the method gets
 exactly ONE more attempt — the same treatment the code-buffer shortfall already
 had, and for the same reason: a measurement-like refusal the next attempt would
-not repeat.
+not repeat. End to end:
+
+```
+[ir] admission RJitGc.make: admitted to the optimizing pipeline
+[cratonvm-jitc] deferred-new ARMED RJitGc.make
+[ir] IrBuilder::build returned None for RJitGc.make — no IR body
+[cratonvm-jitc] full-compile RJitGc.make ...          <- single-pass body published
+[cratonvm-jitc] deferred-new SPENT RJitGc.make
+[cratonvm-jitc] deferred-new retry ENQUEUED RJitGc.make
+[cratonvm-jitc] bg-compile RJitGc.make tier=C2 optimized=true
+[ir] admission RJitGc.make: admitted to the optimizing pipeline   <- and no deferral this time
+```
+
+Getting there cost three attempts, and each was wrong in a way only the
+instrument could name — which is the same lesson as the top of this page. The
+first put the request on the C1→C2 promotion path, which refuses a task already
+at an optimized tier: the bail happens *inside* a C2 task that then falls
+through to single-pass. The second opened a door past that clause, and still
+nothing fired, because `make` is not compiled by the background worker at all —
+it goes through the **eager first-call door**, which reaches the backend
+directly and produces no `CompileOutcome`. This is the "three compile doors"
+shape again. The third named its own refusal, and the answer was one line:
+
+```
+[cratonvm-jitc] deferred-new retry REFUSED RJitGc.make: no tier state for this method
+```
+
+That door hands the backend a method the interpreter never counted invocations
+for, so the tier manager had never seen its key. Creating the state — what
+`on_invocation` already does for its own keys — is the fix, and every other gate
+still applies.
 
 ## Reproducing
 
