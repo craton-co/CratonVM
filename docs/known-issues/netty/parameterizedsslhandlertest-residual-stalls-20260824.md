@@ -318,6 +318,79 @@ first statement is the `class_id_of_object` that faulted. So the value the pin
 HANDED BACK was already stale: this is not "a native forgot to pin", it is
 "the pin did not hold".
 
+### There is now a SECONDS-scale reproducer, off netty
+
+`probes/TmChurnProbe.java` drives the caught native directly: in-memory
+`SSLEngine` handshake pairs with a custom `X509TrustManager` on the server (so
+`engine_consult_trust_managers` has managers to consult) and peer threads
+allocating hard, so a collection can land in the window. No sockets, no event
+loops, no netty class.
+
+| arm | heap | peers | result |
+|---|---|---|---|
+| stress | 600m | 2 | **8 catches** of `NoSuchMethodError java/lang/Object.checkClientTrusted(…)` |
+| control | 4g | 0 | **0 in 2165 handshakes** |
+
+Same binary, so the difference is the collection and not the code path. That
+turns a 1-in-20-to-1-in-230 whole-class hunt into a ~50/50 coin flip per
+process launch, which is the difference between a hand-off and a debugging
+loop.
+
+**It is BIMODAL, and that is a finding of its own.** A launch either catches
+within the first handful of handshakes or runs ~1200 clean and never catches.
+So it is a STARTUP-window race — class loading, JIT warm-up and the first heap
+growth — not a steady-state one. Quote launches caught, never handshakes.
+
+### The PIN-STALE canary was blind, and fixing it named the producer
+
+`pin_native_root` already carried a canary for "this caller pinned an address
+that was ALREADY stale" — which a pin cannot repair, since no later
+`pointer_map` holds a long-dead key. It asked `debug_forwarded_target`, which
+reads the forwarding word AT THE OLD ADDRESS, and G1 zeroes that word when it
+frees the from-region. **Same blind spot as `load_and_forward`.** So its zero
+meant "nothing stale was pinned whose from-region happened to survive", and
+was about to be read as the strong claim.
+
+It now also asks `gc_quiescence::was_vacated`, the exact ledger. It
+immediately fired — 6 hits, its report cap, on the catching run — and named
+the producer:
+
+```
+[blockgc] PIN-STALE tid=6 0x2002f949818->0x20030449c48
+          class=sun/security/ssl/SSLEngineImpl caller:
+    3: engine_consult_trust_managers   t27_tls.rs:14781
+    4: engine_run_trust_check          t27_tls.rs:14679
+```
+
+**The engine reference is already dead when it is pinned.** That explains why
+every downstream instrument reads clean — PIN-DANGLING 0, DISCARDS 0, the
+`[gcpart]` ring holding the forward, no STW give-up: nothing downstream is
+broken. The staleness arrives from upstream.
+
+### Three pin fixes in that file, and none of them moved the rate
+
+Applied in order, each on the reading that the previous capture supported:
+
+1. `do_wrap`: pin `this`/`dst` across the trust-manager callback;
+2. `do_unwrap`: pin `this`/`src` and every element of `dsts` across it;
+3. both: move those pins to FUNCTION ENTRY, before the first `ctx` call,
+   because a pin taken mid-body pins what `this` has already decayed to.
+
+Measured on the reproducer, six launches each, same flags:
+
+| binary | launches caught |
+|---|---|
+| before the entry-pin move | 3 / 6 |
+| after it | 4 / 6 |
+
+**No improvement.** The pins are correct on their own terms — a raw
+`ObjectRef` live across a call that allocates is a defect whether or not it is
+this one — and they are kept for that reason, but they are NOT this stall's
+fix and this page does not present them as one. `this` is already stale when
+`do_unwrap` receives it, so the producer is above these functions: the native
+argument handling, or `unwrap_single`/`wrap_single`. That is where the next
+capture should look, and `PIN-STALE` now points at it.
+
 ### Four ways that can happen, and where each one stands
 
 1. ~~**The pin slot was never remapped**~~ — **REFUTED by inspection.** There
