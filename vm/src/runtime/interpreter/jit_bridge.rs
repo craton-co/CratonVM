@@ -3725,6 +3725,77 @@ pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
         )
 }
 
+/// `AbstractOwnableSynchronizer.setExclusiveOwnerThread` — exempt from the
+/// caller seal, because for this triple the seal protects nothing.
+///
+/// Same species of exemption as [`jit_native_shadow_is_final_wrapper_unbox`]
+/// and [`jit_native_shadow_is_intrinsified_fp_bits`], and the reason is the
+/// seal's own: it exists because *a compiled direct call bypasses the
+/// interpreter's native-vs-bytecode decision*. Four facts say a compiled
+/// caller of this triple has no such call available to it, and all four are
+/// properties of code in this file:
+///
+///  1. **The callee is never compiled.** `try_jit_compile_callee_slow` opens
+///     with `registered_native_will_run(cached.class, method, descriptor)` and
+///     returns `None` when it answers true. It answers true here: the native
+///     is a `SyntheticStub`, `AbstractOwnableSynchronizer` is NOT on
+///     `real_protected_stub_class_common`'s allow-list, so the arbitration
+///     hands the call to the native. With no compiled body, no door has
+///     anything to bind or to publish in an inline cache.
+///  2. **It can never be spliced.** `resolve_inline_site_from` refuses any
+///     site whose SELECTED method's declaring class carries a registered
+///     native — `no!("native-shadow-on-selected-method")` — unconditionally,
+///     receiver-resolved or constant-pool-resolved alike. That refusal does
+///     not consult the guarded-virtual-inline flag, so it holds whether or not
+///     `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is on.
+///  3. **It cannot be direct-bound.** The call is `invokevirtual`, and
+///     `pending_callee_compiles` admits `invokestatic` and `invokespecial`
+///     only (kinds 3 and 1).
+///  4. **Every route left resolves the native.** A compiled caller reaches it
+///     through `try_jit_site_cached_native_dispatch`, which walks to
+///     `AbstractOwnableSynchronizer` and dispatches the registered callback;
+///     when that cache declines for any reason the fallback is
+///     `invoke_or_native`, which is the authority the whole seal defers to.
+///
+/// The method is also `protected final` on `AbstractOwnableSynchronizer`, so
+/// no override can exist and the target is unambiguous — the same closing
+/// condition the two neighbouring exemptions state.
+///
+/// # What it costs to seal it
+///
+/// The seal is not a tier-up delay. `jit_method_calls_native_shadowed`'s
+/// verdict is memoized through `mark_jit_bail_listed`, so a method that
+/// contains this call is JIT-denied **for the lifetime of the process**. Three
+/// of them are on the JDK's uncontended `ReentrantLock` path —
+/// `ReentrantLock$NonfairSync.initialTryLock`, `.tryAcquire` and
+/// `ReentrantLock$Sync.tryRelease` — which is every `LinkedBlockingQueue.add`
+/// and `.take`, i.e. the whole of `HashedWheelTimerTest#testExecutionOnTime`'s
+/// producer/consumer path.
+///
+/// `CRATONVM_JIT_SEAL_AQS_OWNER=1` restores the seal for this triple, so one
+/// binary carries both arms.
+pub(super) fn jit_native_shadow_is_aqs_owner_setter(
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if aqs_owner_seal_forced() {
+        return false;
+    }
+    target_class == "java/util/concurrent/locks/AbstractOwnableSynchronizer"
+        && method_name == "setExclusiveOwnerThread"
+        && descriptor == "(Ljava/lang/Thread;)V"
+}
+
+/// `CRATONVM_JIT_SEAL_AQS_OWNER=1` — keep sealing callers of
+/// `setExclusiveOwnerThread` out of the JIT, as before 2026-08-27.
+fn aqs_owner_seal_forced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SEAL_AQS_OWNER").is_some()
+    })
+}
+
 pub(super) fn jit_invoke_targets_native_shadow(
 
     shared: &SharedVm,
@@ -3786,6 +3857,24 @@ pub(super) fn jit_invoke_targets_native_shadow(
         return false;
     }
     if jit_native_shadow_is_intrinsified_fp_bits(&target_class, &method_name, &descriptor) {
+        return false;
+    }
+    if jit_native_shadow_is_aqs_owner_setter(&target_class, &method_name, &descriptor) {
+        cratonvm_jit::note_jit_native_shadow_cause("aqs-owner-exempt");
+        return false;
+    }
+    // The exemption has to be asked about the DECLARING class too. The
+    // constant pool at a `ReentrantLock$Sync.tryRelease` site names
+    // `ReentrantLock$Sync` (javac emits the current class for a same-package
+    // protected member), not `AbstractOwnableSynchronizer`, so the `direct`
+    // term above answers about the subclass and only the `inherited` term
+    // below — which resolves the declaring class — sees the real triple. An
+    // exemption that checked `target_class` alone would therefore be inert at
+    // exactly the call sites it was written for.
+    if declaring_class.as_deref().is_some_and(|declaring| {
+        jit_native_shadow_is_aqs_owner_setter(declaring, &method_name, &descriptor)
+    }) {
+        cratonvm_jit::note_jit_native_shadow_cause("aqs-owner-exempt");
         return false;
     }
     // A compiled direct call bypasses the interpreter's native-vs-bytecode

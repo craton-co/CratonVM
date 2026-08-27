@@ -10543,10 +10543,15 @@ mod site_refusal {
         // bytecode is what runs, and 2026-08-22 relaxed the compile gates so
         // the JIT compiles it. A stub that WINS is an ordinary registered
         // native that this cache simply declined to resolve, and refusing it
-        // cost every call `invoke_or_native`'s full cascade — 5.34 calls per
+        // cost every call `invoke_or_native`'s full cascade — 4.77 calls per
         // expired task on `HashedWheelTimerTest` alone
         // (`AbstractOwnableSynchronizer.setExclusiveOwnerThread`).
-        "SyntheticStub that WINS the arbitration, but the site cache declined (should be 0)",
+        //
+        // In `Compatible` mode slot 6 is now reachable only through the
+        // `CRATONVM_JIT_SITE_CACHE_STUBS=0` lever, so a non-zero value there
+        // with the lever unset is a defect. Under `--jdk-only` it is the
+        // ordinary §1.3 refusal and a large number is expected.
+        "SyntheticStub refused without asking the arbitration (--jdk-only, or the lever)",
         "site cache disabled (mode=off)",
         "SyntheticStub yields to real bytecode (the bytecode runs; correct to refuse)",
         "policy refused (--jdk-only §1.3), or no callback for the slot",
@@ -10945,6 +10950,17 @@ fn resolve_native_site(
     if vm.natives.native_methods.kind_of_id(id)
         == Some(cratonvm_native_api::NativeKind::SyntheticStub)
     {
+        // Strict mode refuses here, exactly as it did before this change, and
+        // deliberately WITHOUT asking the arbitration. §1.3 forbids invoking a
+        // fake at all, so the yield question is moot — and asking it anyway
+        // would route the site into `admit_jit_fast_native_resolved`'s strict
+        // arm, which records a structured violation per site. That record is
+        // reported by `--jdk-only-report`, so taking this early exit keeps
+        // strict mode's observable output identical rather than growing it a
+        // new entry for a decision that has not changed.
+        if crate::vm::dispatch_policy(vm).is_jdk_only() {
+            return site_refusal::note(6);
+        }
         if !synthetic_stub_site_cache_enabled() {
             return site_refusal::note(6);
         }
