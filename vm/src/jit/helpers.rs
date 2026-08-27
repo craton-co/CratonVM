@@ -7601,13 +7601,17 @@ unsafe fn jit_getfield_impl(
                 );
                 let compact_bit = gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0;
                 eprintln!(
-                    "[punned-ref] class_id={} num_slots={} field_index={field_index} \
-                     tag={tag} payload32={payload32:#x} payload64={payload64:#x} \
-                     decoded={val:?} compact_flag={compact_bit} gc_flags={gc_flags:#x} \
-                     (payload64 is the word that would have been dereferenced; \
-                     compact_flag=true means this was read at the WRONG offsets)",
+                    "[punned-ref] class={} class_id={} num_slots={} \
+                     field_index={field_index} tag={tag} payload32={payload32:#x} \
+                     payload64={payload64:#x} decoded={val:?} \
+                     compact_flag={compact_bit} gc_flags={gc_flags:#x} \
+                     jit_callee={} (payload64 is the word that would have been \
+                     dereferenced; compact_flag=true means this was read at the \
+                     WRONG offsets)",
+                    cratonvm_gc::collector::class_name_for_diagnostics(hdr.class_id.as_u32()),
                     hdr.class_id,
                     hdr.num_slots(),
+                    current_jit_callee(),
                 );
             }
         }
