@@ -1233,9 +1233,28 @@ fn services() -> &'static parking_lot::Mutex<FxHashMap<String, ServiceMap>> {
 /// → canonical_algo_norm`.  BouncyCastle's legacy `addAlgorithm` flow
 /// produces both kinds of put-keys; we resolve aliases on the way in,
 /// not on the way out, so `getService` is a single hash lookup.
-fn aliases() -> &'static parking_lot::Mutex<FxHashMap<(String, String, String), String>> {
+/// One `Alg.Alias.<Type>.<Alias>` row.
+///
+/// The lookup KEY normalises type and alias to upper case, because lookups are
+/// case-insensitive. The row keeps both raw spellings anyway, for the same
+/// reason [`ServiceEntry`] keeps `type_str` and `algorithm`: a provider's
+/// property view has to render `Alg.Alias.MessageDigest.SHA1`, and
+/// `ALG.ALIAS.MESSAGEDIGEST.SHA1` is not a key any caller would recognise.
+/// Recovering the spelling from the normalised key is not possible — uppercase
+/// is lossy, and `TripleDES` is the counter-example that proves it.
+#[derive(Clone, Debug, Default)]
+struct AliasEntry {
+    /// The canonical algorithm, in the provider's own spelling.
+    canonical: String,
+    /// Engine type as the `put` spelled it, e.g. `"MessageDigest"`.
+    type_str: String,
+    /// Alias as the `put` spelled it, e.g. `"SHA1"`.
+    alias: String,
+}
+
+fn aliases() -> &'static parking_lot::Mutex<FxHashMap<(String, String, String), AliasEntry>> {
     use std::sync::OnceLock;
-    static MAP: OnceLock<parking_lot::Mutex<FxHashMap<(String, String, String), String>>> =
+    static MAP: OnceLock<parking_lot::Mutex<FxHashMap<(String, String, String), AliasEntry>>> =
         OnceLock::new();
     MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
@@ -1321,7 +1340,7 @@ fn get_service_entry(provider: &str, type_str: &str, algo: &str) -> Option<Servi
     let canonical = aliases()
         .lock()
         .get(&(provider.to_string(), type_n.clone(), algo_n.clone()))
-        .map(|c| normalize_algo(c))
+        .map(|e| normalize_algo(&e.canonical))
         .unwrap_or(algo_n);
     services()
         .lock()
@@ -1356,7 +1375,7 @@ pub(crate) fn canonical_service_algorithm(
     let lookup = |name: &str| -> Option<String> {
         table
             .get(&(name.to_string(), type_n.clone(), algo_n.clone()))
-            .cloned()
+            .map(|e| e.canonical.clone())
     };
     match provider {
         Some(p) => lookup(p),
@@ -1367,7 +1386,7 @@ pub(crate) fn canonical_service_algorithm(
             names.into_iter().find_map(|(name, _, _)| {
                 table
                     .get(&(name, type_n.clone(), algo_n.clone()))
-                    .cloned()
+                    .map(|e| e.canonical.clone())
             })
         }
     }
@@ -1416,7 +1435,9 @@ pub(crate) fn canonical_if_unrecognised_native_only(
         {
             return None;
         }
-        table.get(&(name, type_n.clone(), algo_n.clone())).cloned()
+        table
+            .get(&(name, type_n.clone(), algo_n.clone()))
+            .map(|e| e.canonical.clone())
     })?;
     drop(table);
     recognised(&canonical).then_some(canonical)
@@ -2173,18 +2194,27 @@ fn seed_direct_native_engine_services() {
         "Blowfish",
         "ChaCha20",
         "ChaCha20-Poly1305",
-        // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
-        // carries the mode set in a `SupportedModes` attribute. The divergence
-        // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
-        // the bare name defaults to ECB — so advertising `DESede` would name a
-        // transformation `getInstance` refuses. Every entry in this list is one
-        // the engine computes; that invariant is worth more than matching
-        // HotSpot's grouping, and it is what
-        // `every_advertised_sunjce_cipher_is_serviceable` pins.
-        "DES/CBC/NoPadding",
-        "DES/CBC/PKCS5Padding",
-        "DESede/CBC/NoPadding",
-        "DESede/CBC/PKCS5Padding",
+        // The bare names, as HotSpot lists them, carrying their mode set in a
+        // `SupportedModes` attribute rather than in the service name.
+        //
+        // These were spelled in full until 2026-08-27, deliberately, and the
+        // reason was recorded here: this engine routed only CBC to the real
+        // SunJCE SPI and the bare name defaults to ECB, so advertising
+        // `DESede` would have named a transformation `getInstance` refuses.
+        // That precondition is gone — `classify_transformation` admits ECB for
+        // this family and `cipher_do_final_impl` forwards the parsed mode — so
+        // the bare form is now both advertised and computed, which is the
+        // invariant `every_advertised_sunjce_cipher_is_serviceable` pins and
+        // the shape HotSpot actually has.
+        //
+        // The fully-spelled `DESede/CBC/PKCS5Padding` is still SERVED: the
+        // `Cipher` arm of `check_provider_ownership` splits a transformation on
+        // `/` and asks about the base name, so one bare service covers every
+        // admitted mode/padding of it. It is no longer separately ADVERTISED,
+        // which is what `Security.getAlgorithms("Cipher")` reports, and there
+        // HotSpot lists two names where this list used to produce four.
+        "DES",
+        "DESede",
         "RSA",
         "PBEWithHmacSHA1AndAES_128",
         "PBEWithHmacSHA1AndAES_256",
@@ -2236,7 +2266,19 @@ fn seed_direct_native_engine_services() {
     put_alias(JCE, "Cipher", "AESWrap_128", "AES_128/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
-    put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
+    // `Alg.Alias.Cipher.TripleDES = DESede` on SunJCE — the BARE name,
+    // measured, not the expanded transformation this row used to carry.
+    //
+    // The expansion was wrong crypto, not merely a wrong spelling: bare
+    // `DESede` is ECB/PKCS5Padding on SunJCE and this row named CBC, so
+    // once the alias registry started being consulted by
+    // `canonical_transformation` (2026-08-26), `getInstance("TripleDES")`
+    // returned a CBC cipher with a random IV where HotSpot returns ECB
+    // with none — different ciphertext, silently. That is exactly the
+    // mode substitution `classify_transformation`'s DesFamily arm and
+    // `cipher_do_final_impl`'s route table each carry a comment about;
+    // the alias reached the engine around both of them.
+    put_alias(JCE, "Cipher", "TripleDES", "DESede");
     // `Alg.Alias.Cipher.RC4 = ARCFOUR` on SunJCE. Measured on HotSpot 25: both
     // spellings resolve, both answer `getProvider()=SunJCE`, and both encrypt
     // the same 16-byte plaintext to `27ca482b161e3ab93f812659b904df95` — while
@@ -3426,7 +3468,11 @@ fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
     let alias_n = normalize_algo(alias);
     aliases().lock().insert(
         (provider.to_string(), type_n, alias_n),
-        canonical.trim().to_string(),
+        AliasEntry {
+            canonical: canonical.trim().to_string(),
+            type_str: type_str.trim().to_string(),
+            alias: alias.trim().to_string(),
+        },
     );
 }
 
@@ -3630,7 +3676,20 @@ fn provider_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let pname = provider_name_of(ctx, this);
-    let val = provider_properties().lock().get(&(pname, key)).cloned();
+    let val = provider_properties()
+        .lock()
+        .get(&(pname.clone(), key.clone()))
+        .cloned()
+        // ...and the seeded registry behind it, which is where every
+        // `Type.Algorithm` and `Alg.Alias.Type.Alias` row this provider was
+        // built with actually lives. BouncyCastle reads aliases back through
+        // exactly this call (`X509SignatureUtil.lookupAlg`).
+        .or_else(|| {
+            projected_registry_rows(&pname)
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        });
     match val {
         Some(v) => {
             let s = ctx.create_string(&v);
@@ -3892,6 +3951,65 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// Sorted so `keySet`, `values` and `entrySet` agree with each other
 /// positionally and the order is stable between calls. HotSpot's is a hash
 /// order and is unspecified, so a defined order is not a divergence.
+/// A provider's SEEDED registry, rendered as the legacy property rows a real
+/// `Provider` carries in its inherited `Properties` table.
+///
+/// `put_service` / `put_service_attribute` / `put_alias` capture into the
+/// structured maps `getInstance` reads, and nothing ever mirrored them into the
+/// property view. So `Security.getProvider("SUN").keySet()` answered EMPTY,
+/// where HotSpot 25 answers 257 keys — 68 services, 86 attributes, 103 aliases
+/// — and every introspection path built on it (`keySet`, `entrySet`, `values`,
+/// `keys`, `elements`, `size`, `isEmpty`, `getProperty`) was silently wrong
+/// rather than merely incomplete.
+///
+/// Rendered on demand from the structured maps rather than duplicated at
+/// `put` time, so there is one source of truth and no way for the two to
+/// disagree. The three key shapes are HotSpot's own, measured:
+///
+/// ```text
+/// MessageDigest.SHA-256                       -> sun.security.provider.SHA2$SHA256
+/// MessageDigest.SHA-256 ImplementedIn         -> Software
+/// Alg.Alias.MessageDigest.SHA256              -> SHA-256
+/// ```
+///
+/// A service with an empty `class_name` is an alias-only artefact of the
+/// legacy `put` flow and is NOT rendered: it is not a row any provider
+/// advertises.
+fn projected_registry_rows(name: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    {
+        let services = services().lock();
+        if let Some(map) = services.get(name) {
+            for entry in map.values() {
+                if !entry.class_name.trim().is_empty() {
+                    rows.push((
+                        format!("{}.{}", entry.type_str, entry.algorithm),
+                        entry.class_name.clone(),
+                    ));
+                }
+                for (attr, value) in &entry.attributes {
+                    rows.push((
+                        format!("{}.{} {}", entry.type_str, entry.algorithm, attr),
+                        value.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    {
+        let aliases = aliases().lock();
+        for ((provider, _, _), entry) in aliases.iter() {
+            if provider == name {
+                rows.push((
+                    format!("Alg.Alias.{}.{}", entry.type_str, entry.alias),
+                    entry.canonical.clone(),
+                ));
+            }
+        }
+    }
+    rows
+}
+
 fn provider_map_rows(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
     let name = provider_name_of(ctx, this);
     let ihash = ctx.identity_hash_code(this) as i64;
@@ -3903,11 +4021,23 @@ fn provider_map_rows(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Strin
         .collect();
     let properties = provider_properties().lock();
     let mut rows: Vec<(String, String)> = if own.is_empty() {
-        properties
+        // An explicit `put` WINS over the projection for the same key: the
+        // property table is what a caller last wrote, and the registry is what
+        // was seeded. Collected properties-first, then deduplicated by key
+        // after the sort below, so the put survives.
+        let mut merged: Vec<(String, String)> = properties
             .iter()
             .filter(|((provider, _), _)| provider == &name)
             .map(|((_, key), value)| (key.clone(), value.clone()))
-            .collect()
+            .collect();
+        let put_keys: std::collections::HashSet<String> =
+            merged.iter().map(|(k, _)| k.clone()).collect();
+        merged.extend(
+            projected_registry_rows(&name)
+                .into_iter()
+                .filter(|(k, _)| !put_keys.contains(k)),
+        );
+        merged
     } else {
         own.into_iter()
             .map(|key| {
@@ -7032,6 +7162,69 @@ mod tests {
                 "{provider}.{engine}.{alias} is an ALIAS and must stay out of                  Security.getAlgorithms"
             );
         }
+    }
+
+    /// A seeded provider's property view is its registry, in the provider's
+    /// own spelling.
+    ///
+    /// `keySet` answered EMPTY for every JDK provider until 2026-08-27 —
+    /// `put_service` / `put_alias` captured into the structured maps and
+    /// nothing mirrored them into the property table `keySet`, `entrySet`,
+    /// `values`, `keys`, `elements`, `size`, `isEmpty` and `getProperty` all
+    /// read. Measured against HotSpot 25, which answers 257 keys on SUN.
+    ///
+    /// The SPELLING half is the part a test is needed for. Lookups normalise
+    /// to upper case, and rendering a row from the normalised key would
+    /// produce `ALG.ALIAS.MESSAGEDIGEST.SHA1`, which is not a key any caller
+    /// recognises and not one `getProperty` could match. That is why
+    /// `AliasEntry` keeps the raw spellings at all, and it is what the exact
+    /// string comparisons below pin.
+    #[test]
+    fn a_seeded_provider_renders_its_registry_as_property_rows() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let rows = projected_registry_rows("SUN");
+        assert!(
+            rows.len() >= 100,
+            "SUN projects {} rows; HotSpot 25 answers 257 and an empty view is \
+             the defect this closes",
+            rows.len()
+        );
+        let find = |key: &str| -> Option<String> {
+            rows.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        // A SERVICE row: `<Type>.<Algorithm>` in the provider's spelling.
+        let digest = find("MessageDigest.SHA-256")
+            .expect("SUN must project MessageDigest.SHA-256 as a property row");
+        assert!(
+            !digest.trim().is_empty(),
+            "a service row's value is its implementation class, never empty"
+        );
+        // An ALIAS row, and the value is the canonical it names.
+        assert_eq!(
+            find("Alg.Alias.MessageDigest.SHA1").as_deref(),
+            Some("SHA-1"),
+            "SUN must project Alg.Alias.MessageDigest.SHA1 = SHA-1, in that \
+             spelling: an upper-cased key matches nothing a caller asks for"
+        );
+        // The upper-cased forms must NOT appear — that is what rendering
+        // from the normalised lookup key would have produced.
+        for mangled in [
+            "ALG.ALIAS.MESSAGEDIGEST.SHA1",
+            "MESSAGEDIGEST.SHA-256",
+        ] {
+            assert!(
+                find(mangled).is_none(),
+                "{mangled} is a normalised LOOKUP key, not a property key"
+            );
+        }
+        // An alias-only service artefact carries no class and is not a row.
+        assert!(
+            rows.iter().all(|(_, v)| !v.trim().is_empty()),
+            "a property row with an empty value is not one any provider advertises"
+        );
     }
 
     /// W7-63 ratchet: no advertised `Signature` name may be refused at

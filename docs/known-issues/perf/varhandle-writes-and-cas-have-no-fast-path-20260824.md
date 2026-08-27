@@ -276,11 +276,13 @@ runs, not two.)
 ### Where the 872x actually is: FOUND, and it is not VarHandle at all
 
 A native profile settled it: composition runs INTERPRETED (92.35% in the VM
-binary, **0.32% in JIT code**), because `CompletableFuture.complete` is a
-registered native and every method calling it is sealed from compilation. On
+binary, **0.32% in JIT code**), because its two hottest methods —
+`UniCompose.tryFire` and `UniRelay.tryFire` — are ASKED and REFUSED by the
+compiler with `reason=unrecorded`. (The native-shadow seal was the first
+explanation and is retracted: turning it off changes nothing.) On
 the current binary `--nojit` is marginally FASTER than JIT, which is what "never
 compiled" looks like. See
-[`native-shadow-seal-keeps-completablefuture-interpreted-20260824.md`](native-shadow-seal-keeps-completablefuture-interpreted-20260824.md).
+[`completablefuture-composition-is-interpreted-tryfire-compile-refused-20260824.md`](completablefuture-composition-is-interpreted-tryfire-compile-refused-20260824.md).
 
 That is why every fix on this page moved the primitive and not the workload.
 The old text below is kept as written:

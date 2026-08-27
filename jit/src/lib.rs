@@ -15110,6 +15110,31 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
     }
 }
 
+/// Record why a compile was refused BEFORE the jit crate was ever entered.
+///
+/// The jit crate's own refusals already reach the stats table: every exit in
+/// `try_compile_with_invokespecial_resolver` funnels through
+/// `take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0))`, so even
+/// a siteless bail names the stage. The VM-side pipeline has no such funnel —
+/// `try_jit_compile_callee_slow` has NINE `return None` exits, none of which
+/// record anything, and a method refused at one of them is retried three times
+/// by the background worker and then retired as
+/// `compile-failed reason=unrecorded`.
+///
+/// That label is worse than no label: `compile-failed` says the compiler was
+/// asked and refused, which sends the reader into the backend, when the truth
+/// may be that the backend was never reached. Measured on
+/// `HibfixComposeProbe2`: `CompletableFuture$UniCompose.tryFire` (97 716
+/// invocations) and `UniRelay.tryFire` (58 612) both retired this way, and they
+/// ARE `CompletableFuture` composition.
+pub fn record_compile_refusal(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    why: &'static str,
+) {
+    record_jit_bail_reason(class_name, method_name, descriptor, (why, 0, 0));
+}
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()

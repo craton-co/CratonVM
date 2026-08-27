@@ -5387,6 +5387,27 @@ pub fn is_fjp_subclass_blocklisted(
     class_name: &str,
     requesting_class_id: Option<ClassId>,
 ) -> bool {
+    // MEASUREMENT LEVER ONLY — `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=0`.
+    //
+    // RFJP.1 is a CORRECTNESS workaround (a `RecursiveTask.compute()` that
+    // returns 0 past recursion depth ~10), so running with it off is expected
+    // to MISCOMPILE and must never ship that way.
+    //
+    // It exists because the comment above claims this blocklist "leave[s] ...
+    // CompletableFuture paths JIT-eligible because they don't extend
+    // ForkJoinTask directly in the hot path", and that claim is FALSE:
+    // `CompletableFuture$UniCompose` and `$UniRelay` extend `Completion`, which
+    // extends `ForkJoinTask`, and they are exactly the hot path — 99 444 and
+    // 59 636 invocations on `HibfixComposeProbe2`, both refused here. So the
+    // whole `CompletableFuture` completion machinery runs interpreted, which is
+    // the 442-872x that probe measures.
+    //
+    // Before narrowing the blocklist (to `compute()`, or to methods that can
+    // actually recurse), price the ceiling with this switch. If lifting it is
+    // worth ~0 the narrowing is not worth its correctness risk.
+    if !crate::runtime::env_cache::jit_fjp_subclass_blocklist() {
+        return false;
+    }
     // Cheap exact-name fast path — the JDK classes themselves are always
     // affected by the same regalloc shape if they ever get to JIT.
     if class_name == "java/util/concurrent/ForkJoinTask"
@@ -5891,6 +5912,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // proper regalloc fix is out of scope here. Returning `None` here forces
     // the interpreter for both direct and dispatcher-cached callee paths.
     if is_fjp_subclass_blocklisted(shared, class_name, None) {
+        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-fjp-subclass-blocklisted");
         return None;
     }
     // FJP fix (CORRECTED): refuse to compile a method only when the method that
@@ -5914,6 +5936,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
     if registered_native_will_run(shared, class_name, method_name, descriptor) {
+        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-callee-is-registered-native");
         return None;
     }
     // Look up the method bytecode
@@ -5924,6 +5947,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // The receiver's class may simply not be loaded yet — a later
             // attempt can succeed, so this `None` must not be cached.
             *cache_negative = false;
+            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-declaring-class-not-loaded");
             return None;
         }
     };
@@ -5936,6 +5960,7 @@ pub(super) fn try_jit_compile_callee_slow(
     )?;
     // Direct dispatcher compilation also bypasses interpreter frame creation.
     if method.is_synchronized() && !allow_synchronized_wrapped_entry {
+        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-synchronized-no-wrapped-entry");
         return None;
     }
 
@@ -5992,6 +6017,7 @@ pub(super) fn try_jit_compile_callee_slow(
     }
     if scan_refuses {
         crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-bytecode-scan-refused");
         return None;
     }
     // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
@@ -6022,6 +6048,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // dispatch through the safe fallback), at which point this
             // function should succeed and start caching the fast entry.
             *cache_negative = false;
+            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-declaring-class-not-initialized");
             return None;
         }
     }
@@ -6041,6 +6068,7 @@ pub(super) fn try_jit_compile_callee_slow(
             .find(declaring_class_name, method_name, descriptor)
             .is_some()
     {
+        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-native-override-present");
         return None;
     }
     let source_file = store
@@ -6091,6 +6119,7 @@ pub(super) fn try_jit_compile_callee_slow(
             method_name,
             &cached.method_descriptor,
         ) {
+            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-callee-compile-gate-refused");
             return None;
         }
     }
@@ -6114,7 +6143,15 @@ pub(super) fn try_jit_compile_callee_slow(
                 name_and_type_index,
                 ..
             }) => *name_and_type_index,
-            _ => return None,
+            _ => {
+                cratonvm_jit::record_compile_refusal(
+                    class_name,
+                    method_name,
+                    descriptor,
+                    "vm-cp-entry-not-a-methodref",
+                );
+                return None;
+            }
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
