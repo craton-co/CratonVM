@@ -16244,7 +16244,13 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
     // `or_insert` and not `insert`: a method whose retry was already granted
     // stays at `1` and is never re-armed.
     if set.len() < MAX_DEFERRED_NEW_RETRIES || set.contains_key(&h) {
+        let armed = !set.contains_key(&h);
         set.entry(h).or_insert(0);
+        if armed && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor}"
+            );
+        }
     }
 }
 
@@ -16265,13 +16271,17 @@ pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: 
         cratonvm_types::ClassId::new(0),
     );
     let mut set = deferred_new_retries().write();
-    match set.get_mut(&h) {
+    let granted = match set.get_mut(&h) {
         Some(state @ 0) => {
             *state = 1;
             true
         }
         _ => false,
+    };
+    if granted && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
     }
+    granted
 }
 
 /// Number of methods currently OWED a deferred-`new` retry. Diagnostics.

@@ -802,21 +802,44 @@ impl CompilerCore {
     /// one-shot memo (`cratonvm_jit::take_deferred_new_retry`), so a method can
     /// reach here at most once per process.
     pub(crate) fn request_deferred_new_retry(&self, key: &MethodKey) {
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some();
+        macro_rules! refuse {
+            ($why:expr) => {{
+                if dbg {
+                    eprintln!(
+                        "[cratonvm-jitc] deferred-new retry REFUSED {}.{}{}: {}",
+                        key.class_name, key.method_name, key.descriptor, $why
+                    );
+                }
+                return;
+            }};
+        }
         {
             let mut methods = self.methods.lock();
             let Some(state) = methods.get_mut(key) else {
-                return;
+                refuse!("no tier state for this method");
             };
-            if state.queued_for_compilation
-                || state.c2_bailout
-                || state.ineligible
-                || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
-            {
-                return;
+            if state.queued_for_compilation {
+                refuse!("already queued");
+            }
+            if state.c2_bailout {
+                refuse!("c2_bailout");
+            }
+            if state.ineligible {
+                refuse!("ineligible");
+            }
+            if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
+                refuse!("tier_fail_count exhausted");
             }
             let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
             if gate != 0 && state.invocation_count < gate {
-                return;
+                refuse!("below the c2-upgrade hotness gate");
+            }
+            if dbg {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new retry ENQUEUED {}.{}{}",
+                    key.class_name, key.method_name, key.descriptor
+                );
             }
             state.queued_for_compilation = true;
             state.queued_tier = Some(CompilationTier::C2);
