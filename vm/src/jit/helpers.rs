@@ -10512,7 +10512,9 @@ mod site_refusal {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// One counter per refusal reason, in the order they are tested.
-    pub(super) static COUNTS: [AtomicU64; 8] = [
+    pub(super) static COUNTS: [AtomicU64; 10] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -10523,7 +10525,7 @@ mod site_refusal {
         AtomicU64::new(0),
     ];
 
-    pub(super) const REASONS: [&str; 8] = [
+    pub(super) const REASONS: [&str; 10] = [
         "invoke-kind not virtual/interface/static, or receiver not a heap object",
         "method name is special-cased by invoke_or_native",
         "receiver class unavailable",
@@ -10535,8 +10537,19 @@ mod site_refusal {
         // cache this path shipped with before 836631dcc. Under the default
         // `all` nothing reports it, exactly as during its retirement.
         "registered, but does not claim leaf (mode=leaf)",
-        "SyntheticStub / policy refused",
+        // Slot 6 used to be every `SyntheticStub` plus every policy refusal in
+        // one number, which made the two indistinguishable — and they have
+        // opposite remedies. A stub that YIELDS (slot 8) must be refused: the
+        // bytecode is what runs, and 2026-08-22 relaxed the compile gates so
+        // the JIT compiles it. A stub that WINS is an ordinary registered
+        // native that this cache simply declined to resolve, and refusing it
+        // cost every call `invoke_or_native`'s full cascade — 5.34 calls per
+        // expired task on `HashedWheelTimerTest` alone
+        // (`AbstractOwnableSynchronizer.setExclusiveOwnerThread`).
+        "SyntheticStub that WINS the arbitration, but the site cache declined (should be 0)",
         "site cache disabled (mode=off)",
+        "SyntheticStub yields to real bytecode (the bytecode runs; correct to refuse)",
+        "policy refused (--jdk-only §1.3), or no callback for the slot",
     ];
 
     #[inline]
@@ -10680,6 +10693,39 @@ fn site_cache_mode_from(raw: Option<&str>) -> SiteCacheMode {
             ),
         },
     }
+}
+
+/// `CRATONVM_JIT_SITE_CACHE_STUBS=0` — refuse every `SyntheticStub` triple at
+/// the site cache, as this path did before 2026-08-27, instead of arbitrating
+/// it the way `invoke_or_native` does.
+///
+/// **Default ON** (arbitrate). The switch exists for the same reason every
+/// other lever in this file does: a release build here is ~16 minutes, so the
+/// only rigorous A/B is one binary against itself. Comparing against a
+/// separately built branch confounds this change with everything else that
+/// landed in between.
+///
+/// It is also the bisect lever for the one hazard the change carries. The
+/// arbitration `resolve_native_site` now performs is asked ONCE per call site
+/// and cached; `invoke_or_native` asks it on every dispatch. Both terms are
+/// monotone in the safe direction — a class becomes loaded, a `Code` attribute
+/// becomes decoded, never the reverse — so a cached "the native wins" cannot
+/// go stale into "the bytecode should have won" while the process runs, and a
+/// JVMTI redefine invalidates the entry through the `any_class_redefined`
+/// check on the dispatch side. If a workload ever disagrees, this switch names
+/// the change without a rebuild.
+fn synthetic_stub_site_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE_STUBS") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => true,
+        }
+    })
 }
 
 /// Does `invoke_or_native` special-case this method name BEFORE it reaches its
@@ -10856,13 +10902,63 @@ fn resolve_native_site(
     if !leaf && !mode.admits_non_leaf() {
         return site_refusal::note(5);
     }
+    // A `SyntheticStub` is not automatically a refusal — it is a QUESTION, and
+    // this path used to refuse rather than ask it.
+    //
+    // `invoke_or_native` arbitrates a stub against the real bytecode with two
+    // terms: `real_protected_stub_class(class)`, a twelve-entry allow-list, and
+    // `has_real`, "the loaded class declares concrete non-native bytecode for
+    // this triple". Only when BOTH hold does the bytecode win. For every other
+    // stub the native wins and runs on every call — which is what the exact
+    // census configuration says (`--nojit CRATONVM_DISABLE_INTRINSICS=1`):
+    // `AbstractOwnableSynchronizer.setExclusiveOwnerThread` dispatches 399,999
+    // times for 400,000 calls.
+    //
+    // Refusing here did not stop that native running. It only stopped it being
+    // RESOLVED ONCE, so every call from compiled code fell to
+    // `invoke_or_native`'s ~27-gate string cascade and three-string registry
+    // hash — and that route, by its own comment, "is NOT counted for the §4
+    // census", which is why `--dump-native-registry` reported 947 of those
+    // 12,000,000 calls and the cost had no name in any census.
+    //
+    // MEASURED on this branch, `probes/OwnerCallProbe.java`, JIT arm, against
+    // the identical two-level call shape on a class with no registration:
+    //
+    //     plain field store through two calls        17 ns/call
+    //     setExclusiveOwnerThread                   458-898 ns/call
+    //
+    // The arbitration is a pure function of `(class, method, descriptor)` — no
+    // per-call term — so asking it HERE, once per site at fill time, is exactly
+    // equivalent to asking it on every dispatch, and the answer is cached with
+    // the entry. `synthetic_stub_should_yield_to_real_bytecode` is the single
+    // centralised predicate both dispatch paths already use; this is a third
+    // caller of it, deliberately not a fourth copy of its five terms.
+    //
+    // `--jdk-only` is untouched: `admit_jit_fast_native_resolved` immediately
+    // below routes every admission through `resolve_native_dispatch_wave1`,
+    // whose §1.3 arm rejects a `SyntheticStub` outright. The refusal that
+    // matters for policy is still there; what is gone is a refusal that only
+    // ever cost throughput.
+    //
+    // `CRATONVM_JIT_SITE_CACHE_STUBS=0` restores the blanket refusal so one
+    // binary can be A/B'd against its own pre-change behaviour.
     if vm.natives.native_methods.kind_of_id(id)
         == Some(cratonvm_native_api::NativeKind::SyntheticStub)
     {
-        return site_refusal::note(6);
+        if !synthetic_stub_site_cache_enabled() {
+            return site_refusal::note(6);
+        }
+        if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            vm,
+            &owner_class,
+            info.method_name,
+            registered_descriptor,
+        ) {
+            return site_refusal::note(8);
+        }
     }
     let Some(callback) = vm.natives.native_methods.callback_of(id) else {
-        return site_refusal::note(6);
+        return site_refusal::note(9);
     };
     let Some((callback, native_id)) = admit_jit_fast_native_resolved(
         vm,
@@ -10872,7 +10968,7 @@ fn resolve_native_site(
         callback,
         Some(id),
     ) else {
-        return site_refusal::note(6);
+        return site_refusal::note(9);
     };
     Some(NativeSiteCache {
         kind,

@@ -116,6 +116,8 @@ spring-suite/build/
 # output does not (the same rule `bench/` and `spring-suite/build/` already
 # have; `probes/` itself is tracked, so it needs its own line).
 probes/out/
+# A second probe build dir, so two branches' probe classes cannot collide.
+probes/out-funnel/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class
