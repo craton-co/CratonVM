@@ -1264,6 +1264,7 @@ pub const INVENTORY: &[E] = &[
     // old behaviour. Same `off_word` shape as `osr-coverage-shadow` and
     // `xt-jit-coverage-handshake`, which are the other two default-ON rows.
     E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
@@ -1272,6 +1273,10 @@ pub const INVENTORY: &[E] = &[
     // elides (the pre-2026-08-26 behaviour), `args`/`2` and the default `3`
     // widen it -- so `off_word` is `0` and the token carries the mode.
     E { group: Group::JIT, token: "call-spill-elision", on_key: Some("CRATONVM_JIT_CALL_SPILL_ELISION"), off_key: None, off_word: Some("0") },
+    // Narrow the safepoint blind spill to the registers that can hold an oop.
+    // DEFAULT-ON, so a KILL SWITCH: `=0` restores the full-GPR spill. Same
+    // off_word shape as `call-spill-elision` beside it.
+    E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
