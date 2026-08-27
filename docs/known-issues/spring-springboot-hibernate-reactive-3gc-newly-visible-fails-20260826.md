@@ -1,11 +1,37 @@
 # Spring Framework, Spring Boot, and Hibernate Reactive 3-GC full-suite runs (2026-08-24/25): newly-visible FAILs, one root-caused
 
 ## Status
-**OPEN, mixed confidence, one cluster root-caused.** Filed as a single
-cross-project doc rather than three, since most of what's here is one
-mechanism (`Class.getDeclaredMethods()` ordering) surfacing in three
-different test suites, and splitting it three ways would just duplicate the
-same investigation.
+**Mostly RESOLVED as of 2026-08-27 — see correction below.** Filed
+2026-08-26 as a single cross-project doc covering 40 fail classes across
+three suites, with a `Class.getDeclaredMethods()` ordering divergence
+proposed as the shared root cause for the JSON-property-order cluster.
+Rerunning the full non-passed union (27 Spring Framework + 18 Spring Boot +
+11 Hibernate Reactive classes, ZGC only, serial) after merging three more
+days of `dev` fixes: **24/27, 11/18, and 10/11 now pass respectively** — the
+entire JSON-property-order cluster this doc named (`JavaConfigTests`,
+`XmlConfigTests`, `AsyncTests`, the Jackson- and health-descriptor-named
+Spring Boot classes) is gone.
+
+**Correction: the `getDeclaredMethods()` root-cause claim below did not
+hold up and should be treated as retracted, not confirmed.** Re-running the
+same reflection probe against the fresh binary shows the exact same
+method-order divergence from HotSpot as before — it was not fixed by
+anything in this window (`git log` between 2026-08-24 and 2026-08-27 shows
+no Jackson/property-order/reflection-ordering fix). Yet the JSON-ordering
+test failures it was invoked to explain are now gone. That means either the
+divergence was never the actual cause (a coincidental correlation — same
+symptom, unrelated mechanism, fixed by something else that landed in this
+window, e.g. `a6911c502` "close the fifth map-view fail-fast door" or one of
+several other merges), or Jackson's real property-order algorithm doesn't
+actually depend on raw `getDeclaredMethods()` order the way this doc
+assumed. Either way: **do not cite this doc's `getDeclaredMethods()` finding
+as a confirmed root cause for anything.** The reflection-order divergence
+itself is still real and reproducible (repro command still below) and may
+be worth its own investigation on its own merits, but it is not shown to
+explain any test failure, past or present.
+
+The remaining residuals (small — 3, 7, and 1 classes respectively) are
+listed under "What's still failing after the 2026-08-27 rerun" below.
 
 ## Why these look like "regressions" but probably aren't
 All three suites were rerun in full (3 GC variants each: generational/G1/ZGC)
@@ -141,6 +167,25 @@ not reconciled:
 * `org.hibernate.reactive.TableGeneratorTest`
 * `org.hibernate.reactive.dynamic.DynamicEntityTest` (`test(VertxTestContext)`,
   `CompletionException: AssertionError`, no further detail captured)
+
+## What's still failing after the 2026-08-27 rerun (ZGC only, serial, fresh `dev`-merged binary)
+
+**Spring Framework — 3 of 27 remain** (24 recovered):
+* `FileNativeConfigurationWriterTests` — already known, not a CratonVM bug (HotSpot fails identically).
+* `BeanRegistrationsAotContributionTests` — already known, AOT/Mockito throughput wall (TIMEOUT).
+* `AotIntegrationTests` — FAIL, not newly root-caused in this pass.
+
+**Spring Boot — 7 of 18 remain** (11 recovered):
+* `loader/spring-boot-loader`: `NestedPathTests`, `ZipContentTests`
+* `module/spring-boot-cache`: `CacheAutoConfigurationTests`
+* `module/spring-boot-jersey`: `JerseyWebEndpointManagementContextConfigurationTests`
+* `module/spring-boot-micrometer-metrics`: `DatadogPropertiesConfigAdapterTests`, `OtlpMetricsExportAutoConfigurationTests`
+* `module/spring-boot-micrometer-tracing-brave`: `OtlpExemplarsAutoConfigurationTests`
+
+None of these seven were individually triaged in this pass — no confirmed shared theme (the micrometer trio might share one, not checked).
+
+**Hibernate Reactive — 1 of 11 remains** (10 recovered):
+* `MultithreadedInsertionWithLazyConnectionTest` — HANG. A concurrent session's commit message (`te-20260824` measurement) already names this class as "perf family, unchanged by the lambda-deopt fix" — an already-tracked performance residual, not new.
 
 ## Next steps
 * Confirm the `getDeclaredMethods()` divergence's actual mechanism (not just

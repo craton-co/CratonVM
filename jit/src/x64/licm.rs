@@ -1827,6 +1827,49 @@ pub(super) fn call_spill_elision_mode() -> u8 {
     })
 }
 
+/// Narrow the SB-CRASH-04 blind GPR spill at a GC-capable safepoint to the
+/// registers that can hold an oop, instead of copying all fourteen
+/// (`CRATONVM_JIT_SPILL_NARROW`, **default-ON; `=0` restores the full copy**).
+///
+/// The spill exists so the conservative `[scanner_sp, entry_sp)` scan can see a
+/// register-resident root, and `=all` (the full file, not just the callee-saved
+/// subset) was required for one stated reason: "a receiver/args staged into
+/// ARG_REGS immediately before a GC-capable call ... sit in caller-saved/
+/// argument registers, which the callee-saved-only spill never covers"
+/// (`Compiler::new`). That reason names a POPULATION, and the population is
+/// nameable: RAX and `ARG_REGS`, plus the register homes of reference-capable
+/// locals, plus whatever the operand stack is holding in a register right now.
+/// A register that hosts a primitive local, or hosts nothing this method ever
+/// wrote, is a store per safepoint for nothing.
+///
+/// What the narrowing gives up is the pure defence-in-depth tail — "a value the
+/// per-slot oop tracker fails to tag" — for the scratch registers (R10/R11 on
+/// SysV) and for local homes the method-wide reference mask says are primitive.
+/// That mask is conservative in the safe direction: `find_reference_locals`
+/// ORs in every `aload`/`astore` across the whole method, so javac's cross-scope
+/// slot reuse only makes it name MORE locals, never fewer.
+///
+/// Fails closed: no publish plan (the legacy `compile` test wrapper), more than
+/// 64 locals (the mask's unrepresented tail), or an explicit
+/// `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` all keep the full fourteen stores.
+/// The slot LAYOUT is unchanged either way — `emit_blind_reg_spill` indexes by
+/// position in `ALL_SPILL_GPRS` — so a skipped store leaves a stale slot, which
+/// the scanner re-validates through `heap.is_object_address` and which can
+/// therefore only over-retain, never under-report.
+pub(super) fn narrow_safepoint_spill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_NARROW") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 /// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
 /// full-GPR safepoint register spill (see the call site in `Compiler::new`).
 /// `precise_maps` has been default-on since 2026-07-07, but its own

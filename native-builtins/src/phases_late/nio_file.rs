@@ -285,10 +285,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_field(uri, 0, Value::Object(Some(raw)));
             let scheme = ctx.create_string("file");
             ctx.set_field(uri, 1, Value::Object(Some(scheme)));
-            let path_str = ctx.create_string(&abs);
+            let path_str = ctx.create_string(&encoded);
             ctx.set_field(uri, 4, Value::Object(Some(path_str)));
         }
-        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&abs));
+        // `encoded`, not `abs`: the override is the RAW path component, and
+        // `uri_publish_named` derives `decodedPath` from it. Passing the decoded
+        // spelling here is what made `getRawPath()` answer an un-escaped path
+        // while `toString()` stayed correct -- see the note on that function.
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&encoded));
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -6997,12 +7001,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let s = ctx.create_string(&uri_str);
             let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 0, Value::Object(Some(s)));
-            let path_s = ctx.create_string(slash_p);
+            let path_s = ctx.create_string(&encoded);
             let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 4, Value::Object(Some(path_s)));
         }
         let uri = ctx.read_native_pin(uri_pin, uri);
-        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(slash_p));
+        // `encoded`, not `slash_p`: the override is the RAW path component and
+        // `uri_publish_named` derives `decodedPath` from it, so handing it the
+        // decoded spelling made `getRawPath()` answer an un-escaped path while
+        // `toString()` stayed correct. This is the registration that actually
+        // runs -- `Path.toUri()` is registered in this file AND in the phase-57
+        // registrar above, and the later one wins -- which is why fixing only
+        // the other copy moved nothing. See `net_phase_e::uri_publish_named`.
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&encoded));
         let uri = ctx.read_native_pin(uri_pin, uri);
         ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
