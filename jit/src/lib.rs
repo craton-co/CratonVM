@@ -15127,11 +15127,21 @@ fn plan_scalar_replacement(
     // PINNED BY AN EARLIER ROUND'S DESCRIPTOR. Escape analysis is iterated
     // (scalar replacement exposes scalar replacement), and a descriptor built
     // in an earlier round can name this allocation as another object's FIELD
-    // VALUE. Deleting it now would leave that recipe pointing at a node the
-    // lowerer cannot resolve, and the object it describes would lose its
-    // materialization -- turning a resumable deopt point into an unresumable
-    // one. The pin is per-node and only ever grows.
-    if descriptor_pinned.contains(&new_node) {
+    // VALUE. Deleting it WITHOUT LEAVING A RECIPE OF ITS OWN would strand that
+    // reference: the enclosing object's field would resolve to a node the
+    // lowerer cannot answer, and `frame_value_for_object` would refuse the
+    // whole enclosing object -- turning a resumable deopt point into an
+    // unresumable one.
+    //
+    // Leaving a recipe of its own is the escape hatch, and it is the normal
+    // case: the enclosing object's field then resolves to a NESTED virtual
+    // object, which the materializer has always supported (it walks the field
+    // graph and allocates a shell per distinct id). So the pin only bites when
+    // this allocation cannot be described at all.
+    if descriptor_pinned.contains(&new_node)
+        && !(deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
+    {
         elide_alloc = false;
     }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
@@ -15595,21 +15605,6 @@ fn virtual_object_info_for(
     reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
     info: &escape_analysis::ScalarReplacementInfo,
 ) -> Option<(ir::NodeId, ir_lower::VirtualObjectInfo)> {
-    // ARRAYS HAVE NO RECIPE. `VirtualObjectInfo` describes an object as a
-    // `class_id` plus a field count, and the VM materializer turns that into
-    // `alloc_object_shared(class_id, num_fields)`. There is no spelling of "a
-    // `short[2]`" in it, and inventing one by passing the array's class id
-    // through would make the materializer allocate an OBJECT with two
-    // reference-shaped fields where the frame expects an array.
-    //
-    // `None` here is not a refusal to optimise -- it is the input to
-    // `plan_scalar_replacement`'s `elide_alloc` gate, which then keeps the
-    // allocation alive for any array a deopt snapshot names, and elides it for
-    // every array no snapshot names. Extending the descriptor to arrays is what
-    // would lift that restriction; until then this is the fail-closed half.
-    if info.array_element_type.is_some() {
-        return None;
-    }
     // Control input (slot 0) of a node, used to recover a node's block for the
     // dominance gate AFTER the node itself is marked `Op::Dead` (its inputs are
     // cleared then, but the captured control node stays live).
@@ -15647,6 +15642,9 @@ fn virtual_object_info_for(
     Some((
         ir_new,
         ir_lower::VirtualObjectInfo {
+            // An array is described by its element type and its LENGTH
+            // (`num_fields`); `class_id` is meaningless for one and is not read.
+            array_element_type: info.array_element_type,
             class_id: info.class_id,
             num_fields: info.num_fields,
             field_values,

@@ -100,6 +100,10 @@ const _: () = assert!(
 /// stable [`crate::deopt::VirtualObjectState::id`] within a deopt frame.
 pub struct VirtualObjectInfo {
     pub class_id: u32,
+    /// `Some(atype)` for a scalar-replaced array: the element atype, with
+    /// `num_fields` as the LENGTH. See [`crate::deopt::VirtualObjectState`],
+    /// which this is the compile-time half of.
+    pub array_element_type: Option<u8>,
     pub num_fields: usize,
     /// Per field index: the IR value node the field holds, or `None` for a field
     /// never stored (resolves to the object's zero default). Admitted allocations
@@ -6981,16 +6985,47 @@ fn reloc_emit_enabled() -> bool {
             let fv = match info.field_values.get(i).copied().flatten() {
                 None => FrameValue::Int(0),
                 Some(vnode) => {
+                    // NESTED VIRTUAL OBJECT. A field whose value is itself a
+                    // scalar-replaced allocation is described in place, by the
+                    // same function, recursively. `emitted` is what makes that
+                    // terminate and what makes sharing work: the second and
+                    // later occurrences of an id come back as
+                    // `FrameValue::VirtualObjectRef`, which the materializer
+                    // resolves against the shell it already allocated. A cycle
+                    // therefore ends at its first repeat rather than recursing.
+                    //
+                    // This used to bail the WHOLE enclosing object ("v1 emits
+                    // no nested graphs"), which is what stopped a wrapper and
+                    // its storage array from both being deleted: the wrapper's
+                    // recipe names the array, so the moment the array became
+                    // replaceable the wrapper's own recipe was refused.
+                    //
+                    // The recursive call re-runs every gate on the nested
+                    // object -- its allocation and stores must strictly
+                    // dominate the same deopt block -- so a nested object that
+                    // cannot be described refuses itself, and the check below
+                    // turns that refusal into a refusal of the enclosing
+                    // object. Fail-closed, one level at a time.
                     if sr.objects.contains_key(&vnode) {
-                        if dbg {
-                            eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} is nested virtual (node {vnode})");
+                        let nested =
+                            self.frame_value_for_object(vnode, deopt_block, sr, emitted);
+                        if matches!(
+                            nested,
+                            FrameValue::Undefined
+                                | FrameValue::Unsupported
+                                | FrameValue::MaterializationRequired(_)
+                        ) {
+                            if dbg {
+                                eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} nested virtual (node {vnode}) -> {nested:?}");
+                            }
+                            return Self::eliminated_object(
+                                new_id,
+                                info,
+                                EliminationCause::NestedVirtualObject,
+                            );
                         }
-                        // nested virtual — deferred (v1 emits no nested graphs)
-                        return Self::eliminated_object(
-                            new_id,
-                            info,
-                            EliminationCause::NestedVirtualObject,
-                        );
+                        field_values.push(nested);
+                        continue;
                     }
                     let fv = self.frame_value_for(vnode);
                     // `MaterializationRequired` joins the refusal set: a field
@@ -7026,6 +7061,7 @@ fn reloc_emit_enabled() -> bool {
             );
         }
         FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: info.array_element_type,
             id: new_id as usize,
             class_id: info.class_id,
             num_fields: info.num_fields,
@@ -12332,7 +12368,7 @@ mod tests {
         let mut objects = HashMap::new();
         objects.insert(
             newo,
-            VirtualObjectInfo {
+            VirtualObjectInfo { array_element_type: None,
                 class_id: 7,
                 num_fields: 1,
                 field_values: vec![Some(v7)],
@@ -12476,14 +12512,19 @@ mod tests {
         assert_eq!(crate::deopt::count_materialization_required(fs), 1);
     }
 
-    /// Every remaining bail in `frame_value_for_object` — not just the
-    /// dominance one — must name the elimination rather than spell it
-    /// `Undefined`. The nested-virtual bail additionally carries its own cause,
-    /// so a compiler report can distinguish "escape analysis left me nothing to
-    /// rebuild from" (fix the dominance gate) from "the recipe exists but v1
-    /// emits no nested graphs" (implement nested virtual objects).
+    /// A field whose value is itself a scalar-replaced allocation is emitted as
+    /// a NESTED `FrameValue::VirtualObject`, not bailed.
+    ///
+    /// This used to answer `MaterializationRequired(NestedVirtualObject)` -- "the
+    /// recipe exists but v1 emits no nested graphs" -- and that restriction is
+    /// what stopped a wrapper object and its storage array from both being
+    /// deleted: the wrapper's recipe names the array, so the moment the array
+    /// became replaceable the wrapper's own recipe was refused and the wrapper
+    /// had to stay on the heap. The materializer has always walked nested field
+    /// graphs (`collect_virtual_objects` recurses, `field_value_to_value`
+    /// resolves a nested state to its shell); only the producer refused.
     #[test]
-    fn scalar_deopt_nested_virtual_field_bails_with_its_own_cause() {
+    fn scalar_deopt_emits_a_nested_virtual_object_for_a_virtual_field() {
         let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
         // Make field 0's value itself a scalar-replaced object: add a second
         // dead `Op::New` and register it in the map, then point the first
@@ -12492,10 +12533,68 @@ mod tests {
         sr_map.objects.insert(
             inner,
             VirtualObjectInfo {
+                array_element_type: None,
                 class_id: 9,
                 num_fields: 0,
                 field_values: vec![],
                 new_ctrl: 1, // Proj(0) — the entry control, dominates everything
+                store_ctrls: vec![],
+            },
+        );
+        sr_map
+            .objects
+            .get_mut(&newo)
+            .expect("outer object")
+            .field_values = vec![Some(inner)];
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        let outer = &deopt_locals_at(&cm, 10)[1];
+        let FrameValue::VirtualObject(state) = outer else {
+            panic!("the outer object must still be a VirtualObject, got {outer:?}");
+        };
+        assert_eq!(state.field_values.len(), 1);
+        assert!(
+            matches!(
+                &state.field_values[0],
+                FrameValue::VirtualObject(inner_state)
+                    if inner_state.class_id == 9 && inner_state.num_fields == 0
+            ),
+            "field 0 must be the nested object's own recipe, got {:?}",
+            state.field_values[0]
+        );
+        let fs = &cm
+            ._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == 10)
+            .expect("deopt box at bci 10")
+            .frame_state;
+        assert!(
+            crate::deopt::frame_state_is_resumable(fs),
+            "a nested graph is rebuildable, so the frame must stay resumable"
+        );
+    }
+
+    /// ...and a nested object that cannot be described refuses the ENCLOSING
+    /// one, with the nested cause. Fail-closed one level at a time: the
+    /// recursion re-runs every gate on the inner object, so an inner allocation
+    /// whose control does not strictly dominate the deopt block takes the outer
+    /// object down with it rather than being silently replaced by a null.
+    #[test]
+    fn scalar_deopt_an_undescribable_nested_field_bails_the_enclosing_object() {
+        let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
+        let inner = g.add(Op::Dead, IrType::Ref, vec![], None);
+        sr_map.objects.insert(
+            inner,
+            VirtualObjectInfo {
+                array_element_type: None,
+                class_id: 9,
+                num_fields: 0,
+                field_values: vec![],
+                // NO_NODE control: unresolvable, so the inner object's own
+                // dominance gate refuses it.
+                new_ctrl: NO_NODE,
                 store_ctrls: vec![],
             },
         );
@@ -12515,8 +12614,8 @@ mod tests {
                 7,
                 EliminationCause::NestedVirtualObject,
             )),
-            "a nested virtual field must bail with NestedVirtualObject, not \
-             ScalarReplacedObject and not Undefined"
+            "an undescribable nested field must bail the enclosing object with \
+             NestedVirtualObject, not ScalarReplacedObject and not Undefined"
         );
     }
 
@@ -12640,7 +12739,7 @@ mod tests {
             frame_state: FrameState {
                 method_key: String::new(),
                 bci: 1,
-                locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                locals: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                     id: 12,
                     class_id: 3,
                     num_fields: 1,
