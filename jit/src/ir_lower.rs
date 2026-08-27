@@ -9892,7 +9892,24 @@ pub(crate) fn lower_inner_with_scopes(
     // `ir_lower_refuses_more_incoming_slots_than_abi_registers` pins the pair
     // together so the two cannot drift apart again.
     if num_params + usize::from(lowerer.needs_context) > incoming_abi_reg_capacity() {
-        return None;
+        // Named, where it used to be a bare `None`. This is the commonest
+        // whole-method refusal an ordinary accessor hits and it said nothing at
+        // all: `VolumeShort2.getIndex(III)I` is `this` + three ints = four
+        // incoming slots, and touching one field turns `needs_context` on, which
+        // is the fifth. Two separate investigations reached this line by
+        // bisecting the lowerer rather than by reading a log.
+        return refuse(Bailout::with_context(
+            BailoutReason::UnsupportedShape("incoming arg slots exceed the entry ABI registers"),
+            format!(
+                "{num_params} param slot(s){} > {} entry register(s)",
+                if lowerer.needs_context {
+                    " + the VM context"
+                } else {
+                    ""
+                },
+                incoming_abi_reg_capacity(),
+            ),
+        ));
     }
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any

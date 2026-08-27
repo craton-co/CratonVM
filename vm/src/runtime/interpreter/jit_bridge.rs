@@ -5020,6 +5020,17 @@ pub(super) fn try_jit_upgrade_with_gate(
                 |cid: u32, cp_class: &str, name: &str, desc: &str| {
                     resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
                 };
+            // The optimizing tier's own inline resolver for this callee compile.
+            let c_ir_inline_resolver =
+                |callee_class: &str, callee_method: &str, callee_desc: &str| {
+                    resolve_ir_inline_site(
+                        shared,
+                        callee_cid,
+                        callee_class,
+                        callee_method,
+                        callee_desc,
+                    )
+                };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -5198,6 +5209,12 @@ pub(super) fn try_jit_upgrade_with_gate(
                 } else {
                     None
                 },
+                // IR-tier inlining. Behind its own gate; `None` splices nothing.
+                if cratonvm_jit::ir_inline_enabled() {
+                    Some(&c_ir_inline_resolver)
+                } else {
+                    None
+                },
                     // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
                     // latch the JIT read for itself, so a `Compatible` VM sharing a
                     // process with a `JdkOnly` one lost the thin direct-call helpers.
@@ -5307,6 +5324,21 @@ pub(super) fn try_jit_upgrade_with_gate(
             Some(&callee_compiler),
         )
     };
+
+    // The optimizing tier's own inline resolver — see `resolve_ir_inline_site`
+    // for how its admission set differs in both directions.
+    let ir_inline_resolver = |callee_class: &str,
+                              callee_method: &str,
+                              callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_ir_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
+    };
     // Main-path small-method inlining is GATED default-OFF behind
     // `CRATONVM_JIT_MAIN_INLINE=1`. Enabling it inlines tiny arith/getter/field
     // leaves correctly (verified: `static int add(int,int){return a+b;}` emits no
@@ -5390,6 +5422,12 @@ pub(super) fn try_jit_upgrade_with_gate(
         },
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&receiver_inline_resolver)
+        } else {
+            None
+        },
+        // IR-tier inlining. Behind its own gate; `None` splices nothing.
+        if cratonvm_jit::ir_inline_enabled() {
+            Some(&ir_inline_resolver)
         } else {
             None
         },
@@ -6776,6 +6814,24 @@ pub(super) fn try_jit_compile_callee_slow(
         )
     };
 
+    // The optimizing tier's own inline resolver. Same three-name question, a
+    // different admission set — see `resolve_ir_inline_site`. No direct-bind
+    // resolver: a spliced body's remaining calls go through the dispatch helper
+    // on this path, and `IrBuilder` has no direct-call lowering inside a
+    // relocated body to bake an entry into.
+    let ir_inline_resolver = |callee_class: &str,
+                              callee_method: &str,
+                              callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_ir_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
+    };
+
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -6828,6 +6884,12 @@ pub(super) fn try_jit_compile_callee_slow(
         },
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&receiver_inline_resolver)
+        } else {
+            None
+        },
+        // IR-tier inlining. Behind its own gate; `None` splices nothing.
+        if cratonvm_jit::ir_inline_enabled() {
+            Some(&ir_inline_resolver)
         } else {
             None
         },
@@ -7480,6 +7542,54 @@ pub(super) fn resolve_inline_site(
         callee_desc,
         0,
         direct_bind,
+        false,
+    )
+}
+
+/// Resolve a body for the **optimizing (IR) tier** to splice — a different
+/// admission set from the single-pass one [`resolve_inline_site`] serves, in
+/// both directions.
+///
+/// WIDER, because the refusals the single-pass path carries are its EMITTER's
+/// limits, not resolution's: `x64::try_emit_inline_body` has no arm for `new`,
+/// for an array load or store, or for `arraylength`, so the resolver refuses
+/// those shapes to keep planning and emission consistent. `IrBuilder` lowers
+/// all of them natively, and `new` is the entire point — an accessor that
+/// allocates is exactly the body escape analysis has to see inside its caller.
+///
+/// NARROWER, because the IR splice re-executes the whole `invoke` on a deopt
+/// (see `ir::IrInlineSite`) and because `IrBuilder` walks a relocated body with
+/// no merge bookkeeping of its own. So v1 additionally refuses:
+///
+///  * any branch — a relocated body's merges and loop headers are computed
+///    over the CALLER's code alone, and there is no second walker;
+///  * `idiv`/`irem`/`ldiv`/`lrem` — the one guard `IrBuilder` emits is the
+///    div-zero guard, and a guard inside a spliced region would deopt to a
+///    re-execution point rather than to itself;
+///  * `ldc`/`ldc2_w` — `InlineSite` records a raw `i64` where the builder needs
+///    the value plus its float/double discriminator, and inventing that bit is
+///    how a `long` constant becomes a `double`;
+///  * more than one return, or a return that is not the last instruction;
+///  * any target that is not provably monomorphic (see the `ir_mode` check on
+///    the selected method) — the IR tier has no class-id guard node, so a
+///    speculative splice has nothing to fall back to.
+pub(super) fn resolve_ir_inline_site(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        None,
+        callee_class,
+        callee_method,
+        callee_desc,
+        0,
+        None,
+        true,
     )
 }
 
@@ -7526,6 +7636,7 @@ pub(super) fn resolve_receiver_inline_site(
         callee_desc,
         0,
         direct_bind,
+        false,
     )
 }
 
@@ -7550,6 +7661,11 @@ fn resolve_inline_site_from(
     callee_desc: &str,
     nest_depth: usize,
     direct_bind: Option<InlineDirectBind<'_>>,
+    // Resolve for the optimizing (IR) tier rather than the single-pass emitter.
+    // See [`resolve_ir_inline_site`] for what the two admission sets differ on
+    // and why. Threaded into the nested resolution below so a nested body is
+    // held to the same contract as the one enclosing it.
+    ir_mode: bool,
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
@@ -7680,6 +7796,33 @@ fn resolve_inline_site_from(
     let Some(declaring_class_name) = store.get(declaring_id).map(|c| &*c.name) else {
         no!("declaring-class-not-in-store");
     };
+    // IR-tier splices are UNGUARDED: `IrBuilder` has no class-id compare and no
+    // miss edge to send a wrong receiver down, so the target must be the only
+    // body a call at this site can ever reach. `invokespecial`/`invokestatic`
+    // are that by definition; a virtual site qualifies only when the language
+    // has already ruled out an override.
+    //
+    // Deliberately NOT a CHA-style "no loaded subclass overrides it" answer:
+    // that is true until the next class loads, so it needs an invalidation
+    // dependency the IR path does not record. `final` is monotone.
+    if ir_mode {
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        let monomorphic = method.is_static()
+            || callee_method == "<init>"
+            || method
+                .access_flags
+                .intersects(MethodAccessFlags::PRIVATE | MethodAccessFlags::FINAL)
+            || store
+                .get(declaring_id)
+                .map(|c| {
+                    c.access_flags
+                        .contains(cratonvm_reader::class_access_flags::ClassAccessFlags::FINAL)
+                })
+                .unwrap_or(false);
+        if !monomorphic {
+            no!("ir-splice-target-not-provably-monomorphic");
+        }
+    }
     if shared
         .natives
         .native_methods
@@ -7783,13 +7926,64 @@ fn resolve_inline_site_from(
     // a site cannot be admitted under one answer and emitted under another.
     let inline_calls_allowed = crate::runtime::env_cache::jit_inline_calls();
     let mut invoke_sites: Vec<(usize, u16, u8)> = Vec::new();
+    // IR-tier only: `new` sites in the body, `(callee_pc, cp_idx)`, resolved to
+    // `(class_id, num_fields)` below once the callee's constant pool is in hand.
+    // This is the row whose absence bailed `VolumeShort2.loadFromArray` out of
+    // the IR tier altogether, and with it out of escape analysis.
+    let mut ir_new_sites: Vec<(usize, u16)> = Vec::new();
+    // IR-tier only: pcs of the body's return opcodes. A relocated body is walked
+    // straight through with no merge bookkeeping, so exactly one return, at the
+    // end, is the shape the splice can honour.
+    let mut ir_return_pcs: Vec<usize> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => no!("tableswitch/lookupswitch"),
+            // `new` — refused for the single-pass emitter, which has no arm for
+            // it; admitted (and resolved) for the IR builder, which lowers it
+            // to `Op::New` for escape analysis to delete.
+            0xbb if ir_mode => {
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                ir_new_sites.push((scan_pc, cp_idx));
+                scan_pc += 3;
+                continue;
+            }
             0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
             0xbf => no!("athrow"),
             0xc0 | 0xc1 => no!("checkcast/instanceof"),
             0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
+            // A relocated body's control flow would need the merge/loop-header
+            // bookkeeping `IrBuilder` computes over the CALLER's code alone.
+            // Straight-line only, v1.
+            0x99..=0xa9 | 0xc6 | 0xc7 | 0xc8 | 0xc9 if ir_mode => no!("ir-splice-branch"),
+            // The only guard `IrBuilder` emits is div-zero, and a guard inside a
+            // spliced region deopts to "re-execute the invoke" rather than to
+            // itself. Keeping division out means a spliced region carries no
+            // guard of its own at all.
+            0x6c | 0x6d | 0x70 | 0x71 if ir_mode => no!("ir-splice-division"),
+            // `InlineSite` records a raw `i64` for these; the builder needs the
+            // value AND whether it is a float/double. See `resolve_ir_inline_site`.
+            0x12 | 0x13 | 0x14 if ir_mode => no!("ir-splice-ldc"),
+            0xac..=0xb1 if ir_mode => {
+                ir_return_pcs.push(scan_pc);
+                scan_pc += 1;
+                continue;
+            }
+            // Array element access and `arraylength` are refused below because
+            // `try_emit_inline_body` bails on them. `IrBuilder` lowers all three
+            // with their own bounds checks, and `Short2` keeps its two shorts in
+            // a `short[2]`, so a splice that could not read one would stop at
+            // the accessor it exists to delete.
+            0x2e..=0x35 | 0x4f..=0x56 | 0xbe if ir_mode => {
+                scan_pc += 1;
+                continue;
+            }
+            // No `static_field_info` is rebased into the builder's tables, so a
+            // spliced `getstatic` would find no row and bail the whole method
+            // AFTER the walk had committed to the body.
+            0xb2 | 0xb3 if ir_mode => no!("ir-splice-static-field"),
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -7873,6 +8067,33 @@ fn resolve_inline_site_from(
         // 4 bytes, which would desync the scan and mis-read the widened
         // operands as opcodes (finding 5).
         scan_pc += inline_instr_length(code, scan_pc);
+    }
+
+    // The relocated body is walked straight through from its first byte to its
+    // return, with the caller's frame parked in `SpliceFrame`. More than one
+    // return means an early exit the walk would never reach the second half of;
+    // a return that is not last means live code after it.
+    if ir_mode && (ir_return_pcs.len() != 1 || ir_return_pcs[0] + 1 != code_len) {
+        no!("ir-splice-not-single-trailing-return");
+    }
+
+    // Resolve the body's `new` sites against the CALLEE's constant pool. A
+    // `Deferred` site — the target class not loaded from this holder's loader
+    // yet — refuses the whole splice rather than being dropped: the builder's
+    // `0xbb` arm bails the METHOD on a missing row, so admitting the body
+    // without the row would cost the caller its IR compile entirely.
+    let mut ir_new_info: Vec<(usize, u32, usize)> = Vec::new();
+    if ir_mode && !ir_new_sites.is_empty() {
+        for &(npc, cp_idx) in &ir_new_sites {
+            match resolve_jit_new_site(&cm, declaring_id, cp_idx) {
+                Some(cratonvm_jit::JitNewSite::Resolved {
+                    class_id,
+                    num_fields,
+                    ..
+                }) => ir_new_info.push((npc, class_id, num_fields)),
+                _ => no!("ir-splice-new-site-unresolved"),
+            }
+        }
     }
 
     let Some(callee_class_info) = cm.get_class(declaring_id) else {
@@ -8218,10 +8439,20 @@ fn resolve_inline_site_from(
     // A nested site is ADDITIVE: the pc keeps its `invoke_targets` entry too,
     // so a nested splice that bails mid-body inside the emitter falls back to
     // the ordinary call rather than failing the outer splice.
+    // IR-tier nesting is deeper and is gated on nothing but `ir_mode`. Deeper
+    // because the accessor chains it exists for are four levels on their own
+    // (`get` → `loadFromArray` → `Short2.<init>()V` → `Short2.<init>([S)V`),
+    // and stopping one short leaves the allocation being passed to an opaque
+    // call — which is an escape, so the whole splice buys nothing. Ungated
+    // because `CRATONVM_JIT_INLINE_NEST` is the single-pass emitter's switch and
+    // the IR path is already behind its own.
+    let nest_budget = if ir_mode {
+        cratonvm_jit::MAX_IR_INLINE_NEST_DEPTH
+    } else {
+        cratonvm_jit::MAX_INLINE_NEST_DEPTH
+    };
     let mut nested_sites: Vec<cratonvm_jit::NestedInlineSite> = Vec::new();
-    if nest_depth + 1 < cratonvm_jit::MAX_INLINE_NEST_DEPTH
-        && crate::runtime::env_cache::jit_inline_nest()
-    {
+    if nest_depth + 1 < nest_budget && (ir_mode || crate::runtime::env_cache::jit_inline_nest()) {
         // The CALLEE's own receiver profile, fetched once for the whole body.
         //
         // This is the piece that makes devirtualising inside a splice possible
@@ -8245,7 +8476,14 @@ fn resolve_inline_site_from(
             None
         };
         for (ipc, target) in &invoke_targets {
-            match target.invoke_kind {
+            // In IR mode every kind takes the statically-bound path: the
+            // monomorphism gate on the selected method is what decides whether
+            // a virtual target is spliceable, and it refuses the ones a guard
+            // would otherwise have to cover. There is no guarded arm to fall
+            // into, so routing `0`/`2` to the profile-driven branch below would
+            // only produce sites the IR consumer must throw away.
+            let kind = if ir_mode { 3 } else { target.invoke_kind };
+            match kind {
                 // Statically bound: one body, no guard.
                 1 | 3 => {
                     let nested = resolve_inline_site_from(
@@ -8257,6 +8495,7 @@ fn resolve_inline_site_from(
                         &target.descriptor,
                         nest_depth + 1,
                         direct_bind,
+                        ir_mode,
                     );
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
@@ -8389,6 +8628,11 @@ fn resolve_inline_site_from(
                         &target.descriptor,
                         nest_depth + 1,
                         direct_bind,
+                        // Unreachable in IR mode (every kind is routed to the
+                        // statically-bound arm above), and a guarded splice is
+                        // not something the IR consumer can emit — so `false`
+                        // here is a statement, not a default.
+                        false,
                     ) {
                         nested_sites.push(cratonvm_jit::NestedInlineSite {
                             callee_pc: *ipc,
@@ -8458,7 +8702,23 @@ fn resolve_inline_site_from(
     // must be either SPLICED IN TURN or DIRECT-BOUND; a site with one that is
     // neither is refused whole. Refusing costs the site its inline; admitting
     // it costs 3.5x.
-    if !crate::runtime::env_cache::jit_inline_call_dispatch() {
+    //
+    // NOT applied in IR mode, and the difference is in the emitter, not the
+    // policy. That measurement is of `try_emit_inline_body`'s invoke arm, which
+    // lowers a spliced call to the BLIND dispatch helper — no MIC, no PIC, a
+    // name resolution per call. `IrBuilder` lowers a spliced call to the same
+    // `Op::Call` it lowers every other invoke to, and `ir_lower` gives it the
+    // ordinary dispatch. That is still one inline cache short of what the
+    // caller's own sites get (the cache is keyed by bytecode pc, and every node
+    // in a spliced region carries the CALLER's `invoke` pc — see
+    // `ir::IrInlineSite`), so it is not free; it is a call, not a resolution.
+    //
+    // Keeping the rule here would refuse exactly the bodies this lane exists
+    // for: `VolumeShort2.loadFromArray` calls `ShortArray.get`, which is an FFM
+    // accessor the nested resolver deliberately refuses to splice (it keeps its
+    // own fast path), and no direct bind is offered for a virtual kind. One
+    // un-spliceable call would cost the site its allocation.
+    if !ir_mode && !crate::runtime::env_cache::jit_inline_call_dispatch() {
         let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
         if let Some((pc, t)) = invoke_targets
             .iter()
@@ -8511,6 +8771,7 @@ fn resolve_inline_site_from(
         // compile keeps it empty, which makes the emitter's invoke arm bail.
         resolved_invoke_infos: Vec::new(),
         nested_sites,
+        ir_new_info,
     })
 }
 

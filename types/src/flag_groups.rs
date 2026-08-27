@@ -1187,6 +1187,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "c2-alloc-upgrade", on_key: Some("CRATONVM_JIT_C2_ALLOC_UPGRADE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "ir-inline", on_key: Some("CRATONVM_JIT_IR_INLINE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
     // Default-ON kill switch, hence `off_key` only:

@@ -1108,6 +1108,144 @@ impl SafepointSnapshot {
 // inline (the single-pass backend does, via `lib.rs`'s `inline_sites`), so
 // nothing registers a scope and `ir_lower` produces exactly the flat, caller-
 // less frame states it always did.
+//
+// STILL empty after `IrBuilder` learned to splice ([`IrInlineSite`]) — and
+// deliberately so, not by omission. A spliced region carries the CALLER's
+// `invoke` bci with re-execute semantics rather than a scope chain, because
+// re-execution needs no frame identity while a chain needs the innermost
+// frame's, which `ir_lower::resolve_frame_state` leaves for the VM to fill from
+// the running `CompiledMethod` (i.e. it would name the caller). The reasoning
+// is written out at [`IrInlineSite`]; this is the note for a reader who arrives
+// here first.
+
+// ── IR-tier inlining (bytecode splicing) ─────────────────────────────
+//
+// `IrBuilder::build` walks ONE method's bytecode. An accessor that returns a
+// freshly-allocated wrapper therefore always shows escape analysis an object
+// that leaves through `areturn`, and `scalar-replaced 0/N` is the only answer
+// per-method EA can give however good the tier is. HotSpot deletes the same
+// object by inlining the accessor into its consuming loop first and running EA
+// on the merged graph; this is that missing first half.
+//
+// The splice is done in the BYTECODE domain, not by re-entering the builder:
+// `lib.rs` hands `build` a combined buffer — the caller's code, then each
+// admitted callee's body appended after it — plus, for every callee pc, the
+// same pc-keyed side-table rows (`field_info`, `invoke_info`, `new_info`, …)
+// the builder already consumes. `build` walks the caller as before and, at an
+// admitted `invoke`, jumps `pc` into the callee's region with the callee's
+// locals installed, returning to `pc + instr_len` at the callee's return. The
+// giant opcode `match` is reused verbatim, which is the point: a second walker
+// would be a second model of every opcode, and a duplicated model is what this
+// tree keeps paying for elsewhere.
+//
+// Relocation is free because JVM branch offsets are relative to the branching
+// instruction — a whole body moves without rewriting. `tableswitch` /
+// `lookupswitch` are the exception (their padding is measured from method
+// start), and the resolver refuses them.
+//
+// ## Why no `InlineScopeTable` entry, and why that is the SAFE choice
+//
+// Every node built inside a splice is re-stamped with the CALLER's `invoke`
+// bci when the outermost splice closes ([`IrBuilder::end_splice`]), and no
+// safepoint snapshot is pushed while inside one. So the deopt metadata says
+// exactly one thing about the whole spliced region: "the `invoke` at this bci
+// has not taken effect; re-execute it". That is true, and it is cheap to keep
+// true — `ir_lower`'s `bci_native` records the EARLIEST native offset for a
+// bci, so the point anchors before the spliced body runs.
+//
+// Re-execution needs no frame identity, which is what makes it the v1 answer.
+// The cost is precision, not correctness: a trap inside a spliced accessor
+// re-runs the accessor rather than resuming inside it.
+//
+// The one thing re-execution cannot survive is a side effect the spliced body
+// has ALREADY committed, so the resolver admits only bodies that cannot commit
+// one before a trap — no `athrow`, no `monitorenter`, no `putstatic`, and no
+// division (`Op::Guard` is emitted for div-zero and nothing else, so with
+// division refused a spliced region carries no guard of its own at all).
+
+/// Hard cap on how many splices may enclose one another.
+///
+/// The accessor chains this exists for are 3-4 deep (`get` → `loadFromArray` →
+/// `<init>()` → `<init>([S)`). Eight leaves room for one deeper shape without
+/// letting a resolver defect turn into an unbounded bytecode expansion — the
+/// combined buffer `lib.rs` builds grows by the callee's whole body per level.
+pub const MAX_IR_SPLICE_DEPTH: usize = 8;
+
+/// One callee body relocated into the combined bytecode buffer `build` walks.
+///
+/// Keyed by the CALLER pc of the `invoke` it replaces. Everything here is
+/// resolved by `lib.rs` before the build starts; the builder does no descriptor
+/// parsing and no class lookup of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrInlineSite {
+    /// Offset of the callee's first bytecode in the combined buffer.
+    pub base: usize,
+    /// Length of the callee's bytecode. `base + code_len` is one past its last
+    /// instruction, and the walk bails if it ever reaches there without having
+    /// seen a return.
+    pub code_len: usize,
+    /// Values the call consumes from the caller's operand stack, receiver
+    /// included. Counted the way this builder counts them — one slot per value,
+    /// a `long`/`double` included (see `crate::static_call_shape`).
+    pub num_args: usize,
+    /// The callee's `max_locals`, i.e. how many local slots to install.
+    pub max_locals: usize,
+    /// JVM local index each argument lands in, in source order. A `long` or
+    /// `double` argument advances the next index by two even though it occupies
+    /// one `NodeId` slot here, so this cannot be derived from `num_args`.
+    pub arg_local_slots: Vec<u32>,
+    /// Whether the callee returns a value to push on the caller's stack.
+    pub returns_value: bool,
+}
+
+/// The pc-keyed rows a set of [`IrInlineSite`]s adds to the builder's existing
+/// side tables, in COMBINED-buffer coordinates.
+///
+/// Splicing a body means the builder meets that body's `getfield`s, `invoke`s
+/// and `new`s at pcs the caller's own resolution never visited, so every table
+/// those arms consult needs the callee's rows too. They arrive as one bundle
+/// rather than eight more setters because they are produced together, from one
+/// resolution pass, and applying half of them would leave the walk bailing in
+/// the middle of a body it had already committed to.
+///
+/// What is NOT here is what v1 refuses in a spliced body: `ldc` / `ldc2_w`
+/// (the resolver records a raw `i64` where the builder wants the value plus its
+/// float/double discriminator, and inventing that bit is how a `long` constant
+/// becomes a `double`), `getstatic` / `putstatic`, `anewarray`, `checkcast` and
+/// `instanceof`. A callee using any of them is refused whole at resolution.
+#[derive(Clone, Debug, Default)]
+pub struct IrInlineTables {
+    /// The bodies themselves, keyed by CALLER pc.
+    pub sites: HashMap<usize, IrInlineSite>,
+    /// `pc → (field_index, type_tag)`, merged into the builder's `field_info`.
+    pub field_info: HashMap<usize, (usize, u8)>,
+    /// `pc → (info_ptr, num_args, ret_type)` for the calls a spliced body makes
+    /// that are NOT themselves spliced.
+    pub invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// `pc → (class_id, num_fields)` for the allocations a spliced body makes.
+    /// This is the row whose absence made `loadFromArray` bail the whole IR
+    /// tier — see `docs/known-issues/jit/per-voxel-allocation-*`.
+    pub new_info: HashMap<usize, (u32, usize)>,
+    /// `invokespecial` pcs the resolver PROVED are no-ops (`Object.<init>()V`,
+    /// or a super constructor whose body is exactly one). Merged into
+    /// `object_init_pcs` — the set that elides on any receiver — because that
+    /// is what "proven no-op body" means, receiver notwithstanding.
+    pub object_init_pcs: HashSet<usize>,
+}
+
+/// The builder's state for one splice in progress.
+struct SpliceFrame {
+    /// Caller pc to resume at — the instruction after the spliced `invoke`.
+    return_pc: usize,
+    /// One past the callee's last bytecode, in combined-buffer coordinates.
+    end: usize,
+    /// Caller pc of the `invoke`. The outermost frame's is what every node
+    /// built inside the splice is re-stamped with.
+    invoke_bci: usize,
+    saved_locals: Vec<NodeId>,
+    saved_stack: Vec<NodeId>,
+    returns_value: bool,
+}
 
 /// Hard cap on inline-scope chain length.
 ///
@@ -3719,6 +3857,44 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// IR-tier inlining: callee bodies to splice, keyed by the CALLER pc of the
+    /// `invoke` each replaces. Empty on every compile that inlines nothing,
+    /// which is every compile with the gate off. See [`IrInlineSite`].
+    inline_sites: HashMap<usize, IrInlineSite>,
+    /// The splices currently open, innermost last. Non-empty exactly while the
+    /// walk is inside a relocated callee body, which is what suppresses merge
+    /// activation, the reachability skip and safepoint recording.
+    splice: Vec<SpliceFrame>,
+    /// First graph node id created inside the OUTERMOST open splice. Every node
+    /// from here on is re-stamped with that splice's `invoke_bci` when it
+    /// closes — see the bci discussion at [`IrInlineSite`].
+    splice_node_floor: usize,
+    /// Diagnostic-only: how many splices this build performed, for the
+    /// `[ir] spliced` line. Never read by lowering.
+    splices_done: usize,
+    /// References the OUTERMOST open splice allocated itself, plus everything
+    /// reachable from one by a field or element read.
+    ///
+    /// A store inside a spliced body has to target one of these — see
+    /// [`Self::splice_store_is_local`] for why, and for why a `Load` from a
+    /// local base is itself local.
+    splice_local: HashSet<NodeId>,
+    /// Splice-local objects that have had a NON-local reference stored into
+    /// them. Reading a field of one gives back something the caller can still
+    /// see, so locality must not propagate through it — see
+    /// [`Self::splice_store_is_local`].
+    splice_tainted: HashSet<NodeId>,
+    /// Set if an `Op::Guard` was ever built inside a splice. Checked at the end
+    /// of [`Self::build`], which refuses the graph.
+    ///
+    /// Belt and braces over the resolver's `ir-splice-division` refusal: the
+    /// div-zero guard is the ONLY guard this builder emits, and a guard inside a
+    /// spliced region would resolve its frame state from the caller's snapshot
+    /// at the `invoke` — a correct re-execution point today, but one that stops
+    /// being correct the moment a spliced body is admitted that can commit a
+    /// side effect first. A structural check here cannot drift from the
+    /// resolver's opcode list the way a comment can.
+    splice_guard_seen: bool,
     /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
     /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
     /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
@@ -3846,6 +4022,13 @@ impl IrBuilder {
             trivial_init_pcs: HashSet::new(),
             object_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            inline_sites: HashMap::new(),
+            splice: Vec::new(),
+            splice_node_floor: 0,
+            splices_done: 0,
+            splice_local: HashSet::new(),
+            splice_tainted: HashSet::new(),
+            splice_guard_seen: false,
             invoke_labels: HashMap::new(),
             method_label: None,
             tdigest_scalar_kernel: false,
@@ -4095,6 +4278,195 @@ impl IrBuilder {
         self.invoke_info = info;
     }
 
+    /// Supply the callee bodies to splice, keyed by the CALLER pc of the
+    /// `invoke` each replaces. Must be called before [`Self::build`], and the
+    /// `code` handed to `build` must be the COMBINED buffer these sites' `base`
+    /// offsets index — a site whose region is not there walks into whatever
+    /// follows and bails on the bounds check in the loop.
+    ///
+    /// A pc present here takes the splice; a pc absent takes whatever lowering
+    /// it took before, so an empty map is byte-identical to no inlining.
+    pub fn set_inline_sites(&mut self, sites: HashMap<usize, IrInlineSite>) {
+        self.inline_sites = sites;
+    }
+
+    /// Install a whole inline plan: the callee bodies plus every side-table row
+    /// they add. Must be called AFTER the per-table `set_*` setters (which
+    /// replace wholesale) and before [`Self::build`].
+    ///
+    /// Rows are merged, not replaced, and a caller pc can never collide with a
+    /// callee pc: callee regions live past the caller's `code_len` by
+    /// construction.
+    pub fn apply_inline_tables(&mut self, tables: IrInlineTables) {
+        let IrInlineTables {
+            sites,
+            field_info,
+            invoke_info,
+            new_info,
+            object_init_pcs,
+        } = tables;
+        self.inline_sites.extend(sites);
+        self.field_info.extend(field_info);
+        self.invoke_info.extend(invoke_info);
+        self.new_info.extend(new_info);
+        self.object_init_pcs.extend(object_init_pcs);
+    }
+
+    /// How many splices [`Self::build`] performed. Diagnostic only.
+    pub fn splices_done(&self) -> usize {
+        self.splices_done
+    }
+
+    /// Enter the callee spliced at caller pc `pc`, returning the combined-buffer
+    /// pc to continue the walk at.
+    ///
+    /// `instr_len` is the length of the `invoke` being replaced (3, or 5 for
+    /// `invokeinterface`) — the caller resumes at `pc + instr_len`.
+    ///
+    /// `None` means "refuse this compile". Every refusal here is a disagreement
+    /// between the resolved site and the state the walk actually reached (too
+    /// deep, not enough operands, an argument slot past the callee's frame), so
+    /// there is nothing to fall back to at this point: the operands have been
+    /// counted against a body that does not match them.
+    fn begin_splice(&mut self, pc: usize, instr_len: usize) -> Option<usize> {
+        let site = self.inline_sites.get(&pc)?;
+        let base = site.base;
+        let end = base.checked_add(site.code_len)?;
+        let num_args = site.num_args;
+        let max_locals = site.max_locals;
+        let returns_value = site.returns_value;
+        let arg_local_slots = site.arg_local_slots.clone();
+
+        if self.splice.len() >= MAX_IR_SPLICE_DEPTH {
+            return None;
+        }
+        if arg_local_slots.len() != num_args || self.stack.len() < num_args {
+            return None;
+        }
+
+        // Deepest-first on the abstract stack, so `split_off` already leaves
+        // them in source order — argument 0 (the receiver, for an instance
+        // callee) first.
+        let args = self.stack.split_off(self.stack.len() - num_args);
+        let mut callee_locals = vec![NO_NODE; max_locals];
+        for (arg, &slot) in args.iter().zip(arg_local_slots.iter()) {
+            let slot = slot as usize;
+            if slot >= callee_locals.len() {
+                return None;
+            }
+            callee_locals[slot] = *arg;
+        }
+
+        let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
+        let saved_stack = std::mem::take(&mut self.stack);
+        if self.splice.is_empty() {
+            self.splice_node_floor = self.graph.nodes.len();
+        }
+        self.splice.push(SpliceFrame {
+            return_pc: pc + instr_len,
+            end,
+            invoke_bci: pc,
+            saved_locals,
+            saved_stack,
+            returns_value,
+        });
+        self.splices_done += 1;
+        Some(base)
+    }
+
+    /// May a store inside the currently open splice write to `base`?
+    ///
+    /// A guard failure inside compiled code returns the `i64::MIN` sentinel and
+    /// the method is re-run in the interpreter — and on the OSR-exit path it is
+    /// resumed precisely, at the bci every node in a spliced region carries: the
+    /// CALLER's `invoke`. Resuming there re-executes the whole call, so any
+    /// write the spliced prefix already committed is committed a second time.
+    ///
+    /// The write is harmless when its target is an object the splice itself
+    /// allocated: re-execution allocates a fresh one and writes that instead,
+    /// and the first is unreachable garbage. So the rule is "stores only to
+    /// objects this splice made", and the proof is a reachability set rather
+    /// than an alias analysis:
+    ///
+    ///  * an `Op::New` / `Op::NewArray` built inside the splice is local;
+    ///  * a `Load` whose BASE is local is local — a field of an object this
+    ///    splice allocated holds either `null` or something this splice stored
+    ///    there — UNLESS what the splice stored there was itself non-local, in
+    ///    which case the base is TAINTED and locality stops at it. Without that
+    ///    second half the rule is wrong in an obvious way: `new W(); w.f =
+    ///    callerObject; w.f.x = 1` would read `w.f` back as "local" and admit a
+    ///    write straight into the caller's object.
+    ///
+    /// That second clause is what admits `Short2.setX` → `Short2.set` →
+    /// `storage[0] = v`: `storage` is read from a `Short2` the splice allocated
+    /// three levels up. It also correctly REFUSES `VolumeShort2.set`, whose
+    /// `storage` is read from the receiver the caller passed in.
+    ///
+    /// `Op::Phi` is not a case here: the resolver admits branch-free bodies
+    /// only, so a spliced region contains no φ.
+    ///
+    /// What this does NOT cover is a CALL the spliced body makes: re-executing
+    /// the `invoke` re-runs it, and the builder cannot see whether it writes.
+    /// See `ir::IrInlineSite`.
+    fn splice_store_is_local(&self, base: NodeId) -> bool {
+        self.splice_local.contains(&base) && !self.splice_tainted.contains(&base)
+    }
+
+    /// Record `id` as splice-local when it is one: called on every allocation
+    /// and every field/element read the walk builds, and a no-op outside a
+    /// splice.
+    fn note_splice_local_alloc(&mut self, id: NodeId) {
+        if !self.splice.is_empty() {
+            self.splice_local.insert(id);
+        }
+    }
+
+    /// Record a `Load`-shaped node as local when its base is.
+    fn note_splice_local_load(&mut self, id: NodeId, base: NodeId) {
+        if !self.splice.is_empty() && self.splice_store_is_local(base) {
+            self.splice_local.insert(id);
+        }
+    }
+
+    /// Record that a non-local value was stored into splice-local `base`, so
+    /// locality stops propagating through its reads.
+    fn note_splice_store_value(&mut self, base: NodeId, value: NodeId) {
+        if !self.splice.is_empty() && !self.splice_local.contains(&value) {
+            self.splice_tainted.insert(base);
+        }
+    }
+
+    /// Leave the innermost splice, restoring the caller's frame and pushing the
+    /// callee's result. Returns the caller pc to continue at.
+    ///
+    /// When this closes the OUTERMOST splice it re-stamps every node built
+    /// since it opened with that splice's `invoke_bci`, which is what makes the
+    /// whole region read as "the `invoke` at this bci has not taken effect" to
+    /// `ir_lower`'s deopt metadata. Nested splices inherit the outermost bci by
+    /// construction — the range covers them too.
+    fn end_splice(&mut self, value: Option<NodeId>) -> Option<usize> {
+        let frame = self.splice.pop()?;
+        self.locals = frame.saved_locals;
+        self.stack = frame.saved_stack;
+        if frame.returns_value {
+            self.push(value?);
+        }
+        if self.splice.is_empty() {
+            // The sets are scoped to one outermost splice: node ids from a
+            // closed region can never be a later region's store target, and
+            // keeping them would only grow.
+            self.splice_local.clear();
+            self.splice_tainted.clear();
+            let bci = frame.invoke_bci;
+            for node in &mut self.graph.nodes[self.splice_node_floor..] {
+                if node.bytecode_pc.is_some() {
+                    node.bytecode_pc = Some(bci);
+                }
+            }
+        }
+        Some(frame.return_pc)
+    }
+
     /// Diagnostic-only: supply `pc → "0xNN cn.mn desc"` for the invoke sites, so
     /// the three invoke bails can name the callee they refused. Never read by
     /// lowering; `lib.rs` only calls this when `CRATONVM_DBG=ir-compiles` (or
@@ -4245,6 +4617,9 @@ impl IrBuilder {
             self.iconst(0)
         };
         let cond = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![divisor, zero], pc);
+        if !self.splice.is_empty() {
+            self.splice_guard_seen = true;
+        }
         self.graph
             .add(Op::Guard { bci: pc }, IrType::Void, vec![ctrl, cond], Some(pc));
     }
@@ -4578,8 +4953,26 @@ impl IrBuilder {
             .collect();
 
         let mut pc = 0;
-        while pc < code_len {
-            if !reachable.contains(&pc) {
+        // The `|| !self.splice.is_empty()` half is IR-tier inlining: inside a
+        // splice `pc` addresses a relocated callee body appended AFTER
+        // `code_len`, and the walk must keep going until that body returns.
+        // With no splices open this is exactly `pc < code_len`.
+        while pc < code_len || !self.splice.is_empty() {
+            // Bounds on the relocated region. A callee body that falls off its
+            // own end never executed a return, which means the resolver admitted
+            // a shape the walk does not agree with — refuse rather than walk
+            // into whatever `lib.rs` appended next.
+            if let Some(frame) = self.splice.last() {
+                if pc >= frame.end {
+                    return ir_build_bail(line!(), pc);
+                }
+            }
+            // A relocated body is unreachable from pc 0 by construction, so the
+            // reachability skip and the merge bookkeeping — both of which are
+            // computed over the CALLER's code alone — apply only outside a
+            // splice. The resolver admits branch-free bodies only, so there is
+            // no merge inside one to activate.
+            if self.splice.is_empty() && !reachable.contains(&pc) {
                 // Handler-only (or otherwise unreachable) bytecode: emit no IR
                 // for it at all. `next_pc` comes from the verifier's canonical
                 // decode, so this steps over multi-byte operands correctly
@@ -4595,7 +4988,7 @@ impl IrBuilder {
             }
 
             // If this PC is a merge target, activate the merge
-            if self.merges.contains_key(&pc) {
+            if self.splice.is_empty() && self.merges.contains_key(&pc) {
                 // Add current state as predecessor (fall-through). On a loop
                 // header this is the forward-entry predecessor; the back-edge
                 // arrives later and is back-patched (see add_merge_predecessor).
@@ -4630,7 +5023,14 @@ impl IrBuilder {
             // NO_NODE, not itself a merge target) has no reachable frame state,
             // so it is skipped. These snapshots are emit-and-discard until the
             // lowerer resolves them — they do not affect codegen on their own.
-            if self.ctrl_opt().is_some() {
+            //
+            // Never inside a splice: a snapshot there would name a
+            // combined-buffer pc, and `build_deopt_points` turns EVERY snapshot
+            // into a `DeoptimizationPoint` whose `bci` the VM parks the
+            // interpreter at. The spliced region is covered instead by the
+            // caller's snapshot at the `invoke` pc, which every node in the
+            // region is re-stamped with — see [`IrInlineSite`].
+            if self.splice.is_empty() && self.ctrl_opt().is_some() {
                 self.graph.push_safepoint(SafepointSnapshot {
                     bci: pc,
                     locals: self.locals.clone(),
@@ -5427,6 +5827,7 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem, array, index],
                         Some(pc),
                     );
+                    self.note_splice_local_load(load, array);
                     self.mem = load;
                     self.push(load);
                     pc += 1;
@@ -5454,6 +5855,12 @@ impl IrBuilder {
                     let value = self.pop();
                     let index = self.pop();
                     let array = self.pop();
+                    // See `splice_store_is_local`: a write inside a spliced body
+                    // may be re-executed, so it must target an array the splice
+                    // itself made.
+                    if !self.splice.is_empty() && !self.splice_store_is_local(array) {
+                        return ir_build_bail(line!(), pc);
+                    }
                     let store = self.graph.add(
                         Op::ArrayStore(kind),
                         IrType::Memory,
@@ -5677,6 +6084,7 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem, base, offset],
                         Some(pc),
                     );
+                    self.note_splice_local_load(load, base);
                     // The load advances the memory token: a subsequent store to
                     // a possibly-aliasing location must be ordered AFTER this
                     // read (WAR), and the scheduler enforces ordering only via
@@ -5734,6 +6142,13 @@ impl IrBuilder {
                     };
                     let value = self.pop();
                     let base = self.pop();
+                    // See `splice_store_is_local`.
+                    if !self.splice.is_empty() {
+                        if !self.splice_store_is_local(base) {
+                            return ir_build_bail(line!(), pc);
+                        }
+                        self.note_splice_store_value(base, value);
+                    }
                     let offset = self.iconst(field_index as i64);
                     let store = self.graph.add(
                         Op::Store(mem_kind),
@@ -5785,6 +6200,7 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem],
                         Some(pc),
                     );
+                    self.note_splice_local_alloc(newobj);
                     self.push(newobj);
                     pc += 3;
                 }
@@ -5809,6 +6225,7 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem, len],
                         Some(pc),
                     );
+                    self.note_splice_local_alloc(arr);
                     self.push(arr);
                     pc += 2;
                 }
@@ -5840,6 +6257,7 @@ impl IrBuilder {
                         vec![self.ctrl, self.mem, len],
                         Some(pc),
                     );
+                    self.note_splice_local_alloc(arr);
                     self.push(arr);
                     pc += 3;
                 }
@@ -5924,7 +6342,16 @@ impl IrBuilder {
                     // reference args (inc 22). Only populated when the
                     // special-call gate is on; otherwise `invoke_info` has no
                     // entry for this pc and the method bails to single-pass.
-                    else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                    // IR-tier inlining: splice the callee's body in place of the
+                    // call. Checked after the elision (eliding costs nothing and
+                    // a site that qualifies for it has no body worth splicing)
+                    // and before the dispatch lowering.
+                    else if self.inline_sites.contains_key(&pc) {
+                        match self.begin_splice(pc, 3) {
+                            Some(next) => pc = next,
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    } else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
                         let mut args = Vec::with_capacity(num_args);
                         for _ in 0..num_args {
                             args.push(self.pop());
@@ -6007,6 +6434,20 @@ impl IrBuilder {
                             continue;
                         }
                     }
+                    // IR-tier inlining: splice the callee's body in place of the
+                    // call. `invokevirtual` reaches here only for a site the
+                    // resolver bound to ONE body (a `final`/`private`/
+                    // effectively-monomorphic target); a polymorphic site never
+                    // gets an entry.
+                    if self.inline_sites.contains_key(&pc) {
+                        match self.begin_splice(pc, 3) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
@@ -6057,6 +6498,16 @@ impl IrBuilder {
                 // the builder (the descriptor was resolved from the cp index by
                 // the caller); only the pc advance differs.
                 0xb9 => {
+                    // IR-tier inlining — five bytes, not three.
+                    if self.inline_sites.contains_key(&pc) {
+                        match self.begin_splice(pc, 5) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
@@ -6268,6 +6719,19 @@ impl IrBuilder {
                 // returns an object was refused at its return.
                 0xac | 0xb0 => {
                     let val = self.pop();
+                    // Inside a splice this is not a method exit: it hands the
+                    // value back to the caller's operand stack and the walk
+                    // resumes after the `invoke`. No `Op::Return`, and `ctrl`
+                    // stays live.
+                    if !self.splice.is_empty() {
+                        match self.end_splice(Some(val)) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let ret =
                         self.graph
                             .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
@@ -6279,6 +6743,15 @@ impl IrBuilder {
                 // lreturn
                 0xad => {
                     let val = self.pop();
+                    if !self.splice.is_empty() {
+                        match self.end_splice(Some(val)) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let ret =
                         self.graph
                             .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
@@ -6308,6 +6781,15 @@ impl IrBuilder {
                 // item-1 `dispatch_threw` peek.
                 0xae | 0xaf => {
                     let val = self.pop();
+                    if !self.splice.is_empty() {
+                        match self.end_splice(Some(val)) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let ret =
                         self.graph
                             .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
@@ -6318,6 +6800,15 @@ impl IrBuilder {
 
                 // return (void)
                 0xb1 => {
+                    if !self.splice.is_empty() {
+                        match self.end_splice(None) {
+                            Some(next) => {
+                                pc = next;
+                                continue;
+                            }
+                            None => return ir_build_bail(line!(), pc),
+                        }
+                    }
                     let ret = self
                         .graph
                         .add(Op::Return, IrType::Void, vec![self.ctrl], Some(pc));
@@ -6544,6 +7035,26 @@ impl IrBuilder {
                 // Unsupported opcode — bail out
                 _ => return ir_build_bail_opcode(op, pc),
             }
+        }
+
+        // A splice still open here means the walk left a relocated body without
+        // passing its return — only reachable if the loop condition and the
+        // splice bookkeeping disagree. The graph would be missing the caller
+        // frame it saved, so refuse rather than emit it.
+        if !self.splice.is_empty() {
+            return ir_build_bail(line!(), code_len);
+        }
+        // See `splice_guard_seen`.
+        if self.splice_guard_seen {
+            return ir_build_bail(line!(), code_len);
+        }
+        if self.splices_done > 0 && ir_bail_reporting() {
+            eprintln!(
+                "[ir] spliced {} callee bod{} into {}",
+                self.splices_done,
+                if self.splices_done == 1 { "y" } else { "ies" },
+                self.method_label.as_deref().unwrap_or("<method>"),
+            );
         }
 
         Some(self.graph)
