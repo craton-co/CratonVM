@@ -3929,6 +3929,30 @@ fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFail
             // of R13: `https://h/a/b?q=1` resolve `<empty>` is `https://h/a/`,
             // not the base.
             let merged = uri_merge_paths(&b_path, &r_path);
+            // ROOT the merged path when the base is absolute AND carries an
+            // authority. `uri_merge_paths` is `java.net.URI.resolvePath`, whose
+            // `i >= 0` guard prepends nothing when the base path has no `/` --
+            // correct for the base path itself, but it leaves a non-empty
+            // merged path unrooted, and recomposition then CONCATENATES it onto
+            // the authority. MEASURED: `URI.create("http://host").resolve("x")`
+            // answered `http://hostx` against HotSpot's `http://host/x`
+            // (`probes/UriLocaleSweep.java`), i.e. a relative reference silently
+            // became part of the HOST.
+            //
+            // The empty-child case is deliberately untouched and is why this is
+            // conditioned on `!merged.is_empty()` rather than applied in
+            // `uri_merge_paths`: `URI.create("https://h").resolve("")` must stay
+            // `https://h`, NOT `https://h/`, which `OpaqueUriProbe` row S17
+            // measured and the merge helper's own comment records.
+            let merged = if b_scheme.is_some()
+                && t_auth.is_some()
+                && !merged.is_empty()
+                && !merged.starts_with('/')
+            {
+                format!("/{merged}")
+            } else {
+                merged
+            };
             t_path = uri_remove_dot_segments(&merged);
         }
     }
@@ -21016,6 +21040,27 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    /// `URI.resolve` must ROOT a merged path against an authority-bearing
+    /// absolute base. Measured against HotSpot 25.0.3+9 with
+    /// `probes/UriLocaleSweep.java`; the first row is the defect --- it
+    /// answered `http://hostx`, folding a relative reference into the HOST.
+    #[test]
+    fn uri_resolve_roots_a_merged_path_against_an_authority() {
+        use super::uri_resolve_ref;
+        assert_eq!(uri_resolve_ref("http://host", "x").unwrap(), "http://host/x");
+        assert_eq!(uri_resolve_ref("http://host", "a/b").unwrap(), "http://host/a/b");
+        // an authority-bearing base WITH a path keeps working
+        assert_eq!(uri_resolve_ref("http://host/", "x").unwrap(), "http://host/x");
+        assert_eq!(uri_resolve_ref("http://host/a/b", "c").unwrap(), "http://host/a/c");
+        assert_eq!(uri_resolve_ref("http://host/a/", "c").unwrap(), "http://host/a/c");
+        // an EMPTY child must NOT gain a slash --- OpaqueUriProbe S17
+        assert_eq!(uri_resolve_ref("https://h", "").unwrap(), "https://h");
+        // no authority, so nothing to fold into: left alone
+        assert_eq!(uri_resolve_ref("rel/path", "x").unwrap(), "rel/x");
+        // an absolute reference path is verbatim
+        assert_eq!(uri_resolve_ref("http://host/a/b", "/c").unwrap(), "http://host/c");
+    }
+
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeContext;
