@@ -292,6 +292,18 @@ fn maybe_dump_shutdown_reports() {
                 .join(" "),
             cratonvm_jit::metrics::despec_escalations_spared()
         );
+        // How WIDE each surviving blind spill was. `stores-emitted` against
+        // `stores-if-full` is the narrowing's engagement AND its size in one
+        // ratio; `full-refused` separates "narrowing kept everything" from
+        // "narrowing was off".
+        eprintln!(
+            "[cratonvm] safepoint spill width: {}",
+            cratonvm_jit::metrics::spill_width_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The per-call safepoint blind spill, and how often the oop-clean-frame
         // proof let a direct call publish the safepoint id alone instead of
         // copying the whole GPR file into the frame. `elided` is the engagement
