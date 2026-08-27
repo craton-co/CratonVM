@@ -882,8 +882,13 @@ function Resolve-CratonExe {
 
 function Resolve-Jdk {
   if ($JdkHome) { return $JdkHome }
-  if ($env:JAVA_HOME) { return $env:JAVA_HOME }
-  return 'C:\Program Files\Java\jdk-25'
+  if ($env:JAVA_HOME -and (Test-Path $env:JAVA_HOME)) { return $env:JAVA_HOME }
+  $cands = @(
+    'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot',
+    'C:\Program Files\Java\jdk-25'
+  )
+  foreach ($c in $cands) { if (Test-Path $c) { return $c } }
+  return 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot'
 }
 
 function Get-EffectiveClassTimeoutSec {

@@ -15080,11 +15080,7 @@ fn jsse_owns_endpoint_identification(
             chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
         }
         // JSSE's OWN default trust manager is an `X509ExtendedTrustManager`,
-        // and on HotSpot it is the thing that identifies the endpoint. On
-        // THIS VM its `checkServerTrusted` is served by a native shim
-        // (`x509_manager::do_check_trusted`) which validates the chain and
-        // nothing else — it never sees the `SSLEngine`, so it cannot read
-        // `SSLParameters.getEndpointIdentificationAlgorithm()`.
+        // and on HotSpot it is the thing that identifies the endpoint.
         //
         // A predicate must mirror the dispatch it guards. Answering "the
         // application owns identification" for a class whose identification
@@ -15092,6 +15088,21 @@ fn jsse_owns_endpoint_identification(
         // `testClientHostnameValidationFail` handshakes a client that dialled
         // `localhost` against `notlocalhost_server.pem` and asserts the
         // handshake FAILS; it completed.
+        //
+        // UPDATED 2026-08-26. The reason this arm gave — that the native shim
+        // for `checkServerTrusted` "never sees the `SSLEngine`" — was true of
+        // the shim and NOT of the call: this file's own loop passes the engine
+        // to the three-argument overload, and the shim simply ignored it.
+        // `x509_manager::check_server_trusted_extended` now reads
+        // `SSLParameters.getEndpointIdentificationAlgorithm()` off it and runs
+        // the name check, which is what closed the netty OpenSSL hole
+        // (`fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`).
+        //
+        // This arm STAYS `true` regardless. The shim identifies only when it
+        // can find a host on the peer, and this VM's own `SSLEngine` object
+        // need not carry a handshake session; the two checks reach the same
+        // verdict when both run, and dropping this one would make that
+        // "need not" into a hole.
         if name.as_deref() == Some("sun/security/ssl/X509TrustManagerImpl") {
             if dbg {
                 eprintln!(
@@ -16785,6 +16796,15 @@ fn do_wrap(
     srcs: Vec<ObjectRef>,
     dst: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
+    // ENTRY pins, before the first `ctx` call. Everything below can allocate
+    // and collect — `engine_id_or_alloc` first of all — and a pin taken later
+    // in the body pins whatever `this` has already decayed to, which a pin
+    // cannot repair. Measured: PIN-STALE named this exact receiver
+    // (`sun/security/ssl/SSLEngineImpl`) being pinned at an already-dead
+    // address by `engine_consult_trust_managers` downstream.
+    let this_entry_pin = ctx.pin_native_root(this);
+    let dst_entry_pin = ctx.pin_native_root(dst);
+    let this = ctx.read_native_pin(this_entry_pin, this);
     let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
@@ -17017,12 +17037,24 @@ fn do_wrap(
         let pending_trust_check = engine_take_pending_trust_check(id, s);
         (cons, status, hs, drained, pending_trust_check, deferred_failure)
     };
+    // `engine_run_trust_check` runs the application's TrustManager — arbitrary
+    // Java that allocates and can collect for as long as it likes. `this` and
+    // `dst` are raw `ObjectRef`s from the argument slots: the caller's operand
+    // slots are roots and get remapped, these copies are not, and `dst` is
+    // WRITTEN THROUGH below. Pin both across the callback and re-derive them
+    // after it — the idiom the retired `unpinned-native-locals-audit` write-up
+    // applies, here over the widest window of that shape in this file.
+    let mut this = this;
+    let mut dst = dst;
     if let Some(pending) = pending_trust_check {
+        this = ctx.read_native_pin(this_entry_pin, this);
         engine_run_trust_check(ctx, pending, Some(this))?;
     }
+    let _ = this;
 
     // Step 3: write the drained bytes into dst.
     let produced = if !drained.is_empty() {
+        dst = ctx.read_native_pin(dst_entry_pin, dst);
         bb_write_from(ctx, dst, &drained)
     } else {
         0
@@ -17140,6 +17172,16 @@ fn do_unwrap(
     src: ObjectRef,
     dsts: Vec<ObjectRef>,
 ) -> cratonvm_types::error::MethodCallResult {
+    // ENTRY pins, before the first `ctx` call. Everything below can allocate
+    // and collect — `engine_id_or_alloc` first of all — and a pin taken later
+    // in the body pins whatever `this` has already decayed to, which a pin
+    // cannot repair. Measured: PIN-STALE named this exact receiver
+    // (`sun/security/ssl/SSLEngineImpl`) being pinned at an already-dead
+    // address by `engine_consult_trust_managers` downstream.
+    let this_entry_pin = ctx.pin_native_root(this);
+    let src_entry_pin = ctx.pin_native_root(src);
+    let dst_entry_pins: Vec<usize> = dsts.iter().map(|d| ctx.pin_native_root(*d)).collect();
+    let this = ctx.read_native_pin(this_entry_pin, this);
     let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
@@ -17839,10 +17881,21 @@ fn do_unwrap(
         let pending_trust_check = engine_take_pending_trust_check(id, s);
         (status, hs, pending_trust_check)
     };
+    // `engine_run_trust_check` runs the application's TrustManager — arbitrary
+    // Java that allocates. `this`, `src` and EVERY element of `dsts` are raw
+    // `ObjectRef`s held across it, and `src` and the `dsts` are WRITTEN THROUGH
+    // below. Pin them all and re-derive after the callback; the `dsts` vector
+    // is the worse half, because a collection leaves every element stale rather
+    // than one. See the retired `unpinned-native-locals-audit` write-up.
+    let mut this = this;
+    let mut src = src;
     if let Some(pending) = pending_trust_check {
+        this = ctx.read_native_pin(this_entry_pin, this);
         engine_run_trust_check(ctx, pending, Some(this))?;
     }
+    let _ = this;
     let consumed = offset - src_pos;
+    src = ctx.read_native_pin(src_entry_pin, src);
     bb_set_pos(ctx, src, src_view.layout, offset);
 
     // Step 3: write plaintext into dsts (may span multiple buffers).
@@ -17859,11 +17912,14 @@ fn do_unwrap(
     // (`TestLargeUpload`: 13107 of 65535 bytes read by the servlet).
     let mut produced_total = 0usize;
     let mut idx = 0usize;
-    for dst in &dsts {
+    for (i, dst) in dsts.iter().enumerate() {
         if idx >= plaintext.len() {
             break;
         }
-        let n = bb_write_from(ctx, *dst, &plaintext[idx..]);
+        // Each `bb_write_from` runs Java of its own, so the NEXT buffer in the
+        // scatter has to be re-derived rather than read from the vector.
+        let dst_now = ctx.read_native_pin(dst_entry_pins[i], *dst);
+        let n = bb_write_from(ctx, dst_now, &plaintext[idx..]);
         produced_total += n;
         idx += n;
     }

@@ -7151,6 +7151,15 @@ impl ZgcRealHeap {
         // dozen holes or twenty thousand, and those want different fixes.
         span_shape: (usize, usize),
     ) {
+        // 2026-08-27: this message used to open "this heap does not compact,
+        // so the bump cursor never rewinds". The first clause stopped being
+        // true — `TestMVStoreTool` on that day reported 11 compaction cycles and
+        // 1 817 474 objects relocated in the same run that printed this — and it
+        // is exactly the sentence that sends a reader looking for a missing
+        // compactor instead of at the `zgc frag:` lines below, which had already
+        // localised the failure to **2 888 live bytes in 49 runs** standing
+        // between 263 216 free bytes and one 266 104-byte contiguous window.
+        // The cursor half is still true and is kept; the compaction half is not.
         static FAILURES: AtomicUsize = AtomicUsize::new(0);
         let failure_seq = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
         if !failure_seq.is_power_of_two() {
@@ -7166,12 +7175,15 @@ impl ZgcRealHeap {
             free_spans = span_shape.0,
             free_span_sizes = span_shape.1,
             failure_seq,
-            "zgc: arena allocation failed — this heap does not compact, so the \
-             bump cursor never rewinds and reclaimed space returns only as \
-             free-list holes. `largest_free_block < request` with a large \
-             `free_list_bytes` means fragmentation, not exhaustion. \
+            "zgc: arena allocation failed — `largest_free_block < request` with \
+             a large `free_list_bytes` means fragmentation, not exhaustion: the \
+             bump cursor never rewinds, so reclaimed space returns as free-list \
+             holes and a big request needs a big CONTIGUOUS one. \
              `failure_seq` is the rung of the caller's try/GC/try/reclaim/try \
-             ladder: 1 is pre-collection, 2 is the post-GC retry.",
+             ladder: 1 is pre-collection, 2 is the post-GC retry. \
+             Read the `zgc frag:` lines that follow — they name the live \
+             objects walling off the cheapest window, which is the question \
+             this line cannot answer.",
         );
     }
 
