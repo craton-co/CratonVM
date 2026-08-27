@@ -212,6 +212,22 @@ fn maybe_dump_shutdown_reports() {
             cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot(),
             cratonvm_vm::jit::helpers::jit_getfield_punned_ref_nonzero()
         );
+        // G1 parallel-evacuation CAS losses, i.e. how often a worker found
+        // another worker had already forwarded the object it was copying and
+        // adopted that target. Until 2026-08-26 that arm returned the target
+        // WITHOUT recording `old -> target` in this cycle's `pointer_map`, so
+        // no root naming `old` could be remapped and it dangled once the
+        // region was reused -- the rare `java/lang/Object`.
+        //
+        // Printed even when zero, for the reason the counter above it is: a
+        // fix to an arm nothing reaches is a no-op dressed as a repair, and
+        // this arm needs TWO WORKERS RACING ON ONE OBJECT, so a quiet run
+        // means the race did not happen, not that the fix is inert.
+        eprintln!(
+            "[cratonvm] G1 evacuation CAS losses (forwards this VM would have \
+             dropped before the 2026-08-26 fix): {}",
+            cratonvm_vm::g1_evacuate_cas_loser_forwards()
+        );
         // The `validate_code_ptr` memo's engagement, on the same switch and for
         // the same reason as every counter above it. The memo replaced a global
         // `Mutex` taken on EVERY compiled call; a run where `hits` is 0 has the

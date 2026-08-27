@@ -622,6 +622,23 @@ impl Tlab {
 /// appended to for every single object copied — the hottest write in the
 /// pause — and a shared destination would serialise exactly the work the
 /// parallel evacuator exists to spread.
+/// How many times `evacuate`'s parallel path LOST the forwarding CAS to another
+/// worker and adopted the winner's target.
+///
+/// This is the arm whose forward went unrecorded until 2026-08-26, and the
+/// counter exists so the fix is not taken on faith: a repair to an arm nothing
+/// reaches is a no-op dressed as a fix. Non-zero on a workload means the hole
+/// was live on it; zero means the defect that workload shows is somewhere else.
+///
+/// Read it with [`evacuate_cas_loser_forwards`].
+pub static EVACUATE_CAS_LOSER_FORWARDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`EVACUATE_CAS_LOSER_FORWARDS`].
+pub fn evacuate_cas_loser_forwards() -> u64 {
+    EVACUATE_CAS_LOSER_FORWARDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Default)]
 struct EvacShard {
     objs: usize,
@@ -928,7 +945,28 @@ impl<'a> SharedEvac<'a> {
             // address is the INFLATED/FORWARDED aliasing this encoding was
             // audited against.
             Err(winner) if ObjectHeader::is_forwarded_mark(winner) => {
-                Some((ObjectHeader::forwarding_target(winner), false))
+                // DEFECT-2 FIX, SECOND SITE (2026-08-26). This arm returned the
+                // winner's target WITHOUT recording `old_ptr -> target` in
+                // `forwards`, so the forward never reached this cycle's
+                // `pointer_map` and no root naming `old_ptr` could be remapped
+                // — it stayed on the from-space copy and dangled once the
+                // region was reused. That is verbatim the defect part 1 fixed
+                // for the fast path forty lines up; the same omission survived
+                // here, on the arm only a two-worker race on ONE object can
+                // reach.
+                //
+                // The rarity and the LOAD DEPENDENCE follow from that race:
+                // more parallel evacuation means more CAS losses, which is why
+                // the netty `ParameterizedSslHandlerTest` stall this was found
+                // from is 1 run in 5 at load 20-27 and 0 in 122 at load 3-7.
+                //
+                // Part 2's invariant is unaffected: it clears `forwarding_ptr`
+                // for every key in `pointer_map` at cycle end, so this key is
+                // cleared too — which is what part 2 wants, not a hazard to it.
+                let target = ObjectHeader::forwarding_target(winner);
+                EVACUATE_CAS_LOSER_FORWARDS.fetch_add(1, Ordering::Relaxed);
+                forwards.push((old_ptr as usize, target as usize));
+                Some((target, false))
             }
             Err(_) => None,
         }
