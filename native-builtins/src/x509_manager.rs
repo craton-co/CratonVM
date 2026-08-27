@@ -5187,9 +5187,6 @@ fn check_server_trusted_extended(
     args: &[Value],
 ) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
-    if crate::nbflags().x509_tm_no_identify_server {
-        return Ok(None);
-    }
     check_extended_tm_endpoint_identity(ctx, args, false)
 }
 
@@ -5206,9 +5203,6 @@ fn check_client_trusted_extended(
     args: &[Value],
 ) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
-    if crate::nbflags().x509_tm_no_identify_client {
-        return Ok(None);
-    }
     check_extended_tm_endpoint_identity(ctx, args, true)
 }
 
@@ -5269,13 +5263,20 @@ fn classify_extended_tm_peer(
 /// `SSLEngineImpl`, whose `getSSLParameters()` is pure Java and re-enters
 /// nothing) keep the method route.
 ///
-/// `CRATONVM_X509_TM_PARAMS_VIA_METHOD` forces the method route back on, so the
-/// attribution above stays a one-run A/B.
+/// **There is deliberately no switch to force the method route back on.** An
+/// earlier revision of this fix shipped three (`CRATONVM_X509_TM_PARAMS_VIA_METHOD`
+/// and a `NO_IDENTIFY` pair) so the attribution stayed a one-run A/B, and one of
+/// them could disable hostname verification outright. A shipped VM must not
+/// carry an environment variable that turns a security check off, whatever its
+/// default. The lever moved to where it belongs: the defect is "Java re-enters
+/// tcnative from inside BoringSSL's callback", so
+/// `probes/OpenSslTls13ClientCertProbe.java` installs a trust manager that makes
+/// that call itself and reproduces it with no VM cooperation at all.
 fn extended_tm_identification_algorithm(
     ctx: &mut dyn NativeContext,
     peer: ObjectRef,
 ) -> Option<String> {
-    if !crate::nbflags().x509_tm_params_via_method && peer_is_netty_openssl_engine(ctx, peer) {
+    if peer_is_netty_openssl_engine(ctx, peer) {
         // `Object(None)` here is "the field is null", not "no such field": the
         // class check above already established the field exists. A null one is
         // netty's own default and means no identification, so answering `None`

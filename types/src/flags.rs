@@ -2008,47 +2008,6 @@ pub struct NativeFlags {
     /// `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` — [`parse::exactly_one`].
     pub use_wildfly_synth_bytecode: bool,
 
-    /// `CRATONVM_X509_TM_PARAMS_VIA_METHOD` — [`parse::present`].
-    ///
-    /// Forces `x509_manager::extended_tm_identification_algorithm` to read the
-    /// endpoint identification algorithm through `engine.getSSLParameters()`
-    /// instead of off netty's `endpointIdentificationAlgorithm` field.
-    ///
-    /// That method call is the thing the field fast path exists to avoid: on
-    /// `ReferenceCountedOpenSslEngine` it is `synchronized` and re-enters
-    /// tcnative (`SSL.getOptions`, `SSL.getCiphers`) on the same `SSL*`
-    /// BoringSSL is already inside whenever netty is configured
-    /// `setUseTasks(false)`, and doing so loses the client's TLSv1.3
-    /// `Certificate` flight. Setting this REPRODUCES that, deterministically,
-    /// which is what keeps
-    /// `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`
-    /// a one-run experiment rather than a rebuild.
-    pub x509_tm_params_via_method: bool,
-
-    /// `CRATONVM_X509_TM_NO_IDENTIFY_CLIENT` — [`parse::present`].
-    ///
-    /// Kill switch for the endpoint identification
-    /// `x509_manager::check_client_trusted_extended` performs — the SERVER
-    /// identifying its client. Present disables it, leaving the chain check.
-    ///
-    /// It exists as a switch rather than a constant because the work it
-    /// suppresses (`engine.getSSLParameters()`, which on netty's OpenSSL engine
-    /// re-enters tcnative for `SSL.getOptions` / `SSL.getCiphers`) runs INSIDE
-    /// BoringSSL's verify callback whenever netty is configured
-    /// `setUseTasks(false)`, and this VM has a measured sensitivity to Java
-    /// re-entering from inside that native. A switch is what makes "is that
-    /// call the cause" a one-run A/B instead of a rebuild.
-    pub x509_tm_no_identify_client: bool,
-
-    /// `CRATONVM_X509_TM_NO_IDENTIFY_SERVER` — [`parse::present`].
-    ///
-    /// The twin of [`Self::x509_tm_no_identify_client`] for
-    /// `check_server_trusted_extended` — the CLIENT identifying the server,
-    /// which is the direction RFC 2818 hostname verification actually protects.
-    /// Disabling it re-opens the hole
-    /// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`
-    /// closed, so it is a diagnostic lever and never a configuration.
-    pub x509_tm_no_identify_server: bool,
 }
 
 impl NativeFlags {
@@ -2207,9 +2166,6 @@ impl NativeFlags {
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
             synthetic_forkjoinpool: present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL"),
-            x509_tm_no_identify_client: present(src, "CRATONVM_X509_TM_NO_IDENTIFY_CLIENT"),
-            x509_tm_params_via_method: present(src, "CRATONVM_X509_TM_PARAMS_VIA_METHOD"),
-            x509_tm_no_identify_server: present(src, "CRATONVM_X509_TM_NO_IDENTIFY_SERVER"),
             synthetic_memoryusage_tostring: one_true_yes_exact(
                 src,
                 "CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING",
