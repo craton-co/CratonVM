@@ -9793,9 +9793,13 @@ pub(crate) fn lower_inner_with_scopes(
     // destroys one. Slot 0 is also the likeliest slot to be a live reference,
     // so the int store's inline three-word cell write would leave a
     // primitive standing where the class declares a pointer -- the G30-1
-    // species, and exactly the shape
+    // species, and the same shape as the punned cell in
     // `docs/known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-20260824.md`
-    // is about (`SQLChar.rawData`, declared `[C`, found holding `Int(1)`).
+    // (`SQLChar.rawData`, declared `[C`, found holding `Int(1)`). This arm is
+    // NOT that page's writer -- `CRATONVM_COMPACT_REF_FIELDS=0`, which makes it
+    // the only lowering for every int store, moved that rate not at all, and
+    // the default-ON flag makes it unreachable anyway. The shape is worth
+    // refusing on its own account.
     //
     // The builder emits a `Const` for every field access it constructs today,
     // so this refuses nothing that currently compiles. It is here because the
