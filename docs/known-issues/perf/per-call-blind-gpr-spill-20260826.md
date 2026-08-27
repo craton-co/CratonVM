@@ -1,16 +1,25 @@
 # The 14-store blind GPR spill at every compiled call — halved for oop-clean frames, OPEN for every other frame
 
-**Status: OPEN, throughput.** Half of this is done and half is not, and the
-open half is why this page is in `known-issues/` rather than in the internal
-record: a compiled call still carries a blind 14-store copy of the whole GPR
-file on **every frame that holds a reference in a register-homed local**, which
-is most real code. What landed 2026-08-26
-(`CRATONVM_JIT_CALL_SPILL_ELISION`, default `mic`, `=0` restores the old route)
-elides that spill where the caller frame is provably oop-clean — **~2x on every
-call shape** there — and, more usefully for whoever picks this up, it makes the
-remaining refusals countable: they are **100% one clause**, and
-[the next lever](#the-next-lever-therefore-is-to-narrow-the-spill-not-to-elide-it)
-is named at the bottom of this page.
+**Status: OPEN, throughput — but both of this page's levers are now spent.**
+Two changes, a day apart, against the same 14-store blind copy of the whole GPR
+file that `emit_pre_safepoint_spill` emitted at every GC-capable call:
+
+* **2026-08-26, elision** (`CRATONVM_JIT_CALL_SPILL_ELISION`, default `mic`) —
+  where the caller frame is provably oop-clean the spill is replaced by a
+  2-instruction safepoint-id publication. **~2x on every call shape.** It
+  refuses on most real code, and the refusal census says so in one clause.
+* **2026-08-27, narrowing** (`CRATONVM_JIT_SPILL_NARROW`, default ON) — where it
+  does NOT refuse the spill outright, it is now cut to the registers that can
+  hold an oop: **476 → 260 stores** on `CallArgCostProbe`, **1344 → 830** on
+  netty's own loop, and **8–24% off a compiled call's overhead** on top of the
+  elision, on frames the elision cannot touch.
+
+The page stays open because the wall is narrowed, not closed: a call in a
+reference-carrying frame still spills RAX, the six `ARG_REGS` and the register
+homes of reference-capable locals — around 8–9 stores — and dropping any of
+those means giving up the population `=all` was added for. What is left is
+described in [What is still there](#what-is-still-there), and it is a different
+kind of change from either of these two.
 
 All numbers: **Azure Linux host `vm1`, quiet (load 3.9–4.7)**, 2026-08-26,
 release build, real-JDK mode, ONE binary with the flag off and on, eight
@@ -141,33 +150,93 @@ survivor, not the moving-young publication proof: those are zero. Real
 reference-manipulating code keeps a receiver or a `this` in a register-homed
 local, and then the blind spill is doing work the elision cannot argue away.
 
-### The next lever, therefore, is to NARROW the spill, not to elide it
+### DONE 2026-08-27: the spill is narrowed to the registers that can hold an oop
 
-The elision is all-or-nothing by construction. What the refusal census points at
-is different: spill the registers that can hold an oop, instead of all fourteen.
-The compiler already has the material —
-`SafepointPublishPlan::register_homed_reference_locals` is a bitmask of exactly
-the locals whose register residency can hide a root, and `local_assignments`
-maps each to its register. A register hosting a *primitive* local, or hosting
-nothing this method ever wrote, is a store per call for nothing.
+The elision is all-or-nothing by construction, so the answer to a refusal that
+is 100% one clause is not a better elision — it is to keep the spill and make it
+smaller. `CRATONVM_JIT_SPILL_NARROW` (default ON, `=0` restores the full copy)
+selects the registers from four sources, and the first two are precisely the
+reason `=all` exists at all — `Compiler::new`: *"a receiver/args staged into
+ARG_REGS immediately before a GC-capable call … which the callee-saved-only
+spill never covers"*:
 
-Two cautions for whoever takes it:
+1. `RAX`, where the emitter materialises every loaded / allocated / returned
+   reference before it is pushed or stored;
+2. every `ARG_REGS` member — a staged receiver or reference argument;
+3. the register home of any local the method-wide reference mask says can hold a
+   reference (`SafepointPublishPlan::register_homed_reference_locals` indexed
+   through `local_assignments`);
+4. any register currently holding an operand-stack entry, oop-marked or not —
+   cheaper to keep than to reason about, and `self.stack` is short.
 
-* the spill is deliberately **blind**, and its own comment says why — "an oop
-  can also live in a callee-saved register as an operand-stack temporary that
-  survives the call, or via a value the per-slot oop tracker fails to tag." The
-  operand-stack half of that is now covered separately and precisely by
-  `flush_callee_saved_oops_enabled()` (default-on); what a narrowing gives up is
-  the untracked-intermediate defence, which is what `=all` was added for
-  (Keycloak Gap 9, a live oop in a caller-saved / argument / RAX register). Any
-  narrowing must keep RAX and the ARG registers.
-* the gate that matters is not a test suite. It is relocation under moving young
-  — see below.
+Dropped: a register hosting a local the mask says is *primitive*, and a register
+this method's model never put anything in (`R10`/`R11` on SysV, plus unused
+local homes). The mask is conservative in the safe direction —
+`find_reference_locals` ORs in every `aload`/`astore` across the whole method, so
+javac's cross-scope slot reuse only makes it name MORE locals, never fewer.
+
+Fails closed to the full fourteen on: no publish plan (the legacy `compile` test
+wrapper), more than 64 locals (the mask's unrepresented tail), or an explicit
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`. The slot LAYOUT is unchanged —
+`emit_blind_reg_spill` indexes by position in `ALL_SPILL_GPRS` — so a skipped
+store leaves a **stale** slot, which the scanner re-validates through
+`heap.is_object_address` and which can therefore only over-retain, never
+under-report. The inline-TLAB `new` site splits its spill across two program
+points, and the deferred half reads the selection the safepoint captured
+(`pending_narrow_spill`) rather than recomputing it, because the operand-stack
+model has moved on by the slow-path label.
+
+**What it is worth.** Measured with the ELISION PINNED OFF
+(`CRATONVM_JIT_CALL_SPILL_ELISION=0`), so every call keeps a spill and the
+narrowing is the only difference — ten interleaved readings per arm, load ~11,
+minimum of each, deltas over `control`:
+
+| call shape | full 14 | narrowed | |
+|---|---:|---:|---|
+| `int0()` | 4.01 ns | **3.33 ns** | −17% |
+| `int1(int)` | 4.39 | **3.44** | −22% |
+| `int2(int,int)` | 5.11 | **4.44** | −13% |
+| `ref1(Object)` | 6.28 | **5.07** | −19% |
+| `ref2(Object,Object)` | 6.57 | **5.61** | −15% |
+| `refRet(Object)->Object` | 5.72 | **4.37** | −24% |
+| `virtInt` | 9.12 | **8.29** | −9% |
+| `virtRef` | 10.80 | **9.91** | −8% |
+
+The separation is complete on the static rows: the **maximum** of the ten
+narrowed `int1` readings (4.74) is below the **minimum** of the ten full ones
+(5.05). Width, from the compile-time census, which is load-independent and is
+the engagement proof: `safepoint spill width: stores-emitted=260
+stores-if-full=476 full-refused=1` against `476 / 476 / 34` unnarrowed.
+
+**What it is NOT worth: anything visible on the two netty loops.** Their store
+counts drop (`1344 → 830` on `HttpStatusClassLoopRate`), but ~5 saved stores per
+safepoint against a ~100 ns iteration is ~2–3%, and twelve interleaved readings
+per arm on this host could not separate the arms in either direction. Recorded
+so nobody re-runs it expecting otherwise.
+
+## What is still there
+
+After both levers, a call in a reference-carrying frame spills RAX + six
+`ARG_REGS` + the reference-local homes — around 8–9 stores. Cutting further
+means dropping exactly the population the full-file spill was introduced for
+(Keycloak Gap 9: a live oop in a caller-saved / argument / RAX register at an
+invoke safepoint), so it is not a filter change. It would need the *staging* to
+be the publication — the direct sites already copy every argument into the
+callee-sentinel service slots and the dispatch/MIC sites already name their
+argument oops in the map, so the information exists; what is missing is a proof
+that every path reaching a safepoint has done one of those before it gets there.
+That is a different kind of change from either of these two, and it wants its
+own page rather than a third section here.
+
+The other caution, unchanged: **the gate that matters is not a test suite. It is
+relocation under moving young** — see below.
 
 ## Gates
 
-This is a GC-root-visibility change, so the correctness argument is the gate
-list, not the diff.
+Both changes are GC-root-visibility changes, so the correctness argument is the
+gate list, not the diff. Everything below was run for the elision (2026-08-26)
+and re-run for the narrowing (2026-08-27, `CRATONVM_JIT_SPILL_NARROW` off and
+on); the numbers quoted are the narrowing's, and the elision's were the same.
 
 * **Relocation under moving young**, `-XX:+UseGenerationalGC`, three interleaved
   rounds per arm, checksums compared against HotSpot on the same host:
@@ -200,7 +269,18 @@ CRATONVM_JIT_CALL_SPILL_ELISION=0 cratonvm --java-home <jdk> -cp . CallArgCostPr
 ```
 
 ```bash
-CRATONVM_DBG=jit-method-stats cratonvm --java-home <jdk> -cp . CallArgCostProbe 20000000 2>&1 | grep 'direct-call spill'
+CRATONVM_DBG=jit-method-stats cratonvm --java-home <jdk> -cp . CallArgCostProbe 20000000 2>&1 | grep -E 'direct-call spill|spill width'
+```
+
+The narrowing on its own, with the elision pinned off so it is the only
+difference — this is the arm the −8..−24% above comes from:
+
+```bash
+CRATONVM_JIT_CALL_SPILL_ELISION=0 cratonvm --java-home <jdk> -cp . CallArgCostProbe 40000000
+```
+
+```bash
+CRATONVM_JIT_CALL_SPILL_ELISION=0 CRATONVM_JIT_SPILL_NARROW=0 cratonvm --java-home <jdk> -cp . CallArgCostProbe 40000000
 ```
 
 ```bash
