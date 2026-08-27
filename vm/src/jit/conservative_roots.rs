@@ -3038,6 +3038,27 @@ fn band_dbg() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
 }
 
+/// The safepoint id the frame at `rbp` is standing on, or `None` when the
+/// method reserved no id slot or the slot is misaligned.
+///
+/// Same read as `moving_young_frame_coverage_complete` makes; split out so the
+/// band reporter can name the ACTIVE map without duplicating the contract.
+/// Diagnostic only — every caller is behind `CRATONVM_MOVING_YOUNG_BAND_DBG`.
+fn frame_active_sp_id(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<u32> {
+    let off = cm.sp_id_slot_off;
+    if off == 0 {
+        return None;
+    }
+    let addr = rbp.checked_sub(off as usize)?;
+    if addr & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: aligned safepoint-id slot of a live JIT frame on this thread,
+    // reached through the same bounds the caller already validated `rbp` with.
+    let v = unsafe { (addr as *const usize).read() };
+    Some(v as u32)
+}
+
 fn report_unpublished_band_words(
     rbp: usize,
     frame_size: usize,
@@ -3058,8 +3079,36 @@ fn report_unpublished_band_words(
             && !published.contains(&w)
         {
             hits += 1;
+            // THE FORK, decided per word. `in_map` asks whether the ACTIVE
+            // safepoint's oop map already names this slot:
+            //
+            //   in_map=true  — the dataflow calls the slot a LIVE reference here
+            //                  and the map names it, but the shadow push did not
+            //                  publish it. The two channels disagree, and
+            //                  `collect_live_oop_homes` is the side that is
+            //                  wrong.
+            //   in_map=false — the dataflow does NOT call it live. Declining to
+            //                  publish is then CORRECT, the slot merely holds a
+            //                  stale reference nothing will read, and the band
+            //                  verifier is refusing on a dead word. The repair
+            //                  belongs on the verifier (a liveness bound it can
+            //                  consult), not on codegen.
+            //
+            // Without this the two are indistinguishable from the outside, which
+            // is how `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`'s
+            // `MVStore.closeStore` residual sat unresolved: 64 of 83 unpublished
+            // words are that method's java-locals, one object in three
+            // consecutive slots.
+            let sp_id = frame_active_sp_id(rbp, cm);
+            let in_map = sp_id.map(|id| {
+                cm.oop_maps
+                    .iter()
+                    .filter(|m| m.bytecode_pc == id)
+                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
+            });
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
+                 sp_id={sp_id:?} in_map={in_map:?} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
