@@ -19,22 +19,38 @@ java.lang.AssertionError: ConcurrentHashMap.elements(): hasMoreElements() never 
 enumeration is not terminating. **`m.keys()` on the same map, three lines
 earlier, PASSES** — it is the VALUES enumeration specifically.
 
-## 2. It is only visible under `--jdk-only-report`
+## 2. CORRECTED — the flag was the VECTOR's, not the defect's
 
-The first isolated reproduction attempt PASSED 3/3, which looked like a
-load-sensitive flake and would have been the wrong conclusion. The harness adds
-`--jdk-only-report <dir>` to every vector under `--jdk-only` — my bare
-invocation was not the same command.
+**This section first read "it is only visible under `--jdk-only-report`". That
+was wrong, and wrong in the direction that makes a bug look narrower than it
+is.** Corrected the same day, from a probe written for something else.
+
+What was true: the suite adds `--jdk-only-report` to every vector under
+`--jdk-only`, and my first bare invocation of `RJdkEnumerations` passed 3/3
+while the suite's failed 3/3. A vector that passes by hand and fails in the
+suite *is* a difference in the invocation, and that reasoning was sound.
+
+What was wrong: I stopped at the first invocation difference that reproduced,
+and concluded the DEFECT needed the flag. `probes/Phase1Sweep.java` — written to
+re-adjudicate the roadmap's P1-F lane, not to chase this — drains a
+three-element `ConcurrentHashMap` and reports:
 
 ```text
-cratonvm --jdk-only                         -cp build RJdkEnumerations   0/3 fail
-cratonvm --jdk-only --jdk-only-report DIR   -cp build RJdkEnumerations   3/3 fail
+P1-F chm keys      [a, b, c]           <- fine, both modes
+P1-F chm elements  NEVER TERMINATED    <- compatible AND --jdk-only
 ```
 
-**A vector that passes when you run it by hand and fails in the suite is a
-difference in the INVOCATION until proven otherwise.** Not the JIT either:
-`--nojit` and `CRATONVM_JIT_SPILL_NARROW=0` both still fail, which ruled out
-dev's narrow-safepoint-spill work in the same merge window.
+with **no `--jdk-only-report`, no suite, and no flags at all**. Three `put`s and
+an `elements()` drain are enough. So the report flag changes only whether
+`RJdkEnumerations`' particular shape trips it; the values-cursor defect is
+plainly reachable without it, in both modes.
+
+**The lesson is about a reproduction, not about this bug.** Finding *an*
+invocation difference that flips the result is not the same as finding *the*
+condition the defect needs, and the first one you hit is the one you are most
+likely to over-claim. The bisect in §3 was unaffected — it was already run
+against the real cause — but the scope statement here would have sent the owning
+lane looking at the report path.
 
 ## 3. Bisected, in two builds
 
@@ -62,14 +78,22 @@ without it the natural assumption is that the newest change broke it.
 * No revert landed. `a0168ed03` carries a measured performance win, and undoing
   another lane's landed work on my own initiative is not this branch's call.
   The revert is **verified to clear the vector** if they want it as a stopgap.
-* Not a `--jdk-only` defect in the mode sense: it reproduces because the strict
-  arm turns the report on, but the report flag is available in either mode.
+* Not a `--jdk-only` defect in the mode sense: it reproduces in COMPATIBLE mode
+  too, with no flags (§2).
 
 ## Reproduce
+
+The smallest form, no flags, either mode — three `put`s and a values drain:
+
+```bash
+cratonvm --java-home "$JDK" -cp probes/out Phase1Sweep
+```
+
+Look for `P1-F chm elements |NEVER TERMINATED|`; `P1-F chm keys` beside it is
+fine, which is what points at the values cursor.
+
+The original suite form, for the bisect record:
 
 ```bash
 cratonvm --java-home "$JDK" --jdk-only --jdk-only-report /tmp/rep -cp regression-suite/build RJdkEnumerations
 ```
-
-Expect `AssertionError: ConcurrentHashMap.elements(): hasMoreElements() never
-terminated`. Drop `--jdk-only-report` and it passes.

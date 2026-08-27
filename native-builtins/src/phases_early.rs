@@ -17238,7 +17238,16 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             }
             let val = match prop_name.as_str() {
                 "securerandom.source" => "file:/dev/urandom",
-                "keystore.type" => "PKCS12",
+                // LOWERCASE, matching the JDK's own `conf/security/java.security`,
+                // which ships `keystore.type=pkcs12`. MEASURED in both modes
+                // (`probes/KeyStoreFamilySweep.java`): `KeyStore.getDefaultType()` is
+                // specified as `Security.getProperty("keystore.type")` verbatim, so
+                // this table's spelling IS the method's answer -- HotSpot "pkcs12",
+                // this VM "PKCS12". Harmless to `KeyStore.getInstance`, which is
+                // case-insensitive; not harmless to the caller that compares the
+                // default type against a literal, which is the ordinary way to ask
+                // "am I on the default store type".
+                "keystore.type" => "pkcs12",
                 "ssl.KeyManagerFactory.algorithm" => "SunX509",
                 "ssl.TrustManagerFactory.algorithm" => "PKIX",
                 _ => return Ok(Some(Value::Object(None))),
