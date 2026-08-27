@@ -5766,7 +5766,10 @@ fn call_site_is_hot(
 /// method by being RETURNED (`loadFromArray` ends in `areturn`), and per-method
 /// EA cannot scalar-replace an escaping object however good its tier. Killing
 /// it needs the accessor chain INLINED into the consuming loop first, then EA
-/// on the merged graph — which is a capability, not a gate. See
+/// on the merged graph — which is a capability, not a gate, and which landed on
+/// 2026-08-27 (`CRATONVM_JIT_IR_INLINE`). It is still not THIS gate that pays:
+/// the win is measured in the CALLER, whose own bytecode contains no `new` and
+/// which therefore never needed this lift at all. See
 /// `c2_alloc_upgrade_enabled` for the regression mechanism that keeps this off
 /// by default.
 ///
@@ -6089,7 +6092,31 @@ pub struct InlineSite {
     /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
     /// is empty at the deepest admitted level, which terminates the recursion.
     pub nested_sites: Vec<NestedInlineSite>,
+    /// IR-tier only: resolved `new` sites in the callee body,
+    /// `(callee_pc, class_id, num_fields)`.
+    ///
+    /// Empty for every site the single-pass emitter plans — its resolver
+    /// refuses a body containing `new` outright, because `try_emit_inline_body`
+    /// has no arm for one. `IrBuilder` does, and it is the arm that matters: an
+    /// accessor that allocates is exactly the body escape analysis has to see
+    /// inside its caller. Filled by `resolve_ir_inline_site` only, and a
+    /// `Deferred` target refuses the whole splice rather than leaving a row out
+    /// — a missing row bails the METHOD, not the site.
+    pub ir_new_info: Vec<(usize, u32, usize)>,
 }
+
+/// How many levels of splice-inside-a-splice the OPTIMIZING tier's resolver
+/// will plan — deeper than [`MAX_INLINE_NEST_DEPTH`], and for a reason the
+/// single-pass number does not have.
+///
+/// A partly-inlined allocation chain is worth nothing: the moment the object is
+/// passed to a call the graph cannot see through, it escapes, and escape
+/// analysis reports `scalar-replaced 0/N` exactly as it did with no inlining at
+/// all. kfusion's own chain is four levels before the allocation's last use is
+/// visible (`VolumeShort2.get` → `loadFromArray` → `Short2.<init>()V` →
+/// `Short2.<init>([S)V`), so a budget of three would have stopped one short and
+/// measured as no change.
+pub const MAX_IR_INLINE_NEST_DEPTH: usize = 6;
 
 /// How many levels of splice-inside-a-splice the resolver will plan.
 ///
@@ -6103,6 +6130,219 @@ pub struct InlineSite {
 /// (`assertEquals(int,int)` -> `assertEquals(Object,Object)` ->
 /// `objectsAreEqual`), which is the shape that motivated nesting.
 pub const MAX_INLINE_NEST_DEPTH: usize = 3;
+
+/// Whether the optimizing tier may splice callee bodies into the graph it
+/// builds. `CRATONVM_JIT_IR_INLINE=1`.
+///
+/// Opt-in, and the shipped default is OFF — but NOT for the reason this comment
+/// used to give. It said the allocation is "only HALF deleted until array
+/// scalar replacement lands beside it"; array scalar replacement landed on
+/// 2026-08-27 and the allocation is fully deleted now (`volume` 478 ->
+/// 43.9 ns/voxel, converging on its own no-wrapper control at 39.2; see
+/// `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
+///
+/// What keeps it off is the ordinary flag-flip discipline: the trades it makes
+/// — more nodes per compile, a spliced body's surviving calls losing their
+/// profile seed, compile time — are still priced on one probe and the
+/// regression suite (72/72 green with this on), not on the
+/// kafka/spring/tomcat/hibernate gauntlet. Note also that on its own it buys
+/// 2.1x here and only reaches 10.9x alongside `CRATONVM_SCALAR_DEOPT=1`, which
+/// has a soak debt of its own, so the two want pricing together.
+pub fn ir_inline_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Total appended bytecode one compile may splice, across every site and every
+/// nesting level.
+///
+/// Not a code-size budget — it bounds the WALK. Every appended byte is bytecode
+/// `IrBuilder` visits and turns into nodes, and the node count is what
+/// `ir_optimize`'s GVN and the escape-analysis connection graph scale in. Four
+/// times [`MAX_INLINE_BYTECODE_SIZE`] is room for a full accessor chain at
+/// several call sites without letting a resolver defect expand a method without
+/// limit.
+const IR_INLINE_MAX_TOTAL_BYTES: usize = 4 * MAX_INLINE_BYTECODE_SIZE;
+
+/// Distinct caller call sites one compile may splice at.
+const IR_INLINE_MAX_SITES: usize = 24;
+
+/// Append one resolved callee body — and, recursively, its own spliced callees
+/// — to `combined`, recording every side-table row the relocated body needs.
+///
+/// `caller_pc` is the pc of the `invoke` this body replaces, already in
+/// COMBINED-buffer coordinates: the compiling method's own code for a top-level
+/// site, the enclosing relocated body for a nested one. Both spaces are the
+/// same space, which is what lets one function serve both.
+///
+/// Returns `false` when the site's data is inconsistent with itself, when a
+/// nested site needs a guard the IR tier cannot emit, or when the walk budget
+/// is spent. The caller rolls `combined` back — a half-added body is worse than
+/// none, because `tables.sites` would then name a body whose `field_info` rows
+/// are missing and the builder would bail the whole METHOD at its first
+/// `getfield`.
+#[allow(clippy::too_many_arguments)]
+fn append_ir_inline_site(
+    mut site: InlineSite,
+    caller_pc: usize,
+    combined: &mut Vec<u8>,
+    tables: &mut ir::IrInlineTables,
+    owned_strings: &mut Vec<Box<str>>,
+    owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+    direct_callee_entries: &mut Vec<usize>,
+    budget: &mut usize,
+    // `(combined pc, num_jit_args)` for each virtual/interface call the spliced
+    // bodies leave behind. The planner gives each its own MIC/PIC — without one
+    // a surviving call falls back to a blind name resolution, and that trade
+    // costs far more than the frame the splice removed (measured: 47 ns to
+    // 11 000 ns per element on the `VoxelAlloc2` control arm).
+    virtual_call_sites: &mut Vec<(usize, usize)>,
+    // Rebased compact-layout rows for the spliced bodies' field accesses; goes
+    // to `ir_lower`, not to the builder, which is why it is not in
+    // `IrInlineTables`.
+    compact_fields_out: &mut HashMap<usize, (u32, bool, u8)>,
+) -> bool {
+    let code_len = site.callee_code_len;
+    if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
+        return false;
+    }
+    let (arg_local_slots, _span) =
+        compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let Some((desc_args, ret)) = static_call_shape(&site.descriptor) else {
+        return false;
+    };
+    let num_args = desc_args + usize::from(!site.callee_is_static);
+    // `compute_param_jvm_slots` counts one entry per VALUE and `static_call_shape`
+    // counts one arg per value, so these agree unless the descriptor was parsed
+    // two different ways — which is exactly the disagreement that would install
+    // an argument in the wrong local.
+    if arg_local_slots.len() != num_args {
+        return false;
+    }
+    if arg_local_slots.iter().any(|&s| s >= site.callee_max_locals) {
+        return false;
+    }
+
+    let base = combined.len();
+    combined.extend_from_slice(&site.callee_code[..code_len]);
+    *budget -= code_len;
+
+    tables.sites.insert(
+        caller_pc,
+        ir::IrInlineSite {
+            base,
+            code_len,
+            num_args,
+            max_locals: site.callee_max_locals,
+            arg_local_slots: arg_local_slots.iter().map(|&s| s as u32).collect(),
+            returns_value: ret != b'V',
+        },
+    );
+    for &(cpc, field_index, type_tag) in &site.field_info {
+        tables.field_info.insert(base + cpc, (field_index, type_tag));
+    }
+    // The compact byte offset for each of those fields, rebased the same way.
+    // Without it `ir_lower` routes every spliced field access through the
+    // checked `jit_getfield` helper — a boundary note, a region walk and a
+    // 16-byte atomic cell read per access, which the single-pass backend
+    // measured at 4.7x. The descriptor tag comes from the `field_info` row
+    // above, so the two cannot disagree about what kind of field this is; a
+    // compact row with no matching `field_info` row is dropped rather than
+    // guessed.
+    for &(cpc, byte_offset, is_ref) in &site.compact_field_info {
+        if let Some(&(_, _, type_tag)) = site.field_info.iter().find(|(fpc, _, _)| *fpc == cpc) {
+            compact_fields_out.insert(base + cpc, (byte_offset, is_ref, type_tag));
+        }
+    }
+    for &(cpc, class_id, num_fields) in &site.ir_new_info {
+        tables.new_info.insert(base + cpc, (class_id, num_fields));
+    }
+    // The resolver PROVED these bodies are no-ops, which is what
+    // `object_init_pcs` means — elidable on any receiver, not only on a fresh
+    // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
+    // `super()` on `this` every constructor starts with.
+    for &cpc in &site.elided_invoke_pcs {
+        tables.object_init_pcs.insert(base + cpc);
+    }
+
+    // Nested splices first, so their callee pcs are known before the remaining
+    // invokes are interned as ordinary calls. A pc carries BOTH a nested site
+    // and an `invoke_targets` entry — the resolver records them additively so
+    // the single-pass emitter can fall back mid-body. `IrBuilder` has no such
+    // fallback: it checks `inline_sites` first and never consults `invoke_info`
+    // for that pc, so installing both would leave a dead row, and installing
+    // the call instead of the splice would leave the allocation escaping.
+    let nested = std::mem::take(&mut site.nested_sites);
+    let mut nested_pcs: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(nested.len());
+    for n in nested {
+        // A guarded nested site needs a receiver class-id compare the IR tier
+        // has no node for. `resolve_ir_inline_site` never produces one (it
+        // routes every kind through the statically-bound arm and refuses a
+        // target that is not provably monomorphic); refuse rather than splice
+        // it unguarded, which would be silent wrong code at an overriding site.
+        if n.guard_class_id != 0 {
+            return false;
+        }
+        nested_pcs.insert(n.callee_pc);
+        if !append_ir_inline_site(
+            n.site,
+            base + n.callee_pc,
+            combined,
+            tables,
+            owned_strings,
+            owned_invoke_infos,
+            direct_callee_entries,
+            budget,
+            virtual_call_sites,
+            compact_fields_out,
+        ) {
+            return false;
+        }
+    }
+
+    // The calls the body makes that stay calls. Interned into THIS compile's
+    // arenas by the same routine the single-pass path uses, so the `&'static
+    // str` names and the baked `*const JitInvokeInfo` have identical lifetime
+    // rules on both paths.
+    intern_inline_invoke_targets(
+        &mut site,
+        owned_strings,
+        owned_invoke_infos,
+        direct_callee_entries,
+    );
+    for r in &site.resolved_invoke_infos {
+        if nested_pcs.contains(&r.callee_pc) {
+            continue;
+        }
+        tables
+            .invoke_info
+            .insert(base + r.callee_pc, (r.info_addr, r.num_jit_args, r.return_type));
+        // `invoke_kind` lives on the resolver-side target, not on the interned
+        // row; 0 = virtual, 2 = interface are the two the inline-cache cascade
+        // serves.
+        if site
+            .invoke_targets
+            .iter()
+            .any(|(pc, t)| *pc == r.callee_pc && matches!(t.invoke_kind, 0 | 2))
+        {
+            virtual_call_sites.push((base + r.callee_pc, r.num_jit_args));
+        }
+    }
+    true
+}
+
+/// Merge one top-level site's rows into the compile's plan. Split out so the
+/// roll-back path has something to NOT call.
+fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTables) {
+    into.sites.extend(from.sites);
+    into.field_info.extend(from.field_info);
+    into.invoke_info.extend(from.invoke_info);
+    into.new_info.extend(from.new_info);
+    into.object_init_pcs.extend(from.object_init_pcs);
+}
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
 /// `*const JitInvokeInfo`s its emitter can bake, interning the names into the
@@ -7233,6 +7473,7 @@ mod profile_guided_inlining_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
@@ -8009,6 +8250,7 @@ mod inline_selection_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
@@ -13984,6 +14226,44 @@ fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Optio
     }
 }
 
+/// The constant element index of an `Op::ArrayLoad` / `Op::ArrayStore`, or
+/// `None` when the index is not a compile-time constant.
+///
+/// The array analogue of [`ir_load_store_field_index`], and it has to be a
+/// separate function because the operand sits at a different slot: an array
+/// access is `[ctrl, mem, array, index, (value)]`, so the index is input 3 for
+/// both — but the *base* is input 2 rather than the field node's `offset` being
+/// at 3. Keeping them apart is what stops a field index and an element index
+/// being read out of each other's slot.
+fn ir_array_const_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    if !matches!(node.op, ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_)) {
+        return None;
+    }
+    let index_node = *node.inputs.get(3)?;
+    match ir_graph.nodes.get(index_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
+/// The constant length of an `Op::NewArray` (`[ctrl, mem, length]`), or `None`.
+///
+/// A negative constant is `None` rather than a length: `newarray -1` throws
+/// `NegativeArraySizeException`, and deleting the allocation would delete the
+/// throw.
+fn ir_new_array_const_length(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    if !matches!(node.op, ir::Op::NewArray { .. }) {
+        return None;
+    }
+    let len_node = *node.inputs.get(2)?;
+    match ir_graph.nodes.get(len_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
 /// Convert an `ir::Graph` to an `escape_analysis::Graph` for standalone
 /// escape analysis.  The two modules define independent `Op` / `Node` /
 /// `Graph` types, so we translate node-by-node.  Returns both the EA graph
@@ -14059,6 +14339,43 @@ fn escape_analysis_from_ir(
             // and neither escapes anything — so misclassifying a node INTO
             // either variant would be a relaxation. Both predicates are
             // therefore written to fire only on a shape that provably is one.
+            // ── Array element access ──────────────────────────────────
+            //
+            // An element access with a CONSTANT index is a field access on the
+            // array: slot `i` of an N-slot allocation. Mapping it that way is
+            // what lets a small constant-length array be scalar-replaced at
+            // all, and it is sound in both directions:
+            //
+            //   * the array is an allocation of THIS graph -> the analysis
+            //     resolves the holder, `field_in_range` checks `i < len`
+            //     against the array's own proven length, and an out-of-range
+            //     constant index is refused (its `ArrayIndexOutOfBounds` throw
+            //     must survive);
+            //   * the array is anything else (a `Param`, a call result) -> the
+            //     holder resolves to no allocation, `field_in_range` answers
+            //     false, and the access takes the same conservative path a
+            //     field access on an unknown holder takes.
+            //
+            // A NON-constant index keeps the old `EaOp::Call` mapping, which
+            // arg-escapes the array reference. That is the fail-closed answer:
+            // the access names a slot the analysis cannot identify, so no slot
+            // may be folded and the array must stay on the heap. It also means
+            // an array with even ONE unresolvable access is refused as a whole,
+            // which is exactly right.
+            ir::Op::ArrayLoad(_) => match ir_array_const_index(ir_graph, i as ir::NodeId) {
+                Some(idx) => escape_analysis::Op::Load(idx),
+                None => escape_analysis::Op::Call,
+            },
+            ir::Op::ArrayStore(_) => match ir_array_const_index(ir_graph, i as ir::NodeId) {
+                Some(idx) => escape_analysis::Op::Store(idx),
+                None => escape_analysis::Op::Call,
+            },
+            // A `newarray` whose length is a compile-time constant has a slot
+            // count, which is the one fact array scalar replacement needs.
+            ir::Op::NewArray { element_type, .. } => escape_analysis::Op::NewArray {
+                element_type: *element_type,
+                length: ir_new_array_const_length(ir_graph, i as ir::NodeId),
+            },
             ir::Op::Cmp(_) if ir_cmp_is_ref_compare(ir_graph, ir_node) => {
                 escape_analysis::Op::RefCompare
             }
@@ -14071,6 +14388,43 @@ fn escape_analysis_from_ir(
         // Don't wire inputs yet — we need all id_map entries populated.
         let ea_id = ea.add_node(ea_op, vec![]);
         id_map[i] = ea_id;
+    }
+
+    // Block side table (`escape_analysis::Graph::blocks`). Only the ops whose
+    // control is pinned at input 0 get an entry, and only when that input names
+    // a real control node — a compact or malformed node contributes nothing and
+    // is then simply not eligible for the one-block dominance proof.
+    //
+    // `Op::Guard` is deliberately absent from the "is this a block boundary"
+    // question: it produces no control token (`ir::Op::is_control`), so a null
+    // or bounds check does not end a block and the accesses either side of it
+    // still name the same control node.
+    for i in 0..ir_node_count {
+        let ir_node = &ir_graph.nodes[i];
+        if !matches!(
+            ir_node.op,
+            ir::Op::Load(_)
+                | ir::Op::Store(_)
+                | ir::Op::ArrayLoad(_)
+                | ir::Op::ArrayStore(_)
+                | ir::Op::New { .. }
+                | ir::Op::NewArray { .. }
+        ) {
+            continue;
+        }
+        let Some(&ctrl) = ir_node.inputs.first() else {
+            continue;
+        };
+        let Some(ctrl_node) = ir_graph.nodes.get(ctrl as usize) else {
+            continue;
+        };
+        if !ctrl_node.op.is_control() {
+            continue;
+        }
+        let (ea_id, ea_ctrl) = (id_map[i], id_map[ctrl as usize]);
+        if ea_id != usize::MAX && ea_ctrl != usize::MAX {
+            ea.blocks.insert(ea_id, ea_ctrl);
+        }
     }
 
     // Second pass: wire inputs (skip Start/Return whose inputs are already set).
@@ -14095,6 +14449,29 @@ fn escape_analysis_from_ir(
                 vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
             }
             ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            // Array element access, re-packed into the same compact layout the
+            // EA graph reads field access in: `Store [holder, value]`,
+            // `Load [holder]`. The array reference is input 2 and the stored
+            // value input 4; the index is NOT an EA operand at all -- it was
+            // folded into the `Op::Load(i)` / `Op::Store(i)` payload above.
+            // Forwarding verbatim would make the CONTROL edge the holder.
+            //
+            // Guarded on the node still being classified as a field op: an
+            // access whose index was not constant kept the `EaOp::Call`
+            // mapping, and a `Call` must keep ALL its reference operands or the
+            // arg-escape rule stops seeing the array.
+            ir::Op::ArrayStore(_)
+                if ir_node.inputs.len() >= 5
+                    && matches!(ea.nodes[ea_id].op, escape_analysis::Op::Store(_)) =>
+            {
+                vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
+            }
+            ir::Op::ArrayLoad(_)
+                if ir_node.inputs.len() >= 4
+                    && matches!(ea.nodes[ea_id].op, escape_analysis::Op::Load(_)) =>
+            {
+                vec![map_id(ir_node.inputs[2])]
+            }
             // EA layout contract: the locked reference is input 0. The IR node
             // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`, so
             // forwarding verbatim would attribute the monitor to the MEMORY
@@ -14284,8 +14661,12 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             class_id: *class_id,
             num_fields: *num_fields,
         },
+        // No graph to ask, so no length: `None` is the fail-closed answer and
+        // makes the array a non-candidate. `escape_analysis_from_ir` fills the
+        // length itself for the nodes it bridges.
         ir::Op::NewArray { element_type, .. } => EaOp::NewArray {
             element_type: *element_type,
+            length: None,
         },
         ir::Op::Call { .. } => EaOp::Call,
         // cov-01. `EaOp::Call` is the conservative mapping and the honest one:
@@ -14302,13 +14683,15 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             EaOp::Call
         }
         ir::Op::ArrayLength => EaOp::ArrayLength,
-        // Array element access escapes its array reference (conservative): map to
-        // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
-        // Today the array is always a Param/external ref (the builder bails on
-        // `newarray`, so a `new[]` never reaches here) and so is never a
-        // scalar-replacement candidate, but routing through `Call` (rather than
-        // the no-op `Other`) keeps a hypothetical future `new[]` from being
-        // wrongly scalar-replaced — the IR lowerer has no scalar-array path.
+        // Array element access, for the callers that have no graph to ask.
+        // `escape_analysis_from_ir` no longer reaches this arm: it classifies
+        // an access with a CONSTANT index as a field access on the array (see
+        // its first pass), which is what makes a small constant-length array
+        // replaceable. Everything else — a non-constant index, and every
+        // caller of this graph-free function — keeps `EaOp::Call`, whose
+        // handling marks every reference input `ArgEscape` and so refuses the
+        // array. That is the fail-closed answer for an access naming a slot
+        // nobody could identify.
         ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_) => EaOp::Call,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
@@ -14595,23 +14978,54 @@ fn plan_scalar_replacement(
     reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
     info: &escape_analysis::ScalarReplacementInfo,
     deopt_descriptor_available: bool,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
 ) -> Option<EaScalarPlan> {
     let new_node = *reverse_map.get(&info.alloc_node)?;
-    if !matches!(ir_graph.node_opt(new_node)?.op, ir::Op::New { .. }) {
+    // An array candidate names an `Op::NewArray` and its slots are reached by
+    // `Op::ArrayLoad` / `Op::ArrayStore`; an object candidate names an
+    // `Op::New` and its fields by `Op::Load` / `Op::Store`. The two node kinds
+    // are checked against `info.array_element_type` rather than accepted
+    // interchangeably, so a candidate whose EA-side and IR-side shapes disagree
+    // is refused instead of half-applied.
+    let is_array = info.array_element_type.is_some();
+    let alloc_op_matches = match &ir_graph.node_opt(new_node)?.op {
+        ir::Op::New { .. } => !is_array,
+        ir::Op::NewArray { .. } => is_array,
+        _ => false,
+    };
+    if !alloc_op_matches {
         return None;
     }
 
-    // The field index a load/store accesses. Must match the index the EA bridge
-    // keyed its field edges by: the real index from the `Const` offset operand
-    // of a full-layout production node, falling back to the `MemKind`-derived
-    // index for a compact / hand-built one.
+    // The slot index a load/store accesses. Must match the index the EA bridge
+    // keyed its edges by: for a field, the real index from the `Const` offset
+    // operand of a full-layout production node, falling back to the
+    // `MemKind`-derived index for a compact / hand-built one; for an array
+    // element, the `Const` index operand.
     let field_index = |id: ir::NodeId| -> Option<usize> {
+        if is_array {
+            return ir_array_const_index(ir_graph, id);
+        }
         if let Some(f) = ir_load_store_field_index(ir_graph, id) {
             return Some(f);
         }
         match &ir_graph.node_opt(id)?.op {
             ir::Op::Load(mk) | ir::Op::Store(mk) => Some(*mk as usize),
             _ => None,
+        }
+    };
+    let load_op_matches = |id: ir::NodeId| -> bool {
+        match ir_graph.node_opt(id).map(|n| &n.op) {
+            Some(ir::Op::Load(_)) => !is_array,
+            Some(ir::Op::ArrayLoad(_)) => is_array,
+            _ => false,
+        }
+    };
+    let store_op_matches = |id: ir::NodeId| -> bool {
+        match ir_graph.node_opt(id).map(|n| &n.op) {
+            Some(ir::Op::Store(_)) => !is_array,
+            Some(ir::Op::ArrayStore(_)) => is_array,
+            _ => false,
         }
     };
 
@@ -14625,7 +15039,7 @@ fn plan_scalar_replacement(
             Some(&l) => l,
             None => continue,
         };
-        if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
+        if !load_op_matches(l) {
             return None;
         }
         // Bridge/analysis agreement check. The index itself is no longer used
@@ -14643,7 +15057,7 @@ fn plan_scalar_replacement(
             Some(&s) => s,
             None => continue,
         };
-        if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
+        if !store_op_matches(s) {
             return None;
         }
         if field_index(s).is_none() {
@@ -14720,6 +15134,26 @@ fn plan_scalar_replacement(
     // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
     // still applies: this costs the elided allocation, not the optimization.
     let mut elide_alloc = true;
+    // PINNED BY AN EARLIER ROUND'S DESCRIPTOR. Escape analysis is iterated
+    // (scalar replacement exposes scalar replacement), and a descriptor built
+    // in an earlier round can name this allocation as another object's FIELD
+    // VALUE. Deleting it WITHOUT LEAVING A RECIPE OF ITS OWN would strand that
+    // reference: the enclosing object's field would resolve to a node the
+    // lowerer cannot answer, and `frame_value_for_object` would refuse the
+    // whole enclosing object -- turning a resumable deopt point into an
+    // unresumable one.
+    //
+    // Leaving a recipe of its own is the escape hatch, and it is the normal
+    // case: the enclosing object's field then resolves to a NESTED virtual
+    // object, which the materializer has always supported (it walks the field
+    // graph and allocates a shell per distinct id). So the pin only bites when
+    // this allocation cannot be described at all.
+    if descriptor_pinned.contains(&new_node)
+        && !(deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
+    {
+        elide_alloc = false;
+    }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
         // value a frame can be rebuilt from — but it is not this pass's business
@@ -14800,6 +15234,27 @@ fn apply_ea_to_ir(
     id_map: &[escape_analysis::NodeId],
     ea_result: &escape_analysis::EscapeAnalysisResult,
 ) {
+    apply_ea_to_ir_pinned(
+        ir_graph,
+        id_map,
+        ea_result,
+        &std::collections::HashSet::new(),
+    );
+}
+
+/// [`apply_ea_to_ir`] with the set of allocations an earlier round's deopt
+/// descriptor already names as a field value, and a count of the plans it
+/// applied.
+///
+/// The count is the iteration's stopping condition: a round that applies
+/// nothing has reached the fixed point and the next round would see the same
+/// graph.
+fn apply_ea_to_ir_pinned(
+    ir_graph: &mut ir::Graph,
+    id_map: &[escape_analysis::NodeId],
+    ea_result: &escape_analysis::EscapeAnalysisResult,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
+) -> usize {
     // Build reverse map: EA NodeId → IR NodeId
     let mut reverse_map: HashMap<escape_analysis::NodeId, ir::NodeId> = HashMap::new();
     for (ir_id, &ea_id) in id_map.iter().enumerate() {
@@ -14818,30 +15273,87 @@ fn apply_ea_to_ir(
     let mut plans: Vec<EaScalarPlan> = Vec::new();
     for info in &ea_result.scalar_replaceable {
         if let Some(plan) =
-            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+            plan_scalar_replacement(
+                ir_graph,
+                &reverse_map,
+                info,
+                deopt_descriptor_available,
+                descriptor_pinned,
+            )
         {
             plans.push(plan);
         }
     }
 
-    // Materialise ONE shared zero default for every never-stored field load
-    // (the old code appended a fresh `Const(0)` per load).
-    let mut zero_default: Option<ir::NodeId> = None;
+    // Materialise ONE shared zero default PER VALUE TYPE for every never-stored
+    // slot load. One shared `Const(0)` typed `Int` was right as long as the only
+    // candidates were objects whose admitted `<init>` shapes read int-shaped
+    // fields; it is not right in general, and array scalar replacement makes
+    // the general case reachable -- a never-stored `long[]` slot forwarded to an
+    // `Int`-typed node is a 32-bit value where a 64-bit one belongs.
+    //
+    // The load node's own `ty` is the authority: it is what the consumer of the
+    // load expects, and forwarding must produce exactly that. `Long` uses
+    // `Op::Const`, `Float`/`Double` the FP constant node (`Op::ConstF`, whose
+    // payload is raw bits -- and +0.0's bits are 0 for both widths).
+    //
+    // A type this does not know how to spell a zero for (`Ref`, and the
+    // non-value types) leaves the load alone: the plan is dropped rather than
+    // answered with a guess. That is why `Op::NewArray` candidates are
+    // restricted to primitive element types -- see `MAX_SCALAR_ARRAY_LEN`'s
+    // neighbourhood in `escape_analysis`.
+    let mut zero_defaults: HashMap<ir::IrType, ir::NodeId> = HashMap::new();
     for plan in plans.iter_mut() {
-        for (_, value) in plan.loads.iter_mut() {
-            if value.is_none() {
-                let z = match zero_default {
-                    Some(z) => z,
-                    None => {
-                        let z = ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None);
-                        zero_default = Some(z);
-                        z
-                    }
-                };
-                *value = Some(z);
+        for (load, value) in plan.loads.iter_mut() {
+            if value.is_some() {
+                continue;
             }
+            let ty = match ir_graph.node_opt(*load).map(|n| n.ty) {
+                Some(t) => t,
+                None => continue,
+            };
+            let z = match zero_defaults.get(&ty) {
+                Some(&z) => Some(z),
+                None => {
+                    let made = match ty {
+                        ir::IrType::Int => Some(ir_graph.add(
+                            ir::Op::Const(0),
+                            ir::IrType::Int,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Long => Some(ir_graph.add(
+                            ir::Op::Const(0),
+                            ir::IrType::Long,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Float => Some(ir_graph.add(
+                            ir::Op::ConstF(0),
+                            ir::IrType::Float,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Double => Some(ir_graph.add(
+                            ir::Op::ConstF(0),
+                            ir::IrType::Double,
+                            vec![],
+                            None,
+                        )),
+                        _ => None,
+                    };
+                    if let Some(z) = made {
+                        zero_defaults.insert(ty, z);
+                    }
+                    made
+                }
+            };
+            *value = z;
         }
     }
+    // A load whose zero default could not be spelled leaves its plan
+    // unanswerable; drop the whole plan rather than apply it in part.
+    plans.retain(|p| p.loads.iter().all(|(_, v)| v.is_some()));
 
     // ── Phase 2: collect victims, then apply in ascending node id ────
     //
@@ -14926,6 +15438,13 @@ fn apply_ea_to_ir(
         }
     }
 
+    // How many NODES this call actually retires. The iteration in
+    // `try_compile_inner` stops when a round retires nothing -- which is the
+    // honest fixed-point signal. Counting PLANS is not: a plan whose
+    // `elide_alloc` was refused and whose loads were already forwarded by an
+    // earlier round retires nothing, and counting it would spin the loop to its
+    // bound on a graph that stopped changing.
+    let applied = victims.len();
     victims.sort_by_key(|&(id, _)| id);
     victims.dedup_by_key(|&mut (id, _)| id);
 
@@ -15016,6 +15535,7 @@ fn apply_ea_to_ir(
         ir_graph.nodes[idx].op = ir::Op::Dead;
         ir_graph.nodes[idx].inputs.clear();
     }
+    applied
 }
 
 /// Build the [`ir_lower::ScalarReplacementMap`] that drives guard-surviving
@@ -15037,6 +15557,7 @@ fn build_scalar_replacement_map(
     ir_graph: &ir::Graph,
     id_map: &[escape_analysis::NodeId],
     ea_result: &escape_analysis::EscapeAnalysisResult,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
 ) -> ir_lower::ScalarReplacementMap {
     let mut reverse_map: HashMap<escape_analysis::NodeId, ir::NodeId> = HashMap::new();
     for (ir_id, &ea_id) in id_map.iter().enumerate() {
@@ -15058,7 +15579,13 @@ fn build_scalar_replacement_map(
         // compiled frame did. `plan_scalar_replacement` is pure and runs on this
         // same pre-apply graph, so the two answers are the same answer.
         let elided =
-            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+            plan_scalar_replacement(
+                ir_graph,
+                &reverse_map,
+                info,
+                deopt_descriptor_available,
+                descriptor_pinned,
+            )
                 .is_some_and(|p| p.elide_alloc);
         if !elided {
             continue;
@@ -15125,6 +15652,9 @@ fn virtual_object_info_for(
     Some((
         ir_new,
         ir_lower::VirtualObjectInfo {
+            // An array is described by its element type and its LENGTH
+            // (`num_fields`); `class_id` is meaningless for one and is not read.
+            array_element_type: info.array_element_type,
             class_id: info.class_id,
             num_fields: info.num_fields,
             field_values,
@@ -15655,6 +16185,112 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
         .read()
         .get(method_key)
         .map(|(measured, _)| measured.saturating_mul(2))
+}
+
+/// Methods whose IR build bailed on a `new` whose class was not loaded YET.
+///
+/// Keyed like [`jit_bail_list`]. Bounded by [`MAX_DEFERRED_NEW_RETRIES`]
+/// entries so a pathological run cannot grow it without limit.
+///
+/// The value is the retry state, and it is what makes the grant ONE-SHOT rather
+/// than a loop: `0` means "one retry is owed", `1` means "already granted". A
+/// method whose class is STILL not loaded on the retry bails a second time and
+/// [`note_deferred_new_bail`] then declines to re-arm it, so a class that never
+/// loads cannot make the same method re-enter the optimizing pipeline forever.
+fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>> {
+    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// How many methods may be remembered for a deferred-`new` retry at once.
+const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
+
+/// Record that this method's IR build bailed on a `new` site whose class was
+/// not loaded at the time — a TRANSIENT refusal, not a property of the class
+/// file.
+///
+/// `resolve_jit_new_site` deliberately never runs a user `ClassLoader.loadClass`
+/// from inside a compile, so a `new` of a class nothing has touched yet reports
+/// `JitNewSite::Deferred`, gets no `new_info` row, and the IR builder's `0xbb`
+/// arm bails the whole method. The class then loads moments later — often on
+/// the very next line of the compile log, because the constructor is the next
+/// thing to run — and nothing ever looked again:
+///
+/// ```text
+/// [ir] admission RJitGc.make(II)LRJitGc$Tree;: admitted to the optimizing pipeline
+/// [ir] new-site DEFERRED: RJitGc$Tree ... loaded_anywhere=false
+/// [ir] IrBuilder::build returned None for RJitGc.make(II)LRJitGc$Tree; — no IR body
+/// ...
+/// [ir] admission RJitGc$Tree.<init>(I)V: admitted to the optimizing pipeline   <- it is loaded now
+/// ```
+///
+/// `make` never appears again: one attempt, single-pass for the life of the
+/// process. That is the same shape as the code-buffer shortfall two functions
+/// up — a measurement-like refusal that the next attempt would not repeat — and
+/// it gets the same treatment.
+///
+/// The memo is consumed by [`take_deferred_new_retry`], so it grants exactly
+/// ONE extra attempt: a class that is still not loaded on the retry bails
+/// again, records nothing, and the method settles on single-pass as before.
+pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &str) {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let mut set = deferred_new_retries().write();
+    // `or_insert` and not `insert`: a method whose retry was already granted
+    // stays at `1` and is never re-armed.
+    if set.len() < MAX_DEFERRED_NEW_RETRIES || set.contains_key(&h) {
+        let armed = !set.contains_key(&h);
+        set.entry(h).or_insert(0);
+        if armed && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor}"
+            );
+        }
+    }
+}
+
+/// Take (clear) this method's one deferred-`new` retry, if it has one.
+///
+/// The C1->C2 supersede door asks this: a method here is admitted to one more
+/// optimizing attempt even though its bytecode contains a `new`, which
+/// [`c2_upgrade_would_engage`] otherwise refuses without
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE`. That refusal exists to avoid trading a
+/// cheap inline TLAB bump for a more optimized body on a method whose
+/// allocations escape anyway; it is not the right answer for a method that was
+/// never given a chance to have its allocation looked at.
+pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let mut set = deferred_new_retries().write();
+    let granted = match set.get_mut(&h) {
+        Some(state @ 0) => {
+            *state = 1;
+            true
+        }
+        _ => false,
+    };
+    if granted && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
+    }
+    granted
+}
+
+/// Number of methods currently OWED a deferred-`new` retry. Diagnostics.
+pub fn deferred_new_retry_count() -> usize {
+    deferred_new_retries()
+        .read()
+        .values()
+        .filter(|&&v| v == 0)
+        .count()
 }
 
 /// Has `method_key` used up its [`MAX_CODE_BUFFER_RETRIES`] re-lowerings?
@@ -16727,6 +17363,10 @@ pub fn try_compile(
         cp_invokedynamic_descriptor_resolver,
         None,
         None,
+        // No IR-tier inline resolver either: `try_compile`'s callers are this
+        // crate's own tests, which have no class manager to resolve a callee
+        // body against. `None` keeps `IrBuilder` splicing nothing.
+        None,
         // No VM in scope here. The latch is what this wrapper's callers (this
         // crate's tests, and any VM site not yet threading a policy) have
         // always read, and no test latches it, so they keep reading
@@ -16882,6 +17522,14 @@ pub fn try_compile_with_invokespecial_resolver(
     // answer — refuses the speculation; it never falls back to the other
     // resolver.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
+    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
+    // VM). Separate from `inline_resolver` because the two answer different
+    // questions: that one resolves what the single-pass emitter can splice,
+    // which refuses `new`, array access and `arraylength` — the three shapes an
+    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
+    // splices nothing, which is byte-identical to the pre-inlining IR path.
+    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
     // JDK-only execution policy for THIS VM's compilations.
     //
     // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
@@ -17013,6 +17661,7 @@ pub fn try_compile_with_invokespecial_resolver(
         cp_invokedynamic_descriptor_resolver,
         class_id_name_resolver,
         receiver_inline_resolver,
+        ir_inline_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
         &admission,
@@ -17067,6 +17716,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 cp_invokedynamic_descriptor_resolver,
                 class_id_name_resolver,
                 receiver_inline_resolver,
+                ir_inline_resolver,
                 &mut retry_backend_attempted,
                 self_call_identity_stable,
                 &admission,
@@ -18120,6 +18770,14 @@ fn try_compile_inner(
     // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
     // See `try_compile`.
     receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
+    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
+    // VM). Separate from `inline_resolver` because the two answer different
+    // questions: that one resolves what the single-pass emitter can splice,
+    // which refuses `new`, array access and `arraylength` — the three shapes an
+    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
+    // splices nothing, which is byte-identical to the pre-inlining IR path.
+    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -19037,6 +19695,12 @@ fn try_compile_inner(
         // and the pcs of elidable `<init>()V` invokespecials. Without it, the
         // builder bails on `new`/`invokespecial`, so allocation-bearing methods
         // stay on the single-pass backend exactly as before (inert default).
+        // Was any `new` site DEFERRED rather than merely unresolvable? That
+        // distinction is what makes an IR bail worth retrying: a deferred class
+        // is one nothing has loaded YET, and the very next thing to run is
+        // usually its constructor. Read again after `IrBuilder::build`, so the
+        // retry is recorded only when the build actually LOST the method.
+        let mut any_deferred_new = false;
         if let (Some(elidable_resolver), Some(new_resolver)) =
             (cp_elidable_init_resolver, cp_new_resolver)
         {
@@ -19049,13 +19713,16 @@ fn try_compile_inner(
                     // DOES compile the site (through the CP-indexed helper).
                     // That is strictly better than the pre-fix behaviour, where
                     // the site bailed BOTH backends.
-                    if let Some(JitNewSite::Resolved {
-                        class_id,
-                        num_fields,
-                        ..
-                    }) = new_resolver(cp_idx)
-                    {
-                        new_info_map.insert(pc, (class_id, num_fields));
+                    match new_resolver(cp_idx) {
+                        Some(JitNewSite::Resolved {
+                            class_id,
+                            num_fields,
+                            ..
+                        }) => {
+                            new_info_map.insert(pc, (class_id, num_fields));
+                        }
+                        Some(JitNewSite::Deferred { .. }) => any_deferred_new = true,
+                        _ => {}
                     }
                 }
                 let mut trivial_init_pcs = std::collections::HashSet::new();
@@ -19977,13 +20644,156 @@ fn try_compile_inner(
                 }
             }
         }
+        // ── IR-tier inlining ────────────────────────────────────────────
+        //
+        // Resolve a body for each admitted call site and relocate it into a
+        // COMBINED buffer that `build` walks: the compiling method's code
+        // first, then one copy of each spliced body after it. The builder jumps
+        // `pc` into a body at its `invoke` and back out at its return; JVM
+        // branch offsets are relative, so a whole body moves without rewriting.
+        //
+        // This is the missing first half of deleting a short-lived wrapper. An
+        // accessor that `areturn`s a fresh object shows escape analysis an
+        // object that leaves its own method, and `scalar-replaced 0/N` is the
+        // only answer per-method EA can give — at any tier, however good.
+        // Inlining the chain into its consuming loop first is what lets the
+        // object die where it is used. See `ir::IrInlineSite`.
+        let mut ir_combined: Option<Vec<u8>> = None;
+        // `(start, end, invoke_bci)` per relocated region, for `ir_lower`'s
+        // `resume_bci`. A top-level site's own body and every body nested inside
+        // it are appended contiguously (`append_ir_inline_site` writes its own
+        // code, then recurses), so one range covers the whole chain.
+        let mut ir_spliced_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        if ir_inline_enabled() {
+            if let (Some(ir_resolver), Some(invoke_resolver)) =
+                (ir_inline_resolver, cp_invoke_resolver)
+            {
+                let mut combined: Vec<u8> = code[..code_len.min(code.len())].to_vec();
+                let mut tables = ir::IrInlineTables::default();
+                let mut budget = IR_INLINE_MAX_TOTAL_BYTES;
+                let mut sites_planned = 0usize;
+                for &(pc, cp_idx, _opcode) in &scan.invoke_ops {
+                    if sites_planned >= IR_INLINE_MAX_SITES || budget == 0 {
+                        break;
+                    }
+                    let Some((cn, mn, desc)) = invoke_resolver(cp_idx) else {
+                        continue;
+                    };
+                    let Some(site) = ir_resolver(&cn, &mn, &desc) else {
+                        continue;
+                    };
+                    // Per-site all-or-nothing. `combined` is truncated and the
+                    // budget restored on refusal, and the site's rows go into a
+                    // scratch table that is simply dropped — so a body that does
+                    // not fit leaves the plan exactly as it was, rather than
+                    // leaving `sites` naming a body with no `field_info`.
+                    let mark = combined.len();
+                    let budget_mark = budget;
+                    let mut sub = ir::IrInlineTables::default();
+                    let mut sub_vcalls: Vec<(usize, usize)> = Vec::new();
+                    let mut sub_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+                    let ok = append_ir_inline_site(
+                        site,
+                        pc,
+                        &mut combined,
+                        &mut sub,
+                        &mut ir_call_strings,
+                        &mut ir_call_infos,
+                        &mut ir_direct_callee_entries,
+                        &mut budget,
+                        &mut sub_vcalls,
+                        &mut sub_compact,
+                    );
+                    if ok {
+                        merge_ir_inline_tables(&mut tables, sub);
+                        // Same gate the caller's own rows are behind, so
+                        // the spliced bodies and the method around them cannot
+                        // disagree about whether compact offsets are in play.
+                        if cratonvm_types::compact_ref_fields_enabled() {
+                            ir_compact_fields.extend(sub_compact);
+                        }
+                        // One inline cache per surviving virtual call. Keyed by
+                        // the call's own combined-buffer pc, which is why the
+                        // spliced nodes keep those pcs — see `ir::IrInlineSite`.
+                        // No profile seed: receiver counts are recorded against
+                        // the bci of the method that was EXECUTING, and a
+                        // relocated pc is not one of those. The first dispatch
+                        // rings the helper, which installs the target, and the
+                        // guard hits from then on.
+                        for (vpc, num_args) in sub_vcalls {
+                            if helpers.invoke_virtual_mic != 0
+                                && num_args >= 1
+                                && num_args + 1 <= ir_entry_abi_reg_count()
+                            {
+                                let mic = Box::new(JitMICSlot::new_at(vpc));
+                                let pic = Box::new(JitPICSlot::new_at(vpc));
+                                pic.seed_from_mic(&mic, false);
+                                let mic_addr = &*mic as *const JitMICSlot as usize;
+                                let pic_addr = &*pic as *const JitPICSlot as usize;
+                                ir_mic_boxes.push(mic);
+                                ir_pic_boxes.push(pic);
+                                ir_ic_slots.insert(vpc, (mic_addr, pic_addr));
+                            }
+                        }
+                        ir_spliced_ranges.push((mark, combined.len(), pc));
+                        sites_planned += 1;
+                    } else {
+                        combined.truncate(mark);
+                        budget = budget_mark;
+                    }
+                }
+                if sites_planned > 0 {
+                    // The call at a spliced pc is not emitted, so its
+                    // direct-call entry and its inline-cache pair describe
+                    // nothing. Dropping them keeps `_direct_callee_entries` —
+                    // which `prepare_for_publication` pins and refuses to publish
+                    // an unresolvable entry from — free of targets this artifact
+                    // never calls.
+                    for &pc in tables.sites.keys() {
+                        if pc < code_len {
+                            ir_direct_calls.remove(&pc);
+                            ir_ic_slots.remove(&pc);
+                        }
+                    }
+                    // `resume_bci` scans these linearly and assumes increasing
+                    // starts. They are pushed in plan order, which is already
+                    // increasing, but sorting makes that a property of the data
+                    // rather than of the loop above.
+                    ir_spliced_ranges.sort_unstable();
+                    if ir_stage_reporting() {
+                        eprintln!(
+                            "[ir] inline-plan {}.{}{}: {} site(s), {} spliced bod{}, {} bytes appended",
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
+                            sites_planned,
+                            tables.sites.len(),
+                            if tables.sites.len() == 1 { "y" } else { "ies" },
+                            combined.len() - code_len,
+                        );
+                    }
+                    // Two sentinel bytes, exactly as a method's own bytecode
+                    // carries: the last relocated body ends in a 1-byte return,
+                    // but a reader that peeks past the final instruction must
+                    // land on zeroes rather than on whatever follows the Vec.
+                    combined.push(0);
+                    combined.push(0);
+                    builder.apply_inline_tables(tables);
+                    ir_combined = Some(combined);
+                }
+            }
+        }
+
         // Phase 2 (build). `nodes_built` is recorded straight after, so the
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
         note_jit_pipeline_stage(JIT_STAGE_BUILD);
     let metrics_build = metrics.phase(metrics::Phase::Build);
-        let built = builder.build(code, code_len);
+        // `code_len` stays the COMPILING method's length whichever buffer this
+        // is: everything past it is relocated callee code, unreachable from pc
+        // 0 and walked only through a splice.
+        let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
         drop(metrics_build);
         if let Some(g) = built.as_ref() {
             metrics.set_nodes_built(g.nodes.len());
@@ -20034,6 +20844,17 @@ fn try_compile_inner(
         // replacement could not fire on it — the signal that the IR builder is
         // missing an opcode the method uses (this is how the `astore` gap, which
         // silently disabled scalar-new on ALL real javac allocations, surfaced).
+        // Remembered for ONE retry, and only now that the build has actually
+        // lost the method: a deferred site the builder never reached (dead
+        // code) would otherwise have cost a wasted C2 attempt.
+        // `take_deferred_new_retry` clears it.
+        if built.is_none() && any_deferred_new {
+            note_deferred_new_bail(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         if built.is_none() && ir_stage_reporting() {
             eprintln!(
                 "[ir] IrBuilder::build returned None for {}.{}{} — no IR body",
@@ -20170,81 +20991,183 @@ fn try_compile_inner(
                     note_jit_pipeline_stage(JIT_STAGE_EA);
     let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
-                    let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
-                    // Cold-path information (docs/jit/escape-analysis.md §6.3).
-                    // Without this `EscapeAnalysisResult::partial_escapes` is
-                    // always empty and `EscapeState::PartialEscape` is dead. It
-                    // is additive and reported-only: no acting consumer reads a
-                    // refined state, so an empty `ir_branch_hints` (profiling
-                    // off, the default) leaves the analysis byte-identical.
-                    ea_mark_cold_from_branch_hints(
-                        &mut ea_graph,
-                        &graph,
-                        &id_map,
-                        &ir_branch_hints,
-                    );
-                    let ea_result = escape_analysis::analyze_escapes(&ea_graph);
-                    // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
-                    // allocation-bearing method, report how many of its `new`s
-                    // escape analysis scalar-replaced. This proves the path is
-                    // actually exercised on real bytecode (a non-vacuous soak):
-                    // `scalar_replaceable < ir_news` means some `new` escaped and
-                    // the method will bail to single-pass via the surviving-New
-                    // gate below.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
-                        let ir_news = graph
-                            .nodes
-                            .iter()
-                            .filter(|n| {
-                                matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
-                            })
-                            .count();
-                        if ir_news > 0 {
-                            eprintln!(
-                                "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
-                                cached.class_name,
-                                cached.method_name,
-                                cached.method_descriptor,
-                                ea_result.scalar_replaceable.len(),
-                                ir_news,
-                            );
+                    // ── ESCAPE ANALYSIS IS ITERATED ──────────────────────
+                    //
+                    // Scalar replacement EXPOSES scalar replacement. The shape
+                    // that forced this is a wrapper object holding a small
+                    // array: the array's only non-element use is the `putfield`
+                    // that publishes it into the wrapper, so round 1 refuses it
+                    // (`StoredIntoAnotherObject`) while replacing the wrapper.
+                    // Round 1's applier then marks that store dead and forwards
+                    // every read of the field to the array node itself -- so in
+                    // round 2 the array has nothing but element accesses left
+                    // and is replaceable. One pass could only ever delete one of
+                    // the two allocations `new Short2()` makes.
+                    //
+                    // Each round is the same sound analysis run on a graph the
+                    // previous round left sound, so nothing here relaxes a
+                    // proof; the loop only gives the existing proof a second
+                    // look at a smaller problem. Bounded by `MAX_EA_ROUNDS`,
+                    // and it stops as soon as a round applies nothing -- which
+                    // is the overwhelmingly common case on the first round, so
+                    // a method with no replaceable allocation pays exactly one
+                    // analysis, as before.
+                    const MAX_EA_ROUNDS: usize = 3;
+                    // Allocations an already-built descriptor names as another
+                    // object's field value. A later round must not delete one:
+                    // the recipe would be left naming a node the lowerer cannot
+                    // resolve. Only ever grows.
+                    let mut descriptor_pinned: std::collections::HashSet<ir::NodeId> =
+                        std::collections::HashSet::new();
+                    for _ea_round in 0..MAX_EA_ROUNDS {
+                        let applied = {
+                        // Rebuilt every round: the previous round marked nodes
+                        // dead and rewired consumers, so last round's EA graph
+                        // and id_map describe a graph that no longer exists.
+                        let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                        let mut round_applied = 0usize;
+                        // Cold-path information (docs/jit/escape-analysis.md §6.3).
+                        // Without this `EscapeAnalysisResult::partial_escapes` is
+                        // always empty and `EscapeState::PartialEscape` is dead. It
+                        // is additive and reported-only: no acting consumer reads a
+                        // refined state, so an empty `ir_branch_hints` (profiling
+                        // off, the default) leaves the analysis byte-identical.
+                        ea_mark_cold_from_branch_hints(
+                            &mut ea_graph,
+                            &graph,
+                            &id_map,
+                            &ir_branch_hints,
+                        );
+                        let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                        // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
+                        // allocation-bearing method, report how many of its `new`s
+                        // escape analysis scalar-replaced. This proves the path is
+                        // actually exercised on real bytecode (a non-vacuous soak):
+                        // `scalar_replaceable < ir_news` means some `new` escaped and
+                        // the method will bail to single-pass via the surviving-New
+                        // gate below.
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                            let ir_news = graph
+                                .nodes
+                                .iter()
+                                .filter(|n| {
+                                    matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
+                                })
+                                .count();
+                            if ir_news > 0 {
+                                eprintln!(
+                                    "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
+                                    cached.class_name,
+                                    cached.method_name,
+                                    cached.method_descriptor,
+                                    ea_result.scalar_replaceable.len(),
+                                    ir_news,
+                                );
+                                // A count says how many objects survived; it does
+                                // not say which fact kept them. Report EVERY
+                                // allocation with its verdict, so a `0/N` is a lead
+                                // rather than the start of a guessing round -- and
+                                // so an allocation the analysis never even
+                                // CONSIDERED is visible rather than absent.
+                                let replaced: std::collections::HashSet<usize> = ea_result
+                                    .scalar_replaceable
+                                    .iter()
+                                    .map(|i| i.alloc_node)
+                                    .collect();
+                                for (ea_id, ea_node) in ea_graph.nodes.iter().enumerate() {
+                                    let kind = match ea_node.op {
+                                        escape_analysis::Op::New { .. } => "new",
+                                        escape_analysis::Op::NewArray { .. } => "newarray",
+                                        _ => continue,
+                                    };
+                                    if replaced.contains(&ea_id) {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: REPLACED",
+                                            kind, ea_id,
+                                        );
+                                    } else if let Some((_, reason)) = ea_result
+                                        .scalar_refusals
+                                        .iter()
+                                        .find(|(a, _)| *a == ea_id)
+                                    {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: refused {:?}",
+                                            kind, ea_id, reason,
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: NOT CONSIDERED",
+                                            kind, ea_id,
+                                        );
+                                    }
+                                }
+                            }
                         }
-                    }
-                    // Gated on `lock_elisions`, not the flat `elide_locks`, for
-                    // the same reason `apply_ea_to_ir` reads the grouped view:
-                    // one source of truth. The two are the same offers (the flat
-                    // list is their union), so this is not a behaviour change.
-                    if !ea_result.scalar_replaceable.is_empty()
-                        || !ea_result.lock_elisions.is_empty()
-                    {
-                        // Capture guard-surviving-SR metadata (gated) BEFORE
-                        // `apply_ea_to_ir` marks the News/stores dead and clears
-                        // their (control) inputs — the dominance gate needs them.
-                        if scalar_deopt_enabled()
-                            && deopt_real_enabled()
-                            && !ea_result.scalar_replaceable.is_empty()
+                        // Gated on `lock_elisions`, not the flat `elide_locks`, for
+                        // the same reason `apply_ea_to_ir` reads the grouped view:
+                        // one source of truth. The two are the same offers (the flat
+                        // list is their union), so this is not a behaviour change.
+                        if !ea_result.scalar_replaceable.is_empty()
+                            || !ea_result.lock_elisions.is_empty()
                         {
-                            sr_map =
-                                Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
-                        }
-                        apply_ea_to_ir(&mut graph, &id_map, &ea_result);
-                        // Stop charging EA here: the verifier run below is its
-                        // own phase and must not be billed to escape analysis.
-                        drop(metrics_ea);
-                        // `apply_ea_to_ir` is a mutating pass: it kills the
-                        // scalar-replaced allocation, its stores and its loads,
-                        // and rewires their consumers. Verify the result under
-                        // the same per-pass gate as `ir_optimize`.
-                        if ir_verify::verify_enabled() {
-                            ir_verify_bail |= ir_verify_reject(
-                                &graph,
-                                "post-escape-analysis",
-                                &cached.class_name,
-                                &cached.method_name,
-                                &cached.method_descriptor,
+                            // Capture guard-surviving-SR metadata (gated) BEFORE
+                            // `apply_ea_to_ir` marks the News/stores dead and clears
+                            // their (control) inputs — the dominance gate needs them.
+                            if scalar_deopt_enabled()
+                                && deopt_real_enabled()
+                                && !ea_result.scalar_replaceable.is_empty()
+                            {
+                                let round_map = build_scalar_replacement_map(
+                                    &graph,
+                                    &id_map,
+                                    &ea_result,
+                                    &descriptor_pinned,
+                                );
+                                // Every node a recipe names as a field value is
+                                // pinned for every later round -- see
+                                // `plan_scalar_replacement`'s pin check.
+                                for vo in round_map.objects.values() {
+                                    for fv in vo.field_values.iter().flatten() {
+                                        descriptor_pinned.insert(*fv);
+                                    }
+                                }
+                                // MERGE, not replace: a round only describes the
+                                // objects IT replaced, and the lowerer needs
+                                // every round's.
+                                match sr_map.as_mut() {
+                                    Some(acc) => acc.objects.extend(round_map.objects),
+                                    None => sr_map = Some(round_map),
+                                }
+                            }
+                            round_applied = apply_ea_to_ir_pinned(
+                                &mut graph,
+                                &id_map,
+                                &ea_result,
+                                &descriptor_pinned,
                             );
+                            // `apply_ea_to_ir` is a mutating pass: it kills the
+                            // scalar-replaced allocation, its stores and its loads,
+                            // and rewires their consumers. Verify the result under
+                            // the same per-pass gate as `ir_optimize`.
+                            if ir_verify::verify_enabled() {
+                                ir_verify_bail |= ir_verify_reject(
+                                    &graph,
+                                    "post-escape-analysis",
+                                    &cached.class_name,
+                                    &cached.method_name,
+                                    &cached.method_descriptor,
+                                );
+                            }
+                        }
+                        round_applied
+                        };
+                        if applied == 0 {
+                            break;
                         }
                     }
+                    // Stop charging EA here: the verifier runs below are their
+                    // own phases and must not be billed to escape analysis.
+                    drop(metrics_ea);
                     // Recorded on BOTH paths — EA that scalar-replaced nothing
                     // still ran, and `nodes_before == nodes_after` is the
                     // finding, not a missing measurement.
@@ -20259,9 +21182,10 @@ fn try_compile_inner(
                 // optimizing tier through the shared `emit_new_array_stub`,
                 // the same way escaping object allocations already are —
                 // a live `Op::NewArray` no longer forces a fall-through to
-                // the single-pass backend. (Scalar-replaced `Op::New` nodes
-                // are already `Op::Dead`; `Op::NewArray` is never scalar
-                // -replaced at all — see `escape_analysis.rs`.)
+                // the single-pass backend. A SURVIVING one, that is: a small
+                // constant-length primitive array can now be scalar-replaced
+                // like an object and is `Op::Dead` by this point, exactly as a
+                // replaced `Op::New` is — see `escape_analysis.rs`.
                 //
                 // Unconditional pre-lowering verification. This is the gate the
                 // review's exit criterion names: "invalid IR or ABI state
@@ -20334,6 +21258,7 @@ fn try_compile_inner(
                         cached.max_locals as usize,
                         helpers,
                         &ir_branch_hints,
+                        &ir_spliced_ranges,
                         sr_map.as_ref(),
                         &ir_direct_calls,
                         &ir_ic_slots,

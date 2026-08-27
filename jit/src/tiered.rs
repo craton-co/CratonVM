@@ -789,6 +789,81 @@ impl CompilerCore {
     /// already queued, already at C2, has bailed out of C2, or has exhausted
     /// its compile retries. Called by the worker loop AFTER
     /// [`Self::complete_task`] cleared the C1 task's queued flag.
+    /// One more C2 attempt for a method whose IR build bailed on a `new` whose
+    /// class had not loaded yet.
+    ///
+    /// [`Self::request_c2_upgrade`] minus the `current_tier >= C2` clause, and
+    /// nothing else: `queued_for_compilation`, `c2_bailout`, `ineligible`, the
+    /// tier-failure budget and the hotness gate all still apply. Dropping that
+    /// one clause is the whole point — the method IS at C2, with a single-pass
+    /// body, because the C2 attempt fell through.
+    ///
+    /// Safe to call unconditionally because the caller has already consumed a
+    /// one-shot memo (`cratonvm_jit::take_deferred_new_retry`), so a method can
+    /// reach here at most once per process.
+    pub(crate) fn request_deferred_new_retry(&self, key: &MethodKey) {
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some();
+        macro_rules! refuse {
+            ($why:expr) => {{
+                if dbg {
+                    eprintln!(
+                        "[cratonvm-jitc] deferred-new retry REFUSED {}.{}{}: {}",
+                        key.class_name, key.method_name, key.descriptor, $why
+                    );
+                }
+                return;
+            }};
+        }
+        {
+            let mut methods = self.methods.lock();
+            // `or_insert_with`, not `get_mut`. MEASURED: `get_mut` refused
+            // every method the eager first-call door compiles, with "no tier
+            // state for this method" -- that door hands the backend a method
+            // the interpreter never counted invocations for, so the manager has
+            // never seen its key. `RJitGc.make` is one, and it is the method
+            // this whole path exists for.
+            //
+            // Creating the state here is what `on_invocation` / `on_backedge`
+            // do for their own keys, and it is inert for everything else: a
+            // fresh `MethodState` is `current_tier = Interpreter`, unqueued,
+            // and every other gate below still applies.
+            let state = methods
+                .entry(key.clone())
+                .or_insert_with(|| MethodState::new(key.clone()));
+            if state.queued_for_compilation {
+                refuse!("already queued");
+            }
+            if state.c2_bailout {
+                refuse!("c2_bailout");
+            }
+            if state.ineligible {
+                refuse!("ineligible");
+            }
+            if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
+                refuse!("tier_fail_count exhausted");
+            }
+            let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
+            if gate != 0 && state.invocation_count < gate {
+                refuse!("below the c2-upgrade hotness gate");
+            }
+            if dbg {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new retry ENQUEUED {}.{}{}",
+                    key.class_name, key.method_name, key.descriptor
+                );
+            }
+            state.queued_for_compilation = true;
+            state.queued_tier = Some(CompilationTier::C2);
+        }
+        self.enqueue(CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::Low,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        });
+    }
+
     fn request_c2_upgrade(&self, key: &MethodKey) {
         {
             let mut methods = self.methods.lock();
@@ -967,6 +1042,15 @@ pub struct CompileOutcome {
     /// publish the worker loop enqueues a Low-priority C2 recompile whose
     /// publish REPLACES the C1 body in the jit cache.
     pub c2_upgrade_candidate: bool,
+    /// This compile's IR build bailed on a `new` whose class was not loaded
+    /// yet, and the method is owed exactly one more optimizing attempt.
+    ///
+    /// Distinct from [`Self::c2_upgrade_candidate`], which is the C1->C2
+    /// promotion and is refused for a task that was ALREADY at an optimized
+    /// tier. This one has to survive that refusal: the bail it answers happens
+    /// *inside* a C2 task, which then falls through to the single-pass backend
+    /// and leaves the method recorded as done with C2.
+    pub deferred_new_retry: bool,
     /// The attempt did not publish because the VM *declined* the method on
     /// grounds that are fixed for the life of the process (skip list, OSR
     /// denial) — as opposed to a compile that ran and failed.
@@ -985,6 +1069,7 @@ impl CompileOutcome {
             compile_time_ms,
             published: false,
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             declined_permanently: false,
         }
     }
@@ -996,6 +1081,7 @@ impl CompileOutcome {
             compile_time_ms,
             published: false,
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             declined_permanently: true,
         }
     }
@@ -1642,6 +1728,22 @@ impl TieredCompilationManager {
 
     /// Called on each back-edge (loop iteration) from the interpreter.
     /// May trigger OSR compilation.
+    /// Ask for the ONE extra optimizing attempt a method is owed after its IR
+    /// build bailed on a `new` whose class had not loaded yet.
+    ///
+    /// The worker loop reaches the same request through `CompileOutcome`, but
+    /// the worker is not the only compile door: the eager first-call door in
+    /// `jit_bridge` reaches the backend directly and produces no
+    /// `CompileOutcome` at all, so a method compiled there would never see its
+    /// memo spent. This is that door's route in.
+    ///
+    /// The one-shot memo (`cratonvm_jit::take_deferred_new_retry`) is what the
+    /// CALLER must consume before calling this, so both doors together can
+    /// still only produce one extra compile per method.
+    pub fn request_deferred_new_retry(&self, key: &MethodKey) {
+        self.core.request_deferred_new_retry(key);
+    }
+
     pub fn on_backedge(&self, key: &MethodKey, bci: u32) -> Option<CompilationTask> {
         if is_osr_denied(key) {
             return None;
@@ -2196,6 +2298,16 @@ impl TieredCompilationManager {
                 && !tier_uses_optimized_backend(task.target_tier)
             {
                 core.request_c2_upgrade(&task.method_key);
+            }
+            // The deferred-`new` retry, which deliberately does NOT carry the
+            // "not already optimized" clause above: the bail it answers happens
+            // inside a C2 task that then fell through to the single-pass
+            // backend, so by the time we get here the method is recorded as
+            // done with C2 and `request_c2_upgrade` would refuse it for exactly
+            // that reason. Bounded by the one-shot memo in `lib.rs` — a method
+            // is armed once, and a class that never loads cannot re-arm it.
+            if outcome.published && outcome.deferred_new_retry && task.osr_bci.is_none() {
+                core.request_deferred_new_retry(&task.method_key);
             }
         }
     }
@@ -5646,6 +5758,7 @@ mod tests {
                     compile_time_ms: 7,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5745,6 +5858,7 @@ mod tests {
                     // Models the VM-side predicate: judged IR-eligible on the
                     // C1 pass; a C2 task never re-seeds an upgrade.
                     c2_upgrade_candidate: !tier_uses_optimized_backend(task.target_tier),
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5821,6 +5935,7 @@ mod tests {
                     compile_time_ms: 3,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))
@@ -5943,6 +6058,7 @@ mod tests {
                     compile_time_ms: 4,
                     published: true,
                     c2_upgrade_candidate: false,
+                    deferred_new_retry: false,
                     declined_permanently: false,
                 }
             }))

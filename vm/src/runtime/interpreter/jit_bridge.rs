@@ -4187,6 +4187,82 @@ fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool 
     false
 }
 
+/// Resolve one `ldc` / `ldc_w` constant-pool entry for the JIT, in the pool of
+/// **`holder`**.
+///
+/// # Why this is one function and not three copies
+///
+/// A `String` or `Class` constant is baked into compiled code as a SITE — the
+/// pair `(holder class id, cp index)` — which `jit_ldc_string_cp` /
+/// `jit_ldc_class_cp` re-read at run time. The two halves of that pair must come
+/// from the same constant pool, and nothing in the types says so: the index is a
+/// `u16` and the holder a `u32`, and either can be filled in from whichever
+/// `ClassId` happens to be in scope.
+///
+/// Three copies of this resolver existed — one for the compiling method, one for
+/// a callee compiled as its own artifact, one for OSR — each spelling the holder
+/// out by hand a few lines below its own `cm.get_class(...)`. The callee copy
+/// spelled the CALLER's `class_id` in its `String` arm while reading the
+/// CALLEE's pool; its `ClassReference` arm three lines further down used the
+/// callee's. Compiling `SqlClientPool.newConnection` (which inlines
+/// `SqlClientConnection.<init>`) then baked `(SqlClientPool, cp#47)` for a
+/// literal that lives at cp#47 of `SqlClientConnection`. cp#47 of
+/// `SqlClientPool` is a `ClassReference`, so the helper raised `InternalError`
+/// and `TechEmpowerTest` answered HTTP 500 — 3/3 runs under
+/// `CRATONVM_BG_COMPILE=0`.
+///
+/// **That was the loud half.** Had the caller held a `String` at that index,
+/// compiled code would have pushed the **wrong literal** and reported nothing.
+///
+/// One function takes one `holder` and uses it for the lookup AND for both
+/// baked sites, so the halves cannot disagree again. Behaviour is otherwise
+/// identical to the three copies it replaces.
+///
+/// `get_utf8_wide(..).is_none()` is the representability test, unchanged: a
+/// lone-surrogate literal cannot be pooled on a Rust `String` and stays
+/// uncompilable.
+fn jit_ldc_constant_for(
+    cm: &crate::classloading::ClassManager,
+    holder: ClassId,
+    cp_idx: u16,
+) -> Option<cratonvm_jit::JitLdcConstant> {
+    let class = cm.get_class(holder)?;
+    match class.constant_pool.get(cp_idx)? {
+        ConstantPoolEntry::Integer(v) => Some(cratonvm_jit::JitLdcConstant::Immediate {
+            bits: *v as i64,
+            is_float: false,
+        }),
+        ConstantPoolEntry::Float(v) => Some(cratonvm_jit::JitLdcConstant::Immediate {
+            bits: v.to_bits() as i64,
+            is_float: true,
+        }),
+        ConstantPoolEntry::StringReference { string_index }
+            if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+        {
+            // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+            // `(class, cp index)`.
+            class
+                .constant_pool
+                .get_utf8(*string_index)
+                .map(|_| cratonvm_jit::JitLdcConstant::String {
+                    holder_class_id: holder.as_u32(),
+                    cp_idx,
+                })
+        }
+        // `ldc <Class>`: the mirror is a heap object and the target class may
+        // not be loaded yet, so report the SITE and let `helpers.ldc_class_cp`
+        // resolve it and fetch the mirror at run time, the way the
+        // interpreter's own `ldc` handler does.
+        ConstantPoolEntry::ClassReference { .. } => {
+            Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                holder_class_id: holder.as_u32(),
+                cp_idx,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
 /// [`RedefineGate`] so the JIT entry inherits the same staleness binding
 /// as the bytecode entry it's replacing.  Saves one
@@ -4711,49 +4787,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // `ldc` still returns `None` → permanent compile bail.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-            }
-            ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-            }
-            ConstantPoolEntry::StringReference { string_index }
-                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-            {
-                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                // `(class, cp index)`. `get_utf8` is only the representability
-                // test the `get_utf8_wide` guard above pairs with -- a
-                // lone-surrogate literal cannot be pooled on a Rust `String`
-                // and stays uncompilable, exactly as before.
-                class
-                    .constant_pool
-                    .get_utf8(*string_index)
-                    .map(|_| cratonvm_jit::JitLdcConstant::String {
-                        holder_class_id: class_id.as_u32(),
-                        cp_idx,
-                    })
-            }
-            // `ldc <Class>`: the mirror is a heap object and the target class
-            // may not be loaded yet, so report the SITE — referencing class id
-            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
-            // fetch the mirror at run time, the way the interpreter's own
-            // `ldc` handler does.
-            ConstantPoolEntry::ClassReference { .. } => {
-                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                    holder_class_id: class_id.as_u32(),
-                    cp_idx,
-                })
-            }
-            _ => None,
-        }
+        jit_ldc_constant_for(&cm, class_id, cp_idx)
     };
 
     // Callee compiler: given (class_name, method_name, descriptor), try to JIT-compile
@@ -5195,6 +5229,17 @@ pub(super) fn try_jit_upgrade_with_gate(
                 |cid: u32, cp_class: &str, name: &str, desc: &str| {
                     resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
                 };
+            // The optimizing tier's own inline resolver for this callee compile.
+            let c_ir_inline_resolver =
+                |callee_class: &str, callee_method: &str, callee_desc: &str| {
+                    resolve_ir_inline_site(
+                        shared,
+                        callee_cid,
+                        callee_class,
+                        callee_method,
+                        callee_desc,
+                    )
+                };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -5239,66 +5284,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // bails (matches the OSR path's behaviour).
             let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
                 let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Integer(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-                    }
-                    ConstantPoolEntry::Float(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-                    }
-                    ConstantPoolEntry::StringReference { string_index }
-                        if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-                    {
-                        // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                        // `(class, cp index)`. `get_utf8` is only the representability
-                        // test the `get_utf8_wide` guard above pairs with -- a
-                        // lone-surrogate literal cannot be pooled on a Rust `String`
-                        // and stays uncompilable, exactly as before.
-                        //
-                        // `callee_cid`, NOT `class_id`. This resolver reads the
-                        // CALLEE's constant pool -- `cm.get_class(callee_cid)`
-                        // three lines up, and `cp_idx` is an index into that
-                        // pool. Pairing it with the CALLER's class id hands the
-                        // runtime helper a (class, index) pair whose two halves
-                        // come from different constant pools, and the helper
-                        // then reads whatever the CALLER happens to hold at
-                        // that index. The `ClassReference` arm immediately
-                        // below always used `callee_cid`; this one did not.
-                        //
-                        // The visible failure is the benign half. Compiling
-                        // `SqlClientPool.newConnection`, which inlines
-                        // `SqlClientConnection.<init>`, baked
-                        // (SqlClientPool, cp#47) for a literal that lives at
-                        // cp#47 of SqlClientConnection; cp#47 of SqlClientPool
-                        // is a ClassReference, so the helper raised
-                        // InternalError. Had the caller held a String there
-                        // instead, compiled code would have pushed the WRONG
-                        // LITERAL and said nothing.
-                        class
-                            .constant_pool
-                            .get_utf8(*string_index)
-                            .map(|_| cratonvm_jit::JitLdcConstant::String {
-                                holder_class_id: callee_cid.as_u32(),
-                                cp_idx,
-                            })
-                    }
-                    // `ldc <Class>` — see the matching arm in the enclosing
-                    // method's resolver.
-                    ConstantPoolEntry::ClassReference { .. } => {
-                        Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                            holder_class_id: callee_cid.as_u32(),
-                            cp_idx,
-                        })
-                    }
-                    _ => None,
-                }
+                jit_ldc_constant_for(&cm, callee_cid, cp_idx)
             };
 
             // Compile callee without recursive inlining (None for callee_compiler)
@@ -5390,6 +5376,12 @@ pub(super) fn try_jit_upgrade_with_gate(
                 },
                 if crate::runtime::env_cache::jit_guarded_virtual_inline() {
                     Some(&c_receiver_inline_resolver)
+                } else {
+                    None
+                },
+                // IR-tier inlining. Behind its own gate; `None` splices nothing.
+                if cratonvm_jit::ir_inline_enabled() {
+                    Some(&c_ir_inline_resolver)
                 } else {
                     None
                 },
@@ -5502,6 +5494,21 @@ pub(super) fn try_jit_upgrade_with_gate(
             Some(&callee_compiler),
         )
     };
+
+    // The optimizing tier's own inline resolver — see `resolve_ir_inline_site`
+    // for how its admission set differs in both directions.
+    let ir_inline_resolver = |callee_class: &str,
+                              callee_method: &str,
+                              callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_ir_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
+    };
     // Main-path small-method inlining is GATED default-OFF behind
     // `CRATONVM_JIT_MAIN_INLINE=1`. Enabling it inlines tiny arith/getter/field
     // leaves correctly (verified: `static int add(int,int){return a+b;}` emits no
@@ -5585,6 +5592,12 @@ pub(super) fn try_jit_upgrade_with_gate(
         },
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&receiver_inline_resolver)
+        } else {
+            None
+        },
+        // IR-tier inlining. Behind its own gate; `None` splices nothing.
+        if cratonvm_jit::ir_inline_enabled() {
+            Some(&ir_inline_resolver)
         } else {
             None
         },
@@ -6699,49 +6712,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // resolver in `try_jit_upgrade_with_gate`.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
-        let class = cm.get_class(cid)?;
-        match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-            }
-            ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-            }
-            ConstantPoolEntry::StringReference { string_index }
-                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-            {
-                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                // `(class, cp index)`. `get_utf8` is only the representability
-                // test the `get_utf8_wide` guard above pairs with -- a
-                // lone-surrogate literal cannot be pooled on a Rust `String`
-                // and stays uncompilable, exactly as before.
-                class
-                    .constant_pool
-                    .get_utf8(*string_index)
-                    .map(|_| cratonvm_jit::JitLdcConstant::String {
-                        holder_class_id: cid.as_u32(),
-                        cp_idx,
-                    })
-            }
-            // `ldc <Class>`: the mirror is a heap object and the target class
-            // may not be loaded yet, so report the SITE — referencing class id
-            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
-            // fetch the mirror at run time, the way the interpreter's own
-            // `ldc` handler does.
-            ConstantPoolEntry::ClassReference { .. } => {
-                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                    holder_class_id: cid.as_u32(),
-                    cp_idx,
-                })
-            }
-            _ => None,
-        }
+        jit_ldc_constant_for(&cm, cid, cp_idx)
     };
 
     let pgo_profile = {
@@ -7013,6 +6984,24 @@ pub(super) fn try_jit_compile_callee_slow(
         )
     };
 
+    // The optimizing tier's own inline resolver. Same three-name question, a
+    // different admission set — see `resolve_ir_inline_site`. No direct-bind
+    // resolver: a spliced body's remaining calls go through the dispatch helper
+    // on this path, and `IrBuilder` has no direct-call lowering inside a
+    // relocated body to bake an entry into.
+    let ir_inline_resolver = |callee_class: &str,
+                              callee_method: &str,
+                              callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_ir_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
+    };
+
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -7068,6 +7057,12 @@ pub(super) fn try_jit_compile_callee_slow(
         } else {
             None
         },
+        // IR-tier inlining. Behind its own gate; `None` splices nothing.
+        if cratonvm_jit::ir_inline_enabled() {
+            Some(&ir_inline_resolver)
+        } else {
+            None
+        },
             // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
             // latch the JIT read for itself, so a `Compatible` VM sharing a
             // process with a `JdkOnly` one lost the thin direct-call helpers.
@@ -7099,6 +7094,28 @@ pub(super) fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
+    // The eager first-call door's half of the deferred-`new` retry. This door
+    // reaches the backend directly and produces no `CompileOutcome`, so the
+    // worker-loop route in `compile_one_task` never sees a method compiled
+    // here -- which is every method the interpreter hands over on its own,
+    // `RJitGc.make` among them. The one-shot memo is consumed here exactly as
+    // it is there, so the two doors together still produce at most one extra
+    // compile per method.
+    if crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        )
+    {
+        shared.jit.tiered_manager.request_deferred_new_retry(
+            &crate::jit::tiered::MethodKey::new(
+                &*cached.class_name,
+                &*cached.method_name,
+                &*cached.method_descriptor,
+            ),
+        );
+    }
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -7502,6 +7519,7 @@ pub(super) fn background_compile_task(
             // OSR artifacts serve loop entry; the invocation path re-tiers
             // separately, so an OSR task never seeds a C2 upgrade.
             c2_upgrade_candidate: false,
+            deferred_new_retry: false,
             // A codegen attempt actually ran here; a non-publish is a real
             // failure, not a policy verdict.
             declined_permanently: false,
@@ -7552,7 +7570,21 @@ pub(super) fn background_compile_task(
     // loop enqueues a Low-priority C2 recompile after it records this C1
     // publish. Evaluated only on a successful non-optimized publish — the
     // scan + predicate are cheap and run once per method.
-    let c2_upgrade_candidate = published
+    // A method whose IR build bailed on a `new` whose class was not loaded YET
+    // is owed ONE more optimizing attempt. Note the absence of `!optimized`:
+    // that bail happens INSIDE a C2 task, which then falls through to the
+    // single-pass backend — so the C1->C2 promotion below, which is only for a
+    // C1 publish, is not the door this can use. `take_deferred_new_retry`
+    // consumes the memo, so a class still not loaded on the retry settles on
+    // single-pass exactly as before.
+    let deferred_new_retry = published
+        && crate::runtime::env_cache::c2_supersede()
+        && cratonvm_jit::take_deferred_new_retry(
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        );
+    let c2_upgrade_candidate = (published
         && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
@@ -7572,7 +7604,7 @@ pub(super) fn background_compile_task(
                 crate::runtime::env_cache::jit_ir_call_virtual(),
             )
         })
-        .unwrap_or(false);
+        .unwrap_or(false));
     // A `None` above is not one thing. The comment on `published` already lists
     // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
     // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt
@@ -7615,6 +7647,7 @@ pub(super) fn background_compile_task(
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
+        deferred_new_retry,
         declined_permanently,
     }
 }
@@ -7717,6 +7750,54 @@ pub(super) fn resolve_inline_site(
         callee_desc,
         0,
         direct_bind,
+        false,
+    )
+}
+
+/// Resolve a body for the **optimizing (IR) tier** to splice — a different
+/// admission set from the single-pass one [`resolve_inline_site`] serves, in
+/// both directions.
+///
+/// WIDER, because the refusals the single-pass path carries are its EMITTER's
+/// limits, not resolution's: `x64::try_emit_inline_body` has no arm for `new`,
+/// for an array load or store, or for `arraylength`, so the resolver refuses
+/// those shapes to keep planning and emission consistent. `IrBuilder` lowers
+/// all of them natively, and `new` is the entire point — an accessor that
+/// allocates is exactly the body escape analysis has to see inside its caller.
+///
+/// NARROWER, because the IR splice re-executes the whole `invoke` on a deopt
+/// (see `ir::IrInlineSite`) and because `IrBuilder` walks a relocated body with
+/// no merge bookkeeping of its own. So v1 additionally refuses:
+///
+///  * any branch — a relocated body's merges and loop headers are computed
+///    over the CALLER's code alone, and there is no second walker;
+///  * `idiv`/`irem`/`ldiv`/`lrem` — the one guard `IrBuilder` emits is the
+///    div-zero guard, and a guard inside a spliced region would deopt to a
+///    re-execution point rather than to itself;
+///  * `ldc`/`ldc2_w` — `InlineSite` records a raw `i64` where the builder needs
+///    the value plus its float/double discriminator, and inventing that bit is
+///    how a `long` constant becomes a `double`;
+///  * more than one return, or a return that is not the last instruction;
+///  * any target that is not provably monomorphic (see the `ir_mode` check on
+///    the selected method) — the IR tier has no class-id guard node, so a
+///    speculative splice has nothing to fall back to.
+pub(super) fn resolve_ir_inline_site(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        None,
+        callee_class,
+        callee_method,
+        callee_desc,
+        0,
+        None,
+        true,
     )
 }
 
@@ -7763,6 +7844,7 @@ pub(super) fn resolve_receiver_inline_site(
         callee_desc,
         0,
         direct_bind,
+        false,
     )
 }
 
@@ -7787,6 +7869,11 @@ fn resolve_inline_site_from(
     callee_desc: &str,
     nest_depth: usize,
     direct_bind: Option<InlineDirectBind<'_>>,
+    // Resolve for the optimizing (IR) tier rather than the single-pass emitter.
+    // See [`resolve_ir_inline_site`] for what the two admission sets differ on
+    // and why. Threaded into the nested resolution below so a nested body is
+    // held to the same contract as the one enclosing it.
+    ir_mode: bool,
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
@@ -7917,6 +8004,33 @@ fn resolve_inline_site_from(
     let Some(declaring_class_name) = store.get(declaring_id).map(|c| &*c.name) else {
         no!("declaring-class-not-in-store");
     };
+    // IR-tier splices are UNGUARDED: `IrBuilder` has no class-id compare and no
+    // miss edge to send a wrong receiver down, so the target must be the only
+    // body a call at this site can ever reach. `invokespecial`/`invokestatic`
+    // are that by definition; a virtual site qualifies only when the language
+    // has already ruled out an override.
+    //
+    // Deliberately NOT a CHA-style "no loaded subclass overrides it" answer:
+    // that is true until the next class loads, so it needs an invalidation
+    // dependency the IR path does not record. `final` is monotone.
+    if ir_mode {
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        let monomorphic = method.is_static()
+            || callee_method == "<init>"
+            || method
+                .access_flags
+                .intersects(MethodAccessFlags::PRIVATE | MethodAccessFlags::FINAL)
+            || store
+                .get(declaring_id)
+                .map(|c| {
+                    c.access_flags
+                        .contains(cratonvm_reader::class_access_flags::ClassAccessFlags::FINAL)
+                })
+                .unwrap_or(false);
+        if !monomorphic {
+            no!("ir-splice-target-not-provably-monomorphic");
+        }
+    }
     if shared
         .natives
         .native_methods
@@ -8020,13 +8134,64 @@ fn resolve_inline_site_from(
     // a site cannot be admitted under one answer and emitted under another.
     let inline_calls_allowed = crate::runtime::env_cache::jit_inline_calls();
     let mut invoke_sites: Vec<(usize, u16, u8)> = Vec::new();
+    // IR-tier only: `new` sites in the body, `(callee_pc, cp_idx)`, resolved to
+    // `(class_id, num_fields)` below once the callee's constant pool is in hand.
+    // This is the row whose absence bailed `VolumeShort2.loadFromArray` out of
+    // the IR tier altogether, and with it out of escape analysis.
+    let mut ir_new_sites: Vec<(usize, u16)> = Vec::new();
+    // IR-tier only: pcs of the body's return opcodes. A relocated body is walked
+    // straight through with no merge bookkeeping, so exactly one return, at the
+    // end, is the shape the splice can honour.
+    let mut ir_return_pcs: Vec<usize> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => no!("tableswitch/lookupswitch"),
+            // `new` — refused for the single-pass emitter, which has no arm for
+            // it; admitted (and resolved) for the IR builder, which lowers it
+            // to `Op::New` for escape analysis to delete.
+            0xbb if ir_mode => {
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                ir_new_sites.push((scan_pc, cp_idx));
+                scan_pc += 3;
+                continue;
+            }
             0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
             0xbf => no!("athrow"),
             0xc0 | 0xc1 => no!("checkcast/instanceof"),
             0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
+            // A relocated body's control flow would need the merge/loop-header
+            // bookkeeping `IrBuilder` computes over the CALLER's code alone.
+            // Straight-line only, v1.
+            0x99..=0xa9 | 0xc6 | 0xc7 | 0xc8 | 0xc9 if ir_mode => no!("ir-splice-branch"),
+            // The only guard `IrBuilder` emits is div-zero, and a guard inside a
+            // spliced region deopts to "re-execute the invoke" rather than to
+            // itself. Keeping division out means a spliced region carries no
+            // guard of its own at all.
+            0x6c | 0x6d | 0x70 | 0x71 if ir_mode => no!("ir-splice-division"),
+            // `InlineSite` records a raw `i64` for these; the builder needs the
+            // value AND whether it is a float/double. See `resolve_ir_inline_site`.
+            0x12 | 0x13 | 0x14 if ir_mode => no!("ir-splice-ldc"),
+            0xac..=0xb1 if ir_mode => {
+                ir_return_pcs.push(scan_pc);
+                scan_pc += 1;
+                continue;
+            }
+            // Array element access and `arraylength` are refused below because
+            // `try_emit_inline_body` bails on them. `IrBuilder` lowers all three
+            // with their own bounds checks, and `Short2` keeps its two shorts in
+            // a `short[2]`, so a splice that could not read one would stop at
+            // the accessor it exists to delete.
+            0x2e..=0x35 | 0x4f..=0x56 | 0xbe if ir_mode => {
+                scan_pc += 1;
+                continue;
+            }
+            // No `static_field_info` is rebased into the builder's tables, so a
+            // spliced `getstatic` would find no row and bail the whole method
+            // AFTER the walk had committed to the body.
+            0xb2 | 0xb3 if ir_mode => no!("ir-splice-static-field"),
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -8110,6 +8275,33 @@ fn resolve_inline_site_from(
         // 4 bytes, which would desync the scan and mis-read the widened
         // operands as opcodes (finding 5).
         scan_pc += inline_instr_length(code, scan_pc);
+    }
+
+    // The relocated body is walked straight through from its first byte to its
+    // return, with the caller's frame parked in `SpliceFrame`. More than one
+    // return means an early exit the walk would never reach the second half of;
+    // a return that is not last means live code after it.
+    if ir_mode && (ir_return_pcs.len() != 1 || ir_return_pcs[0] + 1 != code_len) {
+        no!("ir-splice-not-single-trailing-return");
+    }
+
+    // Resolve the body's `new` sites against the CALLEE's constant pool. A
+    // `Deferred` site — the target class not loaded from this holder's loader
+    // yet — refuses the whole splice rather than being dropped: the builder's
+    // `0xbb` arm bails the METHOD on a missing row, so admitting the body
+    // without the row would cost the caller its IR compile entirely.
+    let mut ir_new_info: Vec<(usize, u32, usize)> = Vec::new();
+    if ir_mode && !ir_new_sites.is_empty() {
+        for &(npc, cp_idx) in &ir_new_sites {
+            match resolve_jit_new_site(&cm, declaring_id, cp_idx) {
+                Some(cratonvm_jit::JitNewSite::Resolved {
+                    class_id,
+                    num_fields,
+                    ..
+                }) => ir_new_info.push((npc, class_id, num_fields)),
+                _ => no!("ir-splice-new-site-unresolved"),
+            }
+        }
     }
 
     let Some(callee_class_info) = cm.get_class(declaring_id) else {
@@ -8455,10 +8647,20 @@ fn resolve_inline_site_from(
     // A nested site is ADDITIVE: the pc keeps its `invoke_targets` entry too,
     // so a nested splice that bails mid-body inside the emitter falls back to
     // the ordinary call rather than failing the outer splice.
+    // IR-tier nesting is deeper and is gated on nothing but `ir_mode`. Deeper
+    // because the accessor chains it exists for are four levels on their own
+    // (`get` → `loadFromArray` → `Short2.<init>()V` → `Short2.<init>([S)V`),
+    // and stopping one short leaves the allocation being passed to an opaque
+    // call — which is an escape, so the whole splice buys nothing. Ungated
+    // because `CRATONVM_JIT_INLINE_NEST` is the single-pass emitter's switch and
+    // the IR path is already behind its own.
+    let nest_budget = if ir_mode {
+        cratonvm_jit::MAX_IR_INLINE_NEST_DEPTH
+    } else {
+        cratonvm_jit::MAX_INLINE_NEST_DEPTH
+    };
     let mut nested_sites: Vec<cratonvm_jit::NestedInlineSite> = Vec::new();
-    if nest_depth + 1 < cratonvm_jit::MAX_INLINE_NEST_DEPTH
-        && crate::runtime::env_cache::jit_inline_nest()
-    {
+    if nest_depth + 1 < nest_budget && (ir_mode || crate::runtime::env_cache::jit_inline_nest()) {
         // The CALLEE's own receiver profile, fetched once for the whole body.
         //
         // This is the piece that makes devirtualising inside a splice possible
@@ -8482,7 +8684,14 @@ fn resolve_inline_site_from(
             None
         };
         for (ipc, target) in &invoke_targets {
-            match target.invoke_kind {
+            // In IR mode every kind takes the statically-bound path: the
+            // monomorphism gate on the selected method is what decides whether
+            // a virtual target is spliceable, and it refuses the ones a guard
+            // would otherwise have to cover. There is no guarded arm to fall
+            // into, so routing `0`/`2` to the profile-driven branch below would
+            // only produce sites the IR consumer must throw away.
+            let kind = if ir_mode { 3 } else { target.invoke_kind };
+            match kind {
                 // Statically bound: one body, no guard.
                 1 | 3 => {
                     let nested = resolve_inline_site_from(
@@ -8494,6 +8703,7 @@ fn resolve_inline_site_from(
                         &target.descriptor,
                         nest_depth + 1,
                         direct_bind,
+                        ir_mode,
                     );
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
@@ -8626,6 +8836,11 @@ fn resolve_inline_site_from(
                         &target.descriptor,
                         nest_depth + 1,
                         direct_bind,
+                        // Unreachable in IR mode (every kind is routed to the
+                        // statically-bound arm above), and a guarded splice is
+                        // not something the IR consumer can emit — so `false`
+                        // here is a statement, not a default.
+                        false,
                     ) {
                         nested_sites.push(cratonvm_jit::NestedInlineSite {
                             callee_pc: *ipc,
@@ -8695,7 +8910,23 @@ fn resolve_inline_site_from(
     // must be either SPLICED IN TURN or DIRECT-BOUND; a site with one that is
     // neither is refused whole. Refusing costs the site its inline; admitting
     // it costs 3.5x.
-    if !crate::runtime::env_cache::jit_inline_call_dispatch() {
+    //
+    // NOT applied in IR mode, and the difference is in the emitter, not the
+    // policy. That measurement is of `try_emit_inline_body`'s invoke arm, which
+    // lowers a spliced call to the BLIND dispatch helper — no MIC, no PIC, a
+    // name resolution per call. `IrBuilder` lowers a spliced call to the same
+    // `Op::Call` it lowers every other invoke to, and `ir_lower` gives it the
+    // ordinary dispatch. That is still one inline cache short of what the
+    // caller's own sites get (the cache is keyed by bytecode pc, and every node
+    // in a spliced region carries the CALLER's `invoke` pc — see
+    // `ir::IrInlineSite`), so it is not free; it is a call, not a resolution.
+    //
+    // Keeping the rule here would refuse exactly the bodies this lane exists
+    // for: `VolumeShort2.loadFromArray` calls `ShortArray.get`, which is an FFM
+    // accessor the nested resolver deliberately refuses to splice (it keeps its
+    // own fast path), and no direct bind is offered for a virtual kind. One
+    // un-spliceable call would cost the site its allocation.
+    if !ir_mode && !crate::runtime::env_cache::jit_inline_call_dispatch() {
         let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
         if let Some((pc, t)) = invoke_targets
             .iter()
@@ -8748,6 +8979,7 @@ fn resolve_inline_site_from(
         // compile keeps it empty, which makes the emitter's invoke arm bail.
         resolved_invoke_infos: Vec::new(),
         nested_sites,
+        ir_new_info,
     })
 }
 

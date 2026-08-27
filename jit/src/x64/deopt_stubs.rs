@@ -236,6 +236,10 @@ impl Compiler {
             self.sr_field_types.get(&(new_pc, k)).copied()
         });
         Some(crate::deopt::VirtualObjectState {
+            // The single-pass backend's scalar replacement is objects only:
+            // its `analyze_escapes` is the bytecode-level one in `x64.rs` and
+            // has no array candidate at all. Arrays come from the IR tier.
+            array_element_type: None,
             id: new_pc,
             class_id: obj.class_id,
             num_fields: obj.num_fields,

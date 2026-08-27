@@ -9141,6 +9141,81 @@ fn punned_store_watch() -> Option<&'static (String, usize)> {
     .as_ref()
 }
 
+/// Does this class id match the watched class substring? Memoized, because
+/// both arms of the watch ask it once per access to the watched SLOT INDEX
+/// on any class, and `class_name_for_diagnostics` builds a `String`.
+fn punned_watch_class_matches(class_id: u32) -> bool {
+    // LATCHED, and deliberately not a `Mutex<HashMap>`.
+    //
+    // The first version of this memo took a process-global mutex on every
+    // access to the watched slot, and that alone made the defect it was built
+    // to observe VANISH: 14 punned cells in 600 runs became 0 in 600, with the
+    // failure count going 16 -> 0 as well. A watch that serialises the thing it
+    // is watching is not an instrument. (That the cell is racy is worth
+    // knowing, and is recorded on the page -- but it has to be learned from a
+    // measurement, not from the measurement's own overhead.)
+    //
+    // One atomic load and a compare once the watched class has been seen once.
+    // Only the FIRST matching class latches, which is enough for a watch spec
+    // that names one class; a substring matching two classes reports the first.
+    static WATCHED_CID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(u32::MAX);
+    let latched = WATCHED_CID.load(std::sync::atomic::Ordering::Relaxed);
+    if latched != u32::MAX {
+        return class_id == latched;
+    }
+    let Some((want_class, _)) = punned_store_watch() else {
+        return false;
+    };
+    if crate::collector::class_name_for_diagnostics(class_id).contains(want_class.as_str()) {
+        WATCHED_CID.store(class_id, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// The four numbers `CRATONVM_DBG_WATCH_PUN` reports at exit.
+///
+/// The two DENOMINATORS are the point. A run of the watch that reports no
+/// punned cell has said nothing until it also says how many times it looked:
+/// the experiment this watch exists for turns the JIT off to ask whether
+/// compiled code is the writer, and that also removes every COMPILED read and
+/// write of the slot. "No punned read" then has two readings -- the cell was
+/// never created, or nobody looked -- and only the denominator separates them.
+/// 2026-08-27: 600 `--nojit` runs reported zero punned cells with
+/// `reads=0`, which is the second reading and was very nearly read as the
+/// first.
+pub(crate) static PUN_WATCH_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PUN_WATCH_READS_PUNNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PUN_WATCH_READS_PUNNED_NONZERO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PUN_WATCH_STORES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PUN_WATCH_STORES_PRIMITIVE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Print the watch census, or say plainly that the watch was never set.
+///
+/// Prints even when every counter is zero, for the reason on
+/// [`PUN_WATCH_READS`]: the absence of a line cannot be told from a zero.
+pub fn report_punned_watch_at_exit() {
+    let Some((class, slot)) = punned_store_watch() else {
+        return;
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "[WATCH-PUN] EXIT watch={class}:{slot} accessor_reads={} accessor_reads_punned={} \
+accessor_reads_punned_nonzero={} accessor_stores={} accessor_stores_primitive={}",
+        PUN_WATCH_READS.load(Relaxed),
+        PUN_WATCH_READS_PUNNED.load(Relaxed),
+        PUN_WATCH_READS_PUNNED_NONZERO.load(Relaxed),
+        PUN_WATCH_STORES.load(Relaxed),
+        PUN_WATCH_STORES_PRIMITIVE.load(Relaxed),
+    );
+}
+
 fn zgc_verify_slide_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -11432,13 +11507,29 @@ impl ZgcRealHeap {
     /// detector prints and the two can be compared directly.
     #[cold]
     fn report_watched_punned_read(&self, obj: ObjectRef, index: usize) {
-        let Some((want_class, want_slot)) = punned_store_watch() else {
+        let Some((_, want_slot)) = punned_store_watch() else {
             return;
         };
         if index != *want_slot {
             return;
         }
         let header = self.header(obj);
+        if !punned_watch_class_matches(header.class_id.as_u32()) {
+            return;
+        }
+        // Counted BEFORE the compact-layout and tag tests: this is the
+        // denominator, and it has to mean "the watched slot was read on the
+        // watched class", not "and it turned out to be interesting".
+        let seen = PUN_WATCH_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The CONTROL for the punned dump. The corrupt object's cells cannot be
+        // read without knowing what a healthy one looks like: whether a
+        // reference cell normally carries anything in `payload32`, whether an
+        // int cell normally leaves `payload64` zero. Three healthy objects of
+        // the watched class, dumped the same way and by the same code, turn
+        // that from an argument about layout constants into a diff.
+        if seen < 3 {
+            self.dump_watched_cells(obj, "healthy");
+        }
         if cratonvm_types::compact_object_field_storage(header, index).is_some() {
             return; // compact cells carry no tag; nothing to mismatch
         }
@@ -11461,10 +11552,20 @@ impl ZgcRealHeap {
         if tag == cratonvm_types::FIELD_CELL_TAG_OBJECT {
             return;
         }
-        let name = crate::collector::class_name_for_diagnostics(header.class_id.as_u32());
-        if !name.contains(want_class.as_str()) {
+        PUN_WATCH_READS_PUNNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The same split `jit_getfield_impl` makes, and for the same reason: a
+        // reference cell of a freshly allocated object is still zero-filled, so
+        // it decodes as `Int(0)` and its payload word is 0 -- the correct null,
+        // by accident. Those are not corruption, and counting them with the
+        // dangerous shape makes a benign number read as a defect number. Only a
+        // NON-ZERO payload under a non-`Object` tag is a word compiled code
+        // would have dereferenced as a pointer.
+        if p64 == 0 {
             return;
         }
+        PUN_WATCH_READS_PUNNED_NONZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dump_watched_cells(obj, "PUNNED");
+        let name = crate::collector::class_name_for_diagnostics(header.class_id.as_u32());
         tracing::error!(
             target: "cratonvm::gc::guard",
             class = %name,
@@ -11475,18 +11576,63 @@ impl ZgcRealHeap {
             "punned read watch: the watched slot does not hold an Object"
         );
     }
+    /// Every 16-byte cell of `obj`, tagged with `why`.
+    ///
+    /// Legacy layout only -- a compact body has no cells to print, and printing
+    /// its bytes as if it did is how a layout disagreement gets read as a
+    /// corrupt value.
+    #[cold]
+    fn dump_watched_cells(&self, obj: ObjectRef, why: &str) {
+        let header = self.header(obj);
+        let n = header.num_slots() as usize;
+        if cratonvm_types::compact_object_field_storage(header, 0).is_some() {
+            eprintln!("[watch-pun-cells] {why} class_id={} COMPACT body, no cells", header.class_id);
+            return;
+        }
+        eprintln!(
+            "[watch-pun-cells] {why} class_id={} num_slots={n} addr={:#x}",
+            header.class_id,
+            obj.as_ptr() as usize
+        );
+        for i in 0..n {
+            // SAFETY: `i < num_slots` and the body is legacy 16-byte cells.
+            let (t, p32, p64) = unsafe {
+                let cell = obj.as_ptr().add(HEADER_SIZE + i * SLOT_SIZE);
+                (
+                    std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32
+                    ),
+                    std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32
+                    ),
+                    std::ptr::read_unaligned(
+                        cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64
+                    ),
+                )
+            };
+            eprintln!("[watch-pun-cells] {why}   slot {i}: tag={t} payload32={p32:#x} payload64={p64:#x}");
+        }
+    }
+
     fn set_field_no_card(&self, obj: ObjectRef, index: usize, value: Value) {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_field");
         // WRITER-side trap for the G30-1 species. Off unless
         // `CRATONVM_DBG_WATCH_PUN=<class-substring>:<slot>` is set; when it is,
         // a primitive landing in the watched slot prints a backtrace naming the
         // code that stored it. The read side can only say a punned cell EXISTS.
-        if !matches!(value, Value::Object(_)) {
-            if let Some((want_class, want_slot)) = punned_store_watch() {
-                if index == *want_slot {
-                    let class_id = self.header(obj).class_id.as_u32();
-                    let name = crate::collector::class_name_for_diagnostics(class_id);
-                    if name.contains(want_class.as_str()) {
+        if let Some((_, want_slot)) = punned_store_watch() {
+            if index == *want_slot {
+                let class_id = self.header(obj).class_id.as_u32();
+                if punned_watch_class_matches(class_id) {
+                    // The denominator again -- see [`PUN_WATCH_READS`]. A
+                    // zero `stores_primitive` beside a zero `stores` says
+                    // nothing about who wrote the cell; beside a large
+                    // `stores` it says the writer is not this accessor.
+                    PUN_WATCH_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !matches!(value, Value::Object(_)) {
+                        PUN_WATCH_STORES_PRIMITIVE
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let name = crate::collector::class_name_for_diagnostics(class_id);
                         tracing::error!(
                             target: "cratonvm::gc::guard",
                             class = %name,

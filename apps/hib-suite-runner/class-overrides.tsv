@@ -94,3 +94,31 @@ org.hibernate.orm.test.type.temporal.ZonedDateTimeTest	900	-
 # margin closes further under host load, so it needs the same floor as the
 # temporal pair rather than a 10% one.
 org.hibernate.orm.test.sql.exec.SmokeTests	900	-
+
+# ASTParserLoadingTest — the one entry here whose slowness is NOT the VM's.
+#
+# It is the class whose 300s kill caused the cross-class stale-schema cascade
+# (fixed-suite-bugs/hibernate/mysql-cross-class-stale-schema-shared-worker-db-
+# 20260822.md): killed at the cap, it left its 54 tables behind for every later
+# class on the shard that shares a table name. The harness now resets a shard's
+# worker database after a kill, so the cascade is closed either way — but with
+# no floor the class is still reported HANG with no per-test breakdown, which is
+# exactly how its supposed "21 real failures" stayed unexamined for a week.
+#
+# MEASURED 2026-08-27, one fresh MySQL 8.0.46 database per arm, same box, same
+# common.args, serial on an idle machine:
+#
+#   real HotSpot 25.0.3+9   104 ok, 0 failed   502s
+#   CratonVM (ZGC, 1500m)   104 ok, 0 failed   633s     <- 1.26x, not 25x
+#
+# HotSpot is over the cap too, which is the whole point: the wall is the
+# DATABASE, not the VM. Both arms issue a byte-identical 8533 SQL statements,
+# of which 6495 (76%) are DDL — 5616 `truncate table` alone, i.e. the fixture
+# truncating its ~54 tables after each of 104 tests. On InnoDB a TRUNCATE is a
+# tablespace drop-and-recreate, and that is what the 500-600s is.
+#
+# The floor is 3600 rather than ~1200 because the wall scales with load on the
+# DATABASE, not on the CPU: six concurrent copies (one fresh schema each, as a
+# six-way shard run would produce) took 1452-1456s each. That is also where the
+# page's headline "1447s" came from.
+org.hibernate.orm.test.hql.ASTParserLoadingTest	3600	-
