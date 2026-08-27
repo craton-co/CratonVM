@@ -14216,6 +14216,44 @@ fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Optio
     }
 }
 
+/// The constant element index of an `Op::ArrayLoad` / `Op::ArrayStore`, or
+/// `None` when the index is not a compile-time constant.
+///
+/// The array analogue of [`ir_load_store_field_index`], and it has to be a
+/// separate function because the operand sits at a different slot: an array
+/// access is `[ctrl, mem, array, index, (value)]`, so the index is input 3 for
+/// both — but the *base* is input 2 rather than the field node's `offset` being
+/// at 3. Keeping them apart is what stops a field index and an element index
+/// being read out of each other's slot.
+fn ir_array_const_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    if !matches!(node.op, ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_)) {
+        return None;
+    }
+    let index_node = *node.inputs.get(3)?;
+    match ir_graph.nodes.get(index_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
+/// The constant length of an `Op::NewArray` (`[ctrl, mem, length]`), or `None`.
+///
+/// A negative constant is `None` rather than a length: `newarray -1` throws
+/// `NegativeArraySizeException`, and deleting the allocation would delete the
+/// throw.
+fn ir_new_array_const_length(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
+    let node = ir_graph.nodes.get(node_id as usize)?;
+    if !matches!(node.op, ir::Op::NewArray { .. }) {
+        return None;
+    }
+    let len_node = *node.inputs.get(2)?;
+    match ir_graph.nodes.get(len_node as usize)?.op {
+        ir::Op::Const(v) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
 /// Convert an `ir::Graph` to an `escape_analysis::Graph` for standalone
 /// escape analysis.  The two modules define independent `Op` / `Node` /
 /// `Graph` types, so we translate node-by-node.  Returns both the EA graph
@@ -14291,6 +14329,43 @@ fn escape_analysis_from_ir(
             // and neither escapes anything — so misclassifying a node INTO
             // either variant would be a relaxation. Both predicates are
             // therefore written to fire only on a shape that provably is one.
+            // ── Array element access ──────────────────────────────────
+            //
+            // An element access with a CONSTANT index is a field access on the
+            // array: slot `i` of an N-slot allocation. Mapping it that way is
+            // what lets a small constant-length array be scalar-replaced at
+            // all, and it is sound in both directions:
+            //
+            //   * the array is an allocation of THIS graph -> the analysis
+            //     resolves the holder, `field_in_range` checks `i < len`
+            //     against the array's own proven length, and an out-of-range
+            //     constant index is refused (its `ArrayIndexOutOfBounds` throw
+            //     must survive);
+            //   * the array is anything else (a `Param`, a call result) -> the
+            //     holder resolves to no allocation, `field_in_range` answers
+            //     false, and the access takes the same conservative path a
+            //     field access on an unknown holder takes.
+            //
+            // A NON-constant index keeps the old `EaOp::Call` mapping, which
+            // arg-escapes the array reference. That is the fail-closed answer:
+            // the access names a slot the analysis cannot identify, so no slot
+            // may be folded and the array must stay on the heap. It also means
+            // an array with even ONE unresolvable access is refused as a whole,
+            // which is exactly right.
+            ir::Op::ArrayLoad(_) => match ir_array_const_index(ir_graph, i as ir::NodeId) {
+                Some(idx) => escape_analysis::Op::Load(idx),
+                None => escape_analysis::Op::Call,
+            },
+            ir::Op::ArrayStore(_) => match ir_array_const_index(ir_graph, i as ir::NodeId) {
+                Some(idx) => escape_analysis::Op::Store(idx),
+                None => escape_analysis::Op::Call,
+            },
+            // A `newarray` whose length is a compile-time constant has a slot
+            // count, which is the one fact array scalar replacement needs.
+            ir::Op::NewArray { element_type, .. } => escape_analysis::Op::NewArray {
+                element_type: *element_type,
+                length: ir_new_array_const_length(ir_graph, i as ir::NodeId),
+            },
             ir::Op::Cmp(_) if ir_cmp_is_ref_compare(ir_graph, ir_node) => {
                 escape_analysis::Op::RefCompare
             }
@@ -14364,6 +14439,29 @@ fn escape_analysis_from_ir(
                 vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
             }
             ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            // Array element access, re-packed into the same compact layout the
+            // EA graph reads field access in: `Store [holder, value]`,
+            // `Load [holder]`. The array reference is input 2 and the stored
+            // value input 4; the index is NOT an EA operand at all -- it was
+            // folded into the `Op::Load(i)` / `Op::Store(i)` payload above.
+            // Forwarding verbatim would make the CONTROL edge the holder.
+            //
+            // Guarded on the node still being classified as a field op: an
+            // access whose index was not constant kept the `EaOp::Call`
+            // mapping, and a `Call` must keep ALL its reference operands or the
+            // arg-escape rule stops seeing the array.
+            ir::Op::ArrayStore(_)
+                if ir_node.inputs.len() >= 5
+                    && matches!(ea.nodes[ea_id].op, escape_analysis::Op::Store(_)) =>
+            {
+                vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
+            }
+            ir::Op::ArrayLoad(_)
+                if ir_node.inputs.len() >= 4
+                    && matches!(ea.nodes[ea_id].op, escape_analysis::Op::Load(_)) =>
+            {
+                vec![map_id(ir_node.inputs[2])]
+            }
             // EA layout contract: the locked reference is input 0. The IR node
             // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`, so
             // forwarding verbatim would attribute the monitor to the MEMORY
@@ -14553,8 +14651,12 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             class_id: *class_id,
             num_fields: *num_fields,
         },
+        // No graph to ask, so no length: `None` is the fail-closed answer and
+        // makes the array a non-candidate. `escape_analysis_from_ir` fills the
+        // length itself for the nodes it bridges.
         ir::Op::NewArray { element_type, .. } => EaOp::NewArray {
             element_type: *element_type,
+            length: None,
         },
         ir::Op::Call { .. } => EaOp::Call,
         // cov-01. `EaOp::Call` is the conservative mapping and the honest one:
@@ -14571,13 +14673,15 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             EaOp::Call
         }
         ir::Op::ArrayLength => EaOp::ArrayLength,
-        // Array element access escapes its array reference (conservative): map to
-        // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
-        // Today the array is always a Param/external ref (the builder bails on
-        // `newarray`, so a `new[]` never reaches here) and so is never a
-        // scalar-replacement candidate, but routing through `Call` (rather than
-        // the no-op `Other`) keeps a hypothetical future `new[]` from being
-        // wrongly scalar-replaced — the IR lowerer has no scalar-array path.
+        // Array element access, for the callers that have no graph to ask.
+        // `escape_analysis_from_ir` no longer reaches this arm: it classifies
+        // an access with a CONSTANT index as a field access on the array (see
+        // its first pass), which is what makes a small constant-length array
+        // replaceable. Everything else — a non-constant index, and every
+        // caller of this graph-free function — keeps `EaOp::Call`, whose
+        // handling marks every reference input `ArgEscape` and so refuses the
+        // array. That is the fail-closed answer for an access naming a slot
+        // nobody could identify.
         ir::Op::ArrayLoad(_) | ir::Op::ArrayStore(_) => EaOp::Call,
         ir::Op::Dead => EaOp::Dead,
         // All other IR ops (Region, Proj, ConstF, conversions, bitwise,
@@ -14866,21 +14970,51 @@ fn plan_scalar_replacement(
     deopt_descriptor_available: bool,
 ) -> Option<EaScalarPlan> {
     let new_node = *reverse_map.get(&info.alloc_node)?;
-    if !matches!(ir_graph.node_opt(new_node)?.op, ir::Op::New { .. }) {
+    // An array candidate names an `Op::NewArray` and its slots are reached by
+    // `Op::ArrayLoad` / `Op::ArrayStore`; an object candidate names an
+    // `Op::New` and its fields by `Op::Load` / `Op::Store`. The two node kinds
+    // are checked against `info.array_element_type` rather than accepted
+    // interchangeably, so a candidate whose EA-side and IR-side shapes disagree
+    // is refused instead of half-applied.
+    let is_array = info.array_element_type.is_some();
+    let alloc_op_matches = match &ir_graph.node_opt(new_node)?.op {
+        ir::Op::New { .. } => !is_array,
+        ir::Op::NewArray { .. } => is_array,
+        _ => false,
+    };
+    if !alloc_op_matches {
         return None;
     }
 
-    // The field index a load/store accesses. Must match the index the EA bridge
-    // keyed its field edges by: the real index from the `Const` offset operand
-    // of a full-layout production node, falling back to the `MemKind`-derived
-    // index for a compact / hand-built one.
+    // The slot index a load/store accesses. Must match the index the EA bridge
+    // keyed its edges by: for a field, the real index from the `Const` offset
+    // operand of a full-layout production node, falling back to the
+    // `MemKind`-derived index for a compact / hand-built one; for an array
+    // element, the `Const` index operand.
     let field_index = |id: ir::NodeId| -> Option<usize> {
+        if is_array {
+            return ir_array_const_index(ir_graph, id);
+        }
         if let Some(f) = ir_load_store_field_index(ir_graph, id) {
             return Some(f);
         }
         match &ir_graph.node_opt(id)?.op {
             ir::Op::Load(mk) | ir::Op::Store(mk) => Some(*mk as usize),
             _ => None,
+        }
+    };
+    let load_op_matches = |id: ir::NodeId| -> bool {
+        match ir_graph.node_opt(id).map(|n| &n.op) {
+            Some(ir::Op::Load(_)) => !is_array,
+            Some(ir::Op::ArrayLoad(_)) => is_array,
+            _ => false,
+        }
+    };
+    let store_op_matches = |id: ir::NodeId| -> bool {
+        match ir_graph.node_opt(id).map(|n| &n.op) {
+            Some(ir::Op::Store(_)) => !is_array,
+            Some(ir::Op::ArrayStore(_)) => is_array,
+            _ => false,
         }
     };
 
@@ -14894,7 +15028,7 @@ fn plan_scalar_replacement(
             Some(&l) => l,
             None => continue,
         };
-        if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
+        if !load_op_matches(l) {
             return None;
         }
         // Bridge/analysis agreement check. The index itself is no longer used
@@ -14912,7 +15046,7 @@ fn plan_scalar_replacement(
             Some(&s) => s,
             None => continue,
         };
-        if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
+        if !store_op_matches(s) {
             return None;
         }
         if field_index(s).is_none() {
@@ -15093,24 +15227,75 @@ fn apply_ea_to_ir(
         }
     }
 
-    // Materialise ONE shared zero default for every never-stored field load
-    // (the old code appended a fresh `Const(0)` per load).
-    let mut zero_default: Option<ir::NodeId> = None;
+    // Materialise ONE shared zero default PER VALUE TYPE for every never-stored
+    // slot load. One shared `Const(0)` typed `Int` was right as long as the only
+    // candidates were objects whose admitted `<init>` shapes read int-shaped
+    // fields; it is not right in general, and array scalar replacement makes
+    // the general case reachable -- a never-stored `long[]` slot forwarded to an
+    // `Int`-typed node is a 32-bit value where a 64-bit one belongs.
+    //
+    // The load node's own `ty` is the authority: it is what the consumer of the
+    // load expects, and forwarding must produce exactly that. `Long` uses
+    // `Op::Const`, `Float`/`Double` the FP constant node (`Op::ConstF`, whose
+    // payload is raw bits -- and +0.0's bits are 0 for both widths).
+    //
+    // A type this does not know how to spell a zero for (`Ref`, and the
+    // non-value types) leaves the load alone: the plan is dropped rather than
+    // answered with a guess. That is why `Op::NewArray` candidates are
+    // restricted to primitive element types -- see `MAX_SCALAR_ARRAY_LEN`'s
+    // neighbourhood in `escape_analysis`.
+    let mut zero_defaults: HashMap<ir::IrType, ir::NodeId> = HashMap::new();
     for plan in plans.iter_mut() {
-        for (_, value) in plan.loads.iter_mut() {
-            if value.is_none() {
-                let z = match zero_default {
-                    Some(z) => z,
-                    None => {
-                        let z = ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None);
-                        zero_default = Some(z);
-                        z
-                    }
-                };
-                *value = Some(z);
+        for (load, value) in plan.loads.iter_mut() {
+            if value.is_some() {
+                continue;
             }
+            let ty = match ir_graph.node_opt(*load).map(|n| n.ty) {
+                Some(t) => t,
+                None => continue,
+            };
+            let z = match zero_defaults.get(&ty) {
+                Some(&z) => Some(z),
+                None => {
+                    let made = match ty {
+                        ir::IrType::Int => Some(ir_graph.add(
+                            ir::Op::Const(0),
+                            ir::IrType::Int,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Long => Some(ir_graph.add(
+                            ir::Op::Const(0),
+                            ir::IrType::Long,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Float => Some(ir_graph.add(
+                            ir::Op::ConstF(0),
+                            ir::IrType::Float,
+                            vec![],
+                            None,
+                        )),
+                        ir::IrType::Double => Some(ir_graph.add(
+                            ir::Op::ConstF(0),
+                            ir::IrType::Double,
+                            vec![],
+                            None,
+                        )),
+                        _ => None,
+                    };
+                    if let Some(z) = made {
+                        zero_defaults.insert(ty, z);
+                    }
+                    made
+                }
+            };
+            *value = z;
         }
     }
+    // A load whose zero default could not be spelled leaves its plan
+    // unanswerable; drop the whole plan rather than apply it in part.
+    plans.retain(|p| p.loads.iter().all(|(_, v)| v.is_some()));
 
     // ── Phase 2: collect victims, then apply in ascending node id ────
     //
@@ -15357,6 +15542,21 @@ fn virtual_object_info_for(
     reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
     info: &escape_analysis::ScalarReplacementInfo,
 ) -> Option<(ir::NodeId, ir_lower::VirtualObjectInfo)> {
+    // ARRAYS HAVE NO RECIPE. `VirtualObjectInfo` describes an object as a
+    // `class_id` plus a field count, and the VM materializer turns that into
+    // `alloc_object_shared(class_id, num_fields)`. There is no spelling of "a
+    // `short[2]`" in it, and inventing one by passing the array's class id
+    // through would make the materializer allocate an OBJECT with two
+    // reference-shaped fields where the frame expects an array.
+    //
+    // `None` here is not a refusal to optimise -- it is the input to
+    // `plan_scalar_replacement`'s `elide_alloc` gate, which then keeps the
+    // allocation alive for any array a deopt snapshot names, and elides it for
+    // every array no snapshot names. Extending the descriptor to arrays is what
+    // would lift that restriction; until then this is the fail-closed half.
+    if info.array_element_type.is_some() {
+        return None;
+    }
     // Control input (slot 0) of a node, used to recover a node's block for the
     // dominance gate AFTER the node itself is marked `Op::Dead` (its inputs are
     // cleared then, but the captured control node stays live).

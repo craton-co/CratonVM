@@ -154,6 +154,18 @@ pub enum Op {
     },
     NewArray {
         element_type: u8,
+        /// The array's length, when the producer proved it a compile-time
+        /// constant; `None` otherwise.
+        ///
+        /// This is what makes an array a scalar-replacement candidate at all:
+        /// an array of constant length N maps onto
+        /// [`ScalarReplacementInfo::field_values`] exactly the way an N-field
+        /// object does, and a constant index is exactly a field index. Without
+        /// a length there is no slot count, so there is nothing to map onto.
+        ///
+        /// `None` is the fail-closed default: a hand-built or future-produced
+        /// node that does not fill it is simply never a candidate.
+        length: Option<usize>,
     },
     Call,
     MonitorEnter,
@@ -407,9 +419,11 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
         .iter()
         .all(|&a| match graph.nodes.get(a).map(|n| &n.op) {
             Some(Op::New { num_fields, .. }) => field < *num_fields,
-            // Arrays have no statically-known field count here; treat any index as
-            // out-of-range so array stores take the conservative escape path.
-            Some(Op::NewArray { .. }) => false,
+            // An array's "fields" are its elements, so a constant length is a
+            // slot count and a constant index is a field index. An array whose
+            // length the producer could not prove constant still answers
+            // `false`, which keeps its accesses on the conservative path.
+            Some(Op::NewArray { length, .. }) => length.is_some_and(|n| field < n),
             _ => false,
         })
 }
@@ -782,6 +796,15 @@ pub struct ScalarReplacementInfo {
     pub load_values: Vec<(NodeId, LoadResolution)>,
     /// Stores that were eliminated.
     pub eliminated_stores: Vec<NodeId>,
+    /// `Some(atype)` when the replaced allocation is an [`Op::NewArray`], and
+    /// the elements rather than fields are what `field_values` describes;
+    /// `None` for an ordinary object.
+    ///
+    /// The IR-side applier reads this to know whether it is looking for
+    /// `Op::Load`/`Op::Store` or `Op::ArrayLoad`/`Op::ArrayStore`, and the
+    /// deopt-descriptor producer reads it to know it cannot describe the
+    /// allocation with a `class_id`.
+    pub array_element_type: Option<u8>,
     /// Whether program order was a sound dominance stand-in **for this
     /// candidate** — either [`program_order_proves_dominance`] for the whole
     /// graph, or [`one_block_proves_dominance`] for this object alone.
@@ -823,6 +846,20 @@ pub struct PartialEscapeInfo {
 }
 
 /// Full result of escape analysis on a graph.
+/// The largest constant array length scalar replacement will take on.
+///
+/// Replacing an array trades one allocation for one live value per element, and
+/// the register allocator pays for every one of them. Small wrapper arrays --
+/// the `short[2]` behind a `Short2`, a `float[3]` behind a vector type -- are
+/// the shape this exists for, and they are the shape where the trade is
+/// obviously good. A long array turns a single allocation into dozens of
+/// simultaneously-live values and spills, which is a pessimisation dressed as
+/// an optimisation.
+///
+/// Eight is chosen to cover the vector/tuple wrappers (2, 3, 4, 8 elements) and
+/// stop well short of anything a loop would index.
+pub const MAX_SCALAR_ARRAY_LEN: usize = 8;
+
 /// Why [`find_scalar_replacements`] refused one allocation.
 ///
 /// # Why this exists
@@ -892,10 +929,14 @@ pub enum ArrayRefusal {
     /// `ArrayIndexOutOfBoundsException` at run time, and deleting the array
     /// deletes the throw.
     IndexOutOfRange,
-    /// `Op::ArrayLength` is answerable for a constant-length array, but this
-    /// array's length is not constant. (Kept separate from
-    /// [`Self::LengthNotConstant`] so the report names the node that asked.)
-    LengthReadOfUnknownLength,
+    /// The array's elements are references (`anewarray`). See the refusal
+    /// site: the applier has no spelling for a `null` zero default.
+    ReferenceElements,
+    /// `Op::ArrayLength` names this array. The length IS a compile-time
+    /// constant and could be folded to it, but no applier arm does that today,
+    /// so replacing the array would leave a live node reading a deleted one.
+    /// Refused rather than half-applied.
+    LengthReadNotFolded,
 }
 
 pub struct EscapeAnalysisResult {
@@ -1504,11 +1545,58 @@ fn find_scalar_replacements(
         .collect();
 
     for (id, node) in graph.nodes.iter().enumerate() {
-        if let Op::New {
-            class_id,
-            num_fields,
-        } = &node.op
-        {
+        // An object contributes its field count; an array of proven constant
+        // length contributes its element count, which is the same thing for
+        // every question below. `class_id` is meaningless for an array and is
+        // never read for one -- `array_element_type` is what the consumers ask.
+        let shape: Option<(u32, usize, Option<u8>)> = match &node.op {
+            Op::New {
+                class_id,
+                num_fields,
+            } => Some((*class_id, *num_fields, None)),
+            Op::NewArray {
+                element_type,
+                length,
+            } if *element_type == 0 => {
+                // `anewarray`: a REFERENCE array (the bridge writes
+                // `element_type = 0` for it; JVM atypes start at 4). Refused,
+                // and not for want of a length. A never-stored slot of one has
+                // to be answered with `null`, and the applier's zero default is
+                // a numeric constant -- an `Int`-typed zero forwarded where a
+                // reference belongs is the silent-null shape this codebase has
+                // paid for more than once. Primitive element types have an
+                // honest zero; a reference does not, here.
+                let _ = length;
+                refusals.push((
+                    id,
+                    ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::ReferenceElements),
+                ));
+                None
+            }
+            Op::NewArray {
+                element_type,
+                length,
+            } => match length {
+                Some(n) if *n <= MAX_SCALAR_ARRAY_LEN => Some((0, *n, Some(*element_type))),
+                Some(n) => {
+                    refusals.push((
+                        id,
+                        ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthTooLarge(*n)),
+                    ));
+                    None
+                }
+                None => {
+                    refusals.push((
+                        id,
+                        ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthNotConstant),
+                    ));
+                    None
+                }
+            },
+            _ => None,
+        };
+        if let Some((class_id, num_fields, array_element_type)) = shape {
+            let (class_id, num_fields) = (&class_id, &num_fields);
             let state = cg.get_escape(id);
             if state != EscapeState::NoEscape {
                 refusals.push((id, ScalarRefusal::Escapes(state)));
@@ -1751,9 +1839,20 @@ fn find_scalar_replacements(
                         can_replace = false;
                         break;
                     }
-                    // ArrayLength on a non-escaping object is fine -- the
-                    // length is known statically. Other uses prevent SR.
-                    Op::ArrayLength => {}
+                    // `arraylength` cannot name an ordinary object, so for one
+                    // this arm is unreachable and skipping it is harmless. For
+                    // an ARRAY candidate it is a live node that would be left
+                    // reading the array this pass is about to delete, and
+                    // nothing folds it to the constant length -- so refuse.
+                    Op::ArrayLength => {
+                        if array_element_type.is_some() {
+                            refusal = Some(ScalarRefusal::ArrayNotReplaceable(
+                                ArrayRefusal::LengthReadNotFolded,
+                            ));
+                            can_replace = false;
+                            break;
+                        }
+                    }
                     _ => {
                         refusal = Some(ScalarRefusal::OpaqueUse);
                         can_replace = false;
@@ -1845,6 +1944,7 @@ fn find_scalar_replacements(
                     replaced_loads,
                     load_values,
                     eliminated_stores,
+                    array_element_type,
                     dominance_proved,
                 });
             } else {
@@ -3606,7 +3706,7 @@ mod tests {
     #[test]
     fn test_array_returned_global_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 10 }, vec![]);
+        let arr = g.add_node(Op::NewArray { element_type: 10, length: None }, vec![]);
         g.nodes[1].inputs.push(arr);
         g.nodes[arr].uses.push(1);
         let result = analyze_escapes(&g);
@@ -3619,7 +3719,7 @@ mod tests {
     #[test]
     fn test_array_local_no_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 5 }, vec![]);
+        let arr = g.add_node(Op::NewArray { element_type: 5, length: None }, vec![]);
         let _len = g.add_node(Op::ArrayLength, vec![arr]);
         let result = analyze_escapes(&g);
         assert_eq!(result.escape_states.get(&arr), Some(&EscapeState::NoEscape));
@@ -3717,6 +3817,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Value(c10))],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: true,
         };
 
@@ -3893,6 +3994,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Value(c42))],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: true,
         };
 
@@ -3946,13 +4048,210 @@ mod tests {
     }
 
     #[test]
-    fn test_new_array_local_scalar_not_replaced() {
-        // NewArray cannot be scalar-replaced (only New can).
+    fn test_new_array_without_constant_length_not_replaced() {
+        // A `newarray` whose length the producer could not prove constant has no
+        // slot count, so there is nothing to map onto `field_values`. It is
+        // still NoEscape -- the refusal is about VALUE, not reachability.
         let mut g = Graph::new();
-        let _arr = g.add_node(Op::NewArray { element_type: 4 }, vec![]);
+        let _arr = g.add_node(
+            Op::NewArray {
+                element_type: 4,
+                length: None,
+            },
+            vec![],
+        );
         let result = analyze_escapes(&g);
         assert!(result.scalar_replaceable.is_empty());
         assert_eq!(result.stats.no_escape, 1);
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                2,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthNotConstant)
+            )],
+            "the refusal must name the missing length, not a generic bail"
+        );
+    }
+
+    /// The `Short2` shape: a `short[2]`, both slots stored then both read.
+    ///
+    /// This is the half of the per-voxel wrapper that `Op::New` scalar
+    /// replacement could never reach -- `docs/known-issues/jit/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-20260827.md`
+    /// recorded it as `test_new_array_local_scalar_not_replaced`.
+    #[test]
+    fn test_constant_length_array_is_scalar_replaced() {
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9, // short
+                length: Some(2),
+            },
+            vec![],
+        );
+        let v0 = g.add_node(Op::Const(7), vec![]);
+        let v1 = g.add_node(Op::Const(9), vec![]);
+        g.add_node(Op::Store(0), vec![arr, v0]);
+        g.add_node(Op::Store(1), vec![arr, v1]);
+        let l0 = g.add_node(Op::Load(0), vec![arr]);
+        let l1 = g.add_node(Op::Load(1), vec![arr]);
+        g.add_node(Op::Add, vec![l0, l1]);
+
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|i| i.alloc_node == arr)
+            .expect("a two-slot array with constant indices is replaceable");
+        assert_eq!(info.array_element_type, Some(9));
+        assert_eq!(info.num_fields, 2);
+        assert_eq!(info.field_values, vec![Some(v0), Some(v1)]);
+        assert_eq!(info.load_value(l0), LoadResolution::Value(v0));
+        assert_eq!(info.load_value(l1), LoadResolution::Value(v1));
+    }
+
+    #[test]
+    fn test_array_longer_than_the_cap_is_refused_by_length() {
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 10,
+                length: Some(MAX_SCALAR_ARRAY_LEN + 1),
+            },
+            vec![],
+        );
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthTooLarge(
+                    MAX_SCALAR_ARRAY_LEN + 1
+                ))
+            )],
+        );
+    }
+
+    #[test]
+    fn test_reference_array_is_refused() {
+        // `anewarray` -> element_type 0. A never-stored slot would have to be
+        // answered with `null`, and the applier's zero default is numeric.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 0,
+                length: Some(2),
+            },
+            vec![],
+        );
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::ReferenceElements)
+            )],
+        );
+    }
+
+    #[test]
+    fn test_array_index_out_of_range_refuses_the_array() {
+        // A constant index outside `0..len` throws `ArrayIndexOutOfBounds` at
+        // run time; deleting the array would delete the throw.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9,
+                length: Some(2),
+            },
+            vec![],
+        );
+        let v = g.add_node(Op::Const(1), vec![]);
+        g.add_node(Op::Store(5), vec![arr, v]);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(arr, ScalarRefusal::FieldIndexOutOfRange)],
+        );
+    }
+
+    #[test]
+    fn test_arraylength_on_a_replaced_array_is_refused() {
+        // Nothing folds `arraylength` to the constant, so replacing the array
+        // would leave a live node reading a deleted one.
+        let mut g = Graph::new();
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 9,
+                length: Some(2),
+            },
+            vec![],
+        );
+        g.add_node(Op::ArrayLength, vec![arr]);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(
+                arr,
+                ScalarRefusal::ArrayNotReplaceable(ArrayRefusal::LengthReadNotFolded)
+            )],
+        );
+    }
+
+    /// The refusal instrument is only worth having if it names the fact that
+    /// actually stopped the object. This is the shape the per-voxel page hit:
+    /// a graph with a branch, an object whose accesses are all in one block.
+    #[test]
+    fn test_one_block_dominance_answers_a_load_a_branchy_graph_could_not() {
+        // Build a graph with a branch somewhere else entirely, so
+        // `program_order_proves_dominance` is false for the whole graph.
+        let build = |same_block: bool| {
+            let mut g = Graph::new();
+            let block = g.add_node(Op::Merge, vec![]);
+            let other = g.add_node(Op::Merge, vec![]);
+            let obj = g.add_node(
+                Op::New {
+                    class_id: 1,
+                    num_fields: 1,
+                },
+                vec![],
+            );
+            let v = g.add_node(Op::Const(42), vec![]);
+            let st = g.add_node(Op::Store(0), vec![obj, v]);
+            let ld = g.add_node(Op::Load(0), vec![obj]);
+            g.add_node(Op::Add, vec![ld, ld]);
+            g.blocks.insert(obj, block);
+            g.blocks.insert(st, block);
+            g.blocks.insert(ld, if same_block { block } else { other });
+            (g, obj, v, ld)
+        };
+
+        let (g, obj, v, ld) = build(true);
+        assert!(
+            !program_order_proves_dominance(&g),
+            "precondition: the graph has a Merge, so the whole-graph stand-in fails"
+        );
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|i| i.alloc_node == obj)
+            .expect("every access is in one block, so the load is answerable");
+        assert!(info.dominance_proved);
+        assert_eq!(info.load_value(ld), LoadResolution::Value(v));
+
+        // Move the load to another block and the proof must fail closed.
+        let (g, obj, _, _) = build(false);
+        let result = analyze_escapes(&g);
+        assert!(result.scalar_replaceable.is_empty());
+        assert_eq!(
+            result.scalar_refusals,
+            vec![(obj, ScalarRefusal::LoadNotAnswerable)],
+            "a load in another block is not ordered by program order"
+        );
     }
 
     #[test]
@@ -4454,7 +4753,7 @@ mod tests {
         let mut cg = build_connection_graph(&g);
         escalate_all_to_global(&mut cg, &g);
         assert!(
-            find_scalar_replacements(&cg, &g).is_empty(),
+            find_scalar_replacements(&cg, &g).0.is_empty(),
             "no allocation may be scalar-replaced after escalation"
         );
         assert!(
@@ -4708,6 +5007,7 @@ mod tests {
             replaced_loads: vec![load],
             load_values: vec![(load, LoadResolution::Unknown)],
             eliminated_stores: vec![store],
+            array_element_type: None,
             dominance_proved: false,
         };
         apply_scalar_replacement(&mut g, &info);
