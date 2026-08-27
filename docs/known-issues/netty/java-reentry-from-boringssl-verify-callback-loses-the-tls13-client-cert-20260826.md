@@ -111,10 +111,23 @@ Java, allocates nothing and calls no native, so the callback is left exactly as
 it was before the hostname fix — while a client that DOES ask for identification
 still gets it.
 
-`CRATONVM_X509_TM_NO_IDENTIFY_SERVER` / `..._CLIENT` disable each direction
-outright. They exist so this attribution stays a one-run A/B rather than a
-rebuild; they are diagnostic levers, and the SERVER one re-opens a real security
-hole, so neither is a configuration.
+**There is no VM switch for any of this, and there was.** An earlier revision of
+this work shipped three environment flags —
+`CRATONVM_X509_TM_PARAMS_VIA_METHOD` to force the offending route back on, and a
+`CRATONVM_X509_TM_NO_IDENTIFY_{SERVER,CLIENT}` pair to disable each direction of
+the check — so that re-arming the defect stayed a one-run A/B instead of a
+rebuild. They are all removed. The `SERVER` one could turn hostname verification
+off outright, and a shipped VM must not carry an environment variable that
+disables a security check, whatever its default; the other two were not worth a
+separate mechanism once the first had to go.
+
+The lever moved to where it belongs. This defect IS "Java re-enters tcnative
+from inside BoringSSL's callback", so a probe can arm it with its own trust
+manager and needs no cooperation from the VM at all:
+`OpenSslTls13ClientCertProbe`'s `ReentrantTrustManager` calls
+`engine.getSSLParameters()` from inside `checkServerTrusted`, throws the answer
+away, and reports the outcome as an `@@REPRO` line scored separately from the
+probe's own pass/fail. HotSpot: `rows_failed=0`.
 
 **The workaround is not the fix**, and the section above is the proof rather
 than the warning: an application trust manager doing its own work on that
@@ -148,11 +161,11 @@ callback — `SSL.getOptions` alone, then `SSL.getCiphers` alone, then the bare
 `synchronized` block with no native inside — and see which row flips. Three
 runs answer the first bullet above.
 
-`CRATONVM_X509_TM_PARAMS_VIA_METHOD=1` re-arms the defect on a shipped binary
-without editing anything, which is the control for each of those three runs.
-And `mustCallResumeTrustedOnSessionResumption` is the arm to confirm a candidate
-fix against, because it is the one this VM fails WITHOUT any help from
-`x509_manager`.
+`OpenSslTls13ClientCertProbe`'s `@@REPRO` rows arm the defect from Java, which
+is the control for each of those three runs — vary what `ReentrantTrustManager`
+calls and watch the row flip. And `mustCallResumeTrustedOnSessionResumption` is
+the arm to confirm a candidate fix against, because it is the one this VM fails
+WITHOUT any help from `x509_manager` and without a probe.
 
 ## Repro
 
@@ -163,15 +176,16 @@ java @common.args OpenSslTls13ClientCertProbe            # HotSpot: 8/8
 cratonvm --java-home <jdk25> --Xmx 1500m -XX:+UseG1GC \
   @common.args OpenSslTls13ClientCertProbe               # expect 8/8 with the workaround in place
 
-# re-arm the defect without editing code:
-CRATONVM_X509_TM_NO_IDENTIFY_SERVER=  cratonvm … OpenSslTls13ClientCertProbe   # still 8/8
 ```
+
+The probe's last two rows re-arm the defect from Java on whatever binary you
+point it at; `@@REPRO ... rows_failed=1` is this VM today, `rows_failed=0` is
+HotSpot and is what a fix has to reach.
 
 ## Related files
 
 - `native-builtins/src/x509_manager.rs` — `extended_tm_identification_algorithm`
   (the field fast path), `check_server_trusted_extended`
-- `types/src/flags.rs` — `x509_tm_no_identify_client` / `x509_tm_no_identify_server`
 - `probes/OpenSslTls13ClientCertProbe.java`
 - `apps/netty/handler/src/main/java/io/netty/handler/ssl/ReferenceCountedOpenSslEngine.java`
   — `getSSLParameters()`, and `OpenSslEngineTestParam.wrapContext`'s `setUseTasks`
