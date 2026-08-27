@@ -1451,6 +1451,12 @@ fn zgc_headroom_margin(capacity: usize) -> usize {
 }
 
 /// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
+///
+/// **This is ABOVE [`ZgcRealHeap::MAX_PLAUSIBLE_ARRAY_LEN`] (`1 << 28`), the
+/// corruption screen `alloc_size` applies.** Every array this constant admits
+/// between the two is legal to allocate and unsizable to the collector; see that
+/// constant's doc for what each consumer does about it, and for why the marker
+/// must not be one of them.
 const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 
 /// Registered objects the sweep refused to size (and therefore refused to
@@ -7819,6 +7825,41 @@ impl ZgcRealHeap {
     /// payload bytes almost always exceeds it. Deliberately generous: this is
     /// a corruption screen, not a policy limit, and refusing a real array would
     /// break a working program in order to catch a broken one.
+    ///
+    /// # It is BELOW the allocator's own limit, and that gap is reachable
+    ///
+    /// [`ZGC_REAL_MAX_ARRAY_LENGTH`] is `i32::MAX` (~2.1G elements), so a
+    /// reference array between `1 << 28` and that IS allocatable on a large
+    /// heap and IS refused here. "larger than any array this VM can hold in the
+    /// heaps it runs" is a statement about the heaps it is usually run in, not a
+    /// bound anything enforces — a 268M-element `Object[]` is 2.1 GB of payload,
+    /// which a 16 GB ergonomic default heap admits.
+    ///
+    /// What that costs, per consumer of [`ZgcRealHeap::alloc_size`]:
+    ///
+    /// * **The marker: nothing, now.** `visit_strong_refs_at` deliberately does
+    ///   NOT screen array length, because refusing there means an out-edge not
+    ///   traced — a live object collected. `enumerate_references` briefly did
+    ///   (2026-08-26, same day, caught before it landed on dev) and that was the
+    ///   bug this paragraph exists to prevent recurring.
+    /// * **The slide: conservative but noisy.** An unsizable object is skipped
+    ///   from relocation and logged at `error`, so such an array is permanently
+    ///   un-compactable and emits guard spam rather than corrupting anything.
+    /// * **`live_bytes` accounting: under-counts** by the array's whole size,
+    ///   which makes its page look emptier than it is to the relocation
+    ///   selector.
+    ///
+    /// Neither sibling collector has this gap: `gen_heap`'s and `g1`'s
+    /// plausibility screens are both written `if !is_array && num_slots > ...`,
+    /// i.e. they cap OBJECT field counts and deliberately leave array length
+    /// alone. ZGC is the only one that caps a length, and therefore the only one
+    /// where the two constants can disagree.
+    ///
+    /// Raising this to `ZGC_REAL_MAX_ARRAY_LENGTH` would close the gap and
+    /// weaken the screen to nothing (every `u32` length passes), so it is not
+    /// the obvious fix; bounding by the ARENA's extent rather than by a constant
+    /// probably is. Not attempted here — it wants a fixture that can allocate a
+    /// multi-gigabyte array, which this suite has no way to run.
     const MAX_PLAUSIBLE_ARRAY_LEN: usize = 1usize << 28;
 
     /// Total size in bytes of the allocation rooted at `header`, or `None` when

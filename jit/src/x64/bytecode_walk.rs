@@ -8318,6 +8318,220 @@ impl Compiler {
                         #[allow(unused_mut)]
                         let mut intrinsic_handled = false;
 
+                        // ===== INTRINSIC REGION BEGIN: FFM_SEGMENT =====
+                        // `MemorySegment.getAtIndex`/`setAtIndex`, lowered to a
+                        // CALL of the FFM element fast-path helper with a
+                        // DECLINE edge that runs the site's ordinary native
+                        // dispatch.
+                        //
+                        // Through that ordinary dispatch these measure ~1158
+                        // ns/element against ~0.8 ns for a `short[]` element,
+                        // and they are per-ELEMENT: any segment-backed array
+                        // drives one per element.
+                        //
+                        // Not inline machine code, deliberately. The carrier's
+                        // liveness model spans two synthetic classes owned by
+                        // two different files, and a second copy of one of its
+                        // slot indices has already made that check silently
+                        // DEAD once (the W7-89 note on `PE_ARENA_CLASS`). The
+                        // helper asks the NATIVE for a verdict instead of
+                        // re-deriving one — see
+                        // `cratonvm_native_builtins::ffm_fast`.
+                        //
+                        // The decline edge is what makes this safe to be wrong
+                        // about: helper returns 0 and control falls into the
+                        // same `invoke_dispatch` the site would have used
+                        // anyway, so a heap-backed carrier, a closed scope, an
+                        // out-of-bounds index or an unrecognised shape all keep
+                        // today's behaviour AND today's exceptions. Nothing
+                        // here has to reproduce an exception.
+                        if !intrinsic_handled
+                            && (callee_entry
+                                == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry()
+                                || callee_entry
+                                    == crate::JitIntrinsic::FfmSegmentSetAtIndex.as_entry())
+                        {
+                            let is_get = callee_entry
+                                == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry();
+                            let helper = if is_get {
+                                self.helpers.ffm_segment_get
+                            } else {
+                                self.helpers.ffm_segment_set
+                            };
+                            // The site's own dispatch info: the decline edge's
+                            // call target, and the source of the element kind
+                            // (the descriptor NAMES the `ValueLayout` subtype,
+                            // so the width is a compile-time constant).
+                            let info_ptr = self
+                                .invoke_info_idx
+                                .get(&pc)
+                                .map(|&i| self.invoke_info[i].1);
+                            // SAFETY: the pointee is owned by this compile's
+                            // `_jit_invoke_infos` arena and outlives the code.
+                            let kind = info_ptr.and_then(|p| {
+                                if p.is_null() {
+                                    None
+                                } else {
+                                    crate::ffm_kind_for_descriptor(unsafe { (*p).descriptor })
+                                }
+                            });
+                            match (info_ptr, kind) {
+                                (Some(info), Some(kind)) if helper != 0 && !info.is_null() => {
+                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                                        eprintln!("[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}");
+                                    }
+                                    self.flush_scratch_registers();
+                                    // Operands, deepest first: receiver, layout,
+                                    // index, and (set only) the value.
+                                    let value_slot =
+                                        if is_get { None } else { Some(self.pop_stack()) };
+                                    let index_slot = self.pop_stack();
+                                    let layout_slot = self.pop_stack();
+                                    let recv_slot = self.pop_stack();
+
+                                    // One slot for the helper's out-parameter
+                                    // (get only). Reserved BEFORE the decline
+                                    // edge's argument buffer so reclaiming that
+                                    // buffer cannot free this.
+                                    let out_base = if is_get {
+                                        match self.reserve_spill_slots(1) {
+                                            Some(b) => Some(b),
+                                            None => {
+                                                self.fail(
+                                                    "singlepass-codegen/ffm-out-spill-exhausted",
+                                                );
+                                                return false;
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    // ---- fast path -------------------------
+                                    // No safepoint spill and no oop map: the
+                                    // helper neither allocates nor blocks, so no
+                                    // GC can run inside it and no oop it is
+                                    // handed can move.
+                                    self.load_slot_to_reg(ARG_REGS[0], recv_slot);
+                                    self.load_slot_to_reg(ARG_REGS[1], index_slot);
+                                    self.emit_mov_imm32_sx(ARG_REGS[2], kind as i32);
+                                    // arg3 is the out-pointer for a get and the
+                                    // value for a set. `is_get` already pinned
+                                    // which of the two is `Some`, but this file
+                                    // routes every recoverable case through a
+                                    // bail rather than a panic (see the
+                                    // `deny(...)` header) — so a shape that
+                                    // cannot arise fails the COMPILE, which
+                                    // drops the method to the interpreter.
+                                    match (out_base, value_slot) {
+                                        (Some(out), _) => {
+                                            self.emit_lea_frame_slot(ARG_REGS[3], out)
+                                        }
+                                        (None, Some(v)) => {
+                                            self.load_slot_to_reg(ARG_REGS[3], v)
+                                        }
+                                        (None, None) => {
+                                            self.fail(
+                                                "singlepass-codegen/ffm-missing-arg3-operand",
+                                            );
+                                            return false;
+                                        }
+                                    }
+                                    self.emit_call_absolute(helper);
+                                    self.emit_test_r64_r64(RAX);
+                                    // RAX == 0 -> declined.
+                                    let declined = self.emit_jcc_rel32_patch(0x84);
+                                    if let Some(out) = out_base {
+                                        self.emit_load_local(RAX, out);
+                                    }
+                                    let done = self.emit_jmp_rel32_patch();
+
+                                    // ---- decline edge: the unchanged dispatch
+                                    self.patch_rel32_to_here(declined);
+                                    let nargs = if is_get { 3 } else { 4 };
+                                    let args_base = match self.reserve_spill_slots(nargs) {
+                                        Some(b) => b,
+                                        None => {
+                                            self.fail(
+                                                "singlepass-codegen/ffm-args-spill-exhausted",
+                                            );
+                                            return false;
+                                        }
+                                    };
+                                    // `jit_invoke_dispatch`'s buffer runs
+                                    // arg[0] at the HIGHEST offset down to
+                                    // arg[n-1] at the lowest — the same layout
+                                    // the generic dispatch site builds. Load
+                                    // every operand into a distinct register
+                                    // before storing any of them: the buffer can
+                                    // overlap the operand homes, and a
+                                    // load-then-store per index would overwrite
+                                    // a home not yet read.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.load_slot_to_reg(RCX, layout_slot);
+                                    self.load_slot_to_reg(RDX, index_slot);
+                                    if let Some(v) = value_slot {
+                                        self.load_slot_to_reg(R10, v);
+                                    }
+                                    let top = args_base + (nargs as i32 - 1) * 8;
+                                    self.emit_store_local(top, RAX);
+                                    self.emit_store_local(top - 8, RCX);
+                                    self.emit_store_local(top - 16, RDX);
+                                    if value_slot.is_some() {
+                                        self.emit_store_local(top - 24, R10);
+                                    }
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                    self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64);
+                                    self.emit_lea_frame_slot(ARG_REGS[2], top);
+                                    self.emit_mov_imm32_sx(ARG_REGS[3], nargs as i32);
+                                    self.emit_pre_safepoint_spill();
+                                    self.emit_call_absolute(self.helpers.invoke_dispatch);
+                                    self.emit_oop_map_for_safepoint();
+                                    self.emit_post_invoke_exception_check(if is_get {
+                                        b'I'
+                                    } else {
+                                        b'V'
+                                    });
+
+                                    // ---- join ------------------------------
+                                    self.patch_rel32_to_here(done);
+                                    // Reclaim both the argument buffer and the
+                                    // out slot; RAX already carries whichever
+                                    // path ran.
+                                    self.next_spill_offset =
+                                        out_base.unwrap_or(args_base).min(args_base);
+                                    if is_get {
+                                        self.push_from_rax();
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                                // Falling through here is NOT safe: the site
+                                // carries an intrinsic SENTINEL as its
+                                // `JitDirectCall::entry`, and the ordinary
+                                // direct-call path would CALL that sentinel
+                                // (measured: `EXCEPTION_ACCESS_VIOLATION at
+                                // pc=0xFFFFFFFFFFFFFFB1`). Registration and
+                                // emission are gated on the same
+                                // `ffm_kind_for_descriptor`, so reaching this
+                                // arm means they disagreed — bail the whole
+                                // compile, which drops the method to the
+                                // interpreter and is always safe.
+                                _ => {
+                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                                        eprintln!(
+                                            "[ffm] UNHANDLED pc={pc} info={} kind={:?} helper={}",
+                                            info_ptr.is_some(),
+                                            kind,
+                                            helper != 0
+                                        );
+                                    }
+                                    self.fail("singlepass-codegen/ffm-unhandled-sentinel");
+                                    return false;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: FFM_SEGMENT =====
+
                         // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
                         // `AtomicInteger` RMW family, emitted as ONE
                         // `LOCK XADD [value], ECX`.

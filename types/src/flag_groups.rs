@@ -234,6 +234,7 @@ pub struct E {
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "a5-census", on_key: Some("CRATONVM_DBG_A5_CENSUS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ffm", on_key: Some("CRATONVM_DBG_FFM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
     // Declared 2026-08-06: these nine were read by `runtime_var`/`runtime_var_os`
     // but named nowhere, so each was served by a live `getenv` instead of the
@@ -1184,6 +1185,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
+    E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
     // Default-ON kill switch, hence `off_key` only:
@@ -1264,7 +1266,6 @@ pub const INVENTORY: &[E] = &[
     // old behaviour. Same `off_word` shape as `osr-coverage-shadow` and
     // `xt-jit-coverage-handshake`, which are the other two default-ON rows.
     E { group: Group::JIT, token: "receiver-despec", on_key: Some("CRATONVM_JIT_RECEIVER_DESPEC"), off_key: None, off_word: Some("0") },
-    E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
     // Numeric: the de-speculation spare factor, default 2. A VALUE knob, like
     // `threshold` above -- the token carries a number, not an on/off.
     E { group: Group::JIT, token: "despec-spare-factor", on_key: Some("CRATONVM_JIT_DESPEC_SPARE_FACTOR"), off_key: None, off_word: None },
@@ -1386,6 +1387,12 @@ pub const INVENTORY: &[E] = &[
     // behaviour where only the RBP half was reset on push and restored on pop,
     // which left the pair naming two different frames. See
     // `conservative_roots::reload_top_rbp_cache`.
+    // Declared 2026-08-26. An OPT-OUT: in the regions the abstract interpreter
+    // MODELS (java locals, operand spill), the band verifier treats a slot the
+    // ACTIVE safepoint map does not name as DEAD rather than demanding it be
+    // published. This key restores the stricter reading. See
+    // `conservative_roots::band_slot_is_verifiable_with_map`.
+    E { group: Group::GC, token: "band-map-liveness", on_key: None, off_key: Some("CRATONVM_GC_NO_BAND_MAP_LIVENESS"), off_word: None },
     E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
@@ -2295,15 +2302,24 @@ mod tests {
 
     #[test]
     fn every_token_is_unique() {
+        // Uniqueness is on the PAIR. The same token in two different groups is
+        // deliberate and has its own test
+        // (`a_token_shared_between_groups_stays_two_keys`), so a bare token
+        // count would condemn 13 legitimate rows.
         let mut seen: Vec<(Group, &str)> = INVENTORY.iter().map(|e| (e.group, e.token)).collect();
-        let before = seen.len();
         seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(
-            before,
-            seen.len(),
-            "two entries claim the same (group, token); merge them into one \
-             entry carrying both an on_key and an off_key instead"
+        let dups: Vec<String> = seen
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| format!("{:?}/{}", w[0].0, w[0].1))
+            .collect();
+        assert!(
+            dups.is_empty(),
+            "these (group, token) pairs are claimed twice: {}. Merge each into \
+             ONE entry carrying both an on_key and an off_key, or delete the \
+             duplicate — two sessions declaring the same knob independently is \
+             how this happens, and the row is usually verbatim-identical.",
+            dups.join(", ")
         );
     }
 
@@ -2313,14 +2329,16 @@ mod tests {
             .iter()
             .flat_map(|e| [e.on_key, e.off_key].into_iter().flatten())
             .collect();
-        let before = keys.len();
         keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(
-            before,
-            keys.len(),
-            "a legacy variable is claimed by more than one token, so its \
-             canonical spelling is ambiguous"
+        let dups: Vec<&str> = keys
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| w[0])
+            .collect();
+        assert!(
+            dups.is_empty(),
+            "these legacy variables are claimed by more than one token, so \
+             their canonical spelling is ambiguous: {dups:?}"
         );
         for s in SCALARS {
             assert!(

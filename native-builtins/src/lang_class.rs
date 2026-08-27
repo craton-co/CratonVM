@@ -20336,6 +20336,22 @@ pub(crate) fn native_class_get_class_loader(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A PRIMITIVE class has no defining loader: `Class.getClassLoader()` is
+    // specified to answer null for `int.class` and friends, exactly as it does
+    // for a bootstrap-loaded class. This has to be checked FIRST, before the
+    // `classLoader` field and the reverse map below, because a primitive mirror
+    // is created by the VM and can pick up whichever loader minted it --
+    // MEASURED: `int.class.getClassLoader()` answered
+    // `ClassLoaders$AppClassLoader` against HotSpot's null, in BOTH modes
+    // (`probes/LoaderModuleSweep.java`).
+    //
+    // The direction matters: a non-null loader on a primitive makes a caller
+    // believe the type is application-defined, and the usual next move --
+    // `loader.loadClass(name)` or a loader-keyed cache -- then keys `int` under
+    // the wrong loader.
+    if mirror_is_primitive(ctx, mirror) {
+        return Ok(Some(Value::Object(None)));
+    }
     // In real-JDK mode `getClassLoader()` is intercepted before its ordinary
     // field-reading bytecode runs. Honor a loader recorded on the mirror by
     // ClassLoader.defineClass before consulting the VM side table or package

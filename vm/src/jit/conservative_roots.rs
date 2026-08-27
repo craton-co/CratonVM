@@ -3038,6 +3038,27 @@ fn band_dbg() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
 }
 
+/// The safepoint id the frame at `rbp` is standing on, or `None` when the
+/// method reserved no id slot or the slot is misaligned.
+///
+/// Same read as `moving_young_frame_coverage_complete` makes; split out so the
+/// band reporter can name the ACTIVE map without duplicating the contract.
+/// Diagnostic only — every caller is behind `CRATONVM_MOVING_YOUNG_BAND_DBG`.
+fn frame_active_sp_id(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<u32> {
+    let off = cm.sp_id_slot_off;
+    if off == 0 {
+        return None;
+    }
+    let addr = rbp.checked_sub(off as usize)?;
+    if addr & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: aligned safepoint-id slot of a live JIT frame on this thread,
+    // reached through the same bounds the caller already validated `rbp` with.
+    let v = unsafe { (addr as *const usize).read() };
+    Some(v as u32)
+}
+
 fn report_unpublished_band_words(
     rbp: usize,
     frame_size: usize,
@@ -3045,6 +3066,7 @@ fn report_unpublished_band_words(
     live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
 ) {
+    let map_slots = frame_active_map_slots(rbp, cm);
     let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
     let mut hits = 0usize;
@@ -3053,13 +3075,41 @@ fn report_unpublished_band_words(
         let w = unsafe { (addr as *const usize).read() };
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi)
+        if band_slot_is_verifiable_with_map(off, &cm.frame_layout, live_hi, map_slots.as_ref())
             && cratonvm_gc::gen_heap::addr_is_movable(w)
             && !published.contains(&w)
         {
             hits += 1;
+            // THE FORK, decided per word. `in_map` asks whether the ACTIVE
+            // safepoint's oop map already names this slot:
+            //
+            //   in_map=true  — the dataflow calls the slot a LIVE reference here
+            //                  and the map names it, but the shadow push did not
+            //                  publish it. The two channels disagree, and
+            //                  `collect_live_oop_homes` is the side that is
+            //                  wrong.
+            //   in_map=false — the dataflow does NOT call it live. Declining to
+            //                  publish is then CORRECT, the slot merely holds a
+            //                  stale reference nothing will read, and the band
+            //                  verifier is refusing on a dead word. The repair
+            //                  belongs on the verifier (a liveness bound it can
+            //                  consult), not on codegen.
+            //
+            // Without this the two are indistinguishable from the outside, which
+            // is how `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`'s
+            // `MVStore.closeStore` residual sat unresolved: 64 of 83 unpublished
+            // words are that method's java-locals, one object in three
+            // consecutive slots.
+            let sp_id = frame_active_sp_id(rbp, cm);
+            let in_map = sp_id.map(|id| {
+                cm.oop_maps
+                    .iter()
+                    .filter(|m| m.bytecode_pc == id)
+                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
+            });
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
+                 sp_id={sp_id:?} in_map={in_map:?} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
@@ -3128,12 +3178,14 @@ fn band_has_unpublished_young_word(
     live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
 ) -> bool {
-    band_has_unpublished_word_with(
+    let map_slots = frame_active_map_slots(rbp, cm);
+    band_has_unpublished_word_with_map(
         rbp,
         frame_size,
         &cm.frame_layout,
         live_hi,
         published,
+        map_slots.as_ref(),
         cratonvm_gc::gen_heap::addr_is_movable,
     )
 }
@@ -3155,10 +3207,85 @@ fn band_has_unpublished_young_word(
 /// Scanned: Java locals, the reserved-locals tail, LICM hoist slots,
 /// scalar-replacement fields and the live operand-spill slots — every place a
 /// compiled frame actually keeps a reference it will use after the call.
+/// [`active_map_slots`] as a set, for the band scan's per-word membership test.
+///
+/// `None` — no id, or no map for it — is the fail-closed answer: it leaves every
+/// band word verifiable, because without a liveness statement the scan must not
+/// assume anything is dead.
+fn frame_active_map_slots(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Option<std::collections::HashSet<i32>> {
+    Some(
+        active_map_slots(rbp, cm)?
+            .into_iter()
+            .map(i32::from)
+            .collect(),
+    )
+}
+
+/// Is `off` in a region the JIT's abstract interpreter MODELS?
+///
+/// Java locals and operand-spill slots are exactly what
+/// `moving_young_coverage_complete` is computed from, so for those the
+/// safepoint's oop map carries a definite liveness statement. Everything else
+/// the band scan looks at — LICM hoist slots, scalar-replacement fields, the
+/// reserved-locals tail — is precisely what the map has NO opinion about, which
+/// is the gap the band verifier was built to close (see
+/// `frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`).
+fn region_is_dataflow_modelled(layout: &cratonvm_jit::FrameLayout, off: i32) -> bool {
+    if layout.java_locals_hi > 0 && off < layout.java_locals_hi {
+        return true;
+    }
+    layout.spill_hi > layout.spill_lo && off >= layout.spill_lo && off < layout.spill_hi
+}
+
+/// `CRATONVM_GC_NO_BAND_MAP_LIVENESS=1` — make the band verifier inspect every
+/// word in a modelled region again, whether or not the active safepoint map
+/// names it.
+///
+/// The bisect lever for the dead-slot exemption, default-ON.
+fn band_map_liveness_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_BAND_MAP_LIVENESS").is_none()
+    })
+}
+
 fn band_slot_is_verifiable(
     off: i32,
     layout: &cratonvm_jit::FrameLayout,
     live_hi: Option<i32>,
+) -> bool {
+    band_slot_is_verifiable_with_map(off, layout, live_hi, None)
+}
+
+/// [`band_slot_is_verifiable`] plus the ACTIVE safepoint's mapped slot offsets,
+/// when one resolved.
+///
+/// `map_slots = Some(set)` means the dataflow has stated, for this exact pc,
+/// which slots hold live references. In a region it MODELS, a word it does not
+/// name is DEAD: the slot holds whatever an earlier scope left there, and
+/// nothing will read it again — so demanding that it be published on the shadow
+/// stack refuses a collection over a word that needs no rewriting.
+///
+/// Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+/// **all 74** of one run's unpublished words reported `in_map=false`, 64 of them
+/// in `MVStore.closeStore:(ZI)V` at `sp_id=174`, four slots (offsets 48/56/64/72
+/// = locals 5..8) all holding the SAME object. `closeStore`'s
+/// `LocalVariableTable` puts slot 5 (`map`) in scope 149..170, so at bci 174 it
+/// is out of scope and 6..8 are javac's loop/finally scaffolding copies of it.
+/// The map, the shadow push and the dataflow all agreed; only the band scan
+/// objected, and it was objecting to dead words.
+///
+/// `None` — no map resolved for the frame's sp-id — keeps every word verifiable,
+/// which is the fail-closed direction: without a liveness statement the scan
+/// makes no assumption about what is dead.
+fn band_slot_is_verifiable_with_map(
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
+    map_slots: Option<&std::collections::HashSet<i32>>,
 ) -> bool {
     if layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
         return false;
@@ -3169,6 +3296,13 @@ fn band_slot_is_verifiable(
     if let Some(hi) = live_hi {
         if layout.spill_hi > layout.spill_lo && off >= layout.spill_lo && off >= hi {
             return false;
+        }
+    }
+    if band_map_liveness_enabled() {
+        if let Some(slots) = map_slots {
+            if region_is_dataflow_modelled(layout, off) && !slots.contains(&off) {
+                return false;
+            }
         }
     }
     true
@@ -3185,6 +3319,29 @@ fn band_has_unpublished_word_with(
     published: &std::collections::HashSet<usize>,
     is_relocatable: impl Fn(usize) -> bool,
 ) -> bool {
+    band_has_unpublished_word_with_map(
+        rbp,
+        frame_size,
+        layout,
+        live_hi,
+        published,
+        None,
+        is_relocatable,
+    )
+}
+
+/// [`band_has_unpublished_word_with`] plus the active map's live slots. See
+/// [`band_slot_is_verifiable_with_map`].
+#[allow(clippy::too_many_arguments)]
+fn band_has_unpublished_word_with_map(
+    rbp: usize,
+    frame_size: usize,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
+    published: &std::collections::HashSet<usize>,
+    map_slots: Option<&std::collections::HashSet<i32>>,
+    is_relocatable: impl Fn(usize) -> bool,
+) -> bool {
     if frame_size == 0 || frame_size > rbp {
         return false;
     }
@@ -3198,7 +3355,7 @@ fn band_has_unpublished_word_with(
     while addr + 8 <= hi {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        if !band_slot_is_verifiable(off, layout, live_hi) {
+        if !band_slot_is_verifiable_with_map(off, layout, live_hi, map_slots) {
             addr += 8;
             continue;
         }
@@ -7015,6 +7172,91 @@ mod tests {
     /// hoist slots and the blind full-GPR safepoint spill area. The band scan
     /// is what closes that gap, so it must FAIL when such a word is present.
     #[test]
+    /// A movable word in a DEAD java-local slot is not a root, and must not
+    /// refuse the collection.
+    ///
+    /// The band scan cannot tell live from dead on its own, so before
+    /// 2026-08-26 it demanded that every movable word in a java-local or
+    /// operand-spill slot be published on the shadow stack. For the regions the
+    /// abstract interpreter MODELS that is stricter than the GC requires: the
+    /// safepoint's oop map already states which of those slots hold live
+    /// references at this exact pc, and a slot it does not name holds whatever
+    /// an earlier scope left there.
+    ///
+    /// Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// ALL 74 unpublished words of one run reported `in_map=false`, 64 of them
+    /// in `MVStore.closeStore:(ZI)V` at `sp_id=174`, with offsets 48/56/64/72
+    /// (locals 5..8) all holding the SAME object. `closeStore`'s
+    /// `LocalVariableTable` scopes slot 5 (`map`) to 149..170, so at bci 174 it
+    /// is out of scope and 6..8 are javac's loop/finally copies of it. The
+    /// dataflow, the map and the shadow push all agreed; only the band scan
+    /// objected, and it objected to dead words.
+    ///
+    /// The exemption is deliberately narrow — see the sibling test for the
+    /// regions it must NOT apply to.
+    #[test]
+    fn a_dead_java_local_is_not_a_root_the_band_scan_may_refuse_on() {
+        let mut layout = cratonvm_jit::FrameLayout::default();
+        layout.java_locals_hi = 80;
+        layout.locals_hi = 80;
+
+        let live = 16i32;
+        let dead = 72i32;
+        // The map names ONE of the two local slots at this pc.
+        let mut map_slots = std::collections::HashSet::new();
+        map_slots.insert(live);
+
+        assert!(
+            band_slot_is_verifiable_with_map(live, &layout, None, Some(&map_slots)),
+            "a local the map DOES name is live and must stay verifiable"
+        );
+        assert!(
+            !band_slot_is_verifiable_with_map(dead, &layout, None, Some(&map_slots)),
+            "a java-local the map does not name is dead; refusing on it refuses \
+             a collection over a word nothing will read"
+        );
+        // Fail closed when no map resolved: without a liveness statement the
+        // scan must assume nothing is dead.
+        assert!(
+            band_slot_is_verifiable_with_map(dead, &layout, None, None),
+            "no map = no liveness statement = every word stays verifiable"
+        );
+    }
+
+    /// The exemption applies ONLY to regions the abstract interpreter models.
+    ///
+    /// LICM hoist slots, scalar-replacement fields and the reserved-locals tail
+    /// are precisely what the map has no opinion about, and closing that gap is
+    /// the whole reason the band scan exists
+    /// (`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`).
+    /// Letting an empty map excuse those would delete the check.
+    #[test]
+    fn the_dead_slot_exemption_does_not_reach_regions_the_map_cannot_describe() {
+        let mut layout = cratonvm_jit::FrameLayout::default();
+        layout.java_locals_hi = 32;
+        layout.locals_hi = 32;
+        layout.scalar_lo = 32;
+        layout.scalar_hi = 48;
+        layout.ref_hoist_lo = 48;
+        layout.ref_hoist_hi = 64;
+
+        // An EMPTY map: the dataflow named no live slot at this pc.
+        let empty: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for off in [40i32, 56i32] {
+            assert!(
+                band_slot_is_verifiable_with_map(off, &layout, None, Some(&empty)),
+                "off={off} ({}) is not modelled by the abstract interpreter, so an \
+                 empty map says nothing about it and it must stay verifiable",
+                layout.region_name(off)
+            );
+        }
+        // …while a java-local at the same empty map IS excused.
+        assert!(
+            !band_slot_is_verifiable_with_map(16, &layout, None, Some(&empty)),
+            "a modelled region with an empty map is dead"
+        );
+    }
+
     fn frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published() {
         // A synthetic compiled-frame spill band. `hoisted` stands for any of
         // the three storage classes outside the local/operand model.

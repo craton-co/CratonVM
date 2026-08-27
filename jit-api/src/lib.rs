@@ -1312,6 +1312,33 @@ pub struct JitRuntimeHelpers {
     /// [`Self::ldc_class_cp`] makes it refuse a class-`ldc` site. Appended at
     /// the END of the struct so all prior golden offsets stay stable.
     pub ldc_string_cp: usize,
+    /// FFM element READ fast path — `MemorySegment.getAtIndex`.
+    ///
+    /// Signature:
+    /// `extern "C" fn(seg: i64, index: i64, kind: i64, out: *mut i64) -> i64`,
+    /// returning 1 when it handled the access (value written through `out`) and
+    /// 0 to DECLINE, in which case the emitted code falls through to the
+    /// unchanged native dispatch for the same site. Everything it declines
+    /// therefore keeps today's behaviour, exceptions included.
+    ///
+    /// `kind` is a compile-time constant taken from the call site's descriptor,
+    /// which names the `ValueLayout` subtype — see the `FFM_KIND_*` codes.
+    ///
+    /// These accessors are per-ELEMENT, and through the ordinary dispatch funnel
+    /// they measure ~1158 ns/element against ~0.8 ns for a `short[]` element.
+    ///
+    /// `0` = not wired (hand-built test tables) → no FFM fast path is emitted
+    /// and every site keeps its native dispatch. Appended at the END so all
+    /// prior golden offsets stay stable.
+    pub ffm_segment_get: usize,
+    /// FFM element WRITE fast path — `MemorySegment.setAtIndex`. The twin of
+    /// [`Self::ffm_segment_get`], same 1-handled / 0-declined contract.
+    ///
+    /// Signature:
+    /// `extern "C" fn(seg: i64, index: i64, kind: i64, value: i64) -> i64`.
+    /// `value` carries raw bits: the integral kinds in their low bytes, float
+    /// and double as `to_bits()`.
+    pub ffm_segment_set: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1499,6 +1526,8 @@ helper_fields! {
     // Optional: 0 makes both backends refuse a string-`ldc` site and bail the
     // compile, the same way an unwired `ldc_class_cp` does for `ldc <Class>`.
     (ldc_string_cp,                  FieldKind::OptionalPtr),
+    (ffm_segment_get,                FieldKind::OptionalPtr),
+    (ffm_segment_set,                FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1524,7 +1553,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 67,
+    JitRuntimeHelpers::NUM_FIELDS == 69,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1921,6 +1950,8 @@ mod tests {
             read_bounds_addr: 0x11C8,
             local_handler_lookup: 0x11D0,
             ldc_string_cp: 0x11D8,
+            ffm_segment_get: 0x11E0,
+            ffm_segment_set: 0x11E8,
         }
     }
 
@@ -2160,6 +2191,8 @@ mod tests {
             read_bounds_addr: 0,
             local_handler_lookup: 0,
             ldc_string_cp: 0,
+            ffm_segment_get: 0,
+            ffm_segment_set: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2336,7 +2369,7 @@ mod tests {
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
         // And the macro-driven count is the canonical 67.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 67);
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 69);
     }
 
     #[test]
@@ -2669,6 +2702,16 @@ mod tests {
                 "ldc_string_cp",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_string_cp),
             ),
+            (
+                67,
+                "ffm_segment_get",
+                std::mem::offset_of!(JitRuntimeHelpers, ffm_segment_get),
+            ),
+            (
+                68,
+                "ffm_segment_set",
+                std::mem::offset_of!(JitRuntimeHelpers, ffm_segment_set),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2723,7 +2766,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
-        assert_eq!(opt, 14, "optional-pointer count drifted");
+        assert_eq!(opt, 16, "optional-pointer count drifted");
         assert_eq!(off, 10, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
