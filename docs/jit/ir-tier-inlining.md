@@ -173,16 +173,16 @@ first-rep.
 
 ## Open
 
-1. **Escape analysis still reports `0/2`.** The chain is inlined and the
-   allocation and its consumer are now in one graph, so the structural blocker
-   is gone — but the objects are not being scalar-replaced, and why is not yet
-   diagnosed. Note that `Short2` is TWO allocations (the object plus its
-   `short[2]` storage) and `escape_analysis` can scalar-replace `Op::New` but
-   not `Op::NewArray` (`test_new_array_local_scalar_not_replaced`), so even a
-   perfect answer here removes one of the two. Array scalar replacement for a
-   constant-length, constant-index array is the natural companion increment: an
-   array of length N maps onto `ScalarReplacementInfo::field_values` exactly the
-   way an N-field object does.
+1. ~~**Escape analysis still reports `0/2`.**~~ **CLOSED 2026-08-27.** Both
+   allocations are deleted and the `volume` arm has converged onto its own
+   control (24.9 ns/voxel against `rawseg`'s 23.8). It took four things, none of
+   which was the one this note guessed at — a per-allocation dominance proof
+   from the basic block the IR already knew, array scalar replacement, an
+   escape-analysis fixed point (replacing the wrapper is what frees its storage
+   array), and a deopt descriptor that can spell an array and a nested object.
+   Requires `CRATONVM_SCALAR_DEOPT=1` alongside this flag; see
+   `docs/internal/fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`,
+   which is also where the "why is it still opt-in" argument lives.
 
 2. **A call left inside a spliced body is re-executed on a deopt.** The store
    rule proves nothing about it. The bodies this admits are accessors, but that

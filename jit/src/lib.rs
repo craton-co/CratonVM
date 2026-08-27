@@ -21046,9 +21046,10 @@ fn try_compile_inner(
                 // optimizing tier through the shared `emit_new_array_stub`,
                 // the same way escaping object allocations already are —
                 // a live `Op::NewArray` no longer forces a fall-through to
-                // the single-pass backend. (Scalar-replaced `Op::New` nodes
-                // are already `Op::Dead`; `Op::NewArray` is never scalar
-                // -replaced at all — see `escape_analysis.rs`.)
+                // the single-pass backend. A SURVIVING one, that is: a small
+                // constant-length primitive array can now be scalar-replaced
+                // like an object and is `Op::Dead` by this point, exactly as a
+                // replaced `Op::New` is — see `escape_analysis.rs`.
                 //
                 // Unconditional pre-lowering verification. This is the gate the
                 // review's exit criterion names: "invalid IR or ABI state

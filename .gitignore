@@ -116,6 +116,10 @@ spring-suite/build/
 # output does not (the same rule `bench/` and `spring-suite/build/` already
 # have; `probes/` itself is tracked, so it needs its own line).
 probes/out/
+# `VoxelAlloc2`'s nested classes compile to `VoxelAlloc2$*.class`, which the
+# `probes/*.class` line below does not cover once they are put in their own
+# output directory (the probe's doc comment uses `-d probes/voxout`).
+probes/voxout/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class

@@ -7575,10 +7575,13 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     }
     // cov-06: `anewarray` sites. Same budget shape and same reasoning as the
     // `new` cap above — it bounds how many reference-array allocations are
-    // admitted, each one lowered through the shared `emit_new_array_stub`
-    // (never scalar-replaced: `escape_analysis.rs` refuses to scalar-replace
-    // any `Op::NewArray`, primitive or reference — an element write is not a
-    // field write, and no pass here models one). `newarray` (0xbc) has no
+    // admitted, each one lowered through the shared `emit_new_array_stub`.
+    // A REFERENCE array is still never scalar-replaced (`escape_analysis.rs`
+    // refuses `anewarray` outright: a never-stored slot would have to be
+    // answered with `null` and the applier's zero default is numeric), so this
+    // cap bounds stub-call cost and nothing else. A small constant-length
+    // PRIMITIVE array is a different story — see `MAX_SCALAR_ARRAY_LEN`.
+    // `newarray` (0xbc) has no
     // analogous cap: it carries no constant-pool site to resolve, so there is
     // nothing here to bound admission on — an unbounded number of primitive
     // array allocations costs the builder nothing `IR_MAX_GRAPH_NODES`
@@ -7663,9 +7666,11 @@ pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
 pub const IR_MAX_ALLOCATIONS: usize = 16;
 
 /// cov-06: maximum `anewarray` sites. Same budget posture as
-/// [`IR_MAX_ALLOCATIONS`] — every admitted site is always lowered through the
-/// shared `emit_new_array_stub` (never scalar-replaced), so this bounds the
-/// stub-call cost, not an optimization headroom.
+/// [`IR_MAX_ALLOCATIONS`] — every admitted REFERENCE-array site is always
+/// lowered through the shared `emit_new_array_stub` (a reference array is never
+/// scalar-replaced), so this bounds the stub-call cost, not an optimization
+/// headroom. It does not cover `newarray` (0xbc), which is where a
+/// scalar-replaceable primitive array comes from.
 pub const IR_MAX_ARRAY_ALLOCATIONS: usize = 16;
 
 /// Maximum bytecode length for the IR pipeline.
