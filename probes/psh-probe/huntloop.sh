@@ -43,6 +43,10 @@ export CRATONVM_DBG_JNI_LOCALREF=1
 # Measured at 190 lines in a whole-class run -- not chatty.
 export CRATONVM_DBG_BLOCKGC=1
 export CRATONVM_DBG_UNPIN_RING=1
+# Prints the G1 CAS-loser engagement number at exit, so a CATCH carries its
+# own answer to whether that arm was reached in the run that failed.
+# Measured 0 on a clean whole-class run, which is why it is not enough.
+export CRATONVM_DBG_JIT_METHOD_STATS=1
 for i in $(seq 1 "$N"); do
   L="$D/run-$i.log"
   t0=$(date +%s); la=$(cut -d' ' -f1 /proc/loadavg)
@@ -52,10 +56,11 @@ for i in $(seq 1 "$N"); do
   rc=$?
   wall=$(( $(date +%s) - t0 ))
   nsme=$(grep -ac "NoSuchMethodError" "$L")
+  casl=$(grep -ao "CAS losses[^:]*: [0-9]*" "$L" | grep -o "[0-9]*$" | tail -1)
   stw=$(grep -ac "still waiting for cooperative mutators" "$L")
   st=PASS; [ "$rc" -eq 97 ] && st=HANG; { [ "$rc" -ne 0 ] && [ "$rc" -ne 97 ]; } && st=OTHER
-  printf "%-3s %-5s rc=%-4s wall=%-5s load0=%-7s xmx=%-6s nsme=%-3s stw=%s\n" \
-     "$i" "$st" "$rc" "$wall" "$la" "${NRES_XMX:-1500m}" "$nsme" "$stw" >> "$SUM"
+  printf "%-3s %-5s rc=%-4s wall=%-5s load0=%-7s xmx=%-6s nsme=%-3s stw=%-3s casloser=%s\n" \
+     "$i" "$st" "$rc" "$wall" "$la" "${NRES_XMX:-1500m}" "$nsme" "$stw" "${casl:--}" >> "$SUM"
   if [ "$st" = HANG ] || [ "$nsme" -gt 0 ] || [ "$stw" -gt 0 ]; then
     echo "CAUGHT at run $i (rc=$rc nsme=$nsme stw=$stw) — stopping so the evidence stays put" >> "$SUM"
     break
