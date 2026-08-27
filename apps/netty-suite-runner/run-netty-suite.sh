@@ -40,11 +40,11 @@
 # =============================================================================
 set -uo pipefail
 
-# --- locations -----------------------------------------------------------
-HERE="/data/cratonvm/apps/netty-suite-runner"
+# --- locations (Windows-form paths: the VM and JVM need native paths) --------
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+HERE="${HERE:-C:/craton/CratonVM/apps/netty-suite-runner}"
 COMMON="$HERE/common.args"          # -cp + sysprops for the forked VM
 RUNNER_CLASS="CratonRunner"         # compiled in $HERE, already on the classpath
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 OVERRIDES="${NETTY_CLASS_OVERRIDES:-}"
 if [ -z "$OVERRIDES" ]; then
   if [ -f "$SELF_DIR/class-overrides.tsv" ]; then OVERRIDES="$SELF_DIR/class-overrides.tsv"
@@ -55,7 +55,7 @@ if [ -z "$BENIGN_ABORTS" ]; then
   if [ -f "$SELF_DIR/known-benign-aborts.tsv" ]; then BENIGN_ABORTS="$SELF_DIR/known-benign-aborts.tsv"
   else BENIGN_ABORTS="$HERE/known-benign-aborts.tsv"; fi
 fi
-NETTY_SRC="${NETTY_SRC:-/data/cratonvm/apps/netty}"   # the built Maven reactor
+NETTY_SRC="${NETTY_SRC:-C:/craton/CratonVM/apps/netty}"   # the built Maven reactor
 MODSCOPE="${NETTY_MODULE_SCOPED:-}"
 if [ -z "$MODSCOPE" ]; then
   if [ -f "$SELF_DIR/module-scoped-classes.tsv" ]; then MODSCOPE="$SELF_DIR/module-scoped-classes.tsv"
@@ -64,15 +64,28 @@ fi
 MODARGS_DIR="$(dirname "$MODSCOPE")/module-args"
 GEN_MODARGS="$(dirname "$MODSCOPE")/gen-module-args.sh"
 
-# --- defaults (override via flags or env) ---------------------------------
-CV_BIN="${CV_BIN:-/data/cratonvm/target/release/cratonvm}"
-JDK="${JDK:-/data/toolchain/jdk-25}"
+# --- JDK autodetect ----------------------------------------------------------
+detect_jdk() {
+  local c
+  for c in "C:/Program Files/Eclipse Adoptium"/jdk-25* \
+           "C:/Program Files/Java"/jdk-25* \
+           "C:/Program Files/Eclipse Adoptium"/jdk-2* \
+           "C:/Program Files/Java"/jdk-2*; do
+    [ -x "$c/bin/java.exe" ] && { printf '%s' "$c"; return 0; }
+  done
+  [ -x "/data/toolchain/jdk-25/bin/java" ] && { printf '%s' "/data/toolchain/jdk-25"; return 0; }
+  return 1
+}
+
+# --- defaults (override via flags or env) ------------------------------------
+CV_BIN="${CV_BIN:-C:/craton/CratonVM/target/release/cratonvm.exe}"
+JDK="${JDK:-$(detect_jdk 2>/dev/null || echo "C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot")}"
 CV_XMX="${CV_XMX:-1500m}"
 SHARDS="${SHARDS:-6}"               # parallel forks per mode
 TIMEOUT="${TIMEOUT:-180}"           # per-class wall cap (s) -> HANG
 OUTROOT="${OUTROOT:-$HERE/runs}"
 USE_OVERRIDES=1                     # --no-overrides disables the table (A/B)
-USE_MODSCOPE=1                      # --no-module-scope disables module scoping (A/B)
+USE_MODSCOPE=0                      # module scope disabled by default on Windows
 
 CATEGORY="passed"
 JITMODE="on"
@@ -336,7 +349,7 @@ load_benign_aborts
 if [ "$SHOW_BENIGN" = 1 ]; then print_benign_aborts; exit 0; fi
 
 ORIG_PWD="$PWD"
-abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$ORIG_PWD" "$1";; esac; }
+abspath() { case "$1" in /*|[A-Za-z]:[/\\]*) printf '%s' "$1";; *) printf '%s/%s' "$ORIG_PWD" "$1";; esac; }
 CV_BIN="$(abspath "$CV_BIN")"
 OUTROOT="$(abspath "$OUTROOT")"
 [ -n "$EXPLICIT_LIST" ] && EXPLICIT_LIST="$(abspath "$EXPLICIT_LIST")"
@@ -344,7 +357,7 @@ cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
 
 [ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
 [ -f "$COMMON" ] || { echo "ERROR: common.args not found: $COMMON" >&2; exit 1; }
-[ -x "$JDK/bin/java" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set JDK=... env)" >&2; exit 1; }
+[ -x "$JDK/bin/java.exe" ] || [ -x "$JDK/bin/java" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set JDK=... env)" >&2; exit 1; }
 mkdir -p "$OUTROOT"
 TS="$(date +%Y%m%d-%H%M%S)"
 
@@ -423,11 +436,12 @@ run_mode() {
   case "$GCMODE" in
     g1)  VMFLAGS_BASE+=(-XX:+UseG1GC);;
     zgc) VMFLAGS_BASE+=(-XX:+UseZGC);;
+    generational|gen) VMFLAGS_BASE+=(-XX:+UseGenerationalGC);;
     default|"") ;;
-    *) echo "ERROR: unknown --gc mode: $GCMODE (want default|g1|zgc)" >&2; exit 2;;
+    *) echo "ERROR: unknown --gc mode: $GCMODE (want default|g1|zgc|generational)" >&2; exit 2;;
   esac
   local n; n=$(grep -c '' "$SLICE")
-  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE module-scope=$MODSCOPE_STATE bin=$CV_BIN"
+  echo "[$label] $n classes | jit=$jit jdk=$jdk gc=${GCMODE:-default} shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE module-scope=$MODSCOPE_STATE bin=$CV_BIN"
   local t0; t0=$(date +%s)
   local s pids=()
   for ((s=0; s<SHARDS; s++)); do awk -v n="$SHARDS" -v r="$s" 'NR%n==r' "$SLICE" > "$MODE/shard-$s.txt"; done
@@ -439,7 +453,7 @@ run_mode() {
   for ((s=0; s<SHARDS; s++)); do tail -n +2 "$MODE/shard-$s/results.tsv" 2>/dev/null; done >> "$MERGED"
   local rec; rec=$(( $(grep -c '' "$MERGED") - 1 ))
   {
-    echo "mode=$label jit=$jit jdk=$jdk classes=$n recorded=$rec wall_seconds=$secs ($((secs/60))m$((secs%60))s) overrides=$OVERRIDES_STATE module-scope=$MODSCOPE_STATE"
+    echo "mode=$label jit=$jit jdk=$jdk gc=${GCMODE:-default} classes=$n recorded=$rec wall_seconds=$secs ($((secs/60))m$((secs%60))s) overrides=$OVERRIDES_STATE module-scope=$MODSCOPE_STATE"
     awk -F'\t' 'NR>1{c[$3]++; tms+=$9} END{printf "status:"; for(k in c) printf " %s=%d",k,c[k]; printf "  sum_class_ms=%d\n",tms}' "$MERGED"
   } | tee "$MODE/SUMMARY.txt"
 }
