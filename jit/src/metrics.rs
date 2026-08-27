@@ -2894,6 +2894,23 @@ pub const SPILL_WIDTH_IF_FULL: usize = 1;
 /// Index: safepoints that fell back to the full copy.
 pub const SPILL_WIDTH_FULL_REFUSED: usize = 2;
 
+/// Safepoints whose site had already staged every Java argument to the frame,
+/// so the selection dropped `RAX` and `ARG_REGS`. The engagement counter for
+/// `spill_args_published_enabled`; a zero means that cut did nothing on this
+/// run, whatever `stores-emitted` says.
+static SPILL_ARGS_PUBLISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SPILL_ARGS_PUBLISHED`].
+#[inline]
+pub fn note_spill_args_published() {
+    SPILL_ARGS_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Number of safepoints that dropped `RAX`/`ARG_REGS` on a staging claim.
+pub fn spill_args_published_count() -> u64 {
+    SPILL_ARGS_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record one blind spill: `emitted` stores against `if_full` had it not been
 /// narrowed, and whether the narrowing refused outright.
 #[inline]
