@@ -5240,11 +5240,31 @@ pub(super) fn try_jit_upgrade_with_gate(
                         // test the `get_utf8_wide` guard above pairs with -- a
                         // lone-surrogate literal cannot be pooled on a Rust `String`
                         // and stays uncompilable, exactly as before.
+                        //
+                        // `callee_cid`, NOT `class_id`. This resolver reads the
+                        // CALLEE's constant pool -- `cm.get_class(callee_cid)`
+                        // three lines up, and `cp_idx` is an index into that
+                        // pool. Pairing it with the CALLER's class id hands the
+                        // runtime helper a (class, index) pair whose two halves
+                        // come from different constant pools, and the helper
+                        // then reads whatever the CALLER happens to hold at
+                        // that index. The `ClassReference` arm immediately
+                        // below always used `callee_cid`; this one did not.
+                        //
+                        // The visible failure is the benign half. Compiling
+                        // `SqlClientPool.newConnection`, which inlines
+                        // `SqlClientConnection.<init>`, baked
+                        // (SqlClientPool, cp#47) for a literal that lives at
+                        // cp#47 of SqlClientConnection; cp#47 of SqlClientPool
+                        // is a ClassReference, so the helper raised
+                        // InternalError. Had the caller held a String there
+                        // instead, compiled code would have pushed the WRONG
+                        // LITERAL and said nothing.
                         class
                             .constant_pool
                             .get_utf8(*string_index)
                             .map(|_| cratonvm_jit::JitLdcConstant::String {
-                                holder_class_id: class_id.as_u32(),
+                                holder_class_id: callee_cid.as_u32(),
                                 cp_idx,
                             })
                     }
