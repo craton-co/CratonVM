@@ -4122,6 +4122,11 @@ pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
 /// A `desc_byte` of 0 means the resolver had no descriptor to report (an empty
 /// descriptor string); that is a missing observation, not a disagreement, so it
 /// is admitted unchanged.
+/// Snapshot of [`JIT_FIELD_TAG_DISAGREEMENTS`], for the end-of-run report.
+pub fn jit_field_tag_disagreements() -> u64 {
+    JIT_FIELD_TAG_DISAGREEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool {
     if field.desc_byte == 0 || field.desc_byte == cp_tag {
         return true;

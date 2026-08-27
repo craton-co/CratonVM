@@ -51,6 +51,34 @@ pub static UNRESOLVED_FIELD_SITE_BAILS: std::sync::atomic::AtomicU64 =
 /// correct; guessing a slot is never correct. The counter says how often it
 /// happens, so "this refusal is expensive" stays a measurement rather than a
 /// worry.
+/// `CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE=1` — restore the pre-fix
+/// behaviour: substitute slot 0 tagged `int` for an unresolved field site and
+/// carry on emitting, instead of refusing the compile.
+///
+/// # Why a switch for a behaviour nobody wants
+///
+/// The refusal is a correctness fix, and a correctness fix that UNBLOCKS a
+/// workload has no A/B: the old binary cannot run the shape that the new one
+/// fixed, so "it passes now" and "it passes today" are indistinguishable on a
+/// workload whose base rate nobody measured. Comparing two BINARIES does not
+/// close that — a cross-binary A/B varies everything that landed between them.
+///
+/// One binary and one variable does close it. Arming this restores exactly the
+/// substitution and nothing else, so a workload that fails with it and passes
+/// without it has been attributed, not merely observed to have stopped failing.
+/// It is not a supported configuration and must never be set outside an arm.
+fn substitute_unresolved_field_sites() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE").is_some()
+    })
+}
+
+/// Snapshot of [`UNRESOLVED_FIELD_SITE_BAILS`], for the end-of-run report.
+pub fn unresolved_field_site_bails() -> u64 {
+    UNRESOLVED_FIELD_SITE_BAILS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn unresolved_field_site(pc: usize, opcode: u8) -> bool {
     UNRESOLVED_FIELD_SITE_BAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::note_jit_bail_site_at("unresolved-field-site", pc, opcode);
@@ -4430,12 +4458,18 @@ impl Compiler {
                 // note there.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = self
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = match self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                    else {
-                        return unresolved_field_site(pc, 0xb2);
+                    {
+                        Some(v) => v,
+                        None => {
+                            if !substitute_unresolved_field_sites() {
+                                return unresolved_field_site(pc, 0xb2);
+                            }
+                            (pc, 0, 0, b'I', false)
+                        }
                     };
 
                     // Direct load, no helper CALL — the structural fix this
@@ -4514,12 +4548,18 @@ impl Compiler {
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = self
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = match self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                    else {
-                        return unresolved_field_site(pc, 0xb3);
+                    {
+                        Some(v) => v,
+                        None => {
+                            if !substitute_unresolved_field_sites() {
+                                return unresolved_field_site(pc, 0xb3);
+                            }
+                            (pc, 0, 0, b'I', false)
+                        }
                     };
 
                     let val_slot = self.pop_stack();
@@ -4559,12 +4599,18 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let Some((_, field_index, type_tag)) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                        else {
-                            return unresolved_field_site(pc, 0xb4);
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb4);
+                                }
+                                (pc, 0, b'I')
+                            }
                         };
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -4619,12 +4665,18 @@ impl Compiler {
                         // {tag,partial-pointer} word that SIGSEGVs when later
                         // dereferenced/called. For a legacy receiver we take the
                         // uniform `index * SLOT_SIZE` 16-byte-cell path inline.
-                        let Some((_, field_index, type_tag)) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                        else {
-                            return unresolved_field_site(pc, 0xb4);
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb4);
+                                }
+                                (pc, 0, b'I')
+                            }
                         };
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
                         let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
@@ -5068,12 +5120,18 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let Some((_, field_index, _type_tag)) = self
+                        let (_, field_index, _type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                        else {
-                            return unresolved_field_site(pc, 0xb5);
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb5);
+                                }
+                                (pc, 0, b'I')
+                            }
                         };
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
@@ -5092,12 +5150,18 @@ impl Compiler {
                     } else {
                         self.flush_scratch_registers();
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let Some((_, field_index, type_tag)) = self
+                        let (_, field_index, type_tag) = match self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                        else {
-                            return unresolved_field_site(pc, 0xb5);
+                        {
+                            Some(v) => v,
+                            None => {
+                                if !substitute_unresolved_field_sites() {
+                                    return unresolved_field_site(pc, 0xb5);
+                                }
+                                (pc, 0, b'I')
+                            }
                         };
                         let receiver_mark_index = self.stack_oop_marks.len().checked_sub(2);
                         let receiver_is_trusted_oop = !self.method_key.is_empty()

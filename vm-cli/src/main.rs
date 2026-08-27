@@ -212,6 +212,32 @@ fn maybe_dump_shutdown_reports() {
             cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot(),
             cratonvm_vm::jit::helpers::jit_getfield_punned_ref_nonzero()
         );
+        // The WRITE side of the same species, and the two ENGAGEMENT counters
+        // for the substitutions that could produce it. All three printed even
+        // when zero, for the reason the counter above them is:
+        //
+        // * `unresolved field sites refused` is how often a backend declined a
+        //   `getfield`/`putfield`/`getstatic`/`putstatic` because it had no
+        //   resolved slot. Those four sites used to substitute slot 0 tagged
+        //   `int` and carry on, which is how JDT's `HashtableOfInt.rehash`
+        //   wrote an `int[]` into slot 0 as `Value::Int(low32_of_ptr)`. A zero
+        //   here says the substitution never fired on this workload -- which is
+        //   the observation that has to precede blaming it for anything.
+        // * `field sites refused for a descriptor disagreement` is how often
+        //   the name-only field resolver found a field whose descriptor is not
+        //   the one the constant pool names, so the site's slot index and its
+        //   type tag would have described different fields.
+        // * `compiled primitive stores into a declared-reference slot` counts
+        //   only while `CRATONVM_DBG_WATCH_PUN` is armed; it is `<not armed>`
+        //   otherwise rather than `0`, because those are different facts.
+        eprintln!(
+            "[cratonvm] unresolved field sites refused: {} | field sites refused for a              descriptor disagreement: {} | compiled primitive stores into a              declared-reference slot: {}",
+            cratonvm_jit::x64::bytecode_walk::unresolved_field_site_bails(),
+            cratonvm_vm::runtime::interpreter::jit_field_tag_disagreements(),
+            cratonvm_vm::jit::helpers::jit_putfield_primitive_into_ref_slot()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<not armed>".to_string()),
+        );
         // G1 parallel-evacuation CAS losses, i.e. how often a worker found
         // another worker had already forwarded the object it was copying and
         // adopted that target. Until 2026-08-26 that arm returned the target

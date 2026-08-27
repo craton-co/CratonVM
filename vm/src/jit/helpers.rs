@@ -6722,6 +6722,14 @@ fn jit_putfield_pun_watch() -> Option<&'static (String, usize)> {
 pub static JIT_PUTFIELD_PRIMITIVE_INTO_REF_SLOT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Snapshot of [`JIT_PUTFIELD_PRIMITIVE_INTO_REF_SLOT`], or `None` when the
+/// watch was never armed — a `0` from an unarmed counter and a `0` from an
+/// armed one are different facts, and only one of them is evidence.
+pub fn jit_putfield_primitive_into_ref_slot() -> Option<u64> {
+    jit_putfield_pun_watch()
+        .map(|_| JIT_PUTFIELD_PRIMITIVE_INTO_REF_SLOT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Report a watched compiled field store, naming the compiled method that made
 /// it and the frames underneath.
 ///

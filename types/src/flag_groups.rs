@@ -872,6 +872,11 @@ pub const INVENTORY: &[E] = &[
     // and the "0" off-word rather than an `off_key`.
     E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
+    // A/B lever, never a supported configuration: restore the pre-fix
+    // substitution of "slot 0, tagged int" for a field site the VM-side
+    // resolver declined. Declared so the arm can be spelled, and so that
+    // `flags` reports it as SET when somebody leaves it on by accident.
+    E { group: Group::JIT, token: "unresolved-field-substitute", on_key: Some("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-inline-mega", on_key: Some("CRATONVM_JIT_SP_INLINE_MEGA"), off_key: None, off_word: None },
