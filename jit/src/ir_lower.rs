@@ -9794,7 +9794,7 @@ pub(crate) fn lower_inner_with_scopes(
     // so the int store's inline three-word cell write would leave a
     // primitive standing where the class declares a pointer -- the G30-1
     // species, and exactly the shape
-    // `docs/known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-*`
+    // `docs/known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-20260824.md`
     // is about (`SQLChar.rawData`, declared `[C`, found holding `Int(1)`).
     //
     // The builder emits a `Const` for every field access it constructs today,
