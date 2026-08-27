@@ -1143,25 +1143,47 @@ impl SafepointSnapshot {
 // `lookupswitch` are the exception (their padding is measured from method
 // start), and the resolver refuses them.
 //
-// ## Why no `InlineScopeTable` entry, and why that is the SAFE choice
+// ## Two bcis, and why a node keeps the COMBINED one
 //
-// Every node built inside a splice is re-stamped with the CALLER's `invoke`
-// bci when the outermost splice closes ([`IrBuilder::end_splice`]), and no
-// safepoint snapshot is pushed while inside one. So the deopt metadata says
-// exactly one thing about the whole spliced region: "the `invoke` at this bci
-// has not taken effect; re-execute it". That is true, and it is cheap to keep
-// true — `ir_lower`'s `bci_native` records the EARLIEST native offset for a
-// bci, so the point anchors before the spliced body runs.
+// A node's `bytecode_pc` is read for two unrelated purposes, and a spliced
+// node needs a different answer for each:
 //
-// Re-execution needs no frame identity, which is what makes it the v1 answer.
-// The cost is precision, not correctness: a trap inside a spliced accessor
-// re-runs the accessor rather than resuming inside it.
+//  * as a **site key** — `ir_lower` looks up the compact field offset, the
+//    direct-call entry and the MIC/PIC pair by it. Here the answer must be
+//    unique per site, so a spliced node keeps its COMBINED-buffer pc and
+//    `lib.rs` rebases the callee's rows to match. Giving every node in a
+//    region the caller's `invoke` pc instead — which an earlier draft did —
+//    makes the whole region share the metadata of the call the splice
+//    REPLACED. That is a wrong-code hazard (an inline-cache hit on a matching
+//    receiver class jumps to the wrong method), and it is also a silent
+//    ~200x slowdown: with no compact-offset row every spliced field read falls
+//    back to the checked `jit_getfield` helper, and with no cache every
+//    surviving call falls back to a blind name resolution. Measured on the
+//    `VoxelAlloc2` probe: `ShortArray.get` spliced into its caller took the
+//    control arm from 47 ns to 11 000 ns per element.
+//
+//  * as an **interpreter program point** — the throw-site bci the exception
+//    table's `[start_pc, end_pc)` check uses, and the bci a null/bounds guard's
+//    deopt point resumes at. Here a combined-buffer pc names no instruction in
+//    this method at all, so `ir_lower` translates it back to the enclosing
+//    `invoke` through `spliced_ranges` (see `Lowerer::resume_bci`). "The
+//    `invoke` at this bci has not taken effect; re-execute it" is true of the
+//    whole region and needs no frame identity — which is why the region gets
+//    that rather than a real inlined-scope chain, whose innermost frame would
+//    need its own method key (`ir_lower::resolve_frame_state` leaves that for
+//    the VM to fill from the running `CompiledMethod`, i.e. it would name the
+//    caller).
+//
+// No safepoint snapshot is pushed inside a splice, so a combined-buffer pc
+// never reaches `build_deopt_points`.
 //
 // The one thing re-execution cannot survive is a side effect the spliced body
 // has ALREADY committed, so the resolver admits only bodies that cannot commit
 // one before a trap — no `athrow`, no `monitorenter`, no `putstatic`, and no
 // division (`Op::Guard` is emitted for div-zero and nothing else, so with
-// division refused a spliced region carries no guard of its own at all).
+// division refused a spliced region carries no guard of its own at all) — and
+// the builder proves every store targets an object the splice itself allocated
+// ([`IrBuilder::splice_store_is_local`]).
 
 /// Hard cap on how many splices may enclose one another.
 ///
@@ -1239,9 +1261,6 @@ struct SpliceFrame {
     return_pc: usize,
     /// One past the callee's last bytecode, in combined-buffer coordinates.
     end: usize,
-    /// Caller pc of the `invoke`. The outermost frame's is what every node
-    /// built inside the splice is re-stamped with.
-    invoke_bci: usize,
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
@@ -3865,10 +3884,6 @@ pub struct IrBuilder {
     /// walk is inside a relocated callee body, which is what suppresses merge
     /// activation, the reachability skip and safepoint recording.
     splice: Vec<SpliceFrame>,
-    /// First graph node id created inside the OUTERMOST open splice. Every node
-    /// from here on is re-stamped with that splice's `invoke_bci` when it
-    /// closes — see the bci discussion at [`IrInlineSite`].
-    splice_node_floor: usize,
     /// Diagnostic-only: how many splices this build performed, for the
     /// `[ir] spliced` line. Never read by lowering.
     splices_done: usize,
@@ -4024,7 +4039,6 @@ impl IrBuilder {
             invoke_info: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
-            splice_node_floor: 0,
             splices_done: 0,
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
@@ -4359,13 +4373,9 @@ impl IrBuilder {
 
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
-        if self.splice.is_empty() {
-            self.splice_node_floor = self.graph.nodes.len();
-        }
         self.splice.push(SpliceFrame {
             return_pc: pc + instr_len,
             end,
-            invoke_bci: pc,
             saved_locals,
             saved_stack,
             returns_value,
@@ -4439,11 +4449,10 @@ impl IrBuilder {
     /// Leave the innermost splice, restoring the caller's frame and pushing the
     /// callee's result. Returns the caller pc to continue at.
     ///
-    /// When this closes the OUTERMOST splice it re-stamps every node built
-    /// since it opened with that splice's `invoke_bci`, which is what makes the
-    /// whole region read as "the `invoke` at this bci has not taken effect" to
-    /// `ir_lower`'s deopt metadata. Nested splices inherit the outermost bci by
-    /// construction — the range covers them too.
+    /// Nodes built inside the splice keep their COMBINED-buffer pcs; `ir_lower`
+    /// translates those to the enclosing `invoke` wherever a bci has to name an
+    /// instruction in this method. See the two-bci discussion at
+    /// [`IrInlineSite`].
     fn end_splice(&mut self, value: Option<NodeId>) -> Option<usize> {
         let frame = self.splice.pop()?;
         self.locals = frame.saved_locals;
@@ -4457,12 +4466,6 @@ impl IrBuilder {
             // keeping them would only grow.
             self.splice_local.clear();
             self.splice_tainted.clear();
-            let bci = frame.invoke_bci;
-            for node in &mut self.graph.nodes[self.splice_node_floor..] {
-                if node.bytecode_pc.is_some() {
-                    node.bytecode_pc = Some(bci);
-                }
-            }
         }
         Some(frame.return_pc)
     }
