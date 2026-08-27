@@ -6994,8 +6994,16 @@ fn alloc_arraylist_iterator_as(
         }
     }
     let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    // The split that lets `java/util/ArrayList$Itr` mean "a real `modCount`".
+    // See [`itr_backing_has_real_mod_count`]; the layout and slot triple are
+    // identical either way, so every `al_itr_*` native reads both the same.
+    let itr_class = if itr_backing_has_real_mod_count(&*ctx, list) {
+        "java/util/ArrayList$Itr"
+    } else {
+        AL_VIEW_ITR_CLASS
+    };
     let roots_base = ctx.pin_native_root(list);
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields)?;
+    let itr = try_alloc_synthetic(ctx, itr_class, n_fields)?;
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let list = ctx.read_native_pin(roots_base, list);
@@ -19245,6 +19253,45 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // Iterators — ArrayList$Itr and HashMap$KeyItr
 // ===========================================================================
 
+/// The class an `ArrayList`-shaped cursor is minted as when its backing object
+/// does NOT carry a real `modCount`.
+///
+/// `java/util/ArrayList$Itr` is shared by every ArrayList-shaped receiver in the
+/// VM, and they are not all alike: a map VIEW carrier has no `modCount` slot at
+/// all (it extends `AbstractCollection`, so `AbstractList`'s resolved index
+/// names its own first declared REFERENCE field). While the two share a class,
+/// the class cannot be allowed to run the real JDK cursor -- HotSpot's
+/// `checkForComodification` reads that reference as an int and throws a
+/// spurious `ConcurrentModificationException`.
+///
+/// Splitting them at MINT time is what makes `java/util/ArrayList$Itr` mean
+/// "over something with a real `modCount`", which is the precondition the
+/// bytecode yield needs and cannot express any other way: the yield is a
+/// per-(call site, receiver CLASS) decision, so a per-INSTANCE fact has to be
+/// encoded in the class or it cannot be consulted at all.
+const AL_VIEW_ITR_CLASS: &str = "cratonvm/internal/ArrayListViewItr";
+
+/// Does `list` carry a real `modCount` — i.e. is it something HotSpot's own
+/// `ArrayList$Itr` could legally iterate?
+///
+/// `ArrayList` and `Vector` both extend `AbstractList` and declare one.
+/// Everything else — a `MAP_VIEW_CARRIERS` carrier, a bare `Object`
+/// placeholder, an unnamed synthetic — does not, and gets
+/// [`AL_VIEW_ITR_CLASS`] instead.
+///
+/// Deliberately a WHITELIST. The failure this exists to stop is silent (a
+/// plausible wrong answer from a reference field read as an int), and the
+/// population of ArrayList-shaped receivers has repeatedly turned out to be
+/// wider than an audit predicted — `LinkedBlockingQueue.iterator()` mints this
+/// class with the snapshot ARRAY in slot 0, a third layout again. A new shape
+/// must therefore default to the safe side without anyone remembering to add it.
+fn itr_backing_has_real_mod_count(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    matches!(
+        al_slots_and_layout_for(ctx, list).1,
+        AlLayout::ArrayList | AlLayout::Vector
+    )
+}
+
 /// Widest a genuine `java.util.ArrayList$Itr` can be: `cursor`, `lastRet`,
 /// `expectedModCount`, `this$0`. Anything wider that reaches the `al_itr_*`
 /// natives is one of [`VALUES_ITR_CARRIERS`], whose three snapshot fields live
@@ -20131,24 +20178,71 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     // which the census shows minting its own `IdentityHashMap$ValueIterator`,
     // still arrived here and threw. The class a receiver mints in isolation is
     // not the class it reaches this native with.
-    r.register(
-        "java/util/ArrayList$Itr",
-        "hasNext",
-        "()Z",
-        native_al_itr_has_next,
-    );
-    r.register(
-        "java/util/ArrayList$Itr",
-        "next",
-        "()Ljava/lang/Object;",
-        native_al_itr_next,
-    );
+    // `hasNext`/`next` are `SyntheticStub`, not `Bridge`, so the yield predicate
+    // can reach them and the real JDK cursor runs -- which is what lets the JIT
+    // compile it AT ALL. A registered native pins its method out of the JIT
+    // entirely: the tier-up counter lives only in the `VirtualBytecode` arm of
+    // `dispatch_virtual`, so a site serving a `VirtualNative` target is never
+    // counted, nominated or compiled. `ArrayList$Itr.next` was entered 2 000 000
+    // times on a 2000x1000 walk and never appeared in `CRATONVM_DBG_JITC`.
+    //
+    // This is sound ONLY because [`itr_backing_has_real_mod_count`] now splits
+    // the mint: a backing without a real `modCount` gets [`AL_VIEW_ITR_CLASS`]
+    // instead, so this class name is a genuine guarantee rather than a wish.
+    // Removing that split re-opens the spurious-CME hazard on every
+    // `for (v : map.values())`.
+    //
+    // Pairs with `java/util/ArrayList$Itr` on `real_protected_stub_class_common`
+    // -- both halves are required, and each alone is useless or worse.
+    //
+    // `remove` stays `Bridge`: not on the hot path, and it is the one of the
+    // three that writes through to the backing list, so it keeps the native
+    // `propagate_list_removal` understands. Real-bytecode `next`/`hasNext`
+    // beside a native `remove` is what `probes/ItrYieldProbe`'s `lastRet` and
+    // cursor-rewind rows exercise.
+    //
+    // `CRATONVM_ITR_BYTECODE=0` restores `Bridge`: the one-binary A/B and the
+    // kill switch.
+    let itr_kind = if cratonvm_types::flags::runtime_var("CRATONVM_ITR_BYTECODE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        cratonvm_native_api::NativeKind::Bridge
+    } else {
+        cratonvm_native_api::NativeKind::SyntheticStub
+    };
+    r.with_category(itr_kind, |r| {
+        r.register(
+            "java/util/ArrayList$Itr",
+            "hasNext",
+            "()Z",
+            native_al_itr_has_next,
+        );
+        r.register(
+            "java/util/ArrayList$Itr",
+            "next",
+            "()Ljava/lang/Object;",
+            native_al_itr_next,
+        );
+    });
     r.register(
         "java/util/ArrayList$Itr",
         "remove",
         "()V",
         native_al_itr_remove,
     );
+    // The same three bodies on [`AL_VIEW_ITR_CLASS`], the cursor minted for a
+    // backing with no real `modCount`. Same layout, same slot triple, same
+    // natives -- the ONLY thing the separate class buys is that it is not
+    // `java/util/ArrayList$Itr`, so the bytecode yield cannot reach it.
+    r.register(AL_VIEW_ITR_CLASS, "hasNext", "()Z", native_al_itr_has_next);
+    r.register(
+        AL_VIEW_ITR_CLASS,
+        "next",
+        "()Ljava/lang/Object;",
+        native_al_itr_next,
+    );
+    r.register(AL_VIEW_ITR_CLASS, "remove", "()V", native_al_itr_remove);
     // The per-family values iterators (`VALUES_ITR_CARRIERS`). They need the
     // SAME three bodies for the same reason the `MAP_KEY_ITR_CARRIERS` classes
     // do: their snapshot lives past the class's own declared fields, so the
