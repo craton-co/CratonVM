@@ -49,21 +49,36 @@ io.netty.resolver.dns.DnsNameResolverTest	600	-
 # inside that HANG for two weeks. See
 # fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md
 #
-# THE NUMBERS BELOW, and how they were chosen. CratonVM costs about 2.0 s per
-# case on this family against HotSpot's ~0.14 s -- measured, not assumed: 720
-# cases of `OpenSslEngineTest` summed to 2 758 s of in-test time with a 2.02 s
-# mean over the passing ones. `JdkSslEngineTest` is a direct measurement,
-# 1 363 s wall for 821 cases with five forks in flight. The rest are that rate
-# times the case count, plus the wall the still-open TLSv1.3 failures burn on
-# their 10-120 s waits, rounded UP hard. They are floors, not budgets: a class
-# that finishes sooner costs nothing.
+# THE NUMBERS BELOW, and how they were chosen. Measured on the fixed binary,
+# `MethodRunner` (which times every case), `OpenSslEngineTest`:
 #
-# THAT IS EXPENSIVE AND IT SHOULD BE SAID. A four-hour floor on a class is a
-# real change to a suite whose whole 657-class run was 178 minutes. It buys the
-# per-class ok/failed breakdown that a HANG destroys. The cost is dominated by
-# the VM's ~14x per-case slowdown on TLS handshakes, which is a performance
-# item and not a harness one; lowering these numbers is a downstream benefit of
-# fixing that, not a thing to do by editing this table.
+#     everything except one method    672 cases    798 s    1.19 s/case
+#     mustCallResumeTrustedOnSessionResumption
+#                                      31 cases  2 618 s   84.5 s/case
+#
+# So the per-case cost is ~1.19 s against HotSpot's ~0.14 s -- about 8.4x -- and
+# ONE method is most of the wall, because each of its twelve deterministic
+# failures burns a 60 s JUnit timeout
+# (known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md).
+# That puts `OpenSslEngineTest` near 8 700 s and the floor below at ~1.6x it.
+# `JdkSslEngineTest` is a direct wall measurement, 1 363 s for 821 cases with
+# five forks in flight. The two Interopt classes are the same rate times their
+# case counts, rounded UP hard. These are floors, not budgets: a class that
+# finishes sooner costs nothing.
+#
+# AN EARLIER REVISION OF THIS COMMENT SAID ~2.0 s/case AND ~14x, and it was
+# wrong for a reason worth recording: that figure was taken on a binary carrying
+# a regression (a `getSSLParameters()` call from inside BoringSSL's verify
+# callback) whose extra failures inflated the mean. A per-case rate measured on
+# a binary with a known defect in the workload is a rate for that defect, not
+# for the VM.
+#
+# THAT IS STILL EXPENSIVE AND IT SHOULD BE SAID. A four-hour floor on a class is
+# a real change to a suite whose whole 657-class run was 178 minutes. It buys
+# the per-class ok/failed breakdown that a HANG destroys. Closing the
+# re-entrancy defect above would take `OpenSslEngineTest` from ~2.4 h to ~1.5 h
+# and would justify lowering these; that is the way to lower them, not editing
+# this table.
 io.netty.handler.ssl.JdkSslEngineTest	3600	-
 io.netty.handler.ssl.OpenSslEngineTest	14400	-
 io.netty.handler.ssl.OpenSslJdkSslEngineInteroptTest	10800	-

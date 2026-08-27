@@ -296,11 +296,81 @@ address explicitly. **A control has to be measured, not assumed.**
 
 ## What the five classes report now
 
-PLACEHOLDER-RESULTS
+## What the classes report now
+
+Per-method, `OpenSslEngineTest`, on the fixed binary, `MethodRunner` (which
+prints and times every case). **On a quiet host** — this box is shared, and the
+section after this one explains why that qualifier is load-bearing:
+
+| method | pre-fix | first cut of Defect 2's fix | fixed |
+| --- | --- | --- | --- |
+| `testMutualAuthDiffCerts` | **0 / 48** | 36 / 48 | **48 / 48** |
+| `testClientHostnameValidationFail` | **0 / 48** | 48 / 48 | **48 / 48** |
+| `testMutualAuthSameCertChain` | 47 / 48 * | 28 / 48 | **48 / 48** |
+| `mustCallResumeTrustedOnSessionResumption` | 36 / 48 | 36 / 48 | 36 / 48 |
+| the other 13 methods | — | 48 / 48 | **48 / 48** |
+
+\* `testMutualAuthSameCertChain` is the one method that does NOT dial
+`NetUtil.LOCALHOST`; it connects to `serverChannel.localAddress()` verbatim, so
+before the bind fix it reached the server over IPv4 and Defect 1 never bit it.
+That is worth knowing, because it is also what made an early reading of the
+residual blame the IPv6 transport.
+
+`mustCallResumeTrustedOnSessionResumption` is unchanged by any of this and is
+the one real failure left in the class: **the same twelve invocations fail on
+the pre-fix and post-fix binaries**, HotSpot passes 48/48, and it installs its
+own trust manager so it never reaches the code this page changed. It has its own
+page: `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`.
+
+**Scope of the inventory, stated rather than implied.** 707 of the class's
+3 992 cases were run to completion on a quiet host — 17 of its 19 methods, whole
+— covering every method this page's two defects touched. A full 3 992-case pass
+is scheduled to run when the machine is next idle; it is not folded in here
+because the attempt that ran while a concurrent build had the box at 0 GB free
+produced 58 "failures" of which the diagnostic one was
+
+```
+java.lang.InternalError: JIT dispatch into java/lang/Thread.start()V failed:
+  failed to spawn child Java thread (OS refused ...) Os { code: 1450 }
+```
+
+— the OS refusing to create threads. **A saturated host does not produce a
+weaker measurement, it produces a different one**, and counting those 58 as
+results would have put two fixed methods back on this page as broken.
 
 ## The override table
 
-PLACEHOLDER-OVERRIDES
+`apps/netty-suite-runner/class-overrides.tsv` now carries all five, with the
+HotSpot walls above written into the file as the justification:
+
+| class | floor |
+| --- | ---: |
+| `io.netty.handler.ssl.JdkSslEngineTest` | 3 600 s |
+| `io.netty.handler.ssl.OpenSslEngineTest` | 14 400 s |
+| `io.netty.handler.ssl.OpenSslJdkSslEngineInteroptTest` | 10 800 s |
+| `io.netty.handler.ssl.JdkOpenSslEngineInteroptTest` | 10 800 s |
+| `io.netty.handler.ssl.ReferenceCountedOpenSslEngineTest` | 14 400 s |
+
+`run-netty-suite.sh overrides` prints `state: 6 (loaded)`.
+
+The rate behind them is measured on the fixed binary: **1.19 s per case** over
+the 672 cases that are not `mustCallResumeTrustedOnSessionResumption`, against
+HotSpot's ~0.14 s — about **8.4x**, not the ~14x an earlier revision of this page
+and of the table's own comment claimed. That figure came off the binary carrying
+the regression described above, whose extra failures inflated the mean: **a
+per-case rate measured on a binary with a known defect in the workload is a rate
+for the defect.**
+
+One method is most of the wall: 2 618 s across 31 invocations against 798 s for
+the other 672 cases together, because each of its twelve failures burns a 60 s
+JUnit timeout. Closing that page would take this class from roughly 2.4 h to
+1.5 h and would be the way to lower these floors — not editing the table.
+
+**The floors are expensive and that is a real trade.** A four-hour cap on a
+class changes a suite whose whole 657-class run was 178 minutes. What it buys is
+the per-class `ok`/`failed` breakdown that a `HANG` destroys: the two defects on
+this page sat inside one for two weeks, and one of them was accepting a
+certificate issued for the wrong host.
 
 ## Repro
 

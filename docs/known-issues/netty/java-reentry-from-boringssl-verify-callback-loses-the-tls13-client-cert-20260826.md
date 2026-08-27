@@ -2,10 +2,13 @@
 
 ## Status
 
-**OPEN, 2026-08-26 — found by regressing it, then worked around rather than
-fixed.** No test in the suite fails on this today. It is written down because
-the workaround is the only thing keeping it quiet, and the next person to add a
-Java call on that path will hit it again with no idea why.
+**OPEN, 2026-08-26.** Found by regressing it, worked around at the one call site
+that caused the regression — and then measured to be **already present on a
+second, independent path that the workaround does not touch**:
+`OpenSslEngineTest.mustCallResumeTrustedOnSessionResumption` fails 12 of 48 on
+`dev`, deterministically, with an identical failing index set before and after
+the fix. So this is a live defect with a standing witness, not a hazard that only
+exists if someone reintroduces it.
 
 ## What happens
 
@@ -69,6 +72,34 @@ nothing was rejected — a read-only query from the wrong place was enough.
 `useTasks=false` parameterisations, and that is not a contradiction: its client
 presents no certificate, so there is no client `Certificate` flight to lose.
 
+## The standing witness: `mustCallResumeTrustedOnSessionResumption`
+
+This one is NOT the regression, and that is what makes it worth having. It
+installs its own `SessionValueSettingTrustManager` — an application
+`X509ExtendedTrustManager` that does real work (it writes a value into the
+`SSLSession`) from inside the same callback — so it never reaches
+`x509_manager`'s shim at all, and the field fast path below cannot help it.
+
+Interleaved, one run per arm, same host, same argfile:
+
+| arm | result | failing invocations |
+| --- | --- | --- |
+| HotSpot 25 | **48/48 ok**, 23.6 s | — |
+| CratonVM, before the endpoint-identification fix | 36 ok, **12 failed**, 782 s | `10 12 14 16 26 28 30 32 42 44 46 48` |
+| CratonVM, after it (post `dev` merge) | 36 ok, **12 failed**, 797 s | `10 12 14 16 26 28 30 32 42 44 46 48` |
+
+**The same twelve, both arms.** Decoded against
+`OpenSslEngineTestParam.expandCombinations` they are exactly `TLSv1.3` AND
+`useTasks=false`, for all three buffer types and both `delegate` / `useTickets`
+values — the identical signature to the regression above, arrived at from
+completely different Java.
+
+It is also, on its own, most of what this class costs on CratonVM. Measured over
+a whole-class run: 2 618 s across 31 invocations of this method against 798 s
+for the other 672 tests put together, because each failure burns a 60 s JUnit
+timeout. Fixing it would take `OpenSslEngineTest` from roughly 2.4 h to about
+1.5 h here.
+
 ## The workaround that is in the tree
 
 `extended_tm_identification_algorithm` reads netty's
@@ -85,9 +116,11 @@ outright. They exist so this attribution stays a one-run A/B rather than a
 rebuild; they are diagnostic levers, and the SERVER one re-opens a real security
 hole, so neither is a configuration.
 
-**The workaround is not the fix.** It removes this VM's exposure at one call
-site. Any other Java that ends up on that callback — a future trust manager, a
-key manager, a logging hook — re-introduces it.
+**The workaround is not the fix**, and the section above is the proof rather
+than the warning: an application trust manager doing its own work on that
+callback fails today, on `dev`, with the workaround in place. The workaround
+removes this VM's exposure at ONE call site. Any other Java that ends up on that
+callback — a trust manager, a key manager, a logging hook — hits it.
 
 ## What is NOT established
 
@@ -114,6 +147,12 @@ makes this cheap to bisect. Add one re-entrant call at a time back into the
 callback — `SSL.getOptions` alone, then `SSL.getCiphers` alone, then the bare
 `synchronized` block with no native inside — and see which row flips. Three
 runs answer the first bullet above.
+
+`CRATONVM_X509_TM_PARAMS_VIA_METHOD=1` re-arms the defect on a shipped binary
+without editing anything, which is the control for each of those three runs.
+And `mustCallResumeTrustedOnSessionResumption` is the arm to confirm a candidate
+fix against, because it is the one this VM fails WITHOUT any help from
+`x509_manager`.
 
 ## Repro
 
