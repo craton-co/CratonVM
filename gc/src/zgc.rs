@@ -8689,6 +8689,32 @@ impl ZgcRealHeap {
     /// [`mark::ZMarkContext::is_in_heap`] then refuses like any other wild
     /// child. This is the same reason the census reads slots raw.
     ///
+    /// # What the merge cost, measured
+    ///
+    /// The concern that deferred this work for two days was that hardening
+    /// `enumerate_references` would mean `heap::read_value_cell_checked`'s
+    /// ATOMIC 16-byte load on every legacy slot of the default collector's mark
+    /// path. It does not: this read is a 4-byte tag load and a compare, and it
+    /// skips the 8-byte payload load entirely when the tag is not
+    /// `VTAG_OBJECT`, so it is strictly less work than the
+    /// `std::ptr::read::<Value>` it replaced.
+    ///
+    /// Measured anyway, because a structural argument is not a number.
+    /// `RMapGcStress` under ZGC at `--Xmx 64m` (34-35 real collections per run,
+    /// so the walk is engaged), 7 interleaved pairs, priced in CPU time:
+    ///
+    /// * median paired difference **-0.58 s on ~21.8 s (-2.6%)**, after faster
+    ///   in **4 of 7 pairs** — a coin flip.
+    /// * within-arm spread **1.57x** (20.88 s to 32.67 s on the BEFORE arm).
+    ///
+    /// So: **no measurable difference.** The spread means this resolves about
+    /// +/-10%, which is enough to rule out the per-slot atomic that was feared
+    /// and NOT enough to claim the change is faster. Do not quote the -2.6% as a
+    /// speedup; it is noise with a sign.
+    ///
+    /// The BEFORE arm was built at the same base with only this function
+    /// reverted, because a cross-base A/B is not an A/B.
+    ///
     /// `skip_index` is the referent-slot hole: `Some(0)` for a registered
     /// `Weak`/`Soft`/`Phantom`/`Cleaner` `Reference` object, exactly as
     /// `collect_garbage`'s `skip_for` computes it.
