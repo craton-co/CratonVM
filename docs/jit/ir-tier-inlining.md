@@ -151,21 +151,25 @@ flag A/B:
 
 | arm | inlining OFF | inlining ON | HotSpot |
 |---|---|---|---|
-| `volume` — `VolumeShort2.get`, i.e. two segment reads plus the `Short2` pair | 2490-2741 ns | **171-203 ns** | 1.3-1.4 ns |
-| `rawseg` — the same two reads, no wrapper (the CONTROL) | 39-47 ns | **24-28 ns** | 1.1 ns |
-| `array` — a plain `short[]` (the floor) | 2.8-3.7 ns | 2.1-2.2 ns | 0.4 ns |
+| `volume` — `VolumeShort2.get`, i.e. two segment reads plus the `Short2` pair | 2.1-2.7 µs | **171-313 ns** | 1.3-1.4 ns |
+| `rawseg` — the same two reads, no wrapper (the CONTROL) | 39-47 ns | **24-38 ns** | 1.1 ns |
+| `array` — a plain `short[]` (the floor) | 2.2-3.7 ns | 2.1-2.9 ns | 0.4 ns |
 
 Checksum `8589672448` in every row of every arm.
 
-**~13x on the target arm, and the allocation is still there**: the same run
+**~10x on the target arm, and the allocation is still there**: the same run
 reports `scalar-replaced 0/2 alloc(s)` for the spliced method. The win is
 removing five dispatch frames per voxel and giving the spliced bodies compact
 field offsets and inline caches — not deleting the object. See [Open](#open) for
 what deleting it still needs.
 
-The `volume` arm is allocation-dominated and therefore GC-noisy: the OFF arm
-ranged 1.9-2.7 µs across runs, and it degrades rep over rep. The ON arm does
-not degrade, which is itself a signal.
+Ranges, not points, because the `volume` arm is allocation-dominated and
+therefore GC-noisy: across runs the OFF arm sat between 1.9 and 2.7 µs and the
+ON arm between 171 and 313 ns. The OFF arm also DEGRADES rep over rep (past 3 µs
+by rep 5, and the allocation-free `array` arm degrades with it, which is what
+says the cause is heap pressure and not the arm). The ON arm does not degrade —
+itself a signal, and the reason the honest comparison is steady-state and not
+first-rep.
 
 ## Open
 
