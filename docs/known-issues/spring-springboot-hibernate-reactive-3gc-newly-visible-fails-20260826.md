@@ -1,7 +1,7 @@
 # Spring Framework, Spring Boot, and Hibernate Reactive 3-GC full-suite runs (2026-08-24/25): re-triaged 2026-08-27
 
 ## Status
-**MOSTLY RESOLVED.** The one mechanism this page root-caused —
+**MOSTLY RESOLVED — 2 open.** The one mechanism this page root-caused —
 `Class.getDeclaredMethods()` ordering — **has been falsified as the cause of
 anything listed here**, by measurement rather than by argument.
 
@@ -18,7 +18,8 @@ each covers what the other does not:
   reclassifies 5 more as "fails identically on HotSpot" — which a sweep without
   a control necessarily counts as remaining CratonVM failures.
 
-Combined: **3 functional defects remain**, plus 3 throughput items that are not
+Combined: **2 functional defects remain** (a third, the Infinispan one, is fixed
+here), plus 3 throughput items that are not
 functional failures. 5 fixed here, 25 of the 38 already passed when re-run, and
 5 fail identically on HotSpot.
 
@@ -240,12 +241,80 @@ a reopening — it passes.
 
 ## What is actually left
 
-Three functional defects, none of them this page's original mechanism:
+### 1. `CacheAutoConfigurationTests` — FIXED (`456c09257`)
 
-1. `CacheAutoConfigurationTests` — 3 Infinispan contexts fail to start.
-2. `JerseyWebEndpointManagementContextConfigurationTests` — `ObjectProvider<PathMapper>` unsatisfied.
-3. `AotIntegrationTests` — untriaged, and from the broad sweep rather than this
-   page's own list.
+3 of 59, all Infinispan. `OffHeapMemoryAllocator` calls the restricted
+`MemorySegment.reinterpret` from a **static initialiser**, CratonVM refused, and
+JVMS 5.5 makes a `<clinit>` failure permanent for the class.
+
+The refusal was the defect. Measured on Adoptium 25.0.4
+(`probes/RestrictedFfmPolicyProbe.java`): a JDK 25 launcher WARNS and proceeds,
+and throws only under `--illegal-native-access=deny`. `ofAddress` is not
+restricted at all — the JDK permits it even under `deny`, because the segment it
+returns is zero-length and widening it needs `reinterpret`. CratonVM denied both,
+unconditionally. It now matches all three JDK modes, `--illegal-native-access`
+is added so `deny` stays reachable, and `untrusted_code` is pinned to deny
+regardless — that mode already forced the gate closed, so the new default would
+otherwise have loosened it. **59/59.**
+
+### 2. `JerseyWebEndpointManagementContextConfigurationTests` — NOT a defect in the test it fails in
+
+1 of 4. **All four methods pass when run individually.** The failure needs a
+specific pair, and only that pair:
+
+| first | then `autoConfigurationIsConditionalOnClassResourceConfig` |
+|---|---|
+| `refreshSucceedsWithoutHealth` | **FAILS** |
+| `jerseyWebEndpointsResourcesRegistrarForEndpointsIsAutoConfigured` | passes |
+| `autoConfigurationIsConditionalOnServletWebApplication` | passes |
+
+`refreshSucceedsWithoutHealth` is the one carrying `@ClassPathExclusions`, so it
+runs under a `ModifiedClassPathClassLoader`. Something it leaves behind makes the
+later test's `servletEndpointDiscoverer` fail to resolve `ObjectProvider<PathMapper>`
+— i.e. Spring's `ObjectProvider.class == descriptor.getDependencyType()` identity
+check stops matching. So this is **cross-test state leakage**, not anything wrong
+with the failing test's own path, and it should not be triaged as an
+`ObjectProvider` bug.
+
+**Four hypotheses measured and killed**, recorded so they are not re-run:
+
+* *Class-mirror identity* — every reflective surface (`getParameterTypes`,
+  `Field.getType`, `getReturnType`, `Class.forName`, `getSuperclass`,
+  `getInterfaces`, `getComponentType`, `getDeclaringClass`, `getClass`) returns
+  the canonical mirror. Identical to HotSpot.
+* *`FilteredClassLoader` delegation* — a class reached through one is the
+  parent's copy, and the hidden class really is hidden.
+* *Name-keyed absence memo* — a failed load through a hiding loader does not
+  poison the class for the app loader, in either the class or package flavour.
+* *Loader-faithful reflection after a duplicate definition* — defining a second
+  copy of `ObjectProvider` in a parent-last loader does NOT make the original
+  class's `getParameterTypes()` return the duplicate.
+
+The minimal shapes all pass too: a `@Bean` method taking `ObjectProvider<T>` with
+zero candidates, with and without `.withClassLoader(new FilteredClassLoader(...))`.
+Whatever leaks is narrower than any of these.
+
+### 3. `AotIntegrationTests` — cause chain identified, not fixed
+
+1 of 4 (2 skipped). It is AOT **generation**, and the chain bottoms out in
+ByteBuddy rather than in Spring:
+
+```text
+TestContextAotException: Failed to process test class
+    [...mockito.integration.SpringExtensionAndMockitoExtensionIntegrationTests]
+ -> MockitoException: Could not modify all classes [interface ...$UserService]
+ -> IllegalStateException
+ -> IllegalArgumentException: Unknown type:
+        org/springframework/test/context/bean/override/mockito/hierarchies/FooService
+```
+
+"Unknown type" is ByteBuddy's `TypePool` failing to resolve a class file.
+**Resource access is ruled out**: `getResourceAsStream`, `getResource` and
+`Class.getResourceAsStream` all return the same bytes as HotSpot for
+`FooService`, for the failing test class, and for `AotIntegrationTests` itself
+(`probes/ClassBytesProbe.java`). So the bytes are reachable and something else in
+the Mockito-inline / ByteBuddy path cannot see them — the same family as
+`BeanRegistrationsAotContributionTests`, which is AOT + Mockito too.
 
 And three throughput items that are NOT functional failures, all pre-existing —
 listed so they are not re-triaged as defects:
