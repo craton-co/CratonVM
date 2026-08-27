@@ -816,9 +816,20 @@ impl CompilerCore {
         }
         {
             let mut methods = self.methods.lock();
-            let Some(state) = methods.get_mut(key) else {
-                refuse!("no tier state for this method");
-            };
+            // `or_insert_with`, not `get_mut`. MEASURED: `get_mut` refused
+            // every method the eager first-call door compiles, with "no tier
+            // state for this method" -- that door hands the backend a method
+            // the interpreter never counted invocations for, so the manager has
+            // never seen its key. `RJitGc.make` is one, and it is the method
+            // this whole path exists for.
+            //
+            // Creating the state here is what `on_invocation` / `on_backedge`
+            // do for their own keys, and it is inert for everything else: a
+            // fresh `MethodState` is `current_tier = Interpreter`, unqueued,
+            // and every other gate below still applies.
+            let state = methods
+                .entry(key.clone())
+                .or_insert_with(|| MethodState::new(key.clone()));
             if state.queued_for_compilation {
                 refuse!("already queued");
             }
