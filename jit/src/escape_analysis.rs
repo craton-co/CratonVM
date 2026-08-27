@@ -738,6 +738,81 @@ pub struct PartialEscapeInfo {
 }
 
 /// Full result of escape analysis on a graph.
+/// Why [`find_scalar_replacements`] refused one allocation.
+///
+/// # Why this exists
+///
+/// `scalar-replaced 0/2` is a count, and a count cannot be acted on. The
+/// per-voxel `Short2` page spent three rounds guessing at a `0/N` — twice
+/// wrongly — because the analysis reported how many objects it kept and never
+/// which fact stopped it. Each variant below is one `continue`/`break` in
+/// `find_scalar_replacements`, so the report and the control flow cannot drift.
+///
+/// Purely informational: nothing acts on a refusal, and producing one is not a
+/// decision. It is emitted under `CRATONVM_DBG_SCALAR_NEW`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScalarRefusal {
+    /// Not `NoEscape` — the reachability fact (fact 1) does not hold.
+    Escapes(EscapeState),
+    /// A live node observes the object's address (fact 3).
+    IdentityObserved,
+    /// The object is published into another object's field, so it escapes
+    /// through the heap.
+    StoredIntoAnotherObject,
+    /// A field op names this allocation as its holder with an index that is not
+    /// a field of it (or a malformed operand layout).
+    FieldIndexOutOfRange,
+    /// A φ carrying this reference could not be proved to be a transparent copy
+    /// of exactly this allocation.
+    PhiNotTransparentCopy,
+    /// A monitor operation names the object.
+    MonitorOperation,
+    /// A use this walk has no rule for — a `Call` argument, a `Return`, a
+    /// `Throw`, an `Op::Other`. The catch-all.
+    OpaqueUse,
+    /// A value written into one of the object's own fields may BE the object,
+    /// so a reference to it can be recovered through a load this walk never
+    /// visits.
+    SelfReference,
+    /// A surviving load of a field that HAS stores, in a graph where program
+    /// order is not dominance (`program_order_proves_dominance` is false —
+    /// any branch, join or multi-input φ). Fact 2 is unprovable, not false.
+    ///
+    /// This is the refusal a hot loop hits: the loop body's own branches deny
+    /// the whole graph the ordering stand-in, even for a store and a load that
+    /// sit next to each other in one block.
+    LoadNotAnswerable,
+    /// `Op::NewArray`. Array scalar replacement handles a constant-length
+    /// array whose every index is a constant in range; anything else — a
+    /// non-constant length, a non-constant or out-of-range index — is refused
+    /// here rather than guessed at.
+    ArrayNotReplaceable(ArrayRefusal),
+}
+
+/// Why an `Op::NewArray` was not scalar-replaced. See
+/// [`ScalarRefusal::ArrayNotReplaceable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArrayRefusal {
+    /// The length operand is not a compile-time constant, so the array has no
+    /// statically-known number of slots to map onto scalars.
+    LengthNotConstant,
+    /// The constant length is larger than [`MAX_SCALAR_ARRAY_LEN`]. Replacing a
+    /// long array trades one allocation for a large number of live values, and
+    /// the register allocator pays for every one of them.
+    LengthTooLarge(usize),
+    /// An element access whose index is not a compile-time constant. Which slot
+    /// it names is unknown, so neither a load nor a store can be attributed.
+    IndexNotConstant,
+    /// A constant index outside `0..len`. The access throws
+    /// `ArrayIndexOutOfBoundsException` at run time, and deleting the array
+    /// deletes the throw.
+    IndexOutOfRange,
+    /// `Op::ArrayLength` is answerable for a constant-length array, but this
+    /// array's length is not constant. (Kept separate from
+    /// [`Self::LengthNotConstant`] so the report names the node that asked.)
+    LengthReadOfUnknownLength,
+}
+
 pub struct EscapeAnalysisResult {
     /// Escape states for all allocation sites.
     ///
@@ -788,6 +863,12 @@ pub struct EscapeAnalysisResult {
     /// informational — it exists so a fail-closed answer is *reportable* rather
     /// than invisible.
     pub lock_refusals: Vec<(NodeId, LockRefusal)>,
+    /// Every allocation [`find_scalar_replacements`] refused, with the reason.
+    ///
+    /// Sorted by node id and deduplicated; one entry per refused allocation
+    /// (the walk stops at the first refusal, so an object has one reason).
+    /// Informational only — see [`ScalarRefusal`].
+    pub scalar_refusals: Vec<(NodeId, ScalarRefusal)>,
     /// Allocations whose every escape site is cold, with those sites.
     /// Informational: nothing acts on it yet.
     pub partial_escapes: Vec<PartialEscapeInfo>,
@@ -1314,8 +1395,14 @@ pub fn find_identity_observations(cg: &ConnectionGraph, graph: &Graph) -> Vec<(N
 // ── Phase 3b: Find scalar replacement candidates ────────────────────────
 
 /// Identify allocations that can be decomposed into scalar field values.
-fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarReplacementInfo> {
+fn find_scalar_replacements(
+    cg: &ConnectionGraph,
+    graph: &Graph,
+) -> (Vec<ScalarReplacementInfo>, Vec<(NodeId, ScalarRefusal)>) {
     let mut results = Vec::new();
+    // One reason per refused allocation. The walk below stops at its
+    // first refusal, so an object never accumulates two.
+    let mut refusals: Vec<(NodeId, ScalarRefusal)> = Vec::new();
 
     // Program order is only dominance in a branch-free graph; see
     // `program_order_proves_dominance`. Computed once — it is a property of the
@@ -1337,7 +1424,9 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             num_fields,
         } = &node.op
         {
-            if cg.get_escape(id) != EscapeState::NoEscape {
+            let state = cg.get_escape(id);
+            if state != EscapeState::NoEscape {
+                refusals.push((id, ScalarRefusal::Escapes(state)));
                 continue;
             }
             // IDENTITY GATE. Checked before anything else so a `synchronized`
@@ -1345,6 +1434,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             // observation reached through an alias this loop does not classify
             // as transparent would otherwise slip past the use walk below.
             if identity_observed.contains(&id) {
+                refusals.push((id, ScalarRefusal::IdentityObserved));
                 continue;
             }
 
@@ -1365,6 +1455,8 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             let mut load_fields: Vec<usize> = Vec::new();
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
+            // Set beside every `can_replace = false` so the two cannot drift.
+            let mut refusal: Option<ScalarRefusal> = None;
 
             // WIDENED ACCEPTED SHAPE (increment 1):
             //
@@ -1467,10 +1559,12 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                         } else if is_value {
                             // Published into another object's field -> escapes;
                             // cannot scalar-replace.
+                            refusal = Some(ScalarRefusal::StoredIntoAnotherObject);
                             can_replace = false;
                             break;
                         } else {
                             // Holder role but out-of-range / malformed field.
+                            refusal = Some(ScalarRefusal::FieldIndexOutOfRange);
                             can_replace = false;
                             break;
                         }
@@ -1484,6 +1578,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                             replaced_loads.push(use_id);
                             load_fields.push(*field_idx);
                         } else {
+                            refusal = Some(ScalarRefusal::FieldIndexOutOfRange);
                             can_replace = false;
                             break;
                         }
@@ -1534,6 +1629,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                                 worklist.push(u);
                             }
                         } else {
+                            refusal = Some(ScalarRefusal::PhiNotTransparentCopy);
                             can_replace = false;
                             break;
                         }
@@ -1560,9 +1656,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     Op::MonitorEnter
                     | Op::MonitorExit
                     | Op::MonitorWait
-                    | Op::MonitorNotify
-                    | Op::RefCompare
-                    | Op::IdentityHash => {
+                    | Op::MonitorNotify => {
+                        refusal = Some(ScalarRefusal::MonitorOperation);
+                        can_replace = false;
+                        break;
+                    }
+                    Op::RefCompare | Op::IdentityHash => {
+                        refusal = Some(ScalarRefusal::IdentityObserved);
                         can_replace = false;
                         break;
                     }
@@ -1570,6 +1670,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     // length is known statically. Other uses prevent SR.
                     Op::ArrayLength => {}
                     _ => {
+                        refusal = Some(ScalarRefusal::OpaqueUse);
                         can_replace = false;
                         break;
                     }
@@ -1603,6 +1704,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                 'self_ref: for stores in field_stores.iter() {
                     for fs in stores {
                         if fs.value == id || cg.resolve_points_to(fs.value).contains(&id) {
+                            refusal = Some(ScalarRefusal::SelfReference);
                             can_replace = false;
                             break 'self_ref;
                         }
@@ -1627,6 +1729,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     let resolution =
                         resolve_field_load(&field_stores[field], load, dominance_proved);
                     if resolution == LoadResolution::Unknown {
+                        refusal = Some(ScalarRefusal::LoadNotAnswerable);
                         can_replace = false;
                         break;
                     }
@@ -1646,11 +1749,19 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     eliminated_stores,
                     dominance_proved,
                 });
+            } else {
+                // Every `can_replace = false` above sets `refusal`; the
+                // `unwrap_or` is the belt-and-braces answer for a future arm
+                // that forgets, and is deliberately the least specific reason
+                // rather than a silent omission.
+                refusals.push((id, refusal.unwrap_or(ScalarRefusal::OpaqueUse)));
             }
         }
     }
 
-    results
+    refusals.sort_unstable();
+    refusals.dedup();
+    (results, refusals)
 }
 
 /// Resolve one field load against the field's positional store record.
@@ -2621,7 +2732,7 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
     let mut cg = build_connection_graph(graph);
     propagate_escape_states(&mut cg, graph);
 
-    let scalar_replaceable = find_scalar_replacements(&cg, graph);
+    let (scalar_replaceable, scalar_refusals) = find_scalar_replacements(&cg, graph);
     let (lock_elisions, mut lock_refusals) = find_lock_elision_plans(&cg, graph);
     let (lock_coarsening, coarsening_refusals) = find_lock_coarsening_plans(&cg, graph);
     lock_refusals.extend(coarsening_refusals);
@@ -2707,6 +2818,7 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
         lock_elisions,
         lock_coarsening,
         lock_refusals,
+        scalar_refusals,
         partial_escapes,
         identity_observations,
         stats,

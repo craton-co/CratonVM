@@ -20605,6 +20605,44 @@ fn try_compile_inner(
                                 ea_result.scalar_replaceable.len(),
                                 ir_news,
                             );
+                            // A count says how many objects survived; it does
+                            // not say which fact kept them. Report EVERY
+                            // allocation with its verdict, so a `0/N` is a lead
+                            // rather than the start of a guessing round -- and
+                            // so an allocation the analysis never even
+                            // CONSIDERED is visible rather than absent.
+                            let replaced: std::collections::HashSet<usize> = ea_result
+                                .scalar_replaceable
+                                .iter()
+                                .map(|i| i.alloc_node)
+                                .collect();
+                            for (ea_id, ea_node) in ea_graph.nodes.iter().enumerate() {
+                                let kind = match ea_node.op {
+                                    escape_analysis::Op::New { .. } => "new",
+                                    escape_analysis::Op::NewArray { .. } => "newarray",
+                                    _ => continue,
+                                };
+                                if replaced.contains(&ea_id) {
+                                    eprintln!(
+                                        "[cratonvm-scalarnew]   {} node {}: REPLACED",
+                                        kind, ea_id,
+                                    );
+                                } else if let Some((_, reason)) = ea_result
+                                    .scalar_refusals
+                                    .iter()
+                                    .find(|(a, _)| *a == ea_id)
+                                {
+                                    eprintln!(
+                                        "[cratonvm-scalarnew]   {} node {}: refused {:?}",
+                                        kind, ea_id, reason,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[cratonvm-scalarnew]   {} node {}: NOT CONSIDERED",
+                                        kind, ea_id,
+                                    );
+                                }
+                            }
                         }
                     }
                     // Gated on `lock_elisions`, not the flat `elide_locks`, for
