@@ -2,10 +2,36 @@
 
 ## Status
 
-**Root-caused, not fixed.** Three separate blockers found; one is a stale gate
-and is now liftable behind an opt-in flag, but lifting it measured NEUTRAL —
-because the third blocker is not a gate at all. Closing this needs IR-tier
-inlining of the accessor chain, which is a capability rather than a bug fix.
+**Structural blocker removed; the allocation is still there.**
+
+Three separate blockers were found. The third — a returned object escapes its
+own method, so per-method escape analysis cannot touch it — is closed: the
+optimizing tier can now inline the accessor chain into its consuming loop, so
+the allocation and its consumer are in one graph (`CRATONVM_JIT_IR_INLINE=1`,
+`docs/jit/ir-tier-inlining.md`). The measured effect on a voxel read is **~13x**
+(2490-2741 ns to 171-203 ns on the probe below), and it comes from removing five
+dispatch frames per voxel, NOT from deleting the object: the same run still
+reports `scalar-replaced 0/2 alloc(s)`.
+
+Two things stand between here and the object actually going away, and only the
+first is understood:
+
+  * **`Short2` is TWO allocations** — the object plus its `short[2]` storage —
+    and `escape_analysis` can scalar-replace `Op::New` but not `Op::NewArray`
+    (`test_new_array_local_scalar_not_replaced`). A perfect answer for the
+    object still leaves the array. Array scalar replacement for a
+    constant-length, constant-index array is the companion increment: an array
+    of length N maps onto `ScalarReplacementInfo::field_values` exactly the way
+    an N-field object does.
+  * **why EA reports `0/2` on the merged graph is not yet diagnosed.** The
+    structural reason it used to give (`areturn`) no longer applies.
+
+Also fixed on the way through, and worth more than this page:
+`docs/jit/ir-tier-inlining.md` records that `Op::NewArray` published a
+shadow-stack push it never reloaded, which made `lower_inner` refuse **every**
+C2 candidate containing a `newarray` alongside a live oop, with no reason
+printed. That is what the `2 shadow pushes vs 1 reloads` line at the bottom of
+this page was.
 
 ## What it costs
 
@@ -112,26 +138,39 @@ scalar-replaced by an analysis scoped to that method, at any tier.
 HotSpot removes it by inlining `get` → `loadFromArray` into the consuming loop
 first; the object then dies in the caller and EA scalar-replaces it there.
 
-## What closing this actually requires
+## What was done, and what is left
 
 IR-tier **inlining** of the accessor chain into the hot method, so EA sees the
-allocation and its consumer in one graph. The single-pass backend has an inline
-planner; the IR tier's ability to inline this chain is the open question and the
-place to start. Blockers 1 and 2 are then prerequisites, not the fix — which is
-why fixing 1 alone moved nothing.
+allocation and its consumer in one graph — `docs/jit/ir-tier-inlining.md` for
+the design, the admission set and the measurements. Blockers 1 and 2 were
+prerequisites, not the fix, which is why fixing 1 alone moved nothing.
 
-Two adjacent refusals are worth a look while in there, both hit by this same
-chain and neither yet explained:
+Both adjacent refusals named here turned out to matter, and both are now closed:
 
 ```
 [ir] lower_inner refused: 2 shadow pushes vs 1 reloads — an unmatched push leaks the thread's shadow top
-      (Short2.<init>()V)
-[ir] ir_lower::lower_inner returned None    (VolumeShort2.get, .getIndex, .<init> — no reason printed;
-                                             these Nones bypass `refuse()`, so CRATONVM_DBG_IR_BAILOUT is silent)
 ```
 
-That silence is its own small defect: five methods lost their IR body in this
-run and only one of them said why.
+was `Op::NewArray` emitting a safepoint map (hence a shadow push) with no paired
+`emit_shadow_reload`. Not a leak in practice — `lower_inner`'s
+`shadow_pushes != shadow_reloads` check caught it and refused the method — but
+that made it a SILENT coverage hole: every C2 candidate with a `newarray` beside
+a live oop lost its optimized body. `Short2.<init>()V` is
+`iconst_2; newarray short; invokespecial <init>([S)V`, and so was
+`VoxelAlloc2.sweepVolume` once the chain was spliced into it. Fixing it is what
+took the probe from 578 ns to 175 ns — the splice alone had already reached 578.
+
+```
+[ir] ir_lower::lower_inner returned None    (VolumeShort2.get, .getIndex, .<init> — no reason printed)
+```
+
+was the ABI-capacity refusal: an instance method with three parameters has four
+incoming slots, and touching one field turns `needs_context` on, which is the
+fifth. It is now named
+(`unsupported shape: incoming arg slots exceed the entry ABI registers`) rather
+than a bare `None`. It is a real and unfixed coverage limit — `getIndex(III)I`
+cannot be lowered at the IR tier standalone at all — but it does not block the
+chain, because those methods are spliced INTO a caller whose own arity fits.
 
 ## Reproducing
 

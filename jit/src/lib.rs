@@ -7463,6 +7463,7 @@ mod profile_guided_inlining_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
@@ -8239,6 +8240,7 @@ mod inline_selection_tests {
             invoke_targets: Vec::new(),
             resolved_invoke_infos: Vec::new(),
             nested_sites: Vec::new(),
+            ir_new_info: Vec::new(),
         }
     }
 
