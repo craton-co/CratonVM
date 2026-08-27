@@ -5254,12 +5254,49 @@ pub mod oop_map_audit {
     /// at the same stack shape. What the question needs is "which METHOD has
     /// which unmapped SLOT", which is what this records.
     pub static SITES: std::sync::Mutex<
-        Option<std::collections::BTreeMap<(usize, i32), &'static str>>,
+        Option<std::collections::BTreeMap<(usize, i32), SiteInfo>>,
     > = std::sync::Mutex::new(None);
 
-    pub fn note_site(entry_ptr: usize, off: i32, class: &'static str) {
+    /// What a never-mapped site needs to be ACTED on rather than counted.
+    ///
+    /// A bare `code=0x781daa08b000 rbp-0x58 operand-spill` cannot be checked by
+    /// anybody: settling whether the slot is genuinely live or merely stale
+    /// means reading that method's `LocalVariableTable` scopes against the
+    /// safepoint's bci, and for that you need the METHOD and the BCI. Both are
+    /// in hand at the recording site and neither was kept.
+    #[derive(Clone)]
+    pub struct SiteInfo {
+        pub class: &'static str,
+        pub method: String,
+        /// The active safepoint id (bytecode pc) the frame was standing on.
+        pub sp_id: u32,
+        /// The frame's `fully_oop_covered` (frame-slot notion).
+        pub oop_covered: bool,
+        /// The frame's `fully_shadow_covered` — the claim the moving path
+        /// spends, and the one a never-mapped live oop would refute.
+        pub shadow_covered: bool,
+    }
+
+    pub fn note_site(
+        entry_ptr: usize,
+        off: i32,
+        class: &'static str,
+        method: &str,
+        sp_id: u32,
+        oop_covered: bool,
+        shadow_covered: bool,
+    ) {
         if let Ok(mut g) = SITES.lock() {
-            g.get_or_insert_with(Default::default).insert((entry_ptr, off), class);
+            g.get_or_insert_with(Default::default).insert(
+                (entry_ptr, off),
+                SiteInfo {
+                    class,
+                    method: method.to_string(),
+                    sp_id,
+                    oop_covered,
+                    shadow_covered,
+                },
+            );
         }
     }
 
@@ -5271,16 +5308,24 @@ pub mod oop_map_audit {
             if let Some(map) = g.as_ref() {
                 let mut by_class: std::collections::BTreeMap<&'static str, usize> =
                     Default::default();
-                for class in map.values() {
-                    *by_class.entry(class).or_default() += 1;
+                for info in map.values() {
+                    *by_class.entry(info.class).or_default() += 1;
                 }
                 eprintln!(
                     "[cratonvm] oop-map audit: DISTINCT never-mapped sites={} by_class={:?}",
                     map.len(),
                     by_class
                 );
-                for ((ptr, off), class) in map.iter().take(24) {
-                    eprintln!("[cratonvm] oop-map audit:   code={ptr:#x} rbp-{off:#x} {class}");
+                for ((ptr, off), info) in map.iter().take(32) {
+                    eprintln!(
+                        "[cratonvm] oop-map audit:   code={ptr:#x} rbp-{off:#x} {} \
+                         sp_id={} oop_cov={} shadow_cov={} {}",
+                        info.class,
+                        info.sp_id,
+                        info.oop_covered,
+                        info.shadow_covered,
+                        info.method
+                    );
                 }
             }
         }
@@ -5458,6 +5503,9 @@ fn verify_precise_covers_conservative(
             audit::FRAMES_CLAIMING_SHADOW_COVERAGE.fetch_add(1, AOrd::Relaxed);
         }
 
+        // The bci this frame is standing on, so a reported site can be checked
+        // against the method's LocalVariableTable scopes.
+        let active_sp_id = frame_active_sp_id(rbp, frame_cm).unwrap_or(u32::MAX);
         let active: std::collections::HashSet<i16> = match active_map_slots(rbp, frame_cm) {
             Some(v) => v.into_iter().collect(),
             None => {
@@ -5500,13 +5548,21 @@ fn verify_precise_covers_conservative(
                         // is already reported by the NO_PRECISE_MAP obligation and
                         // says nothing here -- the first run's probe arm was almost
                         // entirely those.
+                        audit::note_site(
+                            frame_cm.entry_ptr() as usize,
+                            off,
+                            class,
+                            &frame_cm.method_label,
+                            active_sp_id,
+                            frame_cm.fully_oop_covered,
+                            frame_cm.fully_shadow_covered,
+                        );
                         if frame_cm.fully_shadow_covered {
                             audit::NEVER_MAPPED_WHILE_SHADOW_COVERED
                                 .fetch_add(1, AOrd::Relaxed);
                         }
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
-                            audit::note_site(frame_cm.entry_ptr() as usize, off, class);
                             // The bit has been caught claiming coverage it does
                             // not have. Latch it: `collect_roots` consults this
                             // before skipping the conservative backstop.
