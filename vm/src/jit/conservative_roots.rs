@@ -5125,12 +5125,22 @@ fn note_coverage_oracle_refutation() {
 /// is how we know the walk really covered the same frames the backstop would.
 pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) -> bool {
     let before = oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed);
+    // Both claims, because the near-vacuous one cannot carry this alone:
+    // `fully_oop_covered` is the FRAME-SLOT notion, false for any method with a
+    // direct JIT->JIT call taking a reference argument, so a gate watching only
+    // it almost never has a true guard to fire on. The moving path spends
+    // `fully_shadow_covered`, so an unmapped live oop under THAT claim is the
+    // refutation that matters.
+    let before_shadow =
+        oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed);
     scan_active_jit_frames(heap, roots);
     if oracle_force_refute() {
         note_coverage_oracle_refutation();
         return true;
     }
     oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
+        || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed)
+            > before_shadow
 }
 
 /// Whether the pre-suppression verification should run: only when the oracle is
@@ -5209,6 +5219,32 @@ pub mod oop_map_audit {
     /// i.e. the codegen bit asserting complete coverage was wrong.
     pub static NEVER_MAPPED_WHILE_COVERED: AtomicU64 = AtomicU64::new(0);
 
+    /// `never_mapped` hits on a frame whose `fully_shadow_covered` is `true`.
+    ///
+    /// **This is the number the question actually wants.** `fully_oop_covered`
+    /// above is the FRAME-SLOT notion, and a direct JIT→JIT call taking a
+    /// reference argument can never satisfy it — 439 of 449 recorded coverage
+    /// failures were that one shape — so `while_covered` is near-vacuous: its
+    /// guard is almost never true, and a 0 means "never asked", not "never
+    /// wrong". The moving path spends `fully_shadow_covered` (the OSR check
+    /// reads it, and it is the aggregate the per-frame proof is built from), so
+    /// that is the claim an unmapped live oop would refute.
+    ///
+    /// It matters now because the 2026-08-27 band-verifier change gave up
+    /// refusing collections over unpublished words in java-local and
+    /// operand-spill slots. That backstop is gone; this counter is what
+    /// replaces it, and it is only worth anything read beside its engagement
+    /// counters below.
+    pub static NEVER_MAPPED_WHILE_SHADOW_COVERED: AtomicU64 = AtomicU64::new(0);
+    /// Frames inspected that asserted `fully_oop_covered`.
+    pub static FRAMES_CLAIMING_OOP_COVERAGE: AtomicU64 = AtomicU64::new(0);
+    /// Frames inspected that asserted `fully_shadow_covered`.
+    ///
+    /// The ENGAGEMENT counter for the line above: a zero refutation count means
+    /// nothing while this is also zero, because the oracle then never inspected
+    /// a frame making the claim.
+    pub static FRAMES_CLAIMING_SHADOW_COVERAGE: AtomicU64 = AtomicU64::new(0);
+
     /// Distinct `(method entry_ptr, slot offset)` pairs reported as
     /// never-mapped, with the storage class of the slot.
     ///
@@ -5250,12 +5286,16 @@ pub mod oop_map_audit {
         }
         eprintln!(
             "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
-             never_mapped={} (while_covered={}) wrong_map={} below_jit={}",
+             never_mapped={} (while_covered={} of {} claiming; \
+             while_shadow_covered={} of {} claiming) wrong_map={} below_jit={}",
             FRAMES.load(Ordering::Relaxed),
             UNREADABLE_FRAMES.load(Ordering::Relaxed),
             WORDS.load(Ordering::Relaxed),
             NEVER_MAPPED.load(Ordering::Relaxed),
             NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed),
+            FRAMES_CLAIMING_OOP_COVERAGE.load(Ordering::Relaxed),
+            NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed),
+            FRAMES_CLAIMING_SHADOW_COVERAGE.load(Ordering::Relaxed),
             WRONG_MAP.load(Ordering::Relaxed),
             BELOW_JIT.load(Ordering::Relaxed),
         );
@@ -5406,6 +5446,18 @@ fn verify_precise_covers_conservative(
         let band_lo = rbp - frame_size;
         lowest_band_lo = lowest_band_lo.min(band_lo);
 
+        // Engagement, counted per FRAME INSPECTED rather than per hit, so a zero
+        // refutation above can be told from "the oracle never inspected a frame
+        // that made the claim". Counted here — after the frame is known
+        // readable, before its words are walked — so the denominator is exactly
+        // the frames the refutation counters could have fired on.
+        if frame_cm.fully_oop_covered {
+            audit::FRAMES_CLAIMING_OOP_COVERAGE.fetch_add(1, AOrd::Relaxed);
+        }
+        if frame_cm.fully_shadow_covered {
+            audit::FRAMES_CLAIMING_SHADOW_COVERAGE.fetch_add(1, AOrd::Relaxed);
+        }
+
         let active: std::collections::HashSet<i16> = match active_map_slots(rbp, frame_cm) {
             Some(v) => v.into_iter().collect(),
             None => {
@@ -5448,6 +5500,10 @@ fn verify_precise_covers_conservative(
                         // is already reported by the NO_PRECISE_MAP obligation and
                         // says nothing here -- the first run's probe arm was almost
                         // entirely those.
+                        if frame_cm.fully_shadow_covered {
+                            audit::NEVER_MAPPED_WHILE_SHADOW_COVERED
+                                .fetch_add(1, AOrd::Relaxed);
+                        }
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
                             audit::note_site(frame_cm.entry_ptr() as usize, off, class);
