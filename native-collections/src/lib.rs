@@ -1930,6 +1930,28 @@ fn hm_int_fast_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     key
 }
 
+/// Drop whatever the integer overlay is holding for `this`, answering
+/// whether it held anything.
+///
+/// The overlay is keyed by an identity the object keeps across relocation,
+/// NOT by its contents, so nothing that resets a map through its fields --
+/// `publish_map_table`, `set_map_size(.., 0)`, a fresh bucket array -- empties
+/// it. `native_map_size` prefers [`hm_int_fast_len`] over the size field, so a
+/// map reset field-by-field while an overlay survives reports the OVERLAY's
+/// count and can only ever grow. That is what a keySet view's backing did on
+/// every rebuild: `resync_view_set_inner` re-put the source's current keys
+/// into a backing whose overlay still held every key it had ever seen, so
+/// `keySet().size()` tracked the high-water mark and never came back down
+/// after a `remove` or a `clear`.
+fn hm_int_fast_purge(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let object_key = hm_int_fast_obj_key(ctx, this);
+    hm_int_fast_shard_for(object_key)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&object_key)
+        .is_some()
+}
+
 fn hm_int_fast_len(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let key = hm_int_fast_obj_key(ctx, this);
     hm_int_fast_shard_for(key)
@@ -1973,6 +1995,16 @@ fn try_hm_int_fast_put(
                 .entries
                 .insert(int_key, (key_ref, value))
                 .map(|(_, old_value)| old_value);
+            let structural = old.is_none();
+            drop(table);
+            // A key the overlay did not already hold is a structural
+            // modification of the `HashMap` this overlay stands in for, and
+            // until 2026-08-27 it moved NO generation at all: the entries live
+            // in the Rust side table, so none of the node-path
+            // `bump_map_mod_count` calls ran. See [`hm_int_fast_bump`].
+            if structural {
+                hm_int_fast_bump(ctx, this);
+            }
             return Some(Ok(Some(old.unwrap_or(Value::Object(None)))));
         }
     }
@@ -1996,7 +2028,40 @@ fn try_hm_int_fast_put(
             .map(|(_, old_value)| old_value);
         old
     };
+    if old.is_none() {
+        hm_int_fast_bump(ctx, this);
+    }
     Some(Ok(Some(old.unwrap_or(Value::Object(None)))))
+}
+
+/// Move `map`'s structural-modification generation for an overlay insert.
+///
+/// The integer overlay is a REPRESENTATION of a `java.util.HashMap`, so every
+/// observer of that map must see the same events it would see from the node
+/// table, and the generation is one of those events. Two readers depend on it:
+/// the `HashMap$HashIterator` comodification check, and the keySet-view
+/// rebuild elision, which SKIPS a resync while it has not moved.
+///
+/// Without this an int-keyed `HashMap` reported "never modified" for its whole
+/// life. `probes/MapGenProbe` measured `keySet().size() == 0` on a six-entry
+/// map whose iterator yielded all six -- and that pair is exactly the shape
+/// ecj's `StackMapFrameCodeStream.getFramePositions` is built out of:
+///
+/// ```java
+/// int[] positions = new int[set.size()];
+/// int n = 0;
+/// for (Object pos : set) { positions[n++] = ...; }   // index == length
+/// ```
+///
+/// which threw `ArrayIndexOutOfBoundsException: Index n out of bounds for
+/// length n` on 49 of Tomcat's 81 non-passing classes on 2026-08-27 -- every
+/// JSP compile runs through ecj, and its frame-position map is int-keyed.
+///
+/// No Java heap allocation and no Java dispatch, so the contract on
+/// [`jit_overlay_hashmap_put`] -- which reaches this through the same
+/// `try_hm_int_fast_put` -- still holds.
+fn hm_int_fast_bump(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    bump_map_mod_count(&*ctx, map);
 }
 
 fn try_hm_int_fast_get(
@@ -2050,6 +2115,13 @@ fn materialize_hm_int_fast(
 
     let map_pin = ctx.pin_native_root(this);
     let current = ctx.read_native_pin(map_pin, this);
+    // Moving the overlay into the node table changes the REPRESENTATION, not
+    // the contents, so it must not be observable as a modification: the
+    // per-entry `native_map_put_evict_pinned` below bumps the generation once
+    // per entry, and an iterator already walking this map would then throw a
+    // `ConcurrentModificationException` HotSpot never throws. Capture the
+    // generation here and put it back at the end.
+    let gen_before = read_map_mod_count(&*ctx, current);
     set_map_size(ctx, current, 0);
     for int_key in int_keys {
         let (key_ref, value) = {
@@ -2083,6 +2155,7 @@ fn materialize_hm_int_fast(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&object_key);
     let current = ctx.read_native_pin(map_pin, this);
+    restore_map_mod_count(ctx, current, gen_before);
     ctx.unpin_native_roots(map_pin);
     Ok(current)
 }
@@ -12128,9 +12201,96 @@ fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cn
 /// `ConcurrentHashMap` bumps its SEGMENT's counter and never its own, which is
 /// exactly why `view_source_generation` refuses a CHM source.
 fn bump_map_mod_count(ctx: &dyn NativeContext, this: ObjectRef) {
-    if let Value::Int(current) = ctx.get_field_by_name(this, "modCount") {
-        ctx.set_field_by_name(this, "modCount", Value::Int(current.wrapping_add(1)));
+    let Some(slot) = map_mod_count_slot(ctx, this) else {
+        MAP_MODCOUNT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        report_mod_count_refusal(ctx, this);
+        return;
+    };
+    if let Value::Int(current) = ctx.get_field(this, slot) {
+        ctx.set_field(this, slot, Value::Int(current.wrapping_add(1)));
+        MAP_MODCOUNT_BUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        MAP_MODCOUNT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        report_mod_count_refusal(ctx, this);
     }
+}
+
+/// Read `this`'s current generation without moving it -- the twin of
+/// [`bump_map_mod_count`], through the same slot resolver.
+fn read_map_mod_count(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    match ctx.get_field(this, map_mod_count_slot(ctx, this)?) {
+        Value::Int(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Put back a generation captured by [`read_map_mod_count`], undoing bumps a
+/// purely internal representation change made along the way.
+fn restore_map_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef, gen: Option<i32>) {
+    let (Some(gen), Some(slot)) = (gen, map_mod_count_slot(&*ctx, this)) else {
+        return;
+    };
+    ctx.set_field(this, slot, Value::Int(gen));
+}
+
+/// The slot this receiver keeps its structural-modification counter in, or
+/// `None` when it keeps none *within its own allocated fields*.
+///
+/// The bound is the point, and it is the twin of the one [`map_size_slot`]
+/// already applies. `modCount` is declared by `java.util.HashMap`, so
+/// `resolve_field_index_by_class_id` answers a slot for every receiver in the
+/// family -- including ones allocated with fewer fields than the class
+/// declares, where a write is dropped and a read answers a constant. The
+/// by-name accessors this replaced (`get_field_by_name`/`set_field_by_name`)
+/// are that same resolver WITHOUT the bound, which is how a reader and a
+/// writer could silently end up on different storage.
+///
+/// A frozen generation is worse than a missing one: [`view_source_generation`]
+/// reads `Some(g)` as "this map reports when it changes", so a constant makes
+/// the keySet-view rebuild elision skip every resync for the life of the map.
+fn map_mod_count_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let class_id = ctx.class_id_of_object(this);
+    let nf = ctx.object_num_fields(this);
+    ctx.resolve_field_index_by_class_id(class_id, "modCount")
+        .filter(|slot| *slot < nf)
+}
+
+/// Structural mutations that moved a readable `modCount`.
+pub(crate) static MAP_MODCOUNT_BUMPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Structural mutations whose receiver had no `modCount` slot of its own to
+/// move. Every one of these is a map [`view_source_generation`] must refuse,
+/// and does -- `map_itr_mod_count` answers `None` for exactly this set.
+pub(crate) static MAP_MODCOUNT_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Name the first receiver of each class whose `modCount` could not be moved,
+/// under `CRATONVM_DBG=map-view-cache`. The allocated field count is printed
+/// beside the resolved slot because the two ways to lose the field look
+/// identical from the call site: a name that resolves to no slot at all, and a
+/// slot that resolves past what the object was actually allocated with.
+fn report_mod_count_refusal(ctx: &dyn NativeContext, this: ObjectRef) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MAP_VIEW_CACHE").is_none() {
+        return;
+    }
+    let cid = ctx.class_id_of_object(this);
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
+    };
+    let key = cid.as_u32();
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let name = ctx
+        .class_name_of_id(cid)
+        .unwrap_or_else(|| format!("<cid {cid:?}>"));
+    let nf = ctx.object_num_fields(this);
+    let unbounded = ctx.resolve_field_index_by_class_id(cid, "modCount");
+    eprintln!(
+        "[MAP-VIEW-CACHE] modCount UNMOVABLE on {name}: num_fields={nf} resolved_slot={unbounded:?}"
+    );
 }
 
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13170,6 +13330,15 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                     // let the node path decide.
                     if hm_int_fast_key_class_ok(state, key_class) {
                         let old = state.entries.remove(&int_key).map(|(_, value)| value);
+                        let structural = old.is_some();
+                        drop(table);
+                        // The overlay twin of the bump `native_map_remove_pinned`
+                        // does on the node path -- see [`hm_int_fast_bump`]. A
+                        // `remove` that found nothing changes no key and, like
+                        // HotSpot's, moves nothing.
+                        if structural {
+                            hm_int_fast_bump(ctx, this);
+                        }
                         return Ok(Some(old.unwrap_or(Value::Object(None))));
                     }
                 }
@@ -14102,13 +14271,16 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if is_chm_receiver(ctx, this) {
         return native_chm_clear(ctx, args);
     }
-    let object_key = hm_int_fast_obj_key(ctx, this);
-    if hm_int_fast_shard_for(object_key)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&object_key)
-        .is_some()
-    {
+    let had_entries = hm_int_fast_len(ctx, this).unwrap_or(0) != 0;
+    if hm_int_fast_purge(&*ctx, this) {
+        // Dropping the overlay IS this map's `clear()`, so it owes the same
+        // generation bump the node path below pays -- see
+        // [`hm_int_fast_bump`]. Guarded on non-empty to match the node arm
+        // (`if size != 0`), which is the stricter of the two: over-
+        // invalidating a view is free, under-invalidating it is the defect.
+        if had_entries {
+            bump_map_mod_count(ctx, this);
+        }
         return Ok(None);
     }
     let (buckets, size, cap) = map_state(ctx, this);
@@ -15338,11 +15510,13 @@ pub fn report_map_view_cache_at_exit() {
         (skipped as f64) * 100.0 / (total as f64)
     };
     eprintln!(
-        "[MAP-VIEW-CACHE] EXIT resync_skipped={skipped} resync_ran={ran} elided={pct:.1}% view_reused={} view_built={} switch={} verify={}",
+        "[MAP-VIEW-CACHE] EXIT resync_skipped={skipped} resync_ran={ran} elided={pct:.1}% view_reused={} view_built={} switch={} verify={} modcount_bumped={} modcount_refused={}",
         MAP_VIEW_REUSED.load(std::sync::atomic::Ordering::Relaxed),
         MAP_VIEW_BUILT.load(std::sync::atomic::Ordering::Relaxed),
         if map_view_cache_enabled() { "ON" } else { "OFF" },
         if verify_map_view_cache() { "ON" } else { "OFF" },
+        MAP_MODCOUNT_BUMPED.load(std::sync::atomic::Ordering::Relaxed),
+        MAP_MODCOUNT_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 
@@ -15724,6 +15898,11 @@ fn make_view_set_of(
     let source = ctx.read_native_pin(source_pin, source);
     let backing = alloc_view_backing(ctx, source, kind, cap)?;
     let backing_pin = ctx.pin_native_root(backing);
+    // A fresh allocation can land on an address a dead overlay tenant was
+    // last seen at, and the overlay outlives the object it was keyed to --
+    // the same hazard `HashMap.<init>` purges for. Do it once here so the
+    // put loop below starts from an empty map by every measure of empty.
+    hm_int_fast_purge(&*ctx, backing);
     let set = ctx.read_native_pin(set_pin, set);
     hs_set_backing_map(ctx, set, backing);
     // The declared enclosing-instance field, next to the undeclared backing
@@ -16437,6 +16616,13 @@ fn resync_view_set_inner(
     // Reset modCount so the JDK spliterator's CME check stays consistent.
     try_set_jdk_map_field(ctx, backing, "modCount", Value::Int(0));
     set_map_size(ctx, backing, 0);
+    // The three lines above reset the backing through its FIELDS, which the
+    // integer overlay does not live in -- see [`hm_int_fast_purge`]. Without
+    // this the re-put loop below adds the current keys to an overlay that
+    // still holds every key this view has ever shown, and `size()` becomes a
+    // high-water mark: `probes/MapGenProbe` reported `keySet().size() == 6`
+    // for a map that a `remove` had taken to 5 and a `clear` to 0.
+    hm_int_fast_purge(&*ctx, backing);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
         let entries = collect_entries_any(ctx, source)?;
@@ -16516,11 +16702,39 @@ fn resync_view_set_inner(
     if let Some(expected) = verify_expected {
         let actual = view_element_fingerprints(ctx, backing);
         if expected != actual {
-            panic!(
-                "CRATONVM_VERIFY_MAP_VIEW_CACHE: the rebuild elision would have served                  STALE contents for a kind={kind} view — the generation guard did not move                  but the contents did.
-  elided (identity hashes): {expected:?}
-  rebuilt                  (identity hashes): {actual:?}"
+            // The divergence alone says the guard under-invalidated; it does
+            // not say which half was wrong. Read the generation back from the
+            // source now, after the rebuild, beside the value the elision
+            // compared: a `gen now` equal to `gen compared` means the mutator
+            // moved nothing at all (the int-overlay `put` did exactly that
+            // until 2026-08-27), while a larger one means the bump landed
+            // where this view's stamp cannot see it.
+            let source = ctx.read_native_pin(source_pin, source);
+            let gen_now = map_itr_mod_count(&*ctx, source);
+            let stamp = view_backing_stamp(&*ctx, backing);
+            let src_cid = ctx.class_id_of_object(source);
+            let src_name = ctx
+                .class_name_of_id(src_cid)
+                .unwrap_or_else(|| format!("<cid {src_cid:?}>"));
+            let mut msg = String::new();
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                msg,
+                "CRATONVM_VERIFY_MAP_VIEW_CACHE: the rebuild elision would have served STALE"
             );
+            let _ = writeln!(
+                msg,
+                "  contents for a kind={kind} view - the generation guard did not move, but"
+            );
+            let _ = writeln!(msg, "  the contents did.");
+            let _ = writeln!(msg, "  source: {src_name}");
+            let _ = writeln!(
+                msg,
+                "  gen compared={source_gen:?} gen now={gen_now:?} backing stamp={stamp:?}"
+            );
+            let _ = writeln!(msg, "  elided  (identity hashes): {expected:?}");
+            let _ = writeln!(msg, "  rebuilt (identity hashes): {actual:?}");
+            panic!("{msg}");
         }
     }
     ctx.unpin_native_roots(roots_base);
@@ -19948,10 +20162,15 @@ fn map_itr_mod_count(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
             }
         }
     }
-    match ctx.get_field_by_name(src, "modCount") {
-        Value::Int(v) => Some(v),
-        _ => None,
-    }
+    // No unbounded by-name retry. `get_field_by_name` is the slot resolver
+    // WITHOUT the `object_num_fields` bound, so a receiver rejected above is
+    // rejected for having no such slot of its own -- and reading past its
+    // fields answered a constant no mutation could move.
+    // `bump_map_mod_count` refuses the same receivers through
+    // [`map_mod_count_slot`], and the two must agree: a reader that accepts
+    // what the writer cannot reach reports "unchanged" forever, which is
+    // precisely what [`view_source_generation`] must never be told.
+    None
 }
 
 /// The JDK's `expectedModCount = modCount` line — at mint, and again after a
