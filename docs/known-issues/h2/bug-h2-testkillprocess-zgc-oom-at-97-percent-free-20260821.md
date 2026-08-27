@@ -1194,11 +1194,87 @@ scan **was** a backstop against a wrong oop map — refusing the moving cycle
 meant a wrong map could not corrupt anything, because nothing moved. That
 defence is now gone for those two regions, deliberately, because it was
 suppressing ~half of all compaction to hedge against a map defect nobody has
-demonstrated. The right instrument for that hedge is the map-completeness
-oracle already listed under §"Still open"
-(`CRATONVM_DBG_VERIFY_OOP_MAPS`'s `never_mapped (while_covered=N)`), which asks
-the question directly instead of paying for it on every collection — and which
-that item notes should now be re-taken against `fully_shadow_covered`.
+demonstrated. ~~The right instrument for that hedge is the map-completeness
+oracle already listed under §"Still open".~~ **WITHDRAWN 2026-08-27** — it was
+re-pointed at `fully_shadow_covered` and run, and it cannot carry the load:
+`TestMultiThread` PASSES with 1.1 M never-mapped words, 670 k of them in frames
+asserting shadow coverage. The counter is dominated by its own declared false
+positive and by the dead slots this section is about. See §"Follow-up 2026-08-27
+(second)". The relaxation stands on the `closeStore` scope proof and the
+corruption canary; a backstop that can tell dead from live without the map does
+not exist yet.
+
+
+## Follow-up 2026-08-27 (second): the oracle is NOT the backstop I said it was
+
+§"Follow-up 2026-08-27" gave up the band scan's role as a check on a wrong oop
+map for java locals and operand spill, and said "the direct instrument for that
+hedge is the map-completeness oracle already listed under §Still open". **That
+claim is wrong, and this section withdraws it.** The oracle was fixed to ask the
+right question, then run, and it cannot carry the load.
+
+### It was asking a question whose guard is almost never true
+
+`while_covered` keyed on `fully_oop_covered` — the FRAME-SLOT notion, which a
+direct JIT→JIT call taking a reference argument can never satisfy (439 of 449
+recorded coverage failures were that one shape, §"Follow-up 2026-08-24" §2). So
+`while_covered=0` had been reporting "never asked", not "never wrong". The moving
+path spends `fully_shadow_covered`.
+
+That is now counted separately, and — the part that makes either number readable
+— **beside its denominator**, per frame INSPECTED:
+
+```
+[cratonvm] oop-map audit: … never_mapped=N
+  (while_covered=A of B claiming; while_shadow_covered=C of D claiming) …
+```
+
+`verify_active_coverage_into` refutes on either counter, so the pre-suppression
+gate can fire at all. Both are behind `CRATONVM_DBG_VERIFY_OOP_MAPS`.
+
+### Measured — and the control is what settles it
+
+| class | rc | `never_mapped` / words | `while_shadow_covered` / claiming | distinct sites |
+|---|---|---|---|---|
+| `TestKillProcessWhileWriting` | 1 | 15 232 / 247 672 | 15 228 / 16 926 | 21 |
+| `TestMVStoreTool` | 1 | 844 / 16 190 | 654 / 714 | 52 |
+| **`TestMultiThread`** | **0 PASS** | **1 108 464 / 21 770 329** | **670 474 / 972 492** | 166 |
+
+Read the third row. `TestMultiThread` **passes**, under a moving collector, with
+**1.1 million** never-mapped words and 670 k of them in frames asserting
+`fully_shadow_covered`. If those were genuine live references no map names, that
+workload would corrupt. It does not.
+
+So the counter is dominated by the false positive its own doc declares —
+*"a primitive `i64` whose bits land on a live object header is counted"* — and by
+the dead stale slots §"Follow-up 2026-08-27" characterised. At **5–6 % of every
+in-band word on every workload measured**, it cannot separate a real coverage
+gap from either. The doc's own summary was right and should have been read
+harder: *"a non-zero `never_mapped` is a lead, and a ZERO is the strong
+result."* There is no zero to be had here.
+
+### Where that leaves the relaxation
+
+Standing, on its own evidence rather than on this oracle: the `closeStore`
+`LocalVariableTable` proof (slot 5 scoped 149..170, read at bci 174) and the
+argument that the active map is the liveness authority for the regions the
+abstract interpreter models. The corruption canary is the empirical half —
+`TestMultiThread` ×4 clean with 62–66 k objects relocated.
+
+What is genuinely open is a backstop that can tell a dead slot from a live one
+without the map. Two candidates, neither cheap: teach the oracle liveness (the
+`LocalVariableTable` scopes, or a type-aware filter to kill the primitive false
+positive), or have codegen clear reference locals as they go dead so no stale
+movable word survives at all. Until one exists, this page should not claim to
+have a check on the map.
+
+### The site list is now actionable
+
+`code=0x781daa08b000 rbp-0x58 operand-spill` could not be checked by anybody.
+Sites now carry the METHOD and the BCI — which is exactly what settled
+`closeStore` — plus both claim flags, and every never-mapped hit is recorded
+rather than only the `fully_oop_covered` subset (which was 3 122 of 15 232, with
+the other 12 110 sites discarded).
 
 ## Still open
 
@@ -1210,12 +1286,16 @@ Ordered by what a next session should pick up first.
   `TestKillProcessWhileWriting` compacts on 88–94 % of cycles. This class
   still fails with `oom=4` and needs its own answer — it is not short of
   compaction, it is short of TIME to compact.
-* **The band scan no longer backstops a wrong oop map for java locals and
-  operand spill.** Given up deliberately (§"Follow-up 2026-08-27") because it
-  was suppressing about half of all compaction to hedge against a map defect
-  nobody has demonstrated. The direct instrument for that hedge is the
-  `while_covered` oracle two items below, which should be re-taken against
-  `fully_shadow_covered`.
+* **There is no working backstop against a wrong oop map for java locals
+  and operand spill.** The band scan's was given up 2026-08-27, and the
+  map-completeness oracle CANNOT replace it: re-pointed at
+  `fully_shadow_covered` and measured, it reports 5–6 % of every in-band word
+  as never-mapped on every workload, including `TestMultiThread`, which
+  PASSES with 1.1 M of them. Dominated by its own declared false positive (a
+  primitive whose bits look like an object header) and by dead stale slots.
+  A real backstop needs liveness the map does not carry — the
+  `LocalVariableTable` scopes, a type-aware filter, or codegen clearing
+  reference locals as they die. See §"Follow-up 2026-08-27 (second)".
 * **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
   bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
   proven cycles 13 against 24. None of the five switches covers it. Almost
