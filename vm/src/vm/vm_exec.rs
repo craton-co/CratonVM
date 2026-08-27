@@ -11799,12 +11799,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // to remap THIS entry (initiator/arrive/fold writeback gap), which
         // no other canary distinguishes from caller-side misuse.
         if handle != usize::MAX && blockgc_dbg() {
-            if let Some(new) = self
+            // Both sources, for the reason spelled out at the PIN-STALE canary:
+            // the forwarding word is zeroed by G1 when it frees the from-region,
+            // so `debug_forwarded_target` alone cannot see the case this canary
+            // exists for. `was_vacated` is the exact ledger.
+            let forwarded = self
                 .shared
                 .mem
                 .heap
                 .debug_forwarded_target(entry.as_ptr() as usize)
-            {
+                .or_else(|| cratonvm_gc::gc_quiescence::was_vacated(entry.as_ptr() as usize));
+            if let Some(new) = forwarded {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
