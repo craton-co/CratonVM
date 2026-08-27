@@ -1747,6 +1747,14 @@ impl VmHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Retire every published FFM fast-path verdict. Those verdicts are keyed
+        // by the carrier's ADDRESS, and after a collection an address no longer
+        // identifies the object it identified before: a reclaimed carrier's
+        // address can be handed to a different object, and a stale verdict would
+        // vouch for it. One relaxed increment per CYCLE, never per access — see
+        // `cratonvm_types::ffm_epoch`. Bumped here, at the one dispatcher every
+        // collector goes through, so a future collector cannot silently miss it.
+        cratonvm_types::ffm_epoch::bump_ffm_epoch();
         match self {
             VmHeap::Generational(h) => {
                 h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)

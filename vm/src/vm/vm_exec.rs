@@ -17594,6 +17594,12 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn free_native_memory(&mut self, alloc_id: i64) {
+        // Retire every published FFM fast-path verdict. A verdict says "this
+        // carrier's scope was live and its block was there"; freeing a block is
+        // exactly the event that can stop that being true, and the carrier goes
+        // on pointing at the freed address. One relaxed increment per FREE,
+        // never per access. See `cratonvm_native_builtins::ffm_fast`.
+        cratonvm_native_builtins::ffm_fast::bump_epoch();
         self.shared.natives.native_memory.lock().free(alloc_id);
     }
 

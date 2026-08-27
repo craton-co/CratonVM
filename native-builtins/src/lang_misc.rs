@@ -2221,8 +2221,33 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // ES-suite failures). The JDK sentinel `UNASSIGNED_STACK` is a zero-length
     // array, so a non-empty `stackTrace` field means it was set (or cached) and
     // must be returned verbatim instead of re-deriving from the backtrace.
+    // A DELIBERATELY EMPTY array is a set array. The guard below used to be
+    // `array_length(set_arr) > 0`, which cannot tell `setStackTrace(new
+    // StackTraceElement[0])` from the never-assigned state -- so clearing a
+    // stack trace silently did nothing and `getStackTrace().length` answered 2
+    // where HotSpot answers 0 (MEASURED: `probes/IoSystemSweep.java`, both
+    // modes). The JDK's own discriminator is IDENTITY, not length: `Throwable`
+    // initialises the field to the private static sentinel `UNASSIGNED_STACK`,
+    // itself a zero-length array, and `setStackTrace` stores a DIFFERENT
+    // zero-length array. Compare against that sentinel when the real class
+    // supplies it, and fall back to the old length test when it does not (a
+    // synthetic-JDK image has no such static).
     if let Value::Object(Some(set_arr)) = throwable_field_get(ctx, this, "stackTrace") {
-        if ctx.array_length(set_arr) > 0 {
+        let unassigned = ctx
+            .class_id_by_name("java/lang/Throwable")
+            .and_then(|cid| {
+                ctx.static_field_index_by_name(cid, "UNASSIGNED_STACK")
+                    .map(|idx| ctx.get_static_field(cid, idx))
+            });
+        let is_sentinel = matches!(unassigned, Some(Value::Object(Some(u))) if u == set_arr);
+        let was_set = match unassigned {
+            // The real class library is present: identity decides, so an
+            // explicitly-set empty array is honoured.
+            Some(Value::Object(Some(_))) => !is_sentinel,
+            // No sentinel to compare against — keep the pre-2026-08-27 rule.
+            _ => ctx.array_length(set_arr) > 0,
+        };
+        if was_set {
             if crate::nbflags().dbg_sttrace {
                 let n = ctx.array_length(set_arr);
                 for i in 0..n {

@@ -1451,6 +1451,12 @@ fn zgc_headroom_margin(capacity: usize) -> usize {
 }
 
 /// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
+///
+/// **This is ABOVE [`ZgcRealHeap::MAX_PLAUSIBLE_ARRAY_LEN`] (`1 << 28`), the
+/// corruption screen `alloc_size` applies.** Every array this constant admits
+/// between the two is legal to allocate and unsizable to the collector; see that
+/// constant's doc for what each consumer does about it, and for why the marker
+/// must not be one of them.
 const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 
 /// Registered objects the sweep refused to size (and therefore refused to
@@ -7819,6 +7825,41 @@ impl ZgcRealHeap {
     /// payload bytes almost always exceeds it. Deliberately generous: this is
     /// a corruption screen, not a policy limit, and refusing a real array would
     /// break a working program in order to catch a broken one.
+    ///
+    /// # It is BELOW the allocator's own limit, and that gap is reachable
+    ///
+    /// [`ZGC_REAL_MAX_ARRAY_LENGTH`] is `i32::MAX` (~2.1G elements), so a
+    /// reference array between `1 << 28` and that IS allocatable on a large
+    /// heap and IS refused here. "larger than any array this VM can hold in the
+    /// heaps it runs" is a statement about the heaps it is usually run in, not a
+    /// bound anything enforces — a 268M-element `Object[]` is 2.1 GB of payload,
+    /// which a 16 GB ergonomic default heap admits.
+    ///
+    /// What that costs, per consumer of [`ZgcRealHeap::alloc_size`]:
+    ///
+    /// * **The marker: nothing, now.** `visit_strong_refs_at` deliberately does
+    ///   NOT screen array length, because refusing there means an out-edge not
+    ///   traced — a live object collected. `enumerate_references` briefly did
+    ///   (2026-08-26, same day, caught before it landed on dev) and that was the
+    ///   bug this paragraph exists to prevent recurring.
+    /// * **The slide: conservative but noisy.** An unsizable object is skipped
+    ///   from relocation and logged at `error`, so such an array is permanently
+    ///   un-compactable and emits guard spam rather than corrupting anything.
+    /// * **`live_bytes` accounting: under-counts** by the array's whole size,
+    ///   which makes its page look emptier than it is to the relocation
+    ///   selector.
+    ///
+    /// Neither sibling collector has this gap: `gen_heap`'s and `g1`'s
+    /// plausibility screens are both written `if !is_array && num_slots > ...`,
+    /// i.e. they cap OBJECT field counts and deliberately leave array length
+    /// alone. ZGC is the only one that caps a length, and therefore the only one
+    /// where the two constants can disagree.
+    ///
+    /// Raising this to `ZGC_REAL_MAX_ARRAY_LENGTH` would close the gap and
+    /// weaken the screen to nothing (every `u32` length passes), so it is not
+    /// the obvious fix; bounding by the ARENA's extent rather than by a constant
+    /// probably is. Not attempted here — it wants a fixture that can allocate a
+    /// multi-gigabyte array, which this suite has no way to run.
     const MAX_PLAUSIBLE_ARRAY_LEN: usize = 1usize << 28;
 
     /// Total size in bytes of the allocation rooted at `header`, or `None` when
@@ -7906,118 +7947,32 @@ impl ZgcRealHeap {
         work: &mut Vec<usize>,
         skip_index: Option<usize>,
     ) {
-        let header = self.header_mut(base);
-        match header.kind() {
-            ObjectKind::Object => {
-                if cratonvm_types::is_compact_object(header) {
-                    // Borrowing accessor: this walk only reads `field_offsets` /
-                    // `is_ref` and drops the handle, so it need not pay the
-                    // `Arc` clone/drop that `class_layout_for_fields` implies.
-                    let _ = cratonvm_types::with_class_layout(
-                        header.class_id.as_u32(),
-                        header.num_slots(),
-                        |layout| {
-                            for (index, (&offset, &is_ref)) in layout
-                                .field_offsets
-                                .iter()
-                                .zip(layout.is_ref.iter())
-                                .enumerate()
-                            {
-                                if !is_ref || skip_index == Some(index) {
-                                    continue;
-                                }
-                                // SAFETY: `offset` comes from this object's own
-                                // registered layout — the layout its body was
-                                // sized with at allocation — so the field lies
-                                // inside the allocation, and `read_ref_slot`
-                                // reads exactly `ref_field_size()` bytes of it.
-                                //
-                                // WHY NOT `std::ptr::read(slot as *const u64)`:
-                                // that is what stood here, and it was wrong
-                                // under compressed oops. `ref_field_size()` is
-                                // 4 when narrow oops are on, so an
-                                // unconditional 8-byte load reads one field
-                                // plus half of the next and calls the result a
-                                // pointer. Every compact reference field then
-                                // traces to garbage — silently refused by the
-                                // registry/`is_in_heap` screen, so nothing
-                                // looks wrong — and the real referent is never
-                                // traced at all: a live object collected.
-                                //
-                                // It was LATENT, never live, and only because
-                                // of a gate in another crate:
-                                // `vm/src/vm/vm_init.rs` (the
-                                // `gc_backend != GcBackend::Generational`
-                                // branch, ~line 1397) refuses compressed oops
-                                // for every backend except `Generational`, so
-                                // ZGC has never seen a narrow slot. THAT GATE
-                                // MUST NOT BE RELAXED PER-BACKEND WITHOUT
-                                // AUDITING EVERY REFERENCE-SLOT READ IN THE
-                                // COLLECTOR BEING ENABLED. `gc/src/g1.rs` was
-                                // audited on 2026-08-07 and still carries the
-                                // same wide-read pattern, held off by the same
-                                // gate; `gen_heap.rs`, the one collector the
-                                // gate admits, is clean.
-                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
-                                let raw =
-                                    unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
-                                if raw != 0 {
-                                    work.push(raw as usize);
-                                }
-                            }
-                        },
-                    );
-                } else {
-                    // The legacy arm is NOT narrow-oop territory and must not be
-                    // "fixed" to match the compact arm above. A legacy field is a
-                    // whole 16-byte `Value` cell (`SLOT_SIZE`, heap_types.rs:171)
-                    // whose object payload is an 8-byte raw pointer at
-                    // `FIELD_CELL_PAYLOAD64_OFFSET` (heap_types.rs:230). Both are
-                    // plain constants: neither narrows when compressed oops are
-                    // on, so the widths here are already right in both configs.
-                    let n = header.num_slots() as usize;
-                    for i in 0..n {
-                        if skip_index == Some(i) {
-                            continue;
-                        }
-                        // SAFETY: i < num_slots so the slot is within the object.
-                        let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
-                        let val = unsafe { std::ptr::read(slot as *const Value) };
-                        if let Value::Object(Some(r)) = val {
-                            work.push(r.as_ptr() as usize);
-                        }
-                    }
-                }
-            }
-            ObjectKind::Array => {
-                if header.element_type() == ArrayElementType::Reference {
-                    let len = header.array_length() as usize;
-                    // This arm was ALREADY narrow-correct and is deliberately
-                    // left calling `read_prim_element`: its `Reference` case
-                    // (gc/src/heap.rs, `ArrayElementType::Reference`) strides by
-                    // `cratonvm_types::ref_element_size()` and loads through
-                    // `narrow_oop::read_ref_slot`, exactly like the two sibling
-                    // walkers in this file. The SAFETY note here used to cite
-                    // `REF_ELEMENT_SIZE` (heap_types.rs:176) as the stride; that
-                    // is the WIDE 8-byte constant and is the wrong stride under
-                    // narrow oops, so do not reintroduce it — the code was
-                    // right, only the comment was.
-                    //
-                    // SAFETY: data area begins at base + ARRAY_DATA_OFFSET; each
-                    // ref element is `ref_element_size()` bytes and `i < len`.
-                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
-                    for i in 0..len {
-                        let val =
-                            unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
-                        if let Value::Object(Some(r)) = val {
-                            work.push(r.as_ptr() as usize);
-                        }
-                    }
-                }
-                // Primitive arrays have no out-edges.
-            }
-            ObjectKind::HumongousFiller => {}
-        }
+        // ONE implementation, not two. Until 2026-08-26 this function and
+        // `visit_strong_refs_at` were separate copies of the same walk, and the
+        // copies had drifted: this one still transmuted a whole `Value` out of
+        // each legacy cell, still had no `num_slots` screen, still ran an array
+        // element through `read_prim_element`'s null-degrade, and still dropped
+        // an unresolvable compact object's out-edges in silence — four defects
+        // its twin had already been fixed for.
+        //
+        // The fork's stated justification was SHAPE: this one fills a
+        // `&mut Vec<usize>` while `mark::ZMarkContext::visit_refs` needs a
+        // `&mut dyn FnMut(u64)` so the engine can push into its own striped
+        // work-stealing stack, and funnelling that through a `Vec` would
+        // allocate per object on every mark worker. That is a real constraint
+        // and it is satisfied here: the callback form is the implementation and
+        // the `Vec` form is this closure, which allocates nothing.
+        //
+        // The screens are the same screen. `visit_strong_refs_at` reads
+        // `num_slots > (1 << 24)` on the legacy arm, `with_class_layout(..)
+        // .is_some()` on the compact arm, and deliberately screens the array arm
+        // not at all; this function was brought to exactly those three rather
+        // than to the stronger `Self::alloc_size`, because `alloc_size` refuses
+        // an array past `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28) while `alloc_array`
+        // admits up to `i32::MAX` — and for a MARKER, refusing a legal array is
+        // a live object collected. Same screen, same reads, so the merge changes
+        // no behaviour on either path.
+        self.visit_strong_refs_at(base, skip_index, &mut |raw| work.push(raw as usize));
     }
 
     /// Bounds-and-sanity check shared by `get_field`/`set_field`. Returns the
@@ -8708,9 +8663,10 @@ impl ZgcRealHeap {
 
     /// Report every **strong** reference out-edge of the object at `base`.
     ///
-    /// # This is a FORK of [`Self::enumerate_references`], and why
+    /// # This WAS a fork of [`Self::enumerate_references`]; it is now the shared
+    /// implementation of both
     ///
-    /// It is not a wrapper for two reasons, one of shape and one historical:
+    /// It was not a wrapper for two reasons, one of shape and one historical:
     ///
     /// * **Shape.** `enumerate_references` pushes into a `&mut Vec<usize>`;
     ///   [`mark::ZMarkContext::visit_refs`] hands each child to a
@@ -8735,6 +8691,35 @@ impl ZgcRealHeap {
     ///   `narrow_oop::read_ref_slot` load this fork does, so the two arms agree
     ///   and this bullet records why the fork exists, not a live divergence.
     ///
+    /// # The fork is GONE (2026-08-26). This body is the only copy.
+    ///
+    /// Only the shape bullet above ever survived scrutiny, and it is one closure
+    /// wide: [`ZgcRealHeap::enumerate_references`] is now
+    /// `self.visit_strong_refs_at(base, skip_index, &mut |raw| work.push(raw as usize))`,
+    /// which satisfies the `Vec`-versus-`FnMut` constraint without allocating.
+    ///
+    /// **The screens are the same screen, and that is what made the merge safe.**
+    /// An earlier draft had `enumerate_references` screening with
+    /// [`ZgcRealHeap::alloc_size`], which is stronger, and unifying onto it would
+    /// have been a REGRESSION rather than a hardening: `alloc_size` refuses an
+    /// array past `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28 elements) while `alloc_array`
+    /// admits up to `ZGC_REAL_MAX_ARRAY_LENGTH` (`i32::MAX`), so a legal
+    /// reference array between those bounds would have had its elements left
+    /// untraced — a live object collected. `MAX_PLAUSIBLE_ARRAY_LEN`'s own doc
+    /// states the trade; it is right for the SWEEP that reads it, where refusing
+    /// means "do not free", and wrong for a MARKER, where it means "do not
+    /// trace". So `enumerate_references` was brought DOWN to this function's
+    /// three screens — `num_slots > (1 << 24)` on the legacy arm,
+    /// `with_class_layout(..).is_some()` on the compact arm, and nothing at all
+    /// on the array arm — rather than this function being brought up to
+    /// `alloc_size`. `both_reference_enumerators_report_the_same_edges_for_every
+    /// _header_shape` is the test that keeps them one walk.
+    ///
+    /// The third fork, `census::reference_slots`, is a different matter and
+    /// stays: it keeps nulls, reports every slot with its tag whatever the tag
+    /// is, and has no `skip_index`, because it counts SLOTS rather than edges.
+    /// Merging it would make the marker carry census metadata per slot.
+    ///
     /// The legacy arm also differs deliberately: it reads the cell's `u32` tag
     /// and `u64` payload directly instead of `std::ptr::read`ing a whole
     /// [`Value`]. A concurrent marker races a mutator's field store, and
@@ -8744,6 +8729,32 @@ impl ZgcRealHeap {
     /// way — a torn cell yields an implausible address, which
     /// [`mark::ZMarkContext::is_in_heap`] then refuses like any other wild
     /// child. This is the same reason the census reads slots raw.
+    ///
+    /// # What the merge cost, measured
+    ///
+    /// The concern that deferred this work for two days was that hardening
+    /// `enumerate_references` would mean `heap::read_value_cell_checked`'s
+    /// ATOMIC 16-byte load on every legacy slot of the default collector's mark
+    /// path. It does not: this read is a 4-byte tag load and a compare, and it
+    /// skips the 8-byte payload load entirely when the tag is not
+    /// `VTAG_OBJECT`, so it is strictly less work than the
+    /// `std::ptr::read::<Value>` it replaced.
+    ///
+    /// Measured anyway, because a structural argument is not a number.
+    /// `RMapGcStress` under ZGC at `--Xmx 64m` (34-35 real collections per run,
+    /// so the walk is engaged), 7 interleaved pairs, priced in CPU time:
+    ///
+    /// * median paired difference **-0.58 s on ~21.8 s (-2.6%)**, after faster
+    ///   in **4 of 7 pairs** — a coin flip.
+    /// * within-arm spread **1.57x** (20.88 s to 32.67 s on the BEFORE arm).
+    ///
+    /// So: **no measurable difference.** The spread means this resolves about
+    /// +/-10%, which is enough to rule out the per-slot atomic that was feared
+    /// and NOT enough to claim the change is faster. Do not quote the -2.6% as a
+    /// speedup; it is noise with a sign.
+    ///
+    /// The BEFORE arm was built at the same base with only this function
+    /// reverted, because a cross-base A/B is not an A/B.
     ///
     /// `skip_index` is the referent-slot hole: `Some(0)` for a registered
     /// `Weak`/`Soft`/`Phantom`/`Cleaner` `Reference` object, exactly as
@@ -8822,7 +8833,7 @@ impl ZgcRealHeap {
                         tracing::debug!(
                             target: "zgc",
                             num_slots = n,
-                            "zgc concurrent mark: suspect header, out-edges omitted"
+                            "zgc reference walk: suspect header, out-edges omitted"
                         );
                         return;
                     }
@@ -14696,6 +14707,123 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The two reference enumerators are ONE walk, and report the same edges.**
+    ///
+    /// `enumerate_references` and `visit_strong_refs_at` were separate copies of
+    /// the same walk until 2026-08-26, and the copies had drifted: one still
+    /// transmuted a whole `Value` out of each legacy cell, had no `num_slots`
+    /// screen, ran array elements through `read_prim_element`'s null-degrade,
+    /// and dropped an unresolvable compact object's edges in silence. They are
+    /// now one implementation with a closure for the shape difference.
+    ///
+    /// This asserts the property that makes the merge safe and keeps it safe:
+    /// for every header shape, both entry points report the SAME multiset of
+    /// out-edges. It is written against a matrix rather than one object because
+    /// the drift that made the merge necessary was per-ARM — the compact arm was
+    /// fixed in one copy and not the other, twice.
+    ///
+    /// It also pins the two screens, which are now the same screen: a legacy
+    /// header past `1 << 24` slots is refused, and an array length is NOT
+    /// screened at all. The second is deliberate and is the one an earlier draft
+    /// of this change got wrong — `alloc_size` refuses past
+    /// `MAX_PLAUSIBLE_ARRAY_LEN` (1<<28) while `alloc_array` admits up to
+    /// `i32::MAX`, and refusing a legal array in a MARKER is a live object
+    /// collected. `a_clobbered_array_length_is_refused_by_both_the_sizer_and_the
+    /// _walker` covers the sizer and the census, which are the consumers where
+    /// refusing IS right.
+    #[test]
+    fn both_reference_enumerators_report_the_same_edges_for_every_header_shape() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+
+        // Both entry points, over the same object, into comparable shapes.
+        let via_vec = |base: *mut u8, skip: Option<usize>| -> Vec<usize> {
+            let mut v = Vec::new();
+            heap.enumerate_references(base, &mut v, skip);
+            v.sort_unstable();
+            v
+        };
+        let via_callback = |base: *mut u8, skip: Option<usize>| -> Vec<usize> {
+            let mut v = Vec::new();
+            heap.visit_strong_refs_at(base, skip, &mut |raw| v.push(raw as usize));
+            v.sort_unstable();
+            v
+        };
+        let agree = |base: *mut u8, skip: Option<usize>, label: &str| -> Vec<usize> {
+            let a = via_vec(base, skip);
+            let b = via_callback(base, skip);
+            assert_eq!(a, b, "{label}: the two enumerators disagree");
+            a
+        };
+
+        // --- legacy object, reference cells ---------------------------------
+        let target_a = heap.alloc_object(ClassId::new(9), 0);
+        let target_b = heap.alloc_object(ClassId::new(9), 0);
+        let legacy = heap.alloc_object(ClassId::new(1), 3);
+        heap.set_field(legacy, 0, Value::Object(Some(target_a)));
+        heap.set_field(legacy, 1, Value::Int(7)); // not an edge
+        heap.set_field(legacy, 2, Value::Object(Some(target_b)));
+        let mut want = vec![target_a.as_ptr() as usize, target_b.as_ptr() as usize];
+        want.sort_unstable();
+        assert_eq!(
+            agree(legacy.as_ptr(), None, "legacy object"),
+            want,
+            "a legacy object must report exactly its non-null reference cells — the              `Value::Int` cell is not an edge and must not be one"
+        );
+
+        // `skip_index` is the `java.lang.ref.Reference` referent hole.
+        assert_eq!(
+            agree(legacy.as_ptr(), Some(0), "legacy object, skip_index"),
+            vec![target_b.as_ptr() as usize],
+            "skip_index must hide exactly the slot it names"
+        );
+
+        // --- legacy object with an implausible slot count --------------------
+        // The one screen both arms share. Clobbered and restored, because the
+        // sweep sizes this object when the heap drops.
+        let saved = unsafe { (*(legacy.as_ptr() as *const ObjectHeader)).num_slots() };
+        unsafe {
+            (*(legacy.as_ptr() as *mut ObjectHeader)).set_num_slots((1 << 24) + 1);
+        }
+        assert!(
+            agree(legacy.as_ptr(), None, "legacy object, clobbered num_slots").is_empty(),
+            "a header claiming more than 1<<24 slots must be refused, not strided —              that walk leaves the arena"
+        );
+        unsafe {
+            (*(legacy.as_ptr() as *mut ObjectHeader)).set_num_slots(saved);
+        }
+        assert_eq!(
+            agree(legacy.as_ptr(), None, "legacy object, restored").len(),
+            2,
+            "and restoring the count must restore the edges, or the fixture proved              nothing about the screen"
+        );
+
+        // --- reference array -------------------------------------------------
+        let arr = heap.alloc_array(ClassId::new(2), ArrayElementType::Reference, 3);
+        heap.set_array_element(arr, 0, Value::Object(Some(target_a)))
+            .expect("in-bounds store");
+        heap.set_array_element(arr, 2, Value::Object(Some(target_b)))
+            .expect("in-bounds store");
+        assert_eq!(
+            agree(arr.as_ptr(), None, "reference array"),
+            want,
+            "a reference array must report its non-null elements; the untouched              element is null and is not an edge"
+        );
+
+        // --- primitive array: no out-edges ------------------------------------
+        let prim = heap.alloc_array(ClassId::new(3), ArrayElementType::Int, 8);
+        assert!(
+            agree(prim.as_ptr(), None, "primitive array").is_empty(),
+            "a primitive array has no reference elements to report"
+        );
+
+        // --- an object with no reference fields --------------------------------
+        let empty = heap.alloc_object(ClassId::new(4), 0);
+        assert!(
+            agree(empty.as_ptr(), None, "zero-slot object").is_empty(),
+            "a zero-slot object has no out-edges"
+        );
+    }
+
     /// `object_body_size` answers `IMPLAUSIBLE_BODY_SIZE` (1 TiB) — not `0` —
     /// for a `GC_FLAG_COMPACT` object whose `(class_id, num_slots)` no longer
     /// resolves to a registered layout (a class unloaded by
@@ -17921,120 +18049,33 @@ pub(crate) mod tests {
         );
     }
 
-    /// **Arming the read barrier reaches the JIT's codegen gate.**
-    ///
-    /// The barrier tests above all sit inside this crate, and every one of
-    /// them would pass while JIT-compiled code went on emitting raw inline
-    /// reference loads over coloured slots -- which is a use-after-free, not a
-    /// missed optimisation. This asserts the one fact that connects the two:
-    /// `set_barrier_color` publishes to `cratonvm_types`, which is what
-    /// `x64::zgc_read_barrier_blocks_inline_fields` reads.
-    ///
-    /// Serialised, because the flag is process-wide by design (see its doc for
-    /// why the JIT cannot read a per-heap one).
-    #[test]
-    fn arming_the_read_barrier_sets_the_process_wide_codegen_gate() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        assert!(
-            !cratonvm_types::zgc_read_barrier_armed(),
-            "the codegen gate must start closed"
-        );
+    // MOVED 2026-08-26 -> `gc/tests/published_bounds_isolation.rs`:
+    //   arming_the_read_barrier_sets_the_process_wide_codegen_gate
+    //   arming_the_read_barrier_empties_the_jit_read_bounds_table
+    //   the_read_bounds_kill_switch_suppresses_the_publish
+    //   a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage
+    //
+    // All four observe or perturb a process-global table (`JIT_READ_BOUNDS`,
+    // `MOVABLE_BOUNDS`, or the `zgc_read_barrier_armed` codegen gate). This
+    // binary constructs 226 heaps across ~1690 tests on a thread per core, and
+    // every construction publishes while every `Drop` clears, so an absolute
+    // read of one of those tables is a value a peer can replace between two
+    // lines. Measured at 6 failures in 10 runs; a shared test mutex did NOT fix
+    // it (12 in 20), because the peers are the ~220 constructions that have
+    // nothing to do with these tables. An integration-test file gets its own
+    // process, which does.
+    //
+    // Two of them also WROTE the tables (`publish_movable_bounds(0xdead_0000..)`
+    // and `clear_jit_read_bounds()`), so they were a cause of other tests'
+    // failures as well as a victim. That is why
+    // `a_compiled_frame_forbids_relocation_only_when_its_coverage_is_unproven`
+    // below needed no change: with those gone, nothing in this binary clears
+    // `MOVABLE_BOUNDS` any more.
 
-        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
-        let armed = cratonvm_types::zgc_read_barrier_armed();
-        heap.set_barrier_color(None);
-        let disarmed = cratonvm_types::zgc_read_barrier_armed();
 
-        assert!(
-            armed,
-            "arming must reach the codegen gate, or the JIT keeps emitting raw              inline loads over coloured slots"
-        );
-        assert!(!disarmed, "and disarming must let the inline arms back on");
-    }
 
-    /// **Arming the read barrier EMPTIES the JIT's read-bounds table, and
-    /// disarming refills it.**
-    ///
-    /// The sibling test above covers the emission-time gate, which only
-    /// governs methods compiled from that moment on. A method compiled while
-    /// the barrier was disarmed already contains a guarded inline reference
-    /// load, and that sequence tests `JIT_READ_BOUNDS` at RUNTIME on every
-    /// execution -- so an empty table is the only thing that can stop it.
-    /// Before ZGC published anything the question did not arise; now that it
-    /// does, this is the assertion that keeps `zgc_codegen_honours_read_
-    /// barrier()` honest.
-    ///
-    /// Verified by BREAKING it: deleting the `clear_jit_read_bounds()` call in
-    /// `set_barrier_color` leaves `armed_lo` non-zero and fails here.
-    #[test]
-    fn arming_the_read_barrier_empties_the_jit_read_bounds_table() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        let heap = ZgcRealHeap::with_capacity(64 * 1024);
-        let (lo, hi) = heap.conservative_addr_span().expect("one arena");
 
-        let published_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let published_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
 
-        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
-        let armed_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let armed_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
-
-        heap.set_barrier_color(None);
-        let refilled_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
-        let refilled_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
-
-        assert_eq!(
-            (published_lo, published_hi),
-            (lo, hi),
-            "construction must publish this heap's arena envelope, or the                inline getfield arm stays unreachable under the default collector"
-        );
-        assert_eq!(
-            (armed_lo, armed_hi),
-            (0, 0),
-            "arming must EMPTY the table -- an emission-time gate cannot reach                a sequence that is already compiled"
-        );
-        assert_eq!(
-            (refilled_lo, refilled_hi),
-            (lo, hi),
-            "and disarming must refill it, or one cycle would cost every later                read the helper for the life of the process"
-        );
-
-        drop(heap);
-        assert_eq!(
-            crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire),
-            0,
-            "a dropped heap must not leave bounds naming a freed arena"
-        );
-    }
-
-    /// The kill switch is real: with `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` set,
-    /// construction publishes nothing and the collector is back to the
-    /// helper-only reads it had before 2026-08-19.
-    ///
-    /// This is the A/B arm every measurement on this change is quoted against,
-    /// so it is worth a test rather than a claim -- a kill switch that gates
-    /// the read but not the write reports itself off while doing the work.
-    #[test]
-    fn the_read_bounds_kill_switch_suppresses_the_publish() {
-        let _serialise = OVERLAY_TEST_LOCK.lock();
-        crate::gen_heap::clear_jit_read_bounds();
-        let published = cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_ZGC_NO_JIT_READ_BOUNDS", Some("1"))],
-            || {
-                // `zgc_jit_read_bounds_enabled` memoises in a `OnceLock`, so a
-                // second test in the same process cannot re-decide it. Ask the
-                // predicate through the same override rather than building a
-                // heap, and assert the publish call is the ONLY thing it gates.
-                cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_READ_BOUNDS")
-                    .is_none()
-            },
-        );
-        assert!(
-            !published,
-            "CRATONVM_ZGC_NO_JIT_READ_BOUNDS must read as 'do not publish'"
-        );
-    }
 
     /// Compaction is **on by default** as of 2026-08-13, with
     /// `CRATONVM_ZGC_RELOCATE=0` as the kill switch.
@@ -18517,76 +18558,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A heap that publishes no movable bounds cannot prove coverage.**
-    ///
-    /// The verifier classifies a frame word as relocatable with
-    /// `gen_heap::addr_is_movable`. Where no collector has published a range,
-    /// that answers `false` for every address in the process, so the scan
-    /// inspects every slot, classifies none, and returns "nothing unpublished"
-    /// having verified nothing — and a refusal built on the verdict then
-    /// relocates on a proof nobody ran. That is exactly how the first version
-    /// of `relocate_stw`'s per-cycle refusal was unsound, and
-    /// `movable_bounds_are_live` is the gate that makes it fail closed instead.
-    ///
-    /// Asserted here rather than only in `conservative_roots` because this is
-    /// the collector that depends on it: ZGC fills `MOVABLE_BOUNDS` at
-    /// construction precisely so its verdict is earned.
-    #[test]
-    fn a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage() {
-        // An empty table matches nothing. Pure function of the table, so no
-        // other test can perturb this half.
-        assert!(
-            !crate::gen_heap::addr_in_movable_bounds(0),
-            "address 0 must never be inside a published range"
-        );
 
-        // Constructing a ZGC heap must publish its envelope. Read slot 0 back
-        // IMMEDIATELY and keep the value: these tables are process-global and
-        // the gc unit tests run in parallel threads, so a peer test's heap can
-        // take the slot at any point after this. Asserting against the live
-        // table later is how this test failed on its first run -- which is
-        // exactly the hazard `ZgcRealHeap::drop` is now owner-checked for, so
-        // the flake was the finding.
-        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
-        let obj = heap.alloc_object(ClassId::new(1), 2);
-        let published_base =
-            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire);
-        let published_end =
-            crate::gen_heap::MOVABLE_BOUNDS.words[1].load(Ordering::Acquire);
-        assert!(
-            crate::gen_heap::movable_bounds_published(),
-            "ZgcRealHeap::with_capacity must publish its arena envelope, or the              frame-band verifier is vacuous on this collector and every coverage              verdict it produces is unearned"
-        );
-
-        // The envelope this heap published must cover an object it allocated.
-        // Guarded on still owning the slot: if a peer test replaced it between
-        // the two reads, the strong claim is about the peer's heap and skipping
-        // it is honest. `heap.conservative_addr_span()` is this heap's own
-        // envelope, so the comparison does not consult the shared table twice.
-        if let Some((base, end)) = heap.conservative_addr_span() {
-            if published_base == base && published_end == end {
-                assert!(
-                    crate::gen_heap::addr_is_movable(obj.as_ptr() as usize),
-                    "an object this heap just allocated is not inside the movable                      bounds it published -- the verifier would classify it as                      immovable and skip it"
-                );
-            }
-            assert!(
-                obj.as_ptr() as usize >= base && (obj.as_ptr() as usize) < end,
-                "the envelope this heap publishes does not contain its own                  allocations, so publishing it cannot help any verifier"
-            );
-        }
-
-        // Teardown is OWNER-CHECKED: dropping a heap that no longer owns slot 0
-        // must leave the current publisher's bounds alone.
-        crate::gen_heap::publish_movable_bounds(0, 0xdead_0000, 0xdead_1000);
-        drop(heap);
-        assert_eq!(
-            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire),
-            0xdead_0000,
-            "a dropped heap wiped movable bounds it did not publish -- which is              how a short-lived heap makes a LIVE heap's verifier vacuous"
-        );
-        crate::gen_heap::clear_movable_bounds();
-    }
 
     /// **A `Reference` the collector moved must be findable at its NEW
     /// address in the reference processor's own tables.**

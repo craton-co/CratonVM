@@ -469,10 +469,56 @@ cursor tolerated that; the real one reads it as an int and compares it to
 
 A values view hands out an `ArrayList$Itr`, the same class an ordinary list
 does, so a class-name allow-list cannot separate the two cases. **The enabling
-change is to mint a distinct iterator class for view carriers** (the
-`VALUES_ITR_CARRIERS` machinery already exists for the values families) so that
-`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its
-own. Do that and this 6.2× is available.
+change is to mint a distinct iterator class for view carriers** so that
+`java/util/ArrayList$Itr` means "a real list" and can be allow-listed on its own.
+
+**CENSUSED 2026-08-24, and it is two receivers, not a family of them.**
+`probes/ItrClassProbe` (new) prints `iterator().getClass().getName()` for 35
+receivers. Almost everything already has its own cursor — every map view of
+`HashMap`, `LinkedHashMap`, `TreeMap` and `Hashtable`, plus sublists,
+`Arrays.asList`, COW and `LinkedList`. Only six land on the shared
+`ArrayList$Itr`, and four of those are fine:
+
+| receiver | CratonVM | verdict |
+|---|---|---|
+| `arrayList` | `ArrayList$Itr` | correct — a real list |
+| `synchList` | `ArrayList$Itr` | **safe**, and matches HotSpot: `SynchronizedCollection.iterator()` returns the backing list's own |
+| `vector`, `stack` | `ArrayList$Itr` | **safe** for this purpose — `Vector` extends `AbstractList`, so it HAS a `modCount` (HotSpot says `Vector$Itr`; a separate, cosmetic divergence) |
+| `chm.values` | `ArrayList$Itr` | **BLOCKER** — `ConcurrentHashMap$ValuesView` extends `CollectionView`/`AbstractCollection`, no `modCount` |
+| `priorityQueue` | `ArrayList$Itr` | **BLOCKER** — `PriorityQueue` extends `AbstractQueue`/`AbstractCollection`, no `modCount` |
+
+**ATTEMPTED 2026-08-27. One of the two was right, the other was wrong, and the
+yield is STILL NOT SAFE — for a reason that invalidates the criterion I was
+using.**
+
+* `ConcurrentHashMap$ValuesView → ConcurrentHashMap$ValueIterator` **landed**.
+  A HotSpot-parity fix on its own: census divergences go 21 → 20 of 66, and the
+  one row that changes is exactly that one.
+* **`PriorityQueue` was never a blocker**, and adding it would have
+  reintroduced a known bug. `native_pq_iterator` deliberately returns an
+  `ArrayList$Itr` over an ArrayList-shaped **wrapper** holding a heap-order
+  snapshot, so its `this$0` IS a genuine `ArrayList` with a real `modCount`.
+  Its own comment records what minting a real `PriorityQueue$Itr` did: slot 0
+  is `cursor:int`, so the snapshot array stored there was coerced away and
+  iteration saw zero elements. The entry was written, caught, and removed.
+
+**And the yield still throws.** With `ArrayList$Itr` retagged, `IdentityHashMap`'s
+values view throws a spurious `ConcurrentModificationException` from
+`checkForComodification`. `ItrClassProbe` says `idm.values` mints its own
+`IdentityHashMap$ValueIterator`, matching HotSpot — and it reached
+`ArrayList$Itr` anyway.
+
+**So a class-name census is NOT a sufficient safety criterion**, which is the
+real result of this attempt. The class a receiver mints *in isolation* is not
+the class it reaches the `al_itr_*` natives with; a hoisted view that is
+resynced, or reached through a `Collection`-typed parameter, can arrive on the
+shared class regardless. Any future attempt needs a runtime assertion — refuse
+the yield unless the iterator's `this$0` actually has a `modCount` — not a
+static list of receivers.
+
+The prize is unchanged and still measured: **6.2× on `iterList`** (944/972/965 →
+150/159/153, one binary, controls flat) plus the `cmeClear` fail-fast fix. What
+it needs is a receiver-shape check at the point of dispatch.
 
 **A coverage note worth acting on independently:** `regression-suite/run.sh`
 passed **72/72 on the broken binary**. A change that makes

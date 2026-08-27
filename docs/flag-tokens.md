@@ -59,12 +59,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-492 tokens.
+493 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
 | `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
+| `ffm` | `CRATONVM_DBG_FFM` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
@@ -558,7 +559,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-230 tokens.
+233 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -721,6 +722,7 @@ export inherited from a parent shell.
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
+| `ffm-intrinsic` | `CRATONVM_JIT_NO_FFM_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
@@ -765,6 +767,7 @@ export inherited from a parent shell.
 | `receiver-despec` | `CRATONVM_JIT_RECEIVER_DESPEC` |
 | `despec-spare-factor` | `CRATONVM_JIT_DESPEC_SPARE_FACTOR` |
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
+| `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -783,6 +786,7 @@ export inherited from a parent shell.
 | `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
 | `lambda-capture-adapter` | `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` |
 | `lambda-const-probe` | `CRATONVM_JIT_LAMBDA_CONST_PROBE` |
+| `fjp-subclass-blocklist` | `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
@@ -795,7 +799,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-76 tokens.
+77 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -835,6 +839,7 @@ export inherited from a parent shell.
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `band-map-liveness` | `CRATONVM_GC_NO_BAND_MAP_LIVENESS` |
 | `cm-id-pairing` | `CRATONVM_GC_NO_CM_ID_PAIRING` |
 | `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |

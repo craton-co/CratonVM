@@ -115,6 +115,52 @@ public class ItrYieldProbe {
         for (Iterator<String> i5 = m2.keySet().iterator(); i5.hasNext(); ) { if (i5.next().equals("k1")) i5.remove(); }
         p("keysRmWriteThrough", m2.toString());
 
+        // ---- every receiver still on the SHARED ArrayList$Itr ----
+        // `probes/ItrClassProbe` says these four still mint `ArrayList$Itr`.
+        // Each is only safe because its `this$0` has a real `modCount`, and
+        // that is precisely what the real `checkForComodification` reads --
+        // so each gets an iterate row AND a fail-fast row here.
+        List<String> vec = new Vector<>(mk(3));
+        p("vector", String.join(",", vec));
+        ex("vectorCme", () -> { List<String> l = new Vector<>(mk(3)); for (String x : l) l.add("q"); });
+        Stack<String> st = new Stack<>(); st.push("a"); st.push("b");
+        p("stack", String.join(",", st));
+        ex("stackCme", () -> { Stack<String> l = new Stack<>(); l.push("a"); l.push("b"); for (String x : l) l.push("q"); });
+        List<String> syn = Collections.synchronizedList(mk(3));
+        p("synchList", String.join(",", syn));
+        ex("synchListCme", () -> { List<String> l = Collections.synchronizedList(mk(3)); for (String x : l) l.add("q"); });
+        // PriorityQueue. CratonVM iterates a heap-order SNAPSHOT wrapper, so a
+        // mutation mid-iteration does NOT throw; HotSpot's real
+        // `PriorityQueue$Itr` keeps an `expectedModCount` and DOES. That makes
+        // `pqSnapshot` a KNOWN PRE-EXISTING DIVERGENCE -- it reads the same on
+        // both arms of `CRATONVM_ITR_BYTECODE`, so it is not the yield's doing,
+        // and it is the only row on this probe the yield does not fix or match.
+        // Left failing deliberately rather than asserted away: it is a real
+        // fail-fast gap and the probe is where it should be visible.
+        PriorityQueue<String> pq = new PriorityQueue<>(mk(4));
+        int pqSeen = 0; for (String x : pq) pqSeen++;
+        p("pqCount", pqSeen);
+        p("pqPoll", pq.poll());
+        ex("pqSnapshot", () -> { PriorityQueue<String> q = new PriorityQueue<>(mk(3)); for (String x : q) q.add("q"); });
+
+        // ---- ConcurrentHashMap views (its values view got its own cursor) ----
+        Map<String,String> chm = new java.util.concurrent.ConcurrentHashMap<>();
+        for (int i = 0; i < 3; i++) chm.put("k"+i, "v"+i);
+        List<String> cv = new ArrayList<>(); for (String v : chm.values()) cv.add(v);
+        Collections.sort(cv); p("chmValues", cv);
+        List<String> ck = new ArrayList<>(); for (String kk : chm.keySet()) ck.add(kk);
+        Collections.sort(ck); p("chmKeys", ck);
+        // CHM is weakly consistent: mutating mid-iteration must NOT throw
+        ex("chmNoCme", () -> { Map<String,String> c = new java.util.concurrent.ConcurrentHashMap<>(chm); for (String v : c.values()) c.put("n","n"); });
+        p("chmValuesAfterPut", chm.values().size());
+
+        // ---- Hashtable views ----
+        Hashtable<String,String> ht = new Hashtable<>();
+        for (int i = 0; i < 3; i++) ht.put("k"+i, "v"+i);
+        List<String> hv = new ArrayList<>(); for (String v : ht.values()) hv.add(v);
+        Collections.sort(hv); p("htValues", hv);
+        ex("htCme", () -> { Hashtable<String,String> h = new Hashtable<>(ht); for (String v : h.values()) h.put("n","n"); });
+
         // ---- copy constructors / toArray go through the same cursors ----
         p("copyList", new ArrayList<>(mk(3)));
         p("copySet", new LinkedHashSet<>(mk(3)).size());
