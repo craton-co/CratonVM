@@ -4154,6 +4154,7 @@ fn native_wildfly_security_manager_get_property_privileged(
 /// sites here; `docs/security/capability-wiring.md` records which of the audit
 /// rows in `docs/security/native-capabilities.md` they close.
 pub mod capability_gate;
+pub mod ffm_fast;
 pub mod case_map;
 /// Descriptor-safe instance-field readers.
 ///
@@ -10445,9 +10446,19 @@ pub fn register_essential_natives_with_shims(
         "getProperty",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
+            // `System.getProperty(null)` throws NPE; it does not answer null.
+            // Answering null turned a caller's programming error into a silent
+            // "property not set", which is the failure this whole override
+            // exists to avoid on the OTHER side. MEASURED against HotSpot
+            // 25.0.3+9, `probes/IoSystemSweep.java`, both modes.
             let key_obj = match args.first() {
                 Some(Value::Object(Some(k))) => *k,
-                _ => return Ok(Some(Value::Object(None))),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("key can't be null".to_string()),
+                    }
+                    .into())
+                }
             };
             let key = property_key_from_java_string(ctx, key_obj);
             match ctx

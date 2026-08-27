@@ -23490,64 +23490,22 @@ mod conservative_narrow_scan_tests {
 
 #[cfg(test)]
 mod published_bounds_ownership {
-    use super::*;
-
-    /// A heap that is NOT the current publisher must not clear the tables on
-    /// its way out.
-    ///
-    /// `JIT_REGION_BOUNDS` is process-global with one writer and last-writer
-    /// wins, so the publisher is whichever heap was constructed most recently.
-    /// `Drop` used to clear unconditionally, which meant an earlier heap going
-    /// away wiped the bounds a LATER, still-live heap had published.
-    ///
-    /// That was tolerable while the only reader was the inline getfield fast
-    /// path, where an empty table costs a slower helper call. It is not
-    /// tolerable now: `addr_in_published_young_regions` reads the same table to
-    /// decide whether a word is young, and the moving-young frame-band verifier
-    /// asks exactly that. An empty table makes the verifier answer "nothing
-    /// unpublished" for every frame — a VACUOUS pass.
-    ///
-    /// NOTE what this does NOT fix: constructing a second heap still overwrites
-    /// the first's entry, because publication is last-writer-wins and there is
-    /// no registry of live heaps. A process holding two generational heaps at
-    /// once still has one of them unrepresented in the table. The fail-closed
-    /// guard in `conservative_roots::moving_young_unpublished_frame_oop_present`
-    /// is what keeps that from being read as good news.
-    #[test]
-    fn a_non_publishing_heap_does_not_clear_the_publishers_bounds() {
-        let early = GenerationalHeap::with_capacity(1024 * 1024);
-        let late = GenerationalHeap::with_capacity(4 * 1024 * 1024);
-        let late_base = late.young_from.lock().base_ptr() as usize;
-        assert_eq!(
-            JIT_REGION_BOUNDS.words[0].load(Ordering::Acquire),
-            late_base,
-            "last writer wins: the later heap is the publisher"
-        );
-
-        drop(early);
-
-        assert!(
-            published_young_regions_are_live(),
-            "the non-publisher must not wipe the publisher's bounds"
-        );
-        assert_eq!(
-            JIT_REGION_BOUNDS.words[0].load(Ordering::Acquire),
-            late_base,
-            "and the table must still name the publisher's young-from arena"
-        );
-        drop(late);
-    }
-
-    /// The publisher still clears on the way out: the tables must never name a
-    /// freed arena, which is the safety property the unconditional clear had.
-    #[test]
-    fn the_publishing_heap_still_clears_its_own_bounds_on_drop() {
-        let heap = GenerationalHeap::with_capacity(4 * 1024 * 1024);
-        assert!(published_young_regions_are_live());
-        drop(heap);
-        assert!(
-            !published_young_regions_are_live(),
-            "the publisher must clear on drop, or the table names a freed arena"
-        );
-    }
+    //! **MOVED 2026-08-26 to `gc/tests/published_bounds_isolation.rs`.**
+    //!
+    //! Both tests that lived here read `JIT_REGION_BOUNDS`, which is
+    //! process-global and last-writer-wins. The lib test binary constructs 226
+    //! heaps across ~1690 tests on a thread per core, so any peer construction
+    //! could replace the slot between two lines of either test. Measured: 6
+    //! failures in 10 runs of `cargo test -p cratonvm-gc --release --lib`, and a
+    //! shared test mutex did NOT fix it (12 in 20) because the peers are the
+    //! ~220 heap constructions that have nothing to do with these tables.
+    //!
+    //! Cargo gives an integration-test file its own process, which is the only
+    //! mechanism that actually removes those writers. The tests are unchanged in
+    //! what they assert; they reach the publisher's base by reading the slot
+    //! back after construction instead of through the private `young_from`
+    //! field, which needs no crate-internal access.
+    //!
+    //! Anything added here that reads one of these tables belongs in that file
+    //! instead.
 }

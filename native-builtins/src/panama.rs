@@ -4573,6 +4573,30 @@ fn pe_segment_access_addr(
     }
 }
 
+/// Publish an FFM fast-path verdict for `seg` — see [`crate::ffm_fast`].
+///
+/// Called only where [`pe_segment_access_addr`] has already returned a
+/// validated address, i.e. the scope was live, the shape resolved and the
+/// access was in bounds. This records THAT, and never the address or the size:
+/// the JIT re-reads those slots itself, so nothing here can go stale under a
+/// slot rewrite.
+///
+/// Gated to the plain SIX-slot CratonVM-minted native carrier, because that is
+/// the only shape whose `[0]=ptr, [1]=size, [5]=offset` decode the JIT can
+/// reproduce. The 8-slot heap-aliasing carrier keeps `ptr` at 0 and reuses
+/// slots 6/7, and the 2-/3-slot shapes have no slot 5 at all — publishing
+/// either would hand the JIT a decode that does not describe it.
+fn ffm_publish_verdict(ctx: &dyn NativeContext, seg: ObjectRef, write: bool) {
+    if ctx.object_num_fields(seg) != 6 {
+        return;
+    }
+    if crate::panama_libffi::is_real_heap_segment(ctx, seg) {
+        return;
+    }
+    crate::ffm_fast::note_validated(seg.as_ptr() as u64, write);
+    crate::ffm_fast::note_publish();
+}
+
 // Exact primitive/covariant descriptors used by real-JDK MemorySegment
 // default methods. They share the checked erased implementation above.
 fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4677,6 +4701,7 @@ fn pe_segment_get_impl(
     }
 
     let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *const u8;
+    ffm_publish_verdict(ctx, seg, false);
 
     // SAFETY: addr is non-null, bounds-checked against the segment's declared
     // size, and the address arithmetic was overflow-checked (see
@@ -4830,6 +4855,7 @@ fn pe_segment_set_impl(
     }
 
     let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *mut u8;
+    ffm_publish_verdict(ctx, seg, true);
 
     // SAFETY: addr is non-null, bounds-checked against the segment's declared
     // size, and the address arithmetic was overflow-checked (see
