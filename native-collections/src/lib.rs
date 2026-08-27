@@ -12250,9 +12250,17 @@ fn restore_map_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef, gen: Opti
 /// the keySet-view rebuild elision skip every resync for the life of the map.
 fn map_mod_count_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let class_id = ctx.class_id_of_object(this);
-    let nf = ctx.object_num_fields(this);
-    ctx.resolve_field_index_by_class_id(class_id, "modCount")
-        .filter(|slot| *slot < nf)
+    // Memoized per `(vm, class)`: the raw resolver hashes the name and walks
+    // the superclass chain under the class-manager read lock, and this now
+    // runs on the integer-overlay put -- which `jit_overlay_hashmap_put`
+    // reaches from compiled code, and whose whole reason to exist is that it
+    // touches nothing but a Rust side table. Same memo the iterator path has
+    // used for this question since perf/collections-classification-cost.
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let slot = MEMO.with(|t| memoized_field_slot(ctx, t, class_id, "modCount"))?;
+    (slot < ctx.object_num_fields(this)).then_some(slot)
 }
 
 /// Structural mutations that moved a readable `modCount`.
@@ -20140,37 +20148,23 @@ fn map_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<Objec
 
 /// `src`'s current modification generation, or `None` when it keeps none.
 fn map_itr_mod_count(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
-    // By SLOT when the class metadata can name one, and only then by name.
+    // By SLOT, memoized per class, and by nothing else.
     //
-    // `get_field_by_name` re-resolves the string on every call, and this runs
-    // once per `next()` — see the measurement on `memoized_field_slot`. The two
-    // forms can only disagree when two fields in one hierarchy share a name and
-    // the by-name resolver picks the other one; `modCount` is declared exactly
-    // once across the `java.util` map hierarchy (`HashMap`, and `Hashtable`'s
-    // own), so there is no second candidate to pick. The by-name arm stays as
-    // the fallback for a receiver whose class metadata has no such field at all
-    // — a fabricated map whose `modCount` lives in an overlay rather than in a
-    // declared slot — which is exactly the population that used to depend on it.
-    let cid = ctx.class_id_of_object(src);
-    thread_local! {
-        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    if let Some(slot) = MEMO.with(|t| memoized_field_slot(ctx, t, cid, "modCount")) {
-        if slot < ctx.object_num_fields(src) {
-            if let Value::Int(v) = ctx.get_field(src, slot) {
-                return Some(v);
-            }
-        }
-    }
-    // No unbounded by-name retry. `get_field_by_name` is the slot resolver
-    // WITHOUT the `object_num_fields` bound, so a receiver rejected above is
-    // rejected for having no such slot of its own -- and reading past its
-    // fields answered a constant no mutation could move.
-    // `bump_map_mod_count` refuses the same receivers through
-    // [`map_mod_count_slot`], and the two must agree: a reader that accepts
-    // what the writer cannot reach reports "unchanged" forever, which is
-    // precisely what [`view_source_generation`] must never be told.
-    None
+    // The by-name arm this replaced was described as "the fallback for a
+    // receiver whose class metadata has no such field at all -- a fabricated
+    // map whose `modCount` lives in an overlay rather than in a declared
+    // slot". There is no such overlay: `get_field_by_name` resolves through
+    // the SAME class metadata and then reads the SAME heap slot, without the
+    // `object_num_fields` bound. So for exactly the receivers it was said to
+    // rescue it read past their fields and answered a constant -- and a
+    // constant is what [`view_source_generation`] reads as "this map has not
+    // changed".
+    //
+    // So there is ONE implementation of "which slot is this receiver's
+    // generation", shared with `bump_map_mod_count` through
+    // [`map_mod_count_slot`]. The two must agree: a reader that accepts a slot
+    // the writer cannot reach reports "unchanged" forever.
+    read_map_mod_count(ctx, src)
 }
 
 /// The JDK's `expectedModCount = modCount` line — at mint, and again after a

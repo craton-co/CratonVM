@@ -4851,7 +4851,17 @@ fn reloc_emit_enabled() -> bool {
                 let offset_node = node.inputs[3];
                 let field_index = match self.graph.nodes[offset_node as usize].op {
                     Op::Const(v) => v,
-                    _ => 0,
+                    // Unreachable: `lower_inner` refuses a graph whose field
+                    // access has a non-constant offset. Kept loud in debug
+                    // rather than silently answering slot 0, which is a
+                    // different field and not a degraded one.
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "Op::Load reached lowering with a non-constant offset"
+                        );
+                        0
+                    }
                 };
                 // Guarded inline read of a compact field, with the checked
                 // helper as the slow path — the same trade the single-pass
@@ -4951,7 +4961,16 @@ fn reloc_emit_enabled() -> bool {
                 let value = node.inputs[4];
                 let field_index = match self.graph.nodes[offset_node as usize].op {
                     Op::Const(v) => v,
-                    _ => 0,
+                    // Unreachable — see the twin arm on `Op::Load`. A store is
+                    // the worse half: slot 0 is the likeliest reference slot,
+                    // and this arm writes a raw `Value::Int` cell over it.
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "Op::Store reached lowering with a non-constant offset"
+                        );
+                        0
+                    }
                 };
                 let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
@@ -9766,6 +9785,44 @@ pub(crate) fn lower_inner_with_scopes(
         })
     {
         return None;
+    }
+    // A field access whose offset input is not a `Const` has no field index to
+    // lower with, and both `Op::Load` and `Op::Store` used to substitute slot
+    // **0** for one, silently. That is not a degraded lowering, it is a
+    // different field: a read of somebody else's value, or a write that
+    // destroys one. Slot 0 is also the likeliest slot to be a live reference,
+    // so the int store's inline three-word cell write would leave a
+    // primitive standing where the class declares a pointer -- the G30-1
+    // species, and exactly the shape
+    // `docs/known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-*`
+    // is about (`SQLChar.rawData`, declared `[C`, found holding `Int(1)`).
+    //
+    // The builder emits a `Const` for every field access it constructs today,
+    // so this refuses nothing that currently compiles. It is here because the
+    // failure it prevents is silent, survives the store, and surfaces as a
+    // SIGSEGV in unrelated code much later -- the cheapest possible check
+    // against the most expensive possible symptom.
+    for (id, n) in graph.nodes.iter().enumerate() {
+        if !matches!(n.op, Op::Load(_) | Op::Store(_)) {
+            continue;
+        }
+        let offset_is_const = n
+            .inputs
+            .get(3)
+            .and_then(|off| graph.nodes.get(*off as usize))
+            .is_some_and(|off| matches!(off.op, Op::Const(_)));
+        if !offset_is_const {
+            return refuse(Bailout::with_context(
+                BailoutReason::Internal(
+                    "ir_lower: a field access has no constant field index",
+                ),
+                format!(
+                    "n{id} ({:?}) has a non-constant offset input; refusing rather \
+                     than lowering it against field slot 0",
+                    n.op
+                ),
+            ));
+        }
     }
     // COV-03 — every non-int field STORE is helper-only, and each width has its
     // own helper. A reference store's helper is the one that carries the write
