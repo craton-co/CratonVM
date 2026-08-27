@@ -2024,7 +2024,28 @@ pub(crate) fn native_unsafe_object_field_offset(
                 return Ok(Some(Value::Long(BUFFER_ADDRESS_SENTINEL as i64)));
             }
         }
-        let (_is_static, _cid, slot, _desc) = crate::lang_class::read_field_meta(ctx, *field_obj);
+        let (is_static, _cid, slot, _desc) = crate::lang_class::read_field_meta(ctx, *field_obj);
+
+        // A STATIC field has no object offset, and the JDK refuses rather than
+        // inventing one: `Unsafe.objectFieldOffset(Field)` throws
+        // `IllegalArgumentException` for a static, and `staticFieldOffset` is
+        // the separate accessor for that case (registered a few lines above
+        // this one). MEASURED: HotSpot 25.0.3+9 throws
+        // `IllegalArgumentException` for `Integer.class.getDeclaredField(
+        // "MAX_VALUE")`; CratonVM accepted it and returned an INSTANCE slot
+        // index, in both modes -- `probes/UnsafeFilesSweep.java`.
+        //
+        // The flag was already being read here and discarded as `_is_static`,
+        // so this is the check the destructuring always anticipated. Answering
+        // an instance offset for a static is the dangerous direction: the
+        // caller's next move is a `getInt`/`putInt` at that offset on some
+        // receiver, which reads or WRITES an unrelated instance field.
+        if is_static {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "not an instance field".to_string(),
+            }
+            .into());
+        }
 
         // T19.H1: if `read_field_meta` returned 0 but the Field actually
         // names an instance field of a superclass layout (the typical case

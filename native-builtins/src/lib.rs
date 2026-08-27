@@ -11542,9 +11542,33 @@ pub fn register_essential_natives_with_shims(
                 crate::lang_class::array_descriptor_for(ctx, this).replace('/', ".")
             } else {
                 let class_id = ctx.class_id_of_object(this);
-                ctx.class_name_of_id(class_id)
-                    .unwrap_or_default()
-                    .replace('/', ".")
+                // A LAMBDA receiver has no entry in the class store -- its
+                // identity lives in `lambda_proxies`, keyed by an id from the
+                // reserved `>= 0x8000_0000` range -- so `class_name_of_id`
+                // answers `None` here. `unwrap_or_default()` then rendered the
+                // EMPTY string and the whole class name vanished, silently:
+                //
+                //     HotSpot:  Probe$$Lambda/0x0000000086040210@7344699f
+                //     CratonVM: @4af
+                //
+                // and `Class.getName()` was right the whole time, which is what
+                // made it read as a formatting quirk rather than a missing case.
+                // Anything that prints a lambda -- string concat, `String.valueOf`,
+                // `println`, `%s`, a collection's own `toString` -- got a nameless
+                // object; Spring's `DefaultRetryPolicy.toString()` is how it
+                // surfaced (`core.retry.RetryPolicyTests.predicatesCombined`).
+                //
+                // `lambda_proxy_class_name` is the SAME helper the reflection
+                // name natives use, so `toString` and `getName` cannot drift.
+                // Its result is already dotted and carries a `/0x<id>` tail that
+                // the `/`->`.` rewrite below would corrupt, so it is used verbatim.
+                match crate::lang_class::lambda_proxy_class_name(ctx, class_id) {
+                    Some(lambda_name) => lambda_name,
+                    None => ctx
+                        .class_name_of_id(class_id)
+                        .unwrap_or_default()
+                        .replace('/', "."),
+                }
             };
             // JDK `Object.toString` is `getName() + "@" + Integer.toHexString(hashCode())`
             // where `hashCode()` is a VIRTUAL call. A receiver that overrides
@@ -13557,7 +13581,23 @@ pub fn register_essential_natives_with_shims(
             let Some(Value::Object(Some(this))) = args.first() else {
                 return Ok(None);
             };
-            let name = args.get(1).cloned().unwrap_or(Value::Object(None));
+            // `Thread.setName`'s first statement is
+            // `if (name == null) throw new NullPointerException("name cannot be
+            // null")`. Accepting the null was TWO defects, not one: the throw
+            // never happened, and the null was then written into `name`, so
+            // `getName()` answered null afterwards -- a Thread whose name is
+            // null is a state the JDK's own API cannot produce. MEASURED:
+            // `probes/ReflectBufferSweep.java`, the single difference in 316
+            // assertions across four families, in BOTH modes.
+            let name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => v.clone(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("name cannot be null".to_string()),
+                    }
+                    .into())
+                }
+            };
             if ctx.object_num_fields(*this) > 0 {
                 ctx.set_field(*this, 0, name.clone());
             }
@@ -26135,6 +26175,19 @@ fn object_to_string_dotted_name(
     }
     // Miss: derive the dotted form (single `replace` or `Arc::from` clone if
     // the name has no `/`) and insert under the write lock.
+    // Lambda proxies first, for the reason spelled out on the `Object.toString`
+    // closure above: they are absent from the class store, so the by-id lookup
+    // below cannot name them. `java/lang/Object.toString` is registered TWICE in
+    // this crate (here via `native_object_to_string`, and as a closure earlier in
+    // the file); whichever registrar runs last wins, and the two used to render an
+    // unknown class differently -- "?" here against "" there. Keeping the lambda
+    // case identical in both means the answer no longer depends on that order.
+    if let Some(lambda_name) = crate::lang_class::lambda_proxy_class_name(ctx, class_id) {
+        // Already dotted, and its `/0x<id>` tail must survive verbatim.
+        let arc: Arc<str> = Arc::from(lambda_name);
+        cache.write().insert(key, Arc::clone(&arc));
+        return arc;
+    }
     let slashed = ctx
         .class_name_of_id(class_id)
         .unwrap_or_else(|| "?".to_string());

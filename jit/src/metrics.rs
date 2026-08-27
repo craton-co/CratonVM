@@ -2816,6 +2816,133 @@ pub const LOCAL_HANDLER_ENTERED: usize = 2;
 /// Index: a throwable this frame does not catch, sent down the old route.
 pub const LOCAL_HANDLER_PROPAGATED: usize = 3;
 
+/// Direct-call safepoint blind-spill census, index-parallel with
+/// `CALL_SPILL_COUNTS`. Compile-time counts, from the one predicate every
+/// direct call to a compiled callee crosses.
+///
+/// Three numbers because `elided=0` alone has three readings that a timing
+/// table cannot tell apart: the elision is off, no direct call was compiled at
+/// all, or every one of them had a reason to refuse. The two refusal counters
+/// say which reason.
+pub const CALL_SPILL_NAMES: [&str; 7] = [
+    "elided",
+    "oop-arg",
+    "no-precise-maps",
+    "ref-local-in-reg",
+    "marks-inexact",
+    "survivor-in-scratch",
+    "moving-unpublishable",
+];
+
+static CALL_SPILL_COUNTS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`CALL_SPILL_NAMES`]: the 14-store blind GPR spill was replaced
+/// by the 2-instruction safepoint-id publication. The engagement counter.
+pub const CALL_SPILL_ELIDED: usize = 0;
+/// Index: refused because an ARGUMENT of this call is a reference and is not
+/// frame-resident at the `CALL`.
+pub const CALL_SPILL_OOP_ARG: usize = 1;
+/// Index: refused because this compile has no precise oop maps, so there is no
+/// map to publish INSTEAD of the spill.
+pub const CALL_SPILL_NO_PRECISE_MAPS: usize = 2;
+/// Index: refused because a register-homed local can hold an object reference.
+/// On real reference-manipulating code this is expected to dominate, and it is
+/// the clause a future narrowing of the spill (rather than an elision of it)
+/// would have to attack.
+pub const CALL_SPILL_REF_LOCAL_IN_REG: usize = 3;
+/// Index: refused because the operand-stack oop marks are absent or inexact.
+pub const CALL_SPILL_MARKS_INEXACT: usize = 4;
+/// Index: refused because an operand-stack survivor lives in a `Scratch`/`Xmm`
+/// register, which the `CALL` clobbers — eliding here would elide the flush
+/// that keeps the value alive, not just the root publication.
+pub const CALL_SPILL_SURVIVOR_IN_SCRATCH: usize = 5;
+/// Index: refused because moving-young cannot publish an empty precise map
+/// here (analysis incomplete, or the live-oop home set is non-empty).
+pub const CALL_SPILL_MOVING_UNPUBLISHABLE: usize = 6;
+
+/// Per-safepoint blind-spill WIDTH census, index-parallel with
+/// `SPILL_WIDTH_COUNTS`.
+///
+/// `stores-emitted` against `stores-if-full` is the whole result: the ratio is
+/// how much of the 14-store blind copy survives narrowing on this workload, and
+/// it is a compile-time count, so it is readable on a loaded host where the
+/// clock is not. `full-refused` counts safepoints that fell back to the
+/// complete copy (no publish plan, >64 locals, or an explicit `=all`), which is
+/// the difference between "narrowing is off" and "narrowing ran and kept
+/// everything".
+pub const SPILL_WIDTH_NAMES: [&str; 3] =
+    ["stores-emitted", "stores-if-full", "full-refused"];
+
+static SPILL_WIDTH_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`SPILL_WIDTH_NAMES`]: blind-spill stores actually emitted.
+pub const SPILL_WIDTH_EMITTED: usize = 0;
+/// Index: stores the same safepoints would have emitted unnarrowed.
+pub const SPILL_WIDTH_IF_FULL: usize = 1;
+/// Index: safepoints that fell back to the full copy.
+pub const SPILL_WIDTH_FULL_REFUSED: usize = 2;
+
+/// Record one blind spill: `emitted` stores against `if_full` had it not been
+/// narrowed, and whether the narrowing refused outright.
+#[inline]
+pub fn note_spill_width(emitted: u64, if_full: u64, refused: bool) {
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_EMITTED].fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_IF_FULL].fetch_add(if_full, std::sync::atomic::Ordering::Relaxed);
+    if refused {
+        SPILL_WIDTH_COUNTS[SPILL_WIDTH_FULL_REFUSED]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for the blind-spill width census, INCLUDING zeros.
+pub fn spill_width_counts() -> Vec<(&'static str, u64)> {
+    SPILL_WIDTH_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                SPILL_WIDTH_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Bump one [`CALL_SPILL_NAMES`] counter.
+#[inline]
+pub fn note_call_spill(index: usize) {
+    if let Some(slot) = CALL_SPILL_COUNTS.get(index) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for the direct-call blind-spill census, INCLUDING zeros --
+/// see [`CALL_SPILL_NAMES`] for why each zero is a different answer.
+pub fn call_spill_counts() -> Vec<(&'static str, u64)> {
+    CALL_SPILL_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            (
+                *n,
+                CALL_SPILL_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
 /// Receiver-type-speculation census, index-parallel with
 /// `RECEIVER_DESPEC_COUNTS`. Compile-time counts, from the one filter every
 /// receiver-guarded call-site intrinsic crosses in

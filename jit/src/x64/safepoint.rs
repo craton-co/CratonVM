@@ -250,11 +250,24 @@ impl Compiler {
             // arg registers here does not perturb the pending call's arguments.
             // Default path is unchanged (`=1` → callee-saved only).
             if self.safepoint_reg_spill_all {
+                let narrow = self.oop_capable_spill_regs();
+                self.pending_narrow_spill = narrow;
+                // Cast: `count_ones` is at most 14, well inside u64.
+                let kept = narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| {
+                    u64::from(m.count_ones())
+                });
+                crate::metrics::note_spill_width(
+                    kept,
+                    ALL_SPILL_GPRS.len() as u64,
+                    narrow.is_none(),
+                );
                 if sink {
-                    self.emit_blind_reg_spill(|reg| ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+                    self.emit_blind_reg_spill(|reg| {
+                        ALLOC_FAST_PATH_CLOBBERS.contains(&reg) && Self::spill_selects(narrow, reg)
+                    });
                     self.deferred_alloc_blind_spill = true;
                 } else {
-                    self.emit_blind_reg_spill(|_| true);
+                    self.emit_blind_reg_spill(|reg| Self::spill_selects(narrow, reg));
                 }
             } else {
                 for i in 0..self.alloc_used_regs.len() {
@@ -296,6 +309,85 @@ impl Compiler {
         }
     }
 
+    /// The registers that can hold an oop at THIS safepoint, as a bitmask over
+    /// [`ALL_SPILL_GPRS`] positions. `None` means "cannot prove anything here"
+    /// and keeps the full fourteen-store copy.
+    ///
+    /// Four sources, and the first two are the reason `=all` exists at all
+    /// (`Compiler::new`: "a receiver/args staged into ARG_REGS immediately
+    /// before a GC-capable call ... which the callee-saved-only spill never
+    /// covers"):
+    ///
+    ///  1. `RAX` — where the emitter materialises every loaded/allocated/
+    ///     returned reference before it is pushed or stored;
+    ///  2. every `ARG_REGS` member — a staged receiver or reference argument;
+    ///  3. the register home of any local the method-wide reference mask says
+    ///     can hold a reference (`register_homed_reference_locals` indexed
+    ///     through `local_assignments`);
+    ///  4. any register currently holding an operand-stack entry, oop-marked or
+    ///     not — cheaper to keep than to reason about, and `self.stack` is
+    ///     short.
+    ///
+    /// What is dropped is a register hosting a local the mask says is
+    /// primitive, and a register this method's model never put anything in
+    /// (R10/R11 on SysV, plus unused local homes). See
+    /// [`narrow_safepoint_spill_enabled`] for what that gives up and why the
+    /// stale slot it leaves behind is safe.
+    fn oop_capable_spill_regs(&self) -> Option<u16> {
+        if !narrow_safepoint_spill_enabled() {
+            return None;
+        }
+        // An explicit `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` is a request for
+        // the full blind copy; honour it literally.
+        if safepoint_reg_spill_all() {
+            return None;
+        }
+        let plan = self.safepoint_publish.as_ref()?;
+        // The mask cannot represent locals >= 64. `color_graph` never gives one
+        // a register home, so no register is actually at risk -- but this is a
+        // root-visibility decision, so it fails closed rather than reasoning.
+        if self.num_locals > 64 {
+            return None;
+        }
+        let bit = |reg: u8| -> u16 {
+            match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                // Cast: position < 14 < 16, so the shift is in range.
+                Some(i) => 1u16 << i,
+                None => 0,
+            }
+        };
+        let mut keep = bit(RAX);
+        for &r in ARG_REGS.iter() {
+            keep |= bit(r);
+        }
+        let refs = plan.register_homed_reference_locals;
+        for (idx, home) in self.local_assignments.iter().enumerate().take(64) {
+            if refs & (1u64 << idx) != 0 {
+                if let Some(reg) = *home {
+                    keep |= bit(reg);
+                }
+            }
+        }
+        for slot in self.stack.iter() {
+            match *slot {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => keep |= bit(r),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        Some(keep)
+    }
+
+    /// `true` when `reg` is selected by `mask` (`None` selects everything).
+    fn spill_selects(mask: Option<u16>, reg: u8) -> bool {
+        match mask {
+            None => true,
+            Some(m) => match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                Some(i) => m & (1u16 << i) != 0,
+                None => false,
+            },
+        }
+    }
+
     /// Emit the `=all` blind GPR spill for the registers `want` selects, into
     /// their fixed `reg_spill_base + i*8` slots. The slot layout is indexed by
     /// position in [`ALL_SPILL_GPRS`] and does not depend on the selection, so a
@@ -323,7 +415,11 @@ impl Compiler {
         if !std::mem::take(&mut self.deferred_alloc_blind_spill) || self.failed {
             return false;
         }
-        self.emit_blind_reg_spill(|reg| !ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+        // The SAME selection the safepoint made -- see `pending_narrow_spill`.
+        let narrow = self.pending_narrow_spill;
+        self.emit_blind_reg_spill(|reg| {
+            !ALLOC_FAST_PATH_CLOBBERS.contains(&reg) && Self::spill_selects(narrow, reg)
+        });
         true
     }
 
@@ -559,14 +655,57 @@ impl Compiler {
     /// Any reference home or incomplete analysis still fails closed to the full
     /// spill + shadow publication.
     pub(super) fn can_elide_self_call_register_spill(&self) -> bool {
+        self.call_spill_elision_core(true)
+    }
+
+    /// Shared body of [`Self::can_elide_self_call_register_spill`] and
+    /// [`Self::can_elide_direct_call_register_spill`].
+    ///
+    /// `strict_survivors` is the ONE difference, and it is why this is a
+    /// parameter rather than a copy. The self-call form requires every operand-
+    /// stack survivor to be `StackSlot::Frame`. That is stronger than the
+    /// mechanism needs, and it is stronger in the same way the predicate's own
+    /// history records for LOCALS: it used to fail closed on *any* register-
+    /// homed local and was narrowed to register-homed *reference* locals once
+    /// it was shown that a primitive's slot is never read as a root.
+    ///
+    /// A survivor in a `CalleeSaved` register is preserved across the `CALL` by
+    /// the callee's own prologue/epilogue (`LOCAL_REGS` is callee-saved on both
+    /// ABIs), and its saved copy lives inside the callee's frame where the
+    /// conservative `[scanner_sp, entry_sp)` walk reads it. Under the moving
+    /// proof `collect_live_oop_homes()` must be empty anyway, so no oop is
+    /// riding in one. A survivor in `Scratch`/`Xmm` is a different matter — the
+    /// call CLOBBERS those registers, which is why `flush_scratch_registers`
+    /// exists and why `emit_pre_safepoint_spill` runs it — so the relaxed form
+    /// still refuses outright when one is present, rather than eliding the
+    /// flush that keeps the value alive.
+    ///
+    /// `probes/CallArgCostProbe.java`'s arms are the shape this unlocks:
+    /// `s += int1(i)` leaves the `long` accumulator on the operand stack across
+    /// the invoke, in a callee-saved register. Strict survivors refused every
+    /// one of them (`direct-call spill: elided=0 frame-not-clean=6`).
+    fn call_spill_elision_core(&self, strict_survivors: bool) -> bool {
         let any_reference_local_in_a_register =
             reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
-        if full_self_call_spill_requested()
-            || !self.precise_maps
-            || any_reference_local_in_a_register
-            || self.stack.len() != self.stack_oop_marks.len()
-            || !self.stack_oop_marks_exact
-        {
+        if full_self_call_spill_requested() {
+            return false;
+        }
+        if !self.precise_maps {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_NO_PRECISE_MAPS);
+            }
+            return false;
+        }
+        if any_reference_local_in_a_register {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_REF_LOCAL_IN_REG);
+            }
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() || !self.stack_oop_marks_exact {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MARKS_INEXACT);
+            }
             return false;
         }
 
@@ -576,11 +715,20 @@ impl Compiler {
         // values that survive in the caller to be frame-resident means the
         // conservative frame walk sees them regardless of their oop tags; any
         // register/XMM home fails closed to the SB-CRASH-04 full spill.
-        let all_survivors_frame_resident = self
-            .stack
-            .iter()
-            .all(|slot| matches!(slot, StackSlot::Frame(_)));
-        if !all_survivors_frame_resident {
+        let survivors_ok = if strict_survivors {
+            self.stack
+                .iter()
+                .all(|slot| matches!(slot, StackSlot::Frame(_)))
+        } else {
+            !self
+                .stack
+                .iter()
+                .any(|slot| matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)))
+        };
+        if !survivors_ok {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_SURVIVOR_IN_SCRATCH);
+            }
             return false;
         }
 
@@ -589,12 +737,63 @@ impl Compiler {
         // predicate and fails the compile closed if the two ever disagree, so
         // they must move together. Default-identical to the old expression.
         if self.shadow_enabled || self_call_moving_proof_enabled() {
-            return moving_oop_free_self_call_is_publishable(
+            let ok = moving_oop_free_self_call_is_publishable(
                 self_call_moving_proof_enabled(),
                 self.moving_young_safepoint_coverage_complete(),
                 self.collect_live_oop_homes().len(),
             );
+            if !ok && !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MOVING_UNPUBLISHABLE);
+            }
+            return ok;
         }
+        true
+    }
+
+    /// [`Self::can_elide_self_call_register_spill`], generalised to a DIRECT
+    /// call to a compiled callee that is not this method.
+    ///
+    /// Everything the self-call predicate proves is about THIS frame — no
+    /// register-homed reference local, exact operand-stack oop marks, every
+    /// surviving stack value frame-resident, and (under moving-young) a
+    /// complete analysis over an empty live-oop set. None of it depends on
+    /// which compiled method is called, so it transfers unchanged.
+    ///
+    /// What does NOT transfer is the ARGUMENTS. At the `CALL` they are staged
+    /// in ABI registers, so a reference argument is a live oop with no frame
+    /// home that the caller-frame proof cannot see. Two answers, selected by
+    /// [`call_spill_elision_mode`]:
+    ///
+    ///  * mode 1 (default) — refuse the elision outright if any argument is a
+    ///    reference. Conservative and needs no assumption about the callee.
+    ///  * mode 2 (`args`) — admit them when `service_args_base` is `Some`, i.e.
+    ///    `reserve_direct_call_service_slots` copied every argument into a
+    ///    contiguous frame range for the cold callee-sentinel service. That
+    ///    range lives inside `[scanner_sp, entry_sp)`, so the conservative walk
+    ///    reads it, and the argument oop is frame-resident at the `CALL` after
+    ///    all.
+    ///
+    /// Fails closed in every uncertain case, and the whole thing is off under
+    /// `CRATONVM_JIT_CALL_SPILL_ELISION=0`.
+    pub(super) fn can_elide_direct_call_register_spill(
+        &self,
+        arg_oops: &[bool],
+        args_frame_resident: bool,
+        min_mode: u8,
+    ) -> bool {
+        let mode = call_spill_elision_mode();
+        if mode == 0 || mode < min_mode {
+            return false;
+        }
+        if !self.call_spill_elision_core(false) {
+            // The core already counted WHICH clause refused.
+            return false;
+        }
+        if arg_oops.iter().any(|&o| o) && (mode < 2 || !args_frame_resident) {
+            crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_OOP_ARG);
+            return false;
+        }
+        crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_ELIDED);
         true
     }
 
@@ -701,6 +900,36 @@ impl Compiler {
                     homes.push(ShadowHome::Reg(r));
                 } else {
                     homes.push(ShadowHome::Frame(self.local_offset(i)));
+                }
+            }
+            // The STAGED INVOKE-ARGUMENT buffer. Same set the oop map's Stage 3
+            // names, and for the same reason: these oops were popped off the
+            // simulated operand stack before the call, so neither loop above can
+            // see them.
+            //
+            // Naming them in the MAP is not enough. The map makes them precise
+            // roots for marking; the SHADOW STACK is the rewritable channel, and
+            // it is the only one `moving_young_unpublished_frame_oop_present`
+            // consults — `published_shadow_values(shadow_window_from_frame(..))`,
+            // with no reference to the map at all. So a staged argument that was
+            // mapped but not pushed sat in the frame's spill band as a
+            // movable-resident word the shadow stack never published, and the
+            // band verifier correctly refused the whole collection with
+            // UNPUBLISHED_FRAME_OOP.
+            //
+            // Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`:
+            // `CRATONVM_JIT_INDY_BRIDGE=0` took that reason from 28 to 5 per 76
+            // collections while four other 2026-08-24 switches left it above 21,
+            // because a bridged `invokedynamic` stages a capturing lambda's
+            // arguments across a call that runs a bootstrap and allocates.
+            // `a51077342` closed the map half of this and stopped there.
+            //
+            // READ, not taken: `emit_oop_map_for_safepoint` still consumes the
+            // list after the call, and taking it here would silently empty the
+            // map's Stage 3.
+            if staged_arg_shadow_enabled() {
+                for off in &self.pending_staged_arg_oops {
+                    homes.push(ShadowHome::Frame(*off));
                 }
             }
             // A local and an operand entry can share the same home register (or two
@@ -1436,6 +1665,118 @@ mod tests {
         }
     }
 
+    /// A staged invoke argument is published on the SHADOW stack, not only
+    /// named in the oop map.
+    ///
+    /// The two are different channels with different consumers. The map makes a
+    /// slot a precise root for MARKING; the shadow stack is the REWRITABLE
+    /// channel, and it is the only one
+    /// `conservative_roots::moving_young_unpublished_frame_oop_present`
+    /// consults — it asks `published_shadow_values(shadow_window_from_frame(..))`
+    /// and never looks at the map. So a staged argument that reached the map but
+    /// not the shadow stack sat in the frame's spill band as a movable-resident
+    /// word the shadow stack never published, and the band verifier correctly
+    /// refused the entire collection with `UNPUBLISHED_FRAME_OOP`.
+    ///
+    /// `a51077342` added the map half (`emit_oop_map_for_safepoint`'s Stage 3)
+    /// and stopped there. Measured consequence on
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// `CRATONVM_JIT_INDY_BRIDGE=0` took `compiled-frame-oop-not-published`
+    /// from 28 to 5 per 76 collections where four other switches left it above
+    /// 21 — a bridged `invokedynamic` stages a capturing lambda's arguments
+    /// across a call that runs a bootstrap and allocates.
+    ///
+    /// The assertion is `shadow ⊇ map Stage 3`, which is the invariant that was
+    /// violated; it deliberately does not require equality, because the shadow
+    /// list also carries register homes the map has no slot for.
+    #[test]
+    fn a_staged_invoke_argument_is_published_on_the_shadow_stack_too() {
+        // The staged buffer only has to be published under MOVING coverage —
+        // that is the mode whose band verifier demands it, and the mode
+        // `collect_live_oop_homes` gates its frame-slot homes on.
+        crate::x64::set_moving_young_override(Some(true));
+
+        const STAGED: [i32; 3] = [64, 72, 80];
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = STAGED.to_vec();
+
+        let homes = c.collect_live_oop_homes();
+        for off in STAGED {
+            assert!(
+                homes.contains(&ShadowHome::Frame(off)),
+                "staged arg at [rbp-{off}] is named by the oop map's Stage 3 but \
+                 was not published on the shadow stack; homes={homes:?}"
+            );
+        }
+
+        // The list the map will consume must still be intact: this collection
+        // READS it, and taking it here would silently empty Stage 3.
+        assert_eq!(
+            c.pending_staged_arg_oops, STAGED,
+            "collect_live_oop_homes must not consume the staged-arg list"
+        );
+
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// The control. Non-moving coverage keeps the conservative frame scan, which
+    /// already finds a staged slot on the stack, so publishing it would only
+    /// over-pin — the hazard `collect_live_oop_homes` documents as the bt18
+    /// small-heap OOM. Without this, the test above would pass just as well if
+    /// the homes were published unconditionally.
+    #[test]
+    fn a_staged_invoke_argument_is_not_published_when_nothing_moves() {
+        crate::x64::set_moving_young_override(Some(false));
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = vec![64];
+        let homes = c.collect_live_oop_homes();
+        assert!(
+            !homes.contains(&ShadowHome::Frame(64)),
+            "the non-moving path must not publish staged args; homes={homes:?}"
+        );
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// A bare `Compiler` with no locals, no operand stack and no register
+    /// assignments, so `collect_live_oop_homes` returns exactly what the staged
+    /// buffer contributes and nothing else can be mistaken for it.
+    fn staged_arg_test_compiler() -> Compiler {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "staged-arg-shadow-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with all-integer
+            // fields, so an all-zero bit pattern is a valid value. Nothing here
+            // dereferences a helper pointer.
+            unsafe { std::mem::zeroed() },
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    }
+
     /// Spot-check two concrete encodings against the ISA so the property test
     /// above cannot pass a self-consistent but wrong rule.
     #[test]
@@ -1445,4 +1786,17 @@ mod tests {
         // 49 81 FC — cmp r12, imm32
         assert_eq!(cmp_r64_imm32_opcode(R12), [0x49, 0x81, 0xFC]);
     }
+}
+
+/// `CRATONVM_JIT_NO_STAGED_ARG_SHADOW=1` — stop publishing the staged
+/// invoke-argument buffer on the shadow stack, restoring the state in which it
+/// was named by the oop map alone.
+///
+/// The bisect lever for that repair, default-ON. Latched: it is a codegen
+/// decision and must not change under a running process.
+fn staged_arg_shadow_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STAGED_ARG_SHADOW").is_none()
+    })
 }
