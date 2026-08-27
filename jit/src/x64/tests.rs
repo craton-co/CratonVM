@@ -12353,6 +12353,7 @@ fn make_inline_site(
         invoke_targets: Vec::new(),
         resolved_invoke_infos: Vec::new(),
         nested_sites: Vec::new(),
+        ir_new_info: Vec::new(),
     }
 }
 
