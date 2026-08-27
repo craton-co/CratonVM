@@ -1276,16 +1276,97 @@ Sites now carry the METHOD and the BCI — which is exactly what settled
 rather than only the `fully_oop_covered` subset (which was 3 122 of 15 232, with
 the other 12 110 sites discarded).
 
+
+## Follow-up 2026-08-27 (third): `TestMVStoreTool`'s wall is 2 888 live bytes, and the instrument for it already existed
+
+The class is not short of compaction. It is short of a *contiguous* 256 KB, and
+the thing standing in the way is **2 888 bytes of live objects in 49 runs**.
+
+### What the existing frag profile says, unedited
+
+`TestMVStoreTool` on the 2026-08-27 `dev` tip, `--Xmx 1g`, default config —
+11 compaction cycles, 1 817 474 objects relocated, and still `rc=1 oom=4`:
+
+```
+zgc: arena allocation failed  request=262160 used=1073545800 capacity=1073741824
+     free_list_bytes=685889664 largest_free_block=131088 free_spans=62070
+
+zgc frag: the CHEAPEST window that could serve this request — 2888 live bytes in
+     49 run(s) are all that stand between 263216 free bytes spread over 266104
+     bytes of contiguous arena.
+
+zgc frag: wall occupant class=org/h2/mvstore/Page$PageReference count=17 bytes=1120
+zgc frag: wall occupant class=org/h2/mvstore/Page$NonLeaf       count=2  bytes=320
+zgc frag: wall occupant class=java/lang/Integer                 count=13 bytes=312
+zgc frag: wall occupant class=java/lang/Object                  count=2  bytes=144
+```
+
+**34 named objects, 1.1 % occupancy, holding a 260 KB window hostage.** None of
+this needed a new instrument: `Arena::frag_profile` has been computing the
+cheapest window and walking its walls all along.
+
+### The causal chain, and the control that closes it
+
+| | |
+|---|---|
+| TLAB chunks carve the arena into ≤ 512 KB pieces | `ZGC_TLAB_MAX_CHUNK` |
+| one survivor per chunk caps every hole at chunk granularity | `largest_free_block` sits at 131 088 = 128 KiB + 16 |
+| compaction runs and relocates 1.8 M objects — but by its own policy | `compaction_cycles=11` |
+| …so it does not evacuate the window the failing request needs | 2 888 live bytes survive in it |
+| the 256 KB request cannot be served, at 64 % free | `oom=4` |
+
+And the control: **with `CRATONVM_ZGC_TLAB=0` the class PASSES** — `rc=0`,
+`oom=0`, 4 342 943 objects relocated, 561 s against 103 s. No chunk carving, no
+wall, no OOM. That is the same lever the 2026-08-11 Hibernate investigation
+found (`sql.exec.SmokeTests` and `DefaultCatalogAndSchemaTest`, `65528`-byte
+holes against a 65 552-byte `DFAState[8192]`), which makes this the second
+workload family localised to it.
+
+Progress since the page opened is real but insufficient for this class:
+`largest_free_block` was **65 440** on 2026-08-21 and is **131 088** now — the
+compaction work doubled the ceiling. The request is 262 160.
+
+### What this asks for
+
+Not more compaction — *targeted* compaction. The failure path already knows
+which window is cheapest and which objects wall it; what it cannot do is act on
+that. The natural shape is to let the next collection's compaction take the
+window the last failure named as its target, since evacuation has to happen at a
+safepoint and not inside an allocation failure. Nothing in this page's history
+suggests the general-policy compactor will find those 49 runs on its own — it
+relocated 1.8 M objects in this very run and left them.
+
+### One correction landed with this
+
+The failure line opened with *"this heap does not compact, so the bump cursor
+never rewinds"*. The first clause stopped being true — the run printing it
+reported 11 compaction cycles and 1.8 M relocated objects — and it is precisely
+the sentence that sends a reader looking for a missing compactor rather than at
+the `zgc frag:` lines directly below, which had already localised the failure to
+those 2 888 bytes. The cursor half is still true and is kept; the message now
+points at the frag lines.
+
+### `TestCachedQueryResults`, for the record
+
+Still the livelock: `rc=124` at the 1 500 s cap, **18 048** `OutOfMemoryError`
+and 14 arena failures. Same fragmentation family, far past the point where a
+single window would help.
+
 ## Still open
 
 Ordered by what a next session should pick up first.
 
-* **`TestMVStoreTool` OOMs after 7–14 collections, before compaction can
-  help it.** Its `UNPUBLISHED_FRAME_OOP` obligation is CLOSED with everything
-  else's (§"Follow-up 2026-08-27": `unpub` 1–4 in both arms now), and
-  `TestKillProcessWhileWriting` compacts on 88–94 % of cycles. This class
-  still fails with `oom=4` and needs its own answer — it is not short of
-  compaction, it is short of TIME to compact.
+* **Compaction has no TARGETED mode, and that is the whole of
+  `TestMVStoreTool`.** §"Follow-up 2026-08-27 (third)": the existing frag
+  profile names **2 888 live bytes in 49 runs** — 34 objects, 1.1 %
+  occupancy — walling off the one 266 KB window that would serve the failing
+  256 KB request, in a run that relocated 1.8 M objects by general policy
+  and left them. `CRATONVM_ZGC_TLAB=0` makes the class PASS, which is the
+  control. The failure path already computes the cheapest window; what it
+  cannot do is hand it to the next collection as a target. That is the
+  feature, and it is the second workload family localised to the TLAB
+  carving (the first was Hibernate's `SmokeTests` /
+  `DefaultCatalogAndSchemaTest`, 2026-08-11).
 * **There is no working backstop against a wrong oop map for java locals
   and operand spill.** The band scan's was given up 2026-08-27, and the
   map-completeness oracle CANNOT replace it: re-pointed at
