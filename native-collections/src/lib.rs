@@ -18390,7 +18390,65 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // for it by construction. Construction of the view is unaffected —
     // `make_view_set_of` populates the backing through `native_map_put` and
     // never comes through here.
-    if view_backing_source(ctx, backing).is_some() {
+    if let Some(view_source) = view_backing_source(ctx, backing) {
+        // ONE VIEW IS ADDABLE, and it is the exception the JDK documents.
+        // `ConcurrentHashMap$EntrySetView.add(Entry)` is supported -- it does
+        // `map.putVal(e.getKey(), e.getValue(), false)` -- unlike every other
+        // map's entrySet, which inherits `AbstractCollection.add`'s bare throw.
+        // Refusing it here was the OPPOSITE-POLARITY twin of the
+        // `TreeMap$KeySet.add` defect fixed the day before: there a view
+        // accepted what the JDK refuses, here a view refused what the JDK
+        // accepts. MEASURED against HotSpot 25.0.3+9,
+        // `probes/ViewFamilySweep.java`, both modes -- the other four entrySet
+        // carriers matched, and only this one differed.
+        let recv_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        if recv_class == "java/util/concurrent/ConcurrentHashMap$EntrySetView" {
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                // `add(null)` on CHM's entrySet dereferences the entry, so it
+                // is an NPE rather than a silent false.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
+            };
+            // Pin across each invoke: `getKey`/`getValue` are Java calls and a
+            // moving young generation would relocate the entry and the backing
+            // behind us. Same discipline as `map_entries_of`.
+            let backing_pin = ctx.pin_native_root(view_source);
+            let entry_pin = ctx.pin_native_root(entry);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let key = ctx
+                .invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let key_pin = pin_value(ctx, key);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let value = ctx
+                .invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let value_pin = pin_value(ctx, value);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            // Put into the SOURCE map, not the view's own backing. Putting
+            // into `backing` is exactly what the refusal comment above warns
+            // about -- "the key landed in the VIEW's backing and not in `m`, so
+            // the caller was left holding a view that disagrees with the map it
+            // is a view of". MEASURED: the first version of this fix did that,
+            // so `add` reported success and the entry never reached the map
+            // (`entrySet is LIVE after put` stayed 4 against HotSpot's 5).
+            let src = ctx.read_native_pin(backing_pin, view_source);
+            let prev = native_map_put(ctx, &[Value::Object(Some(src)), key, value])?;
+            ctx.unpin_native_roots(backing_pin);
+            // `Set.add` reports whether the set CHANGED. CHM's own body returns
+            // `putVal(..) == null`, i.e. true when there was no previous
+            // mapping.
+            let changed = matches!(prev, None | Some(Value::Object(None)));
+            return Ok(Some(Value::Int(i32::from(changed))));
+        }
         return Err(
             cratonvm_types::error::RuntimeError::UnsupportedOperationException {
                 // HotSpot's is message-less; `thrownDetail` prints a message

@@ -4047,16 +4047,22 @@ fn register_trust_manager(r: &mut NativeMethodRegistry, fqn: &'static str) {
     // whose `X509TrustManagerWrapper` delegates the engine-flavoured overload
     // straight through.
     //
-    // The extra `Socket`/`SSLEngine` argument is advisory in JSSE (it exists so
-    // an implementation CAN consult the connection); the chain and authType are
-    // the whole input to the decision this module makes, so both overloads
-    // share the two-argument handlers, which ignore any surplus argument.
+    // The extra `Socket`/`SSLEngine` argument is NOT advisory, and the comment
+    // that used to stand here said it was. Both overloads pointed at the
+    // two-argument handlers, "which ignore any surplus argument" — and the
+    // surplus argument is the only thing that carries ENDPOINT IDENTIFICATION.
+    // In the real `X509TrustManagerImpl` the three-argument forms read
+    // `getSSLParameters().getEndpointIdentificationAlgorithm()` off it and run
+    // RFC 2818 hostname verification; the two-argument form checks the chain and
+    // no name. Collapsing them accepted a certificate issued for a different
+    // host, measured against HotSpot in `probes/OpenSslEndpointIdentProbe.java`.
+    // See `check_server_trusted_extended` for the full record.
     for desc in [
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",
     ] {
-        r.register(fqn, "checkClientTrusted", desc, check_client_trusted);
-        r.register(fqn, "checkServerTrusted", desc, check_server_trusted);
+        r.register(fqn, "checkClientTrusted", desc, check_client_trusted_extended);
+        r.register(fqn, "checkServerTrusted", desc, check_server_trusted_extended);
     }
     r.register(
         fqn,
@@ -5141,6 +5147,403 @@ fn check_client_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn check_server_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     do_check_trusted(ctx, args)
+}
+
+/// `X509ExtendedTrustManager.checkServerTrusted(chain, authType, Socket|SSLEngine)`.
+///
+/// **This is NOT the two-argument check with a spare argument.** In the real
+/// `sun.security.ssl.X509TrustManagerImpl` the three-argument overloads are the
+/// only place ENDPOINT IDENTIFICATION — RFC 2818 hostname verification — runs:
+/// `checkTrusted` reads
+/// `engine.getSSLParameters().getEndpointIdentificationAlgorithm()` and, when it
+/// is non-empty, calls `checkIdentity`, which ends in
+/// `HostnameChecker.getInstance(TYPE_TLS).match(...)`. The two-argument overload
+/// deliberately checks the CHAIN and no name at all.
+///
+/// This module used to register one handler for all three descriptors, with a
+/// comment calling the extra argument "advisory". It is not, and the cost was a
+/// silent hole: **a certificate issued for a different host was accepted.**
+/// MEASURED, `probes/OpenSslEndpointIdentProbe.java`, with every input printed
+/// identical on both VMs (`endpointIdentificationAlgorithm=HTTPS`,
+/// `peerHost=localhost`, an extended handshake session, peer subject
+/// `CN=NOTlocalhost`):
+///
+/// ```text
+/// HotSpot  @@TM delegate=REJECTED CertificateException: No name matching localhost found
+/// CratonVM @@TM delegate=ACCEPTED (no CertificateException)
+/// ```
+///
+/// netty's OpenSSL provider is one such caller: BoringSSL hands the chain back
+/// to Java and `ReferenceCountedOpenSslClientContext.ExtendedTrustManagerVerifyCallback`
+/// calls exactly this overload, so all 48 parameterisations of
+/// `SSLEngineTest.testClientHostnameValidationFail` completed a handshake that
+/// HotSpot rejects, in three netty SSL classes. `probes/HostnameCheckerProbe.java`
+/// clears the JDK's own checker of any part in it: called directly it answers
+/// `No name matching localhost found` on this VM too — it was simply never
+/// reached. See
+/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+fn check_server_trusted_extended(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    do_check_trusted(ctx, args)?;
+    if crate::nbflags().x509_tm_no_identify_server {
+        return Ok(None);
+    }
+    check_extended_tm_endpoint_identity(ctx, args, false)
+}
+
+/// The client-authentication twin of [`check_server_trusted_extended`].
+///
+/// The JDK runs `checkIdentity` in this direction too, and turns a failure into
+/// `CertificateException("Endpoint Identification Algorithm HTTPS is not
+/// supported on the server side")` rather than the name mismatch — because a
+/// server has no name to identify its client by. Mirrored here rather than
+/// skipped, so a server that DOES set the algorithm gets the same answer it
+/// gets on HotSpot instead of a silent pass.
+fn check_client_trusted_extended(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    do_check_trusted(ctx, args)?;
+    if crate::nbflags().x509_tm_no_identify_client {
+        return Ok(None);
+    }
+    check_extended_tm_endpoint_identity(ctx, args, true)
+}
+
+/// What the third argument of an `X509ExtendedTrustManager` overload is.
+///
+/// A plain `java.net.Socket` that is not an `SSLSocket` carries no SSL
+/// parameters and no handshake session — the JDK guards on
+/// `socket instanceof SSLSocket` and skips identification entirely — so it is a
+/// third case, not an error.
+enum ExtendedTmPeer {
+    Engine,
+    SslSocket,
+}
+
+fn classify_extended_tm_peer(
+    ctx: &mut dyn NativeContext,
+    peer: ObjectRef,
+) -> Option<ExtendedTmPeer> {
+    let cid = ctx.class_id_of_object(peer);
+    for (name, kind) in [
+        ("javax/net/ssl/SSLEngine", ExtendedTmPeer::Engine),
+        ("javax/net/ssl/SSLSocket", ExtendedTmPeer::SslSocket),
+    ] {
+        if let Ok(target) = ctx.ensure_class_initialized(name) {
+            if cid == target || ctx.is_subclass(cid, target) {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
+/// The peer's endpoint identification algorithm, or `None` for "do not
+/// identify" — which is what a null or empty one means in the JDK.
+///
+/// **This does NOT call `getSSLParameters()` on a netty OpenSSL engine, and
+/// that is the whole point.** These handlers run inside BoringSSL's certificate
+/// callback whenever netty is configured `setUseTasks(false)`, i.e. Java has
+/// re-entered from inside the tcnative `SSL_do_handshake` native.
+/// `ReferenceCountedOpenSslEngine.getSSLParameters()` is `synchronized` and
+/// itself re-enters tcnative — `SSL.getOptions(ssl)`, and `SSL.getCiphers(ssl)`
+/// by way of `super.getSSLParameters()` -> `getEnabledCipherSuites()` — on the
+/// very `SSL*` BoringSSL is inside. Doing that loses the client's TLSv1.3
+/// `Certificate` flight: the server ends the handshake with
+/// `PEER_DID_NOT_RETURN_A_CERTIFICATE`.
+///
+/// MEASURED, `probes/OpenSslTls13ClientCertProbe.java`, one run per binary:
+/// HotSpot 8/8, CratonVM before the endpoint-identification fix 8/8, CratonVM
+/// with the `getSSLParameters()` call 2 FAIL — and the two are exactly
+/// `TLSv1.3 x useTasks=false`, on BOTH loopback families, so it is not the
+/// transport. Full record:
+/// `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`
+///
+/// The field read below runs no Java, allocates nothing and enters no native,
+/// so on a netty engine this function costs what it cost before the fix — which
+/// matters most in the common case, where the algorithm is null and the whole
+/// call exists only to discover that. Engines with no such field (the JDK's own
+/// `SSLEngineImpl`, whose `getSSLParameters()` is pure Java and re-enters
+/// nothing) keep the method route.
+///
+/// `CRATONVM_X509_TM_PARAMS_VIA_METHOD` forces the method route back on, so the
+/// attribution above stays a one-run A/B.
+fn extended_tm_identification_algorithm(
+    ctx: &mut dyn NativeContext,
+    peer: ObjectRef,
+) -> Option<String> {
+    if !crate::nbflags().x509_tm_params_via_method && peer_is_netty_openssl_engine(ctx, peer) {
+        // `Object(None)` here is "the field is null", not "no such field": the
+        // class check above already established the field exists. A null one is
+        // netty's own default and means no identification, so answering `None`
+        // is the answer and not a fallback.
+        return match ctx.get_field_by_name(peer, "endpointIdentificationAlgorithm") {
+            Value::Object(Some(s)) => ctx.read_string(s).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+    }
+    let params = match ctx.invoke_virtual(
+        peer,
+        "getSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(
+        params,
+        "getEndpointIdentificationAlgorithm",
+        "()Ljava/lang/String;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+/// Is `peer` one of netty's OpenSSL engines — i.e. does it declare the
+/// `endpointIdentificationAlgorithm` field the fast path above reads?
+///
+/// Walked by NAME up the superclass chain rather than resolved through
+/// `ensure_class_initialized`, deliberately: this runs on every extended trust
+/// check in the VM, including in processes that have never heard of netty, and
+/// asking the class manager to resolve a netty class there is both a cost and a
+/// way to run a `<clinit>` nobody asked for. The walk is bounded for the reason
+/// `t27_tls::jsse_owns_endpoint_identification` gives — a corrupted
+/// `superclass_of` must not hang a TLS handshake.
+fn peer_is_netty_openssl_engine(ctx: &mut dyn NativeContext, peer: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(peer));
+    for _ in 0..16 {
+        let Some(c) = cid else { return false };
+        if ctx.class_name_of_id(c).as_deref()
+            == Some("io/netty/handler/ssl/ReferenceCountedOpenSslEngine")
+        {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+/// The handshake session, if the peer has one.
+///
+/// The JDK reads the host off the HANDSHAKE session rather than off the engine,
+/// and refuses the whole check outright when there is none
+/// (`CertificateException: No handshake session`). That last part is
+/// deliberately NOT reproduced — see `extended_tm_peer_host`.
+fn extended_tm_handshake_session(
+    ctx: &mut dyn NativeContext,
+    peer: ObjectRef,
+) -> Option<ObjectRef> {
+    match ctx.invoke_virtual(
+        peer,
+        "getHandshakeSession",
+        "()Ljavax/net/ssl/SSLSession;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => Some(s),
+        _ => None,
+    }
+}
+
+fn extended_tm_session_peer_host(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Option<String> {
+    match ctx.invoke_virtual(session, "getPeerHost", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// The host to identify the peer by: the handshake session's, then the
+/// engine's/socket's own.
+///
+/// The JDK reads only the session's, because on HotSpot the session is always
+/// there by the time a trust manager runs. The second source is what lets this
+/// VM decline to throw when it is not — `SSLEngine.getPeerHost()` is the value
+/// netty passed to `newHandler(alloc, host, port)` and is the same string the
+/// session would have reported.
+fn extended_tm_peer_host(
+    ctx: &mut dyn NativeContext,
+    peer: ObjectRef,
+    session: Option<ObjectRef>,
+) -> Option<String> {
+    if let Some(s) = session {
+        if let Some(h) = extended_tm_session_peer_host(ctx, s).filter(|h| !h.is_empty()) {
+            return Some(h);
+        }
+    }
+    match ctx.invoke_virtual(peer, "getPeerHost", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).filter(|h| !h.is_empty()),
+        _ => None,
+    }
+}
+
+/// The `host_name` entry of the session's requested SNI names, ASCII form.
+///
+/// `X509TrustManagerImpl.checkIdentity` prefers this over the peer host — "the
+/// server_name extension is more reliable than peer host", says its own comment
+/// — and falls back to the peer host when the SNI check fails against a
+/// DIFFERENT name. Reproducing the preference matters: a client that connects by
+/// IP but sends SNI is identified by the SNI name on HotSpot.
+fn extended_tm_sni_host_name(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Option<String> {
+    let names = match ctx.invoke_virtual(
+        session,
+        "getRequestedServerNames",
+        "()Ljava/util/List;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => return None,
+    };
+    let size = match ctx.invoke_virtual(names, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => return None,
+    };
+    for i in 0..size {
+        let Ok(Some(Value::Object(Some(sn)))) =
+            ctx.invoke_virtual(names, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])
+        else {
+            continue;
+        };
+        // Type 0 is `StandardConstants.SNI_HOST_NAME`; only that one carries a
+        // host name, and only `SNIHostName` declares `getAsciiName()`.
+        if !matches!(ctx.invoke_virtual(sn, "getType", "()I", &[]), Ok(Some(Value::Int(0)))) {
+            continue;
+        }
+        if let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(sn, "getAsciiName", "()Ljava/lang/String;", &[])
+        {
+            if let Some(text) = ctx.read_string(s).filter(|t| !t.is_empty()) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// `X509TrustManagerImpl.checkIdentity`, re-derived over this module's own
+/// `verify_hostname` so the two identity checks in this VM cannot drift apart.
+///
+/// The ORDER is the JDK's and is load-bearing: try the SNI name first; if that
+/// passes, done; if it fails and the SNI name IS the peer host, fail with that;
+/// otherwise fall back to the peer host. Checking only the peer host would
+/// reject connections HotSpot accepts (SNI set, connected by IP), and checking
+/// only SNI would accept ones it rejects.
+fn check_extended_tm_endpoint_identity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    checking_client: bool,
+) -> MethodCallResult {
+    let Some(peer) = (match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    }) else {
+        // The JDK validates the chain and skips identification when the extra
+        // argument is null. So do we — `do_check_trusted` already ran.
+        return Ok(None);
+    };
+    if classify_extended_tm_peer(ctx, peer).is_none() {
+        return Ok(None);
+    }
+    let Some(algorithm) = extended_tm_identification_algorithm(ctx, peer) else {
+        return Ok(None);
+    };
+    let session = extended_tm_handshake_session(ctx, peer);
+
+    let chain_val = match args.get(1) {
+        Some(v) => v.clone(),
+        None => Value::Object(None),
+    };
+    let chain = read_chain_arg(ctx, &chain_val);
+    let Some(leaf_der) = chain.first() else {
+        return Err(cert_exception(ctx, "certificate chain is empty".into()));
+    };
+    let leaf = match parse_certificate(leaf_der) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(cert_exception(
+                ctx,
+                format!("peer certificate could not be parsed: {e}"),
+            ))
+        }
+    };
+
+    // Only "HTTPS" (and the LDAP spellings, which use the same RFC 2818 name
+    // matching in this VM) identify by name; anything else is an error on
+    // HotSpot rather than a silent pass.
+    let known = algorithm.eq_ignore_ascii_case("HTTPS")
+        || algorithm.eq_ignore_ascii_case("LDAP")
+        || algorithm.eq_ignore_ascii_case("LDAPS");
+    if !known {
+        return Err(cert_exception(
+            ctx,
+            format!("Unknown identification algorithm: {algorithm}"),
+        ));
+    }
+
+    let peer_host = extended_tm_peer_host(ctx, peer, session).map(|h| {
+        // An FQDN's trailing dot is not allowed in an SNIHostName and is not
+        // part of the name a certificate asserts.
+        h.strip_suffix('.').unwrap_or(&h).to_string()
+    });
+    let sni_host = match (checking_client, session) {
+        (false, Some(s)) => extended_tm_sni_host_name(ctx, s),
+        _ => None,
+    };
+
+    if let Some(sni) = sni_host.as_deref() {
+        match verify_hostname(&leaf, sni) {
+            Ok(()) => return Ok(None),
+            Err(e) => {
+                if peer_host
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(sni))
+                {
+                    return Err(cert_exception(ctx, e.to_string()));
+                }
+                // otherwise fall through to the peer host, as the JDK does
+            }
+        }
+    }
+
+    let Some(host) = peer_host else {
+        // NOT the JDK's `CertificateException: Hostname or IP address is
+        // undefined.`, and the difference is deliberate. On HotSpot the engine
+        // reaching this point always has a handshake session carrying the host;
+        // in this VM the same overload is ALSO called by `t27_tls`'s own rustls
+        // engine, whose `SSLEngine` object need not carry one, and that path
+        // performs endpoint identification itself
+        // (`t27_tls::jsse_owns_endpoint_identification` -> `engine_check_endpoint_identity`).
+        // Throwing here would break every TLS handshake that VM stack makes in
+        // order to close a hole it does not have. Recorded rather than silent.
+        tracing::debug!(
+            "endpoint identification requested ({algorithm}) but the peer reports              no host; skipping the name check"
+        );
+        return Ok(None);
+    };
+    match verify_hostname(&leaf, &host) {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            if checking_client && algorithm.eq_ignore_ascii_case("HTTPS") {
+                Err(cert_exception(
+                    ctx,
+                    "Endpoint Identification Algorithm HTTPS is not supported on the server side"
+                        .into(),
+                ))
+            } else {
+                Err(cert_exception(ctx, e.to_string()))
+            }
+        }
+    }
 }
 
 fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
