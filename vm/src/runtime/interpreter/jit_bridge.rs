@@ -4187,6 +4187,82 @@ fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool 
     false
 }
 
+/// Resolve one `ldc` / `ldc_w` constant-pool entry for the JIT, in the pool of
+/// **`holder`**.
+///
+/// # Why this is one function and not three copies
+///
+/// A `String` or `Class` constant is baked into compiled code as a SITE — the
+/// pair `(holder class id, cp index)` — which `jit_ldc_string_cp` /
+/// `jit_ldc_class_cp` re-read at run time. The two halves of that pair must come
+/// from the same constant pool, and nothing in the types says so: the index is a
+/// `u16` and the holder a `u32`, and either can be filled in from whichever
+/// `ClassId` happens to be in scope.
+///
+/// Three copies of this resolver existed — one for the compiling method, one for
+/// a callee compiled as its own artifact, one for OSR — each spelling the holder
+/// out by hand a few lines below its own `cm.get_class(...)`. The callee copy
+/// spelled the CALLER's `class_id` in its `String` arm while reading the
+/// CALLEE's pool; its `ClassReference` arm three lines further down used the
+/// callee's. Compiling `SqlClientPool.newConnection` (which inlines
+/// `SqlClientConnection.<init>`) then baked `(SqlClientPool, cp#47)` for a
+/// literal that lives at cp#47 of `SqlClientConnection`. cp#47 of
+/// `SqlClientPool` is a `ClassReference`, so the helper raised `InternalError`
+/// and `TechEmpowerTest` answered HTTP 500 — 3/3 runs under
+/// `CRATONVM_BG_COMPILE=0`.
+///
+/// **That was the loud half.** Had the caller held a `String` at that index,
+/// compiled code would have pushed the **wrong literal** and reported nothing.
+///
+/// One function takes one `holder` and uses it for the lookup AND for both
+/// baked sites, so the halves cannot disagree again. Behaviour is otherwise
+/// identical to the three copies it replaces.
+///
+/// `get_utf8_wide(..).is_none()` is the representability test, unchanged: a
+/// lone-surrogate literal cannot be pooled on a Rust `String` and stays
+/// uncompilable.
+fn jit_ldc_constant_for(
+    cm: &crate::classloading::ClassManager,
+    holder: ClassId,
+    cp_idx: u16,
+) -> Option<cratonvm_jit::JitLdcConstant> {
+    let class = cm.get_class(holder)?;
+    match class.constant_pool.get(cp_idx)? {
+        ConstantPoolEntry::Integer(v) => Some(cratonvm_jit::JitLdcConstant::Immediate {
+            bits: *v as i64,
+            is_float: false,
+        }),
+        ConstantPoolEntry::Float(v) => Some(cratonvm_jit::JitLdcConstant::Immediate {
+            bits: v.to_bits() as i64,
+            is_float: true,
+        }),
+        ConstantPoolEntry::StringReference { string_index }
+            if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+        {
+            // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+            // `(class, cp index)`.
+            class
+                .constant_pool
+                .get_utf8(*string_index)
+                .map(|_| cratonvm_jit::JitLdcConstant::String {
+                    holder_class_id: holder.as_u32(),
+                    cp_idx,
+                })
+        }
+        // `ldc <Class>`: the mirror is a heap object and the target class may
+        // not be loaded yet, so report the SITE and let `helpers.ldc_class_cp`
+        // resolve it and fetch the mirror at run time, the way the
+        // interpreter's own `ldc` handler does.
+        ConstantPoolEntry::ClassReference { .. } => {
+            Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                holder_class_id: holder.as_u32(),
+                cp_idx,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
 /// [`RedefineGate`] so the JIT entry inherits the same staleness binding
 /// as the bytecode entry it's replacing.  Saves one
@@ -4711,49 +4787,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // `ldc` still returns `None` → permanent compile bail.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-            }
-            ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-            }
-            ConstantPoolEntry::StringReference { string_index }
-                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-            {
-                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                // `(class, cp index)`. `get_utf8` is only the representability
-                // test the `get_utf8_wide` guard above pairs with -- a
-                // lone-surrogate literal cannot be pooled on a Rust `String`
-                // and stays uncompilable, exactly as before.
-                class
-                    .constant_pool
-                    .get_utf8(*string_index)
-                    .map(|_| cratonvm_jit::JitLdcConstant::String {
-                        holder_class_id: class_id.as_u32(),
-                        cp_idx,
-                    })
-            }
-            // `ldc <Class>`: the mirror is a heap object and the target class
-            // may not be loaded yet, so report the SITE — referencing class id
-            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
-            // fetch the mirror at run time, the way the interpreter's own
-            // `ldc` handler does.
-            ConstantPoolEntry::ClassReference { .. } => {
-                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                    holder_class_id: class_id.as_u32(),
-                    cp_idx,
-                })
-            }
-            _ => None,
-        }
+        jit_ldc_constant_for(&cm, class_id, cp_idx)
     };
 
     // Callee compiler: given (class_name, method_name, descriptor), try to JIT-compile
@@ -5239,66 +5273,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // bails (matches the OSR path's behaviour).
             let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
                 let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Integer(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-                    }
-                    ConstantPoolEntry::Float(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-                    }
-                    ConstantPoolEntry::StringReference { string_index }
-                        if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-                    {
-                        // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                        // `(class, cp index)`. `get_utf8` is only the representability
-                        // test the `get_utf8_wide` guard above pairs with -- a
-                        // lone-surrogate literal cannot be pooled on a Rust `String`
-                        // and stays uncompilable, exactly as before.
-                        //
-                        // `callee_cid`, NOT `class_id`. This resolver reads the
-                        // CALLEE's constant pool -- `cm.get_class(callee_cid)`
-                        // three lines up, and `cp_idx` is an index into that
-                        // pool. Pairing it with the CALLER's class id hands the
-                        // runtime helper a (class, index) pair whose two halves
-                        // come from different constant pools, and the helper
-                        // then reads whatever the CALLER happens to hold at
-                        // that index. The `ClassReference` arm immediately
-                        // below always used `callee_cid`; this one did not.
-                        //
-                        // The visible failure is the benign half. Compiling
-                        // `SqlClientPool.newConnection`, which inlines
-                        // `SqlClientConnection.<init>`, baked
-                        // (SqlClientPool, cp#47) for a literal that lives at
-                        // cp#47 of SqlClientConnection; cp#47 of SqlClientPool
-                        // is a ClassReference, so the helper raised
-                        // InternalError. Had the caller held a String there
-                        // instead, compiled code would have pushed the WRONG
-                        // LITERAL and said nothing.
-                        class
-                            .constant_pool
-                            .get_utf8(*string_index)
-                            .map(|_| cratonvm_jit::JitLdcConstant::String {
-                                holder_class_id: callee_cid.as_u32(),
-                                cp_idx,
-                            })
-                    }
-                    // `ldc <Class>` — see the matching arm in the enclosing
-                    // method's resolver.
-                    ConstantPoolEntry::ClassReference { .. } => {
-                        Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                            holder_class_id: callee_cid.as_u32(),
-                            cp_idx,
-                        })
-                    }
-                    _ => None,
-                }
+                jit_ldc_constant_for(&cm, callee_cid, cp_idx)
             };
 
             // Compile callee without recursive inlining (None for callee_compiler)
@@ -6699,49 +6674,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // resolver in `try_jit_upgrade_with_gate`.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
-        let class = cm.get_class(cid)?;
-        match class.constant_pool.get(cp_idx)? {
-            ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: *v as i64,
-    is_float: false,
-})
-            }
-            ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate {
-    bits: v.to_bits() as i64,
-    is_float: true,
-})
-            }
-            ConstantPoolEntry::StringReference { string_index }
-                if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
-            {
-                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
-                // `(class, cp index)`. `get_utf8` is only the representability
-                // test the `get_utf8_wide` guard above pairs with -- a
-                // lone-surrogate literal cannot be pooled on a Rust `String`
-                // and stays uncompilable, exactly as before.
-                class
-                    .constant_pool
-                    .get_utf8(*string_index)
-                    .map(|_| cratonvm_jit::JitLdcConstant::String {
-                        holder_class_id: cid.as_u32(),
-                        cp_idx,
-                    })
-            }
-            // `ldc <Class>`: the mirror is a heap object and the target class
-            // may not be loaded yet, so report the SITE — referencing class id
-            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
-            // fetch the mirror at run time, the way the interpreter's own
-            // `ldc` handler does.
-            ConstantPoolEntry::ClassReference { .. } => {
-                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
-                    holder_class_id: cid.as_u32(),
-                    cp_idx,
-                })
-            }
-            _ => None,
-        }
+        jit_ldc_constant_for(&cm, cid, cp_idx)
     };
 
     let pgo_profile = {
