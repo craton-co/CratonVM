@@ -1,13 +1,19 @@
-# The native-shadow seal keeps `CompletableFuture` composition INTERPRETED — and that is the 442-872x
+# `CompletableFuture` composition runs INTERPRETED — `UniCompose.tryFire` is refused by the compiler with `reason=unrecorded`
 
 ## Status
-**OPEN (2026-08-24, blast radius measured 2026-08-26). Root cause identified by
-a native profile, not fixed.** The hibernate-reactive suite seals a median
-**1 010 methods per class** this way — 3.6 for every method the JIT ever
-tracks. But half of all seals are `<clinit>` (worthless to fix, including the
-single biggest cause), and the 483 that hit real methods come from **217
-distinct natives in a long tail** — 121 of them to reach 80%. De-registering
-cannot fix this; see "Consequence for the fix".
+**OPEN. The title's causal claim is RETRACTED (2026-08-26).** The seal is
+real and large — the hibernate-reactive suite seals a median **1 010 methods
+per class**, 3.6 for every method the JIT ever tracks — but it is **not** why
+`CompletableFuture` composition is slow. Turning the seal off with
+`CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL=0` changes the compile count by one
+method and the runtime by nothing.
+
+The real constraint is that the two hottest composition methods are ASKED and
+REFUSED: `CompletableFuture$UniCompose.tryFire` (97 716 invocations) and
+`UniRelay.tryFire` (58 612), both `compile-failed` with **`reason=unrecorded`**.
+See the CORRECTION at the bottom, which supersedes the causal argument in the
+sections above; those are kept because the blast-radius measurement and the
+`<clinit>` breakdown stand on their own.
 
 ## Severity
 **HIGH.** It is the reason `CompletableFuture` composition measures 442-872x
@@ -185,15 +191,79 @@ The cheap first probe: count how many of the 217 targets already HAVE a
 compiled-code fast path. Those are seals that could be lifted today with no new
 codegen at all.
 
-## What to try next
+## CORRECTION (2026-08-26): the seal is real but it is NOT why composition is slow
 
-1. **Count how many of the 217 targets already have a compiled-code fast
-   path.** Those seals could be lifted with no new codegen — the bind exists,
-   only the seal's opinion of it is stale.
-2. **Then make the seal ask.** `native_skip` is a scan for "does this method
-   call a shadowed native"; what it should ask is "does it call one the JIT
-   cannot emit". The `VarHandle` read/write/CAS binds are the existence proof
-   that the two questions differ.
-3. Do NOT pursue de-registration further. §6's seven pure delegations were the
-   whole population of that shape; the remaining head is `Map.get`,
-   `Object.hashCode` and `Function.apply`, which are not delegations.
+This page's original claim — that composition is interpreted BECAUSE of the
+native-shadow seal — is **wrong**, and the lever the seal's own comment asks
+for is what disproves it.
+
+`CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL=0` prices the ceiling. Interleaved on
+the compose probe:
+
+| seal | ms | ms |
+|---|---:|---:|
+| on | 12 482 | 11 574 |
+| off | 13 666 | 10 305 |
+
+Means 12.0 s against 12.0 s, with the off arm alone spanning 10.3-13.7 s.
+**Worth ~0**, which is exactly the outcome the seal's comment says should stop
+the per-SITE rewrite from being attempted.
+
+And it is not that the seal removal failed to take effect — it took effect and
+changed nothing that matters:
+
+| seal | methods tracked | compiles |
+|---|---:|---:|
+| on | 10 | c1=6 c2=3 osr=1 |
+| off | 9 | c1=5 c2=3 osr=1 |
+
+Removing the seal causes **no more methods to compile**. It was never the
+binding constraint on this workload.
+
+### What IS the constraint: the two hottest CF methods are REFUSED by the compiler
+
+`CRATONVM_DBG=jit-method-stats` names them:
+
+```
+99956  ineligible-by-policy  HibfixComposeProbe2.chain(...)
+       reason=singlepass-codegen/dup_x2-unprovable-form(pc=15,op=0x5b)
+97716  compile-failed  java/util/concurrent/CompletableFuture$UniCompose.tryFire(I)
+       tier_fail_count=3  reason=unrecorded
+58612  compile-failed  java/util/concurrent/CompletableFuture$UniRelay.tryFire(I)
+       tier_fail_count=3  reason=unrecorded
+```
+
+`UniCompose.tryFire` and `UniRelay.tryFire` ARE composition — they run every
+dependent stage. They are invoked ~98 000 and ~59 000 times, the compiler was
+ASKED and refused three times each, and **the reason is not recorded**.
+
+That is the whole story of the 872x, and it is a different defect from the seal:
+the seal excludes methods before asking; these two were asked and refused.
+
+### The cost structure underneath, for scale
+
+721 103 native invocations for 40 000 chains — **18 native crossings per
+chain**:
+
+| native | calls | per chain |
+|---|---:|---:|
+| `java/lang/Object.<init>` | 360 805 | **9** |
+| `java/lang/invoke/VarHandle.compareAndSet` | 158 180 | 4 |
+| `jdk/internal/misc/Unsafe.compareAndSetInt` | 100 000 | 2.5 |
+| `java/util/concurrent/CompletableFuture.complete` | 100 000 | 2.5 |
+
+At ~300 ns a crossing that is ~5 ns of 54 us per chain — a few percent, not the
+gap. The gap is the interpreter running `tryFire` because the compiler refused
+it.
+
+### What to do
+
+1. **Record the refusal reason.** `reason=unrecorded` on a method invoked
+   97 716 times is the diagnostic gap that matters; every hypothesis below it is
+   guesswork until the refusing site names itself.
+2. Then fix whatever it names, for `UniCompose.tryFire` first.
+3. `singlepass-codegen/dup_x2-unprovable-form` is a real codegen gap too,
+   though the method carrying it here is the probe's own.
+4. Do **not** pursue the seal's per-SITE rewrite on this evidence. The blast
+   radius above is real (1 010 methods per class) but the ceiling is ~0 here,
+   and the seal's own comment sets that as the bar.
