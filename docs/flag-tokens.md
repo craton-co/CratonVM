@@ -59,12 +59,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-492 tokens.
+493 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
 | `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
+| `ffm` | `CRATONVM_DBG_FFM` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
@@ -558,7 +559,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-232 tokens.
+233 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -721,6 +722,7 @@ export inherited from a parent shell.
 | `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
 | `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
+| `ffm-intrinsic` | `CRATONVM_JIT_NO_FFM_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
