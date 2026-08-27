@@ -1,9 +1,21 @@
-# Three `NullPointerException`s in randomized/property tests — not yet explained, not yet cross-checked against HotSpot
+# Three `NullPointerException`s in randomized/property tests — one confirmed real, two did not reproduce on a quiet host
 
 ## Status
-**OPEN, not root-caused.** New this session (2026-08-26 complete-suite ZGC×4-shard
-run, `dev` HEAD `3c09f9d93`). No existing doc anywhere in the repo mentions any of
-these three classes.
+**`LongLongHashMapTest.randomOperations` CONFIRMED real, moved to its own page:
+[`longlonghashmaptest-nullpointerexception-not-in-the-class-under-test-20260827.md`](longlonghashmaptest-nullpointerexception-not-in-the-class-under-test-20260827.md)
+— read that one for the current state. Kept here only for the other two
+classes' history and this page's own paper trail. Not root-caused to
+the exact mechanism. Reproduced identically on THREE separate runs now: the
+original 2026-08-26 contended 4-shard run, an isolated quiet single-shard rerun
+(2026-08-27), and a second quiet single-shard rerun after a fresh `dev` rebuild
+(2026-08-27, wall wasn't even close — same NPE, same line). Direct HotSpot A/B,
+same host, same classpath: **HotSpot `found=3 ok=3 failed=0` — clean pass, every
+time.** `ByteBufDerivationTest` and `DnsQueryContextTest` (below) did NOT
+reproduce on either quiet rerun — most likely they were contention/random-seed
+noise from the original run, not a stable defect. Original report and analysis
+follows; the class-under-test analysis for `LongLongHashMapTest` was WRONG (see
+correction below the class's original section) — keeping the original text
+since the correction is the useful part.
 
 ## Why these three are grouped together
 
@@ -44,7 +56,44 @@ would mean the two maps' key-sets have genuinely diverged, i.e. a real
 alternative (a harmless AssertJ overload-resolution artifact) has not been
 ruled out either.
 
-## 2. `io.netty.buffer.ByteBufDerivationTest.testMixture`
+### Correction (2026-08-27): wrong line, and the class under test cannot NPE at all
+
+The actual failing line, confirmed from two fresh reproductions, is
+`LongLongHashMapTest.java:80/81` — the OTHER branch (`!expected.containsKey(value)`):
+
+```java
+} else {
+    assertThat(actual.get(value)).isEqualTo(-1);        // :80
+    assertThat(actual.put(value, value)).isEqualTo(-1); // :81
+    expected.put(value, value);
+}
+```
+
+`LongLongHashMap` (`common/src/main/java/io/netty/util/internal/LongLongHashMap.java`)
+is a pure open-addressing `long[]`-backed map: `get`/`put`/`remove`/`index` touch
+only primitive `long` locals and one `long[]` field, never a reference type,
+never anything that can be `null`. **There is no expression in this class or
+this call site that can produce a `null` in ordinary Java semantics.** Whatever
+throws the NPE is happening inside CratonVM's own execution of this hot loop
+(6000 × 50 = 300,000 iterations, `assertThat(long)`-heavy, running long enough
+to get JIT-compiled) or inside AssertJ's own generic/overload-resolution
+machinery as CratonVM executes it — not inside the map implementation itself.
+Given how many raw logs this session show CratonVM's own GC guards firing on
+reference/primitive type-confusion in JIT-compiled code
+(`cratonvm::gc::guard`: "a non-reference value was stored into a slot the class
+declares as a REFERENCE", "a descriptor-aware field access DESTROYED the value
+it was handed") — both on paths *with* a guard catching them — this NPE is a
+plausible candidate for the same class of defect surfacing on a path *without*
+a guard. Not confirmed; needs a targeted repro (isolate `assertThat(long
+primitive).isEqualTo(int)` under heavy JIT compilation, off AssertJ, to see if
+it's CratonVM's own dispatch or AssertJ's overload resolution that's wrong)
+before this becomes more than an informed guess.
+
+## 2. `io.netty.buffer.ByteBufDerivationTest.testMixture` — did NOT reproduce on a quiet host
+
+Passed cleanly on both 2026-08-27 quiet single-shard reruns. Original report
+kept below for reference; treat as probable contention/random-seed noise from
+the original contended run unless it reappears.
 
 ```
 java.lang.NullPointerException
@@ -58,7 +107,9 @@ helper that presumably walks the derived buffer's unwrap chain — an NPE here
 could mean an unwrap chain terminated in `null` unexpectedly for some specific
 derivation combination the randomizer picked.
 
-## 3. `io.netty.resolver.dns.DnsQueryContextTest.writeQueryMustNotSendWhenIdSpaceExhausted`
+## 3. `io.netty.resolver.dns.DnsQueryContextTest.writeQueryMustNotSendWhenIdSpaceExhausted` — did NOT reproduce on a quiet host
+
+Also passed cleanly on both 2026-08-27 quiet reruns. Same caveat as above.
 
 ```
 java.lang.NullPointerException
@@ -82,13 +133,12 @@ but noted here in case a future investigation of the NPEs above turns up a
 shared root cause with unexpected extra/missing data.
 
 ## Not yet done
-- No isolated single-fork rerun of any of the three (all three occurred inside
-  a heavily-loaded 4-shard concurrent run — see the timing-margin page above
-  for this run's contention context; these three are called out separately
-  *because* an NPE at an assertion call site is a different, less
-  contention-explicable shape than a timeout or connection-refused).
-- No HotSpot cross-check.
-- No `-Dcraton.batch=1` isolated single-class repro attempted yet.
+- The exact CratonVM mechanism for `LongLongHashMapTest` is still not found —
+  only that it must be CratonVM's own execution (interpreter/JIT dispatch of
+  the `assertThat(long)`/AssertJ chain under this hot loop), not the class
+  under test. See the correction above for the specific next repro to try.
+- `ByteBufDerivationTest`/`DnsQueryContextTest` not retried a third time; if
+  either reappears, it stops being explainable as one-off noise.
 
 ## Repro
 
