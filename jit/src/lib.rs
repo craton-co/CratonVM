@@ -14968,6 +14968,7 @@ fn plan_scalar_replacement(
     reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
     info: &escape_analysis::ScalarReplacementInfo,
     deopt_descriptor_available: bool,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
 ) -> Option<EaScalarPlan> {
     let new_node = *reverse_map.get(&info.alloc_node)?;
     // An array candidate names an `Op::NewArray` and its slots are reached by
@@ -15123,6 +15124,16 @@ fn plan_scalar_replacement(
     // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
     // still applies: this costs the elided allocation, not the optimization.
     let mut elide_alloc = true;
+    // PINNED BY AN EARLIER ROUND'S DESCRIPTOR. Escape analysis is iterated
+    // (scalar replacement exposes scalar replacement), and a descriptor built
+    // in an earlier round can name this allocation as another object's FIELD
+    // VALUE. Deleting it now would leave that recipe pointing at a node the
+    // lowerer cannot resolve, and the object it describes would lose its
+    // materialization -- turning a resumable deopt point into an unresumable
+    // one. The pin is per-node and only ever grows.
+    if descriptor_pinned.contains(&new_node) {
+        elide_alloc = false;
+    }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
         // value a frame can be rebuilt from — but it is not this pass's business
@@ -15203,6 +15214,27 @@ fn apply_ea_to_ir(
     id_map: &[escape_analysis::NodeId],
     ea_result: &escape_analysis::EscapeAnalysisResult,
 ) {
+    apply_ea_to_ir_pinned(
+        ir_graph,
+        id_map,
+        ea_result,
+        &std::collections::HashSet::new(),
+    );
+}
+
+/// [`apply_ea_to_ir`] with the set of allocations an earlier round's deopt
+/// descriptor already names as a field value, and a count of the plans it
+/// applied.
+///
+/// The count is the iteration's stopping condition: a round that applies
+/// nothing has reached the fixed point and the next round would see the same
+/// graph.
+fn apply_ea_to_ir_pinned(
+    ir_graph: &mut ir::Graph,
+    id_map: &[escape_analysis::NodeId],
+    ea_result: &escape_analysis::EscapeAnalysisResult,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
+) -> usize {
     // Build reverse map: EA NodeId → IR NodeId
     let mut reverse_map: HashMap<escape_analysis::NodeId, ir::NodeId> = HashMap::new();
     for (ir_id, &ea_id) in id_map.iter().enumerate() {
@@ -15221,7 +15253,13 @@ fn apply_ea_to_ir(
     let mut plans: Vec<EaScalarPlan> = Vec::new();
     for info in &ea_result.scalar_replaceable {
         if let Some(plan) =
-            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+            plan_scalar_replacement(
+                ir_graph,
+                &reverse_map,
+                info,
+                deopt_descriptor_available,
+                descriptor_pinned,
+            )
         {
             plans.push(plan);
         }
@@ -15296,6 +15334,10 @@ fn apply_ea_to_ir(
     // A load whose zero default could not be spelled leaves its plan
     // unanswerable; drop the whole plan rather than apply it in part.
     plans.retain(|p| p.loads.iter().all(|(_, v)| v.is_some()));
+
+    // How many plans this call actually acts on. The iteration in
+    // `try_compile_inner` stops when a round acts on nothing.
+    let applied = plans.len();
 
     // ── Phase 2: collect victims, then apply in ascending node id ────
     //
@@ -15470,6 +15512,7 @@ fn apply_ea_to_ir(
         ir_graph.nodes[idx].op = ir::Op::Dead;
         ir_graph.nodes[idx].inputs.clear();
     }
+    applied
 }
 
 /// Build the [`ir_lower::ScalarReplacementMap`] that drives guard-surviving
@@ -15491,6 +15534,7 @@ fn build_scalar_replacement_map(
     ir_graph: &ir::Graph,
     id_map: &[escape_analysis::NodeId],
     ea_result: &escape_analysis::EscapeAnalysisResult,
+    descriptor_pinned: &std::collections::HashSet<ir::NodeId>,
 ) -> ir_lower::ScalarReplacementMap {
     let mut reverse_map: HashMap<escape_analysis::NodeId, ir::NodeId> = HashMap::new();
     for (ir_id, &ea_id) in id_map.iter().enumerate() {
@@ -15512,7 +15556,13 @@ fn build_scalar_replacement_map(
         // compiled frame did. `plan_scalar_replacement` is pure and runs on this
         // same pre-apply graph, so the two answers are the same answer.
         let elided =
-            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+            plan_scalar_replacement(
+                ir_graph,
+                &reverse_map,
+                info,
+                deopt_descriptor_available,
+                descriptor_pinned,
+            )
                 .is_some_and(|p| p.elide_alloc);
         if !elided {
             continue;
@@ -20804,119 +20854,183 @@ fn try_compile_inner(
                     note_jit_pipeline_stage(JIT_STAGE_EA);
     let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
-                    let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
-                    // Cold-path information (docs/jit/escape-analysis.md §6.3).
-                    // Without this `EscapeAnalysisResult::partial_escapes` is
-                    // always empty and `EscapeState::PartialEscape` is dead. It
-                    // is additive and reported-only: no acting consumer reads a
-                    // refined state, so an empty `ir_branch_hints` (profiling
-                    // off, the default) leaves the analysis byte-identical.
-                    ea_mark_cold_from_branch_hints(
-                        &mut ea_graph,
-                        &graph,
-                        &id_map,
-                        &ir_branch_hints,
-                    );
-                    let ea_result = escape_analysis::analyze_escapes(&ea_graph);
-                    // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
-                    // allocation-bearing method, report how many of its `new`s
-                    // escape analysis scalar-replaced. This proves the path is
-                    // actually exercised on real bytecode (a non-vacuous soak):
-                    // `scalar_replaceable < ir_news` means some `new` escaped and
-                    // the method will bail to single-pass via the surviving-New
-                    // gate below.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
-                        let ir_news = graph
-                            .nodes
-                            .iter()
-                            .filter(|n| {
-                                matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
-                            })
-                            .count();
-                        if ir_news > 0 {
-                            eprintln!(
-                                "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
-                                cached.class_name,
-                                cached.method_name,
-                                cached.method_descriptor,
-                                ea_result.scalar_replaceable.len(),
-                                ir_news,
-                            );
-                            // A count says how many objects survived; it does
-                            // not say which fact kept them. Report EVERY
-                            // allocation with its verdict, so a `0/N` is a lead
-                            // rather than the start of a guessing round -- and
-                            // so an allocation the analysis never even
-                            // CONSIDERED is visible rather than absent.
-                            let replaced: std::collections::HashSet<usize> = ea_result
-                                .scalar_replaceable
+                    // ── ESCAPE ANALYSIS IS ITERATED ──────────────────────
+                    //
+                    // Scalar replacement EXPOSES scalar replacement. The shape
+                    // that forced this is a wrapper object holding a small
+                    // array: the array's only non-element use is the `putfield`
+                    // that publishes it into the wrapper, so round 1 refuses it
+                    // (`StoredIntoAnotherObject`) while replacing the wrapper.
+                    // Round 1's applier then marks that store dead and forwards
+                    // every read of the field to the array node itself -- so in
+                    // round 2 the array has nothing but element accesses left
+                    // and is replaceable. One pass could only ever delete one of
+                    // the two allocations `new Short2()` makes.
+                    //
+                    // Each round is the same sound analysis run on a graph the
+                    // previous round left sound, so nothing here relaxes a
+                    // proof; the loop only gives the existing proof a second
+                    // look at a smaller problem. Bounded by `MAX_EA_ROUNDS`,
+                    // and it stops as soon as a round applies nothing -- which
+                    // is the overwhelmingly common case on the first round, so
+                    // a method with no replaceable allocation pays exactly one
+                    // analysis, as before.
+                    const MAX_EA_ROUNDS: usize = 3;
+                    // Allocations an already-built descriptor names as another
+                    // object's field value. A later round must not delete one:
+                    // the recipe would be left naming a node the lowerer cannot
+                    // resolve. Only ever grows.
+                    let mut descriptor_pinned: std::collections::HashSet<ir::NodeId> =
+                        std::collections::HashSet::new();
+                    for _ea_round in 0..MAX_EA_ROUNDS {
+                        let applied = {
+                        // Rebuilt every round: the previous round marked nodes
+                        // dead and rewired consumers, so last round's EA graph
+                        // and id_map describe a graph that no longer exists.
+                        let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                        let mut round_applied = 0usize;
+                        // Cold-path information (docs/jit/escape-analysis.md §6.3).
+                        // Without this `EscapeAnalysisResult::partial_escapes` is
+                        // always empty and `EscapeState::PartialEscape` is dead. It
+                        // is additive and reported-only: no acting consumer reads a
+                        // refined state, so an empty `ir_branch_hints` (profiling
+                        // off, the default) leaves the analysis byte-identical.
+                        ea_mark_cold_from_branch_hints(
+                            &mut ea_graph,
+                            &graph,
+                            &id_map,
+                            &ir_branch_hints,
+                        );
+                        let ea_result = escape_analysis::analyze_escapes(&ea_graph);
+                        // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
+                        // allocation-bearing method, report how many of its `new`s
+                        // escape analysis scalar-replaced. This proves the path is
+                        // actually exercised on real bytecode (a non-vacuous soak):
+                        // `scalar_replaceable < ir_news` means some `new` escaped and
+                        // the method will bail to single-pass via the surviving-New
+                        // gate below.
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                            let ir_news = graph
+                                .nodes
                                 .iter()
-                                .map(|i| i.alloc_node)
-                                .collect();
-                            for (ea_id, ea_node) in ea_graph.nodes.iter().enumerate() {
-                                let kind = match ea_node.op {
-                                    escape_analysis::Op::New { .. } => "new",
-                                    escape_analysis::Op::NewArray { .. } => "newarray",
-                                    _ => continue,
-                                };
-                                if replaced.contains(&ea_id) {
-                                    eprintln!(
-                                        "[cratonvm-scalarnew]   {} node {}: REPLACED",
-                                        kind, ea_id,
-                                    );
-                                } else if let Some((_, reason)) = ea_result
-                                    .scalar_refusals
+                                .filter(|n| {
+                                    matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. })
+                                })
+                                .count();
+                            if ir_news > 0 {
+                                eprintln!(
+                                    "[cratonvm-scalarnew] {}.{}{}: scalar-replaced {}/{} alloc(s)",
+                                    cached.class_name,
+                                    cached.method_name,
+                                    cached.method_descriptor,
+                                    ea_result.scalar_replaceable.len(),
+                                    ir_news,
+                                );
+                                // A count says how many objects survived; it does
+                                // not say which fact kept them. Report EVERY
+                                // allocation with its verdict, so a `0/N` is a lead
+                                // rather than the start of a guessing round -- and
+                                // so an allocation the analysis never even
+                                // CONSIDERED is visible rather than absent.
+                                let replaced: std::collections::HashSet<usize> = ea_result
+                                    .scalar_replaceable
                                     .iter()
-                                    .find(|(a, _)| *a == ea_id)
-                                {
-                                    eprintln!(
-                                        "[cratonvm-scalarnew]   {} node {}: refused {:?}",
-                                        kind, ea_id, reason,
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "[cratonvm-scalarnew]   {} node {}: NOT CONSIDERED",
-                                        kind, ea_id,
-                                    );
+                                    .map(|i| i.alloc_node)
+                                    .collect();
+                                for (ea_id, ea_node) in ea_graph.nodes.iter().enumerate() {
+                                    let kind = match ea_node.op {
+                                        escape_analysis::Op::New { .. } => "new",
+                                        escape_analysis::Op::NewArray { .. } => "newarray",
+                                        _ => continue,
+                                    };
+                                    if replaced.contains(&ea_id) {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: REPLACED",
+                                            kind, ea_id,
+                                        );
+                                    } else if let Some((_, reason)) = ea_result
+                                        .scalar_refusals
+                                        .iter()
+                                        .find(|(a, _)| *a == ea_id)
+                                    {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: refused {:?}",
+                                            kind, ea_id, reason,
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[cratonvm-scalarnew]   {} node {}: NOT CONSIDERED",
+                                            kind, ea_id,
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    // Gated on `lock_elisions`, not the flat `elide_locks`, for
-                    // the same reason `apply_ea_to_ir` reads the grouped view:
-                    // one source of truth. The two are the same offers (the flat
-                    // list is their union), so this is not a behaviour change.
-                    if !ea_result.scalar_replaceable.is_empty()
-                        || !ea_result.lock_elisions.is_empty()
-                    {
-                        // Capture guard-surviving-SR metadata (gated) BEFORE
-                        // `apply_ea_to_ir` marks the News/stores dead and clears
-                        // their (control) inputs — the dominance gate needs them.
-                        if scalar_deopt_enabled()
-                            && deopt_real_enabled()
-                            && !ea_result.scalar_replaceable.is_empty()
+                        // Gated on `lock_elisions`, not the flat `elide_locks`, for
+                        // the same reason `apply_ea_to_ir` reads the grouped view:
+                        // one source of truth. The two are the same offers (the flat
+                        // list is their union), so this is not a behaviour change.
+                        if !ea_result.scalar_replaceable.is_empty()
+                            || !ea_result.lock_elisions.is_empty()
                         {
-                            sr_map =
-                                Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
-                        }
-                        apply_ea_to_ir(&mut graph, &id_map, &ea_result);
-                        // Stop charging EA here: the verifier run below is its
-                        // own phase and must not be billed to escape analysis.
-                        drop(metrics_ea);
-                        // `apply_ea_to_ir` is a mutating pass: it kills the
-                        // scalar-replaced allocation, its stores and its loads,
-                        // and rewires their consumers. Verify the result under
-                        // the same per-pass gate as `ir_optimize`.
-                        if ir_verify::verify_enabled() {
-                            ir_verify_bail |= ir_verify_reject(
-                                &graph,
-                                "post-escape-analysis",
-                                &cached.class_name,
-                                &cached.method_name,
-                                &cached.method_descriptor,
+                            // Capture guard-surviving-SR metadata (gated) BEFORE
+                            // `apply_ea_to_ir` marks the News/stores dead and clears
+                            // their (control) inputs — the dominance gate needs them.
+                            if scalar_deopt_enabled()
+                                && deopt_real_enabled()
+                                && !ea_result.scalar_replaceable.is_empty()
+                            {
+                                let round_map = build_scalar_replacement_map(
+                                    &graph,
+                                    &id_map,
+                                    &ea_result,
+                                    &descriptor_pinned,
+                                );
+                                // Every node a recipe names as a field value is
+                                // pinned for every later round -- see
+                                // `plan_scalar_replacement`'s pin check.
+                                for vo in round_map.objects.values() {
+                                    for fv in vo.field_values.iter().flatten() {
+                                        descriptor_pinned.insert(*fv);
+                                    }
+                                }
+                                // MERGE, not replace: a round only describes the
+                                // objects IT replaced, and the lowerer needs
+                                // every round's.
+                                match sr_map.as_mut() {
+                                    Some(acc) => acc.objects.extend(round_map.objects),
+                                    None => sr_map = Some(round_map),
+                                }
+                            }
+                            round_applied = apply_ea_to_ir_pinned(
+                                &mut graph,
+                                &id_map,
+                                &ea_result,
+                                &descriptor_pinned,
                             );
+                            // `apply_ea_to_ir` is a mutating pass: it kills the
+                            // scalar-replaced allocation, its stores and its loads,
+                            // and rewires their consumers. Verify the result under
+                            // the same per-pass gate as `ir_optimize`.
+                            if ir_verify::verify_enabled() {
+                                ir_verify_bail |= ir_verify_reject(
+                                    &graph,
+                                    "post-escape-analysis",
+                                    &cached.class_name,
+                                    &cached.method_name,
+                                    &cached.method_descriptor,
+                                );
+                            }
+                        }
+                        round_applied
+                        };
+                        if applied == 0 {
+                            break;
                         }
                     }
+                    // Stop charging EA here: the verifier runs below are their
+                    // own phases and must not be billed to escape analysis.
+                    drop(metrics_ea);
                     // Recorded on BOTH paths — EA that scalar-replaced nothing
                     // still ran, and `nodes_before == nodes_after` is the
                     // finding, not a missing measurement.
