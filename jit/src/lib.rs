@@ -15335,10 +15335,6 @@ fn apply_ea_to_ir_pinned(
     // unanswerable; drop the whole plan rather than apply it in part.
     plans.retain(|p| p.loads.iter().all(|(_, v)| v.is_some()));
 
-    // How many plans this call actually acts on. The iteration in
-    // `try_compile_inner` stops when a round acts on nothing.
-    let applied = plans.len();
-
     // ── Phase 2: collect victims, then apply in ascending node id ────
     //
     // Ascending order matters for the splice: a victim's incoming token is an
@@ -15422,6 +15418,13 @@ fn apply_ea_to_ir_pinned(
         }
     }
 
+    // How many NODES this call actually retires. The iteration in
+    // `try_compile_inner` stops when a round retires nothing -- which is the
+    // honest fixed-point signal. Counting PLANS is not: a plan whose
+    // `elide_alloc` was refused and whose loads were already forwarded by an
+    // earlier round retires nothing, and counting it would spin the loop to its
+    // bound on a graph that stopped changing.
+    let applied = victims.len();
     victims.sort_by_key(|&(id, _)| id);
     victims.dedup_by_key(|&mut (id, _)| id);
 
