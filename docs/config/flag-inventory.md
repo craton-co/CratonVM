@@ -1294,6 +1294,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_SCALAR_NEW` | JIT | `CRATONVM_JIT=scalar-new` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_SELF_TAILCALL` | JIT | `CRATONVM_JIT=self-tailcall` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SITE_CACHE` | JIT | `CRATONVM_JIT=site-cache` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_SPILL_NARROW` | JIT | `CRATONVM_JIT=spill-narrow` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SP_IC_DENY` | JIT | `CRATONVM_JIT=sp-ic-deny` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` | JIT | `CRATONVM_JIT=sp-ic-deopt-check` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SP_IC_ONLY` | JIT | `CRATONVM_JIT=sp-ic-only` | opt-in | off | behaviour | snapshot | jit |

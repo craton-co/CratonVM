@@ -250,11 +250,24 @@ impl Compiler {
             // arg registers here does not perturb the pending call's arguments.
             // Default path is unchanged (`=1` → callee-saved only).
             if self.safepoint_reg_spill_all {
+                let narrow = self.oop_capable_spill_regs();
+                self.pending_narrow_spill = narrow;
+                // Cast: `count_ones` is at most 14, well inside u64.
+                let kept = narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| {
+                    u64::from(m.count_ones())
+                });
+                crate::metrics::note_spill_width(
+                    kept,
+                    ALL_SPILL_GPRS.len() as u64,
+                    narrow.is_none(),
+                );
                 if sink {
-                    self.emit_blind_reg_spill(|reg| ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+                    self.emit_blind_reg_spill(|reg| {
+                        ALLOC_FAST_PATH_CLOBBERS.contains(&reg) && Self::spill_selects(narrow, reg)
+                    });
                     self.deferred_alloc_blind_spill = true;
                 } else {
-                    self.emit_blind_reg_spill(|_| true);
+                    self.emit_blind_reg_spill(|reg| Self::spill_selects(narrow, reg));
                 }
             } else {
                 for i in 0..self.alloc_used_regs.len() {
@@ -296,6 +309,85 @@ impl Compiler {
         }
     }
 
+    /// The registers that can hold an oop at THIS safepoint, as a bitmask over
+    /// [`ALL_SPILL_GPRS`] positions. `None` means "cannot prove anything here"
+    /// and keeps the full fourteen-store copy.
+    ///
+    /// Four sources, and the first two are the reason `=all` exists at all
+    /// (`Compiler::new`: "a receiver/args staged into ARG_REGS immediately
+    /// before a GC-capable call ... which the callee-saved-only spill never
+    /// covers"):
+    ///
+    ///  1. `RAX` — where the emitter materialises every loaded/allocated/
+    ///     returned reference before it is pushed or stored;
+    ///  2. every `ARG_REGS` member — a staged receiver or reference argument;
+    ///  3. the register home of any local the method-wide reference mask says
+    ///     can hold a reference (`register_homed_reference_locals` indexed
+    ///     through `local_assignments`);
+    ///  4. any register currently holding an operand-stack entry, oop-marked or
+    ///     not — cheaper to keep than to reason about, and `self.stack` is
+    ///     short.
+    ///
+    /// What is dropped is a register hosting a local the mask says is
+    /// primitive, and a register this method's model never put anything in
+    /// (R10/R11 on SysV, plus unused local homes). See
+    /// [`narrow_safepoint_spill_enabled`] for what that gives up and why the
+    /// stale slot it leaves behind is safe.
+    fn oop_capable_spill_regs(&self) -> Option<u16> {
+        if !narrow_safepoint_spill_enabled() {
+            return None;
+        }
+        // An explicit `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` is a request for
+        // the full blind copy; honour it literally.
+        if safepoint_reg_spill_all() {
+            return None;
+        }
+        let plan = self.safepoint_publish.as_ref()?;
+        // The mask cannot represent locals >= 64. `color_graph` never gives one
+        // a register home, so no register is actually at risk -- but this is a
+        // root-visibility decision, so it fails closed rather than reasoning.
+        if self.num_locals > 64 {
+            return None;
+        }
+        let bit = |reg: u8| -> u16 {
+            match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                // Cast: position < 14 < 16, so the shift is in range.
+                Some(i) => 1u16 << i,
+                None => 0,
+            }
+        };
+        let mut keep = bit(RAX);
+        for &r in ARG_REGS.iter() {
+            keep |= bit(r);
+        }
+        let refs = plan.register_homed_reference_locals;
+        for (idx, home) in self.local_assignments.iter().enumerate().take(64) {
+            if refs & (1u64 << idx) != 0 {
+                if let Some(reg) = *home {
+                    keep |= bit(reg);
+                }
+            }
+        }
+        for slot in self.stack.iter() {
+            match *slot {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => keep |= bit(r),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        Some(keep)
+    }
+
+    /// `true` when `reg` is selected by `mask` (`None` selects everything).
+    fn spill_selects(mask: Option<u16>, reg: u8) -> bool {
+        match mask {
+            None => true,
+            Some(m) => match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                Some(i) => m & (1u16 << i) != 0,
+                None => false,
+            },
+        }
+    }
+
     /// Emit the `=all` blind GPR spill for the registers `want` selects, into
     /// their fixed `reg_spill_base + i*8` slots. The slot layout is indexed by
     /// position in [`ALL_SPILL_GPRS`] and does not depend on the selection, so a
@@ -323,7 +415,11 @@ impl Compiler {
         if !std::mem::take(&mut self.deferred_alloc_blind_spill) || self.failed {
             return false;
         }
-        self.emit_blind_reg_spill(|reg| !ALLOC_FAST_PATH_CLOBBERS.contains(&reg));
+        // The SAME selection the safepoint made -- see `pending_narrow_spill`.
+        let narrow = self.pending_narrow_spill;
+        self.emit_blind_reg_spill(|reg| {
+            !ALLOC_FAST_PATH_CLOBBERS.contains(&reg) && Self::spill_selects(narrow, reg)
+        });
         true
     }
 
