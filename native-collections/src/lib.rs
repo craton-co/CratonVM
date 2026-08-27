@@ -72610,6 +72610,184 @@ mod tests {
                 .remove(&overlay_key);
         }
 
+        /// Give an overlay-touching test its own pointer range: the side tables
+        /// are process-global and keyed by an identity hash the mock derives
+        /// from the raw pointer, and every `MockCtx` starts allocating at the
+        /// same address. Same reason as
+        /// `int_overlay_refuses_a_foreign_wrapper_class`, hoisted so the
+        /// generation tests below can share it.
+        fn spread_mock_pointers(ctx: &mut MockCtx) {
+            static PTR_SPREAD: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(1024);
+            let pad = PTR_SPREAD.fetch_add(256, std::sync::atomic::Ordering::Relaxed);
+            let filler = ClassId::new(2130);
+            ctx.define_class(filler, "java/lang/Object");
+            for _ in 0..pad {
+                let _ = ctx.alloc_object(filler, 0);
+            }
+        }
+
+        /// A class declares `modCount`; an object of that class may still not
+        /// HAVE that slot.
+        ///
+        /// This is the whole defect in one assertion. `resolve_field_index_by_class_id`
+        /// answers 5 for every `java/util/HashMap` receiver, including ones
+        /// allocated with fewer fields than the class declares — and the by-name
+        /// accessors this replaced applied no bound, so the write was dropped
+        /// and the read answered a constant. `view_source_generation` reads a
+        /// constant as "this map reports when it changes".
+        #[test]
+        fn mod_count_slot_is_bounded_by_the_objects_own_fields() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+
+            let full = ctx.alloc_object_of(HASHMAP_CID, 8);
+            assert_eq!(
+                map_mod_count_slot(&ctx, full),
+                Some(5),
+                "a receiver with the slot reports it"
+            );
+
+            let starved = ctx.alloc_object_of(HASHMAP_CID, 3);
+            assert_eq!(
+                map_mod_count_slot(&ctx, starved),
+                None,
+                "slot 5 is past this receiver's three fields, so it has no \
+                 generation at all — and `None` is what makes every reader \
+                 rebuild instead of trusting a frozen counter"
+            );
+        }
+
+        /// The writer and the reader must agree about which receivers HAVE a
+        /// generation. A reader that accepts what the writer cannot reach
+        /// reports "unchanged" forever.
+        #[test]
+        fn the_generation_reader_accepts_exactly_what_the_writer_can_move() {
+            let mut ctx = MockCtx::new(1);
+            define_real_hashmap(&ctx);
+
+            let full = ctx.alloc_object_of(HASHMAP_CID, 8);
+            ctx.set_field(full, 5, Value::Int(0));
+            bump_map_mod_count(&ctx, full);
+            bump_map_mod_count(&ctx, full);
+            assert_eq!(
+                map_itr_mod_count(&ctx, full),
+                Some(2),
+                "two structural mutations, two generations"
+            );
+
+            let starved = ctx.alloc_object_of(HASHMAP_CID, 3);
+            bump_map_mod_count(&ctx, starved);
+            assert_eq!(
+                map_itr_mod_count(&ctx, starved),
+                None,
+                "the writer could not move this receiver, so the reader must \
+                 not hand `view_source_generation` a number for it"
+            );
+        }
+
+        /// An overlay insert is a structural modification of the `HashMap` the
+        /// overlay stands in for, and has to move the generation the keySet-view
+        /// rebuild elision reads — otherwise the view freezes at whatever it
+        /// held when it was built, `keySet().size()` disagrees with the same
+        /// view's iterator, and ecj's `getFramePositions` throws
+        /// `ArrayIndexOutOfBoundsException` with index == length.
+        ///
+        /// A value-replacing put moves nothing, exactly as on HotSpot
+        /// (`probes/MapModCountProbe2`: `put=5 remove=6 replace=6`).
+        #[test]
+        fn an_overlay_put_moves_the_generation_only_when_it_is_structural() {
+            let mut ctx = MockCtx::new(1);
+            spread_mock_pointers(&mut ctx);
+            define_real_hashmap(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            ctx.set_field(map, 5, Value::Int(0));
+
+            let k1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2131),
+                "java/lang/Integer",
+                Value::Int(7),
+            );
+            let k2 = ctx.alloc_object_of(ClassId::new(2131), 1);
+            ctx.set_field(k2, 0, Value::Int(9));
+
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(k1)), Value::Int(1))
+                    .is_some(),
+                "a fresh exact HashMap with an Integer key takes the overlay"
+            );
+            assert_eq!(
+                map_itr_mod_count(&ctx, map),
+                Some(1),
+                "a new key is structural"
+            );
+
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(k1)), Value::Int(2))
+                    .is_some()
+            );
+            assert_eq!(
+                map_itr_mod_count(&ctx, map),
+                Some(1),
+                "replacing a value changes no key — HotSpot does not bump here \
+                 either, and an entrySet view is already refused a generation"
+            );
+
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(k2)), Value::Int(3))
+                    .is_some()
+            );
+            assert_eq!(
+                map_itr_mod_count(&ctx, map),
+                Some(2),
+                "a second new key is structural too"
+            );
+
+            // Leave the process-global overlay as we found it.
+            hm_int_fast_purge(&ctx, map);
+        }
+
+        /// `hm_int_fast_purge` is what makes a field-by-field map reset actually
+        /// empty the map. Nothing that writes the bucket array, the size slot or
+        /// the `modCount` slot touches the overlay, and `native_map_size` prefers
+        /// the overlay's count — so a keySet view's backing, rebuilt through
+        /// exactly those field writes, reported a high-water mark until this
+        /// ran on it.
+        #[test]
+        fn purging_the_overlay_is_what_makes_a_field_reset_empty_the_map() {
+            let mut ctx = MockCtx::new(1);
+            spread_mock_pointers(&mut ctx);
+            define_real_hashmap(&ctx);
+            let map = ctx.alloc_object_of(HASHMAP_CID, 8);
+            ctx.set_field(map, 5, Value::Int(0));
+            let key = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2132),
+                "java/lang/Integer",
+                Value::Int(4),
+            );
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(key)), Value::Int(1))
+                    .is_some()
+            );
+            assert_eq!(hm_int_fast_len(&ctx, map), Some(1));
+
+            // The three writes a view-backing rebuild makes.
+            let buckets = ctx.new_ref_array(ClassId::new(0), 16);
+            publish_map_table(&mut ctx, map, buckets, 16);
+            try_set_jdk_map_field(&mut ctx, map, "modCount", Value::Int(0));
+            set_map_size(&mut ctx, map, 0);
+            assert_eq!(
+                hm_int_fast_len(&ctx, map),
+                Some(1),
+                "none of them reach the overlay — this is the bug, stated"
+            );
+
+            assert!(hm_int_fast_purge(&ctx, map), "the purge reports what it dropped");
+            assert_eq!(hm_int_fast_len(&ctx, map), None, "now the map is empty");
+        }
+
         // ===============================================================
         // Receiver classification memo
         // (perf/collections-classification-cost)
