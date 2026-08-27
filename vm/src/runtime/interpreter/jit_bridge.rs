@@ -4467,7 +4467,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // rule needs. Returns `None` (no override) whenever the redirect does
     // not apply, which is the overwhelming majority of `invokespecial` sites
     // (constructors, private methods, ordinary direct-superclass supers).
-    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+    let invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -4484,7 +4484,43 @@ pub(super) fn try_jit_upgrade_with_gate(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+        // method selects exactly that method: no override lookup, no walk up
+        // from the receiver. javac emits 0xb6 for a call to a private instance
+        // method from Java 11 on (JEP 181 nestmates), where it used to emit
+        // `invokespecial` -- so this is now the ordinary encoding of
+        // `this.somePrivateHelper()`, including the
+        // constructor-calls-its-own-`init()` shape that
+        // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+        // `HttpClientOptions` all use, one per level of the same chain.
+        //
+        // Answering here reclassifies the site as a DIRECT bind at the
+        // declaring class, which is what stops the compiled dispatchers
+        // resolving it from the receiver and landing on the most-derived
+        // same-named private method.
+        //
+        // Access control makes the answer precise rather than a guess: a
+        // private method is invocable only from the class that declares it, so
+        // the constant pool's owner name is this compiling class itself and no
+        // loader-blind name lookup is in play.
+        if opcode == 0xb6 {
+            let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
+            let store = cm.class_store();
+            let (method, declaring_id) = crate::classloading::find_method_recursive(
+                cp_class_id,
+                method_name,
+                descriptor,
+                store,
+            )?;
+            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return None;
+            }
+            return store.get(declaring_id).map(|c| c.name.to_string());
+        }
+        if opcode != 0xb7 {
+            return None;
+        }
         let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(
@@ -4997,7 +5033,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // `try_compile`'s doc comment. `callee_cid` is the class whose
             // bytecode is being compiled here (the eagerly-compiled callee),
             // i.e. the calling class for every invoke site in ITS bytecode.
-            let c_invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+            let c_invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -5014,7 +5050,43 @@ pub(super) fn try_jit_upgrade_with_gate(
                     _ => return None,
                 };
                 let target_class = class.constant_pool.get_class_name(class_idx)?;
-                let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+                // method selects exactly that method: no override lookup, no walk up
+                // from the receiver. javac emits 0xb6 for a call to a private instance
+                // method from Java 11 on (JEP 181 nestmates), where it used to emit
+                // `invokespecial` -- so this is now the ordinary encoding of
+                // `this.somePrivateHelper()`, including the
+                // constructor-calls-its-own-`init()` shape that
+                // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+                // `HttpClientOptions` all use, one per level of the same chain.
+                //
+                // Answering here reclassifies the site as a DIRECT bind at the
+                // declaring class, which is what stops the compiled dispatchers
+                // resolving it from the receiver and landing on the most-derived
+                // same-named private method.
+                //
+                // Access control makes the answer precise rather than a guess: a
+                // private method is invocable only from the class that declares it, so
+                // the constant pool's owner name is this compiling class itself and no
+                // loader-blind name lookup is in play.
+                if opcode == 0xb6 {
+                    let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
+                    let store = cm.class_store();
+                    let (method, declaring_id) = crate::classloading::find_method_recursive(
+                        cp_class_id,
+                        method_name,
+                        descriptor,
+                        store,
+                    )?;
+                    if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                        return None;
+                    }
+                    return store.get(declaring_id).map(|c| c.name.to_string());
+                }
+                if opcode != 0xb7 {
+                    return None;
+                }
                 let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
                 let store = cm.class_store();
                 let start = crate::classloading::invokespecial_selection_start(
@@ -6391,7 +6463,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // `invokespecial_owner_resolver` above / `try_compile`'s doc comment.
     // `cid` is this callee's own declaring class, i.e. the calling class for
     // every invoke site scanned in its bytecode.
-    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+    let invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
@@ -6408,7 +6480,43 @@ pub(super) fn try_jit_compile_callee_slow(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+        // method selects exactly that method: no override lookup, no walk up
+        // from the receiver. javac emits 0xb6 for a call to a private instance
+        // method from Java 11 on (JEP 181 nestmates), where it used to emit
+        // `invokespecial` -- so this is now the ordinary encoding of
+        // `this.somePrivateHelper()`, including the
+        // constructor-calls-its-own-`init()` shape that
+        // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+        // `HttpClientOptions` all use, one per level of the same chain.
+        //
+        // Answering here reclassifies the site as a DIRECT bind at the
+        // declaring class, which is what stops the compiled dispatchers
+        // resolving it from the receiver and landing on the most-derived
+        // same-named private method.
+        //
+        // Access control makes the answer precise rather than a guess: a
+        // private method is invocable only from the class that declares it, so
+        // the constant pool's owner name is this compiling class itself and no
+        // loader-blind name lookup is in play.
+        if opcode == 0xb6 {
+            let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
+            let store = cm.class_store();
+            let (method, declaring_id) = crate::classloading::find_method_recursive(
+                cp_class_id,
+                method_name,
+                descriptor,
+                store,
+            )?;
+            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return None;
+            }
+            return store.get(declaring_id).map(|c| c.name.to_string());
+        }
+        if opcode != 0xb7 {
+            return None;
+        }
         let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(

@@ -15704,6 +15704,23 @@ pub fn osr_entry_reject_count() -> usize {
     osr_entry_rejects().read().len()
 }
 
+/// Compiled call sites reclassified from `invokevirtual` to a direct,
+/// non-dispatching bind because the constant pool resolved them to a **private**
+/// method (JVMS 5.4.6; javac has emitted `invokevirtual` for such calls since
+/// Java 11 / JEP 181).
+///
+/// This is the ENGAGEMENT counter for that reclassification. Without it, "the
+/// probe passes now" cannot be told apart from "no site on this workload was
+/// one" — and the shape is common enough that a zero on a large workload would
+/// itself be the finding.
+pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`PRIVATE_INVOKEVIRTUAL_PINNED`].
+pub fn private_invokevirtual_pinned() -> u64 {
+    PRIVATE_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
 /// `None` = disabled.
 ///
@@ -16690,7 +16707,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // returns `None` for a given site — the overwhelmingly common case)
     // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
     // `classloading::invokespecial_selection_start` for the algorithm.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
@@ -17996,7 +18013,7 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     // See `try_compile_with_invokespecial_resolver`.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
@@ -19236,9 +19253,24 @@ fn try_compile_inner(
                         // method on single-pass — the builder bails on an invoke
                         // with no `invoke_info` entry.
                         let is_static = opcode == 0xb8;
-                        let is_special = opcode == 0xb7;
-                        let is_virtual = opcode == 0xb6;
+                        // JVMS 5.4.6 — an `invokevirtual` resolving to a PRIVATE
+                        // method is not a dispatch site; see the matching note
+                        // in the single-pass invoke loop below. The optimizing
+                        // tier has to make the same reclassification, and make
+                        // it HERE, before `is_virtual`/`is_special` feed the
+                        // direct-bind decision and the baked `invoke_kind`.
+                        let private_virtual_owner: Option<String> = if opcode == 0xb6 {
+                            cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode))
+                        } else {
+                            None
+                        };
+                        let is_special = opcode == 0xb7 || private_virtual_owner.is_some();
+                        let is_virtual = opcode == 0xb6 && private_virtual_owner.is_none();
                         let is_interface = opcode == 0xb9;
+                        if private_virtual_owner.is_some() {
+                            PRIVATE_INVOKEVIRTUAL_PINNED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if !((is_static && ir_emit_calls)
                             || (is_special && ir_emit_special_calls)
                             || ((is_virtual || is_interface) && ir_emit_virtual_calls))
@@ -19527,10 +19559,10 @@ fn try_compile_inner(
                         // check exists to catch.
                         let mut direct_target_is_thin_helper = false;
                         if ir_direct && (is_static || is_special) && !is_self_recursive {
-                            let special_owner: Option<String> = if is_special {
-                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
+                            let special_owner: Option<String> = if opcode == 0xb7 {
+                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode))
                             } else {
-                                None
+                                private_virtual_owner.clone()
                             };
                             let direct_class: &str =
                                 special_owner.as_deref().unwrap_or(cn.as_str());
@@ -20909,12 +20941,48 @@ fn try_compile_inner(
             let Some((class_name, method_name, descriptor)) = resolver(cp_idx) else {
                 jitc_bail!("invoke_resolve")
             };
-            let invoke_kind = match opcode {
+            let mut invoke_kind = match opcode {
                 0xb6 => 0u8,
                 0xb7 => 1,
                 0xb9 => 2,
                 _ => 3,
             };
+            // JVMS 5.4.6: an `invokevirtual` that RESOLVES TO A PRIVATE METHOD
+            // selects that method, with no override lookup at all.
+            //
+            // javac has emitted `invokevirtual` for a call to a private instance
+            // method since Java 11 (JEP 181 nestmates) — before that it emitted
+            // `invokespecial`. The opcode changed; the semantics did not. Every
+            // dispatcher downstream of `invoke_kind == 0` resolves by walking up
+            // from the RECEIVER's class, so on such a site it finds the
+            // most-derived same-named private method and calls THAT.
+            //
+            // The shape is ordinary and common: a class whose constructor calls
+            // its own `private void init()`, subclassed by a class that does the
+            // same. `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+            // `HttpClientOptions` are three such levels in one chain, and the
+            // consequence is that constructing a `WebClientOptions` runs
+            // `HttpClientOptions.init()` three times and `TCPSSLOptions.init()`
+            // never — leaving `transportOptions` null, which surfaces much later
+            // as a null `other` in `TcpConfig`'s copy constructor
+            // (`known-issues/jit/bg-compile-off-nulls-a-reference-argument-…`).
+            //
+            // A private target is not a dispatch site, so it takes the same
+            // route `invokespecial` does: bind exactly, at the resolved owner.
+            let class_name = if invoke_kind == 0 {
+                match cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode)) {
+                    Some(owner) => {
+                        invoke_kind = 1;
+                        PRIVATE_INVOKEVIRTUAL_PINNED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        owner
+                    }
+                    None => class_name,
+                }
+            } else {
+                class_name
+            };
+            let invoke_kind = invoke_kind;
             if dbg_intrinsic_enabled() {
                 eprintln!(
                     "[cratonvm-intrinsic] single-pass site {class_name}.{method_name}{descriptor} @pc={pc} kind={invoke_kind}"
@@ -20928,9 +20996,9 @@ fn try_compile_inner(
             // recursive-call check, inlining, direct-callee compile, and the
             // `JitInvokeInfo` baked into the compiled code), so a wrong
             // target is never baked into any of them.
-            let class_name = if invoke_kind == 1 {
+            let class_name = if invoke_kind == 1 && opcode == 0xb7 {
                 cp_invokespecial_owner_resolver
-                    .and_then(|r| r(cp_idx))
+                    .and_then(|r| r(cp_idx, opcode))
                     .unwrap_or(class_name)
             } else {
                 class_name
