@@ -6681,6 +6681,105 @@ unsafe fn jit_field_cell_ptr(
     ((obj_ptr as *mut u8).add(HEADER_SIZE + off), storage)
 }
 
+/// `CRATONVM_DBG_WATCH_PUN=<class-name-substring>:<slot>` — the parsed watch,
+/// for the **compiled store side**.
+///
+/// # Why this exists separately from the collector's copy of the same watch
+///
+/// `ZgcRealHeap::set_field_no_card` already carries a writer-side trap under
+/// this exact variable, and the punned-`SQLChar.rawData` investigation used it
+/// to conclude that nothing writes slot 1 at all: a run that demonstrably
+/// produced the punned cell fired that watch **6879 times for slot 2** (the
+/// positive control) and **zero times for slot 1**.
+///
+/// That conclusion followed from a false premise. The page recording it states
+/// that "the `jit_putfield_*` helpers call `heap.set_field`" and are therefore
+/// covered. They do not, and they are not: every one of [`jit_putfield_int`],
+/// [`jit_putfield_long`], [`jit_putfield_float`] and [`jit_putfield_double`]
+/// resolves the cell itself with [`jit_field_cell_ptr`] and writes it with
+/// `write_value_atomic` / `write_compact_field` — no accessor, no lock, and no
+/// watch. The collector-side trap is blind to the entire compiled putfield
+/// family, which is exactly the population a JIT-written punned cell comes
+/// from.
+///
+/// So the measured `0` was never evidence of absence; it was an instrument
+/// pointed where the writer cannot be. This is the same watch, on the path the
+/// other one cannot see.
+fn jit_putfield_pun_watch() -> Option<&'static (String, usize)> {
+    static W: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let spec = cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_PUN").ok()?;
+        let (class, slot) = spec.rsplit_once(':')?;
+        Some((class.to_string(), slot.parse().ok()?))
+    })
+    .as_ref()
+}
+
+/// How many primitive stores compiled code made into a slot its class declares
+/// a **reference**. Counted only while [`jit_putfield_pun_watch`] is armed —
+/// the reference-ness lookup re-reads the class-layout registry, which is not
+/// something to put on the hot putfield path unmeasured.
+pub static JIT_PUTFIELD_PRIMITIVE_INTO_REF_SLOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Report a watched compiled field store, naming the compiled method that made
+/// it and the frames underneath.
+///
+/// `Backtrace::force_capture` gives ~40 symbolized frames on Linux, which is
+/// what turns "a punned cell exists" into "this method wrote it".
+///
+/// # Safety
+/// `obj_ptr` must name a live object whose header is readable, and
+/// `field_index` must already be bounds-checked against its slot count.
+#[cold]
+unsafe fn report_jit_punned_putfield(obj_ptr: i64, field_index: i64, value: Value) {
+    let Some((want_class, want_slot)) = jit_putfield_pun_watch() else {
+        return;
+    };
+    if field_index < 0 || field_index as usize != *want_slot {
+        return;
+    }
+    let class_id = std::ptr::read(obj_ptr as *const u32);
+    let name = cratonvm_gc::collector::class_name_for_diagnostics(class_id);
+    if !name.contains(want_class.as_str()) {
+        return;
+    }
+    // Whether the CLASS declares this slot a reference. `compact_field_slot`
+    // answers from the registered layout, which exists for a class whether or
+    // not this particular instance was allocated compact — the distinction that
+    // made the original report ambiguous (`compact_flag=false` on an instance
+    // of a class that does have a layout). `None` = no registered layout.
+    let declared_ref =
+        cratonvm_types::compact_field_slot(class_id, field_index as usize).map(|(_, r)| r);
+    if declared_ref == Some(true) {
+        JIT_PUTFIELD_PRIMITIVE_INTO_REF_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_BYTE_OFFSET));
+    let num_slots =
+        std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
+    eprintln!(
+        "[punned-store-jit] class={name} class_id={class_id} num_slots={num_slots} \
+         field_index={field_index} value={value:?} declared_ref={declared_ref:?} \
+         compact_flag={} gc_flags={gc_flags:#x} jit_callee={}\n{}",
+        gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0,
+        current_jit_callee(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
+/// Armed-check for [`report_jit_punned_putfield`], inlined into the four
+/// compiled putfield helpers so the default configuration pays one cached
+/// `Option` test and nothing else.
+///
+/// # Safety
+/// Same contract as [`report_jit_punned_putfield`].
+#[inline]
+unsafe fn note_jit_putfield_watch(obj_ptr: i64, field_index: i64, value: Value) {
+    if jit_putfield_pun_watch().is_some() {
+        report_jit_punned_putfield(obj_ptr, field_index, value);
+    }
+}
+
 /// How many compiled `getfield` reads fell through the inline guard into
 /// [`jit_getfield`]. See the counter's own comment there, and
 /// `dispatch_counters`' neighbours for the house style.
@@ -7576,6 +7675,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     // Atomic per-word store: the concurrent GC marker may read this 16-byte
     // slot at the same time (it scans object fields concurrently). See
     // `cratonvm_types::write_value_atomic`.
+    note_jit_putfield_watch(obj_ptr, field_index, Value::Int(val as i32));
     if let Some(storage) = storage {
         cratonvm_types::write_compact_field(
             ptr,
@@ -7610,6 +7710,7 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     let (ptr, storage) = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
+    note_jit_putfield_watch(obj_ptr, field_index, Value::Long(val));
     if let Some(storage) = storage {
         cratonvm_types::write_compact_field(
             ptr,
@@ -7645,6 +7746,7 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
     let value = Value::Float(f32::from_bits(val as u32));
+    note_jit_putfield_watch(obj_ptr, field_index, value);
     if let Some(storage) = storage {
         cratonvm_types::write_compact_field(
             ptr,
@@ -7680,6 +7782,7 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
     let value = Value::Double(f64::from_bits(val as u64));
+    note_jit_putfield_watch(obj_ptr, field_index, value);
     if let Some(storage) = storage {
         cratonvm_types::write_compact_field(
             ptr,

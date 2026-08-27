@@ -644,6 +644,9 @@ pub(super) fn compile_osr_artifact(
                     };
                     let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let type_tag = *descriptor.as_bytes().first()?;
+                    if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                        return None;
+                    }
                     static_field_info.push((
                         pc,
                         field.declaring_class_id.as_u32(),
@@ -686,6 +689,9 @@ pub(super) fn compile_osr_artifact(
                     };
                     let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                     let type_tag = *descriptor.as_bytes().first()?;
+                    if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                        return None;
+                    }
                     field_info.push((pc, field.field_index, type_tag));
                     if compact_fields {
                         let slot = cratonvm_types::compact_field_slot(
@@ -4075,6 +4081,66 @@ pub(super) fn try_jit_upgrade(
     try_jit_upgrade_with_gate(shared, cached, gate)
 }
 
+
+/// How many compiled field sites were refused because the field the resolver
+/// FOUND does not have the descriptor the constant pool NAMED.
+pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Does the resolved field's own descriptor agree with the one the constant
+/// pool's `NameAndType` spells for this site?
+///
+/// # Why this has to be asked at all
+///
+/// JVMS §5.4.3.2 resolves a field by **name and descriptor**. This VM's field
+/// resolution — `MemberResolver::locate_field`, `ClassFile::find_own_field` and
+/// `find_field_recursive` underneath it — matches on the **name alone** and
+/// returns the first field of that name it meets walking the class, its
+/// superinterfaces and its superclass chain.
+///
+/// For the interpreter that is almost always harmless: it reads and writes a
+/// dynamically-tagged 16-byte cell, so landing on a same-named field of another
+/// type produces a wrong value, not a wrong SHAPE.
+///
+/// For the JIT it is not harmless, because the two halves of a compiled field
+/// site come from two different places. The **slot index** comes from that
+/// name-only search; the **type tag** comes from the constant-pool descriptor,
+/// which the search never consulted. When they name different fields the
+/// compiler emits the tag of one field at the slot of the other — and a `putfield`
+/// whose CP descriptor says `I` at a slot whose class declares `[C` writes a
+/// `Value::Int` into a reference cell. That is the punned-cell shape exactly:
+/// `SQLChar.rawData` (`[C`, slot 1) found holding `Int(1)`, dereferenced by a
+/// compiled `arraylength` as the pointer `1`
+/// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+///
+/// Refusing the site is the conservative answer: the method falls back to a
+/// tier that reads the cell's own tag, so the disagreement costs compilation
+/// rather than correctness. Fixing the resolver to match on the descriptor too
+/// is the larger change this guard makes safe to defer — and the counter says
+/// whether it is ever needed.
+///
+/// A `desc_byte` of 0 means the resolver had no descriptor to report (an empty
+/// descriptor string); that is a missing observation, not a disagreement, so it
+/// is admitted unchanged.
+fn jit_field_tag_agrees(field: &ResolvedField, cp_tag: u8, cp_idx: u16) -> bool {
+    if field.desc_byte == 0 || field.desc_byte == cp_tag {
+        return true;
+    }
+    let n = JIT_FIELD_TAG_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 32 {
+        tracing::warn!(
+            target: "cratonvm::jit",
+            cp_index = cp_idx,
+            declaring_class_id = field.declaring_class_id.as_u32(),
+            field_index = field.field_index,
+            resolved_desc = field.desc_byte as char,
+            cp_desc = cp_tag as char,
+            "refusing a compiled field site: name-only resolution found a field              whose descriptor differs from the one the constant pool names, so              the site's slot index and type tag describe different fields",
+        );
+    }
+    false
+}
+
 /// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
 /// [`RedefineGate`] so the JIT entry inherits the same staleness binding
 /// as the bytecode entry it's replacing.  Saves one
@@ -4320,6 +4386,9 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         // `None` ⇒ no genuine compact slot for this field (class has no
         // registered `CompactLayout`, or the index falls outside it).
         // Fabricating a `(0, false)` placeholder here poisoned the JIT's
@@ -4351,6 +4420,9 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         Some((
             field.declaring_class_id.as_u32(),
             field.field_index,
@@ -4853,6 +4925,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
+                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                    return None;
+                }
                 // `None` ⇒ no genuine compact slot — do NOT fabricate
                 // `(0, false)` (see the sibling resolver's comment).
                 Some((
@@ -4878,6 +4953,9 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
                 let type_tag = *descriptor.as_bytes().first()?;
+                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                    return None;
+                }
                 Some((
                     field.declaring_class_id.as_u32(),
                     field.field_index,
@@ -6236,6 +6314,9 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         // `None` ⇒ no genuine compact slot for this field (class has no
         // registered `CompactLayout`, or the index falls outside it).
         // Fabricating a `(0, false)` placeholder here poisoned the JIT's
@@ -6267,6 +6348,9 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         let type_tag = *descriptor.as_bytes().first()?;
+        if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+            return None;
+        }
         Some((
             field.declaring_class_id.as_u32(),
             field.field_index,

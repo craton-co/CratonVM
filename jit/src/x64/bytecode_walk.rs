@@ -13,6 +13,50 @@
 
 use super::*;
 
+/// How many compiles the single-pass backend refused because a field site had
+/// no resolved layout. Read by the `jit-method-stats` report.
+pub static UNRESOLVED_FIELD_SITE_BAILS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Refuse the compile: a `getfield`/`putfield`/`getstatic`/`putstatic` site has
+/// no entry in the resolved field tables, so this backend has no slot index and
+/// no type tag for it. Returns `false`, the walker's "stay interpreted" answer.
+///
+/// # Why a refusal and not a default
+///
+/// These four sites each used to substitute `(pc, 0, b'I')` — **slot 0, tagged
+/// `int`** — and carry on emitting. That is not a conservative default; it is a
+/// write to a DIFFERENT field of the receiver, under a type the field does not
+/// have, with nothing in the generated code or in any counter recording that a
+/// substitution happened.
+///
+/// It has already been caught doing exactly that once. When the OSR compile
+/// path shipped without populating `field_info`, every instance-field write in
+/// an OSR-compiled method took this default: `HashtableOfInt.rehash()` (Eclipse
+/// JDT BatchCompiler boot) stored its new `int[]` into slot 0 as
+/// `Value::Int(low32_of_ptr)`, and the next `put()` read that back and died at
+/// `arraylength` with "expected object reference, got int(N)". The fix then was
+/// to populate the table for that one path — the default that turned a missing
+/// entry into a corrupt heap cell was left in place for every other path.
+///
+/// It is the same shape as the punned `SQLChar.rawData` cell — a `[C` slot
+/// holding `Int(1)`, dereferenced by a compiled `arraylength` as the pointer
+/// `1` — and the reason that investigation could not name a writer is that a
+/// substituted slot leaves no trace of having been substituted
+/// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+///
+/// A missing entry means the VM-side resolver declined the site (the field's
+/// class is not loadable at compile time, or the constant-pool entry is
+/// malformed). Declining the METHOD costs one interpreted method and is always
+/// correct; guessing a slot is never correct. The counter says how often it
+/// happens, so "this refusal is expensive" stays a measurement rather than a
+/// worry.
+fn unresolved_field_site(pc: usize, opcode: u8) -> bool {
+    UNRESOLVED_FIELD_SITE_BAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::note_jit_bail_site_at("unresolved-field-site", pc, opcode);
+    false
+}
+
 /// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
 /// instruction is a constant push.
 ///
@@ -4386,11 +4430,13 @@ impl Compiler {
                 // note there.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
+                    let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    else {
+                        return unresolved_field_site(pc, 0xb2);
+                    };
 
                     // Direct load, no helper CALL — the structural fix this
                     // opcode's long bail comment above describes. It emits the
@@ -4468,11 +4514,13 @@ impl Compiler {
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
+                    let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
-                        .unwrap_or((pc, 0, 0, b'I', false));
+                    else {
+                        return unresolved_field_site(pc, 0xb3);
+                    };
 
                     let val_slot = self.pop_stack();
 
@@ -4511,11 +4559,13 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = self
+                        let Some((_, field_index, type_tag)) = self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        else {
+                            return unresolved_field_site(pc, 0xb4);
+                        };
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
                         let field_off =
@@ -4569,11 +4619,13 @@ impl Compiler {
                         // {tag,partial-pointer} word that SIGSEGVs when later
                         // dereferenced/called. For a legacy receiver we take the
                         // uniform `index * SLOT_SIZE` 16-byte-cell path inline.
-                        let (_, field_index, type_tag) = self
+                        let Some((_, field_index, type_tag)) = self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        else {
+                            return unresolved_field_site(pc, 0xb4);
+                        };
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
                         let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
                                                                                               // GUARDED (default) vs RAW (CRATONVM_JIT_INLINE_GETFIELD):
@@ -5016,11 +5068,13 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, _type_tag) = self
+                        let Some((_, field_index, _type_tag)) = self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        else {
+                            return unresolved_field_site(pc, 0xb5);
+                        };
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -5038,11 +5092,13 @@ impl Compiler {
                     } else {
                         self.flush_scratch_registers();
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = self
+                        let Some((_, field_index, type_tag)) = self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
+                        else {
+                            return unresolved_field_site(pc, 0xb5);
+                        };
                         let receiver_mark_index = self.stack_oop_marks.len().checked_sub(2);
                         let receiver_is_trusted_oop = !self.method_key.is_empty()
                             && self.stack_oop_marks_exact
