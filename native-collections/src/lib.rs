@@ -18382,7 +18382,65 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // for it by construction. Construction of the view is unaffected —
     // `make_view_set_of` populates the backing through `native_map_put` and
     // never comes through here.
-    if view_backing_source(ctx, backing).is_some() {
+    if let Some(view_source) = view_backing_source(ctx, backing) {
+        // ONE VIEW IS ADDABLE, and it is the exception the JDK documents.
+        // `ConcurrentHashMap$EntrySetView.add(Entry)` is supported -- it does
+        // `map.putVal(e.getKey(), e.getValue(), false)` -- unlike every other
+        // map's entrySet, which inherits `AbstractCollection.add`'s bare throw.
+        // Refusing it here was the OPPOSITE-POLARITY twin of the
+        // `TreeMap$KeySet.add` defect fixed the day before: there a view
+        // accepted what the JDK refuses, here a view refused what the JDK
+        // accepts. MEASURED against HotSpot 25.0.3+9,
+        // `probes/ViewFamilySweep.java`, both modes -- the other four entrySet
+        // carriers matched, and only this one differed.
+        let recv_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        if recv_class == "java/util/concurrent/ConcurrentHashMap$EntrySetView" {
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                // `add(null)` on CHM's entrySet dereferences the entry, so it
+                // is an NPE rather than a silent false.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
+            };
+            // Pin across each invoke: `getKey`/`getValue` are Java calls and a
+            // moving young generation would relocate the entry and the backing
+            // behind us. Same discipline as `map_entries_of`.
+            let backing_pin = ctx.pin_native_root(view_source);
+            let entry_pin = ctx.pin_native_root(entry);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let key = ctx
+                .invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let key_pin = pin_value(ctx, key);
+            let entry_c = ctx.read_native_pin(entry_pin, entry);
+            let value = ctx
+                .invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[])?
+                .unwrap_or(Value::Object(None));
+            let value_pin = pin_value(ctx, value);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let value = read_pinned_elem(ctx, value_pin, value);
+            // Put into the SOURCE map, not the view's own backing. Putting
+            // into `backing` is exactly what the refusal comment above warns
+            // about -- "the key landed in the VIEW's backing and not in `m`, so
+            // the caller was left holding a view that disagrees with the map it
+            // is a view of". MEASURED: the first version of this fix did that,
+            // so `add` reported success and the entry never reached the map
+            // (`entrySet is LIVE after put` stayed 4 against HotSpot's 5).
+            let src = ctx.read_native_pin(backing_pin, view_source);
+            let prev = native_map_put(ctx, &[Value::Object(Some(src)), key, value])?;
+            ctx.unpin_native_roots(backing_pin);
+            // `Set.add` reports whether the set CHANGED. CHM's own body returns
+            // `putVal(..) == null`, i.e. true when there was no previous
+            // mapping.
+            let changed = matches!(prev, None | Some(Value::Object(None)));
+            return Ok(Some(Value::Int(i32::from(changed))));
+        }
         return Err(
             cratonvm_types::error::RuntimeError::UnsupportedOperationException {
                 // HotSpot's is message-less; `thrownDetail` prints a message
@@ -19324,6 +19382,39 @@ const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
         "java/util/TreeMap$EntrySet",
         "java/util/TreeMap$EntryIterator",
     ),
+    // The one receiver that was still sharing `java/util/ArrayList$Itr` over a
+    // backing object with no `modCount`. `ConcurrentHashMap$ValuesView` extends
+    // `CollectionView`, an `AbstractCollection`, so `AbstractList`'s resolved
+    // index names its first declared REFERENCE field. While it shared
+    // `ArrayList$Itr`, letting that class run the real JDK cursor made
+    // `checkForComodification` read that reference as an int and throw a
+    // spurious `ConcurrentModificationException`. It is also a plain parity fix
+    // -- HotSpot names `ConcurrentHashMap$ValueIterator` here.
+    //
+    // This is the PRECONDITION for the `ArrayList$Itr` bytecode yield: that
+    // allow-list entry is safe only while `java/util/ArrayList$Itr` means "an
+    // iterator over something with a real `modCount`".
+    //
+    // `probes/ItrClassProbe` shows four other receivers still on the shared
+    // class, and every one is fine:
+    //
+    //   * `ArrayList` itself.
+    //   * `Collections.synchronizedList`, which returns the BACKING list's own
+    //     iterator -- exactly what HotSpot does.
+    //   * `Vector` / `Stack`, which extend `AbstractList` and so DO have a
+    //     `modCount`. Their class name still differs from HotSpot's
+    //     `Vector$Itr`; that is a separate, cosmetic gap.
+    //   * `PriorityQueue`. It looks like a blocker -- `AbstractQueue` has no
+    //     `modCount` -- and is not: `native_pq_iterator` deliberately returns an
+    //     `ArrayList$Itr` over an ArrayList-shaped WRAPPER holding a heap-order
+    //     snapshot, so `this$0` is a genuine `ArrayList`. Do NOT "fix" it by
+    //     adding it here: that mints a real `PriorityQueue$Itr`, whose slot 0 is
+    //     `cursor:int`, and the snapshot array stored there is coerced away --
+    //     the bug `native_pq_iterator`'s own comment records.
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+    ),
 ];
 
 /// The iterator class a values-shaped view should mint, or `None` for anything
@@ -20080,6 +20171,24 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ArrayList$Itr
+    //
+    // `hasNext`/`next` stay `Bridge`. Retagging them `SyntheticStub` and
+    // allow-listing `java/util/ArrayList$Itr` makes the real JDK cursor run and
+    // be COMPILED -- measured 6.2x on `probes/KeySetBench iterList`, and it
+    // fixes `cmeClear` too -- but it is NOT SAFE YET. See
+    // `known-issues/perf/springboot-configurationpropertysources-native-collections-floor`
+    // for the measurement and for what remains: some values view still reaches
+    // this class over a carrier with no `modCount`, and the real
+    // `checkForComodification` then throws a spurious
+    // `ConcurrentModificationException` on `for (v : map.values())`.
+    //
+    // Do not re-apply it on the strength of an `ItrClassProbe` census alone.
+    // That census now covers 66 receivers and says only `ArrayList`,
+    // `Properties.values`, `synchronizedList`, `PriorityQueue`, `Vector` and
+    // `Stack` still share this class -- and `IdentityHashMap`'s values view,
+    // which the census shows minting its own `IdentityHashMap$ValueIterator`,
+    // still arrived here and threw. The class a receiver mints in isolation is
+    // not the class it reaches this native with.
     r.register(
         "java/util/ArrayList$Itr",
         "hasNext",
@@ -52438,6 +52547,25 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(None)
 }
 
+/// `Set.add` / `Set.addAll` on a MAP KEY-SET VIEW: always
+/// `UnsupportedOperationException`.
+///
+/// A keySet view has no value to associate with a new key, so the JDK's
+/// `AbstractCollection.add` default stands and every map's keySet refuses.
+/// CratonVM mirrors the `TreeSet` native surface onto
+/// `java/util/TreeMap$KeySet` because the view is a TreeSet-SHAPED object whose
+/// state lives in the same side-table -- correct for every method except this
+/// one pair, where the two contracts are opposites.
+fn native_view_add_unsupported(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Err(RuntimeError::UnsupportedOperationException {
+        message: "add is not supported on a key-set view".to_string(),
+    }
+    .into())
+}
+
 fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -54330,7 +54458,28 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)V",
             native_ts_init_collection,
         );
-        registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        // `add`/`addAll` are the ONE place the two carriers' contracts diverge,
+        // so they are the one place the surface must not be identical. A
+        // `TreeSet` may be added to; a `TreeMap$KeySet` is a VIEW and
+        // `Set.add` on it throws `UnsupportedOperationException` -- there is no
+        // mapping to invent a value for. Sharing `native_ts_add` let
+        // `treeMap.keySet().add("z")` SUCCEED, inserting a key into the view's
+        // side-table that the backing map never learned about (MEASURED against
+        // HotSpot 25.0.3+9, `probes/IoSystemSweep.java`, both modes).
+        //
+        // `remove` deliberately stays shared: removing THROUGH a keySet view is
+        // legal and writes through, which is exactly what `native_ts_remove`
+        // does over the shared side-table.
+        //
+        // This is the `CopyOnWriteArraySet`/`HashSet` shape recorded in
+        // `a-vm-collection-can-share-a-native-surface-with-the-opposite-contract`:
+        // a view class sharing a native surface with a class whose contract is
+        // the opposite on one method.
+        if c == "java/util/TreeMap$KeySet" {
+            registry.register(c, "add", "(Ljava/lang/Object;)Z", native_view_add_unsupported);
+        } else {
+            registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
+        }
         registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
         // Serialization: drive the stream from `ts_state` so a native TreeSet
         // round-trips byte-correct (the inherited real methods go through the
@@ -54431,7 +54580,19 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
             native_ts_sub_set_inclusive,
         );
-        registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        if c == "java/util/TreeMap$KeySet" {
+            // See the `add` note above: `addAll` on a keySet view is the same
+            // refusal, and the JDK reaches it through `AbstractCollection
+            // .addAll` calling `add`.
+            registry.register(
+                c,
+                "addAll",
+                "(Ljava/util/Collection;)Z",
+                native_view_add_unsupported,
+            );
+        } else {
+            registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
+        }
         registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
         // `spliterator()` for the same reason `stream()` is here: both classes
         // declare it, and the JDK body goes through `TreeMap.keySpliteratorFor`
