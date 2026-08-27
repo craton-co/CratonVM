@@ -7218,6 +7218,33 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
     if class_name == "java/util/ArrayList" {
         return !cratonvm_types::arraylist_view::arraylist_classed_view_possible();
     }
+    // `java/util/ArrayList$Itr`, for `hasNext`/`next`, retagged `SyntheticStub`
+    // at their registration. 6.2x on `probes/KeySetBench iterList`, and it also
+    // FIXES `cmeClear` -- the native did not throw `ConcurrentModificationException`
+    // when a list was cleared mid-iteration.
+    //
+    // BOTH HALVES ARE REQUIRED AND NEITHER WORKS ALONE. Two earlier arms read as
+    // failures for two different reasons, and both were the measurement rather
+    // than the fix: allow-list alone does nothing (term 1 is
+    // `kind != SyntheticStub -> refuse`), and retag alone is 1.56x SLOWER
+    // (`resolve_native_site` refuses to cache ANY `SyntheticStub`, so the site
+    // falls out of the JIT's native cache onto the generic path -- still running
+    // the native, by the expensive route).
+    //
+    // AND IT IS SOUND ONLY BECAUSE OF THE MINT SPLIT.
+    // `itr_backing_has_real_mod_count` gives any backing WITHOUT a real
+    // `modCount` a different class (`cratonvm/internal/ArrayListViewItr`), so
+    // this name is a guarantee. Before that split, `for (v : map.values())`
+    // threw a spurious CME: HotSpot's `checkForComodification` read a view
+    // carrier's first declared REFERENCE field as an int.
+    //
+    // Do NOT re-derive that guarantee from a class census. `probes/ItrClassProbe`
+    // said `IdentityHashMap`'s values view minted its own iterator, matching
+    // HotSpot -- and it still arrived here and threw. The class a receiver mints
+    // in isolation is not the class it reaches the `al_itr_*` natives with.
+    if class_name == "java/util/ArrayList$Itr" {
+        return true;
+    }
     matches!(
         class_name,
         "java/util/concurrent/locks/ReentrantLock"

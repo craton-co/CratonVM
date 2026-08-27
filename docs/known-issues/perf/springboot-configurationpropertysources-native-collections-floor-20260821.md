@@ -508,17 +508,52 @@ values view throws a spurious `ConcurrentModificationException` from
 `IdentityHashMap$ValueIterator`, matching HotSpot — and it reached
 `ArrayList$Itr` anyway.
 
-**So a class-name census is NOT a sufficient safety criterion**, which is the
-real result of this attempt. The class a receiver mints *in isolation* is not
-the class it reaches the `al_itr_*` natives with; a hoisted view that is
-resynced, or reached through a `Collection`-typed parameter, can arrive on the
-shared class regardless. Any future attempt needs a runtime assertion — refuse
-the yield unless the iterator's `this$0` actually has a `modCount` — not a
-static list of receivers.
+**A class-name census is NOT a sufficient safety criterion.** The class a
+receiver mints *in isolation* is not the class it reaches the `al_itr_*` natives
+with; a hoisted view that is resynced, or reached through a `Collection`-typed
+parameter, can arrive on the shared class regardless.
 
-The prize is unchanged and still measured: **6.2× on `iterList`** (944/972/965 →
-150/159/153, one binary, controls flat) plus the `cmeClear` fail-fast fix. What
-it needs is a receiver-shape check at the point of dispatch.
+### LANDED 2026-08-27 — the check moved to the MINT, and the 6.8× shipped
+
+The check could not go where it was first proposed. The yield is a
+per-(call site, receiver CLASS) decision, so a per-INSTANCE fact cannot be
+consulted there at all — it has to be encoded in the class or it does not exist.
+
+So `itr_backing_has_real_mod_count` runs at the point the cursor is minted, and
+a backing without a real `modCount` gets a different class:
+**`cratonvm/internal/ArrayListViewItr`**, same layout, same three natives, the
+only difference being that it is not `java/util/ArrayList$Itr` and so the yield
+cannot reach it. That makes the class name a guarantee instead of a wish, and
+`java/util/ArrayList$Itr` can then be allow-listed safely.
+
+The predicate is a **whitelist** — `AlLayout::ArrayList | Vector`, the two that
+extend `AbstractList` and declare a `modCount`. Deliberately, because the
+failure it prevents is silent and the population of ArrayList-shaped receivers
+kept turning out wider than any audit predicted: `LinkedBlockingQueue.iterator()`
+mints this class with the snapshot ARRAY in slot 0, a third layout again. A new
+shape has to default to the safe side without anyone remembering it.
+
+**Measured, one binary, `CRATONVM_ITR_BYTECODE` as the A/B, interleaved:**
+
+| rung | OFF | ON | HotSpot |
+|---|---:|---:|---:|
+| `iterList` | 1210.5/1148.5/1124.0 | **171.5/182.0/161.0** | 9.5 |
+| `hoisted` | 681.0/771.5/682.0 | 717.0/709.5/893.5 | 10.0 |
+| `iterSet` | 900.0/858.5/888.5 | 975.5/863.5/866.5 | 14.5 |
+| `idxList` | 87.0/141.5/110.5 | 104.5/109.5/114.5 | 11.0 |
+| `rawArr` (**control**) | 23.0/23.5/25.5 | 28.0/24.0/24.5 | 4.5 |
+
+**6.8×**, controls flat, and `ArrayList$Itr.hasNext`/`next` go from never
+appearing in `CRATONVM_DBG_JITC` to `admitted … full-compile`. It is also more
+correct: `ItrYieldProbe` differs from HotSpot on **1 of 54 rows with the yield ON
+against 2 with it OFF** — the yield FIXES `cmeClear`, and the one remaining row
+(`pqSnapshot`) reads the same on both arms.
+
+**`pqSnapshot` is a known pre-existing divergence, not this change's.**
+CratonVM iterates a heap-order snapshot wrapper, so mutating a `PriorityQueue`
+mid-iteration does not throw; HotSpot's `PriorityQueue$Itr` keeps an
+`expectedModCount` and does. Left failing on the probe deliberately, where it is
+visible.
 
 **A coverage note worth acting on independently:** `regression-suite/run.sh`
 passed **72/72 on the broken binary**. A change that makes
