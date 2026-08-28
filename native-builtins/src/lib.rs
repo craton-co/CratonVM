@@ -8828,17 +8828,54 @@ pub fn register_essential_natives_with_shims(
         "java/lang/Module",
         "canUse",
         "(Ljava/lang/Class;)Z",
-        |_ctx, args| {
-            match args.first() {
-                Some(Value::Object(Some(_))) => {}
-                _ => return Ok(Some(Value::Int(0))),
-            }
-            match args.get(1) {
-                Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
-                _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let Some(Value::Object(Some(service))) = args.get(1).copied() else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("Module.canUse: service class is null".into()),
                 }
-                .into()),
+                .into());
+            };
+            // `canUse` is true iff the module DECLARES `uses` for that service.
+            // An UNNAMED module uses everything; a NAMED one uses exactly what
+            // its descriptor says.
+            //
+            // MEASURED (`probes/ClassShadowSweep.java`), both modes:
+            //   java.base.canUse(Runnable.class)   HotSpot false   CratonVM true
+            //
+            // This used to answer `true` for any non-null service on any
+            // receiver, and the note here said a faithful version would have to
+            // call back into Java for `getDescriptor().uses()` -- the one thing
+            // this native exists to avoid, because a named Module mirror can
+            // carry a NULL `descriptor` field. That was wrong: the VM's own
+            // module registry already holds the `uses` set, reachable with no
+            // Java call and no re-entrancy, via `ctx.module_uses`.
+            //
+            // An unregistered or descriptor-less module yields an EMPTY uses
+            // list, which would answer false for everything -- so the unnamed
+            // case is decided first, and a named module with no registry entry
+            // keeps the permissive answer rather than newly refusing work that
+            // used to succeed.
+            let module_name = crate::phases_late::read_module_name(ctx, this);
+            if module_name.is_empty() {
+                return Ok(Some(Value::Int(1)));
+            }
+            if !ctx.module_is_registered(&module_name) {
+                return Ok(Some(Value::Int(1)));
+            }
+            let service_name = crate::lang_class::mirror_class_name(ctx, service)
+                .unwrap_or_default()
+                .replace('/', ".");
+            let uses = ctx.module_uses(&module_name);
+            let declared = uses
+                .iter()
+                .any(|u| u.replace('/', ".") == service_name);
+            return Ok(Some(Value::Int(i32::from(declared))));
+            #[allow(unreachable_code)]
+            {
+                Ok(Some(Value::Int(1)))
             }
         },
     );

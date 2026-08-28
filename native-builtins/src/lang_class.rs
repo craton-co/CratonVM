@@ -3063,6 +3063,38 @@ pub(crate) fn native_class_for_name(
     validate_for_name_dotted(&dotted_name)?;
     let internal_name = dotted_name.replace('.', "/");
 
+    // AN ARRAY DESCRIPTOR is resolved HERE, without consulting any loader.
+    //
+    // `Class.forName("[I")` and `Class.forName("[Ljava.lang.String;")` are
+    // specified to work; `ClassLoader.loadClass("[I")` is specified to throw
+    // `ClassNotFoundException`. Both are measured against HotSpot 25.0.3+9 and
+    // both probes now assert them (`ClassShadowSweep`, `ClassLoaderShadowSweep`).
+    //
+    // This VM implemented `forName` by delegating to `loader.loadClass(name)`,
+    // which meant the two doors could not disagree -- so adding the binary-name
+    // refusal that `loadClass` owes turned three passing `forName` rows red.
+    // Handling the descriptor form before the delegation is what lets each door
+    // keep its own contract.
+    //
+    // Two builds were spent learning that the guard could not live in the
+    // shared base OR at the `loadClass` entry, because `forName` reaches both.
+    // The asymmetry is a property of the two APIs, not of one call site.
+    if internal_name.starts_with('[') {
+        if let Some(cid) = ctx
+            .class_id_by_name(&internal_name)
+            .or_else(|| ctx.ensure_class_initialized(&internal_name).ok())
+        {
+            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+        }
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &dotted_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+    }
+
     // BUG-06 вЂ” mark this thread as inside a reflective class-existence probe for
     // the duration of resolution. The class loader consults this flag and
     // refuses to fabricate a synthetic enterprise-framework stub (org/jboss/,
@@ -16931,10 +16963,25 @@ pub(crate) fn native_field_get_annotation(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let ann_mirror = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+    // A NULL annotation class is a NullPointerException, not "not present".
+    //
+    // MEASURED against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/FieldMethodShadowSweep.java`): HotSpot NPE, this VM answered
+    // null. `Field.getAnnotation` opens `Objects.requireNonNull(annotationClass)`
+    // -- it is the first statement, ahead of any lookup.
+    //
+    // The direction matters here more than in most null cases: this method's
+    // ORDINARY answer for an absent annotation is also null, so a null argument
+    // and a genuine absence became indistinguishable. A caller passing a class
+    // it failed to resolve reads "no such annotation" and takes the same branch
+    // it would for a correct negative.
+    let Some(Value::Object(Some(ann_mirror))) = args.get(1) else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getAnnotation: annotationClass is null".to_string()),
+        }
+        .into());
     };
+    let ann_mirror = *ann_mirror;
     let (class_id, field_name) = match field_class_and_name(ctx, this) {
         Some(v) => v,
         None => return Ok(Some(Value::Object(None))),
@@ -19231,10 +19278,17 @@ pub(crate) fn i2_classloader_get_defined_package(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let package_name = match args.get(1) {
-        Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
+    // A NULL package name is a NullPointerException, not "no such package".
+    // MEASURED in both modes: HotSpot NPE, this VM answered null -- and null is
+    // also this method's ordinary answer for an absent package, so the two were
+    // indistinguishable to the caller.
+    let Some(Value::Object(Some(name_obj))) = args.get(1) else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("ClassLoader.getDefinedPackage: name is null".to_string()),
+        }
+        .into());
     };
+    let package_name = ctx.read_string(*name_obj).unwrap_or_default();
     if package_name.contains('/') {
         return Ok(Some(Value::Object(None)));
     }
@@ -19432,7 +19486,30 @@ fn real_defined_package_names(
 /// cannot name `java/lang/Package` — which on any real boot it can, since every
 /// caller here has just produced `Package` instances.
 fn alloc_package_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
-    match ctx.class_id_by_name("java/lang/Package") {
+    // LOAD `java.lang.Package`, do not merely look it up.
+    //
+    // `class_id_by_name` answers only for a class already LOADED, and nothing
+    // on the ordinary path to `getDefinedPackages()` loads `java.lang.Package`
+    // first -- so the lookup missed, the fallback produced an `Object[]`, and
+    // the typed-array comment above this function described a fix that was not
+    // in force. MEASURED in BOTH modes
+    // (`probes/ClassLoaderShadowSweep.java`):
+    //
+    //   APP.getDefinedPackages().getClass().getName()
+    //     HotSpot  [Ljava.lang.Package;      CratonVM  [Ljava.lang.Object;
+    //
+    // This is the same shape as the `$RustJvmImpl` superclass bug fixed earlier
+    // in this campaign: a lookup-only helper standing where a load belongs, so
+    // the guard is present, reached, and inert. `ensure_class_initialized` is
+    // the loading form already used elsewhere in this crate for exactly this.
+    //
+    // The `Reference` fallback is kept for the case where even the load fails:
+    // an array of the wrong component type is still better than no array, and
+    // the caller's `arraylength` works either way.
+    let cid = ctx
+        .class_id_by_name("java/lang/Package")
+        .or_else(|| ctx.ensure_class_initialized("java/lang/Package").ok());
+    match cid {
         Some(cid) => ctx.new_ref_array(cid, len),
         None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, len),
     }
@@ -20474,6 +20551,31 @@ pub(crate) fn native_class_get_class_loader(
     // the wrong loader.
     if mirror_is_primitive(ctx, mirror) {
         return Ok(Some(Value::Object(None)));
+    }
+    // AN ARRAY'S loader is its COMPONENT's loader, recursively.
+    //
+    // `String[].class.getClassLoader()` is null because `String`'s is;
+    // `MyClass[].class.getClassLoader()` is the loader that defined `MyClass`.
+    // An array class is not defined by any loader of its own, so reading the
+    // mirror's own `classLoader` field or the reverse map answers about the
+    // wrong thing. MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`):
+    //
+    //   ClassLoaderShadowSweep[].class.getClassLoader() == APP
+    //     HotSpot  true      CratonVM  false
+    //
+    // The direction is the damaging one for a framework: an application array
+    // type reported as bootstrap-loaded looks like a JDK type, and the usual
+    // next moves -- a loader-keyed cache, an `isAssignableFrom` check against a
+    // loader-scoped class, a serializer choosing a resolver -- all key it wrong.
+    // `String[]` answering null is CORRECT and is why this must recurse to the
+    // component rather than simply return the receiver's own loader.
+    if mirror_is_array(ctx, mirror) {
+        if let Some(arr_cid) = ctx.class_id_from_mirror(mirror) {
+            if let Some(comp_cid) = ctx.array_component_class_id(arr_cid) {
+                let comp_mirror = ctx.get_class_mirror(comp_cid);
+                return native_class_get_class_loader(ctx, &[Value::Object(Some(comp_mirror))]);
+            }
+        }
     }
     // In real-JDK mode `getClassLoader()` is intercepted before its ordinary
     // field-reading bytecode runs. Honor a loader recorded on the mirror by

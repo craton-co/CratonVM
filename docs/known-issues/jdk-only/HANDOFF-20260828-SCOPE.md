@@ -12,13 +12,20 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 
 | lane | owner | worktree | branch |
 | --- | --- | --- | --- |
-| **L5 reflection & class metadata** | **TAKEN — this session, in progress** | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
-| L1, L2, L3, L4, L6, L7 | unclaimed | your own worktree | your own branch |
+| **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
+| **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
+| **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
+| L1, L3, L6, L7 | unclaimed | your own worktree | your own branch |
 
-**I am working L5 only.** Everything else is free. Do not take L5 without saying
-so, and do not edit `native-builtins/src/lang_class.rs` reflection natives while
-L5 is open — that is the one file where a collision is likely rather than
-theoretical.
+**L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
+Everything else is unclaimed.
+
+Two items L5 first recorded as OPEN were later FIXED, and both had been deferred
+for reasons that one lookup would have refuted — `Module.canUse` (the VM's own
+`ctx.module_uses` already exposes the registry; no Java callback needed) and the
+duplicate-`defineClass` error type (the right `LinkageError` variant already
+existed). **Before recording something as too expensive to fix, check the API
+you are assuming you lack.**
 
 Add your row to the table above in your first commit so the next worker can see
 it.
@@ -111,7 +118,7 @@ each**. Nobody owns the tail yet; finish your lane before taking any of it.
 
 ## 3. The method — four families in, it is mechanical
 
-Four families are done this way: **510 probed rows, 28 defects, 27 fixed.**
+Five families are done this way: **993 probed rows, 48 defects, 48 fixed.**
 
 1. **Take your families' `native-won` triples from the report.** Do not pick
    methods by hand and do not probe what the report says already loses.
@@ -123,8 +130,8 @@ Four families are done this way: **510 probed rows, 28 defects, 27 fixed.**
 
 ### Aim at edges, not the happy path
 
-**All 28 defects so far are on contract edges. Not one was a wrong answer to an
-ordinary call, in any of four independent families.** Nulls, bounds, refusal
+**All 48 defects so far are on contract edges. Not one was a wrong answer to an
+ordinary call, in any of five independent families.** Nulls, bounds, refusal
 types, constructor validation, naming special cases, callback boundaries.
 
 Two consequences:

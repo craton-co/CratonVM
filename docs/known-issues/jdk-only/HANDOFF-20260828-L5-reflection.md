@@ -1,14 +1,16 @@
-# L5 — reflection and class metadata: 207 rows — **TAKEN, IN PROGRESS**
+# L5 — reflection and class metadata: 207 rows — **COMPLETE 2026-08-28**
 
 **Read `HANDOFF-20260828-SCOPE.md` first.**
 
-> **OWNER: this session.**
+> **OWNER: this session. LANE COMPLETE** — 483 probed rows, 20 defects fixed,
+> **0 residuals**, both modes. Full record:
+> `L5-reflection-lane-complete-20260828.md`. The lane is free for anyone who
+> wants to extend it into the long tail; nothing here is still in flight.
 > worktree `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee`
 > branch `claude/jdk-only-mode-handoff-09b48c`
 >
-> **Do not take this lane, and do not edit reflection natives in
-> `native-builtins/src/lang_class.rs` while it is open.** That is the one file
-> where a collision between lanes is likely rather than theoretical.
+> `native-builtins/src/lang_class.rs` is FREE again — the collision warning that
+> stood here while the lane was in flight no longer applies.
 
 ## Families
 
@@ -26,60 +28,42 @@ java/lang/Module             24
 Registrars: `native-builtins/src/lang_class.rs` (28 231 lines) and
 `native-builtins/src/lib.rs`, plus `phases_late/reflect_invoke.rs` for `Module`.
 
-## Done so far in this lane
+## Result
 
-`probes/ClassShadowSweep.java` — 261 rows over the 20 `Class` and 5 `Module`
-native-won triples. **9 defects, 8 fixed**, landed in `eeffb12d6`:
+| probe | rows | compat | `--jdk-only` |
+| --- | ---: | --- | --- |
+| `ClassShadowSweep` | 261 | 0 diffs | 0 diffs |
+| `FieldMethodShadowSweep` | 132 | 0 diffs | 0 diffs |
+| `ClassLoaderShadowSweep` | 90 | 0 diffs | 0 diffs |
 
-* `getPackageName()` returned `""` for all six primitives and `void` where the
-  JDK returns `"java.lang"` — six rows, one bug. The check had to go BEFORE the
-  memo, since `PACKAGE_NAME_CACHE` is keyed on `ClassId` and a primitive mirror
-  has one.
-* `Class.getResourceAsStream(null)` answered null instead of throwing NPE.
-* `Module.canRead(null)` answered `false` instead of throwing NPE.
+All 207 `native-won` triples covered. **20 defects, all fixed, no residuals.**
+The full account — including two items first recorded OPEN and then fixed, and
+two wrong placements of one guard — is in
+`L5-reflection-lane-complete-20260828.md`.
 
-Also landed earlier in this lane's area: `int.class.getClassLoader()` returned
-the app loader instead of null (`primitive-class-had-a-loader-and-two-deeper-gaps`).
+## The two findings most useful to other lanes
 
-**What passed** — and this is the map of where the work is *not*: every
-`getName` / `getSimpleName` / `descriptorString` special case across primitives,
-arrays, nested, enum and anonymous classes; all of `forName` (primitives
-correctly NOT findable by name, `[I` and `[[I` findable, the slash form
-rejected, a null loader scoping to bootstrap); `cast` including its null and
-primitive rules; and the whole public-vs-declared split for fields, methods and
-constructors.
+**`Field`/`Method` came back 132/132 with one defect.** Every widening and
+narrowing rule holds in both directions, every `invoke` edge holds, all the
+metadata holds. A clean family is a result: it said this lane's work was in the
+LOADING path, not the accessor path, and the next 90 rows confirmed it. Do not
+skip a family because you expect it to be clean, and do not keep digging in one
+that measured clean.
 
-## Open in this lane
+**Two items were deferred for reasons a single lookup refuted.** `Module.canUse`
+was recorded as needing a Java callback into the native written to avoid a null
+`descriptor` field — but `ctx.module_uses()` already exposes the VM's own module
+registry. The duplicate-`defineClass` error type was recorded as needing a new
+`LinkageError` variant — but `DuplicateClassDefinition` already existed, mapping
+to `java/lang/LinkageError` with HotSpot's wording. **Before recording something
+as too expensive, check the API you are assuming you lack.**
 
-* **`Module.canUse` over-approximates.** `java.base.canUse(Runnable.class)` is
-  `true` here and `false` on HotSpot. Documented in the registrar with the
-  measurement and the cost. Not fixed because a faithful implementation must
-  read the descriptor's `uses` set — and that native exists *precisely because* a
-  named `Module` mirror can carry a null `descriptor` field. Fixing it means
-  calling back into Java from the native written to avoid touching that field,
-  on `ServiceLoader.checkCaller`'s path during `Console.<clinit>`, for one row.
-* **`Module.getPackages()` for `java.base` is short** (`< 100`) — recorded in
-  `primitive-class-had-a-loader-and-two-deeper-gaps-20260827.md` §3. The
-  predicates are all right; the package SET is incomplete.
-* **`MethodHandle.invokeExact` does not enforce its exact signature** — recorded
-  §4 of the same page. Deliberately not fixed: it needs the call-site descriptor
-  to reach the handle's dispatch, which is a change to how `invokeExact` is
-  dispatched rather than to a native body.
+## If you extend this lane
 
-## Remaining in this lane
+`java/lang/Module.getPackages()` for `java.base` is still short (`<100`), and
+`MethodHandle.invokeExact` still does not enforce its exact signature — both
+recorded in `primitive-class-had-a-loader-and-two-deeper-gaps-20260827.md` §3
+and §4. Neither is a `native-won` triple in this lane's 207, so neither blocked
+completion; both are real.
 
-`reflect/Field` (32), `reflect/Method` (26), `ClassLoader` (29) and
-`java/lang/System$1` (29) are **not yet probed** — 116 of the 207 rows.
-
-`System$1` is the `JavaLangAccess` implementation. It is not callable from Java
-and must be reached INDIRECTLY, through the `Module` and `ClassLoader` calls that
-route into it. `probes/LoaderModuleSweep.java` already exercises some of that
-path and is the place to start.
-
-Edges to aim at: `Field.get`/`set` on a static, a final, a primitive and a
-mismatched type (`IllegalArgumentException` vs `IllegalAccessException` — the
-two are easy to swap); `setAccessible` on a JDK-internal member under the module
-system; `Method.invoke` with a null receiver on an instance method, a wrong
-argument count, and an exception thrown by the callee wrapped in
-`InvocationTargetException`; `ClassLoader.loadClass` delegation order and
-`getResource` relative-vs-absolute naming.
+The long tail (71 classes with ≤3 rows each) is unowned.

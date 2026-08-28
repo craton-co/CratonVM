@@ -897,6 +897,41 @@ fn cl_real_load_class(
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    // BINARY NAME VALIDATION, at THIS entry point only.
+    //
+    // `ClassLoader.loadClass` takes a BINARY name -- `java.lang.String`. Two
+    // spellings that look close enough are refused by the JDK, and both were
+    // accepted here. MEASURED against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/ClassLoaderShadowSweep.java`):
+    //
+    //   loadClass("java/lang/String")  HotSpot ClassNotFoundException  CratonVM ok
+    //   loadClass("[I")                HotSpot ClassNotFoundException  CratonVM ok
+    //
+    // The slash form got in because `cl_real_load_class_base_rooted` does
+    // `replace('.', "/")`, a NO-OP on a name that already uses slashes. The
+    // array form got in because the class store holds array classes under their
+    // JVMS descriptor.
+    //
+    // SCOPED TO THIS FUNCTION, and that scoping is the whole point: the first
+    // cut put this check in the shared `cl_real_load_class_base`, which
+    // `Class.forName` also reaches -- and `Class.forName("[I")` MUST resolve.
+    // The broad guard turned three passing `forName` rows in
+    // `ClassShadowSweep` red and crashed `ClassLoaderShadowSweep` at row 20 of
+    // 90. Arrays are findable through `forName` and not through `loadClass`;
+    // both probes now assert both halves so the asymmetry cannot be "fixed" in
+    // the wrong direction later.
+    if let Some(name) = ctx.read_string(class_name_obj) {
+        if name.contains('/') || name.starts_with('[') {
+            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+                ctx,
+                "java/lang/ClassNotFoundException",
+                1,
+                &name,
+            );
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+        }
+    }
+
     // `ClassLoader.loadClass(String)` is virtual too. Honor an override of
     // that exact public overload before looking for the protected
     // `(String,boolean)` form: Spring Boot's ModifiedClassPathClassLoader

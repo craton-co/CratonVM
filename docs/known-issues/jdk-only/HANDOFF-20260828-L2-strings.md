@@ -2,7 +2,7 @@
 
 **Read `HANDOFF-20260828-SCOPE.md` first.**
 
-**Owner: unclaimed.** L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
+**Owner: TAKEN 2026-08-28**, branch `claude/l2-strings-20260828`, worktree `/data/cvm-l2s-20260828` on the Linux build host. This lane also took `WORKER-3-NOTE-3` — nobody was on it, and its N1 residual turned out to be the root cause of four of this lane's measured defects. (Superseded text: unclaimed.) L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
 `h2-known-issues-206dee`) is the only lane currently running.
 
 ## Your families
