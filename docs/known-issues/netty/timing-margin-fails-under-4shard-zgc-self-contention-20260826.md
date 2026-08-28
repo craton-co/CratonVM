@@ -45,8 +45,10 @@ contention rather than a regression of the original bug.
 
 (`util.HashedWheelTimerTest` also failed this run on its usual `testExecutionOnTime`
 signature — that one is NOT contention, see its own page:
-`hashedwheeltimertest-native-funnel-throughput-20260826.md`. Its second failure
-this run, `testNewTimeoutShouldStopThrowingRejectedExecutionExceptionWhenExistingTimeoutIsExecuted`
+`fixed-suite-bugs/netty/hashedwheeltimertest-two-dispatch-defects-not-a-funnel-floor-20260827.md`,
+which supersedes the open page this used to name and corrects its root cause.
+Its second failure this run,
+`testNewTimeoutShouldStopThrowingRejectedExecutionExceptionWhenExistingTimeoutIsExecuted`
 timing out after 3000ms, fits this contention bucket instead.)
 
 ## Caveat — this is a pattern, not 17 individual confirmations
