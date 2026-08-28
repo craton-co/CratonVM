@@ -3234,42 +3234,100 @@ impl Compiler {
                 0x84 => {
                     let idx = code[pc + 1] as usize; // Widening: always safe
                     let inc = code[pc + 2] as i8 as i32; // Widening: always safe
-                    if let Some(local_reg) = self.reg_for_local(idx) {
-                        // Invalidate any CalleeSaved refs before modifying the register
-                        self.invalidate_callee_saved(local_reg);
-                        // ADD r32, imm directly on the callee-saved register
-                        if local_reg >= 8 {
-                            self.buf.emit_byte(0x41); // REX.B
-                        }
-                        if (-128..=127).contains(&inc) {
-                            self.buf.emit_byte(0x83); // ADD r/m32, imm8
-                            self.buf.emit_byte(0xC0 | (local_reg & 7));
-                            self.buf.emit_byte(inc as u8); // Cast: x86-64 immediate encoding
-                        } else {
-                            self.buf.emit_byte(0x81); // ADD r/m32, imm32
-                            self.buf.emit_byte(0xC0 | (local_reg & 7));
-                            self.buf.emit(&inc.to_le_bytes());
-                        }
-                        // Sign-extend r32 to r64
-                        self.rex_w_rb(local_reg, local_reg);
-                        self.buf.emit_byte(0x63); // MOVSXD r64, r/m32
-                        self.modrm_reg(local_reg, local_reg);
-                    } else {
-                        let off = self.local_offset(idx);
-                        self.emit_load_local(RAX, off);
-                        if (-128..=127).contains(&inc) {
-                            self.buf.emit(&[0x83, 0xC0]); // ADD eax, imm8
-                            self.buf.emit_byte(inc as u8); // Cast: x86-64 immediate encoding
-                        } else {
-                            self.buf.emit_byte(0x05); // ADD eax, imm32
-                            self.buf.emit(&inc.to_le_bytes());
-                        }
-                        // Sign-extend back
-                        self.rex_w();
-                        self.buf.emit(&[0x63, 0xC0]); // movsxd rax, eax
-                        self.emit_store_local(off, RAX);
-                    }
+                    self.emit_iinc_local(idx, inc);
                     pc += 3;
+                }
+
+                // wide (JVMS §6.5) — the two-byte-index prefix. See `jit_scan`'s
+                // own `0xC4` arm for what one un-emittable `iinc_w` cost, and
+                // why the scan and this walk are changed together: a form the
+                // scan admits and this arm cannot emit is a whole-method
+                // compile bail, and a form this arm emits that the scan refuses
+                // is unreachable.
+                //
+                // The load and store bodies mirror the narrow arms above
+                // one-for-one — only the operand decode differs — and `iinc`
+                // shares its emitter outright rather than keeping a second copy
+                // of the ADD/MOVSXD sequence.
+                0xc4 => {
+                    let wop = code[pc + 1];
+                    // Cast: a JVM local index; `max_locals` bounds it.
+                    let idx = u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize;
+                    match wop {
+                        // wide iload / lload / fload / dload / aload
+                        0x15..=0x19 => {
+                            let is_aload = wop == 0x19;
+                            // fload/dload may have an XMM-allocated local.
+                            if matches!(wop, 0x17 | 0x18) {
+                                if let Some(xmm) = self.xmm_for_local(idx) {
+                                    // FP value — never an oop.
+                                    self.stack_push(StackSlot::Xmm(xmm), false);
+                                    pc += 4;
+                                    continue;
+                                }
+                            }
+                            if let Some(local_reg) = self.reg_for_local(idx) {
+                                self.stack_push(StackSlot::CalleeSaved(local_reg), is_aload);
+                            } else {
+                                let off = self.local_offset(idx);
+                                self.emit_load_local(RAX, off);
+                                self.push_from_rax();
+                                if is_aload {
+                                    self.mark_top_as_oop();
+                                }
+                            }
+                            pc += 4;
+                        }
+                        // wide istore / lstore / fstore / dstore / astore
+                        0x36..=0x3a => {
+                            if matches!(wop, 0x38 | 0x39) {
+                                if let Some(dst_xmm) = self.xmm_for_local(idx) {
+                                    let slot = self.pop_stack();
+                                    match slot {
+                                        StackSlot::Xmm(src) if src == dst_xmm => {}
+                                        StackSlot::Xmm(src) => {
+                                            if wop == 0x39 {
+                                                self.emit_movsd_xmm_xmm(dst_xmm, src);
+                                            } else {
+                                                self.emit_movss_xmm_xmm(dst_xmm, src);
+                                            }
+                                        }
+                                        _ => {
+                                            self.load_slot_to_reg(RAX, slot);
+                                            self.emit_movq_xmm_from_rax(dst_xmm);
+                                        }
+                                    }
+                                    pc += 4;
+                                    continue;
+                                }
+                            }
+                            self.pop_to_rax();
+                            if let Some(local_reg) = self.reg_for_local(idx) {
+                                self.invalidate_callee_saved(local_reg);
+                                self.emit_mov_reg_reg(local_reg, RAX);
+                            } else {
+                                let off = self.local_offset(idx);
+                                self.emit_store_local(off, RAX);
+                            }
+                            pc += 4;
+                        }
+                        // wide iinc — the SIGNED 16-bit constant is the whole
+                        // reason javac emits this prefix in netty's codecs
+                        // (`iinc_w 18, -255`).
+                        0x84 => {
+                            // Widening: i16 -> i32, sign preserved.
+                            let inc = i16::from_be_bytes([code[pc + 4], code[pc + 5]]) as i32;
+                            self.emit_iinc_local(idx, inc);
+                            pc += 6;
+                        }
+                        // `wide ret` and anything else — `jit_scan` refuses the
+                        // same set, so this is unreachable; bail rather than
+                        // emit for a form neither walk models.
+                        _ => {
+                            self.fail("singlepass-codegen/wide-unsupported-opcode");
+                            return false;
+                        }
+                    }
                 }
 
                 // i2l — sign-extend int to long
@@ -12661,5 +12719,51 @@ impl Compiler {
         self.emit_exception_check_stub();
         self.emit_deopt_stubs();
         true
+    }
+
+    /// `iinc local[idx] += inc`, for both the narrow (`0x84`) and the `wide`
+    /// (`0xC4 0x84`) encodings.
+    ///
+    /// One emitter, two callers, because the two encodings differ ONLY in how
+    /// the index and the constant are decoded — the machine code is identical,
+    /// and it already handled an `imm32` addend before `wide` could reach it.
+    /// A second copy would be a second place to forget the `MOVSXD` that
+    /// re-canonicalises the 32-bit result into the 64-bit local slot.
+    fn emit_iinc_local(&mut self, idx: usize, inc: i32) {
+        if let Some(local_reg) = self.reg_for_local(idx) {
+            // Invalidate any CalleeSaved refs before modifying the register
+            self.invalidate_callee_saved(local_reg);
+            // ADD r32, imm directly on the callee-saved register
+            if local_reg >= 8 {
+                self.buf.emit_byte(0x41); // REX.B
+            }
+            if (-128..=127).contains(&inc) {
+                self.buf.emit_byte(0x83); // ADD r/m32, imm8
+                self.buf.emit_byte(0xC0 | (local_reg & 7));
+                self.buf.emit_byte(inc as u8); // Cast: x86-64 immediate encoding
+            } else {
+                self.buf.emit_byte(0x81); // ADD r/m32, imm32
+                self.buf.emit_byte(0xC0 | (local_reg & 7));
+                self.buf.emit(&inc.to_le_bytes());
+            }
+            // Sign-extend r32 to r64
+            self.rex_w_rb(local_reg, local_reg);
+            self.buf.emit_byte(0x63); // MOVSXD r64, r/m32
+            self.modrm_reg(local_reg, local_reg);
+        } else {
+            let off = self.local_offset(idx);
+            self.emit_load_local(RAX, off);
+            if (-128..=127).contains(&inc) {
+                self.buf.emit(&[0x83, 0xC0]); // ADD eax, imm8
+                self.buf.emit_byte(inc as u8); // Cast: x86-64 immediate encoding
+            } else {
+                self.buf.emit_byte(0x05); // ADD eax, imm32
+                self.buf.emit(&inc.to_le_bytes());
+            }
+            // Sign-extend back
+            self.rex_w();
+            self.buf.emit(&[0x63, 0xC0]); // movsxd rax, eax
+            self.emit_store_local(off, RAX);
+        }
     }
 }

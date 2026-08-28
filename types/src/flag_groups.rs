@@ -1439,6 +1439,11 @@ pub const INVENTORY: &[E] = &[
     // ACTIVE safepoint map does not name as DEAD rather than demanding it be
     // published. This key restores the stricter reading. See
     // `conservative_roots::band_slot_is_verifiable_with_map`.
+    // Declared 2026-08-28. Opt-IN: an allocation failure names the window
+    // the next collection should empty, and pages in it bypass the
+    // profitability ranking. This key restores the pure ranking. See
+    // `zgc::ZRelocationPolicy::target_pages`.
+    E { group: Group::GC, token: "targeted-compaction", on_key: Some("CRATONVM_ZGC_TARGETED_COMPACTION"), off_key: None, off_word: None },
     E { group: Group::GC, token: "band-map-liveness", on_key: None, off_key: Some("CRATONVM_GC_NO_BAND_MAP_LIVENESS"), off_word: None },
     E { group: Group::GC, token: "cm-id-pairing", on_key: None, off_key: Some("CRATONVM_GC_NO_CM_ID_PAIRING"), off_word: None },
     E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },

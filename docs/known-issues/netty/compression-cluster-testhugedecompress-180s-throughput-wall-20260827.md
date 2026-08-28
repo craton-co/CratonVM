@@ -1,34 +1,31 @@
-# `codec.compression.*IntegrationTest` — the shared `testHugeDecompress` wall, 2.4x closed 2026-08-28, 4 of 11 classes still over
+# `codec.compression.*IntegrationTest` — three classes now PASS, four are inside the cap, four are not
 
 ## Status
 
-**OPEN, but a different page than it was.** The shared per-byte native wall that
-made all eleven classes HANG identically is fixed. One class now PASSES, six
-COMPLETE in 149-203 s where they used to run past the suite's 180 s cap, and
-four are still over 320 s with a residual that is not the one this page
-describes.
+**OPEN, and a different page from the one that was written.** Every one of the
+eleven used to HANG at the suite's 180 s cap. Three now PASS outright, four more
+COMPLETE inside the cap and fail only netty's own 120 s per-method timeout, and
+four are still over. Two distinct defects were behind the original wall and both
+are fixed; what remains is a third thing, named at the bottom, that is not a
+defect at all.
 
 The page's own retirement condition — *"no new investigation needed unless the
-failure signature changes"* — has been met: the signature changed, from
-`process-died rc=124 timeout=180s` to a class that finishes and reports
-`TimeoutException: testHugeDecompress() timed out after 120 seconds`, which is
-netty's own per-method timeout and not the harness's.
+failure signature changes"* — has been met twice over.
 
 ## What the eleven share
 
 All eleven inherit `AbstractIntegrationTest.testHugeDecompress`, which builds a
-256 MiB buffer one byte at a time:
+256 MiB buffer one byte at a time and pushes it through the class's codec:
 
 ```java
 in.writeByte(byteValue);      // 268,435,456 times
 digest.update(byteValue);     // 268,435,456 times, and again on the decompress side
 ```
 
-## What was actually costing the time
+## Defect 1 — 1.07 billion generic native dispatches
 
-A `--dump-native-registry` census of `JdkZlibIntegrationTest` — which the
-earlier investigation never took — named it exactly. **1.07 billion generic
-native dispatches**, three call sites:
+A `--dump-native-registry` census of `JdkZlibIntegrationTest`, which the earlier
+investigation never took, named it exactly:
 
 ```
 536 870 912  java/security/MessageDigest.update(B)V
@@ -36,19 +33,12 @@ native dispatches**, three call sites:
 268 435 456  java/nio/DirectByteBuffer.put(IB)...       <- PooledDirectByteBuf._setByte
 ```
 
-`perf` put the funnel plus its receiver validation at ~45 % of the run. The
-previous page attributed the residual to "the native-dispatch floor
-(~170 ns/call)" and judged closing it unjustified. The floor was real. What was
-missing is that all three calls have a thin direct bind that skips it — and that
-FOUR separate mechanisms were each independently keeping those binds away from
-these sites (the inline splice, the OSR door, the IR tier's `is_intrinsic_site`
-routing, and the same routing again for `VarHandle`).
-
-## The fix
-
-`perf(jit): thin direct binds for the three per-BYTE natives`, on
-`fix/netty-longlong-npe-and-compression-wall-20260827`. Per operation, against
-HotSpot on the same host:
+`perf` put the funnel and its receiver validation at ~45 % of the run. The
+previous page priced this as an irreducible "~170 ns native-dispatch floor". The
+floor was real; what was missing is that all three calls have a thin direct bind
+that skips it, and that FOUR mechanisms were each independently keeping those
+binds away from these sites. Fixed by `perf(jit): thin direct binds for the
+three per-BYTE natives`:
 
 | | before | after | HotSpot |
 |---|---:|---:|---:|
@@ -57,94 +47,115 @@ HotSpot on the same host:
 | `ByteBuf.forEachByte` | 349 ns | **122 ns** | 5.9 ns |
 
 Same-binary A/B on `JdkZlibIntegrationTest`, B arm
-`CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0 CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0`,
-on merged `dev` (2026-08-28):
+`CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0 CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0`:
+**A 149/150/151 s against B 368/227 s**, where the B arm reproduces the 369 s
+this class measured immediately before the work.
 
-```
-A  149 s / 150 s / 151 s          B  368 s / 227 s
-```
+## Defect 2 — one `iinc_w` made a whole method permanently uncompilable
 
-The B arm reproduces the 369 s this class measured on `dev` immediately before
-the work, which is what says the win is the binds and not the routing changes
-that carry them.
+The four slowest classes did not have defect 1's shape at all, and a per-TEST
+breakdown is what said so: `testHugeDecompress` was 618 s of FastLz's 658 s, and
+`testLargeRandom` — one megabyte through the same codec — took 33.8 s.
+
+`FastLz.compress` operates on `ByteBuf` directly and is 1617 bytes whose entire
+job is one loop, so the method-entry door never sees it hot and OSR is its only
+route to compiled code. It contains three `iinc_w` instructions — of which
+`iinc_w 18, -255` is nothing more exotic than an increment too big for a signed
+byte — and `jit_scan` had no arm for the `wide` prefix. Its catch-all `None`
+calls `mark_jit_bail_listed`, which bans the method from EVERY compile door for
+the life of the process. 256 MiB of compression ran in the **interpreter**.
+
+Fixed by `fix(jit): implement the wide prefix`:
+
+    FastLz encode, 1 MiB, steady state:   5115 ms  ->  844 ms   (6.1x)
 
 ## Where the eleven stand
 
-Solo, uncapped, killed at 320 s, one run each on a quiet host, merged `dev`:
+Solo, uncapped, one run each on a quiet host, merged `dev` 2026-08-28.
+`regression-suite/run.sh` 72/72 on the same binary.
 
 | class | wall | |
 |---|---:|---|
-| `LengthAwareLzfIntegrationTest` | 103 s | **PASSES**, `ok=11 failed=0` |
-| `JdkZlibIntegrationTest` | 149-151 s | completes |
-| `ZstdIntegrationTest` | 151 s | completes |
-| `BrotliIntegrationTest` | 153 s | completes |
-| `Lz4FrameIntegrationTest` | 154 s | completes |
-| `JZlibIntegrationTest` | 184 s | completes |
-| `LzfIntegrationTest` | 203 s | completes |
-| `SnappyIntegrationTest` | > 320 s (500 s uncapped) | still over |
-| `SnappyJumboSizeIntegrationTest` | > 320 s | still over |
-| `Bzip2IntegrationTest` | > 320 s | still over |
-| `FastLzIntegrationTest` | > 320 s | still over |
+| `JdkZlibIntegrationTest` | 94 s | **PASSES** `ok=11 failed=0` |
+| `ZstdIntegrationTest` | 109 s | **PASSES** `ok=11 failed=0` |
+| `LengthAwareLzfIntegrationTest` | 110 s | **PASSES** `ok=11 failed=0` |
+| `JZlibIntegrationTest` | 142 s | completes |
+| `BrotliIntegrationTest` | 142 s | completes |
+| `Lz4FrameIntegrationTest` | 146 s | completes |
+| `LzfIntegrationTest` | 148 s | completes |
+| `FastLzIntegrationTest` | 322 s | over |
+| `SnappyIntegrationTest` | 334 s | over |
+| `SnappyJumboSizeIntegrationTest` | 408 s | over |
+| `Bzip2IntegrationTest` | 489 s | over |
 
 Against 455-528 s for `JdkZlibIntegrationTest` when this page was written, and
-369 s for it on `dev` immediately before this work.
+369 s for it on `dev` immediately before this work. "Completes" means the class
+finishes inside the harness's 180 s cap and reports `ok=10 failed=1`:
+`TimeoutException: testHugeDecompress() timed out after 120 seconds`, which is
+netty's own per-method timeout, not the harness's.
 
-"Completes" means the class finishes and reports `ok=10 failed=1`: the class is
-inside the harness's 180 s cap (or near it) but `testHugeDecompress` is still
-over netty's own 120 s per-method timeout.
+## What is left, and why it is not a third defect
 
-## The two residuals, which are NOT the same residual
+The four that remain, and the four that are 20-30 s over their method timeout,
+are all now limited by the same thing: **the `ByteBuf` per-byte accessor chain in
+compiled code**. `FastLz.compress` reads and writes its input through
+`ByteBuf.getByte(int)` / `setByte(int,int)`, and each one is
 
-**1. `testHugeDecompress` sits just over netty's 120 s method timeout.** The
-seven that complete need roughly another 1.3x, not a new mechanism.
-`LengthAwareLzfIntegrationTest` already has it. Run-to-run spread on this
-workload is wide — `JdkZlibIntegrationTest` measured 85 s, 119 s, 125 s and
-143 s on the pre-merge tree and a tight 149-151 s after — so a single run is not
-evidence either way.
+```
+invokevirtual AbstractByteBuf.getByte  ->  checkIndex  ->  ensureAccessible
+    ->  RefCnt VarHandle read  ->  _getByte (virtual)  ->  ByteBuffer.get  ->  helper
+```
 
-What is left in its profile after the binds is diffuse: 41 % in JIT-compiled
-code, and the rest spread across field access through the collector
-(`get_field_as` / `coerce_field_value_for_slot` / `read_value_cell_checked`),
-`jit_checkcast`, `jit_invoke_virtual_mic`, and the digest accumulator's per-byte
-`Mutex` + hash. No single item is above 8 %.
+— four virtual calls and a helper call where HotSpot inlines the whole chain to
+about two instructions. With `compress` compiled, FastLz encode is 844 ms/MiB
+against HotSpot's 37 ms: **23x**, and the profile behind it is flat. The largest
+single entry is 5.9 %, and the top ten are the receiver memo, the `VarHandle`
+read, the collector's field accessors and `jit_checkcast` — none of them a
+funnel, a stuck method, or anything else this page can name and fix.
 
-**2. Snappy / SnappyJumbo / Bzip2 / FastLz are a different wall.**
-`SnappyIntegrationTest` runs 500 s uncapped for 15 tests, and its census has NO
-concentrated funnel left — the largest native is 175 M `VarHandle.get` and its
-profile's top entry is 3.8 %. Its cost is the platform's general per-operation
-overhead against netty's pure-Java codec loops, which belongs to `the snappy
-wall is VM runtime, not compiled code` and not to this page. Grouping these four
-with the other seven was correct while the shared wall dominated everything; it
-is not correct now.
+Closing that is inlining depth and devirtualisation through netty's `ByteBuf`
+hierarchy. It is a project, not a residual of this page, and it is the same
+ceiling `the snappy wall is VM runtime, not compiled code` describes —
+`SnappyIntegrationTest` has no `wide` at all and never had defect 1's census.
 
 ## Not a bug to keep re-discovering
 
-If one of the seven shows up as FAIL with `TimeoutException:
-testHugeDecompress() timed out after 120 seconds`, this is why, and the number
-to watch is the CLASS wall time: above ~250 s means something regressed, because
-these now sit at 103-203 s. **A HANG at the 180 s cap from one of the seven IS
-new** and worth investigating — that was the old signature and it should not
-come back.
+`TimeoutException: testHugeDecompress() timed out after 120 seconds` on one of
+the seven that complete is the EXPECTED failure today. The number to watch is
+the CLASS wall time; above ~250 s for one of the seven means something
+regressed. **A HANG at the 180 s cap is new** — that was the old signature and
+it should not come back.
 
-`CRATONVM_DBG=jit-method-stats` prints the bound-SITE and served/declined CALL
-counts for the three helpers. `ByteBuffer.byteElement=0`, or a served count far
-below the call count, is the shape of a bind that stopped reaching these sites —
-which happened four times while this was being written, once per compile door.
-A site count is not an engagement count; only the second one says the fast path
-is running.
+Three instruments earn their keep here, because each one was the only thing that
+could see its own defect:
+
+* `CRATONVM_DBG=jit-method-stats` prints bound-SITE and served/declined CALL
+  counts for the three thin helpers. A site count is not an engagement count:
+  `ByteBuffer.byteElement=2` with `served=1636` against five million funnel
+  invocations is what named the IR-tier routing gap.
+* `[cratonvm-jitc] OSR-compile FAILED … stage=` names which region of
+  `compile_osr_artifact` refused. An OSR refusal is silent AND permanent — the
+  loop just runs interpreted forever while `OSR-recompile
+  reason=no-cached-artifact` repeats — and that function has ~25 bare
+  `return None`s.
+* `[cratonvm-jitc] scan-bail op=0x…` names the byte `jit_scan` refused. It is
+  what turned "OSR failed" into "opcode 0xc4 at pc 960".
 
 ## Repro
 
 ```bash
 cd apps/netty-suite-runner
 cratonvm.exe --java-home <jdk25> --Xmx 1500m -XX:+UseZGC @common.args -Dcraton.batch=1 \
-  CratonRunner io.netty.handler.codec.compression.JdkZlibIntegrationTest
+  CratonRunner io.netty.handler.codec.compression.FastLzIntegrationTest
 ```
+
+`TimedRunner` (same directory, same arguments) prints a per-TEST breakdown,
+which is what separated `testHugeDecompress` from the rest of a class and made
+`testLargeRandom` usable as a 30-second stand-in for a 600-second one.
 
 ## Related
 
-* Full investigation and fix history of the earlier rounds:
-  `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
+* `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
 * `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
 * The per-call native-dispatch floor, priced independently elsewhere: the
   `HashedWheelTimerTest` page and the KFusion FFM-segment page.
