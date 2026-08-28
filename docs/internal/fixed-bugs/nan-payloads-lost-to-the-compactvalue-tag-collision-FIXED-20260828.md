@@ -141,14 +141,33 @@ Regressions:
   HotSpot run, so it is an oracle diff, not a self-check).
 * `cargo test -p cratonvm-types --lib`: **589 passed, 0 failed**.
 * `cargo test -p cratonvm-gc --lib`: **1687 passed, 0 failed**.
-* `cargo test -p cratonvm-vm --lib`: 2636 passed, 2 failed —
-  `runtime::resolve::guard::the_allowlist_has_no_dead_rows` and
-  `no_unallowlisted_metadata_table_bypass_exists`. **Both are red on `dev`
-  independently of this change**: the first offender they name is a stale
-  allowlist row for `vm/src/native/jni.rs`, a file this branch does not touch and
-  which is byte-identical to `origin/dev`.
-* H2 suite, first 40 classes, JIT on: matches the tracked `baseline.tsv` on every
-  class, with `TestIndex` passing where the baseline records FAIL.
+* `cargo test -p cratonvm-vm --lib`: 2637 passed, 2 failed.
+* `cargo test -p cratonvm-jit --lib`: 2122 passed, 2 failed.
+* H2 suite, first 40 classes, JIT on, run twice on the same host the same
+  afternoon — once with this branch's binary and once with a pre-fix one:
+  **37 PASS / 1 FAIL / 2 HANG in both arms, with zero per-class differences.**
+  Both arms also match the tracked `baseline.tsv` or beat it (`TestIndex`,
+  `TestLargeBlob` and `TestLIRSMemoryConsumption` pass where it records
+  FAIL/FAIL/HANG). Every stderr log in both arms: no collapse line.
+
+The four unit-test failures are `dev`'s, not this branch's, and that was checked
+rather than assumed — a pristine `origin/dev` worktree reproduces all of them:
+
+```
+runtime::resolve::guard::the_allowlist_has_no_dead_rows            dev: FAIL
+runtime::resolve::guard::no_unallowlisted_metadata_table_bypass_exists
+                                                                   dev: FAIL
+layout_constant_inventory::layout_constant_emission_sites_are_inventoried
+                                                                   dev: FAIL
+ir_lower::tests::ir_lower_loads_incoming_arguments_past_the_entry_abi_registers
+                                                                   dev: FAIL
+```
+
+They are left alone on purpose. The two allowlist rows record *added* bypass
+sites, so raising the numbers would grant permission for someone else's new
+bypass; the layout inventory's own message requires confirming that two new
+object-header displacement sites are value-safe at the shrunk layout, which is
+the header-shrink author's call, not this branch's.
 
 ## What is deliberately still lossy, and why it cannot be reached
 
