@@ -5,24 +5,26 @@ closed with the flag still default-off and one sentence of debt: *"it needs the
 kafka/spring/tomcat/hibernate gauntlet that flag has never had."* This is that
 soak.
 
-**Verdict: do not flip.** Two independent reasons, and neither is a timing
-result:
+**Verdict: do not flip.** Three independent reasons, and none of them is a
+timing result:
 
-0. **It would not buy anything.** Across the 651-class Tomcat suite the flag
+1. **It would not buy anything.** Across the 651-class Tomcat suite the flag
    fires ZERO times — in every arm, including the two that lift the gates
    upstream of it. Real server code's allocations escape (22 of 22 in a sampled
    class, all `GlobalEscape`), so the predicate the flag controls is never
    reached. Flipping it default-on would change no compiled code on that
-   workload while carrying reason 1 below.
-1. **The designated pre-flip gate is RED.** `jit/tests/ir_vs_singlepass.rs`
+   workload while carrying reason 2 below.
+2. **The designated pre-flip gate is RED.** `jit/tests/ir_vs_singlepass.rs`
    fails with the flag on and passes with it off, returning a heap address where
    an `int` belongs — `docs/known-issues/jit/scalar-deopt-elision-returns-the-object-in-the-differential-harness-20260827.md`.
    The same source shape compiled the ordinary way is correct, so the two
    environments disagree and that has to be resolved before a flip, not after.
-2. **Flipping it ALONE would change almost nothing anyway.** The flag decides
-   one bit — may an allocation a deopt snapshot names be deleted — and on real
-   code that bit is rarely reached, because `c2_upgrade_would_engage` keeps
-   allocation-bearing methods out of C2 in the first place. Measured below.
+3. **Even where the lane DOES pay, this flag alone is not what pays.** It
+   decides one bit — may an allocation a deopt snapshot names be deleted — and
+   reaching that bit needs a DIFFERENT gate lifted first: `c2_upgrade_would_engage`
+   keeps allocation-bearing methods out of C2 at all. On the one workload where
+   the flag does engage it is worth 10.9x, and only alongside
+   `CRATONVM_JIT_IR_INLINE`. Measured below.
 
 ## The instrument, and why the soak needed one first
 
