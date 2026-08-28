@@ -8829,6 +8829,61 @@ impl AtomicIntFieldLayout {
     }
 }
 
+/// `AtomicLong.value`'s addresses — the 64-bit twin of
+/// [`AtomicIntFieldLayout`], and different from it in exactly two places: the
+/// legacy payload sits at [`cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET`]
+/// rather than the 32-bit one, and a compact storage width that is not exactly
+/// **8** bytes is refused.
+///
+/// Both differences are load-bearing rather than cosmetic. The emitted
+/// instruction is a REX.W `LOCK XADD`, so pointing it at the 32-bit payload
+/// offset would read four bytes of the cell's TAG along with half the value,
+/// and admitting a narrower storage width would have it write past the field.
+/// Refusing returns `None` and the call simply keeps its native dispatch.
+pub struct AtomicLongFieldLayout {
+    /// Abstract field slot index of `AtomicLong.value`.
+    pub value_field_index: usize,
+    /// Byte offset of `value`'s 8-byte payload in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 8-byte payload in a LEGACY instance.
+    pub value_legacy_offset: i32,
+    /// `ObjectHeader` class id of `java/util/concurrent/atomic/AtomicLong`,
+    /// used as the receiver guard. `AtomicLong` is not final and its methods
+    /// are not final, so a subclass could override them — the guard is what
+    /// makes inlining the field access sound, and a mismatch falls back to
+    /// ordinary dispatch, which runs the override.
+    pub class_id: u32,
+}
+
+impl AtomicLongFieldLayout {
+    pub fn new(value_field_index: usize, class_id: u32) -> Option<Self> {
+        if class_id == 0 {
+            return None;
+        }
+        // LEGACY: uniform 16-byte `Value` cell, 8-byte long payload inside it.
+        let legacy = (cratonvm_types::HEADER_SIZE
+            + value_field_index * cratonvm_types::SLOT_SIZE) as i32
+            + cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32;
+        let mut compact = legacy;
+        if cratonvm_types::compact_ref_fields_enabled() {
+            if let Some((body_off, storage)) =
+                cratonvm_types::compact_field_storage(class_id, value_field_index)
+            {
+                if storage.size_runtime() != 8 {
+                    return None;
+                }
+                compact = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+            }
+        }
+        Some(Self {
+            value_field_index,
+            value_compact_offset: compact,
+            value_legacy_offset: legacy,
+            class_id,
+        })
+    }
+}
+
 impl StringFieldLayout {
     /// Build a layout from raw field indices, precomputing, for each of
     /// `value`/`coder`/`hash`, the two byte offsets the codegen needs: the
@@ -9209,6 +9264,41 @@ pub enum JitIntrinsic {
     AtomicIntGetAndAdd,        // getAndAdd(I)I       -> old
     AtomicIntAddAndGet,        // addAndGet(I)I       -> old + delta
     // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+    // The 64-bit twin of the region above, emitted as one REX.W `LOCK XADD`.
+    //
+    // It exists because the `AtomicInteger` ladder was measured and its
+    // `AtomicLong` counterpart was not written: the exact census
+    // (`--nojit CRATONVM_DISABLE_INTRINSICS=1`) of
+    // `HashedWheelTimerTest#testExecutionOnTime` puts
+    // `AtomicLong.incrementAndGet` and `.decrementAndGet` at **1.00 call per
+    // expired task each**, and netty's `HashedWheelTimer.pendingTimeouts` is
+    // exactly that pair — one increment per `newTimeout`, one decrement per
+    // expiry. Each was a full native dispatch, measured at ~154 ns/call on
+    // this branch against the ~1 ns an uncontended `lock xadd` costs.
+    //
+    // Soundness rests on the same three things the 32-bit region names, and
+    // each was re-checked for this class rather than assumed:
+    //   * the registered natives keep their state in the SAME memory —
+    //     `native_atomic_long_get` is `get_field_volatile(this, 0)` and
+    //     `native_atomic_long_increment_and_get` is
+    //     `atomic_fetch_add_long(this, 0, 1)` — so an interpreted caller and a
+    //     compiled caller still agree on one location;
+    //   * the receiver class-id guard, because `AtomicLong` is not final;
+    //   * the per-object COMPACT/LEGACY branch.
+    AtomicLongGetAndIncrement, // getAndIncrement()J  -> old
+    /// `get()J` / `getPlain()J` / `getAcquire()J` — a plain aligned 64-bit
+    /// load. On x86-64 TSO an aligned `MOV` IS a correct volatile/acquire load
+    /// and is atomic at 8 bytes, so no fence and no `LOCK` is owed. (`set` is
+    /// deliberately NOT here: a volatile STORE owes StoreLoad.)
+    AtomicLongGet,
+    AtomicLongGetAndDecrement, // getAndDecrement()J  -> old
+    AtomicLongIncrementAndGet, // incrementAndGet()J  -> old + 1
+    AtomicLongDecrementAndGet, // decrementAndGet()J  -> old - 1
+    AtomicLongGetAndAdd,       // getAndAdd(J)J       -> old
+    AtomicLongAddAndGet,       // addAndGet(J)J       -> old + delta
+    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
     /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
@@ -10122,6 +10212,141 @@ pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` thin direct-call binds.
+//
+// Census-driven, exactly like `Preconditions.checkIndex` above.
+// `--dump-native-registry` on `BufProbe` (netty's `ByteBuf.writeByte` /
+// `forEachByte` in a loop, the two operations
+// `AbstractIntegrationTest.testHugeDecompress` runs 268 million times each)
+// reports ONE `java/nio/DirectByteBuffer.put(IB)` per `writeByte` and one
+// `get(I)B` per byte read, both `bridge`:
+//
+//     5 242 880  java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;
+//     3 145 728  java/nio/DirectByteBuffer.get(I)B
+//
+// against a measured 700 ns/op for `writeByte` and 349 ns/op for
+// `forEachByte`, where HotSpot is 5.1 ns and 5.9 ns. `perf` puts
+// `safe_native_call_impl` + `try_jit_site_cached_native_dispatch` +
+// the argument marshalling + `is_object_address` at ~30 % of that profile:
+// the native bodies are a bounds check and a one-byte copy, and everything
+// else is the funnel around them.
+//
+// The site's constant-pool class is `java/nio/ByteBuffer` (netty's
+// `PooledDirectByteBuf.memory` is declared as one), so the bind uses
+// `direct_native_helper_for_impl`: the POLICY question has to be asked about
+// `java/nio/DirectByteBuffer`, which is where the native the helper stands in
+// for is registered. The helper declines any receiver whose class the funnel
+// has not already served with the modelled layout -- including every
+// `HeapByteBuffer` -- so a polymorphic site keeps today's behaviour on every
+// receiver the fast path was not proven for.
+pub static NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to the two `ByteBuffer` single-byte helpers.
+pub static NIO_BYTE_ELEMENT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Calls the thin helpers actually SERVED, and calls they DECLINED to the
+/// generic dispatcher.
+///
+/// A site count and a served count answer different questions, and the gap
+/// between them is where a fast path hides: `ByteBuffer.byteElement=2` with
+/// five million funnel invocations still in the census means the bind happened
+/// and the helper said no to every call. Timings cannot tell those apart.
+pub static NIO_BYTE_ELEMENT_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static NIO_BYTE_ELEMENT_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(nio served, nio declined, md served, md declined)`.
+pub fn byte_element_helper_calls() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        NIO_BYTE_ELEMENT_SERVED.load(Relaxed),
+        NIO_BYTE_ELEMENT_DECLINED.load(Relaxed),
+        MD_UPDATE_BYTE_SERVED.load(Relaxed),
+        MD_UPDATE_BYTE_DECLINED.load(Relaxed),
+    )
+}
+
+/// Bound `ByteBuffer` single-byte element sites, for a census that can tell
+/// "the fast path was never installed" from "it was installed and is no
+/// faster" -- the distinction timings alone cannot make.
+pub fn nio_byte_element_sites() -> u64 {
+    NIO_BYTE_ELEMENT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_nio_bytebuffer_byte_direct_fns(put: usize, get: usize) {
+    NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN.store(put, std::sync::atomic::Ordering::Relaxed);
+    NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN.store(get, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `MessageDigest.update(byte)` thin direct-call bind.
+///
+/// The third rung of the same census. `testHugeDecompress` feeds SHA-256 a byte
+/// at a time 536 million times (268 M on the compress side, 268 M more through
+/// `ByteProcessor.process` on the decompress side) at 216 ns/call against
+/// HotSpot's 8.6 ns. `update` is FINAL on `MessageDigest`, so a provider's
+/// subclass cannot override it and the helper has to check the receiver itself
+/// — it serves only the exact class this VM's own `getInstance` builds, and
+/// declines everything else to the funnel, which forwards to `engineUpdate`.
+pub static MD_UPDATE_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to [`MD_UPDATE_BYTE_DIRECT_FN`].
+pub static MD_UPDATE_BYTE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound `MessageDigest.update(byte)` sites — the same "was it ever installed?"
+/// census [`nio_byte_element_sites`] exists for.
+pub fn md_update_byte_sites() -> u64 {
+    MD_UPDATE_BYTE_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_md_update_byte_direct_fn(addr: usize) {
+    MD_UPDATE_BYTE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0` — send every
+/// `MessageDigest.update(byte)` back through the generic native funnel.
+/// Default ON; the kill switch and B arm, as beside.
+pub fn md_update_direct_helper_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0` — send every `ByteBuffer`
+/// single-byte element access back through the generic native funnel. Default
+/// ON, so a KILL SWITCH and the B arm of a one-binary A/B, for the same reason
+/// `census-direct-helpers` and `long-box-direct-helpers` beside it have one.
+pub fn nio_byte_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
 
 /// Register the exact-HashMap thin direct-call helpers (called once from the
 /// VM's `build_helpers`).
@@ -11432,6 +11657,95 @@ pub fn try_resolve_atomic_intrinsic(
         );
     }
     Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+}
+
+/// Call sites the `AtomicLong` intrinsic has claimed this process.
+///
+/// The acceptance criterion, and not the ns/op: the 32-bit twin's own doc says
+/// "a perf claim about this family is not believable without checking that this
+/// is non-zero — the intrinsic answering the same values as the native it
+/// replaced proves nothing about whether it actually ran."
+/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each site.
+pub static ATOMIC_LONG_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC=1` — keep every `AtomicLong` RMW call
+/// on ordinary native dispatch.
+///
+/// Separate from `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` on purpose: the two
+/// families are emitted by different code and a bisect that cannot tell them
+/// apart is not a bisect. Default off.
+fn atomic_long_intrinsic_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC").is_some()
+    })
+}
+
+/// Matcher for the ATOMIC_LONG region — the 64-bit twin of
+/// [`try_resolve_atomic_intrinsic`], with the same contract: returns the
+/// intrinsic entry, the parameter count excluding the receiver, the return
+/// type tag, and the receiver class id to guard on.
+///
+/// The guard is ALWAYS emitted for this family, for the same reason:
+/// `AtomicLong` is not final, so a receiver could be a subclass that overrides
+/// `incrementAndGet`, and only an exact class-id match may take the inline
+/// path.
+///
+/// `num_params` is 1 for `getAndAdd(J)J` / `addAndGet(J)J` and not 2: this
+/// JIT's operand stack is one 64-bit slot per value, not JVMS category-2
+/// pairs — the same counting `LONG_VALUE_OF_DIRECT_FN`'s bind documents.
+pub fn try_resolve_atomic_long_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if class != "java/util/concurrent/atomic/AtomicLong" {
+        return None;
+    }
+    if atomic_long_intrinsic_disabled() {
+        return None;
+    }
+    // Derived from the SITE's declared class id and field slot 0 — the same
+    // two inputs the codegen re-derives it from, and the same slot the
+    // registered natives address (`get_field_volatile(this, 0)` /
+    // `atomic_fetch_add_long(this, 0, ..)`). `AtomicLongFieldLayout::new`
+    // returns `None` when the compact storage width is not exactly 8 bytes, so
+    // a layout this 64-bit `LOCK XADD` could not address never reaches codegen.
+    let layout = AtomicLongFieldLayout::new(0, guard_class_id)?;
+    if layout.class_id == 0 {
+        return None;
+    }
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+    let hit: Option<(JitIntrinsic, usize)> = match (name, descriptor) {
+        ("get", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getPlain", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getAcquire", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("longValue", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getAndIncrement", "()J") => Some((JitIntrinsic::AtomicLongGetAndIncrement, 0)),
+        ("getAndDecrement", "()J") => Some((JitIntrinsic::AtomicLongGetAndDecrement, 0)),
+        ("incrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongIncrementAndGet, 0)),
+        ("decrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongDecrementAndGet, 0)),
+        ("getAndAdd", "(J)J") => Some((JitIntrinsic::AtomicLongGetAndAdd, 1)),
+        ("addAndGet", "(J)J") => Some((JitIntrinsic::AtomicLongAddAndGet, 1)),
+        _ => None,
+    };
+    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
+    let (intrinsic, num_params) = hit?;
+    ATOMIC_LONG_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+        eprintln!(
+            "[atomic-long-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
+            class,
+            name,
+            descriptor,
+            layout.class_id,
+            layout.value_compact_offset,
+            layout.value_legacy_offset,
+        );
+    }
+    Some((intrinsic.as_entry(), num_params, b'J', layout.class_id))
 }
 
 #[cfg(test)]
@@ -15355,11 +15669,24 @@ fn plan_scalar_replacement(
     // object, which the materializer has always supported (it walks the field
     // graph and allocates a shell per distinct id). So the pin only bites when
     // this allocation cannot be described at all.
-    if descriptor_pinned.contains(&new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    // Engagement census. These two gates are the ONLY thing
+    // `CRATONVM_SCALAR_DEOPT` changes, so they are the only place that can say
+    // whether the flag reached a workload — see
+    // `cratonvm_types::scalar_deopt_census`. Counted once per allocation
+    // (`descriptor_decided`), not once per gate: an allocation can be both
+    // pinned by an earlier round and named by a snapshot, and counting it twice
+    // would inflate an engagement number a soak is about to reason from.
+    let mut descriptor_rescued = false;
+    let mut descriptor_blocked = false;
+    if descriptor_pinned.contains(&new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
     }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
@@ -15367,11 +15694,23 @@ fn plan_scalar_replacement(
         // to silently retarget it.
         elide_alloc = false;
     }
-    if ea_snapshot_names(ir_graph, new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    if ea_snapshot_names(ir_graph, new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
+    }
+    // BLOCKED wins over RESCUED: an allocation that hit both gates and failed
+    // either one is kept, so reporting it as engagement would be a lie in the
+    // direction that flatters the flag.
+    if descriptor_blocked {
+        cratonvm_types::scalar_deopt_census::note_blocked();
+    } else if descriptor_rescued {
+        cratonvm_types::scalar_deopt_census::note_rescued();
     }
     if !ea_splice_feasible(ir_graph, new_node)
         || stores.iter().any(|&s| !ea_splice_feasible(ir_graph, s))
@@ -20345,6 +20684,8 @@ fn try_compile_inner(
                         let is_intrinsic_site = try_resolve_intrinsic(&cn, &mn, &desc).is_some()
                             || try_resolve_atomic_intrinsic(&cn, &mn, &desc, 0).is_some()
                             || cn == "java/util/concurrent/atomic/AtomicInteger"
+                            || try_resolve_atomic_long_intrinsic(&cn, &mn, &desc, 0).is_some()
+                            || cn == "java/util/concurrent/atomic/AtomicLong"
                             || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
                             || cn == "java/lang/String"
                             // FFM element accessors. Registered by their OWN
@@ -20360,7 +20701,54 @@ fn try_compile_inner(
                             // compiled code was never asking.
                             || (cn == "java/lang/foreign/MemorySegment"
                                 && matches!(mn.as_str(), "getAtIndex" | "setAtIndex")
-                                && ffm_kind_for_descriptor(&desc).is_some());
+                                && ffm_kind_for_descriptor(&desc).is_some())
+                            // The single-BYTE `ByteBuffer` element accessors
+                            // and `MessageDigest.update(byte)`. Bound by their
+                            // own arm in the single-pass scan, for the same
+                            // reason the FFM row above is: they carry a
+                            // dispatch info for the decline edge, so
+                            // `try_resolve_intrinsic` does not name them and
+                            // this predicate has to.
+                            //
+                            // Found the same way, by the same instrument. With
+                            // the bind wired at two doors and the splice
+                            // refusing to swallow the site, `BufProbe` still
+                            // reported `ByteBuffer.byteElement=2` bound sites
+                            // against `served=1636` calls and 5 239 468 funnel
+                            // invocations in the native census: 1 636 is what a
+                            // single-pass compile serves BEFORE
+                            // `PooledDirectByteBuf._setByte` tiers up, and the
+                            // IR tier it tiers up to lowers the site to a plain
+                            // dispatch. A count that small next to a bound-site
+                            // count is the signature of this exact routing.
+                            || (nio_byte_direct_helpers_enabled()
+                                && cn == "java/nio/ByteBuffer"
+                                && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
+                                    || (mn == "get" && desc == "(I)B")))
+                            || (md_update_direct_helper_enabled()
+                                && cn == "java/security/MessageDigest"
+                                && mn == "update"
+                                && desc == "(B)V")
+                            // `VarHandle` read/write modes, bound at BOTH the
+                            // single-pass and OSR doors and lost at this one for
+                            // the same reason as the three rows above.
+                            //
+                            // MEASURED on `JdkZlibIntegrationTest#
+                            // testHugeDecompress` after the other three landed:
+                            // the census still showed **269 768 215**
+                            // `VarHandle.get` bridge invocations — one per
+                            // `ByteBuf.writeByte`, from the `RefCnt` read inside
+                            // `ensureAccessible` — while
+                            // `CRATONVM_DBG=jit-method-stats` reported
+                            // `VarHandle.read=2/0`. Two sites bound at the
+                            // single-pass door, none at OSR, and the tiny hot
+                            // accessor that holds the site tiering up to here.
+                            || (varhandle_read_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_read_helper_slot(&mn, &desc).is_some())
+                            || (varhandle_write_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_write_helper_slot(&mn, &desc).is_some());
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
@@ -23315,6 +23703,94 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                // `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` — the
+                // per-BYTE element accessors. See
+                // `NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN` for the census that
+                // named them and for why the receiver test lives in the
+                // helper rather than in a `guard_class_id` here: the fast
+                // path serves only a class the FUNNEL has already served
+                // with the modelled layout, which is a fact this compile
+                // cannot know.
+                if direct_jit_callee_calls_enabled
+                    && nio_byte_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/nio/ByteBuffer"
+                    && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
+                        || (method_name == "get" && descriptor == "(I)B"))
+                {
+                    let is_put = method_name == "put";
+                    let entry = direct_native_helper_for_impl(
+                        if is_put {
+                            &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                        } else {
+                            &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                        },
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        "java/nio/DirectByteBuffer",
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        NIO_BYTE_ELEMENT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: if is_put { 2 } else { 1 },
+                                // `put` hands back the receiver, which the
+                                // return-value ladder must mark as an oop;
+                                // `get` returns a Java `byte`, which reaches
+                                // the operand stack sign-extended into an int
+                                // exactly as the registered native's
+                                // `Value::Int` does.
+                                return_type: if is_put { b'L' } else { b'I' },
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `MessageDigest.update(byte)` — see
+                // `MD_UPDATE_BYTE_DIRECT_FN`. `update` is FINAL on
+                // `MessageDigest`, so the site is statically monomorphic in the
+                // only sense that matters here: whatever the receiver's class,
+                // this method is the one that runs. Which receivers the fast
+                // path may SERVE is the helper's question, not this one's.
+                if direct_jit_callee_calls_enabled
+                    && md_update_direct_helper_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/security/MessageDigest"
+                    && method_name == "update"
+                    && descriptor == "(B)V"
+                {
+                    let entry = direct_native_helper(
+                        &MD_UPDATE_BYTE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        MD_UPDATE_BYTE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 if direct_jit_callee_calls_enabled
                     && invoke_kind == 2
                     && class_name == "java/util/concurrent/ConcurrentMap"
@@ -23596,6 +24072,37 @@ fn try_compile_inner(
                     continue;
                 }
                 // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
+                // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+                // The 64-bit twin, on exactly the same terms: registered only
+                // with a resolved receiver class id, because `AtomicLong` is
+                // not final and a subclass override must keep ordinary
+                // dispatch.
+                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
+                    .and_then(|r| r(cp_idx))
+                    .and_then(|cid| {
+                        try_resolve_atomic_long_intrinsic(
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                            cid,
+                        )
+                    })
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                            guard_class_id,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
                 // Then the `java/lang/String` intrinsics — registered only
                 // when the String field layout has resolved (and carries a

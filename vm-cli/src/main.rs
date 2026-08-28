@@ -274,6 +274,33 @@ fn maybe_dump_shutdown_reports() {
             "[cratonvm] invokevirtual sites pinned to a private target: {}",
             cratonvm_jit::private_invokevirtual_pinned()
         );
+        // Fieldrefs where a field of the NAME exists but not with the
+        // constant pool's descriptor. Since 2026-08-28 each of these raises
+        // NoSuchFieldError, which is what JVMS 5.4.3.2 says; before it, each
+        // was answered by that other field.
+        //
+        // Deliberately NOT counting the case where the name exists nowhere:
+        // that is NoSuchFieldError either way, so counting it would report
+        // behaviour changes that did not happen -- as it did on SLF4J's own
+        // version sanity check, which probes for a field it expects to be
+        // absent and catches the error by design.
+        //
+        // A non-zero here on a workload that used to pass is the first place
+        // to look; `CRATONVM_DBG_FIELD_DESCRIPTOR=1` names each one, and
+        // `CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` restores the old answer for
+        // a single-binary A/B.
+        eprintln!(
+            "[cratonvm] fieldrefs whose name exists but not with the recorded              descriptor (now NoSuchFieldError): {}",
+            cratonvm_vm::runtime::resolve::field_resolution_descriptor_fallbacks()
+        );
+        // And the number that says whether applying the descriptor CHANGED an
+        // answer. Every one of these is a field access that used to reach a
+        // same-named field of another type -- and in compiled code, to pair
+        // that field's slot index with the constant pool's type tag.
+        eprintln!(
+            "[cratonvm] field resolutions the descriptor key answered differently              from the name-only key: {}",
+            cratonvm_vm::runtime::resolve::field_resolution_descriptor_corrections()
+        );
         eprintln!(
             "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );

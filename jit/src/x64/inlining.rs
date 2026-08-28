@@ -178,7 +178,14 @@ impl Compiler {
         self.push_inline_scope(pc, site.callee_num_args);
         let walk_at_checkpoint = self.inline_walk_at;
         self.inline_walk_at = (usize::MAX, 0);
+        // The callee-local oop scope this splice pushes lives exactly as long
+        // as its body is being emitted. Truncated on BOTH exits, like every
+        // other speculative side effect above: a scope left behind by a bailed
+        // splice would name spill slots the fall-through call path has already
+        // handed to something else.
+        let oop_scope_checkpoint = self.inline_oop_scopes.len();
         let inline_ok = self.try_emit_inline_body(pc, site);
+        self.inline_oop_scopes.truncate(oop_scope_checkpoint);
         let bailed_at = self.inline_walk_at;
         // A nested splice runs the same walk, so restore the enclosing walk's
         // position on the way out: otherwise an inner body that finished
@@ -355,6 +362,29 @@ impl Compiler {
             return false;
         };
 
+        // Make those locals DESCRIBABLE at the safepoints this body emits.
+        // Without it they are named by nothing -- see `Compiler::
+        // inline_oop_scopes` for the miscompile that produced. Pushed here
+        // rather than in the wrapper because the base address is only known
+        // now; popped by the wrapper, which owns every other rollback.
+        {
+            let callee_param_oop_mask =
+                crate::compute_param_oop_mask(&site.descriptor, site.callee_is_static);
+            let (masks, reached) = compute_local_oop_masks(
+                callee_code,
+                callee_len,
+                callee_locals_size,
+                callee_param_oop_mask,
+            );
+            self.inline_oop_scopes.push(InlineOopScope {
+                local_base: callee_local_base,
+                num_locals: callee_locals_size,
+                masks,
+                reached,
+                cur_pc: 0,
+            });
+        }
+
         // Pop arguments from caller stack and store into callee locals.
         // Args are pushed left-to-right, so stack top = last arg.
         // For instance methods, arg0 = objectref ('this').
@@ -512,6 +542,13 @@ impl Compiler {
             // Name the spot for a rollback report (see `inline_walk_at`). A
             // bail leaves this at the instruction it died on.
             self.inline_walk_at = (cpc, op);
+            // Keep this splice's scope pointed at the instruction being
+            // emitted, so a safepoint inside the body reads the oop-local mask
+            // for the right callee pc. `last_mut`: a nested splice pushes its
+            // own scope and owns the cursor while it runs.
+            if let Some(scope) = self.inline_oop_scopes.last_mut() {
+                scope.cur_pc = cpc;
+            }
 
             // Merge-point handling.
             //

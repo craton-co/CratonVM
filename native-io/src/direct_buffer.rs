@@ -1563,6 +1563,99 @@ mod elem_census {
     }
 }
 
+/// What the single-byte element accessors have PROVEN, published so the JIT can
+/// serve those two calls without the native funnel.
+///
+/// # Why anything is published at all
+///
+/// `--dump-native-registry` on netty's `AbstractIntegrationTest.testHugeDecompress`
+/// puts `DirectByteBuffer.put(int,byte)` and `get(int)` at the top of the census:
+/// one funnel round trip per BYTE, 268 million of each. The bodies below are a
+/// bounds check and a one-byte copy; everything else is the ~160 ns generic
+/// native dispatch around them, which is what `jit_dbb_put_byte_direct` /
+/// `jit_dbb_get_byte_direct` (`vm/src/jit/helpers.rs`) skip.
+///
+/// # Why the JIT is told rather than asking
+///
+/// The fast path must not re-derive this layout. A second copy of a field index
+/// is exactly how a check goes silently dead, so the numbers here are the ones
+/// `dbb_elem_fields` resolved and the class ids are ones an accessor actually
+/// SERVED -- not ones anybody looked up by name. Until the funnel has run once
+/// nothing is published, `slots()` answers `None`, and every site keeps today's
+/// dispatch. That makes the fast path unreachable before the slow path has
+/// agreed with it, which is the direction that cannot be wrong.
+pub mod elem_fastpath {
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+    /// `-1` until `dbb_elem_fields` has resolved this VM's layout.
+    static ADDRESS_SLOT: AtomicI32 = AtomicI32::new(-1);
+    static LIMIT_SLOT: AtomicI32 = AtomicI32::new(-1);
+    static READONLY_SLOT: AtomicI32 = AtomicI32::new(-1);
+    /// Receiver class ids an accessor has served, one pair per direction.
+    /// `DirectByteBuffer` and `DirectByteBufferR` are the two the JDK has; a
+    /// third would simply not be served here.
+    static SERVED_GET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    static SERVED_PUT: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+    /// `(address, limit, is_read_only)` field indices, or `None` while the
+    /// funnel has not resolved them.
+    pub fn slots() -> Option<(usize, usize, usize)> {
+        let a = ADDRESS_SLOT.load(Ordering::Relaxed);
+        let l = LIMIT_SLOT.load(Ordering::Relaxed);
+        let r = READONLY_SLOT.load(Ordering::Relaxed);
+        if a < 0 || l < 0 || r < 0 {
+            return None;
+        }
+        // Casts: each was stored from a `usize` field index below.
+        Some((a as usize, l as usize, r as usize))
+    }
+
+    /// Has an accessor of this direction actually served a receiver of this
+    /// class? `write` selects the put table, which a read-only carrier can
+    /// never enter because `dbb_elem_addr(for_write = true)` refuses it.
+    pub fn class_is_served(class_id: u32, write: bool) -> bool {
+        if class_id == 0 {
+            return false;
+        }
+        let table = if write { &SERVED_PUT } else { &SERVED_GET };
+        table.iter().any(|c| c.load(Ordering::Relaxed) == class_id)
+    }
+
+    pub(super) fn publish_slots(address: usize, limit: usize, read_only: usize) {
+        // Cast: a field index, far below `i32::MAX`. A layout that somehow
+        // exceeded it stays unpublished rather than wrapping into a valid-
+        // looking slot.
+        let fit = |v: usize| i32::try_from(v).unwrap_or(-1);
+        ADDRESS_SLOT.store(fit(address), Ordering::Relaxed);
+        LIMIT_SLOT.store(fit(limit), Ordering::Relaxed);
+        READONLY_SLOT.store(fit(read_only), Ordering::Relaxed);
+    }
+
+    pub(super) fn note_served(class_id: u32, write: bool) {
+        if class_id == 0 {
+            return;
+        }
+        let table = if write { &SERVED_PUT } else { &SERVED_GET };
+        for cell in table.iter() {
+            match cell.load(Ordering::Relaxed) {
+                v if v == class_id => return,
+                0 => {
+                    // A racing writer that wins stores a class id that was also
+                    // served, so a lost race costs nothing.
+                    let _ = cell.compare_exchange(
+                        0,
+                        class_id,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Resolve (once) the field indices used by the element accessors.
 ///
 /// `DirectByteBufferR` adds no instance fields of its own, so a single
@@ -1573,13 +1666,15 @@ fn dbb_elem_fields(ctx: &mut dyn NativeContext) -> Option<DbbElemFields> {
     static CACHE: OnceLock<Option<DbbElemFields>> = OnceLock::new();
     *CACHE.get_or_init(|| {
         const CLASS: &str = "java/nio/DirectByteBuffer";
-        Some(DbbElemFields {
+        let fields = DbbElemFields {
             address: ctx.resolve_field_index(CLASS, "address")?,
             limit: ctx.resolve_field_index(CLASS, "limit")?,
             is_read_only: ctx.resolve_field_index(CLASS, "isReadOnly")?,
             position: ctx.resolve_field_index(CLASS, "position")?,
             big_endian: ctx.resolve_field_index(CLASS, "bigEndian"),
-        })
+        };
+        elem_fastpath::publish_slots(fields.address, fields.limit, fields.is_read_only);
+        Some(fields)
     })
 }
 
@@ -1650,6 +1745,9 @@ fn dbb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         return dbb_elem_bail_get(ctx, this, args);
     }
     elem_census::served(elem_census::GET_ABS, addr);
+    // This receiver's class has now been served by the modelled layout, so the
+    // JIT's thin bind may serve the same class without the funnel.
+    elem_fastpath::note_served(ctx.class_id_of_object(this).as_u32(), false);
     // `ByteBuffer.get` returns a Java `byte` — signed. Route through `i8` so a
     // value >= 0x80 sign-extends the way every `b < 0` caller expects.
     Ok(Some(Value::Int(i32::from(byte[0] as i8))))
@@ -1672,6 +1770,8 @@ fn dbb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         return dbb_elem_bail_put(ctx, this, args);
     }
     elem_census::served(elem_census::PUT_ABS, addr);
+    // Served by the modelled layout AND writable — see `elem_fastpath`.
+    elem_fastpath::note_served(ctx.class_id_of_object(this).as_u32(), true);
     // `put(int, byte)` returns `this`.
     Ok(Some(Value::Object(Some(this))))
 }

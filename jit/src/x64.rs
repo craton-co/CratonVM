@@ -1052,6 +1052,30 @@ struct Compiler {
     /// instruction and reported by `try_emit_inline_site` under
     /// `CRATONVM_DBG_JITC`.
     pub(super) inline_walk_at: (usize, u8),
+    /// Live inline (spliced-callee) scopes, innermost LAST.
+    ///
+    /// A call-carrying splice (`CRATONVM_JIT_INLINE_CALLS`, default-on since
+    /// 2026-08-20) puts the callee's JVM locals in the CALLER's spill area and
+    /// then emits a real, GC-capable call from inside the spliced body. Those
+    /// local slots were named by nothing: `local_oop_masks` describes the
+    /// ENCLOSING method's locals and the operand marks describe operands -- so
+    /// a reference the splice parked in a callee local (`this`, above all) was
+    /// in neither the safepoint's oop map nor the shadow publication.
+    ///
+    /// That was sound only while a moving collector PINNED whatever the
+    /// conservative frame sweep found, which is what `emit_inline_direct_call`
+    /// asserts. ZGC's relocate-under-proven-JIT path (2026-08-21) SUPPRESSES
+    /// that sweep whenever the per-cycle coverage proof passes, and the proof
+    /// consulted a completeness claim this file made without looking at splices
+    /// at all. Measured on `LongLongHashMapTest.randomOperations`: the spliced
+    /// `AbstractLongAssert.<init>` holds `this` in a callee local across its
+    /// super-constructor call, the slide moves the object, and the splice's
+    /// trailing `putfield longs` lands on the vacated copy -- a `LongAssert`
+    /// whose `longs` reads back null and NPEs on the next assertion.
+    ///
+    /// One entry per active splice, so a nested splice (`inline-nest`) keeps
+    /// its parent's locals covered too.
+    pub(super) inline_oop_scopes: Vec<InlineOopScope>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -2597,6 +2621,7 @@ impl Compiler {
             local_liveness_covered: Vec::new(),
             exception_ranges_dbg_len: 0,
             inline_walk_at: (usize::MAX, 0),
+            inline_oop_scopes: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             param_oop_mask: 0,
@@ -3084,3 +3109,46 @@ mod flag_and_header_contracts;
 // rather than a peeled prefix.
 #[cfg(test)]
 mod loop_unroll_admission;
+
+
+/// One spliced callee's local-variable oop coverage, for the safepoints emitted
+/// while its body is being walked.
+///
+/// `masks`/`reached` come from the SAME forward "must be oop" dataflow the
+/// enclosing method uses ([`compute_local_oop_masks`]), run over the callee's
+/// own bytecode and seeded with the callee's reference parameters, so a bit is
+/// set only when every path reaching that callee pc stored a reference there.
+#[derive(Clone, Debug)]
+pub struct InlineOopScope {
+    /// Frame offset of the callee's JVM local 0: local `k` lives at
+    /// `[rbp - (local_base + k*8)]`, the convention `try_emit_inline_body`'s
+    /// own `emit_store_local` uses when it marshals the arguments in.
+    pub local_base: i32,
+    /// Number of JVM local slots this splice reserved for the callee.
+    pub num_locals: usize,
+    /// Per-callee-pc "must be oop" masks.
+    pub masks: Vec<u64>,
+    /// Whether the forward dataflow reached each callee pc.
+    pub reached: Vec<bool>,
+    /// The callee pc currently being emitted.
+    pub cur_pc: usize,
+}
+
+impl InlineOopScope {
+    /// The oop-local mask at the callee pc being emitted, or `None` when the
+    /// dataflow cannot answer for it -- an unsupported local count (it returns
+    /// empty vectors above 64 locals) or a pc it never reached.
+    ///
+    /// `None` is a REFUSAL, not an empty mask. A caller that read it as "this
+    /// splice holds no references" would be making exactly the claim that
+    /// produced the miscompile this type exists to stop.
+    pub fn mask_at_cur(&self) -> Option<u64> {
+        if self.masks.is_empty() {
+            return None;
+        }
+        if !self.reached.get(self.cur_pc).copied().unwrap_or(false) {
+            return None;
+        }
+        self.masks.get(self.cur_pc).copied()
+    }
+}

@@ -8065,6 +8065,26 @@ pub(crate) fn read_java_thread_tid(shared: &SharedVm, thread_obj: ObjectRef) -> 
     }
 }
 
+/// Is the JMX ownable-synchronizer index being maintained?
+///
+/// **Default yes.** `CRATONVM_JMX_OWNED_SYNCHRONIZERS=off` stops the writes —
+/// see [`NativeContextImpl::record_jmx_owned_synchronizer`] for what that costs
+/// in fidelity and why the lever exists. Latched once: the answer must not be
+/// able to change mid-run, or the index would hold a partial history that no
+/// reader could interpret.
+fn jmx_owned_synchronizer_index_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JMX_OWNED_SYNCHRONIZERS") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => true,
+        }
+    })
+}
+
 fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -> Option<ThreadId> {
     // Real-JDK mirrors: resolve by the unique Java `Thread.tid` first — immune
     // to the mirror-address recycling that makes the pointer walk misreport a
@@ -15969,6 +15989,25 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     /// clears it from every thread before assigning, so a hand-off between
     /// threads cannot leave it recorded against both.
     fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        // `CRATONVM_JMX_OWNED_SYNCHRONIZERS=off` — DIAGNOSTIC ONLY, default on.
+        //
+        // This bookkeeping is two `parking_lot` mutexes, an `FxHashMap`
+        // insert/remove and a `Vec` push/retain, and it runs **4.77 times per
+        // expired task** on `HashedWheelTimerTest#testExecutionOnTime` (the
+        // JIT-arm census, once `setExclusiveOwnerThread` became site-cacheable
+        // and therefore countable). Whether that is 30 ns of the native's
+        // ~211 ns or 100 of it decides whether it is worth redesigning, and no
+        // amount of reading the code answers it — so the switch exists to
+        // price it on ONE binary, which is the only A/B that means anything
+        // here.
+        //
+        // It is NOT a supported configuration: turning it off empties
+        // `ThreadInfo.getLockedSynchronizers()` and blinds
+        // `findDeadlockedThreads()` to every AQS-derived lock, which is
+        // exactly the capability `isSynchronizerUsageSupported()` promises.
+        if !jmx_owned_synchronizer_index_enabled() {
+            return;
+        }
         // AQS sets the owner from the owning thread itself — `acquire` passes
         // `Thread.currentThread()`, `release` passes null — so the mirror handed
         // in is virtually always this thread's own. Recognising that by pointer
