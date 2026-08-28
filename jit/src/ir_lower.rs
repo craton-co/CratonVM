@@ -4860,6 +4860,17 @@ fn reloc_emit_enabled() -> bool {
                 // Build + box the deopt point for this guard (stable address,
                 // baked below). The point's frame state comes from the safepoint
                 // snapshot recorded for `bci` during IR building.
+                //
+                // Through `resume_bci`, like every other deopt this file
+                // emits. `IrBuilder::splice_guard_seen` refuses a graph that
+                // built a guard inside a splice, so today the mapping is a
+                // no-op here — but this arm was the ONLY one resolving from a
+                // raw bci, and a raw bci inside a spliced body is the exact
+                // shape that produced
+                // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror`.
+                // A fence and an asymmetry is one fence away from the bug;
+                // agreeing with the other emitters costs nothing.
+                let bci = self.resume_bci(bci);
                 let frame_state = self.resolve_frame_state_for_bci(bci);
                 let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
@@ -10161,7 +10172,17 @@ pub(crate) fn lower_inner_with_scopes(
         &slot_plan,
         helpers,
         branch_hints,
-        &[],
+        // NOT `&[]`. This argument was dropped on the floor from the day
+        // splicing landed: the parameter arrived, `Lowerer::new` got an
+        // empty slice, and `Lowerer::resume_bci` was therefore the identity
+        // in every production lowering. Every deopt inside a spliced body
+        // then recorded its RELOCATED bci — a program point that does not
+        // exist in the method's own bytecode — so the interpreter's sink
+        // found no matching deopt point, defaulted the reason to
+        // `UnreachedCode`, and refused the replay against a bci nothing
+        // could resume at. See
+        // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+        spliced_ranges,
         sr_map,
         direct_calls,
         ic_slots,

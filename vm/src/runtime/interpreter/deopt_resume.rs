@@ -1798,6 +1798,69 @@ pub(crate) fn dbg_deopt_sink(
     );
 }
 
+/// May the interpreter re-run this method from entry instead of resuming
+/// precisely at `resume_bci`?
+///
+/// `true` means the abandoned compiled attempt cannot have committed anything
+/// observable, so a re-run from bci 0 is the same execution — the locals are
+/// rebuilt from the same arguments and nothing outside the frame was written.
+///
+/// # Why a PREFIX, and not the whole body
+///
+/// The rule used to be "the whole method commits no side effect", and that is
+/// the right rule for a method the compiler ran end to end. It is the wrong
+/// rule for an abandoned attempt: what a replay could DUPLICATE is only what
+/// the attempt already committed, and the attempt stopped at `resume_bci`.
+/// Every deopt point this VM emits carries `ResumeSemantics::REEXECUTE` (only
+/// `PendingException` differs, and those frames go to a different stash), so
+/// the bytecode AT `resume_bci` had not completed and the bytecodes after it
+/// never ran. Only `code[..resume_bci]` can have committed anything.
+///
+/// The narrower rule cost a real answer: netty's
+/// `UnpooledHeapByteBuf._getUnsignedMedium` is `getfield array; invokestatic
+/// getUnsignedMedium`, and once `CRATONVM_JIT_IR_INLINE` splices that callee
+/// in, an out-of-bounds read deopts at the invoke. The whole body "commits a
+/// side effect" — it contains a call — so the replay was refused and a
+/// three-byte bounds check raised `InternalError` instead of
+/// `IndexOutOfBoundsException`. Nothing before the invoke commits anything, and
+/// the call itself never completed, so the replay was always safe. See
+/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+///
+/// # The second half
+///
+/// A spliced artifact's attempt also ran part of a RELOCATED callee body, which
+/// the caller's bytecode does not describe. `spliced_bodies_pure` is the
+/// artifact's own answer for that half (`CompiledMethod::
+/// spliced_bodies_side_effect_free`), computed at compile time with this same
+/// predicate over each spliced region. It is vacuously `true` for an artifact
+/// that spliced nothing.
+///
+/// Conservative in both directions it can be: an out-of-range `resume_bci`
+/// (including the `u32::MAX` identity-less re-run sentinel) falls back to
+/// asking the question of the whole body, which is the historical rule.
+pub(crate) fn replay_from_entry_is_observably_equivalent(
+    code: &[u8],
+    spliced_bodies_pure: bool,
+    resume_bci: u32,
+) -> bool {
+    // The historical rule first: a body that commits nothing anywhere needs no
+    // reasoning about where the attempt stopped, and answers `true` even for
+    // the `u32::MAX` sentinel.
+    if !cratonvm_jit::bytecode_commits_side_effect(code, code.len()) {
+        return true;
+    }
+    if !spliced_bodies_pure {
+        return false;
+    }
+    let Ok(prefix) = usize::try_from(resume_bci) else {
+        return false;
+    };
+    if prefix > code.len() {
+        return false;
+    }
+    !cratonvm_jit::bytecode_commits_side_effect(code, prefix)
+}
+
 pub(crate) fn deopt_frame_matches_method(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
     class_name: &str,
