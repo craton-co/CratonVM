@@ -355,7 +355,40 @@ pub struct ThreadRegistry {
     /// remaps the lists themselves. An entry naming a reaped thread is inert —
     /// `threads.get` answers `None` and the removal is skipped, exactly as the
     /// linear scan used to skip a missing entry.
-    synchronizer_owner: Mutex<FxHashMap<usize, ThreadId>>,
+    /// SHARDED, and the shard count is the point. This map is written twice per
+    /// uncontended `ReentrantLock` lock/unlock pair by whichever thread owns
+    /// the lock, so a single mutex here serialises every producer against every
+    /// consumer that share a queue — the exact shape of
+    /// `LinkedBlockingQueue.add`/`take`.
+    ///
+    /// MEASURED, one binary, `CRATONVM_JMX_OWNED_SYNCHRONIZERS=off` as the B
+    /// arm. Single-threaded (`probes/AqsAttributionProbe.java`, the
+    /// `setExclusiveOwnerThread x2` rung) the whole index costs **nothing**:
+    /// 386 ns against 384. Two threads sharing a queue
+    /// (`probes/HwtScaleProbe.java` at n=100 000, the producer thread and the
+    /// timer worker) it costs **25% of the drain**: 767/718 ms against 529/615.
+    /// A cost that appears only when a second thread arrives, and not at all
+    /// on the same work done alone, is contention and nothing else.
+    synchronizer_owner: [Mutex<FxHashMap<usize, ThreadId>>; SYNCHRONIZER_OWNER_SHARDS],
+}
+
+/// How many shards [`ThreadRegistry::synchronizer_owner`] is split into.
+///
+/// A power of two so the index is a mask. 64 is chosen against the thing being
+/// spread: threads that share one lock, which is a handful, not hundreds — and
+/// the memory is 64 empty `FxHashMap`s per registry, which allocate nothing
+/// until first insert.
+const SYNCHRONIZER_OWNER_SHARDS: usize = 64;
+
+/// Which shard owns a synchronizer's heap address.
+///
+/// Shifted by four first: heap objects are at least 8-byte aligned and in
+/// practice 16, so the low bits are constant and hashing on them would put
+/// everything in one shard — the failure mode that would leave this change
+/// measuring as inert while looking correct.
+#[inline]
+fn synchronizer_owner_shard_index(key: usize) -> usize {
+    (key >> 4) & (SYNCHRONIZER_OWNER_SHARDS - 1)
 }
 
 /// Upper bound on retained former-mirror addresses (see
@@ -390,7 +423,7 @@ impl ThreadRegistry {
                 FxHashMap::default(),
                 std::collections::VecDeque::new(),
             )),
-            synchronizer_owner: Mutex::new(FxHashMap::default()),
+            synchronizer_owner: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
         }
     }
 
@@ -1633,7 +1666,7 @@ impl ThreadRegistry {
         );
         let key = synchronizer.as_ptr() as usize;
         let previous = {
-            let mut index = self.synchronizer_owner.lock();
+            let mut index = self.synchronizer_owner[synchronizer_owner_shard_index(key)].lock();
             match owner {
                 Some(owner) => index.insert(key, owner),
                 None => index.remove(&key),
@@ -1676,7 +1709,7 @@ impl ThreadRegistry {
     pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
         let key = synchronizer.as_ptr() as usize;
         let previous = {
-            let mut index = self.synchronizer_owner.lock();
+            let mut index = self.synchronizer_owner[synchronizer_owner_shard_index(key)].lock();
             match owner {
                 Some(owner) => index.insert(key, owner),
                 None => index.remove(&key),
@@ -2376,15 +2409,31 @@ impl ThreadRegistry {
             }
         }
         if !synchronizer_rekeys.is_empty() {
-            let mut index = self.synchronizer_owner.lock();
             for (old_addr, new_addr, tid) in synchronizer_rekeys {
                 // Only move an entry this index actually owns AND that still
                 // names the thread whose list we just remapped: a synchronizer
                 // recorded against someone else is that owner's row to move,
                 // and it will be moved by its own iteration of the loop above.
-                if index.get(&old_addr) == Some(&tid) {
-                    index.remove(&old_addr);
-                    index.insert(new_addr, tid);
+                //
+                // Relocation changes the ADDRESS, and the address is what picks
+                // the shard — so the entry may have to move between shards.
+                // Removing from the old shard and inserting into the new one is
+                // two locks, taken one after the other and never together, so
+                // there is no ordering to get wrong. Both are uncontended here:
+                // this runs under STW.
+                let old_shard = synchronizer_owner_shard_index(old_addr);
+                let new_shard = synchronizer_owner_shard_index(new_addr);
+                let moved = {
+                    let mut index = self.synchronizer_owner[old_shard].lock();
+                    if index.get(&old_addr) == Some(&tid) {
+                        index.remove(&old_addr);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if moved {
+                    self.synchronizer_owner[new_shard].lock().insert(new_addr, tid);
                 }
             }
         }
