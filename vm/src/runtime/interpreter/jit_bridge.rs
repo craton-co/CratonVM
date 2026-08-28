@@ -4866,23 +4866,24 @@ pub(super) fn try_jit_upgrade_with_gate(
         if opcode == 0xb6 {
             let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
             let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
+            if let Some(declaring_id) = crate::classloading::invokevirtual_private_declaring_class(
                 cp_class_id,
                 method_name,
                 descriptor,
                 store,
-            )?;
-                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+            ) {
                 return store.get(declaring_id).map(|c| c.name.to_string());
             }
             // Not private, but possibly unoverridable anyway — a `final`
             // method, or any method of a `final` class, has exactly one
             // possible target at this site for the same reason a private one
             // does. Same conclusion (statically bound; substitute the
-            // DECLARING class, which for this rule is often not the class the
-            // constant pool names), reached by a different argument. The rule
-            // lives in `invoke::invokevirtual_site_final_owner` so these three
-            // per-door copies cannot drift apart on it.
+            // DECLARING class, which for this rule is often NOT the class the
+            // constant pool names), reached by a different argument. Both
+            // rules live outside this file — the private one in
+            // `classloading::invokevirtual_private_declaring_class`, this one
+            // in `invoke::invokevirtual_site_final_owner` — so these three
+            // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
                 &cm,
                 class_id,
@@ -5406,23 +5407,24 @@ pub(super) fn try_jit_upgrade_with_gate(
                 if opcode == 0xb6 {
                     let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
                     let store = cm.class_store();
-                    let (method, declaring_id) = crate::classloading::find_method_recursive(
+                    if let Some(declaring_id) = crate::classloading::invokevirtual_private_declaring_class(
                         cp_class_id,
                         method_name,
                         descriptor,
                         store,
-                    )?;
-                                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                    ) {
                         return store.get(declaring_id).map(|c| c.name.to_string());
                     }
                     // Not private, but possibly unoverridable anyway — a `final`
                     // method, or any method of a `final` class, has exactly one
                     // possible target at this site for the same reason a private one
                     // does. Same conclusion (statically bound; substitute the
-                    // DECLARING class, which for this rule is often not the class the
-                    // constant pool names), reached by a different argument. The rule
-                    // lives in `invoke::invokevirtual_site_final_owner` so these three
-                    // per-door copies cannot drift apart on it.
+                    // DECLARING class, which for this rule is often NOT the class the
+                    // constant pool names), reached by a different argument. Both
+                    // rules live outside this file — the private one in
+                    // `classloading::invokevirtual_private_declaring_class`, this one
+                    // in `invoke::invokevirtual_site_final_owner` — so these three
+                    // per-door copies cannot drift apart on either.
                     return super::invoke::invokevirtual_site_final_owner(
                         &cm,
                         callee_cid,
@@ -6859,23 +6861,24 @@ pub(super) fn try_jit_compile_callee_slow(
         if opcode == 0xb6 {
             let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
             let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
+            if let Some(declaring_id) = crate::classloading::invokevirtual_private_declaring_class(
                 cp_class_id,
                 method_name,
                 descriptor,
                 store,
-            )?;
-                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+            ) {
                 return store.get(declaring_id).map(|c| c.name.to_string());
             }
             // Not private, but possibly unoverridable anyway — a `final`
             // method, or any method of a `final` class, has exactly one
             // possible target at this site for the same reason a private one
             // does. Same conclusion (statically bound; substitute the
-            // DECLARING class, which for this rule is often not the class the
-            // constant pool names), reached by a different argument. The rule
-            // lives in `invoke::invokevirtual_site_final_owner` so these three
-            // per-door copies cannot drift apart on it.
+            // DECLARING class, which for this rule is often NOT the class the
+            // constant pool names), reached by a different argument. Both
+            // rules live outside this file — the private one in
+            // `classloading::invokevirtual_private_declaring_class`, this one
+            // in `invoke::invokevirtual_site_final_owner` — so these three
+            // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
                 &cm,
                 cid,

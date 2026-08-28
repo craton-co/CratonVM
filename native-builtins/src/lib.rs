@@ -8798,6 +8798,29 @@ pub fn register_essential_natives_with_shims(
     // `descriptor` field -> `NullPointerException: ... "this.descriptor" is
     // null`). Synthetic-jdk mode has no competing real bytecode, so this
     // native always took effect there — see vm/tests/wave3_console_module.rs.
+    // KNOWN OVER-APPROXIMATION, measured and left standing 2026-08-28.
+    //
+    //   java.base.canUse(Runnable.class)
+    //     HotSpot   false      CratonVM  true
+    //
+    // (`probes/ClassShadowSweep.java`, identical in both modes.) `canUse` is
+    // true only when the module DECLARES `uses` for that service; an unnamed
+    // module uses everything, a named one uses what its descriptor says. This
+    // native answers true for any non-null service on any receiver.
+    //
+    // Not corrected here, and the reason is the comment above: this native
+    // exists precisely because a named Module mirror can carry a NULL
+    // `descriptor` field, which is the one thing a faithful implementation
+    // would have to read. Consulting it means calling back into Java
+    // (`getDescriptor().uses().contains(..)`) from inside the native written to
+    // avoid touching that field — re-entrancy for one row, on the path
+    // `ServiceLoader.checkCaller` takes during `Console.<clinit>`.
+    //
+    // What it costs meanwhile: an application on a NAMED module asking whether
+    // it may use a service gets `true` where the reference VM says no, and then
+    // loads a service its module descriptor did not declare. Application code
+    // on the unnamed module — which is most code on this VM — is unaffected,
+    // because an unnamed module genuinely can use anything.
     registry.register(
         "java/lang/Module",
         "canUse",

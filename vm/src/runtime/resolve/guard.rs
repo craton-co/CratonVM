@@ -203,8 +203,8 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/native/jni.rs",
         "find_field_recursive(",
-        1,
-        "migration step 1: the walk inside the `GetFieldID` closure.",
+        2,
+        "migration step 1: the walk inside the `GetFieldID` closure. ONE walk,          written as two calls since 2026-08-28: a field is identified by name          AND descriptor, so the closure calls          `find_field_recursive_by_descriptor` first and falls back to the          name-only `find_field_recursive` (counted by          `FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS`) when no field of that exact          pair exists. The empty-signature NULL case keeps the name-only search          outright, which is the second occurrence. Both go away with the same          `MemberResolver::declared_field` migration as the row above, which          already implements the same two-step.",
     ),
     (
         "vm/src/vm/vm_exec.rs",

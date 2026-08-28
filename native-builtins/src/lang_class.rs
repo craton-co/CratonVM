@@ -2414,10 +2414,26 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+    // A NULL resource name is a NullPointerException, not "not found".
+    //
+    // MEASURED in BOTH modes (`probes/ClassShadowSweep.java`): HotSpot NPE,
+    // this VM answered null. The JDK's body calls `resolveName(name)`, which
+    // dereferences it immediately. The distinction matters because null and
+    // "absent" are otherwise the SAME answer here -- a caller that builds a
+    // resource path and gets null back cannot tell a missing file from a bug
+    // in its own path construction, which is exactly the case worth telling
+    // apart.
+    //
+    // Scoped to this native deliberately: the sibling `getResource` has the
+    // same shape and the same JDK behaviour, but it was not in the measured
+    // set, and this survey does not change what it has not asked.
+    let Some(Value::Object(Some(name_obj))) = args.get(1) else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Class.getResourceAsStream: name is null".to_string()),
+        }
+        .into());
     };
+    let name_obj = *name_obj;
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let resource_name = match t19_h10_resolve_resource_name(ctx, this, &name) {
         Some(n) => n,
@@ -18359,6 +18375,26 @@ pub(crate) fn native_class_get_package_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A PRIMITIVE's package is `java.lang`, not the empty string.
+    //
+    // MEASURED against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/ClassShadowSweep.java`), all six plus `void`:
+    //
+    //   int.class.getPackageName()   HotSpot "java.lang"   CratonVM ""
+    //
+    // The JDK's body is `if (isPrimitive()) return "java.lang";` before it
+    // looks at anything else, and the reason is not arbitrary: a primitive's
+    // wrapper, its `Class` mirror and `void` all live in `java.lang`, so code
+    // that groups reflected types by package — a scanner, a doc generator, an
+    // access check keyed on package — puts primitives with the classes they
+    // belong to instead of into an anonymous default-package bucket.
+    //
+    // Checked BEFORE the cache, since the cache is keyed on `ClassId` and a
+    // primitive mirror has one; a wrong answer would otherwise be memoised for
+    // the life of the VM.
+    if mirror_is_primitive(ctx, this) {
+        return Ok(Some(Value::Object(Some(ctx.create_string("java.lang")))));
+    }
     // Cache the dotted package prefix per `ClassId` вЂ” invariant for the
     // program's lifetime. Cache-eligible mirrors are those owned by the
     // VM reverse map (rules out test-fixture ClassId(0) collisions).
