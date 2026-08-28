@@ -2033,7 +2033,7 @@ mod deopt_step3_tests {
     /// A scalar-replaced object placeholder: id `id`, class `class_id`, with the
     /// given field values (`num_fields` derived from the vec length).
     fn vobj(id: usize, class_id: u32, fields: Vec<FrameValue>) -> FrameValue {
-        FrameValue::VirtualObject(VirtualObjectState {
+        FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id,
             class_id,
             num_fields: fields.len(),
@@ -2707,7 +2707,7 @@ mod deopt_step3_tests {
     /// actual `field_values` length is rejected (malformed snapshot).
     #[test]
     fn verify_rejects_malformed_virtual_field_count() {
-        let bad = FrameValue::VirtualObject(VirtualObjectState {
+        let bad = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 0,
             class_id: 1,
             num_fields: 2,                          // claims 2…

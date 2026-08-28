@@ -52,6 +52,14 @@ public class HibfixVarHandleProbe {
         }
 
         long t;
+
+        t = System.nanoTime();
+        for (int i = 0; i < iters; i++) { Node cur = (Node) REF.get(p); if (cur == null) throw new AssertionError(); }
+        report("VarHandle.get reference", iters, System.nanoTime() - t);
+
+        t = System.nanoTime();
+        for (int i = 0; i < iters; i++) { int cur = (int) NUM.get(p); if (cur == Integer.MIN_VALUE) throw new AssertionError(); }
+        report("VarHandle.get int", iters, System.nanoTime() - t);
         t = System.nanoTime();
         for (int i = 0; i < iters; i++) { Node cur = (Node) REF.get(p); REF.compareAndSet(p, cur, cur == a ? b : a); }
         report("VarHandle.CAS reference", iters, System.nanoTime() - t);

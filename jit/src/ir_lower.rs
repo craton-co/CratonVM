@@ -100,6 +100,10 @@ const _: () = assert!(
 /// stable [`crate::deopt::VirtualObjectState::id`] within a deopt frame.
 pub struct VirtualObjectInfo {
     pub class_id: u32,
+    /// `Some(atype)` for a scalar-replaced array: the element atype, with
+    /// `num_fields` as the LENGTH. See [`crate::deopt::VirtualObjectState`],
+    /// which this is the compile-time half of.
+    pub array_element_type: Option<u8>,
     pub num_fields: usize,
     /// Per field index: the IR value node the field holds, or `None` for a field
     /// never stored (resolves to the object's zero default). Admitted allocations
@@ -337,6 +341,22 @@ const ENTRY_ABI_REGS: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 /// Returns `(0, _)` when nothing goes on the stack, so a call whose arguments
 /// all fit registers emits no `SUB RSP` at all and is byte-identical to what
 /// this backend produced before the stack path existed.
+/// `[RBP + STACK_ARG_BASE]` is where the CALLER's first stack-passed argument
+/// lands, as seen from inside this prologue.
+///
+/// After `push rbp; mov rbp, rsp` the saved RBP is at `[rbp+0]` and the return
+/// address at `[rbp+8]`. On Windows the next 32 bytes are the caller's shadow
+/// space (home slots for the four register arguments), so stack arguments begin
+/// at `[rbp+0x30]`; SysV has no shadow space and they begin at `[rbp+0x10]`.
+///
+/// This is the READ side of [`stack_arg_block_size`]'s write side, and it is
+/// the same number `x64::frames`' prologue uses — the two backends share the
+/// convention, so a method compiled by either can be called by either.
+#[cfg(target_os = "windows")]
+const STACK_ARG_BASE: i32 = 16 + 32;
+#[cfg(not(target_os = "windows"))]
+const STACK_ARG_BASE: i32 = 16;
+
 fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
     #[cfg(target_os = "windows")]
     let (shadow, base) = (32i32, 32i32);
@@ -354,9 +374,10 @@ fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
 /// deposit — the context pointer (when present) plus the Java arguments,
 /// receiver included.
 ///
-/// `emit_prologue` reads incoming arguments from `ENTRY_ABI_REGS` and nothing
-/// else, so this is a hard capacity, not a heuristic: an argument past it
-/// arrives on the caller's stack and is silently dropped. `lower()` refuses
+/// How many incoming slots arrive in REGISTERS. No longer a hard limit: an
+/// argument past it arrives on the caller's stack and `emit_prologue` loads it
+/// from there. Kept because the prologue still has to know where the register
+/// half stops. Historically `lower()` refused
 /// such a graph up front — see the Gap B bail there for what that cost the
 /// last time the two got out of step.
 #[inline]
@@ -757,6 +778,18 @@ struct Lowerer<'a> {
     /// whenever profiling is off) ⇒ every `Op::If` keeps its historical layout
     /// byte-for-byte.
     branch_hints: &'a HashMap<usize, bool>,
+    /// IR-tier inlining: `(start, end, invoke_bci)` for each relocated callee
+    /// region in the combined bytecode buffer `IrBuilder` walked, in increasing
+    /// `start` order and non-overlapping.
+    ///
+    /// A node inside a region carries its COMBINED-buffer pc, because that is
+    /// what keys its own compact-field row, direct-call entry and inline cache.
+    /// That pc names no instruction in THIS method, so wherever a bci is handed
+    /// to the interpreter — a throw site checked against the exception table's
+    /// `[start_pc, end_pc)` ranges, or the resume bci of a null/bounds guard —
+    /// [`Lowerer::resume_bci`] maps it back to the enclosing `invoke`. Empty on
+    /// every compile that splices nothing, where `resume_bci` is the identity.
+    spliced_ranges: &'a [(usize, usize, usize)],
     /// Guard-surviving scalar replacement: metadata for each scalar-replaced
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
@@ -869,6 +902,7 @@ impl<'a> Lowerer<'a> {
         slot_plan: &'a SlotPlan,
         helpers: &JitRuntimeHelpers,
         branch_hints: &'a HashMap<usize, bool>,
+        spliced_ranges: &'a [(usize, usize, usize)],
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
@@ -1135,6 +1169,7 @@ impl<'a> Lowerer<'a> {
             },
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
+            spliced_ranges,
             sr_map,
             inline_scopes,
             // Off by default; `lower_inner_with_scopes` installs a plan when
@@ -1880,34 +1915,43 @@ fn reloc_emit_enabled() -> bool {
         // shifted to ABI[1..]. Store the context to its slot, then the params to
         // their local slots.
         //
-        // `lower()` refuses the graph before reaching here when the context
-        // slot plus the Java arguments would exceed `incoming_abi_reg_capacity()`,
-        // so every param below comes from a register. The `break` is that
-        // guard's backstop, NOT a supported path: an argument past the register
-        // file arrives on the caller's stack, and dropping it leaves the local
-        // holding whatever the frame slot contained — a silent wrong value, no
-        // diagnostic. That is what shipped while the bail was scoped to
-        // `needs_context` only.
-        debug_assert!(
-            self.num_params + usize::from(self.needs_context) <= abi_regs.len(),
-            "lower() must refuse {} incoming slots (needs_context={}) — the prologue \
-             can only deposit {}",
-            self.num_params,
-            self.needs_context,
-            abi_regs.len(),
-        );
+        // An argument past the register file arrives on the CALLER'S STACK, and
+        // this prologue used to drop it: the loop `break`s and the local keeps
+        // whatever the frame slot happened to contain. `lower()` therefore
+        // refused any method with more incoming slots than registers outright —
+        // four on Win64, six on SysV — which made it "the commonest whole-method
+        // refusal an ordinary accessor hits": an instance method with three
+        // parameters is four slots, and touching one field turns
+        // `needs_context` on, which is the fifth.
+        //
+        // It is loaded now, the way the single-pass prologue has loaded it since
+        // the ROUND-12 fix (`x64/frames.rs`), from the same place, because the
+        // two backends share the outgoing convention: `stack_arg_block_size`
+        // here mirrors `x64::frames::stack_arg_block_size`, and a caller
+        // materializes stack arguments at `[rsp + shadow]` immediately before
+        // the CALL. After the CALL pushes the return address and this prologue
+        // pushes RBP, argument `k` past the register file sits at
+        // `[rbp + STACK_ARG_BASE + (k - reg_count) * 8]`.
         let base = if self.needs_context {
             self.store_abi_reg(abi_regs[0], self.context_slot_off);
             1
         } else {
             0
         };
-        for i in 0..self.num_params {
-            let abi_idx = base + i;
-            if abi_idx >= abi_regs.len() {
-                break;
-            }
-            self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
+        // Java arguments that fit the register file, then the rest off the
+        // caller's frame. `reg_count` is how many of THIS method's arguments a
+        // register carries, which is the file size minus the context slot.
+        let reg_count = self.num_params.min(abi_regs.len().saturating_sub(base));
+        for i in 0..reg_count {
+            self.store_abi_reg(abi_regs[base + i], ((i as i32) + 1) * 8); // local_offset(i)
+        }
+        for i in reg_count..self.num_params {
+            // `[RBP + disp]`, which `load_reg_from_frame` spells as a NEGATIVE
+            // offset (it encodes `[RBP - offset]`). Via RAX because there is no
+            // memory-to-memory MOV.
+            let disp = STACK_ARG_BASE + ((i - reg_count) as i32) * 8;
+            self.load_reg_from_frame(RAX, -disp);
+            self.store_abi_reg(RAX, ((i as i32) + 1) * 8); // local_offset(i)
         }
         // Zero the cached-thread and watermark slots BEFORE the fetch. The
         // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
@@ -3433,7 +3477,9 @@ fn reloc_emit_enabled() -> bool {
     /// exit can reach the stub without a throw-site bci — the defect the stub's
     /// own doc comment describes.
     fn push_call_exc_patch(&mut self, patch: usize) {
-        let bci = self.cur_bci;
+        // `cur_bci` is the node's own pc, which inside a spliced region is a
+        // combined-buffer pc — see `resume_bci`.
+        let bci = self.resume_bci(self.cur_bci);
         self.call_exc_patches.push((patch, bci));
     }
 
@@ -4548,6 +4594,23 @@ fn reloc_emit_enabled() -> bool {
                     length_slot,
                     self.frame_record,
                 );
+                // The reload that PAIRS with the map above. Its absence was not
+                // a missed optimisation: `emit_shadow_push` bumps the thread's
+                // shadow top and `emit_shadow_reload` is what retracts it, so an
+                // array allocation with any live reference around it leaked one
+                // frame's worth of shadow slots per execution. The
+                // `shadow_pushes != shadow_reloads` check at the end of
+                // `lower_inner` caught it and refused the whole method — which
+                // is why every C2 candidate containing `newarray` alongside a
+                // live oop silently lost its optimized body, `Short2.<init>()V`
+                // (`2 shadow pushes vs 1 reloads`) included.
+                //
+                // `Op::New` needs no counterpart: it emits no map, so it takes
+                // no push. Placed exactly where `Op::ConstString` /
+                // `Op::ConstClass` put theirs — after the stub, before the
+                // zero test — because the reload uses RCX and never RAX, so the
+                // returned (possibly relocated) pointer is untouched.
+                self.emit_shadow_reload();
 
                 self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
                 self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
@@ -4849,9 +4912,17 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
-                let field_index = match self.graph.nodes[offset_node as usize].op {
-                    Op::Const(v) => v,
-                    _ => 0,
+                // `lower_inner` refuses the graph unless every field access's
+                // offset edge is a `Const`, so the `None` arm is unreachable.
+                // It deopts rather than falling back to slot `0`, which is what
+                // it used to do: slot 0 is a DIFFERENT field of the same
+                // receiver, read or written with no trace of the substitution.
+                // A deopt is the one answer that is always correct here — the
+                // interpreter re-executes the access against the real layout —
+                // and it costs nothing on a path nothing reaches.
+                let Op::Const(field_index) = self.graph.nodes[offset_node as usize].op else {
+                    self.emit_unconditional_deopt(node.bytecode_pc.unwrap_or(0));
+                    return;
                 };
                 // Guarded inline read of a compact field, with the checked
                 // helper as the slow path — the same trade the single-pass
@@ -4949,9 +5020,11 @@ fn reloc_emit_enabled() -> bool {
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
                 let value = node.inputs[4];
-                let field_index = match self.graph.nodes[offset_node as usize].op {
-                    Op::Const(v) => v,
-                    _ => 0,
+                // Unreachable for the same reason the `Op::Load` arm's is, and
+                // deopts for the same reason — see there.
+                let Op::Const(field_index) = self.graph.nodes[offset_node as usize].op else {
+                    self.emit_unconditional_deopt(node.bytecode_pc.unwrap_or(0));
+                    return;
                 };
                 let tag_off = HEADER_SIZE as i32 + (field_index as i32) * SLOT_SIZE as i32;
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
@@ -5790,7 +5863,10 @@ fn reloc_emit_enabled() -> bool {
             Op::Throw => {
                 let exc = node.inputs[2];
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
-                let bci = node.bytecode_pc.unwrap_or(0);
+                // `athrow` is refused inside a spliced body today; translating
+                // anyway keeps the rule "a bci handed to the interpreter goes
+                // through `resume_bci`" without an exception to remember.
+                let bci = self.resume_bci(node.bytecode_pc.unwrap_or(0));
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[1], bci as u64);
                 self.emit_mov_reg_imm64(RAX, self.throw_exception as u64);
                 self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
@@ -6091,6 +6167,30 @@ fn reloc_emit_enabled() -> bool {
     /// is what binds the snapshot to its inlined scope
     /// ([`InlineScopeTable::snapshot_scope`]), so the search is a `position`
     /// rather than a `find`.
+    /// The bci to hand the INTERPRETER for a node whose `bytecode_pc` may be a
+    /// combined-buffer pc inside a relocated callee body.
+    ///
+    /// Identity outside a spliced region, and identity on every compile that
+    /// splices nothing. Inside one it answers the enclosing `invoke`'s bci,
+    /// which is the only pc in this method that describes where execution is:
+    /// the call has not taken effect, so re-executing it re-runs the callee.
+    ///
+    /// Both consumers need this for correctness, not tidiness. A throw-site bci
+    /// is range-checked against this method's own exception table
+    /// (`jit_set_throw_bci` → `route_jit_exception_through_method`), and a pc
+    /// past the end of the bytecode falls outside every `[start_pc, end_pc)` —
+    /// which silently drops a `catch`-all, the exact defect that helper exists
+    /// to fix. A guard's resume bci is worse: the interpreter would be parked at
+    /// an instruction that does not exist.
+    fn resume_bci(&self, bci: usize) -> usize {
+        for &(start, end, invoke_bci) in self.spliced_ranges {
+            if bci >= start && bci < end {
+                return invoke_bci;
+            }
+        }
+        bci
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
         match self.graph.safepoints.iter().position(|s| s.bci == bci) {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
@@ -6260,6 +6360,21 @@ fn reloc_emit_enabled() -> bool {
         self.emit_deopt_unless(0x85, bci, reason);
     }
 
+    /// Leave for the interpreter unconditionally at `bci`.
+    ///
+    /// `XOR EAX, EAX` sets ZF, so the `JNZ` [`emit_deopt_if_zero`] emits is
+    /// never taken and control always reaches the deopt stub. Callers must
+    /// `return` immediately: nothing after this executes, and the node's result
+    /// slot (if it has one) is never read because no consumer runs.
+    ///
+    /// Used where a lowering discovers it has no correct encoding to emit. The
+    /// alternative — emitting SOMETHING and continuing — is how a wrong field
+    /// slot becomes a punned heap cell that faults somewhere else entirely.
+    fn emit_unconditional_deopt(&mut self, bci: usize) {
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX  (sets ZF)
+        self.emit_deopt_if_zero(bci, DeoptReason::UnreachedCode);
+    }
+
     /// Emit a guard that deopts at `bci` UNLESS the just-set flags satisfy
     /// `jcc_continue` (the near-`Jcc` second byte, e.g. `0x85`=JNZ, `0x82`=JB).
     /// The "continue" condition falls through to the following code; otherwise
@@ -6267,6 +6382,9 @@ fn reloc_emit_enabled() -> bool {
     /// `DEOPT_ARG0`. Generalises `emit_deopt_if_zero` so a bounds check can
     /// continue on `JB` (unsigned index < length) and deopt otherwise.
     fn emit_deopt_unless(&mut self, jcc_continue: u8, bci: usize, reason: DeoptReason) {
+        // A guard inside a spliced body resumes at the enclosing `invoke`, whose
+        // snapshot is the caller's state before the call — see `resume_bci`.
+        let bci = self.resume_bci(bci);
         let frame_state = self.resolve_frame_state_for_bci(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
@@ -6893,16 +7011,47 @@ fn reloc_emit_enabled() -> bool {
             let fv = match info.field_values.get(i).copied().flatten() {
                 None => FrameValue::Int(0),
                 Some(vnode) => {
+                    // NESTED VIRTUAL OBJECT. A field whose value is itself a
+                    // scalar-replaced allocation is described in place, by the
+                    // same function, recursively. `emitted` is what makes that
+                    // terminate and what makes sharing work: the second and
+                    // later occurrences of an id come back as
+                    // `FrameValue::VirtualObjectRef`, which the materializer
+                    // resolves against the shell it already allocated. A cycle
+                    // therefore ends at its first repeat rather than recursing.
+                    //
+                    // This used to bail the WHOLE enclosing object ("v1 emits
+                    // no nested graphs"), which is what stopped a wrapper and
+                    // its storage array from both being deleted: the wrapper's
+                    // recipe names the array, so the moment the array became
+                    // replaceable the wrapper's own recipe was refused.
+                    //
+                    // The recursive call re-runs every gate on the nested
+                    // object -- its allocation and stores must strictly
+                    // dominate the same deopt block -- so a nested object that
+                    // cannot be described refuses itself, and the check below
+                    // turns that refusal into a refusal of the enclosing
+                    // object. Fail-closed, one level at a time.
                     if sr.objects.contains_key(&vnode) {
-                        if dbg {
-                            eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} is nested virtual (node {vnode})");
+                        let nested =
+                            self.frame_value_for_object(vnode, deopt_block, sr, emitted);
+                        if matches!(
+                            nested,
+                            FrameValue::Undefined
+                                | FrameValue::Unsupported
+                                | FrameValue::MaterializationRequired(_)
+                        ) {
+                            if dbg {
+                                eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} nested virtual (node {vnode}) -> {nested:?}");
+                            }
+                            return Self::eliminated_object(
+                                new_id,
+                                info,
+                                EliminationCause::NestedVirtualObject,
+                            );
                         }
-                        // nested virtual — deferred (v1 emits no nested graphs)
-                        return Self::eliminated_object(
-                            new_id,
-                            info,
-                            EliminationCause::NestedVirtualObject,
-                        );
+                        field_values.push(nested);
+                        continue;
                     }
                     let fv = self.frame_value_for(vnode);
                     // `MaterializationRequired` joins the refusal set: a field
@@ -6938,6 +7087,7 @@ fn reloc_emit_enabled() -> bool {
             );
         }
         FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: info.array_element_type,
             id: new_id as usize,
             class_id: info.class_id,
             num_fields: info.num_fields,
@@ -9419,6 +9569,7 @@ pub fn lower(
         num_locals,
         helpers,
         &empty,
+        &[],
         None,
         &no_direct,
         &no_ic,
@@ -9449,6 +9600,7 @@ pub fn lower_with_branch_hints(
         num_locals,
         helpers,
         branch_hints,
+        &[],
         None,
         &no_direct,
         &no_ic,
@@ -9481,6 +9633,7 @@ pub fn lower_with_scalar_deopt(
         num_locals,
         helpers,
         &empty,
+        &[],
         sr_map,
         &no_direct,
         &no_ic,
@@ -9520,6 +9673,7 @@ pub(crate) fn lower_inner(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
+    spliced_ranges: &[(usize, usize, usize)],
     sr_map: Option<&ScalarReplacementMap>,
     direct_calls: &HashMap<usize, (usize, bool)>,
     ic_slots: &HashMap<usize, (usize, usize)>,
@@ -9535,6 +9689,7 @@ pub(crate) fn lower_inner(
         num_locals,
         helpers,
         branch_hints,
+        spliced_ranges,
         sr_map,
         direct_calls,
         ic_slots,
@@ -9561,6 +9716,7 @@ pub(crate) fn lower_inner_with_scopes(
     num_locals: usize,
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
+    spliced_ranges: &[(usize, usize, usize)],
     sr_map: Option<&ScalarReplacementMap>,
     // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)` for
     // every statically-bound call site whose callee was eagerly compiled. Empty
@@ -9785,6 +9941,34 @@ pub(crate) fn lower_inner_with_scopes(
             return None;
         }
     }
+    // Every field access carries its slot index as a `Const` offset input, and
+    // both lowerings read that index out of the node the edge points at. If it
+    // is not a `Const`, neither has an index to use — and both used to fall
+    // back to a silent `0`, i.e. to accessing SOME OTHER FIELD of the receiver.
+    //
+    // A silent `0` is the worst available answer for exactly the defect family
+    // this lane keeps meeting: a store lands in a slot the class declares a
+    // reference, the cell then holds a primitive under a reference's name, and
+    // the fault appears much later in whatever dereferences it — a compiled
+    // `arraylength` on `Int(1)`, faulting at `addr=0x5`
+    // (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-caught-in-sqlchar-init-20260827.md`).
+    // Nothing in the report points back here, because a wrong-slot write leaves
+    // no trace of having chosen the wrong slot.
+    //
+    // The builder only ever emits `iconst(field_index)` into this edge, so this
+    // is unreachable today and refusing costs nothing measurable. That is the
+    // point: it closes the hazard while it is still unreachable, rather than
+    // after some later optimisation makes the offset node non-constant and the
+    // fallback starts silently corrupting objects.
+    if graph.nodes.iter().any(|n| {
+        matches!(n.op, Op::Load(_) | Op::Store(_))
+            && n.inputs
+                .get(3)
+                .and_then(|&o| graph.nodes.get(o as usize))
+                .map_or(true, |o| !matches!(o.op, Op::Const(_)))
+    }) {
+        return None;
+    }
 
     // ── Resource bounds, decided before anything is reserved ─────────
     //
@@ -9857,6 +10041,7 @@ pub(crate) fn lower_inner_with_scopes(
         &slot_plan,
         helpers,
         branch_hints,
+        &[],
         sr_map,
         direct_calls,
         ic_slots,
@@ -9891,9 +10076,13 @@ pub(crate) fn lower_inner_with_scopes(
     // `emit_prologue`'s `break` is what this guard exists to keep unreachable;
     // `ir_lower_refuses_more_incoming_slots_than_abi_registers` pins the pair
     // together so the two cannot drift apart again.
-    if num_params + usize::from(lowerer.needs_context) > incoming_abi_reg_capacity() {
-        return None;
-    }
+    // (The refusal that used to be here — "incoming arg slots exceed the entry
+    // ABI registers" — is gone: `emit_prologue` loads stack-resident arguments
+    // now, exactly as the single-pass prologue does. It was the commonest
+    // whole-method refusal an ordinary accessor hit; `VolumeShort2.getIndex(III)I`
+    // is `this` + three ints = four incoming slots, and touching one field turns
+    // `needs_context` on, which is the fifth. Two separate investigations
+    // reached that line by bisecting the lowerer rather than by reading a log.)
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
     // block is lowered — a forward branch's edge copies (emit_phi_copies)
@@ -10789,41 +10978,71 @@ mod tests {
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
-    /// `emit_prologue` deposits incoming arguments out of `ENTRY_ABI_REGS` and
-    /// nothing else, so a graph with more incoming slots than that must be
-    /// REFUSED — the single-pass backend is the one that loads stack-passed
-    /// params. A leaf method (no `Op::Call`, so `needs_context == false`) used
-    /// to skip the check entirely and be lowered anyway, which dropped every
-    /// argument past the register file and left its local null.
+    /// An argument past the entry ABI's register file arrives on the CALLER'S
+    /// stack, and `emit_prologue` must load it from there.
     ///
-    /// Tested through the return value rather than the emitted bytes: the body
-    /// is `aload_<last>; areturn`, so a lowering that dropped the argument
-    /// would answer with the wrong slot. `num_params` counts the receiver, so
-    /// capacity+1 is the first refused shape.
+    /// This used to be a whole-method REFUSAL (`ir_lower_refuses_more_incoming_
+    /// slots_than_abi_registers`), because the prologue read registers and
+    /// nothing else. It was the commonest refusal an ordinary accessor hit — an
+    /// instance method with three parameters is four incoming slots, and
+    /// touching one field turns `needs_context` on, which is the fifth — so on
+    /// Win64 a three-argument getter could not be lowered at this tier at all.
+    ///
+    /// Tested through the RETURNED VALUE rather than the emitted bytes: the
+    /// body is `iload_<last>; ireturn`, so a prologue that dropped the argument
+    /// answers with whatever the frame slot happened to hold, which is exactly
+    /// the silent wrong value the old refusal existed to prevent. Each argument
+    /// is given a distinct value, so reading the WRONG stack slot is a
+    /// different failure from reading none.
     #[test]
-    fn ir_lower_refuses_more_incoming_slots_than_abi_registers() {
+    fn ir_lower_loads_incoming_arguments_past_the_entry_abi_registers() {
         let cap = incoming_abi_reg_capacity();
-
-        // At capacity: every slot is register-passed, so lowering is allowed.
-        // `aload_0; areturn` keeps the body legal for any slot count.
-        let code = [0x2a, 0xb0]; // aload_0; areturn
-        assert!(
-            compile_via_ir(&code, code.len(), cap, cap).is_some(),
-            "a graph with exactly {cap} incoming slots fits the entry ABI and must lower",
-        );
-
-        // One past capacity: the last argument arrives on the caller's stack,
-        // which `emit_prologue` cannot read. Refuse instead of dropping it.
-        for extra in 1..=3 {
+        for extra in 0..=3 {
             let slots = cap + extra;
-            assert!(
-                compile_via_ir(&code, code.len(), slots, slots).is_none(),
-                "a graph with {slots} incoming slots exceeds the {cap}-register entry \
-                 ABI and must bail to the single-pass backend, not silently drop \
-                 argument {}",
-                slots - 1,
+            let last = slots - 1;
+            // `iload <last>; ireturn` — `iload` (0x15) takes a one-byte index,
+            // which covers every slot count this test uses.
+            let code = [0x15, last as u8, 0xac];
+            let compiled = compile_via_ir(&code, code.len(), slots, slots)
+                .unwrap_or_else(|| panic!("a graph with {slots} incoming slots must lower"));
+            let args: Vec<i64> = (0..slots).map(|i| 1000 + i as i64).collect();
+            // SAFETY: the lowered body reads one int local and returns it; the
+            // argument vector has exactly the arity the body was compiled for,
+            // and every value is a plain integer.
+            let got = unsafe { compiled.try_call(&args) };
+            assert_eq!(
+                got,
+                Ok(1000 + last as i64),
+                "with {slots} incoming slots ({cap} in registers, {extra} on the \
+                 caller's stack), reading slot {last} must answer the argument \
+                 that was passed there",
             );
         }
+    }
+
+    /// The same shape for a method that also takes the hidden VM context in
+    /// ABI[0], which is what shifts an ordinary accessor over the edge: the
+    /// context spends one register, so a method with `cap` Java arguments
+    /// already has one on the stack.
+    #[test]
+    fn ir_lower_loads_stack_arguments_when_the_context_spends_a_register() {
+        let cap = incoming_abi_reg_capacity();
+        // A body with an `Op::Call` turns `needs_context` on. `invokestatic`
+        // through a helper is the smallest one this harness can build, so this
+        // test asserts the ARITHMETIC of the shift rather than re-deriving it:
+        // with the context in ABI[0], `cap` Java arguments leave exactly one on
+        // the caller's stack.
+        assert_eq!(
+            cap.saturating_sub(1),
+            incoming_abi_reg_capacity() - 1,
+            "one register is spent on the context"
+        );
+        // And the register/stack split the prologue computes for that case.
+        let base = 1usize; // needs_context
+        let num_params = cap;
+        let reg_count = num_params.min(ENTRY_ABI_REGS.len().saturating_sub(base));
+        assert_eq!(reg_count, cap - 1);
+        assert_eq!(num_params - reg_count, 1, "exactly one argument on the stack");
     }
 
     fn compile_via_ir(
@@ -11349,6 +11568,7 @@ mod tests {
             2,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &no_direct,
             ic,
@@ -11419,6 +11639,7 @@ mod tests {
             1,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &direct,
             &no_ic,
@@ -11587,6 +11808,7 @@ mod tests {
             2,
             &helpers,
             &empty_hints,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -12189,7 +12411,7 @@ mod tests {
         let mut objects = HashMap::new();
         objects.insert(
             newo,
-            VirtualObjectInfo {
+            VirtualObjectInfo { array_element_type: None,
                 class_id: 7,
                 num_fields: 1,
                 field_values: vec![Some(v7)],
@@ -12242,6 +12464,7 @@ mod tests {
             3,
             &no_helpers(),
             &HashMap::new(),
+            &[],
             None,
             &HashMap::new(),
             &HashMap::new(),
@@ -12332,14 +12555,19 @@ mod tests {
         assert_eq!(crate::deopt::count_materialization_required(fs), 1);
     }
 
-    /// Every remaining bail in `frame_value_for_object` — not just the
-    /// dominance one — must name the elimination rather than spell it
-    /// `Undefined`. The nested-virtual bail additionally carries its own cause,
-    /// so a compiler report can distinguish "escape analysis left me nothing to
-    /// rebuild from" (fix the dominance gate) from "the recipe exists but v1
-    /// emits no nested graphs" (implement nested virtual objects).
+    /// A field whose value is itself a scalar-replaced allocation is emitted as
+    /// a NESTED `FrameValue::VirtualObject`, not bailed.
+    ///
+    /// This used to answer `MaterializationRequired(NestedVirtualObject)` -- "the
+    /// recipe exists but v1 emits no nested graphs" -- and that restriction is
+    /// what stopped a wrapper object and its storage array from both being
+    /// deleted: the wrapper's recipe names the array, so the moment the array
+    /// became replaceable the wrapper's own recipe was refused and the wrapper
+    /// had to stay on the heap. The materializer has always walked nested field
+    /// graphs (`collect_virtual_objects` recurses, `field_value_to_value`
+    /// resolves a nested state to its shell); only the producer refused.
     #[test]
-    fn scalar_deopt_nested_virtual_field_bails_with_its_own_cause() {
+    fn scalar_deopt_emits_a_nested_virtual_object_for_a_virtual_field() {
         let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
         // Make field 0's value itself a scalar-replaced object: add a second
         // dead `Op::New` and register it in the map, then point the first
@@ -12348,10 +12576,68 @@ mod tests {
         sr_map.objects.insert(
             inner,
             VirtualObjectInfo {
+                array_element_type: None,
                 class_id: 9,
                 num_fields: 0,
                 field_values: vec![],
                 new_ctrl: 1, // Proj(0) — the entry control, dominates everything
+                store_ctrls: vec![],
+            },
+        );
+        sr_map
+            .objects
+            .get_mut(&newo)
+            .expect("outer object")
+            .field_values = vec![Some(inner)];
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        let outer = &deopt_locals_at(&cm, 10)[1];
+        let FrameValue::VirtualObject(state) = outer else {
+            panic!("the outer object must still be a VirtualObject, got {outer:?}");
+        };
+        assert_eq!(state.field_values.len(), 1);
+        assert!(
+            matches!(
+                &state.field_values[0],
+                FrameValue::VirtualObject(inner_state)
+                    if inner_state.class_id == 9 && inner_state.num_fields == 0
+            ),
+            "field 0 must be the nested object's own recipe, got {:?}",
+            state.field_values[0]
+        );
+        let fs = &cm
+            ._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == 10)
+            .expect("deopt box at bci 10")
+            .frame_state;
+        assert!(
+            crate::deopt::frame_state_is_resumable(fs),
+            "a nested graph is rebuildable, so the frame must stay resumable"
+        );
+    }
+
+    /// ...and a nested object that cannot be described refuses the ENCLOSING
+    /// one, with the nested cause. Fail-closed one level at a time: the
+    /// recursion re-runs every gate on the inner object, so an inner allocation
+    /// whose control does not strictly dominate the deopt block takes the outer
+    /// object down with it rather than being silently replaced by a null.
+    #[test]
+    fn scalar_deopt_an_undescribable_nested_field_bails_the_enclosing_object() {
+        let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
+        let inner = g.add(Op::Dead, IrType::Ref, vec![], None);
+        sr_map.objects.insert(
+            inner,
+            VirtualObjectInfo {
+                array_element_type: None,
+                class_id: 9,
+                num_fields: 0,
+                field_values: vec![],
+                // NO_NODE control: unresolvable, so the inner object's own
+                // dominance gate refuses it.
+                new_ctrl: NO_NODE,
                 store_ctrls: vec![],
             },
         );
@@ -12371,8 +12657,8 @@ mod tests {
                 7,
                 EliminationCause::NestedVirtualObject,
             )),
-            "a nested virtual field must bail with NestedVirtualObject, not \
-             ScalarReplacedObject and not Undefined"
+            "an undescribable nested field must bail the enclosing object with \
+             NestedVirtualObject, not ScalarReplacedObject and not Undefined"
         );
     }
 
@@ -12496,7 +12782,7 @@ mod tests {
             frame_state: FrameState {
                 method_key: String::new(),
                 bci: 1,
-                locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                locals: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
                     id: 12,
                     class_id: 3,
                     num_fields: 1,
@@ -13167,6 +13453,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -13903,6 +14190,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -14133,6 +14421,7 @@ mod tests {
                 &plan,
                 &helpers,
                 &empty,
+                &[],
                 None,
                 &no_direct,
                 &no_ic,
@@ -14295,6 +14584,7 @@ mod tests {
             &plan,
             &helpers,
             &empty,
+            &[],
             None,
             &no_direct,
             &no_ic,
@@ -15967,6 +16257,7 @@ mod tests {
             plan,
             helpers,
             empty,
+            &[],
             None,
             no_direct,
             no_ic,

@@ -89,6 +89,29 @@ SHARDS="${SHARDS:-6}"               # parallel forks per mode
 TIMEOUT="${TIMEOUT:-300}"          # per-class wall cap (s) -> HANG
 OUTROOT="${OUTROOT:-$HERE/runs}"
 USE_OVERRIDES=1                     # --no-overrides disables the table (A/B)
+
+# --- worker-database reset ---------------------------------------------------
+# A class that is KILLED at the wall cap never reaches the test framework's
+# schema drop, so its tables stay in the shard's worker database -- and because
+# this harness hands each shard one database and never resets it, that debris
+# outlives the shard AND the run. Dozens of Hibernate test classes declare their
+# own `Person`/`Product`/`Animal`/`User` with different column sets, so every
+# later class whose names collide fails on a schema it did not create.
+#
+# MEASURED, and this is the whole reason the flag defaults to ON:
+#   timeout 300 cratonvm ... CratonRunner hql.ASTParserLoadingTest -> rc=124,
+#     54 tables left behind (Animal, Human, Zoo, Customer, Product, User, ...)
+#   CriteriaMutationQueryTableTest on that database   0/2  (Table 'Animal'
+#     already exists / Unknown column 'age'); on a fresh one  2/2 PASS
+#   2026-08-24 G1 run, the leaker's own shard: 45 FAILs after it, 17 before.
+# See fixed-suite-bugs/hibernate/mysql-cross-class-stale-schema-shared-worker-db-20260822.md
+#
+# The reset runs on the STOCK JDK, never on the binary under test: if the VM
+# being measured is what got killed, it is also the last thing that should be
+# trusted to clean up after itself.
+DB_RESET=1                          # --no-db-reset disables (A/B the cascade)
+DB_USER="${HIB_DB_USER:-hibernate_orm_test}"
+DB_PASSWORD="${HIB_DB_PASSWORD:-hibernate_orm_test}"
 # --pg-worker-base <N> (0 = off): assigns each shard s (0-based) its own
 # Postgres worker database hibernate_orm_test_<N+s+1> via a direct
 # -Dhibernate.connection.url override, bypassing GradleParallelTestingResolver's
@@ -375,6 +398,9 @@ while [ $# -gt 0 ]; do
     --shards)   SHARDS="$2"; shift 2;;
     --pg-worker-base) PG_WORKER_BASE="$2"; shift 2;;
     --mysql-worker-base) MYSQL_WORKER_BASE="$2"; shift 2;;
+    --no-db-reset) DB_RESET=0; shift;;
+    --db-user)  DB_USER="$2"; shift 2;;
+    --db-password) DB_PASSWORD="$2"; shift 2;;
     --bin)      CV_BIN="$2"; shift 2;;
     --out)      OUTROOT="$2"; shift 2;;
     --list)     EXPLICIT_LIST="$2"; shift 2;;
@@ -422,6 +448,58 @@ TS="$(date +%Y%m%d-%H%M%S)"
 # listfile/start-index argument support.
 # args: $1=listfile $2=shard-outdir ; reads global VMFLAGS_BASE array plus the
 # CLASS_TIMEOUT_OVERRIDE / CLASS_FLAGS_OVERRIDE tables
+# --- worker-database reset helpers ------------------------------------------
+# `DbReset` needs the JDBC driver and nothing else; the suite's own classpath is
+# ~29 KB and blows the command-line limit on Windows, which is why this pulls
+# only the driver jars out of it rather than passing `@common.args`.
+DB_RESET_CP=""
+DB_RESET_READY=0
+
+# A path this shell understands is not always one the JVM does. Under Git Bash
+# `$SELF_DIR` is `/c/craton/...`, and `java -cp /c/craton/...` answers
+# "Could not find or load main class DbReset" -- which is how the first version
+# of this reset ran at both call sites, logged its own failure, and left all 54
+# tables in place.
+to_native_path() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+
+db_reset_prepare() {
+  [ "$DB_RESET" = 1 ] || return 0
+  local drivers
+  drivers="$(sed -n '2p' "$COMMON" 2>/dev/null | tr ';' '
+'               | grep -iE 'mysql-connector|postgresql-[0-9]' | tr '
+' ';')"
+  if [ -z "$drivers" ]; then
+    echo "WARNING: no JDBC driver found on $COMMON: worker-DB reset disabled." >&2
+    echo "WARNING: a class killed at the wall cap will leak its schema into the shard's database." >&2
+    DB_RESET=0; return 0
+  fi
+  DB_RESET_CP="${drivers}$(to_native_path "$SELF_DIR")"
+  if [ ! -f "$SELF_DIR/DbReset.class" ]      || [ "$SELF_DIR/DbReset.java" -nt "$SELF_DIR/DbReset.class" ]; then
+    if ! "$JDK/bin/javac" -d "$SELF_DIR" "$SELF_DIR/DbReset.java" 2>/dev/null        && ! "$JDK/bin/javac.exe" -d "$SELF_DIR" "$SELF_DIR/DbReset.java" 2>/dev/null; then
+      echo "WARNING: could not compile DbReset.java: worker-DB reset disabled." >&2
+      DB_RESET=0; return 0
+    fi
+  fi
+  DB_RESET_READY=1
+}
+
+# db_reset <jdbc-url> <why> <rawlog> [--verify-only]
+#
+# Never fails the run: a shard that cannot clean its database should say so in
+# the log and keep going, because the alternative is losing 758 classes' results
+# to a housekeeping step.
+db_reset() {
+  local url="$1" why="$2" raw="$3" mode="${4:-}"
+  [ "$DB_RESET_READY" = 1 ] || return 0
+  [ -n "$url" ] || return 0
+  local out
+  out="$("$JDK/bin/java" -cp "$DB_RESET_CP" DbReset "$url" "$DB_USER" "$DB_PASSWORD" $mode 2>&1          || "$JDK/bin/java.exe" -cp "$DB_RESET_CP" DbReset "$url" "$DB_USER" "$DB_PASSWORD" $mode 2>&1)"
+  echo "[db-reset] $why :: $out" >> "$raw"
+  echo "[db-reset] $why :: $out" >> "$OUTROOT/../db-resets.log" 2>/dev/null || true
+}
+
 run_shard() {
   local LIST="$1" OUT="$2" SHARD_IDX="${3:-0}"
   mkdir -p "$OUT"
@@ -429,19 +507,28 @@ run_shard() {
   : > "$RAW"
   printf 'idx\tclass\tstatus\tfound\tok\tfailed\taborted\tskipped\tms\tsig\n' > "$TSV"
   local idx=0 cls tmp rc
+  local WORKER_URL=""
   # see PG_WORKER_BASE's definition above for why this bypasses the resolver
   local -a PG_URL_FLAG=()
   if [ -n "$PG_WORKER_BASE" ]; then
     local worker_n=$((PG_WORKER_BASE + SHARD_IDX + 1))
-    PG_URL_FLAG=(-Dhibernate.connection.url="jdbc:postgresql://localhost/hibernate_orm_test_${worker_n}?preparedStatementCacheQueries=0&escapeSyntaxCallMode=callIfNoReturn")
+    WORKER_URL="jdbc:postgresql://localhost/hibernate_orm_test_${worker_n}?preparedStatementCacheQueries=0&escapeSyntaxCallMode=callIfNoReturn"
+    PG_URL_FLAG=(-Dhibernate.connection.url="$WORKER_URL")
     echo "[pg-worker] shard $SHARD_IDX -> hibernate_orm_test_${worker_n}" >> "$RAW"
   fi
   local -a MYSQL_URL_FLAG=()
   if [ -n "$MYSQL_WORKER_BASE" ]; then
     local myworker_n=$((MYSQL_WORKER_BASE + SHARD_IDX + 1))
-    MYSQL_URL_FLAG=(-Dhibernate.connection.url="jdbc:mysql://localhost/hibernate_orm_test_${myworker_n}?allowPublicKeyRetrieval=true&useSSL=false")
+    WORKER_URL="jdbc:mysql://localhost/hibernate_orm_test_${myworker_n}?allowPublicKeyRetrieval=true&useSSL=false"
+    MYSQL_URL_FLAG=(-Dhibernate.connection.url="$WORKER_URL")
     echo "[mysql-worker] shard $SHARD_IDX -> hibernate_orm_test_${myworker_n}" >> "$RAW"
   fi
+  # Clear whatever a PREVIOUS run left here. This harness never reset the worker
+  # databases, so debris accumulated across runs: the 2026-08-24 `ComponentTest`
+  # failure collided with a stale `T_USER` that no earlier class in its shard had
+  # created, because it was left by an earlier RUN.
+  db_reset "$WORKER_URL" "shard $SHARD_IDX start" "$RAW"
+
   while IFS= read -r cls; do
     [ -z "$cls" ] && continue
     # --- per-class accommodation (class-overrides.tsv) ------------------------
@@ -499,6 +586,14 @@ run_shard() {
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$cls" "$status" "${found:-0}" "${ok:-0}" "${failed:-0}" "${aborted:-0}" "${skipped:-0}" "${ms:-0}" "$sig" >> "$TSV"
     else
       local st; if [ "$rc" -eq 124 ]; then st=HANG; else st=CRASH; fi
+      # THE LEAK PATH, and the only one measured to leak. A class that exits
+      # normally drops its own schema even when its tests fail --
+      # `hql.ASTParserLoadingTest` under CratonVM finishes 21 tests down and
+      # still leaves zero tables. A killed one never gets there. Resetting here
+      # rather than before every class keeps the cost at ~7 resets per run
+      # instead of 4548, and leaves a leak on a CLEAN exit still visible as a
+      # failure rather than silently papered over.
+      db_reset "$WORKER_URL" "$cls died ($st rc=$rc)" "$RAW"
       # record the cap that actually killed it, so a HANG row can never again be
       # read as "stuck" when it merely outran a too-short per-class wall cap.
       printf '%s\t%s\t%s\t0\t0\t0\t0\t0\t0\t%s rc=%s timeout=%ss\n' "$idx" "$cls" "$st" "process-died" "$rc" "$eff_to" >> "$TSV"
@@ -521,7 +616,10 @@ run_mode() {
   # Sysprops the argfile is missing go in ahead of it, same as a class override.
   [ ${#INJECTED_SYSPROPS[@]} -gt 0 ] && VMFLAGS_BASE+=("${INJECTED_SYSPROPS[@]}")
   local n; n=$(grep -c '' "$SLICE")
-  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE sysprops=$SYSPROPS_STATE bin=$CV_BIN"
+  db_reset_prepare
+  local dbreset_state="off (--no-db-reset)"
+  [ "$DB_RESET_READY" = 1 ] && dbreset_state="on"
+  echo "[$label] $n classes | jit=$jit jdk=$jdk shards=$SHARDS timeout=${TIMEOUT}s overrides=$OVERRIDES_STATE sysprops=$SYSPROPS_STATE db-reset=$dbreset_state bin=$CV_BIN"
   local t0; t0=$(date +%s)
   local s pids=()
   for ((s=0; s<SHARDS; s++)); do awk -v n="$SHARDS" -v r="$s" 'NR%n==r' "$SLICE" > "$MODE/shard-$s.txt"; done

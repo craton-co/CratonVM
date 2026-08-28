@@ -4912,6 +4912,93 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             }
         }
     }
+    // A declaring class in a BUILT-IN loader must resolve its descriptors
+    // through the BUILT-IN delegation chain, not through the global by-name
+    // store below.
+    //
+    // The gate above declines for these ("built-in loaders (0/1/2) ARE the
+    // global store, so the legacy path is already correct for them"), and that
+    // premise holds only while nobody else has defined the same name. Once a
+    // USER-DEFINED loader defines its own copy — which is routine: Spring Boot's
+    // `@ClassPathExclusions` re-loads the world under a
+    // `ModifiedClassPathClassLoader`, and every test using it does this — the
+    // global lookup can hand that CHILD's copy to a method whose declaring
+    // class is in the application loader.
+    //
+    // MEASURED, `probes/ReflectiveLoaderFidelityProbe.java`, after one such
+    // test has run in the same JVM:
+    //
+    //     declaringClass  …WebEndpointServletConfiguration  loader=AppClassLoader
+    //     paramTypes[1]   …ObjectProvider                   loader=ModifiedClassPathClassLoader
+    //
+    // i.e. `Method.getParameterTypes()` answered a type from a loader the
+    // declaring class cannot even see. Spring's `resolveDependency` decides
+    // "is this an ObjectProvider" with `ObjectProvider.class == type`, so the
+    // mismatched copy turned an always-satisfiable provider into a failing bean
+    // lookup and killed the context — one test poisoning a later one
+    // (`boot.jersey…JerseyWebEndpointManagementContextConfigurationTests`).
+    // `ResolvableType.resolve()` stayed correct throughout, because it goes
+    // through the generic-signature path rather than this one, which is what
+    // made the two disagree.
+    //
+    // Delegation order, and a built-in loader never delegates DOWN: an
+    // application-declared name is looked for in bootstrap, then extension,
+    // then application, and the first hit wins — the same order
+    // `get_loaded_class_id_for_requester` walks. A miss falls through to the
+    // global path below unchanged, which still owns arrays, primitives,
+    // not-yet-loaded names and synthetics.
+    if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        let loader_id = ctx.loader_id_of_class(declaring_class_id);
+        if (0..=2).contains(&loader_id) {
+            // (a) Already loaded somewhere in the built-in chain? Cheap, and the
+            // common case.
+            for builtin in 0..=(loader_id as u32) {
+                if let Some(cid) = ctx.class_id_defined_by_loader_exact(inner, builtin) {
+                    return ctx.get_class_mirror(cid);
+                }
+            }
+            // (b) NOT loaded there yet — and this is the half a lookup cannot
+            // fix. The global fallback below is a by-name probe with no loader
+            // context, so it answers with whichever copy exists; if a
+            // user-defined loader got there first, that is the copy it returns,
+            // and the mirror caches it forever.
+            //
+            // The ORDER is what makes this reachable, and it is not exotic.
+            // MEASURED with `CRATONVM_DBG_DEFINE_FILTER=beans/factory/ObjectProvider`
+            // over the Spring Boot pair that exposed it:
+            //
+            //     insert name=…/ObjectProvider loader=UserDefined(3) id=2095  <- child, FIRST
+            //     insert name=…/ObjectProvider loader=Application    id=2972  <- app, LATER
+            //
+            // The `Method` mirror is built between those two, when the ONLY
+            // definition is the child's. So (a) misses, the fallback collapses
+            // onto `UserDefined(3)`, and `Method.getParameterTypes()` reports a
+            // class the declaring class cannot see. It is order-dependent in
+            // exactly the way that makes it look flaky: resolve the name in the
+            // application namespace first and the same code is correct.
+            //
+            // Initiate through the declaring class's own loader instead —
+            // `class_id_by_name_via_referencing_class` is JVMS §5.4.3
+            // initiating-loader resolution, and its own contract names this
+            // failure ("collapse to whichever loader defined `name` FIRST
+            // process-wide"). It RESOLVES rather than initialises, which is the
+            // right strength here: building a reflective mirror must not run a
+            // parameter type's `<clinit>`.
+            //
+            // Gated on the fallback actually being about to answer wrong, so
+            // the ordinary "not loaded anywhere yet" case keeps its existing
+            // cheap path and no Java loader call is added to it.
+            let foreign_copy_would_win = ctx
+                .class_id_by_name(inner)
+                .is_some_and(|cid| ctx.loader_id_of_class(cid) >= 3);
+            if foreign_copy_would_win {
+                if let Ok(cid) = ctx.class_id_by_name_via_referencing_class(declaring_class_id, inner)
+                {
+                    return ctx.get_class_mirror(cid);
+                }
+            }
+        }
+    }
     descriptor_to_class_mirror(ctx, desc)
 }
 

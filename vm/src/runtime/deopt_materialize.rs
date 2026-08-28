@@ -41,6 +41,7 @@ use cratonvm_types::ClassId;
 
 use crate::error::{MethodCallFailed, VmError};
 use crate::runtime::interpreter::{alloc_object_shared, maybe_gc_forced_pub};
+use cratonvm_gc::heap::ArrayElementType;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
@@ -90,6 +91,29 @@ impl<'a> TempRootScope<'a> {
         let obj = alloc_object_shared(shared, self.thread, class_id, num_fields)?;
         self.thread.native_pin_roots.push(obj);
         Ok(obj)
+    }
+
+    /// The array analogue of [`Self::alloc_shell`]: a zeroed array of `length`
+    /// elements of `element_type`, pinned the instant it exists.
+    ///
+    /// Same ordering contract, for the same reason -- `gc_alloc_array` can GC
+    /// on its slow path, and every shell pinned before this call is already a
+    /// root.
+    fn alloc_array_shell(
+        &mut self,
+        shared: &SharedVm,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Result<ObjectRef, MethodCallFailed> {
+        let arr = crate::runtime::interpreter::gc_alloc_array(
+            shared,
+            self.thread,
+            ClassId::new(0),
+            element_type,
+            length,
+        )?;
+        self.thread.native_pin_roots.push(arr);
+        Ok(arr)
     }
 
     /// Mutable access to the underlying thread (Phase-1 alloc / forced GC).
@@ -181,7 +205,33 @@ pub(crate) fn materialize_virtual_objects(
     let mut pin_of: BTreeMap<usize, usize> = BTreeMap::new();
     for (&id, state) in &states {
         let pin_index = scope.thread().native_pin_roots.len();
-        scope.alloc_shell(shared, ClassId::new(state.class_id), state.num_fields)?;
+        // An ARRAY state carries its element atype and its LENGTH (in
+        // `num_fields`); an object state carries a class id and a field count.
+        // The two are different allocations and must not be confused -- an
+        // object shell where the frame expects an array is a wrong-shaped
+        // header the collector would walk as fields.
+        match state.array_element_type {
+            Some(atype) => {
+                let element_type = match atype_to_element_type(atype) {
+                    Some(t) => t,
+                    // Only primitive atypes are ever emitted (a reference array
+                    // is refused in `escape_analysis`), so this is unreachable
+                    // -- and it refuses rather than guesses, which sends the
+                    // caller down the safe whole-method re-run path.
+                    None => {
+                        return Err(MethodCallFailed::InternalError(VmError::Internal {
+                            message: format!(
+                                "deopt materialize: virtual array with unsupported atype {atype}"
+                            ),
+                        }))
+                    }
+                };
+                scope.alloc_array_shell(shared, element_type, state.num_fields)?;
+            }
+            None => {
+                scope.alloc_shell(shared, ClassId::new(state.class_id), state.num_fields)?;
+            }
+        }
         pin_of.insert(id, pin_index);
         if stress_gc {
             // Force a GC with the just-pinned shell (and all prior shells) rooted:
@@ -205,7 +255,15 @@ pub(crate) fn materialize_virtual_objects(
         let shell = shells[&id];
         for (field_index, fv) in state.field_values.iter().enumerate() {
             let value = field_value_to_value(fv, &shells)?;
-            store_field_barriered(shared, shell, field_index, value);
+            if state.array_element_type.is_some() {
+                // An array's slots are ELEMENTS. `set_field` would write them
+                // at the object field offsets, which for an array is the
+                // length word and past it. No pre-barrier: only primitive
+                // element types are emitted, so no reference is overwritten.
+                let _ = shared.mem.heap.set_array_element(shell, field_index, value);
+            } else {
+                store_field_barriered(shared, shell, field_index, value);
+            }
         }
     }
 
@@ -250,6 +308,24 @@ pub(crate) fn materialize_virtual_objects(
         drop(scope);
     }
     Ok(result)
+}
+
+/// The [`ArrayElementType`] for a JVM `newarray` atype, or `None` for an atype
+/// that is not a primitive element kind. Mirrors `jit_newarray`'s table, which
+/// is the one the compiled `newarray` uses -- a materialized array has to have
+/// the same element kind the compiled code would have allocated.
+fn atype_to_element_type(atype: u8) -> Option<ArrayElementType> {
+    Some(match atype {
+        4 => ArrayElementType::Boolean,
+        5 => ArrayElementType::Char,
+        6 => ArrayElementType::Float,
+        7 => ArrayElementType::Double,
+        8 => ArrayElementType::Byte,
+        9 => ArrayElementType::Short,
+        10 => ArrayElementType::Int,
+        11 => ArrayElementType::Long,
+        _ => return None,
+    })
 }
 
 /// The virtual-object id a top-level `FrameValue` refers to, if any.
@@ -374,7 +450,7 @@ mod tests {
     /// A scalar-replaced object placeholder: id `id`, class `class_id`,
     /// `num_fields` default-`Undefined` fields.
     fn vobj(id: usize, class_id: u32, num_fields: usize) -> FrameValue {
-        FrameValue::VirtualObject(VirtualObjectState {
+        FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id,
             class_id,
             num_fields,
@@ -479,7 +555,7 @@ mod tests {
         let real_addr = real.as_ptr() as usize as u64;
 
         // One virtual object (id 0, class 5, 3 fields): [Int(42), Object(real), Undefined].
-        let vo = FrameValue::VirtualObject(VirtualObjectState {
+        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 0,
             class_id: 5,
             num_fields: 3,
@@ -524,13 +600,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // A (id 0).field0 -> B ;  B (id 1).field0 -> A
-        let a = FrameValue::VirtualObject(VirtualObjectState {
+        let a = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 0,
             class_id: 1,
             num_fields: 1,
             field_values: vec![FrameValue::VirtualObjectRef(1)],
         });
-        let b = FrameValue::VirtualObject(VirtualObjectState {
+        let b = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
             id: 1,
             class_id: 1,
             num_fields: 1,

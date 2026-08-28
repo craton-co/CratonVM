@@ -166,6 +166,13 @@ fn maybe_dump_shutdown_reports() {
     // ran at all.
     cratonvm_vm::report_map_view_cache_at_exit();
 
+    // The punned-cell watch census, on `CRATONVM_DBG_WATCH_PUN=<class>:<slot>`.
+    // `accessor_reads` / `accessor_stores` are the ENGAGEMENT counters: the
+    // experiment this watch exists for turns the JIT off, which also removes
+    // every compiled read and write of the slot, so a zero numerator without
+    // them cannot be told from "nobody looked".
+    cratonvm_vm::report_punned_watch_at_exit();
+
     // The notification-credit census, on `CRATONVM_DBG=monitor-notify`.
     // `credits_consumed` is the engagement counter for the `Object.wait()`
     // lost-wakeup fix: a run with no stalls says nothing about whether the
@@ -211,6 +218,64 @@ fn maybe_dump_shutdown_reports() {
              dereferenced: {})",
             cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot(),
             cratonvm_vm::jit::helpers::jit_getfield_punned_ref_nonzero()
+        );
+        // The WRITE side of the same species, and the two ENGAGEMENT counters
+        // for the substitutions that could produce it. All three printed even
+        // when zero, for the reason the counter above them is:
+        //
+        // * `unresolved field sites refused` is how often a backend declined a
+        //   `getfield`/`putfield`/`getstatic`/`putstatic` because it had no
+        //   resolved slot. Those four sites used to substitute slot 0 tagged
+        //   `int` and carry on, which is how JDT's `HashtableOfInt.rehash`
+        //   wrote an `int[]` into slot 0 as `Value::Int(low32_of_ptr)`. A zero
+        //   here says the substitution never fired on this workload -- which is
+        //   the observation that has to precede blaming it for anything.
+        // * `field sites refused for a descriptor disagreement` is how often
+        //   the name-only field resolver found a field whose descriptor is not
+        //   the one the constant pool names, so the site's slot index and its
+        //   type tag would have described different fields.
+        // * `compiled primitive stores into a declared-reference slot` counts
+        //   only while `CRATONVM_DBG_WATCH_PUN` is armed; it is `<not armed>`
+        //   otherwise rather than `0`, because those are different facts.
+        eprintln!(
+            "[cratonvm] unresolved field sites refused: {} | field sites refused \
+             for a descriptor disagreement: {} | compiled primitive stores into \
+             a declared-reference slot: {}",
+            cratonvm_jit::x64::bytecode_walk::unresolved_field_site_bails(),
+            cratonvm_vm::runtime::interpreter::jit_field_tag_disagreements(),
+            cratonvm_vm::jit::helpers::jit_putfield_primitive_into_ref_slot()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<not armed>".to_string()),
+        );
+        // Compiled field stores the helper family DISCARDED. Both drops are
+        // right in isolation -- writing through an implausible receiver, or
+        // past the end of the object, corrupts the neighbouring allocation
+        // instead. What they lacked is visibility: a dropped store leaves the
+        // field exactly as it was, and for a field assigned once in a
+        // constructor that is the zero-filled cell a reference `getfield` reads
+        // back as an ordinary `null`. The defect then surfaces arbitrarily far
+        // away as "this reference cannot be null", with nothing connecting it
+        // to a store that did not happen.
+        //
+        // Printed even when zero, because zero is the useful reading: it rules
+        // the whole mechanism out for a run, which is what a null-reference
+        // investigation needs before it starts looking anywhere else.
+        // `CRATONVM_DBG_DROPPED_PUTFIELD=1` names the receiver, the slot and
+        // the compiled method for the first 32 of each.
+        let (dropped_recv, dropped_oob) = cratonvm_vm::jit::helpers::jit_putfield_dropped_stores();
+        // ENGAGEMENT counter for the JVMS 5.4.6 reclassification: how many
+        // compiled call sites were bound directly because their constant pool
+        // resolved to a PRIVATE method, instead of being dispatched from the
+        // receiver's class. Without it, "the workload passes now" cannot be
+        // told from "no site on this workload was one" -- and the shape (a
+        // constructor calling its own `private void init()`, subclassed) is
+        // common enough that a zero on a large workload is itself a finding.
+        eprintln!(
+            "[cratonvm] invokevirtual sites pinned to a private target: {}",
+            cratonvm_jit::private_invokevirtual_pinned()
+        );
+        eprintln!(
+            "[cratonvm] compiled field stores dropped: implausible receiver={dropped_recv}              slot out of bounds={dropped_oob}"
         );
         // G1 parallel-evacuation CAS losses, i.e. how often a worker found
         // another worker had already forwarded the object it was copying and

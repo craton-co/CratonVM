@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-493 tokens.
+494 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -74,6 +74,7 @@ export inherited from a parent shell.
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
 | `watch-pun` | `CRATONVM_DBG_WATCH_PUN` |
+| `dropped-putfield` | `CRATONVM_DBG_DROPPED_PUTFIELD` |
 | `read0-latency` | `CRATONVM_DBG_READ0LAT` |
 | `refdisc` | `CRATONVM_DBG_REFDISC` |
 | `site-alias` | `CRATONVM_DBG_SITE_ALIAS` |
@@ -559,13 +560,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-235 tokens.
+237 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
+| `unresolved-field-substitute` | `CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE` |
 | `sp-ic-deopt-check` | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` |
 | `sp-ic-only` | `CRATONVM_JIT_SP_IC_ONLY` |
 | `sp-inline-mega` | `CRATONVM_JIT_SP_INLINE_MEGA` |
@@ -724,6 +726,7 @@ export inherited from a parent shell.
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `ffm-intrinsic` | `CRATONVM_JIT_NO_FFM_INTRINSIC` |
 | `c2-alloc-upgrade` | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
+| `ir-inline` | `CRATONVM_JIT_IR_INLINE` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
