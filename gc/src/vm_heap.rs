@@ -2703,7 +2703,8 @@ impl VmHeap {
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}"
+                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}",
+                targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
             );
             // CONCURRENT marking, on its own line and with five fields rather
             // than one, because four different runs look identical in any
