@@ -1446,11 +1446,21 @@ pub fn dump_method_stats_to_stderr() {
     let (check_index_sites, fence_sites) = crate::census_direct_helper_sites();
     let (long_value_of_sites, long_long_value_sites) = crate::long_box_direct_helper_sites();
     let (vh_read_sp, vh_read_osr) = crate::varhandle_read_direct_helper_sites();
+    let nio_byte_sites = crate::nio_byte_element_sites();
+    let md_update_sites = crate::md_update_byte_sites();
     eprintln!(
         "[cratonvm] JIT thin direct-helper binds: Preconditions.checkIndex={check_index_sites} \
          Reference.reachabilityFence={fence_sites} Long.valueOf={long_value_of_sites} \
-         Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr}",
+         Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr} \
+         ByteBuffer.byteElement={nio_byte_sites} MessageDigest.update={md_update_sites}",
     );
+    let (nio_served, nio_declined, md_served, md_declined) = crate::byte_element_helper_calls();
+    if nio_served | nio_declined | md_served | md_declined != 0 {
+        eprintln!(
+            "[cratonvm] JIT byte-element helper calls: ByteBuffer served={nio_served} \
+             declined={nio_declined} MessageDigest served={md_served} declined={md_declined}",
+        );
+    }
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {
         eprintln!(

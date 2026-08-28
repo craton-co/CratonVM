@@ -514,6 +514,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "remap-residue", on_key: Some("CRATONVM_DBG_REMAP_RESIDUE"), off_key: None, off_word: None },
     // Declared 2026-08-23. `jit-rootscan` reports the moving-young coverage
     // verdict as an aggregate `map_coverage=N` counter, which names neither the
     // METHOD nor WHICH of `fully_oop_covered`'s four terms said no. `oopcov`
@@ -925,6 +926,8 @@ pub const INVENTORY: &[E] = &[
     // AFTER `CRATONVM_JIT_FORCE_C2` in the admission chain).
     E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "census-direct-helpers", on_key: Some("CRATONVM_JIT_CENSUS_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "nio-byte-direct-helpers", on_key: Some("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "md-update-direct-helper", on_key: Some("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None },

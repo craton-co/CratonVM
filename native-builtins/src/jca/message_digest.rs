@@ -431,9 +431,76 @@ fn read_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// SHA-256 a byte at a time, 268 million times, so the copy alone was 4% of
 /// that test's profile.
 fn md_receiver_is_ours(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    match ctx.class_name_arc_of_id(ctx.class_id_of_object(this)) {
-        Some(name) => &*name == "java/security/MessageDigest",
+    let class_id = ctx.class_id_of_object(this);
+    match ctx.class_name_arc_of_id(class_id) {
+        Some(name) => {
+            let ours = &*name == "java/security/MessageDigest";
+            if ours {
+                update_fastpath::note_ours(class_id.as_u32());
+            }
+            ours
+        }
         None => true,
+    }
+}
+
+/// What `update(byte)` has PROVEN, published so the JIT can feed the digest a
+/// byte without the native funnel.
+///
+/// # Why
+///
+/// netty's `AbstractIntegrationTest.testHugeDecompress` calls
+/// `MessageDigest.update(byte)` **536 million** times — 268 million per side —
+/// and each one measured 216 ns against HotSpot's 8.6. The body below is a
+/// hash-map probe and a `Vec::push`; the rest is the generic native dispatch,
+/// which `jit_md_update_byte_direct` (`vm/src/jit/helpers.rs`) skips.
+///
+/// # Why the JIT is told rather than asking
+///
+/// Two facts have to hold before a byte may be appended, and neither is
+/// re-derived on the fast path:
+///
+///  * the receiver's class is EXACTLY `java.security.MessageDigest`, i.e. this
+///    crate built it and `update` is not a provider subclass's state
+///    ([`md_receiver_is_ours`], whose verdict is what publishes the id); and
+///  * the side table ALREADY has an accumulator for that receiver, which
+///    `md_get_instance_named` creates. [`append_byte`] therefore refuses to
+///    create one — a receiver this crate never handed out has no entry, so a
+///    stray identity-hash collision cannot fabricate a digest.
+pub mod update_fastpath {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The class id of `java.security.MessageDigest`, learned from a receiver
+    /// [`super::md_receiver_is_ours`] accepted. `0` until then.
+    static OURS_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+    /// Is this the exact class the accumulator natives own?
+    pub fn class_is_ours(class_id: u32) -> bool {
+        class_id != 0 && OURS_CLASS_ID.load(Ordering::Relaxed) == class_id
+    }
+
+    pub(super) fn note_ours(class_id: u32) {
+        if class_id == 0 {
+            return;
+        }
+        // A racing writer stores the same id (this class has one), so a lost
+        // race costs nothing.
+        let _ = OURS_CLASS_ID.compare_exchange(0, class_id, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Append one byte to the accumulator `key` ALREADY names, or `false`.
+    ///
+    /// `get_mut`, never `or_default`: see the module doc. The caller must
+    /// compute `key` with the same identity hash `NativeContext` uses, or it
+    /// will simply miss and decline.
+    pub fn append_byte(key: i32, byte: u8) -> bool {
+        match super::accumulators().lock().get_mut(&key) {
+            Some(buf) => {
+                buf.push(byte);
+                true
+            }
+            None => false,
+        }
     }
 }
 

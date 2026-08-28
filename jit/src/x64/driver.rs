@@ -1831,6 +1831,45 @@ pub fn compile_with_param_slots(
     compiler.sr_local_prov_at = sr_plan.local_prov_at;
     compiler.sr_monitor_at = sr_plan.monitor_at;
     compiler.sr_monitor_scalar_ops = sr_plan.monitor_scalar_ops;
+    // `CRATONVM_DBG_JIT_EA=<method-key substring>` -- what escape analysis
+    // decided for this method, per pc.
+    //
+    // A scalar-replaced `new` pushes a DUMMY ZERO and its field ops are
+    // rewritten to frame slots; a site the plan covers and one it does not pop
+    // DIFFERENT numbers of operands, so a `new` in `objects` whose `<init>`
+    // is not in `init_skips` (or whose field ops are not in `field_ops`) leaves
+    // the operand stack desynchronised for everything after it. In a method
+    // that is one 23-arm `lookupswitch` of `new SQLxxx(); dup; invokespecial
+    // <init>; areturn` -- `DataValueFactoryImpl.getNullDVDWithUCS_BASICcollation`
+    // -- that is how one arm's constructor reaches another arm's object.
+    if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_EA") {
+        let key = compiler.method_key.clone();
+        if key.contains(&want) {
+            let mut news: Vec<(usize, u32, usize)> = sr_plan
+                .objects
+                .iter()
+                .map(|(pc, o)| (*pc, o.class_id, o.num_fields))
+                .collect();
+            news.sort_unstable();
+            let mut fops: Vec<(usize, usize)> =
+                sr_plan.field_ops.iter().map(|(a, b)| (*a, *b)).collect();
+            fops.sort_unstable();
+            let mut skips: Vec<usize> = sr_plan.init_skips.iter().copied().collect();
+            skips.sort_unstable();
+            let mut elid: Vec<usize> = elidable_init_pcs
+                .as_ref()
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            elid.sort_unstable();
+            let mut nen: Vec<usize> = non_escaping_new.iter().copied().collect();
+            nen.sort_unstable();
+            eprintln!(
+                "[jit-ea] method={key} new_sites={} elidable_init_pcs={elid:?} \
+non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skips:?}",
+                compiler.new_info.len()
+            );
+        }
+    }
     compiler.scalar_replaced = sr_plan.objects;
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
@@ -2492,7 +2531,7 @@ pub fn compile_with_param_slots(
         eprintln!(
             "[oopcov] uncovered method={} frameslot={} shadow={} \
              shadow_missing_pcs={shadow_missing:?} \
-             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={}) ",
+             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={} inline_scope={}) ",
             compiler.method_key,
             cm.fully_oop_covered,
             cm.fully_shadow_covered,
@@ -2503,6 +2542,7 @@ pub fn compile_with_param_slots(
             scauses[4],
             scauses[5],
             scauses[6],
+            scauses[7],
         );
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \

@@ -63,7 +63,7 @@ Defaults are decided at the **read site**, not in `types/src/flag_groups.rs`
   `monitors: Vec::new()`, and `can_deopt_resume` is gated on the graph holding
   no `Op::MonitorEnter`/`Op::MonitorExit`, so that omission cannot be reached.
   The 2026-08-27 gauntlet soak
-  (`docs/internal/performance/scalar-deopt-gauntlet-soak-20260827.md`) found the
+  (`performance/scalar-deopt-gauntlet-soak-20260827.md`) found the
   flag green and **inert**: 30 392 allocation-bearing IR compiles across netty
   and hibernate produced ZERO scalar replacements, so it emitted no descriptor
   anywhere — including on the probe written to exercise it. Flipping it on that

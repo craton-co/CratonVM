@@ -9951,7 +9951,7 @@ pub(crate) fn lower_inner_with_scopes(
     // reference, the cell then holds a primitive under a reference's name, and
     // the fault appears much later in whatever dereferences it — a compiled
     // `arraylength` on `Int(1)`, faulting at `addr=0x5`
-    // (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-caught-in-sqlchar-init-20260827.md`).
+    // (`fixed-suite-bugs/tomcat/punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
     // Nothing in the report points back here, because a wrong-slot write leaves
     // no trace of having chosen the wrong slot.
     //

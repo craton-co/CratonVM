@@ -1015,6 +1015,13 @@ pub static COMMITTED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
 /// deliberately generous bound that real workloads rarely approach.
 const DEFAULT_JIT_CODE_CACHE_CAP_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hands out [`CompiledMethod::artifact_id`]. Monotonic for the life of the
+/// process; `0` is reserved for "not recorded".
+fn next_artifact_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of `try_compile` calls refused because the code-cache cap was hit.
 static JIT_CODE_CACHE_CAP_REFUSALS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1893,6 +1900,97 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     (addr >= *entry && addr < *end).then_some(*cm)
 }
 
+/// `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR=0` -- stop rewriting an elidable
+/// `invokespecial C.<init>()V` site's callee class to `java/lang/Object`.
+///
+/// The rewrite is what lets the single-pass `0xb7` codegen drop the per-object
+/// `jit_invoke_dispatch` for a constructor whose whole body is
+/// `aload_0; invokespecial Object.<init>; return`. It also DISCARDS the site's
+/// real callee identity, which every consumer downstream of the rewrite then
+/// sees as `Object.<init>` -- so this is the bisect lever for anything that
+/// appears only when an elidable constructor is in the method.
+///
+/// Default ON. `CRATONVM_DBG_JIT_ELIDE_CTOR=<caller substring>` names each
+/// rewrite as it happens.
+pub fn elide_trivial_ctor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_ELIDE_TRIVIAL_CTOR")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_DBG_JIT_DIRECT_BINDS=<caller-method substring>` -- print every raw
+/// JIT-to-JIT direct call this compile BAKES: the caller, the bytecode pc, the
+/// callee triple the site resolved to, and the entry address bound.
+///
+/// A baked `CALL` carries no identity at runtime -- `JitCalleeGuard` is only
+/// constructed by `jit_invoke_dispatch`, which a raw call bypasses -- so the
+/// punned-store report names the door and not the site. This is the same
+/// question asked where the answer is still attributable, and it is the one
+/// place that sees both the pc and the address.
+///
+/// Cross-check against `CRATONVM_DBG=jitc`'s
+/// `full-compile <method> entry=0x...`: a bind whose entry belongs to a method
+/// other than the one named here is a site bound to the wrong body.
+pub fn dbg_direct_binds() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_DIRECT_BINDS").ok())
+        .as_deref()
+}
+
+/// Emit one `[jit-direct-bind]` line when the CALLER matches the filter.
+pub fn note_direct_bind(
+    caller: &str,
+    pc: usize,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+    entry: usize,
+) {
+    let Some(filter) = dbg_direct_binds() else {
+        return;
+    };
+    if !caller.contains(filter) {
+        return;
+    }
+    eprintln!(
+        "[jit-direct-bind] caller={caller} pc={pc} callee={callee_class}.{callee_method}{callee_desc} entry={entry:#x}"
+    );
+}
+
+/// DIAGNOSTIC: name the compiled body whose code range contains `addr`.
+///
+/// [`pin_jit_code_range_owner`] cannot answer for a body registered through the
+/// non-owning [`register_jit_code_range`] — its `Weak` never upgrades — and
+/// that is most of them, so a diagnostic built on the pin prints an empty list.
+/// This reads the method key straight off the artifact the range table already
+/// points at.
+///
+/// Only for reports taken from INSIDE the body (a helper called by it): the
+/// range table's `cm` is the address of a live `CompiledMethod` for exactly as
+/// long as that body can be executing, which is the only window this is called
+/// in. Do not call it about an arbitrary address.
+pub fn jit_code_range_method_key(addr: usize) -> Option<String> {
+    let cm = lookup_jit_code_range(addr)?;
+    // SAFETY: see the contract above — `cm` is the address of the
+    // `CompiledMethod` whose code is executing at `addr`.
+    let compiled: &CompiledMethod = unsafe { &*(cm as *const CompiledMethod) };
+    compiled
+        .deopt_points
+        .iter()
+        .map(|d| d.frame_state.method_key.clone())
+        .find(|k| !k.is_empty())
+        .or_else(|| {
+            compiled
+                ._deopt_point_boxes
+                .iter()
+                .map(|d| d.frame_state.method_key.clone())
+                .find(|k| !k.is_empty())
+        })
+}
+
 /// Resolve `addr` to a *retained* owner of the compiled body containing it.
 ///
 /// [`lookup_jit_code_range`] returns a bare `usize` — the address of an
@@ -2473,6 +2571,26 @@ pub struct CompiledMethod {
     /// Native entries of compiled callees referenced by baked direct calls.
     /// Filled by the compile driver before publication.
     pub _direct_callee_entries: Vec<usize>,
+    /// `(entry, artifact_id)` for every raw direct CALL baked into this body:
+    /// the address, and WHICH artifact owned it when the address was baked.
+    ///
+    /// Without the second half, `prepare_for_publication` can only ask whether
+    /// something live owns the address now. Measured on
+    /// `TestWebdavPropertyStore` 2026-08-28, one run's log, in order:
+    ///
+    /// ```text
+    /// full-compile SQLChar.<init>()V     entry=E len=1362
+    /// [jit-code-free] base=E published=true authorised=false
+    /// full-compile SQLInteger.<init>()V  entry=E len=657      <- E recycled
+    /// full-compile DataValueFactoryImpl.getNullDVDWithUCS_BASICcollation
+    /// [punned-store-jit] ... executing at E+0x224
+    /// ```
+    ///
+    /// The caller baked `CALL E` for `SQLChar.<init>`; by publication E was
+    /// `SQLInteger.<init>`, whose body opens `putfield isnull:Z` -- field
+    /// index 1, `Int(1)`. `SQLChar` slot 1 is `rawData`, declared `[C`, so
+    /// Derby then read that field as the pointer `1`.
+    pub _direct_callee_expected: Vec<(usize, u64)>,
     /// Strong ownership matching `_direct_callee_entries`. A loaded caller can
     /// therefore never outlive executable code reached by one of its baked
     /// calls, even after the callee is invalidated and removed from the cache.
@@ -2822,6 +2940,19 @@ pub struct CompiledMethod {
     /// the compile-wide thread-local witness [`open_compile_epoch_witness`]
     /// opens (so the stamp is the epoch at compile START, not at finalize).
     pub install_epoch: u64,
+    /// Process-unique identity for this artifact.
+    ///
+    /// Neither the entry ADDRESS nor the `CompiledMethod`'s own address
+    /// identifies a body: an executable buffer is recycled to the next
+    /// compile of a similar size, and the `Arc`'s allocation is recycled by
+    /// the global allocator just as readily. A check built on either is an
+    /// ABA -- it compares equal across two different artifacts. This is a
+    /// monotonic counter, so it never repeats.
+    ///
+    /// Read by [`JitCache::prepare_for_publication`], which has to answer
+    /// "is the body at this baked address still the one it was baked for",
+    /// not merely "is something alive there".
+    pub artifact_id: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -2923,6 +3054,7 @@ impl CompiledMethod {
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
             _direct_callee_entries: Vec::new(),
+            _direct_callee_expected: Vec::new(),
             _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
@@ -2978,6 +3110,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            artifact_id: next_artifact_id(),
         }
     }
 
@@ -2997,6 +3130,7 @@ impl CompiledMethod {
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
             _direct_callee_entries: Vec::new(),
+            _direct_callee_expected: Vec::new(),
             _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
@@ -3052,6 +3186,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            artifact_id: next_artifact_id(),
         }
     }
 
@@ -6191,7 +6326,7 @@ fn append_ir_inline_site(
     tables: &mut ir::IrInlineTables,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
-    direct_callee_entries: &mut Vec<usize>,
+    direct_callee_entries: &mut Vec<(usize, u64)>,
     budget: &mut usize,
     // `(combined pc, num_jit_args)` for each virtual/interface call the spliced
     // bodies leave behind. The planner gives each its own MIC/PIC — without one
@@ -6357,7 +6492,7 @@ pub(crate) fn intern_inline_invoke_targets(
     site: &mut InlineSite,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
-    direct_callee_entries: &mut Vec<usize>,
+    direct_callee_entries: &mut Vec<(usize, u64)>,
 ) {
     // Wholesale, never additive: an `InlineSite` may have been CLONED from
     // a cached plan that already carries pointers from an earlier compile,
@@ -6399,7 +6534,9 @@ pub(crate) fn intern_inline_invoke_targets(
         // does and needs the same registration; skipping it leaves a raw `CALL`
         // into freed code.
         if direct_entry != 0 {
-            direct_callee_entries.push(direct_entry);
+            // The owner AT BAKE TIME -- see `_direct_callee_expected`.
+            direct_callee_entries
+                .push((direct_entry, jit_entry_artifact_id(direct_entry)));
         }
         site.resolved_invoke_infos.push(ResolvedInlineInvoke {
             callee_pc: *callee_pc,
@@ -10076,6 +10213,141 @@ pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
 pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` thin direct-call binds.
+//
+// Census-driven, exactly like `Preconditions.checkIndex` above.
+// `--dump-native-registry` on `BufProbe` (netty's `ByteBuf.writeByte` /
+// `forEachByte` in a loop, the two operations
+// `AbstractIntegrationTest.testHugeDecompress` runs 268 million times each)
+// reports ONE `java/nio/DirectByteBuffer.put(IB)` per `writeByte` and one
+// `get(I)B` per byte read, both `bridge`:
+//
+//     5 242 880  java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;
+//     3 145 728  java/nio/DirectByteBuffer.get(I)B
+//
+// against a measured 700 ns/op for `writeByte` and 349 ns/op for
+// `forEachByte`, where HotSpot is 5.1 ns and 5.9 ns. `perf` puts
+// `safe_native_call_impl` + `try_jit_site_cached_native_dispatch` +
+// the argument marshalling + `is_object_address` at ~30 % of that profile:
+// the native bodies are a bounds check and a one-byte copy, and everything
+// else is the funnel around them.
+//
+// The site's constant-pool class is `java/nio/ByteBuffer` (netty's
+// `PooledDirectByteBuf.memory` is declared as one), so the bind uses
+// `direct_native_helper_for_impl`: the POLICY question has to be asked about
+// `java/nio/DirectByteBuffer`, which is where the native the helper stands in
+// for is registered. The helper declines any receiver whose class the funnel
+// has not already served with the modelled layout -- including every
+// `HeapByteBuffer` -- so a polymorphic site keeps today's behaviour on every
+// receiver the fast path was not proven for.
+pub static NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to the two `ByteBuffer` single-byte helpers.
+pub static NIO_BYTE_ELEMENT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Calls the thin helpers actually SERVED, and calls they DECLINED to the
+/// generic dispatcher.
+///
+/// A site count and a served count answer different questions, and the gap
+/// between them is where a fast path hides: `ByteBuffer.byteElement=2` with
+/// five million funnel invocations still in the census means the bind happened
+/// and the helper said no to every call. Timings cannot tell those apart.
+pub static NIO_BYTE_ELEMENT_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static NIO_BYTE_ELEMENT_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(nio served, nio declined, md served, md declined)`.
+pub fn byte_element_helper_calls() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        NIO_BYTE_ELEMENT_SERVED.load(Relaxed),
+        NIO_BYTE_ELEMENT_DECLINED.load(Relaxed),
+        MD_UPDATE_BYTE_SERVED.load(Relaxed),
+        MD_UPDATE_BYTE_DECLINED.load(Relaxed),
+    )
+}
+
+/// Bound `ByteBuffer` single-byte element sites, for a census that can tell
+/// "the fast path was never installed" from "it was installed and is no
+/// faster" -- the distinction timings alone cannot make.
+pub fn nio_byte_element_sites() -> u64 {
+    NIO_BYTE_ELEMENT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_nio_bytebuffer_byte_direct_fns(put: usize, get: usize) {
+    NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN.store(put, std::sync::atomic::Ordering::Relaxed);
+    NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN.store(get, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `MessageDigest.update(byte)` thin direct-call bind.
+///
+/// The third rung of the same census. `testHugeDecompress` feeds SHA-256 a byte
+/// at a time 536 million times (268 M on the compress side, 268 M more through
+/// `ByteProcessor.process` on the decompress side) at 216 ns/call against
+/// HotSpot's 8.6 ns. `update` is FINAL on `MessageDigest`, so a provider's
+/// subclass cannot override it and the helper has to check the receiver itself
+/// — it serves only the exact class this VM's own `getInstance` builds, and
+/// declines everything else to the funnel, which forwards to `engineUpdate`.
+pub static MD_UPDATE_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to [`MD_UPDATE_BYTE_DIRECT_FN`].
+pub static MD_UPDATE_BYTE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound `MessageDigest.update(byte)` sites — the same "was it ever installed?"
+/// census [`nio_byte_element_sites`] exists for.
+pub fn md_update_byte_sites() -> u64 {
+    MD_UPDATE_BYTE_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_md_update_byte_direct_fn(addr: usize) {
+    MD_UPDATE_BYTE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0` — send every
+/// `MessageDigest.update(byte)` back through the generic native funnel.
+/// Default ON; the kill switch and B arm, as beside.
+pub fn md_update_direct_helper_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0` — send every `ByteBuffer`
+/// single-byte element access back through the generic native funnel. Default
+/// ON, so a KILL SWITCH and the B arm of a one-binary A/B, for the same reason
+/// `census-direct-helpers` and `long-box-direct-helpers` beside it have one.
+pub fn nio_byte_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Register the exact-HashMap thin direct-call helpers (called once from the
 /// VM's `build_helpers`).
 pub fn set_hashmap_put_direct_fn(addr: usize) {
@@ -13094,6 +13366,36 @@ pub(crate) fn register_jit_entry_owner_for_adapter(entry: usize, arc: &Arc<Compi
     jit_entry_owners().lock().insert(entry, Arc::downgrade(arc));
 }
 
+/// The identity of whatever owns `entry` right now, for recording beside a
+/// baked direct-call address. `0` means "nothing owns it", which
+/// `prepare_for_publication` treats as "no identity recorded".
+pub(crate) fn jit_entry_artifact_id(entry: usize) -> u64 {
+    let id = resolve_jit_entry_owner(entry).map_or(0, |o| o.artifact_id);
+    // `CRATONVM_JIT_CALLEE_IDENTITY=0` keeps this lookup -- and the
+    // `jit_entry_owners` lock it takes -- but records NO identity, so
+    // `prepare_for_publication` falls back to its historical liveness-only
+    // answer. That is the control the fix needs: a lock taken on a compile path
+    // can serialise a race away by itself, and this session has already watched
+    // a `Mutex` in a diagnostic make the defect vanish. If the defect stays away
+    // with the check disabled, the check is not what fixed it.
+    if callee_identity_check_enabled() {
+        id
+    } else {
+        0
+    }
+}
+
+/// `CRATONVM_JIT_CALLEE_IDENTITY=0` -- record no bake-time callee identity.
+/// Default ON. See [`jit_entry_artifact_id`] for why the switch exists.
+fn callee_identity_check_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALLEE_IDENTITY")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
     jit_entry_owners().lock().get(&entry)?.upgrade()
 }
@@ -13503,6 +13805,13 @@ pub static UNPINNED_JIT_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Baked direct-call targets whose entry address changed hands between bake
+/// and publication. `UNROOTED_DIRECT_CALLEES` cannot see these: the pin
+/// succeeds, on the wrong body.
+pub static REBOUND_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
 /// Whether an unrootable baked direct-call target blocks publication.
@@ -13876,10 +14185,43 @@ flushed at epoch {barrier}",
     /// `call` to an address nothing keeps alive.
     fn prepare_for_publication(compiled: &mut CompiledMethod) -> bool {
         let wanted = compiled._direct_callee_entries.len();
+        // IDENTITY, not liveness. `resolve_jit_entry_owner` answers "what owns
+        // this ADDRESS now"; `_direct_callee_expected` says which artifact owned
+        // it when the address was baked into this code. A recycled buffer makes
+        // those two different bodies and the pin then SUCCEEDS on the wrong one,
+        // so the old liveness-only test let the caller publish a `CALL` into a
+        // method it never resolved. Compared by `artifact_id` and not by
+        // pointer: the freed `Arc` allocation is recycled too, so an address
+        // comparison is an ABA and reads as a match.
+        let expected: Vec<(usize, u64)> = compiled._direct_callee_expected.clone();
+        let expected_of = |entry: usize| -> Option<u64> {
+            expected.iter().find(|(e, _)| *e == entry).map(|(_, id)| *id)
+        };
         compiled._direct_callee_roots = compiled
             ._direct_callee_entries
             .iter()
-            .filter_map(|&entry| resolve_jit_entry_owner(entry))
+            .filter_map(|&entry| {
+                let owner = resolve_jit_entry_owner(entry)?;
+                match expected_of(entry) {
+                    // Baked with no recorded identity (a synthetic range): keep
+                    // the historical liveness-only answer rather than refuse a
+                    // body that was fine before.
+                    None | Some(0) => Some(owner),
+                    Some(want) if owner.artifact_id == want => Some(owner),
+                    Some(_) => {
+                        REBOUND_DIRECT_CALLEES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dbg_jit_pin_enabled() {
+                            eprintln!(
+                                "[jit-rebound-callee] entry {entry:#x} now belongs to a \
+different artifact than the one baked into this body: its buffer was recycled before \
+publication"
+                            );
+                        }
+                        None
+                    }
+                }
+            })
             .collect();
         let got = compiled._direct_callee_roots.len();
         if got == wanted {
@@ -20047,7 +20389,7 @@ fn try_compile_inner(
         // `_direct_callee_entries` — keep-alive + invalidation closure).
         let mut ir_direct_calls: std::collections::HashMap<usize, (usize, bool)> =
             std::collections::HashMap::new();
-        let mut ir_direct_callee_entries: Vec<usize> = Vec::new();
+        let mut ir_direct_callee_entries: Vec<(usize, u64)> = Vec::new();
         // IR inline caches (jit-inlining-and-ir-calls): `pc → (mic_addr,
         // pic_addr)` for each virtual/interface site the IR lowerer may serve
         // from a MIC + 4-way-PIC cascade, plus the owning boxes, which are moved
@@ -20359,7 +20701,54 @@ fn try_compile_inner(
                             // compiled code was never asking.
                             || (cn == "java/lang/foreign/MemorySegment"
                                 && matches!(mn.as_str(), "getAtIndex" | "setAtIndex")
-                                && ffm_kind_for_descriptor(&desc).is_some());
+                                && ffm_kind_for_descriptor(&desc).is_some())
+                            // The single-BYTE `ByteBuffer` element accessors
+                            // and `MessageDigest.update(byte)`. Bound by their
+                            // own arm in the single-pass scan, for the same
+                            // reason the FFM row above is: they carry a
+                            // dispatch info for the decline edge, so
+                            // `try_resolve_intrinsic` does not name them and
+                            // this predicate has to.
+                            //
+                            // Found the same way, by the same instrument. With
+                            // the bind wired at two doors and the splice
+                            // refusing to swallow the site, `BufProbe` still
+                            // reported `ByteBuffer.byteElement=2` bound sites
+                            // against `served=1636` calls and 5 239 468 funnel
+                            // invocations in the native census: 1 636 is what a
+                            // single-pass compile serves BEFORE
+                            // `PooledDirectByteBuf._setByte` tiers up, and the
+                            // IR tier it tiers up to lowers the site to a plain
+                            // dispatch. A count that small next to a bound-site
+                            // count is the signature of this exact routing.
+                            || (nio_byte_direct_helpers_enabled()
+                                && cn == "java/nio/ByteBuffer"
+                                && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
+                                    || (mn == "get" && desc == "(I)B")))
+                            || (md_update_direct_helper_enabled()
+                                && cn == "java/security/MessageDigest"
+                                && mn == "update"
+                                && desc == "(B)V")
+                            // `VarHandle` read/write modes, bound at BOTH the
+                            // single-pass and OSR doors and lost at this one for
+                            // the same reason as the three rows above.
+                            //
+                            // MEASURED on `JdkZlibIntegrationTest#
+                            // testHugeDecompress` after the other three landed:
+                            // the census still showed **269 768 215**
+                            // `VarHandle.get` bridge invocations — one per
+                            // `ByteBuf.writeByte`, from the `RefCnt` read inside
+                            // `ensureAccessible` — while
+                            // `CRATONVM_DBG=jit-method-stats` reported
+                            // `VarHandle.read=2/0`. Two sites bound at the
+                            // single-pass door, none at OSR, and the tiny hot
+                            // accessor that holds the site tiering up to here.
+                            || (varhandle_read_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_read_helper_slot(&mn, &desc).is_some())
+                            || (varhandle_write_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_write_helper_slot(&mn, &desc).is_some());
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
@@ -20679,7 +21068,8 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             if !direct_target_is_thin_helper {
-                                ir_direct_callee_entries.push(entry);
+                                ir_direct_callee_entries
+                                    .push((entry, jit_entry_artifact_id(entry)));
                             }
                         } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
                             .is_some()
@@ -21639,8 +22029,10 @@ fn try_compile_inner(
                             // CALL to an address nothing keeps mapped. The
                             // lowerer records none today, which is exactly why
                             // the assignment looked safe.
+                            compiled._direct_callee_entries
+                                .extend(ir_direct_callee_entries.iter().map(|(e, _)| *e));
                             compiled
-                                ._direct_callee_entries
+                                ._direct_callee_expected
                                 .append(&mut ir_direct_callee_entries);
                             compiled._direct_callee_entries.sort_unstable();
                             compiled._direct_callee_entries.dedup();
@@ -22056,7 +22448,7 @@ fn try_compile_inner(
     let mut invoke_info: Vec<(usize, *const JitInvokeInfo)> = Vec::new();
     let mut owned_invoke_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
     let mut direct_calls: Vec<(usize, JitDirectCall)> = Vec::new();
-    let mut direct_callee_entries: Vec<usize> = Vec::new();
+    let mut direct_callee_entries: Vec<(usize, u64)> = Vec::new();
     let mut mic_slots: Vec<(usize, *const JitMICSlot)> = Vec::new();
     let mut owned_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
     // HIGH-7 — Eager PIC allocation strategy.
@@ -22925,7 +23317,8 @@ fn try_compile_inner(
                                     let info_ptr: *const JitInvokeInfo = &*info;
                                     owned_invoke_infos.push(info);
                                     invoke_info.push((pc, info_ptr));
-                                    direct_callee_entries.push(entry);
+                                    direct_callee_entries
+                                        .push((entry, jit_entry_artifact_id(entry)));
                                     direct_calls.push((
                                         pc,
                                         JitDirectCall {
@@ -23057,7 +23450,21 @@ fn try_compile_inner(
                                 if callee_needs_ctx {
                                     needs_heap = true;
                                 }
-                                direct_callee_entries.push(entry);
+                                note_direct_bind(
+                                    &format!(
+                                        "{}.{}{}",
+                                        cached.class_name,
+                                        cached.method_name,
+                                        cached.method_descriptor
+                                    ),
+                                    pc,
+                                    &class_name,
+                                    &method_name,
+                                    &descriptor,
+                                    entry,
+                                );
+                                direct_callee_entries
+                                    .push((entry, jit_entry_artifact_id(entry)));
                                 direct_calls.push((
                                     pc,
                                     JitDirectCall {
@@ -23290,6 +23697,94 @@ fn try_compile_inner(
                                 // one 64-bit slot per value, not JVMS
                                 // category-2 pairs.
                                 return_type: b'J',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` — the
+                // per-BYTE element accessors. See
+                // `NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN` for the census that
+                // named them and for why the receiver test lives in the
+                // helper rather than in a `guard_class_id` here: the fast
+                // path serves only a class the FUNNEL has already served
+                // with the modelled layout, which is a fact this compile
+                // cannot know.
+                if direct_jit_callee_calls_enabled
+                    && nio_byte_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/nio/ByteBuffer"
+                    && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
+                        || (method_name == "get" && descriptor == "(I)B"))
+                {
+                    let is_put = method_name == "put";
+                    let entry = direct_native_helper_for_impl(
+                        if is_put {
+                            &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                        } else {
+                            &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                        },
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        "java/nio/DirectByteBuffer",
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        NIO_BYTE_ELEMENT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: if is_put { 2 } else { 1 },
+                                // `put` hands back the receiver, which the
+                                // return-value ladder must mark as an oop;
+                                // `get` returns a Java `byte`, which reaches
+                                // the operand stack sign-extended into an int
+                                // exactly as the registered native's
+                                // `Value::Int` does.
+                                return_type: if is_put { b'L' } else { b'I' },
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `MessageDigest.update(byte)` — see
+                // `MD_UPDATE_BYTE_DIRECT_FN`. `update` is FINAL on
+                // `MessageDigest`, so the site is statically monomorphic in the
+                // only sense that matters here: whatever the receiver's class,
+                // this method is the one that runs. Which receivers the fast
+                // path may SERVE is the helper's question, not this one's.
+                if direct_jit_callee_calls_enabled
+                    && md_update_direct_helper_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/security/MessageDigest"
+                    && method_name == "update"
+                    && descriptor == "(B)V"
+                {
+                    let entry = direct_native_helper(
+                        &MD_UPDATE_BYTE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        MD_UPDATE_BYTE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
                                 guard_class_id: 0,
                             },
                         ));
@@ -23776,8 +24271,18 @@ fn try_compile_inner(
             let class_name = if invoke_kind == 1
                 && method_name == "<init>"
                 && descriptor == "()V"
+                && elide_trivial_ctor_enabled()
                 && cp_elidable_init_resolver.map_or(false, |r| r(cp_idx))
             {
+                if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_ELIDE_CTOR") {
+                    let key =
+                        format!("{}.{}", cached.class_name, cached.method_name);
+                    if key.contains(&want) {
+                        eprintln!(
+                            "[jit-elide-ctor] caller={key} pc={pc} rewrote {class_name}.<init>()V -> java/lang/Object.<init>()V"
+                        );
+                    }
+                }
                 "java/lang/Object".to_string()
             } else {
                 class_name
@@ -24214,7 +24719,21 @@ fn try_compile_inner(
     compiled._jit_pic_slots.extend(owned_pic_slots);
     direct_callee_entries.sort_unstable();
     direct_callee_entries.dedup();
-    compiled._direct_callee_entries = direct_callee_entries;
+    if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_FIELD_SITES") {
+        let key = format!(
+            "{}.{}{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        );
+        if key.contains(&want) {
+            eprintln!(
+                "[jit-kept-callees] method={key} entries={:x?}",
+                direct_callee_entries
+            );
+        }
+    }
+    compiled._direct_callee_entries =
+        direct_callee_entries.iter().map(|(e, _)| *e).collect();
+    compiled._direct_callee_expected = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
     // C2-review P1 — publish the inlining decision totals on the artifact so
     // `metrics::CompileRecorder::installed` can harvest them alongside
