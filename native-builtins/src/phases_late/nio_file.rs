@@ -5230,7 +5230,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.unpin_native_roots(arr_pin);
                     Ok(Some(Value::Object(Some(stream))))
                 }
-                Err(e) => Err(p57_io_error(&e)),
+                // The READ was moved to the strict decoder above and this arm
+                // was left behind, so `Files.lines(<missing>)` kept answering a
+                // bare `IOException` while its two siblings had already moved.
+                // MEASURED after the first fix: `readAllLines` and `readString`
+                // both raised `NoSuchFileException` and `lines` did not — which
+                // is exactly the half-fixed shape this campaign keeps finding,
+                // reached this time inside a single function rather than across
+                // a duplicate pair.
+                Err(e) => Err(p57_fs_error(ctx, &e, &p)),
             }
         },
     );

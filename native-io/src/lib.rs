@@ -2180,21 +2180,21 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer at a sane chunk size to bound memory), so loop until `n`
     // bytes have been skipped or EOF is reached. Return the actual
     // number of bytes skipped, matching `java.io.FileInputStream.skip`.
-    // PAST THE END IS LEGAL AND IS NOT A SHORT SKIP. HotSpot's `skip0` is a
-    // single `lseek(fd, n, SEEK_CUR)` and returns the distance it moved, so
-    // `skip(4)` at end of file answers **4** — the file pointer really does sit
-    // four bytes past the end, and a following `write` would extend the file
-    // there. MEASURED: HotSpot 4, this VM 0.
+    // NOT REPAIRED HERE, AND THE REGISTRY SAYS WHY. HotSpot's `skip` past end
+    // of file answers the requested count (its `skip0` is one `lseek`), and
+    // this body answers 0. A seek was added here and MEASURED INERT: under
+    // `--jdk-only` the `skip(J)J` triple is not registered at all, and in the
+    // default mode it is registered with `invocations: 0`. So is `skip0(J)J`,
+    // in both. What actually answers is `java.io.InputStream.skip`'s
+    // read-and-discard default — the invocation counts prove it
+    // (`readBytes` +4 for two skips over a 2-byte file, `skip0` +0).
     //
-    // Both answers satisfy `InputStream.skip`'s "may skip over some smaller
-    // number of bytes"; the reason to match HotSpot anyway is that the two
-    // disagree about the CURSOR, not just the return value, and a caller that
-    // skips a fixed record header before writing gets a different file.
-    //
-    // The read-and-discard loop stays: it is what a non-seekable descriptor
-    // (a pipe, a socket-backed stream) needs, and the seek below only makes up
-    // the shortfall the loop could not read, so a genuine short read on a live
-    // stream is unaffected.
+    // That is a RESOLUTION finding, not a body one: `FileInputStream.skip`
+    // resolves to its superclass's method, so no change to either native here
+    // can move the answer. Recorded as a nomination rather than fixed with an
+    // edit that cannot fire. The answer is contract-legal in the meantime —
+    // `InputStream.skip` is specified to "skip over some smaller number of
+    // bytes, possibly zero".
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;
@@ -2214,19 +2214,6 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         total_skipped += read as u64;
         remaining -= read as u64;
-    }
-    // The loop stopped short only at end of file. On a SEEKABLE descriptor the
-    // remaining distance is still a legal move, and HotSpot makes it — see the
-    // note above the loop.
-    if remaining > 0 {
-        let want = i64::try_from(remaining).unwrap_or(i64::MAX);
-        if ctx
-            .fd_table()
-            .rw_seek(fd, std::io::SeekFrom::Current(want))
-            .is_ok()
-        {
-            total_skipped += remaining;
-        }
     }
     Ok(Some(Value::Long(total_skipped as i64)))
 }

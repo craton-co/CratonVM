@@ -1459,6 +1459,9 @@ pub(crate) fn native_printstream_write_int(
         _ => 0,
     };
     let buf = [b];
+    if crate::printstream_refuse_if_closed(ctx, args) {
+        return Ok(None);
+    }
     // LOCK-SCOPE (2026-07-21): see `stream_write`.
     let text = String::from_utf8_lossy(&buf);
     if !surefire_forwarding_write(ctx, args, &text, false)
@@ -1470,7 +1473,16 @@ pub(crate) fn native_printstream_write_int(
             if let Some(Value::Object(Some(this))) = args.first().copied() {
                 cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
             }
+        } else if let Some(Value::Object(Some(this))) = args.first().copied() {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
         }
+    }
+    // `write(int b)` is the ONE overload whose autoflush is conditional:
+    // `if ((b == '\n') && autoFlush) out.flush();`. Its byte-array sibling
+    // flushes unconditionally, which is why the two cannot share a hook.
+    // MEASURED: `new PrintStream(sink, true).write('\n')` did not flush.
+    if b == b'\n' {
+        crate::printstream_autoflush(ctx, args);
     }
     Ok(None)
 }
