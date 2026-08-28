@@ -3069,6 +3069,18 @@ pub struct ZgcRealHeap {
     parallel_mark_cycles: AtomicUsize,
     compaction_cycles: AtomicUsize,
     objects_relocated: AtomicUsize,
+    /// The arena window (offsets, `start..end`) the last allocation failure
+    /// needs emptied, or `None`.
+    ///
+    /// Written on the failure path, consumed once by the next relocation. The
+    /// profitability ranking in `ZRelocationSet::select` cannot find these
+    /// pages on its own -- it sorts by garbage ratio, which answers "reclaim the
+    /// most per byte copied" and not "make one CONTIGUOUS hole of size N".
+    ///
+    /// `TestMVStoreTool` is the case: 2 888 live bytes in 49 runs standing
+    /// between a 262 160-byte request and 266 104 contiguous bytes, in a cycle
+    /// that relocated 1 817 474 objects by that ranking and left those 34.
+    compaction_target: Mutex<Option<(usize, usize)>>,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -3530,6 +3542,7 @@ impl ZgcRealHeap {
             parallel_mark_cycles: AtomicUsize::new(0),
             compaction_cycles: AtomicUsize::new(0),
             objects_relocated: AtomicUsize::new(0),
+            compaction_target: Mutex::new(None),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -5995,7 +6008,12 @@ impl ZgcRealHeap {
             // and the bump EXTENT in another -- an ambiguity that inverts the
             // selector's profitability ranking.
             let candidates = adapters::page_candidates(&views);
-            let policy = forwarding::ZRelocationPolicy::default();
+            let mut policy = forwarding::ZRelocationPolicy::default();
+            // The window the last allocation failure named, if any. Consumed
+            // here so one failure biases exactly one cycle.
+            if targeted_compaction_enabled() {
+                policy.target_pages = self.take_compaction_target_pages();
+            }
             let reloc_set = forwarding::ZRelocationSet::select(&candidates, &policy);
             let mut selected: std::collections::HashSet<u64> =
                 reloc_set.pages().iter().map(|p| p.page_id).collect();
@@ -7212,6 +7230,46 @@ impl ZgcRealHeap {
     ///
     /// Bounded on purpose: at most [`Self::ZGC_FRAG_REPORT_WALLS`] walls are
     /// walked and that many class rows returned.
+    /// Remember the cheapest window that would serve `request`, for the next
+    /// relocation to empty.
+    ///
+    /// Takes the arena lock itself: the caller dropped it before logging, and
+    /// this must not extend that critical section.
+    fn record_compaction_target(&self, request: usize) {
+        {
+            let cur = self.compaction_target.lock();
+            if cur.is_some() {
+                // A target is already outstanding and no cycle has consumed it
+                // yet. Re-deriving it now would sort the free list again for an
+                // answer nothing has acted on.
+                return;
+            }
+        }
+        let window = {
+            let arena = self.arena.lock();
+            arena.frag_profile(request).cheapest
+        };
+        if let Some(w) = window {
+            *self.compaction_target.lock() = Some((w.start, w.end));
+        }
+    }
+
+    /// Take the outstanding compaction target as a logical page-id range.
+    ///
+    /// Consume-once: a target that a cycle has looked at is cleared whether or
+    /// not that cycle managed to evacuate it, so a stale window cannot pin the
+    /// selector to one part of the arena forever.
+    fn take_compaction_target_pages(&self) -> Option<(u64, u64)> {
+        let (start, end) = self.compaction_target.lock().take()?;
+        if end <= start {
+            return None;
+        }
+        let lo = start / Self::Z_LOGICAL_PAGE_BYTES;
+        let hi = (end - 1) / Self::Z_LOGICAL_PAGE_BYTES;
+        // Cast: a logical page index is bounded by capacity / 2 MiB.
+        Some((lo as u64, hi as u64))
+    }
+
     fn frag_report_once(&self, request: usize, arena: &Arena) -> Option<ZFragReport> {
         static REPORTS: AtomicUsize = AtomicUsize::new(0);
         if REPORTS.fetch_add(1, Ordering::Relaxed) >= 2 {
@@ -7387,6 +7445,15 @@ impl ZgcRealHeap {
                     // the case it was written for: see the `hard_alloc_failure`
                     // field doc.
                     self.hard_alloc_failure.store(true, Ordering::Relaxed);
+                    // ...and WHERE that collection should compact. The latch
+                    // above has always asked for a cycle; this is the first
+                    // thing that tells it where the request actually needs
+                    // room. Recomputed only when no target is outstanding, so a
+                    // storm of failures does not re-sort the free list per
+                    // attempt -- the same argument `coalesce_threshold` makes.
+                    if targeted_compaction_enabled() {
+                        self.record_compaction_target(size);
+                    }
                     return None;
                 }
             };
@@ -8990,6 +9057,19 @@ const ZGC_TLAB_ALIGN: usize = 8;
 /// Small heaps are unaffected: [`ZArenaTlabRegistry::chunk_bytes_for_capacity`]
 /// takes `capacity / 1024` first, so this ceiling only binds above ~512 MiB,
 /// which is exactly where the fragmentation it exists to prevent appears.
+/// `CRATONVM_ZGC_NO_TARGETED_COMPACTION=1` — stop letting an allocation failure
+/// name the window the next collection should empty, restoring the pure
+/// profitability ranking.
+///
+/// The bisect lever for targeted compaction, default-ON. Latched: it decides
+/// what a collection does and must not change mid-cycle.
+fn targeted_compaction_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_TARGETED_COMPACTION").is_none()
+    })
+}
+
 const ZGC_TLAB_MAX_CHUNK: usize = 512 * 1024;
 
 /// Size at or above which an allocation is served from the arena's HIGH end

@@ -1288,6 +1288,28 @@ pub struct ZRelocationPolicy {
     /// to reclaim at least 3.
     pub max_live_occupancy: f64,
 
+    /// A page-id range the last allocation failure needs emptied, inclusive.
+    ///
+    /// **The profitability ranking below cannot find these pages.** It sorts by
+    /// garbage ratio, which is the right question for "reclaim the most bytes
+    /// per byte copied" and the wrong one for "make one CONTIGUOUS hole of size
+    /// N". A window can be 98.9 % free and still refuse a request, and the few
+    /// dense pages walling it are exactly the ones the ranking puts last and
+    /// `max_live_occupancy` then filters out entirely.
+    ///
+    /// Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// `TestMVStoreTool` OOMs on a 262 160-byte request while 2 888 live bytes
+    /// in 49 runs are all that stand between it and 266 104 contiguous bytes —
+    /// in a cycle that relocated 1 817 474 objects by this ranking and left
+    /// those 34 objects where they were.
+    ///
+    /// `Arena::frag_profile` already computes that window; this is how it
+    /// reaches the selector. Pages in the range bypass the zero-garbage and
+    /// occupancy filters (a wholly-live page inside the window is precisely
+    /// what must move) and sort ahead of everything else, so the evacuation
+    /// budget cannot be spent before reaching them.
+    pub target_pages: Option<(u64, u64)>,
+
     /// Whether large (single-object) pages participate. **`false` by default.**
     ///
     /// A large page in ZGC holds exactly one object and is committed at that
@@ -1349,6 +1371,7 @@ impl Default for ZRelocationPolicy {
         Self {
             max_evacuation_bytes: ZFWD_DEFAULT_MAX_EVACUATION_BYTES,
             max_live_occupancy: ZFWD_DEFAULT_MAX_LIVE_OCCUPANCY,
+            target_pages: None,
             relocate_large_pages: false,
         }
     }
@@ -1365,6 +1388,19 @@ pub struct ZRelocationSet {
     /// being filtered on occupancy or size class). Feeds the "we are falling
     /// behind" heuristic a future controller will want.
     deferred_for_budget: usize,
+}
+
+/// Pages admitted to a relocation set because they fell in the window an
+/// allocation failure named — the ENGAGEMENT counter for targeted compaction.
+///
+/// A workload-level result is unreadable without it: "the OOM went away" and
+/// "no target was ever set" produce the same `compaction_cycles`.
+pub static TARGETED_PAGES_SELECTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read [`TARGETED_PAGES_SELECTED`].
+pub fn targeted_pages_selected() -> usize {
+    TARGETED_PAGES_SELECTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ZRelocationSet {
@@ -1403,6 +1439,13 @@ impl ZRelocationSet {
     /// is worth moving, so the right response is to raise the budget rather
     /// than to quietly evacuate everything except the page that matters.
     pub fn select(pages: &[PageCandidate], policy: &ZRelocationPolicy) -> ZRelocationSet {
+        // Does this page sit in the window the last allocation failure named?
+        let targeted = |p: &PageCandidate| -> bool {
+            policy
+                .target_pages
+                .is_some_and(|(lo, hi)| p.page_id >= lo && p.page_id <= hi)
+        };
+
         let mut eligible: Vec<PageCandidate> = Vec::new();
         for p in pages.iter() {
             if p.is_large() && !policy.relocate_large_pages {
@@ -1411,12 +1454,19 @@ impl ZRelocationSet {
             if p.capacity_bytes == 0 {
                 continue;
             }
-            if p.garbage_bytes() == 0 {
-                // Nothing to reclaim: pure copy cost.
-                continue;
-            }
-            if p.live_occupancy() >= policy.max_live_occupancy {
-                continue;
+            // A TARGETED page is admitted on both of the next two filters. Both
+            // ask "is this page worth evacuating for the bytes it reclaims",
+            // which is the wrong question for a page whose only job is to stop
+            // walling a contiguous window: reclaiming nothing while unblocking a
+            // 256 KiB request is the trade being made on purpose.
+            if !targeted(p) {
+                if p.garbage_bytes() == 0 {
+                    // Nothing to reclaim: pure copy cost.
+                    continue;
+                }
+                if p.live_occupancy() >= policy.max_live_occupancy {
+                    continue;
+                }
             }
             eligible.push(*p);
         }
@@ -1425,9 +1475,16 @@ impl ZRelocationSet {
         // tie-break. u128 keeps the cross-product exact for any plausible page
         // size (a 32 MiB page is 2^25, so the product is ~2^50).
         eligible.sort_by(|a, b| {
+            // Targeted pages first, ahead of the profitability ranking. The
+            // budget below is a PREFIX rule, so anything sorted after a full
+            // budget is silently dropped -- and the whole point of a target is
+            // that it must not be the thing dropped.
             let lhs = (a.garbage_bytes() as u128) * (b.capacity_bytes as u128);
             let rhs = (b.garbage_bytes() as u128) * (a.capacity_bytes as u128);
-            rhs.cmp(&lhs).then_with(|| a.page_id.cmp(&b.page_id))
+            targeted(b)
+                .cmp(&targeted(a))
+                .then_with(|| rhs.cmp(&lhs))
+                .then_with(|| a.page_id.cmp(&b.page_id))
         });
 
         let mut selected: Vec<PageCandidate> = Vec::new();
@@ -1437,6 +1494,9 @@ impl ZRelocationSet {
         let mut deferred: usize = 0;
 
         for p in eligible.iter() {
+            if targeted(p) {
+                TARGETED_PAGES_SELECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if live_total.saturating_add(p.live_bytes) > policy.max_evacuation_bytes {
                 // Prefix rule: stop here, count the rest as budget-deferred.
                 deferred = eligible.len() - selected.len();
@@ -2279,6 +2339,81 @@ mod tests {
             capacity_bytes: 2 * 1024 * 1024,
             size_class_index: ZFWD_SIZE_CLASS_SMALL,
         }
+    }
+
+    /// A page the profitability ranking REFUSES is evacuated anyway when an
+    /// allocation failure named its window.
+    ///
+    /// This is the whole feature. `select` sorts by garbage ratio and drops
+    /// anything at or above `max_live_occupancy`, which answers "reclaim the
+    /// most bytes per byte copied". A window can be 98.9 % free and still
+    /// refuse a request, and the pages walling it are dense by construction —
+    /// exactly what both filters throw away.
+    ///
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// `TestMVStoreTool` OOMs on a 262 160-byte request with 2 888 live bytes in
+    /// 49 runs standing between it and 266 104 contiguous bytes, in a cycle that
+    /// relocated 1 817 474 objects by this ranking and left those 34 objects.
+    #[test]
+    fn a_targeted_page_is_evacuated_even_though_the_ranking_refuses_it() {
+        let mb = 1024 * 1024;
+        // Page 7 is 90 % live: above `max_live_occupancy`, and the LAST thing
+        // the garbage ranking would pick.
+        let dense_wall = small(7, (mb * 9) / 10);
+        let pages = vec![small(1, mb / 8), dense_wall, small(3, mb / 4)];
+
+        let untargeted = ZRelocationPolicy {
+            max_evacuation_bytes: usize::MAX,
+            ..ZRelocationPolicy::default()
+        };
+        let set = ZRelocationSet::select(&pages, &untargeted);
+        assert!(
+            !set.contains(7),
+            "control: the ranking must refuse a 90%-live page, or this test \
+             proves nothing"
+        );
+
+        let targeted = ZRelocationPolicy {
+            max_evacuation_bytes: usize::MAX,
+            target_pages: Some((7, 7)),
+            ..ZRelocationPolicy::default()
+        };
+        let set = ZRelocationSet::select(&pages, &targeted);
+        assert!(
+            set.contains(7),
+            "a page in the window an allocation failure named must be evacuated \
+             even with nothing to reclaim — unblocking the request IS the benefit"
+        );
+        assert_eq!(
+            set.pages().first().map(|p| p.page_id),
+            Some(7),
+            "and it must sort FIRST: the evacuation budget is a prefix rule, so \
+             a target sorted after a full budget is silently dropped"
+        );
+    }
+
+    /// The target does not drag in the rest of the arena.
+    ///
+    /// A bias that admitted everything would "fix" the window by evacuating the
+    /// whole heap, which is not a trade anybody chose. Only pages inside the
+    /// named range get the exemption.
+    #[test]
+    fn targeting_one_window_does_not_admit_the_pages_around_it() {
+        let mb = 1024 * 1024;
+        let pages = vec![
+            small(5, (mb * 9) / 10), // dense, OUTSIDE the window
+            small(7, (mb * 9) / 10), // dense, inside
+            small(9, (mb * 9) / 10), // dense, OUTSIDE
+        ];
+        let policy = ZRelocationPolicy {
+            max_evacuation_bytes: usize::MAX,
+            target_pages: Some((7, 7)),
+            ..ZRelocationPolicy::default()
+        };
+        let set = ZRelocationSet::select(&pages, &policy);
+        assert!(set.contains(7), "the targeted page is in");
+        assert!(!set.contains(5), "page 5 is outside the window and stays out");
+        assert!(!set.contains(9), "page 9 is outside the window and stays out");
     }
 
     #[test]
