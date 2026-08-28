@@ -172,6 +172,13 @@ The CPU-time A/B on `CodecProbe` is the instrument to use when the host is busy:
 it separated "this change is neutral" (A 5.54/6.36/5.49 s user against B
 7.06/5.44/5.33, interleaved) from the 26 % the wall clock was showing.
 
+Contention does not merely blur these numbers, it **changes the verdict**.
+`LengthAwareLzfIntegrationTest` sits just under netty's 120 s per-method
+timeout, and one run taken while two other sessions were each holding a core at
+100 % reported `143 s ok=10 failed=1` — a PASS turned into a FAIL. Three repeats
+of the identical binary: 107 s `ok=11`, 115 s `ok=11`, 105 s `ok=11`. Check
+`uptime` and `ps aux --sort=-%cpu` before recording any row in the table below.
+
 | class | wall | |
 |---|---:|---|
 | `JdkZlibIntegrationTest` | 94 s | **PASSES** `ok=11 failed=0` |
