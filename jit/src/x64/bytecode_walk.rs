@@ -2513,42 +2513,113 @@ impl Compiler {
 
                 // dup_x2 — FORM-1 `[…, c, b, a] → […, a, c, b, a]` (all three
                 // category-1) vs FORM-2 `[…, w, a] → […, a, w, a]` (w is a
-                // category-2 long/double = ONE slot in this model). The form
-                // depends on the width of the values UNDER the top, which this
-                // model does not track — so restrict to the one shape that
-                // proves FORM-1 locally: the NEXT opcode is a category-1 array
-                // store, in which case the verifier guarantees the top three
-                // slots are [arrayref, index, cat1-value]. That is exactly
-                // javac's `++z[i]` / `--z[i]` value-producing pattern — BC's
-                // `Nat.inc`/`Nat.dec` DRBG block-counter helpers re-ran the
-                // whole compile pipeline 35,923× in one crypto-prng suite run
-                // bailing on this opcode. Any other shape stays interpreted.
+                // category-2 long/double = ONE slot in this model). The top is
+                // category-1 in BOTH forms; what decides the shape is the width
+                // of the entry BELOW it — two entries deep for FORM-2, three for
+                // FORM-1 — and that width is exactly what this backend's compact
+                // operand model does not carry.
+                //
+                // Two independent witnesses answer it, and either alone suffices:
+                //
+                //   * `stack_entry_categories` — the `x64::stack_kinds` forward
+                //     analysis, admitted only when its depth and per-entry
+                //     ref-ness agree with the emitter's own model and, for the
+                //     top entry, with `dup2_top_cat2`'s wholly independent
+                //     peephole. This is the same second-entry oracle `dup2_x2`
+                //     (0x5e) already uses, and it is what lifts the restriction
+                //     this arm used to carry.
+                //   * the NEXT opcode is a category-1 array store — then the
+                //     verifier guarantees the top three slots are
+                //     `[arrayref, index, cat1-value]`, i.e. FORM-1. Kept as the
+                //     fallback for methods whose kind analysis poisons: it is
+                //     javac's `++z[i]` / `--z[i]` value-producing pattern, which
+                //     is BC's `Nat.inc`/`Nat.dec` DRBG block-counter helpers
+                //     re-running the whole compile pipeline 35 923× in one
+                //     crypto-prng suite run.
+                //
+                // What the analysis adds over the peephole is the POST-increment
+                // idiom `z[i]++` / `arr[n[0]++] = v`, where the `dup_x2` is
+                // followed by `iconst_1; iadd; iastore` rather than by the store
+                // itself. That is the shape that kept
+                // `HibfixComposeProbe2.chain` `ineligible-by-policy` at pc=15 —
+                // see
+                // `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
                 0x5b => {
-                    let next_is_cat1_astore = pc + 1 < code_len
-                        && matches!(code[pc + 1], 0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56);
-                    if dupx_codegen_disabled()
-                        || dup_x2_codegen_disabled()
-                        || !next_is_cat1_astore
-                        || self.stack.len() < 3
-                    {
-                        // Unprovable form (or malformed height) — stay
-                        // interpreted; placeholder keeps the model height
-                        // plausible until the post-loop `failed` check.
-                        self.fail("singlepass-codegen/dup_x2-unprovable-form");
-                        let _ = self.push_stack();
-                    } else {
-                        let a_slot = self.peek_stack();
-                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
-                        self.load_slot_to_reg(RAX, a_slot);
-                        self.push_from_rax(); // […, c, b, a, aC]
-                        if a_oop {
-                            self.mark_top_as_oop();
+                    let cats = self.stack_entry_categories(pc);
+                    let peephole_top = self.dup2_top_cat2(code, pc);
+                    // Insertion depth in MODEL entries, or `None` for a form
+                    // this compile cannot prove.
+                    let depth = cats
+                        .as_ref()
+                        .and_then(|cats| {
+                            let n = cats.len();
+                            let top = (*cats.get(n.checked_sub(1)?)?)?;
+                            // Third opinion: when the peephole answers for the
+                            // top it must agree. A disagreement means one of two
+                            // independent analyses is wrong; use neither.
+                            if matches!(peephole_top, Some(p) if p != top) {
+                                return None;
+                            }
+                            if top {
+                                // No legal `dup_x2` form has a category-2 top.
+                                return None;
+                            }
+                            let second = (*cats.get(n.checked_sub(2)?)?)?;
+                            if second {
+                                Some(2usize) // FORM-2
+                            } else {
+                                // FORM-1 additionally requires v3 category-1.
+                                let third = (*cats.get(n.checked_sub(3)?)?)?;
+                                if third {
+                                    None
+                                } else {
+                                    Some(3usize)
+                                }
+                            }
+                        })
+                        .or_else(|| {
+                            let next_is_cat1_astore = pc + 1 < code_len
+                                && matches!(code[pc + 1], 0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56);
+                            next_is_cat1_astore.then_some(3usize)
+                        });
+                    let disabled = dupx_codegen_disabled() || dup_x2_codegen_disabled();
+                    match depth {
+                        Some(depth) if !disabled && self.stack.len() >= depth => {
+                            let a_slot = self.peek_stack();
+                            let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+                            let before = self.stack.len();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.push_from_rax(); // […, c, b, a, aC]
+                            // `push_from_rax` is SILENT when it cannot reserve a
+                            // spill slot: it emits nothing and does NOT grow the
+                            // model, and the rotate below would then reorder the
+                            // WRONG entries and leave the operand stack one
+                            // short — silent wrong code rather than a bail. The
+                            // same guard has been in `dup_x1`/`dup2_x1`/
+                            // `dup2_x2` since they were written; this arm was
+                            // the one missing it.
+                            if self.stack.len() != before + 1 {
+                                self.fail("singlepass-codegen/dup_x2-copy-not-pushed");
+                                pc += 1;
+                                continue;
+                            }
+                            if a_oop {
+                                self.mark_top_as_oop();
+                            }
+                            let n = self.stack.len();
+                            let window = depth + 1;
+                            self.stack[n - window..].rotate_right(1); // […, aC, c, b, a]
+                            self.stack_oop_marks[n - window..].rotate_right(1);
+                            if dupx_eager_canon() {
+                                self.canonicalize_stack();
+                            }
                         }
-                        let n = self.stack.len();
-                        self.stack[n - 4..].rotate_right(1); // […, aC, c, b, a]
-                        self.stack_oop_marks[n - 4..].rotate_right(1);
-                        if dupx_eager_canon() {
-                            self.canonicalize_stack();
+                        _ => {
+                            // Unprovable form (or the kill switch) — stay
+                            // interpreted; placeholder keeps the model height
+                            // plausible until the post-loop `failed` check.
+                            self.fail("singlepass-codegen/dup_x2-unprovable-form");
+                            let _ = self.push_stack();
                         }
                     }
                     pc += 1;
@@ -2624,56 +2695,109 @@ impl Compiler {
                 // ONE entry in this value model, b category-1) vs FORM-1
                 // `[…, c, b, a] → […, b, a, c, b, a]` (all three category-1).
                 //
-                // Only FORM-2 is admitted, and proving it needs just the top's
-                // width: a VERIFIED `dup2_x1` whose top is category-2 cannot be
-                // FORM-1 (that form is all category-1), and JVMS requires its
-                // value2 to be category-1 — a category-2 second operand would
-                // have had to be `dup2_x2`. So `dup2_top_cat2` answering `true`
-                // settles the shape on its own.
+                // Both are lowered now, and each has its own witness:
                 //
-                // In this model FORM-2 is then structurally identical to
-                // `dup_x1` above: push a copy of the top, rotate the top three
-                // entries right by one. FORM-1 needs a different rotate over
-                // five entries and has no witness here, so it stays interpreted
-                // — same conservatism as `dup_x2`.
+                //   * FORM-2 needs only the TOP's width. A VERIFIED `dup2_x1`
+                //     whose top is category-2 cannot be FORM-1 (that form is all
+                //     category-1), and JVMS requires its value2 to be
+                //     category-1 — a category-2 second operand would have had to
+                //     be `dup2_x2`. So `dup2_top_cat2` answering `true` settles
+                //     the shape on its own, and that peephole is kept as the
+                //     fallback for methods whose kind analysis poisons.
+                //   * FORM-1 duplicates TWO entries and so needs the widths of
+                //     the three entries under the dup — `stack_entry_categories`
+                //     (the `x64::stack_kinds` forward analysis, cross-checked
+                //     against the emitter's depth, its per-entry oop marks and
+                //     the peephole's opinion of the top). Same oracle, same
+                //     admission rules, as `dup_x2` and `dup2_x2`.
                 //
-                // What this unsticks: javac emits `dup2_x1` for
+                // What FORM-2 unsticks: javac emits `dup2_x1` for
                 // `return this.field = value;` on a long/double field, which is
                 // every synthetic outer-class setter of a `double` field.
                 // commons-math's `PSquarePercentile$Marker.access$502` is one,
-                // reached from the P-square min/max update path.
+                // reached from the P-square min/max update path. FORM-1 is the
+                // same statement over a category-1 field, and the `map[k] = v`
+                // shapes that leave `[map, key, value]` on the stack.
                 0x5d => {
-                    let top_cat2 = self.dup2_top_cat2(code, pc);
-                    if dupx_codegen_disabled()
-                        || dup_x1_codegen_disabled()
-                        || top_cat2 != Some(true)
-                        || self.stack.len() < 2
-                    {
-                        self.fail("singlepass-codegen/dup2_x1-unprovable-form");
-                        let _ = self.push_stack();
-                    } else {
-                        let a_slot = self.peek_stack();
-                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
-                        let before = self.stack.len();
-                        self.load_slot_to_reg(RAX, a_slot);
-                        self.push_from_rax(); // […, b, a, aC]
-                        // `push_from_rax` is silent when it cannot reserve a
-                        // spill slot — it emits nothing and does not grow the
-                        // model, and the rotate below would then reorder the
-                        // WRONG three entries. See the same guard in `dup_x1`.
-                        if self.stack.len() != before + 1 {
-                            self.fail("singlepass-codegen/dup2_x1-copy-not-pushed");
-                            pc += 1;
-                            continue;
+                    let cats = self.stack_entry_categories(pc);
+                    let peephole_top = self.dup2_top_cat2(code, pc);
+                    // (entries duplicated, insertion depth in entries).
+                    let shape = cats
+                        .as_ref()
+                        .and_then(|cats| {
+                            let n = cats.len();
+                            let top = (*cats.get(n.checked_sub(1)?)?)?;
+                            // Third opinion, as in `dup_x2`/`dup2_x2`.
+                            if matches!(peephole_top, Some(p) if p != top) {
+                                return None;
+                            }
+                            let second = (*cats.get(n.checked_sub(2)?)?)?;
+                            if top {
+                                // FORM-2 — JVMS requires value2 category-1.
+                                if second {
+                                    None
+                                } else {
+                                    Some((1usize, 2usize))
+                                }
+                            } else {
+                                // FORM-1 — all three category-1.
+                                if second {
+                                    return None;
+                                }
+                                let third = (*cats.get(n.checked_sub(3)?)?)?;
+                                if third {
+                                    None
+                                } else {
+                                    Some((2usize, 3usize))
+                                }
+                            }
+                        })
+                        .or_else(|| {
+                            (peephole_top == Some(true) && self.stack.len() >= 2)
+                                .then_some((1usize, 2usize))
+                        });
+                    let disabled = dupx_codegen_disabled() || dup_x1_codegen_disabled();
+                    match shape {
+                        Some((dup_entries, depth)) if !disabled && self.stack.len() >= depth => {
+                            // Same emit as `dup2_x2`: materialize the copies into
+                            // fresh frame slots deepest-first so the pushed group
+                            // ends up in operand order, then rotate the top
+                            // `depth + dup_entries` MODEL entries right by
+                            // `dup_entries` to slide the copies underneath.
+                            let n0 = self.stack.len();
+                            let mut ok = true;
+                            for k in (0..dup_entries).rev() {
+                                let src = self.stack[n0 - 1 - k];
+                                let src_oop = self.stack_oop_marks[n0 - 1 - k];
+                                let before = self.stack.len();
+                                self.load_slot_to_reg(RAX, src);
+                                self.push_from_rax();
+                                // `push_from_rax` is SILENT when it cannot
+                                // reserve a spill slot — it emits nothing and
+                                // does not grow the model, and the rotate below
+                                // would then reorder the wrong entries.
+                                if self.stack.len() != before + 1 {
+                                    self.fail("singlepass-codegen/dup2_x1-copy-not-pushed");
+                                    ok = false;
+                                    break;
+                                }
+                                if src_oop {
+                                    self.mark_top_as_oop();
+                                }
+                            }
+                            if ok {
+                                let n = self.stack.len();
+                                let window = depth + dup_entries;
+                                self.stack[n - window..].rotate_right(dup_entries);
+                                self.stack_oop_marks[n - window..].rotate_right(dup_entries);
+                                if dupx_eager_canon() {
+                                    self.canonicalize_stack();
+                                }
+                            }
                         }
-                        if a_oop {
-                            self.mark_top_as_oop();
-                        }
-                        let n = self.stack.len();
-                        self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
-                        self.stack_oop_marks[n - 3..].rotate_right(1);
-                        if dupx_eager_canon() {
-                            self.canonicalize_stack();
+                        _ => {
+                            self.fail("singlepass-codegen/dup2_x1-unprovable-form");
+                            let _ = self.push_stack();
                         }
                     }
                     pc += 1;

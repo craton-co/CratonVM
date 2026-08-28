@@ -618,8 +618,8 @@ Profiling that clean run:
 `VarHandle` operations on a reference field, **uncontended** here because each
 thread owns its futures.
 
-That led to
-[`../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`](../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md):
+That led to `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
+(FIXED and retired to the internal tree on 2026-08-27):
 
 | operation | HotSpot | CratonVM | ratio |
 |---|---:|---:|---:|
@@ -667,9 +667,17 @@ which is the method to keep: reproduce the exact shape, run it hot, count.
 The rate drifts between 0% and 25% with no code change, so size arms by §5.3
 and **discard any arm whose control did not fail**.
 
-1. **Fix the `VarHandle` funnel** — `../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`. It is
-   deterministic, needs no failing run, and is 872x on composition. Everything
-   else on this list is downstream of it.
+1. **DONE (2026-08-27), and it was not the `VarHandle` funnel.** The funnel
+   was fixed — `set` bound, the global mutex removed, the CAS served in-funnel,
+   the volatile stripe pool unpacked from a single cache line — and composition
+   barely moved. What the 872x actually was: `UniCompose.tryFire` and
+   `UniRelay.tryFire` force-interpreted by a stale `ForkJoinTask`-subclass
+   blocklist, plus a `dup_x2` shape the single-pass backend could not prove.
+   Composition is **3.95x** faster and the gap is 446x -> 113x. See
+   `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
+   and `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
+   The residual is
+   [`../perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md).
 2. **Test the variance hypothesis of §5.9 directly.** It predicts that
    anything reducing JIT timing variance reduces the failure, while anything
    reducing mean speed does not. `CRATONVM_BG_COMPILE=0` (synchronous

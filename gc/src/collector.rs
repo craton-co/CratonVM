@@ -33,16 +33,49 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 // exclusion without storing the data inside the lock.
 //
 // Stripe count is a power of two so the index modulo is a single AND. 64 is
-// a balance between false-sharing (a too-small pool serializes unrelated
-// fields) and memory (64 × ~5 bytes is negligible).
+// a balance between stripe COLLISION (a too-small pool serializes unrelated
+// fields) and memory.
 const VOLATILE_STRIPE_COUNT: usize = 64;
 
-static VOLATILE_STRIPES: std::sync::OnceLock<[parking_lot::Mutex<()>; VOLATILE_STRIPE_COUNT]> =
+/// One stripe, on a cache line of its own.
+///
+/// # Why the padding is load-bearing
+///
+/// `parking_lot::Mutex<()>` is ONE BYTE — its `RawMutex` is an `AtomicU8` and
+/// the `()` payload is zero-sized. So `[parking_lot::Mutex<()>; 64]`, which is
+/// what this pool used to be, occupied exactly 64 bytes: **one cache line, for
+/// every stripe of every object of every field**. Striping by
+/// `(obj_ref, index)` removed the LOGICAL contention (two threads rarely pick
+/// the same stripe) and left the HARDWARE contention completely untouched: a
+/// `lock()`/`unlock()` pair is two atomic read-modify-writes, each of which
+/// takes that single line exclusive, so N threads storing to N different
+/// volatile fields of N different objects still serialised on the coherence
+/// protocol exactly as if the pool had one stripe.
+///
+/// That is what `HibfixVarHandleScale` measured, and it is why removing the
+/// `vh_meta_table` convoy in 2026-08-24 made the curve FLAT rather than
+/// scaling: with each thread owning its own object and its own field, there
+/// was no contention left on the data, no contention left on the metadata, and
+/// throughput still did not rise past 4 threads. The comment that used to sit
+/// here reasoned about "false-sharing" meaning stripe collision, and put the
+/// pool's whole size at "64 × ~5 bytes is negligible" — which is precisely
+/// the property that made every stripe share one line.
+///
+/// 128 rather than 64 because x86-64's adjacent-cache-line prefetcher pulls
+/// lines in pairs, so a 64-byte stride still lets two stripes travel together.
+/// The whole pool is 8 KiB.
+///
+/// See `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
+#[repr(align(128))]
+struct VolatileStripe(parking_lot::Mutex<()>);
+
+static VOLATILE_STRIPES: std::sync::OnceLock<[VolatileStripe; VOLATILE_STRIPE_COUNT]> =
     std::sync::OnceLock::new();
 
 #[inline]
-fn volatile_stripes() -> &'static [parking_lot::Mutex<()>; VOLATILE_STRIPE_COUNT] {
-    VOLATILE_STRIPES.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(())))
+fn volatile_stripes() -> &'static [VolatileStripe; VOLATILE_STRIPE_COUNT] {
+    VOLATILE_STRIPES
+        .get_or_init(|| std::array::from_fn(|_| VolatileStripe(parking_lot::Mutex::new(()))))
 }
 
 /// Acquire the stripe lock guarding volatile reads/writes for the given
@@ -63,7 +96,7 @@ pub fn volatile_stripe_lock(
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(index);
     let stripe = mixed & (VOLATILE_STRIPE_COUNT - 1);
-    volatile_stripes()[stripe].lock()
+    volatile_stripes()[stripe].0.lock()
 }
 
 /// Resolves the identity hash of an object whose mark word is no longer
@@ -888,5 +921,39 @@ mod coercion_provenance_tests {
         let u = crate::heap::FieldCoercionSite::UNATTRIBUTED;
         assert_eq!(u.kind.name(), "unattributed");
         assert!(u.class_id.is_none() && u.index.is_none());
+    }
+
+    /// The volatile stripe pool must occupy one cache line PER STRIPE, not one
+    /// cache line in TOTAL.
+    ///
+    /// This asserts both halves, because either alone is satisfiable by the
+    /// bug: the second assertion is the fix, and the first is the reason the
+    /// fix was needed and the thing that would make a future "simplification"
+    /// back to a bare `[Mutex<()>; N]` look harmless. A `parking_lot::Mutex<()>`
+    /// is one byte, so an unpadded 64-entry pool is 64 bytes — every stripe on
+    /// one line, and every `lock()` an atomic RMW that takes that line
+    /// exclusive from every other thread.
+    #[test]
+    fn volatile_stripes_do_not_share_a_cache_line() {
+        assert!(
+            std::mem::size_of::<parking_lot::Mutex<()>>() <= 8,
+            "a bare `Mutex<()>` is {} bytes — that is WHY the pool is padded",
+            std::mem::size_of::<parking_lot::Mutex<()>>(),
+        );
+        assert_eq!(
+            std::mem::align_of::<VolatileStripe>(),
+            128,
+            "each volatile stripe must start on its own 128-byte boundary",
+        );
+        assert_eq!(
+            std::mem::size_of::<VolatileStripe>(),
+            128,
+            "each volatile stripe must OCCUPY 128 bytes, not merely start on a 128-byte boundary",
+        );
+        // And the pool as a whole: 64 stripes that genuinely do not overlap.
+        assert_eq!(
+            std::mem::size_of::<[VolatileStripe; VOLATILE_STRIPE_COUNT]>(),
+            128 * VOLATILE_STRIPE_COUNT,
+        );
     }
 }

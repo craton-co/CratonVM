@@ -134,6 +134,99 @@ public class RJdkForkJoin {
         }
     }
 
+    /**
+     * The DEEP divide-and-conquer shape, kept separate from {@link SumTask}
+     * because the depth is the point.
+     *
+     * {@code SumTask} splits 20 000 elements at a threshold of 64, i.e.
+     * recursion depth ~log2(20000/64) ~= 9. RFJP.1 -- the JIT miscompile that
+     * made every {@code ForkJoinTask} subclass force-interpreted for a year --
+     * was recorded as appearing "once the recursion depth is ~10+", so that
+     * vector sat just BELOW the failing depth and its pass proved nothing about
+     * it. A threshold of 2 over 65 536 elements forces depth 15.
+     *
+     * Two properties are deliberate and must not be "simplified":
+     *
+     *   * the return type is {@code Long}, so every recursive return BOXES and
+     *     every use UNBOXES -- RFJP.1 was root-caused to a {@code Long.valueOf}
+     *     boxing miscompile, not to regalloc as its first diagnosis claimed;
+     *   * {@code r} is a {@code long} local held live ACROSS the recursive
+     *     {@code right.compute()} call, which is the operand-stack shape the
+     *     original note describes.
+     *
+     * See `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
+     */
+    static final class DeepSumTask extends RecursiveTask<Long> {
+        private static final long serialVersionUID = 1L;
+        final long[] a;
+        final int lo;
+        final int hi;
+        final int depth;
+
+        DeepSumTask(long[] a, int lo, int hi, int depth) {
+            this.a = a;
+            this.lo = lo;
+            this.hi = hi;
+            this.depth = depth;
+        }
+
+        @Override
+        protected Long compute() {
+            if (depth > MAX_DEPTH.get()) {
+                MAX_DEPTH.accumulateAndGet(depth, Math::max);
+            }
+            if (hi - lo <= 2) {
+                long s = 0;
+                for (int i = lo; i < hi; i++) {
+                    s += a[i];
+                }
+                return s;
+            }
+            int mid = (lo + hi) >>> 1;
+            DeepSumTask left = new DeepSumTask(a, lo, mid, depth + 1);
+            left.fork();
+            DeepSumTask right = new DeepSumTask(a, mid, hi, depth + 1);
+            long r = right.compute();
+            return left.join() + r;
+        }
+    }
+
+    static final AtomicInteger MAX_DEPTH = new AtomicInteger();
+
+    /**
+     * Deep recursion, run enough times that the JIT compiles {@code compute()}
+     * and the answer is produced by COMPILED code rather than by the
+     * interpreter.
+     *
+     * The rounds are not decoration. A single invoke can finish before the
+     * invocation counter crosses the C1 threshold, and a green run in which
+     * {@code compute()} was never compiled says nothing about a JIT defect.
+     * The depth assertion is the other half: without it a mistyped threshold
+     * turns this into a shallow tree that still sums correctly.
+     */
+    static void deepRecursion() {
+        int n = 65536;
+        long[] data = new long[n];
+        long expected = 0;
+        for (int i = 0; i < n; i++) {
+            data[i] = i;
+            expected += i;
+        }
+        ForkJoinPool pool = new ForkJoinPool(4);
+        try {
+            for (int round = 0; round < 3; round++) {
+                long got = pool.invoke(new DeepSumTask(data, 0, n, 0));
+                check(got == expected,
+                        "deep RecursiveTask sum round " + round + ": " + got + " != " + expected);
+            }
+            check(MAX_DEPTH.get() >= 14,
+                    "deep tree must recurse past the RFJP.1 depth; got " + MAX_DEPTH.get());
+            System.out.println("CK RJdkForkJoin deepSum=" + expected + " depth=" + MAX_DEPTH.get());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
     /** A CountedCompleter: completion propagates up the tree exactly once. */
     static final class Counter extends CountedCompleter<Void> {
         private static final long serialVersionUID = 1L;
@@ -441,6 +534,7 @@ public class RJdkForkJoin {
 
     public static void main(String[] args) throws Exception {
         recursiveTasks();
+        deepRecursion();
         countedCompleter();
         parallelStreams();
         workerException();

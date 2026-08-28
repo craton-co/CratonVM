@@ -1195,7 +1195,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_FIELD_SITE_CACHE` | JIT | `CRATONVM_JIT=field-site-cache` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FIELD_SITE_CACHE_LOADER` | JIT | `CRATONVM_JIT=field-site-cache-loader` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FIELD_SITE_SLOTS` | JIT | `CRATONVM_JIT=field-site-slots` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST` | JIT | `CRATONVM_JIT=fjp-subclass-blocklist` | default-on | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST` | JIT | `CRATONVM_JIT=fjp-subclass-blocklist` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FORCE_C2` | JIT | `CRATONVM_JIT=force-c2` | opt-in | off | behaviour | snapshot | difftest, jit |
 | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` | JIT | `CRATONVM_JIT=full-self-call-spill` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GATE_PASS_MEMO` | JIT | `CRATONVM_JIT=gate-pass-memo` | default-on | on | behaviour | snapshot | vm |
