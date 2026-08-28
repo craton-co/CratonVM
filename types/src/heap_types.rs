@@ -659,6 +659,47 @@ pub enum ArrayElementType {
     Reference = 0,
 }
 
+/// The `KIND_TAGS_BYTE_OFFSET` byte that a receiver has **iff** it is exactly
+/// the one-dimensional primitive array `descriptor` names — or `None` when
+/// `descriptor` is not such a type.
+///
+/// `[B` and its seven siblings are the one array shape a JIT `checkcast` can
+/// settle without asking anything else, and the reason is that a class-id
+/// compare CANNOT settle it: a primitive array carries `class_id == 0` (it has
+/// no class entry at all), and a reference array carries its COMPONENT's id, so
+/// neither answers "is this a `byte[]`". The header's own kind/element tags do,
+/// exactly, in one byte: `kind` is bits 0..1 and `element_type` bits 2..5 of
+/// this byte (`KIND_SHIFT` / `ELEM_SHIFT`), and bits 6..7 are reserved zero, so
+/// the whole byte is a single comparable constant.
+///
+/// One dimension only, and that is what makes it sound rather than nearly
+/// sound: `byte[][]` holds REFERENCES to `byte[]` objects, so its element type
+/// is `Reference`, not `Byte`. A two-character descriptor is therefore the
+/// exact predicate — `[B` matches only a real `byte[]`, and `[[B` has no answer
+/// here and keeps the helper.
+///
+/// Lives here rather than in the JIT because it is a statement about the header
+/// layout, and the layout is what would silently invalidate it.
+#[inline]
+pub fn primitive_array_kind_tags_byte(descriptor: &str) -> Option<u8> {
+    let b = descriptor.as_bytes();
+    if b.len() != 2 || b[0] != b'[' {
+        return None;
+    }
+    let elem = match b[1] {
+        b'Z' => ArrayElementType::Boolean,
+        b'C' => ArrayElementType::Char,
+        b'F' => ArrayElementType::Float,
+        b'D' => ArrayElementType::Double,
+        b'B' => ArrayElementType::Byte,
+        b'S' => ArrayElementType::Short,
+        b'I' => ArrayElementType::Int,
+        b'J' => ArrayElementType::Long,
+        _ => return None,
+    } as u8;
+    Some((ObjectKind::Array as u8) | (elem << 2))
+}
+
 #[inline]
 pub fn object_kind_from_tag(tag: u8) -> Option<ObjectKind> {
     match tag {
