@@ -6,10 +6,11 @@
 now PASS outright, four more COMPLETE inside the cap and fail only netty's own
 120 s per-method timeout, and four are still over.
 
-Three defects have been found and fixed. What is left is NOT a fourth defect,
-and this revision replaces the previous "the accessor chain is the ceiling"
-sentence — which was a hypothesis — with a measurement of it, plus the price of
-every lever that could move it.
+FOUR defects have been found and fixed — the fourth, `checkcast`, was named on
+this page as a priced lever before it was one. What is left after it is not a
+fifth: this page now carries a MEASUREMENT of the ceiling rather than the
+description of it that earlier revisions carried, plus the price of every
+remaining lever, and none of them closes a class.
 
 ## What the eleven share
 
