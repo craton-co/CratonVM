@@ -10002,6 +10002,14 @@ pub(crate) fn lower_inner_with_scopes(
             slot_plan.slots,
             slot_plan.peak_live,
         );
+        for (id, colour) in slot_plan.node_color.iter().enumerate() {
+            if let Some(c) = colour {
+                eprintln!(
+                    "[ir-slots]   node {id:3} -> colour {c} class={:?}",
+                    slot_plan.class.get(id).copied().flatten(),
+                );
+            }
+        }
     }
 
     // ── Every emitted value has a location, decided before emission ──

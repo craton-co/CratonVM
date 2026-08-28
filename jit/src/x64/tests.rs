@@ -13234,7 +13234,12 @@ fn interning_reaches_nested_bodies_too() {
 
     let mut strings: Vec<Box<str>> = Vec::new();
     let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
-    let mut direct_entries: Vec<usize> = Vec::new();
+    // `(entry, epoch)`: the pin gained an epoch when a baked direct call turned
+    // out to be pinned by ADDRESS alone and the address had changed hands
+    // (b56bb79b9). This call site was not updated with it, which left the whole
+    // `cratonvm-jit` lib test binary failing to COMPILE on dev — so every test
+    // in it, not just this one, was silently unrunnable.
+    let mut direct_entries: Vec<(usize, u64)> = Vec::new();
     crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
 
     assert_eq!(outer.resolved_invoke_infos.len(), 1);
@@ -13261,8 +13266,11 @@ fn interning_reaches_nested_bodies_too() {
     // way to find this caller. The outer target carries one bind, the nested
     // one carries none, so exactly one address must come out — and it must be
     // the one that was bound, not a placeholder.
+    // The ADDRESS is what this test is about; the epoch beside it is whatever
+    // `jit_entry_artifact_id` answers for a fabricated address, which is not
+    // this test's business. Assert the addresses.
     assert_eq!(
-        direct_entries,
+        direct_entries.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
         vec![0xfeed_0000],
         "every baked direct-call entry must be registered for keep-alive",
     );
