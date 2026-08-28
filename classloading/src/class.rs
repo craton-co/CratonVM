@@ -2167,6 +2167,50 @@ pub fn find_method_recursive<'a>(
 /// start) for `<init>`, for interface references, or whenever the redirect
 /// condition does not hold — i.e. it is always safe to feed the result
 /// straight into [`find_method_recursive`] in place of `cp_class_id`.
+/// JVMS §5.4.6 `invokevirtual` — does this site name a **private** method?
+///
+/// The `invokevirtual` counterpart of [`invokespecial_selection_start`], and
+/// here for the same reason: resolving the constant-pool entry is not the
+/// same as selecting the method to invoke, and the difference is a rule of
+/// the spec rather than a policy of any one caller.
+///
+/// JVMS §5.4.6 selects a private method as the one the constant pool
+/// resolved, with **no override lookup at all**. javac has emitted
+/// `invokevirtual` for a call to a private instance method since Java 11
+/// (JEP 181 nestmates), where it used to emit `invokespecial` — the opcode
+/// changed, the semantics did not. Every compiled dispatcher resolves an
+/// ordinary `invokevirtual` by walking up from the RECEIVER's class, so on
+/// such a site it finds the most-derived same-named private method and calls
+/// THAT. The shape is ordinary — a class whose constructor calls its own
+/// `private void init()`, subclassed by a class that does the same — and
+/// `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+/// `HttpClientOptions` are three such levels in one chain.
+///
+/// Returns the **declaring class** of the resolved method when the site
+/// names a private one, and `None` otherwise (not private, or not
+/// resolvable). A `Some` means the site must be classified as a direct,
+/// non-dispatching bind rather than as virtual dispatch. No class-name
+/// substitution is needed on top: JVM access control makes a private method
+/// invocable only from the class that declares it, so the constant pool's
+/// owner already IS the declaring class.
+///
+/// Had four copies until 2026-08-28 — one per compile door plus the
+/// interpreter's own — which is what the resolve guard's bypass budget
+/// noticed. One rule, one implementation, in the module that owns selection.
+pub fn invokevirtual_private_declaring_class(
+    cp_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    store: &ClassStore,
+) -> Option<ClassId> {
+    let (method, declaring_id) =
+        find_method_recursive(cp_class_id, method_name, method_descriptor, store)?;
+    method
+        .access_flags
+        .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PRIVATE)
+        .then_some(declaring_id)
+}
+
 pub fn invokespecial_selection_start(
     caller_class_id: ClassId,
     cp_class_id: ClassId,
