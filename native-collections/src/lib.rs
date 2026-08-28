@@ -11734,6 +11734,40 @@ fn map_init_capacity_inner(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // ARGUMENT VALIDATION, which this constructor had none of.
+    //
+    // MEASURED against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/HashMapShadowSweep.java`):
+    //
+    //   new HashMap<>(-1)          HotSpot IllegalArgumentException  CratonVM no-throw
+    //   new HashMap<>(16, -1f)     HotSpot IllegalArgumentException  CratonVM no-throw
+    //   new HashMap<>(16, NaN)     HotSpot IllegalArgumentException  CratonVM no-throw
+    //
+    // The JDK's own body is three guards before it does anything else:
+    // `initialCapacity < 0`, then `loadFactor <= 0 || Float.isNaN(loadFactor)`.
+    // Both messages name the offending value, which is the whole reason a
+    // caller with a computed capacity can find the bug.
+    //
+    // NaN is the one that has to be spelled out rather than folded into the
+    // `<= 0` test: every comparison against NaN is false, so `NaN <= 0` does
+    // NOT catch it, and a NaN load factor silently produces a threshold of NaN
+    // and a table that never resizes.
+    if let Some(Value::Int(c)) = args.get(1) {
+        if *c < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Illegal initial capacity: {c}"),
+            }
+            .into());
+        }
+    }
+    if let Some(Value::Float(f)) = args.get(2) {
+        if *f <= 0.0 || f.is_nan() {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Illegal load factor: {f}"),
+            }
+            .into());
+        }
+    }
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
             // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
@@ -21949,11 +21983,28 @@ where
     Ok(())
 }
 
+/// `Arrays.fill(int[], int)`.
+///
+/// **This is the registration that OWNS the slot.** `native-builtins`'
+/// `phases_early.rs` registers the same triple and loses; the registry dump
+/// says so (`owns_slot`), and a fix applied only there is inert. Checked with
+/// `--dump-native-registry` after exactly that mistake:
+///
+/// ```text
+/// fill ([II)V   kind=bridge inv=1 owns=True by=native-collections/src/lib.rs:20914
+/// ```
 fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(None),
+    // A null array is a NullPointerException, not a silent no-op. MEASURED
+    // against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/ArraysHashSetShadowSweep.java`): HotSpot NPE, this VM `no-throw`.
+    // The JDK reaches it by dereferencing `a.length` on the first loop guard.
+    let Some(Value::Object(Some(arr))) = args.first() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Arrays.fill: array is null".to_string()),
+        }
+        .into());
     };
+    let arr = *arr;
     let val = args.get(1).copied().unwrap_or(Value::Int(0));
     let len = ctx.array_length(arr);
     for i in 0..len {
@@ -21962,12 +22013,52 @@ fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(None)
 }
 
+/// `Arrays.fill(Object[], Object)` — null-checked AND store-checked.
+///
+/// Same slot ownership note as [`native_arrays_fill_int`].
+///
+/// The store check is the one that matters. `Arrays.fill(Object[], Object)` is
+/// an ordinary covariant array store per element, so filling a `String[]` with
+/// an `Integer` is an `ArrayStoreException` — and `set_array_element` does not
+/// check. MEASURED in BOTH modes, and the result is not merely a missing
+/// exception:
+///
+/// ```text
+/// String[] t = new String[2];
+/// Arrays.fill((Object[]) t, Integer.valueOf(1));
+///   HotSpot   ArrayStoreException
+///   CratonVM  no-throw, and Arrays.toString(t) is [1, 1]
+/// ```
+///
+/// A `String[]` whose contents are `Integer`s is an object that contradicts its
+/// own type. Every later reader — a cast, a `checkcast` the JIT elides on the
+/// strength of the array's type, a serializer — is entitled to assume it cannot
+/// exist. This is the same hole the roadmap tracked as P3-A for the `aastore`
+/// opcode, reached through a library method instead.
 fn native_arrays_fill_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(None),
+    let Some(Value::Object(Some(arr))) = args.first() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Arrays.fill: array is null".to_string()),
+        }
+        .into());
     };
+    let arr = *arr;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
+    // A null value stores into any reference array, and a component type of
+    // `java/lang/Object` accepts everything; both short-circuit.
+    if let Value::Object(Some(v)) = val {
+        let comp = ctx.class_id_of_object(arr);
+        let actual = ctx.class_id_of_object(v);
+        if actual != comp
+            && !ctx.is_subclass(actual, comp)
+            && ctx.class_name_of_id(comp).as_deref() != Some("java/lang/Object")
+        {
+            return Err(RuntimeError::ArrayStoreException {
+                message: ctx.class_name_of_id(actual).unwrap_or_default(),
+            }
+            .into());
+        }
+    }
     let len = ctx.array_length(arr);
     for i in 0..len {
         ctx.set_array_element(arr, i, val);
@@ -23646,6 +23737,30 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
 
     // Key absent — call function.apply(key).
+    //
+    // MOD-COUNT SNAPSHOT across the callback. `HashMap.computeIfAbsent` is
+    // specified to throw `ConcurrentModificationException` if the mapping
+    // function modifies THIS map, and the JDK enforces it by comparing
+    // `modCount` either side of the call. MEASURED in both modes
+    // (`probes/HashMapShadowSweep.java`):
+    //
+    //   cme.computeIfAbsent("y", x -> { cme.put("z", 9); return 2; })
+    //     HotSpot   ConcurrentModificationException
+    //     CratonVM  no-throw
+    //
+    // Why it is not merely a missing exception: the native decided the key was
+    // absent BEFORE calling the mapper, and then writes its result afterwards.
+    // If the mapper resized or rewrote the table in between, that write lands
+    // against a decision taken on a table that no longer exists. The CME is
+    // what stops a caller from silently corrupting its own map, and it is the
+    // reason the JDK's own body re-checks rather than trusting the earlier
+    // lookup.
+    //
+    // The real `modCount` is used rather than a size comparison: an add paired
+    // with a remove leaves the size unchanged and is still a structural
+    // modification. `read_map_mod_count` answers `None` for a receiver with no
+    // real-JDK layout slot, and the check is then skipped rather than guessed.
+    let mod_before = read_map_mod_count(&*ctx, ctx.read_native_pin(this_pin, this));
     let function_cur = ctx.read_native_pin(function_pin, function);
     let key_cur = read_pinned_elem(ctx, key_pin, key);
     let result = match ctx.invoke_virtual(
@@ -23660,6 +23775,13 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             return Err(e);
         }
     };
+    if let Some(before) = mod_before {
+        let after = read_map_mod_count(&*ctx, ctx.read_native_pin(this_pin, this));
+        if after.is_some_and(|a| a != before) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(RuntimeError::ConcurrentModificationException.into());
+        }
+    }
     // Keep the result boxed — maps store Object references; unboxing here makes
     // the value read back as null (TreeMap's native_tm_compute_if_absent stores
     // it boxed and is correct). The boxed wrapper is what the JDK stores/returns.

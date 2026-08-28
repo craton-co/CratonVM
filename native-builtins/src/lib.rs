@@ -21028,12 +21028,9 @@ pub fn register_essential_natives_with_shims(
         "copyOf",
         "([Ljava/lang/Object;I)[Ljava/lang/Object;",
         |ctx, args| {
-            let src = match args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                _ => return Ok(Some(Value::Object(None))),
-            };
+            let src = arrays_src_or_npe(args, "copyOf")?;
             let new_len = match args.get(1) {
-                Some(Value::Int(n)) => *n as usize,
+                Some(Value::Int(n)) => arrays_len_or_negative(*n)?,
                 _ => 0,
             };
             let src_len = ctx.array_length(src);
@@ -21050,28 +21047,54 @@ pub fn register_essential_natives_with_shims(
         "copyOf",
         "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
         |ctx, args| {
-            let src = match args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                _ => return Ok(Some(Value::Object(None))),
-            };
+            let src = arrays_src_or_npe(args, "copyOf")?;
             let new_len = match args.get(1) {
-                Some(Value::Int(n)) => *n as usize,
+                Some(Value::Int(n)) => arrays_len_or_negative(*n)?,
                 _ => 0,
             };
             let src_len = ctx.array_length(src);
-            let comp_cid = match args.get(2) {
-                Some(Value::Object(Some(mirror))) => {
-                    crate::lang_class::mirror_class_id(ctx, *mirror)
-                        .and_then(|arr_cid| ctx.array_component_class_id(arr_cid))
+            // A NULL target class is a NullPointerException, not a silent
+            // fallback to `Object[]`. MEASURED: HotSpot NPE, this VM no-throw.
+            let Some(Value::Object(Some(mirror))) = args.get(2) else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("Arrays.copyOf: newType is null".to_string()),
                 }
-                _ => None,
+                .into());
             };
+            let comp_cid = crate::lang_class::mirror_class_id(ctx, *mirror)
+                .and_then(|arr_cid| ctx.array_component_class_id(arr_cid));
             let dst = match comp_cid {
                 Some(cid) => ctx.new_ref_array(cid, new_len),
                 None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len),
             };
+            // PER-ELEMENT STORE CHECK. The 3-arg form is specified to throw
+            // `ArrayStoreException` when an element of `original` is not
+            // assignable to `newType`'s component type -- it is the one copy
+            // method that can NARROW the type. MEASURED in both modes:
+            //
+            //   Arrays.copyOf(new Object[]{"s", Integer.valueOf(1)}, 2, String[].class)
+            //     HotSpot  ArrayStoreException     CratonVM  no-throw
+            //
+            // Without it the native manufactures a `String[]` containing an
+            // `Integer` -- an array whose contents contradict its own type, which
+            // every later reader is entitled to assume cannot exist. Skipped
+            // when the component type is `java/lang/Object`, which accepts all.
+            let comp_is_object = comp_cid
+                .and_then(|c| ctx.class_name_of_id(c))
+                .as_deref()
+                == Some("java/lang/Object");
             for i in 0..src_len.min(new_len) {
-                ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
+                let e = ctx.get_array_element(src, i);
+                if let (Some(cid), Value::Object(Some(v)), false) = (comp_cid, e, comp_is_object) {
+                    let actual = ctx.class_id_of_object(v);
+                    if actual != cid && !ctx.is_subclass(actual, cid) {
+                        return Err(RuntimeError::ArrayStoreException {
+                            message: ctx.class_name_of_id(actual).unwrap_or_default(),
+                        }
+                        .into());
+                    }
+                }
+                ctx.set_array_element(dst, i, e);
             }
             Ok(Some(Value::Object(Some(dst))))
         },
@@ -21081,19 +21104,12 @@ pub fn register_essential_natives_with_shims(
         "copyOfRange",
         "([Ljava/lang/Object;II)[Ljava/lang/Object;",
         |ctx, args| {
-            let src = match args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let from = match args.get(1) {
-                Some(Value::Int(n)) => (*n).max(0) as usize,
-                _ => 0,
-            };
-            let to = match args.get(2) {
-                Some(Value::Int(n)) => (*n).max(0) as usize,
-                _ => 0,
-            };
-            let new_len = to.saturating_sub(from);
+            let src = arrays_src_or_npe(args, "copyOfRange")?;
+            let from_i = match args.get(1) { Some(Value::Int(n)) => *n, _ => 0 };
+            let to_i = match args.get(2) { Some(Value::Int(n)) => *n, _ => 0 };
+            // Bounds BEFORE the length, and against the source's real length:
+            // `to` past the end is legal and pads, `from` past the end is not.
+            let (from, new_len) = arrays_range_or_throw(from_i, to_i, ctx.array_length(src))?;
             let comp_cid = ctx.class_id_of_object(src);
             let dst = ctx.new_ref_array(comp_cid, new_len);
             let src_len = ctx.array_length(src);
@@ -21106,12 +21122,9 @@ pub fn register_essential_natives_with_shims(
         },
     );
     registry.register("java/util/Arrays", "copyOf", "([II)[I", |ctx, args| {
-        let src = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
+        let src = arrays_src_or_npe(args, "copyOf")?;
         let new_len = match args.get(1) {
-            Some(Value::Int(n)) => *n as usize,
+            Some(Value::Int(n)) => arrays_len_or_negative(*n)?,
             _ => 0,
         };
         let src_len = ctx.array_length(src);
@@ -21126,19 +21139,12 @@ pub fn register_essential_natives_with_shims(
         "copyOfRange",
         "([BII)[B",
         |ctx, args| {
-            let src = match args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let from = match args.get(1) {
-                Some(Value::Int(n)) => (*n).max(0) as usize,
-                _ => 0,
-            };
-            let to = match args.get(2) {
-                Some(Value::Int(n)) => (*n).max(0) as usize,
-                _ => 0,
-            };
-            let new_len = to.saturating_sub(from);
+            let src = arrays_src_or_npe(args, "copyOfRange")?;
+            let from_i = match args.get(1) { Some(Value::Int(n)) => *n, _ => 0 };
+            let to_i = match args.get(2) { Some(Value::Int(n)) => *n, _ => 0 };
+            // Bounds BEFORE the length, and against the source's real length:
+            // `to` past the end is legal and pads, `from` past the end is not.
+            let (from, new_len) = arrays_range_or_throw(from_i, to_i, ctx.array_length(src))?;
             let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
             let src_len = ctx.array_length(src);
             for i in 0..new_len {
@@ -21150,12 +21156,9 @@ pub fn register_essential_natives_with_shims(
         },
     );
     registry.register("java/util/Arrays", "copyOf", "([BI)[B", |ctx, args| {
-        let src = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
+        let src = arrays_src_or_npe(args, "copyOf")?;
         let new_len = match args.get(1) {
-            Some(Value::Int(n)) => *n as usize,
+            Some(Value::Int(n)) => arrays_len_or_negative(*n)?,
             _ => 0,
         };
         let src_len = ctx.array_length(src);
@@ -25641,6 +25644,87 @@ fn system_ephemeral_port_range() -> (i32, i32) {
         // IANA's dynamic/private range is the portable fallback when the host
         // has no Linux procfs port-range setting (for example on Windows).
         .unwrap_or((49_152, 65_535))
+}
+
+/// The source array for an `Arrays.copyOf`/`copyOfRange`/`fill` native: a null
+/// one is a `NullPointerException`, not a null RESULT.
+///
+/// MEASURED 2026-08-28 in BOTH modes (`probes/ArraysHashSetShadowSweep.java`),
+/// against HotSpot 25.0.3+9. Every one of these natives opened with
+///
+/// ```rust
+/// let src = match args.first() {
+///     Some(Value::Object(Some(a))) => *a,
+///     _ => return Ok(Some(Value::Object(None))),   // <- a null array answers null
+/// };
+/// ```
+///
+/// so `Arrays.copyOf(null, 1)` handed the caller a null array where the JDK
+/// throws. That is the worst shape a refusal can take: the caller does not
+/// learn it passed a null until the null it got back is dereferenced somewhere
+/// else, by which time the array is no longer in the frame.
+fn arrays_src_or_npe(args: &[Value], what: &str) -> Result<ObjectRef, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(a))) => Ok(*a),
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some(format!("Arrays.{what}: array is null")),
+        }
+        .into()),
+    }
+}
+
+/// A new-array length: negative is `NegativeArraySizeException`.
+///
+/// MEASURED: `Arrays.copyOf(src, -1)` answered **OutOfMemoryError** on this VM
+/// against HotSpot's `NegativeArraySizeException`, because the length was read
+/// as `*n as usize` -- and `-1 as usize` on a 64-bit host is 18 446 744 073 709
+/// 551 615, which is a perfectly sincere request for eighteen exabytes. The
+/// allocator did the only thing it could.
+///
+/// The wrong TYPE matters more than the wrong message here: an application that
+/// catches `NegativeArraySizeException` around a computed length recovers, and
+/// `OutOfMemoryError` is an `Error` that most catch blocks deliberately do not
+/// take.
+fn arrays_len_or_negative(n: i32) -> Result<usize, MethodCallFailed> {
+    if n < 0 {
+        return Err(RuntimeError::NegativeArraySizeException { size: n }.into());
+    }
+    Ok(n as usize)
+}
+
+/// `copyOfRange`'s three-way bound check, in the JDK's own order.
+///
+/// `Arrays.copyOfRange` is specified as: `from < 0 || from > original.length`
+/// is `ArrayIndexOutOfBoundsException`, `from > to` is
+/// `IllegalArgumentException`, and **`to` beyond the end is LEGAL** -- the
+/// result is zero/null-padded. MEASURED, all four rows silently returned an
+/// array on this VM:
+///
+/// ```text
+/// copyOfRange(src, 3, 1)   HotSpot IllegalArgumentException        CratonVM no-throw
+/// copyOfRange(src, -1, 2)  HotSpot ArrayIndexOutOfBoundsException  CratonVM no-throw
+/// copyOfRange(src, 9, 9)   HotSpot ArrayIndexOutOfBoundsException  CratonVM no-throw
+/// copyOfRange(null, 0, 1)  HotSpot NullPointerException            CratonVM no-throw
+/// ```
+///
+/// The old code read both ends with `(*n).max(0)`, which turns a negative
+/// `from` into 0 and makes the out-of-range case indistinguishable from a
+/// legal one. Clamping an argument is not validating it.
+fn arrays_range_or_throw(from: i32, to: i32, src_len: usize) -> Result<(usize, usize), MethodCallFailed> {
+    if from < 0 || (from as usize) > src_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: from,
+            message: Some(format!("copyOfRange: from {from} out of bounds for length {src_len}")),
+        }
+        .into());
+    }
+    if from > to {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("{from} > {to}"),
+        }
+        .into());
+    }
+    Ok((from as usize, (to - from) as usize))
 }
 
 pub(crate) fn obj_arg(

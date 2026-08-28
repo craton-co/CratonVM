@@ -1185,10 +1185,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.fill(int[], int)
     r.register(arrays, "fill", "([II)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let val = args.get(1).copied().unwrap_or(Value::Int(0));
         let len = ctx.array_length(arr);
         for i in 0..len {
@@ -1203,11 +1200,35 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "fill",
         "([Ljava/lang/Object;Ljava/lang/Object;)V",
         |ctx, args| {
-            let arr = match args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                _ => return Ok(None),
-            };
+            let arr = crate::arrays_src_or_npe(args, "fill")?;
             let val = args.get(1).copied().unwrap_or(Value::Object(None));
+            // STORE CHECK. `Arrays.fill(Object[], Object)` is an ordinary
+            // covariant array store per element, so filling a `String[]` with an
+            // `Integer` is an `ArrayStoreException` -- and `set_array_element`
+            // does not check, so this native accepted it.
+            //
+            // MEASURED in BOTH modes (`probes/ArraysHashSetShadowSweep.java`):
+            // HotSpot ArrayStoreException, this VM `no-throw`, leaving an
+            // Integer sitting in a String[] for the next reader to trip over.
+            // That is the same class of hole as the `aastore` covariance gap
+            // the roadmap tracked as P3-A, reached through a library method
+            // instead of through the opcode.
+            //
+            // A null value is always storable, and a component type of
+            // `java/lang/Object` accepts everything, so both short-circuit.
+            if let Value::Object(Some(v)) = val {
+                let comp = ctx.class_id_of_object(arr);
+                let actual = ctx.class_id_of_object(v);
+                if actual != comp
+                    && !ctx.is_subclass(actual, comp)
+                    && ctx.class_name_of_id(comp).as_deref() != Some("java/lang/Object")
+                {
+                    return Err(RuntimeError::ArrayStoreException {
+                        message: ctx.class_name_of_id(actual).unwrap_or_default(),
+                    }
+                    .into());
+                }
+            }
             let len = ctx.array_length(arr);
             for i in 0..len {
                 ctx.set_array_element(arr, i, val);
@@ -1218,10 +1239,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.fill(long[], long)
     r.register(arrays, "fill", "([JJ)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let val = args.get(1).copied().unwrap_or(Value::Long(0));
         let len = ctx.array_length(arr);
         for i in 0..len {
@@ -1232,10 +1250,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.fill(byte[], byte)
     r.register(arrays, "fill", "([BB)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let val = args.get(1).copied().unwrap_or(Value::Int(0));
         let len = ctx.array_length(arr);
         for i in 0..len {
@@ -1246,10 +1261,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.sort(int[])
     r.register(arrays, "sort", "([I)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let len = ctx.array_length(arr);
         let mut vals: Vec<i32> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
@@ -1266,10 +1278,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.sort(long[])
     r.register(arrays, "sort", "([J)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let len = ctx.array_length(arr);
         let mut vals: Vec<i64> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
@@ -1286,10 +1295,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.sort(double[])
     r.register(arrays, "sort", "([D)V", |ctx, args| {
-        let arr = match args.first() {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
+        let arr = crate::arrays_src_or_npe(args, "fill")?;
         let len = ctx.array_length(arr);
         let mut vals: Vec<f64> = (0..len)
             .map(|i| match ctx.get_array_element(arr, i) {
