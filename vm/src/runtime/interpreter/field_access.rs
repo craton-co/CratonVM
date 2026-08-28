@@ -524,6 +524,33 @@ pub(super) fn resolve_field_in_class(
     // does not change it.
     let resolved = {
         let cm = shared.classes.class_manager.read();
+        // JVMS §5.4.3.2 — the OTHER half of the fieldref key.
+        //
+        // Resolution is by name AND descriptor, and §4.5 forbids only the pair
+        // from repeating: one class may legally declare several fields sharing
+        // a name. Matching on the name alone returns whichever comes first in
+        // declaration order, which can be a field of an entirely different
+        // type — and the caller then gets its slot index and its
+        // static/instance flag.
+        //
+        // Read straight back out of the referencing class's own constant pool
+        // rather than threading it down from `resolve_field_ref`: this function
+        // already holds `cp_index` and the `cm` guard, and both of its callers
+        // reach it only on a resolution-cache MISS, so the lookup is cold.
+        // `None` (a malformed or non-fieldref entry) keeps the historical
+        // name-only key, which is what those callers got before.
+        let descriptor: Option<&str> = cm.get_class(current_class_id).and_then(|c| {
+            match c.constant_pool.get(cp_index) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => c
+                    .constant_pool
+                    .get_name_and_type(*name_and_type_index)
+                    .map(|(_, d)| d),
+                _ => None,
+            }
+        });
         let resolver = crate::runtime::resolve::MemberResolver::new(shared);
         let accessor = resolver.scope(current_class_id);
         let owner = resolver.scope(field_class_id);
@@ -533,6 +560,7 @@ pub(super) fn resolve_field_in_class(
             owner,
             &field_class_name,
             &field_name,
+            descriptor,
             crate::runtime::resolve::AccessPolicy::ModuleOnly,
         )?;
         resolver.adopt(scoped)?

@@ -1044,10 +1044,26 @@ impl LinkResolver {
     }
 
     /// Field-resolution sibling of [`Self::resolve_method_in_store`].
-    /// The field cache key uses an empty descriptor because JVMS
-    /// `(class, name)` is already unique within a class (multiple
-    /// fields with the same name are illegal).  This matches the JNI
-    /// `GetFieldID` wiring in `vm::native::jni`.
+    ///
+    /// # The empty descriptor in the cache key is a NAME-ONLY key
+    ///
+    /// This used to justify itself with "JVMS `(class, name)` is already unique
+    /// within a class (multiple fields with the same name are illegal)". That is
+    /// not what JVMS says. §4.5 forbids two fields in one class file sharing a
+    /// name **and** descriptor; sharing a name alone is legal, and javac is not
+    /// the only thing that emits class files. §5.4.3.2 accordingly resolves a
+    /// fieldref by name and descriptor.
+    ///
+    /// That sentence is the belief the whole gap grew from: it is why
+    /// `find_own_field` and `find_field_recursive` key on the name, and why a
+    /// compiled field access could take its slot index from one field and its
+    /// type tag from another.
+    ///
+    /// This entry point still keys on the name alone, and its callers pass
+    /// names they own. A caller that has a descriptor — the `getfield` /
+    /// `putfield` resolution path, and JNI `GetFieldID` — must use
+    /// `find_field_recursive_by_descriptor` (or `MemberResolver::locate_field`
+    /// with `Some(descriptor)`) instead.
     pub fn resolve_field_in_store(
         &self,
         class_id: ClassId,
