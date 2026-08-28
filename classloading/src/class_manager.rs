@@ -5742,14 +5742,31 @@ impl ClassManager {
                 );
             }
             if dup.is_some() {
-                return Err(VmError::Linkage(
-                    LinkageError::IncompatibleClassChangeError {
-                        message: format!(
-                            "class {} already defined by {} loader",
-                            stored_name_preview, loader_id
-                        ),
-                    },
-                ));
+                // `DuplicateClassDefinition`, NOT `IncompatibleClassChangeError`.
+                //
+                // HotSpot throws `java.lang.LinkageError` ITSELF for a duplicate
+                // definition, and the variant beside it in `LinkageError`
+                // already exists for exactly this, mapping to
+                // `java/lang/LinkageError` with HotSpot's own wording (see
+                // `vm/src/runtime/exceptions.rs`, whose comment names Tomcat's
+                // loader lifecycle and ByteBuddy's injection strategies as the
+                // callers that catch the base type).
+                //
+                // MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`):
+                // defining the same bytes twice in one loader gave
+                // `IncompatibleClassChangeError` against HotSpot's
+                // `LinkageError`. ICCE *is* a LinkageError subclass, so
+                // `catch (LinkageError)` was unaffected -- but code that
+                // catches ICCE specifically caught ours and would not catch
+                // HotSpot's, which is a recovery path running here that never
+                // runs on the reference VM.
+                //
+                // The right variant was already present and simply not used
+                // here; nothing needed to be added to the enum.
+                return Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                    class_name: stored_name_preview.to_string(),
+                    loader: format!("{loader_id:?}"),
+                }));
             }
 
             // A synthetic stub for this exact name may already exist under a
@@ -5847,9 +5864,22 @@ impl ClassManager {
                 }
             }
             match this.load_class(internal) {
-                Err(VmError::Linkage(LinkageError::IncompatibleClassChangeError { message }))
-                    if message.contains("already defined by") =>
-                {
+                // MATCHES THE VARIANT, not a message substring. The duplicate
+                // raise site above used to build an
+                // `IncompatibleClassChangeError` whose text contained "already
+                // defined by", and this arm keyed on that text. Correcting the
+                // raise site to `DuplicateClassDefinition` (HotSpot throws
+                // `java.lang.LinkageError` itself) would have silently stopped
+                // this arm from matching, turning a RECOVERED concurrent-
+                // definition race into a hard failure -- so the two move
+                // together. Keying on the variant instead of the wording is
+                // also why the next wording change cannot break it.
+                Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                    class_name,
+                    loader,
+                })) => {
+                    let message =
+                        format!("duplicate class definition for {class_name} by {loader}");
                     // Benign concurrent-definition race: this recursive
                     // supertype/interface resolution (superclass or
                     // interfaces of the class currently being defined) lost
@@ -5872,9 +5902,13 @@ impl ClassManager {
                     // this class's own definition outright.
                     match loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
                         Some(id) => Ok(id),
-                        None => Err(VmError::Linkage(
-                            LinkageError::IncompatibleClassChangeError { message },
-                        )),
+                        None => {
+                            let _ = &message;
+                            Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                                class_name,
+                                loader,
+                            }))
+                        }
                     }
                 }
                 other => other,
