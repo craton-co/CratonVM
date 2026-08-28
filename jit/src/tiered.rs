@@ -1465,6 +1465,17 @@ pub fn dump_method_stats_to_stderr() {
             "[cratonvm] JIT invokevirtual pinned non-virtual: private={private_pinned}              final={final_pinned}",
         );
     }
+    // Inline `checkcast`, by cause. The runtime engagement number is the
+    // `membership walks by JIT site: checkcast=` line above: every walk the
+    // fast path avoids is one that line does not report.
+    let (cc_sp, cc_ir, cc_prim, cc_no_target, cc_untrusted) = crate::checkcast_inline_sites();
+    if cc_sp | cc_ir | cc_prim | cc_no_target | cc_untrusted != 0 {
+        eprintln!(
+            "[cratonvm] JIT checkcast inline sites: single-pass={cc_sp} optimizing={cc_ir} \
+             prim-array={cc_prim} refused-no-target-id={cc_no_target} \
+             refused-untrusted-operand={cc_untrusted}",
+        );
+    }
     let (nio_served, nio_declined, md_served, md_declined) = crate::byte_element_helper_calls();
     if nio_served | nio_declined | md_served | md_declined != 0 {
         eprintln!(

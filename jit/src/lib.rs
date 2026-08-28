@@ -17000,6 +17000,76 @@ pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
 pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `checkcast` sites that got the inline class-id compare, and the two reasons
+/// the rest did not.
+///
+/// Per CAUSE, not a single "not inlined" total. The two refusals want opposite
+/// fixes — an unresolved target id means the site's `CONSTANT_Class` was not
+/// loaded when this body was compiled (transient, and a re-compile fixes it),
+/// while an untrusted operand means the backend's `stack_oop_marks` could not
+/// prove the operand is an oop (structural, and the same open question the
+/// compact `getfield` arm's own diagnostic exists to answer). A combined count
+/// that moves cannot say which one a workload is hitting.
+///
+/// These are COMPILE-time counts. The runtime engagement counter already
+/// exists and needs nothing new: `CRATONVM_DBG=jit-method-stats` prints
+/// `membership walks by JIT site: checkcast=…`, and every walk the fast path
+/// avoids is one this number does not report.
+pub static CHECKCAST_INLINE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// [`CHECKCAST_INLINE_SITES`] for the OPTIMIZING tier's own `checkcast`
+/// lowering (`ir_lower`'s `Op::CheckCast`).
+///
+/// Counted apart from the single-pass door because they are two independent
+/// emitters and a hot method only ever runs the second one. Folding them into
+/// one number is what would have hidden this fix's first version, which
+/// patched only the single-pass arm and moved a four-million-cast probe by
+/// 80 walks out of 3,203,316.
+pub static CHECKCAST_INLINE_SITES_IR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// [`CHECKCAST_INLINE_SITES`] for the one-dimensional PRIMITIVE ARRAY variant,
+/// which proves its answer from the header's kind/element tags instead of a
+/// class id (see `cratonvm_types::primitive_array_kind_tags_byte`).
+///
+/// Counted apart because it serves a disjoint population and was added for a
+/// workload the class-id compare provably could not help: netty's
+/// `PooledByteBuf<T>` casts its erased `memory` field to `byte[]` on every
+/// byte, and a primitive array's header class id is 0, so the first version of
+/// this fix moved `checkcast=11,994,524` walks by 7,690 out of 12 million.
+pub static CHECKCAST_INLINE_SITES_PRIM_ARRAY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Sites refused because the target class was not resolvable at compile time.
+pub static CHECKCAST_INLINE_NO_TARGET_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Sites refused because the operand was not a provably-trusted oop.
+pub static CHECKCAST_INLINE_UNTRUSTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the [`CHECKCAST_INLINE_SITES`] counters: single-pass sites,
+/// optimizing-tier sites, and the two refusal causes.
+pub fn checkcast_inline_sites() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        CHECKCAST_INLINE_SITES.load(Relaxed),
+        CHECKCAST_INLINE_SITES_IR.load(Relaxed),
+        CHECKCAST_INLINE_SITES_PRIM_ARRAY.load(Relaxed),
+        CHECKCAST_INLINE_NO_TARGET_ID.load(Relaxed),
+        CHECKCAST_INLINE_UNTRUSTED.load(Relaxed),
+    )
+}
+
+/// The interned name of a typecheck site, for the emitters' descriptor tests.
+///
+/// # Safety
+/// `ptr`/`len` must be a pair produced by [`intern_typecheck_target`], which
+/// leaks its names for the life of the process.
+pub unsafe fn typecheck_site_name<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).ok()
+}
+
 /// Snapshot of [`FINAL_INVOKEVIRTUAL_PINNED`].
 pub fn final_invokevirtual_pinned() -> u64 {
     FINAL_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
