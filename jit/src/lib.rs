@@ -1893,6 +1893,97 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     (addr >= *entry && addr < *end).then_some(*cm)
 }
 
+/// `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR=0` -- stop rewriting an elidable
+/// `invokespecial C.<init>()V` site's callee class to `java/lang/Object`.
+///
+/// The rewrite is what lets the single-pass `0xb7` codegen drop the per-object
+/// `jit_invoke_dispatch` for a constructor whose whole body is
+/// `aload_0; invokespecial Object.<init>; return`. It also DISCARDS the site's
+/// real callee identity, which every consumer downstream of the rewrite then
+/// sees as `Object.<init>` -- so this is the bisect lever for anything that
+/// appears only when an elidable constructor is in the method.
+///
+/// Default ON. `CRATONVM_DBG_JIT_ELIDE_CTOR=<caller substring>` names each
+/// rewrite as it happens.
+pub fn elide_trivial_ctor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_ELIDE_TRIVIAL_CTOR")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_DBG_JIT_DIRECT_BINDS=<caller-method substring>` -- print every raw
+/// JIT-to-JIT direct call this compile BAKES: the caller, the bytecode pc, the
+/// callee triple the site resolved to, and the entry address bound.
+///
+/// A baked `CALL` carries no identity at runtime -- `JitCalleeGuard` is only
+/// constructed by `jit_invoke_dispatch`, which a raw call bypasses -- so the
+/// punned-store report names the door and not the site. This is the same
+/// question asked where the answer is still attributable, and it is the one
+/// place that sees both the pc and the address.
+///
+/// Cross-check against `CRATONVM_DBG=jitc`'s
+/// `full-compile <method> entry=0x...`: a bind whose entry belongs to a method
+/// other than the one named here is a site bound to the wrong body.
+pub fn dbg_direct_binds() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_DIRECT_BINDS").ok())
+        .as_deref()
+}
+
+/// Emit one `[jit-direct-bind]` line when the CALLER matches the filter.
+pub fn note_direct_bind(
+    caller: &str,
+    pc: usize,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+    entry: usize,
+) {
+    let Some(filter) = dbg_direct_binds() else {
+        return;
+    };
+    if !caller.contains(filter) {
+        return;
+    }
+    eprintln!(
+        "[jit-direct-bind] caller={caller} pc={pc} callee={callee_class}.{callee_method}{callee_desc} entry={entry:#x}"
+    );
+}
+
+/// DIAGNOSTIC: name the compiled body whose code range contains `addr`.
+///
+/// [`pin_jit_code_range_owner`] cannot answer for a body registered through the
+/// non-owning [`register_jit_code_range`] — its `Weak` never upgrades — and
+/// that is most of them, so a diagnostic built on the pin prints an empty list.
+/// This reads the method key straight off the artifact the range table already
+/// points at.
+///
+/// Only for reports taken from INSIDE the body (a helper called by it): the
+/// range table's `cm` is the address of a live `CompiledMethod` for exactly as
+/// long as that body can be executing, which is the only window this is called
+/// in. Do not call it about an arbitrary address.
+pub fn jit_code_range_method_key(addr: usize) -> Option<String> {
+    let cm = lookup_jit_code_range(addr)?;
+    // SAFETY: see the contract above — `cm` is the address of the
+    // `CompiledMethod` whose code is executing at `addr`.
+    let compiled: &CompiledMethod = unsafe { &*(cm as *const CompiledMethod) };
+    compiled
+        .deopt_points
+        .iter()
+        .map(|d| d.frame_state.method_key.clone())
+        .find(|k| !k.is_empty())
+        .or_else(|| {
+            compiled
+                ._deopt_point_boxes
+                .iter()
+                .map(|d| d.frame_state.method_key.clone())
+                .find(|k| !k.is_empty())
+        })
+}
+
 /// Resolve `addr` to a *retained* owner of the compiled body containing it.
 ///
 /// [`lookup_jit_code_range`] returns a bare `usize` — the address of an
@@ -13324,6 +13415,7 @@ pub static UNPINNED_JIT_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
 /// Whether an unrootable baked direct-call target blocks publication.
@@ -22851,6 +22943,19 @@ fn try_compile_inner(
                                 if callee_needs_ctx {
                                     needs_heap = true;
                                 }
+                                note_direct_bind(
+                                    &format!(
+                                        "{}.{}{}",
+                                        cached.class_name,
+                                        cached.method_name,
+                                        cached.method_descriptor
+                                    ),
+                                    pc,
+                                    &class_name,
+                                    &method_name,
+                                    &descriptor,
+                                    entry,
+                                );
                                 direct_callee_entries.push(entry);
                                 direct_calls.push((
                                     pc,
@@ -23539,8 +23644,18 @@ fn try_compile_inner(
             let class_name = if invoke_kind == 1
                 && method_name == "<init>"
                 && descriptor == "()V"
+                && elide_trivial_ctor_enabled()
                 && cp_elidable_init_resolver.map_or(false, |r| r(cp_idx))
             {
+                if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_ELIDE_CTOR") {
+                    let key =
+                        format!("{}.{}", cached.class_name, cached.method_name);
+                    if key.contains(&want) {
+                        eprintln!(
+                            "[jit-elide-ctor] caller={key} pc={pc} rewrote {class_name}.<init>()V -> java/lang/Object.<init>()V"
+                        );
+                    }
+                }
                 "java/lang/Object".to_string()
             } else {
                 class_name

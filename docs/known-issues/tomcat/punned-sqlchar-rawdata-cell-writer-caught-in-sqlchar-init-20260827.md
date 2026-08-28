@@ -1,12 +1,144 @@
-# `SQLChar.rawData` holds `Int(1)`: caught in the act — `jit_putfield_int(this, 1, Int(1))` from a compiled `SQLChar.<init>`
+# `SQLChar.rawData` holds `Int(1)`: the store is a sibling constructor's `isnull = true` landing on a `SQLChar`
 
 | | |
 |---|---|
-| **Status** | **OPEN**, reopened 2026-08-27, the same day it was retired. The retirement's 640 runs were on a QUIET host, where the rate is zero; with four CPU spinners it reproduces at ~4-8% and the compiled-store watch that retirement built catches the writer on the first contended campaign. |
+| **Status** | **OPEN**, not fixed. The writer is identified down to six candidate bodies and seven single-lever A/Bs take it to zero; the step from those to the defect is still missing. Reopened 2026-08-27 (see below); this section is 2026-08-28. |
 | **Symptom** | a `[C` field (slot 1 of an 8-slot `SQLChar`) holding `Value::Int(1)` |
 | **Why it matters** | `org.apache.catalina.servlets.TestWebdavPropertyStore` FAILS — Derby cannot create its database, `NullPointerException` in `StoredPage.readRecordFromArray`. Before the detector, a compiled `arraylength` dereferenced the cell as the pointer `1`: `SIGSEGV addr=0x5` |
-| **The writer** | `jit_putfield_int(SQLChar, field_index=1, Int(1))` — the compiled INT putfield helper, aimed at a slot the class declares `[C` |
-| **The owner** | the compiled body of `SQLChar.<init>`. `CRATONVM_JIT_DENY=SQLChar.<init>` takes 12 compiled stores and 12 failures per 300 runs to **0 and 0**, with the workload's read counts unchanged |
+| **The store** | `jit_putfield_int(SQLChar, field_index=1, Int(1))`, `declared_ref=Some(true)` |
+| **What emits exactly that** | `SQL{Boolean,Double,Integer,Longint,Real,Smallint}.<init>()V` — each is `putfield isnull:Z` at pc 6, field index 1, value `iconst_1`. **No `SQLChar` method emits an int store to slot 1**, proven at compile time. |
+
+## What the store is, proven at compile time
+
+`CRATONVM_DBG_JIT_FIELD_SITES=<method substring>` prints every field site the
+single-pass backend emits: method, pc, resolved slot, type tag. Over a whole
+process (1 988 sites) exactly six methods emit `slot=1` with an int-category
+tag and the constant 1, and all six are Derby `DataValueDescriptor`
+constructors setting `isnull = true`:
+
+```text
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLBoolean.<init>:()V  pc=6 slot=1 tag=Z
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLDouble.<init>:()V   pc=6 slot=1 tag=Z
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLInteger.<init>:()V  pc=6 slot=1 tag=Z
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLLongint.<init>:()V  pc=6 slot=1 tag=Z
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLReal.<init>:()V     pc=6 slot=1 tag=Z
+[jit-field-site] putfield method=org/apache/derby/iapi/types/SQLSmallint.<init>:()V pc=6 slot=1 tag=Z
+```
+
+Every `SQLChar` site is correct and none of them is `slot=1 tag=I`:
+
+```text
+SQLChar.<init>             pc=6 slot=2 tag=I   (rawLength = -1)   pc=14 slot=7 tag=[  (arg_passer)
+SQLChar.getCharArray       pc=38 slot=1 tag=[  pc=47 slot=2 tag=I  pc=52 slot=3 tag=L
+SQLChar.readExternalFromArray pc=45 slot=1 tag=[  pc=68 slot=2 tag=I  pc=78 slot=1 tag=[
+```
+
+So the receiver is wrong, not the index: one of those six constructor bodies
+runs with a `SQLChar` as `this`, and `SQLChar` slot 1 is `rawData`, declared
+`[C`.
+
+## Seven levers that take it to zero
+
+300 runs each, four streams, under load; the slot-1 accessor **read count** is
+printed beside each because a lever that moves it by 10x has changed the
+workload rather than fixed anything.
+
+| lever | stores / 300 | runs failed | slot-1 reads |
+|---|---:|---:|---:|
+| baseline (adjacent control) | 12 | 15 | 7.51 M |
+| `--nojit` | **0** | **0** | 11.0 M |
+| `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` | **0** | **0** | 1.06 M |
+| `CRATONVM_JIT_SCALAR_NEW=0` | **0** | **0** | 7.87 M |
+| `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR=0` (new lever) | **0** | **0** | 7.87 M |
+| `CRATONVM_JIT_DENY=DataValueFactoryImpl.getNull` | **0** | **0** | 7.87 M |
+| `CRATONVM_JIT_DENY=SQLChar.<init>` | **0** | **0** | 7.87 M |
+| `CRATONVM_JIT_DENY=SQL{Boolean,Double,Integer,Longint,Real,Smallint}.<init>` | **0** | 3 | 7.80 M |
+
+Two of those are weaker than they look and should not be read as "this code is
+the corrupter": denying the factory or `SQLChar.<init>` also changes **who
+creates the object**, so a zero there is consistent with "no such `SQLChar` is
+produced" as well as with "nothing corrupts it". The six-constructor deny does
+not have that reading — those bodies emit the store itself.
+
+`CRATONVM_JIT_ELIDE_TRIVIAL_CTOR=0` is the tightest: it disables one `if` in
+`try_compile_inner` that rewrites an elidable `invokespecial C.<init>()V`
+site's callee class to `java/lang/Object` so the single-pass `0xb7` codegen can
+drop the call. `CRATONVM_DBG_JIT_ELIDE_CTOR=SQLChar` shows it firing:
+
+```text
+[jit-elide-ctor] caller=org/apache/derby/iapi/types/SQLChar.<init> pc=1
+                 rewrote org/apache/derby/iapi/types/DataType.<init>()V -> java/lang/Object.<init>()V
+```
+
+It is also a usable **mitigation** today, at an unmeasured cost: the elision
+exists because the terminal `Object.<init>` of every constructor chain
+otherwise costs one `jit_invoke_dispatch` per allocation (~69 M on bintrees18).
+Do not flip its default without measuring that.
+
+## Eleven eliminations
+
+Each is a single lever, 300 runs, against a ~12-21/300 baseline. None moved the
+rate.
+
+| lever | stores / 300 |
+|---|---:|
+| `CRATONVM_ZGC_RELOCATE=0` | 10 / 600 (vs 14 / 600) |
+| `CRATONVM_NO_JIT_INLINE_PUTFIELD=1` | 20 |
+| `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | 19 |
+| `CRATONVM_COMPACT_REF_FIELDS=0` | 28 |
+| `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE=0` | 18 |
+| `CRATONVM_JIT_CODE_CACHE_MAX_MB=0` (nothing reclaimed) | 6 |
+| `CRATONVM_DISABLE_SCALAR_REPLACEMENT=1` | 15 |
+| `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY=0` | 15 |
+| `--Xmx 8g` | 15 |
+| `CRATONVM_JIT_DENY=SQLInteger.<init>` (one of the six) | 14 |
+| a bake-time owner-identity check in `prepare_for_publication` (below) | 1, then its own control |
+
+The `RELOCATE=0` row has a consequence beyond itself: ZGC does not move objects
+in that arm, so no explanation may assume a relocated receiver.
+
+## Four hypotheses that died on measurement
+
+Recording these because each looked conclusive and each cost roughly half an
+hour.
+
+1. **"The executable buffer was recycled and a stale direct call landed in the
+   new tenant."** `SQLChar.<init>()V` and `SQLInteger.<init>()V` really do get
+   `full-compile`d at the same entry address in every hit run — and in
+   **291 of 296 non-hit runs too**. Address reuse is ubiquitous and carries no
+   signal. The first version of this check counted *any* duplicate anywhere and
+   looked just as convincing.
+2. **"The keep-alive is missing, so the callee dies under its caller."**
+   `CRATONVM_DBG_JIT_PIN=1` reports `[jit-unrooted-callee]`, and it is
+   **anti-correlated**: 0 of 16 hit runs, 232 of 284 non-hit runs. When the pin
+   fails, `strict_callee_roots` refuses publication — that is the SAFE case.
+3. **"Then the pin succeeds on the wrong artifact, because `JIT_ENTRY_OWNERS`
+   is keyed by entry address."** A bake-time `(entry, owner)` record with an
+   identity check at publication was implemented and measured: its refusal
+   **never fired once in 300 runs**, and the defect survived it (1/300 on the
+   repeat arm, after 0/300 on the first — which was luck). Reverted; the change
+   is not in the tree.
+4. **"The direct bind names the wrong body at compile time."**
+   `CRATONVM_DBG_JIT_DIRECT_BINDS=DataValueFactoryImpl` prints every baked
+   direct call with its callee triple and entry address. Cross-checked against
+   `full-compile ... entry=0x...` in the same log, across every hit run:
+   **no mismatch**. The binds are right when they are made.
+
+## Where that leaves it
+
+The store is a raw JIT-to-JIT direct call's business (`DIRECT_CALLEE_CALLS=0`
+kills it), it needs the trivial-constructor elision (`ELIDE_TRIVIAL_CTOR=0`
+kills it), the emitted code is correct at every site the compiler prints, and
+the bind is correct at bake time. What is not yet established is how one of the
+six `<init>` bodies comes to run on a `SQLChar` receiver at run time.
+
+The next measurement should name the executing body at the fault rather than
+infer it. `compiled_frames=` in the `[punned-store-jit]` report is a
+conservative stack scan and reports an unnamed frame at a consistent
+`entry+0x224` — consistent enough to be the return address, not certain enough
+to build on. Building the frame list from a real RBP chain (a diagnostic build
+with `-C force-frame-pointers=yes`) would settle in one run what four
+hypotheses could not.
 
 ## The reproduction the retirement was missing: CPU contention
 

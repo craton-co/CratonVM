@@ -1575,6 +1575,13 @@ impl Compiler {
                     if let Some((_, field_index, type_tag)) =
                         site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
+                        super::bytecode_walk::note_field_site(
+                            &self.method_key,
+                            "putfield/inlined",
+                            cpc,
+                            field_index,
+                            type_tag,
+                        );
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
                         // Make a null receiver a real Java NPE before either

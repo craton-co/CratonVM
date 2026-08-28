@@ -6797,11 +6797,81 @@ unsafe fn report_jit_punned_putfield(obj_ptr: i64, field_index: i64, value: Valu
     eprintln!(
         "[punned-store-jit] class={name} class_id={class_id} num_slots={num_slots} \
          field_index={field_index} value={value:?} declared_ref={declared_ref:?} \
-         compact_flag={} gc_flags={gc_flags:#x} jit_callee={}\n{}",
+         compact_flag={} gc_flags={gc_flags:#x} jit_callee={} compiled_frames=[{}]\n{}",
         gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0,
         current_jit_callee(),
+        compiled_frames_above(),
         std::backtrace::Backtrace::force_capture(),
     );
+}
+
+/// The compiled methods whose bodies are on the stack above this helper, named.
+///
+/// `current_jit_callee()` is populated by `JitCalleeGuard`, which only
+/// `jit_invoke_dispatch` constructs — so a callee reached by a RAW JIT-to-JIT
+/// direct call has no name there at all, and the punned-store report came back
+/// with `jit_callee=` empty every time. That is not a gap in the report, it is
+/// the report telling you which call form you are looking at; but it leaves the
+/// writer unnamed and the only way to the method was a deny bisect.
+///
+/// This walks the machine stack the same way the conservative root scanner
+/// does — every word from here up, tested against the JIT code-range registry
+/// — and names each compiled body it finds. Diagnostic-only, on a `#[cold]`
+/// path behind `CRATONVM_DBG_JIT_PUTFIELD`, so its cost is irrelevant; and it
+/// cannot fabricate an answer, because `pin_jit_code_range_owner` returns a
+/// body only for an address a LIVE compiled artifact actually covers.
+fn compiled_frames_above() -> String {
+    // 64 KiB of stack is far more than the few frames between a compiled
+    // putfield and its method's own frame, and bounds the scan on a thread
+    // whose stack base this function does not know.
+    const WORDS: usize = 8192;
+    let anchor = 0usize;
+    let base = &anchor as *const usize;
+    // The range table, not the pinned owner. `register_jit_code_range` (the
+    // non-owning spelling) stores a `Weak::new()` that can never upgrade, so
+    // `pin_jit_code_range_owner` answers `None` for every range registered
+    // that way -- which is why the first version of this printed an empty
+    // list on a live positive control. The ENTRY address is enough: it is
+    // what `CRATONVM_DBG=jitc` prints beside the method name on
+    // `full-compile <method> entry=0x...`.
+    let ranges = cratonvm_jit::jit_code_ranges_snapshot();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for i in 0..WORDS {
+        // SAFETY: reading our own stack upward. `base` is a local of this
+        // frame, so `base + i` over this range stays inside the thread's stack
+        // mapping for any reasonable stack size; the word is treated as an
+        // opaque integer and never dereferenced.
+        let word = unsafe { std::ptr::read(base.add(i)) };
+        if word < 0x1000 {
+            continue;
+        }
+        let Some(&(entry, _)) = ranges.iter().find(|(e, end)| word >= *e && word < *end) else {
+            continue;
+        };
+        if seen.contains(&entry) {
+            continue;
+        }
+        seen.push(entry);
+        let name = cratonvm_jit::jit_code_range_method_key(word).unwrap_or_default();
+        out.push(format!("{entry:#x}+{:#x}{}", word - entry,
+            if name.is_empty() { String::new() } else { format!("({name})") }));
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        // A blank list has two readings and they want different fixes: the
+        // range table was empty, or no stack word in the window fell inside a
+        // range. Say which.
+        let lo = ranges.iter().map(|(e, _)| *e).min().unwrap_or(0);
+        let hi = ranges.iter().map(|(_, e)| *e).max().unwrap_or(0);
+        return format!(
+            "none: ranges={} span={lo:#x}..{hi:#x} stack_base={base:?}",
+            ranges.len()
+        );
+    }
+    out.join(", ")
 }
 
 /// Armed-check for [`report_jit_punned_putfield`], inlined into the four

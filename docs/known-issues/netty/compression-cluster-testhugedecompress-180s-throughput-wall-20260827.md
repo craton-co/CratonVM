@@ -3,7 +3,7 @@
 ## Status
 **Known throughput characteristic, partially fixed, expected to still HANG at
 the harness's 180s cap.** Pulled back from
-`docs/internal/fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
+`fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
 (full investigation and fix history) — this page is the public-facing summary.
 Reproduces every run this session, including the 2026-08-27 quiet single-shard
 ZGC rerun.
@@ -87,5 +87,5 @@ cratonvm.exe --java-home <jdk25> --Xmx 1500m -XX:+UseZGC @common.args -Dcraton.b
 ```
 
 ## Related
-- Full investigation: `docs/internal/fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
-- `docs/internal/fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
+- Full investigation: `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
+- `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
