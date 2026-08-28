@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-494 tokens.
+500 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -285,11 +285,17 @@ export inherited from a parent shell.
 | `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
 | `loop-work` | `CRATONVM_DBG_LOOP_WORK` |
 | `field-site` | `CRATONVM_DBG_FIELD_SITE` |
+| `field-descriptor` | `CRATONVM_DBG_FIELD_DESCRIPTOR` |
+| `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
+| `jit-ea` | `CRATONVM_DBG_JIT_EA` |
+| `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
+| `jit-field-sites` | `CRATONVM_DBG_JIT_FIELD_SITES` |
 | `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `remap-residue` | `CRATONVM_DBG_REMAP_RESIDUE` |
 | `oopcov` | `CRATONVM_DBG_OOPCOV` |
 | `xt-coverage` | `CRATONVM_DBG_XT_COVERAGE` |
 | `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
@@ -560,7 +566,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-237 tokens.
+243 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -587,6 +593,8 @@ export inherited from a parent shell.
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
 | `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
+| `nio-byte-direct-helpers` | `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS` |
+| `md-update-direct-helper` | `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER` |
 | `cached-entry-owner-reuse` | `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
@@ -773,6 +781,10 @@ export inherited from a parent shell.
 | `call-spill-elision` | `CRATONVM_JIT_CALL_SPILL_ELISION` |
 | `spill-narrow` | `CRATONVM_JIT_SPILL_NARROW` |
 | `spill-args-published` | `CRATONVM_JIT_SPILL_ARGS_PUBLISHED` |
+| `callee-identity` | `CRATONVM_JIT_CALLEE_IDENTITY` |
+| `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
+| `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
+| `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -961,10 +973,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-20 tokens.
+21 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `jmx-owned-synchronizers` | `CRATONVM_JMX_OWNED_SYNCHRONIZERS` |
 | `assert-single-os-thread` | `CRATONVM_ASSERT_SINGLE_OS_THREAD` |
 | `async-handoff-sleep-floor-ms` | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` |
 | `async-submit-grace-ms` | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` |
@@ -1009,10 +1022,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-17 tokens.
+18 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `field-resolution-name-only` | `CRATONVM_FIELD_RESOLUTION_NAME_ONLY` |
 | `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `map-view-cache` | `CRATONVM_MAP_VIEW_CACHE` |
 | `verify-map-view-cache` | `CRATONVM_VERIFY_MAP_VIEW_CACHE` |

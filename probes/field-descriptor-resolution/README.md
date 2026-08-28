@@ -30,16 +30,49 @@ the punned-cell containment path, so the defect surfaced as "this reference
 cannot be null" — the same species as the two known-issue pages closed the same
 day.
 
+## The other half: the pair is absent
+
+`StrictMain` + `Cv1.java` / `Cv2.java` build the case where the recorded
+`(name, descriptor)` exists **nowhere**: compiled against a `C` declaring
+`Object x`, run against a `C` whose `x` is an `int`. JVMS §5.4.3.2 makes that a
+`NoSuchFieldError`.
+
+| | result |
+|---|---|
+| HotSpot 25 | `NoSuchFieldError` |
+| CratonVM before 2026-08-28 | resolved to `C.x:I` and read an int through a reference field |
+| CratonVM after | `NoSuchFieldError` |
+
+`CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` restores the lenient answer, for a
+single-binary A/B.
+
 ## Run
+
+`B` and `C` each exist in two versions, in `v1/`+`v2/` and `c1/`+`c2/`. They
+declare the same public class name, so they must live in same-named files in
+separate directories and be compiled separately — that separation IS the shape
+under test.
 
 ```bash
 JDK=/path/to/jdk-25
-"$JDK/bin/javac" -d v1c A.java Bv1.java
+CV=/path/to/cratonvm
+
+# --- the descriptor picks the RIGHT field (corrections) --------------------
+"$JDK/bin/javac" -d v1c A.java v1/B.java
 "$JDK/bin/javac" -cp v1c -d mainc Main.java
-"$JDK/bin/javac" -cp v1c -d v2c Bv2.java && cp v1c/A.class v2c/A.class
-"$JDK/bin/java"      -cp "mainc:v2c" Main     # oracle
-<cratonvm> --java-home "$JDK" -cp "mainc:v2c" Main
+"$JDK/bin/javac" -cp v1c -d v2c v2/B.java && cp v1c/A.class v2c/A.class
+"$JDK/bin/java" -cp "mainc:v2c" Main                       # oracle: A.x-object
+"$CV" --java-home "$JDK" -cp "mainc:v2c" Main              # must match
+
+# --- an absent (name, descriptor) pair is NoSuchFieldError (strict) --------
+"$JDK/bin/javac" -d c1c c1/C.java
+"$JDK/bin/javac" -cp c1c -d smainc StrictMain.java
+"$JDK/bin/javac" -d c2c c2/C.java
+"$JDK/bin/java" -cp "smainc:c2c" StrictMain                # oracle: NoSuchFieldError
+"$CV" --java-home "$JDK" -cp "smainc:c2c" StrictMain       # must match
+
+# the pre-2026-08-28 answer, for a single-binary A/B
+CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1 "$CV" --java-home "$JDK" -cp "smainc:c2c" StrictMain
 ```
 
-`Bv1.java` and `Bv2.java` both declare `class B`; compile them into the separate
-output directories shown, never together.
+Both print `PROBE-PASS` or `PROBE-FAIL`.

@@ -6797,11 +6797,95 @@ unsafe fn report_jit_punned_putfield(obj_ptr: i64, field_index: i64, value: Valu
     eprintln!(
         "[punned-store-jit] class={name} class_id={class_id} num_slots={num_slots} \
          field_index={field_index} value={value:?} declared_ref={declared_ref:?} \
-         compact_flag={} gc_flags={gc_flags:#x} jit_callee={}\n{}",
+         compact_flag={} gc_flags={gc_flags:#x} jit_callee={} compiled_frames=[{}]\n{}",
         gc_flags & cratonvm_types::GC_FLAG_COMPACT != 0,
         current_jit_callee(),
+        compiled_frames_above(),
         std::backtrace::Backtrace::force_capture(),
     );
+}
+
+/// The compiled methods whose bodies are on the stack above this helper, named.
+///
+/// `current_jit_callee()` is populated by `JitCalleeGuard`, which only
+/// `jit_invoke_dispatch` constructs — so a callee reached by a RAW JIT-to-JIT
+/// direct call has no name there at all, and the punned-store report came back
+/// with `jit_callee=` empty every time. That is not a gap in the report, it is
+/// the report telling you which call form you are looking at; but it leaves the
+/// writer unnamed and the only way to the method was a deny bisect.
+///
+/// This walks the machine stack the same way the conservative root scanner
+/// does — every word from here up, tested against the JIT code-range registry
+/// — and names each compiled body it finds. Diagnostic-only, on a `#[cold]`
+/// path behind `CRATONVM_DBG_JIT_PUTFIELD`, so its cost is irrelevant; and it
+/// cannot fabricate an answer, because `pin_jit_code_range_owner` returns a
+/// body only for an address a LIVE compiled artifact actually covers.
+fn compiled_frames_above() -> String {
+    // EXACT, via the frame-pointer chain -- not a conservative sweep.
+    //
+    // The scan this replaced tested every stack word in a window against the
+    // JIT code-range table. It found frames sometimes and nothing at other
+    // times on the same build, which is the worst property a witness can have:
+    // its silence meant nothing. The chain answers the actual question -- which
+    // return addresses are on this stack -- and answers it the same way every
+    // time.
+    //
+    // Requires frame pointers in the Rust frames between here and
+    // `jit_putfield_int`; build the diagnostic binary with
+    // `RUSTFLAGS="-C force-frame-pointers=yes"`. Compiled JIT frames maintain
+    // RBP already (`emit_post_call_rbp_republish` exists to keep it correct
+    // across a raw JIT-to-JIT return), so the chain continues into them.
+    let ranges = cratonvm_jit::jit_code_ranges_snapshot();
+    if ranges.is_empty() {
+        return "none: code-range table empty".to_string();
+    }
+    let mut rbp: usize;
+    // SAFETY: reads a register. No memory is accessed by the asm itself.
+    unsafe {
+        std::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    // 64 links is far past the handful of frames between this helper and the
+    // compiled body that called it, and bounds a chain a clobbered RBP could
+    // otherwise make cyclic.
+    while depth < 64 && rbp > 0xffff && rbp % 8 == 0 {
+        // SAFETY: `rbp` is a frame-pointer value read from the chain; each link
+        // is `[saved_rbp, return_address]`. The bounds tests above reject the
+        // obviously-invalid values a clobbered register would produce, and the
+        // loop is depth-bounded.
+        let (next, ret) = unsafe {
+            (
+                std::ptr::read_volatile(rbp as *const usize),
+                std::ptr::read_volatile((rbp + 8) as *const usize),
+            )
+        };
+        if let Some(&(entry, _)) = ranges.iter().find(|(e, end)| ret >= *e && ret < *end) {
+            let name = cratonvm_jit::jit_code_range_method_key(ret).unwrap_or_default();
+            out.push(format!(
+                "{entry:#x}+{:#x}{}",
+                ret - entry,
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("({name})")
+                }
+            ));
+            if out.len() >= 6 {
+                break;
+            }
+        }
+        if next <= rbp {
+            break; // the chain must grow upward; anything else is not a frame
+        }
+        rbp = next;
+        depth += 1;
+    }
+    if out.is_empty() {
+        format!("none: walked {depth} frames, {} ranges live", ranges.len())
+    } else {
+        out.join(", ")
+    }
 }
 
 /// Armed-check for [`report_jit_punned_putfield`], inlined into the four
@@ -10843,7 +10927,9 @@ mod site_refusal {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// One counter per refusal reason, in the order they are tested.
-    pub(super) static COUNTS: [AtomicU64; 8] = [
+    pub(super) static COUNTS: [AtomicU64; 10] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -10854,7 +10940,7 @@ mod site_refusal {
         AtomicU64::new(0),
     ];
 
-    pub(super) const REASONS: [&str; 8] = [
+    pub(super) const REASONS: [&str; 10] = [
         "invoke-kind not virtual/interface/static, or receiver not a heap object",
         "method name is special-cased by invoke_or_native",
         "receiver class unavailable",
@@ -10866,8 +10952,24 @@ mod site_refusal {
         // cache this path shipped with before 836631dcc. Under the default
         // `all` nothing reports it, exactly as during its retirement.
         "registered, but does not claim leaf (mode=leaf)",
-        "SyntheticStub / policy refused",
+        // Slot 6 used to be every `SyntheticStub` plus every policy refusal in
+        // one number, which made the two indistinguishable — and they have
+        // opposite remedies. A stub that YIELDS (slot 8) must be refused: the
+        // bytecode is what runs, and 2026-08-22 relaxed the compile gates so
+        // the JIT compiles it. A stub that WINS is an ordinary registered
+        // native that this cache simply declined to resolve, and refusing it
+        // cost every call `invoke_or_native`'s full cascade — 4.77 calls per
+        // expired task on `HashedWheelTimerTest` alone
+        // (`AbstractOwnableSynchronizer.setExclusiveOwnerThread`).
+        //
+        // In `Compatible` mode slot 6 is now reachable only through the
+        // `CRATONVM_JIT_SITE_CACHE_STUBS=0` lever, so a non-zero value there
+        // with the lever unset is a defect. Under `--jdk-only` it is the
+        // ordinary §1.3 refusal and a large number is expected.
+        "SyntheticStub refused without asking the arbitration (--jdk-only, or the lever)",
         "site cache disabled (mode=off)",
+        "SyntheticStub yields to real bytecode (the bytecode runs; correct to refuse)",
+        "policy refused (--jdk-only §1.3), or no callback for the slot",
     ];
 
     #[inline]
@@ -11011,6 +11113,39 @@ fn site_cache_mode_from(raw: Option<&str>) -> SiteCacheMode {
             ),
         },
     }
+}
+
+/// `CRATONVM_JIT_SITE_CACHE_STUBS=0` — refuse every `SyntheticStub` triple at
+/// the site cache, as this path did before 2026-08-27, instead of arbitrating
+/// it the way `invoke_or_native` does.
+///
+/// **Default ON** (arbitrate). The switch exists for the same reason every
+/// other lever in this file does: a release build here is ~16 minutes, so the
+/// only rigorous A/B is one binary against itself. Comparing against a
+/// separately built branch confounds this change with everything else that
+/// landed in between.
+///
+/// It is also the bisect lever for the one hazard the change carries. The
+/// arbitration `resolve_native_site` now performs is asked ONCE per call site
+/// and cached; `invoke_or_native` asks it on every dispatch. Both terms are
+/// monotone in the safe direction — a class becomes loaded, a `Code` attribute
+/// becomes decoded, never the reverse — so a cached "the native wins" cannot
+/// go stale into "the bytecode should have won" while the process runs, and a
+/// JVMTI redefine invalidates the entry through the `any_class_redefined`
+/// check on the dispatch side. If a workload ever disagrees, this switch names
+/// the change without a rebuild.
+fn synthetic_stub_site_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE_STUBS") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => true,
+        }
+    })
 }
 
 /// Does `invoke_or_native` special-case this method name BEFORE it reaches its
@@ -11187,13 +11322,78 @@ fn resolve_native_site(
     if !leaf && !mode.admits_non_leaf() {
         return site_refusal::note(5);
     }
+    // A `SyntheticStub` is not automatically a refusal — it is a QUESTION, and
+    // this path used to refuse rather than ask it.
+    //
+    // `invoke_or_native` arbitrates a stub against the real bytecode with two
+    // terms: `real_protected_stub_class(class)`, a twelve-entry allow-list, and
+    // `has_real`, "the loaded class declares concrete non-native bytecode for
+    // this triple". Only when BOTH hold does the bytecode win. For every other
+    // stub the native wins and runs on every call — which is what the exact
+    // census configuration says (`--nojit CRATONVM_DISABLE_INTRINSICS=1`):
+    // `AbstractOwnableSynchronizer.setExclusiveOwnerThread` dispatches 399,999
+    // times for 400,000 calls.
+    //
+    // Refusing here did not stop that native running. It only stopped it being
+    // RESOLVED ONCE, so every call from compiled code fell to
+    // `invoke_or_native`'s ~27-gate string cascade and three-string registry
+    // hash — and that route, by its own comment, "is NOT counted for the §4
+    // census", which is why `--dump-native-registry` reported 947 of those
+    // 12,000,000 calls and the cost had no name in any census.
+    //
+    // MEASURED on this branch, `probes/OwnerCallProbe.java`, JIT arm, against
+    // the identical two-level call shape on a class with no registration:
+    //
+    //     plain field store through two calls        17 ns/call
+    //     setExclusiveOwnerThread                   458-898 ns/call
+    //
+    // The arbitration is a pure function of `(class, method, descriptor)` — no
+    // per-call term — so asking it HERE, once per site at fill time, is exactly
+    // equivalent to asking it on every dispatch, and the answer is cached with
+    // the entry. `synthetic_stub_should_yield_to_real_bytecode` is the single
+    // centralised predicate both dispatch paths already use; this is a third
+    // caller of it, deliberately not a fourth copy of its five terms.
+    //
+    // `--jdk-only` is untouched: `admit_jit_fast_native_resolved` immediately
+    // below routes every admission through `resolve_native_dispatch_wave1`,
+    // whose §1.3 arm rejects a `SyntheticStub` outright. The refusal that
+    // matters for policy is still there; what is gone is a refusal that only
+    // ever cost throughput.
+    //
+    // `CRATONVM_JIT_SITE_CACHE_STUBS=0` restores the blanket refusal so one
+    // binary can be A/B'd against its own pre-change behaviour.
     if vm.natives.native_methods.kind_of_id(id)
         == Some(cratonvm_native_api::NativeKind::SyntheticStub)
     {
-        return site_refusal::note(6);
+        // Strict mode refuses here, exactly as it did before this change, and
+        // deliberately WITHOUT asking the arbitration. §1.3 forbids invoking a
+        // fake at all, so the yield question is moot — and asking it anyway
+        // would route the site into `admit_jit_fast_native_resolved`'s strict
+        // arm, which calls `record_jdk_only_fastpath_refusal` and grows the
+        // bounded violation list `--jdk-only-report` prints. This early exit is
+        // scoped to that one report: it keeps the fast-path refusal record from
+        // gaining an entry for a decision that has not changed. It is NOT a
+        // claim about the whole strict-mode census — `native-shadows-bytecode`
+        // is recorded by the INTERPRETER's Step 1 door
+        // (`record_native_shadow_ran_over_bytecode`), which this path does not
+        // reach in either direction.
+        if crate::vm::dispatch_policy(vm).is_jdk_only() {
+            return site_refusal::note(6);
+        }
+        if !synthetic_stub_site_cache_enabled() {
+            return site_refusal::note(6);
+        }
+        if crate::runtime::interpreter::synthetic_stub_should_yield_to_real_bytecode(
+            vm,
+            &owner_class,
+            info.method_name,
+            registered_descriptor,
+        ) {
+            return site_refusal::note(8);
+        }
     }
     let Some(callback) = vm.natives.native_methods.callback_of(id) else {
-        return site_refusal::note(6);
+        return site_refusal::note(9);
     };
     let Some((callback, native_id)) = admit_jit_fast_native_resolved(
         vm,
@@ -11203,7 +11403,7 @@ fn resolve_native_site(
         callback,
         Some(id),
     ) else {
-        return site_refusal::note(6);
+        return site_refusal::note(9);
     };
     Some(NativeSiteCache {
         kind,
@@ -14260,15 +14460,29 @@ unsafe fn varhandle_instance_field_read_bits(
     site_ret: u8,
     thread: Option<&mut JvmThread>,
 ) -> Option<i64> {
-    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
-    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
-    // The GC-stable key `vh_meta_get` files the handle under. Mirrors
-    // `NativeContextImpl::identity_hash_code`, including the displaced-hash
-    // consultation a thin-locked or inflated header needs.
+    // Both probes and the identity hash go through the per-epoch receiver memo.
+    // This helper serves 269 768 215 calls on
+    // `JdkZlibIntegrationTest#testHugeDecompress` — one per `ByteBuf.writeByte`,
+    // from the `RefCnt` read inside `ensureAccessible` — and it asked
+    // `is_object_address` TWICE and re-derived the handle's identity hash on
+    // every one of them. `ZObjectStarts::contains` + `is_object_address` were
+    // 10.3 % of that profile with every funnel already gone.
+    //
+    // The memo answers exactly what the two probes answered — "this address is
+    // a live object base in this GC epoch" — and its `identity` is computed by
+    // the same `java_identity_hash` arbitration this code used, so a thin-locked
+    // or inflated header still yields the displaced value `vh_meta_get` filed
+    // the handle under.
+    let (vh_class_id, key) = direct_receiver_facts(vm, vh_raw as usize)?;
+    if vh_class_id == 0 {
+        return None;
+    }
+    let (recv_class_id, _) = direct_receiver_facts(vm, recv_raw as usize)?;
+    if recv_class_id == 0 {
+        return None;
+    }
+    let receiver = ObjectRef::from_raw(recv_raw as usize as *mut u8);
     let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
     let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // Reference/primitive agreement between the variable and the call site.
     let site_is_ref = matches!(site_ret, b'L' | b'[');
@@ -15749,6 +15963,395 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
         &LONG_LONG_VALUE_INFO as *const JitInvokeInfo as i64,
         args.as_ptr() as i64,
         1,
+    )
+}
+
+/// A one-entry, per-thread memo of "the raw address `recv` holds a live object
+/// of class `class_id`", valid only inside one GC epoch.
+///
+/// # Why
+///
+/// `ZgcRealHeap::is_object_address` plus `ZObjectStarts::contains` measured
+/// **16 %** of `JdkZlibIntegrationTest#testHugeDecompress` once the funnel was
+/// off its three hot calls -- and the receiver it re-validates is the SAME
+/// object 268 million times running: one `MessageDigest`, one pooled
+/// `ByteBuffer` per megabyte chunk.
+///
+/// # Why the epoch is the whole safety argument
+///
+/// The hazard a memo has to answer is an address whose object died and whose
+/// storage was handed to something else. That cannot happen inside one epoch:
+/// an address occupied by a live object at memo time is not on any free list
+/// until a collection reclaims it, and every collection bumps
+/// `VmHeap::collection_count`. A memo from a previous epoch therefore never
+/// matches, and a moving collection is covered twice over -- the compiled
+/// frame's receiver is rewritten to the new address, which misses on `recv`
+/// as well.
+///
+/// Per-thread, so no lock and no cross-thread visibility question. A miss costs
+/// exactly what every call used to pay.
+#[derive(Clone, Copy)]
+struct DirectReceiverMemo {
+    recv: usize,
+    epoch: u64,
+    class_id: u32,
+    /// The `NativeContext`-compatible identity hash, so a helper keyed by it
+    /// (`MessageDigest.update`) does not re-derive one per call. Never `0` for
+    /// a filled entry: `java_identity_hash` refuses to hand back zero.
+    identity: i32,
+}
+
+/// FOUR entries, and the number is measured rather than chosen.
+///
+/// A ONE-entry memo removed nothing on the workload it was written for:
+/// `testHugeDecompress`'s inner loop alternates `in.writeByte(b)` with
+/// `digest.update(b)`, so consecutive calls arrive with two different receivers
+/// and a single slot thrashes on every one. `is_object_address` +
+/// `ZObjectStarts::contains` stayed at 15 % of the profile across the change.
+/// EIGHT, for the same reason four beat one. `testHugeDecompress`'s inner loop
+/// touches four distinct receivers per byte once the `VarHandle` read is on the
+/// memo too — the digest, the pooled `ByteBuffer`, the `RefCnt` the accessibility
+/// check reads, and the `VarHandle` itself — and the loop's other calls bring
+/// their own. Eight leaves headroom for that without the scan mattering: it is
+/// eight predictable compares against a probe that walks a sorted page index.
+const DIRECT_RECEIVER_MEMO_WAYS: usize = 8;
+
+thread_local! {
+    static DIRECT_RECEIVER_MEMO: std::cell::Cell<[DirectReceiverMemo; DIRECT_RECEIVER_MEMO_WAYS]> =
+        const {
+            std::cell::Cell::new(
+                [DirectReceiverMemo { recv: 0, epoch: 0, class_id: 0, identity: 0 };
+                    DIRECT_RECEIVER_MEMO_WAYS],
+            )
+        };
+    /// Round-robin victim for the memo above.
+    static DIRECT_RECEIVER_MEMO_NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `is_object_address` + `class_id_of` (+ the identity hash) for a thin direct
+/// helper's receiver, memoised per GC epoch. `None` means the address is not a
+/// live object base and the caller must decline.
+///
+/// # Safety
+/// `raw` is a receiver argument from JIT-compiled code; `vm` is live.
+#[inline]
+unsafe fn direct_receiver_facts(vm: &SharedVm, raw: usize) -> Option<(u32, i32)> {
+    let epoch = vm.mem.heap.collection_count();
+    let ways = DIRECT_RECEIVER_MEMO.with(std::cell::Cell::get);
+    for way in ways.iter() {
+        if way.recv == raw && way.epoch == epoch && way.class_id != 0 {
+            return Some((way.class_id, way.identity));
+        }
+    }
+    let object = vm.mem.heap.is_object_address(raw)?;
+    let class_id = vm.mem.heap.class_id_of(object).as_u32();
+    // The SAME key `NativeContextImpl::identity_hash_code` computes: the heap
+    // answer, then the monitor's displaced-hash arbitration. A locked object's
+    // mark word cannot hold a hash, so the heap answer alone is the wrong key
+    // for any side table the natives maintain.
+    let heap = &vm.mem.heap;
+    let identity = vm.threads.monitors.java_identity_hash(
+        object,
+        heap.identity_hash_code(object),
+        || heap.next_identity_hash(),
+    );
+    if class_id != 0 {
+        let slot = DIRECT_RECEIVER_MEMO_NEXT.with(|c| {
+            let i = c.get();
+            c.set((i + 1) % DIRECT_RECEIVER_MEMO_WAYS);
+            i
+        });
+        let mut updated = ways;
+        updated[slot] = DirectReceiverMemo {
+            recv: raw,
+            epoch,
+            class_id,
+            identity,
+        };
+        DIRECT_RECEIVER_MEMO.with(|c| c.set(updated));
+    }
+    Some((class_id, identity))
+}
+
+/// Synthetic call-site info for the `ByteBuffer` single-byte element helpers'
+/// DECLINE edge. `num_jit_args` counts the receiver, the way an instance
+/// site's does.
+static NIO_BYTEBUFFER_PUT_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/nio/ByteBuffer",
+    method_name: "put",
+    descriptor: "(IB)Ljava/nio/ByteBuffer;",
+    num_jit_args: 3,
+    return_type: b'L',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+static NIO_BYTEBUFFER_GET_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/nio/ByteBuffer",
+    method_name: "get",
+    descriptor: "(I)B",
+    num_jit_args: 2,
+    return_type: b'I',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+/// The shared prologue of both `ByteBuffer` single-byte helpers: prove the
+/// receiver is a direct buffer of a class the FUNNEL has already served with
+/// the modelled layout, and return the element's absolute address.
+///
+/// It reads the same three fields `native-io`'s `dbb_elem_addr` reads, through
+/// the same descriptor-aware accessor, in the same order, and refuses on the
+/// same conditions — a negative or out-of-limit index, a read-only carrier for
+/// a write, a non-positive address. That is deliberate duplication of a
+/// SEQUENCE, not of a LAYOUT: the three field indices come from
+/// `elem_fastpath::slots()`, which is what the native itself resolved, so
+/// there is no second copy of the layout to drift.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+unsafe fn dbb_direct_elem_addr(
+    vm: &SharedVm,
+    receiver: i64,
+    index: i64,
+    for_write: bool,
+) -> Option<i64> {
+    let raw = receiver as u64;
+    if (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+        return None;
+    }
+    let (address_slot, limit_slot, read_only_slot) =
+        cratonvm_native_io::direct_buffer::elem_fastpath::slots()?;
+    // The arena-membership probe, for the reason the `Long.longValue` twin
+    // states: nothing on this path has read the receiver's header yet, so it is
+    // the only thing between a fabricated argument and the field reads below.
+    // Memoised per GC epoch -- see `direct_receiver_facts`.
+    let (class_id, _identity) = direct_receiver_facts(vm, raw as usize)?;
+    if !cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served(class_id, for_write) {
+        return None;
+    }
+    // The memo proved this address is a live object base in this epoch, so the
+    // reference is reconstructible without a second probe -- the same step
+    // `jit_hashmap_get_direct` takes after its own exact-receiver screen.
+    let object = ObjectRef::from_raw(raw as usize as *mut u8);
+    // H12-1, as on the `HashMap` helpers: the registered row is `bridge`, so
+    // under a policy latch that went strict AFTER this site was compiled the
+    // real bytecode is authoritative and this helper must not answer. Placed
+    // after the receiver screens so the refusal counter counts calls the fast
+    // path would otherwise have SERVED.
+    if jit_direct_helper_refused(vm) {
+        return None;
+    }
+    let cratonvm_types::Value::Int(limit) = vm.mem.heap.get_field_as(object, limit_slot, b'I')
+    else {
+        return None;
+    };
+    // Cast: the JIT operand stack carries one sign-extended i64 per int.
+    let idx = index as i32;
+    if idx < 0 || idx >= limit {
+        return None;
+    }
+    if for_write
+        && !matches!(
+            vm.mem.heap.get_field_as(object, read_only_slot, b'Z'),
+            cratonvm_types::Value::Int(0)
+        )
+    {
+        return None;
+    }
+    let cratonvm_types::Value::Long(address) = vm.mem.heap.get_field_as(object, address_slot, b'J')
+    else {
+        return None;
+    };
+    if address <= 0 {
+        return None;
+    }
+    address.checked_add(i64::from(idx))
+}
+
+/// Thin direct-call target for JIT `ByteBuffer.put(int,byte)` sites.
+///
+/// See `cratonvm_jit::NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN` for the census. The
+/// fast path writes one byte and returns the receiver, which is what
+/// `put(int,byte)` returns; **every** case it is not certain of — a null or
+/// fabricated receiver, a class the funnel has not served, an out-of-limit
+/// index, a read-only carrier, an address the off-heap store refuses — falls
+/// through to the generic dispatcher, so the exception a caller sees is still
+/// the registered native's.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_dbb_put_byte_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    index: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(at) = dbb_direct_elem_addr(vm, receiver, index, true) {
+        // Cast: only the low 8 bits are the Java `byte`; the operand stack
+        // widened it to int.
+        let byte = value as u8;
+        // Classified by the TAG BIT and not by an arena liveness probe, for the
+        // reason `NativeContextImpl::copy_to_native_memory` states: a tagged
+        // handle whose arena was freed must be DECLINED, never copied as an OS
+        // pointer.
+        let stored = if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(at) {
+            cratonvm_native_builtins::unsafe_arena_copy_in(at, &[byte])
+        } else if at > 0 {
+            // SAFETY: `at` is `address + index` for an index the carrier's own
+            // `limit` admits, and `address` is the block this buffer owns.
+            std::ptr::write(at as *mut u8, byte);
+            true
+        } else {
+            false
+        };
+        if stored {
+            cratonvm_jit::NIO_BYTE_ELEMENT_SERVED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return receiver;
+        }
+    }
+    cratonvm_jit::NIO_BYTE_ELEMENT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, index, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &NIO_BYTEBUFFER_PUT_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
+/// Thin direct-call target for JIT `ByteBuffer.get(int)` sites — the read twin
+/// of [`jit_dbb_put_byte_direct`], with the same decline contract.
+///
+/// The value is returned SIGN-EXTENDED through `i8`, which is what
+/// `dbb_get_abs` produces (`Value::Int(i32::from(byte as i8))`) and what every
+/// `b < 0` caller expects.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_dbb_get_byte_direct(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(at) = dbb_direct_elem_addr(vm, receiver, index, false) {
+        let mut byte = [0u8; 1];
+        let loaded = if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(at) {
+            cratonvm_native_builtins::unsafe_arena_copy_out(at, &mut byte)
+        } else if at > 0 {
+            // SAFETY: as the store twin — inside the carrier's own block.
+            byte[0] = std::ptr::read(at as *const u8);
+            true
+        } else {
+            false
+        };
+        if loaded {
+            cratonvm_jit::NIO_BYTE_ELEMENT_SERVED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return i64::from(byte[0] as i8);
+        }
+    }
+    cratonvm_jit::NIO_BYTE_ELEMENT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, index];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &NIO_BYTEBUFFER_GET_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
+}
+
+/// Synthetic call-site info for [`jit_md_update_byte_direct`]'s decline edge.
+static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/security/MessageDigest",
+    method_name: "update",
+    descriptor: "(B)V",
+    num_jit_args: 2,
+    return_type: b'V',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+/// Thin direct-call target for JIT `MessageDigest.update(byte)` sites.
+///
+/// See `cratonvm_jit::MD_UPDATE_BYTE_DIRECT_FN` for the census. The fast path
+/// appends one byte to the accumulator the registered native keeps for this
+/// receiver, and it may do so only when BOTH of the native's own conditions
+/// hold: the receiver's class is the exact one `md_receiver_is_ours` accepted,
+/// and the side table already has an entry for it.
+///
+/// The key is computed the way `NativeContextImpl::identity_hash_code`
+/// computes it — heap answer, then `Monitors::java_identity_hash` — and NOT
+/// from the heap alone. A locked object's mark word cannot hold a hash, so the
+/// heap answer for one is `0` and the monitor holds the displaced value; using
+/// the heap answer directly would file a byte under a key the native never
+/// uses. Getting it wrong would MISS rather than corrupt (the entry is looked
+/// up, never created), but a miss on every call is a fast path that does
+/// nothing while looking installed.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_md_update_byte_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    'fast: {
+        let raw = receiver as u64;
+        if (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+            break 'fast;
+        }
+        // The arena-membership probe: the only thing between a fabricated
+        // argument and the class-header read below. Memoised per GC epoch --
+        // see `direct_receiver_facts`. This receiver is the SAME digest for
+        // every one of the 268 million bytes a side, so the memo hits on all
+        // but the first (and the entry carries the identity key, which is what
+        // this helper would otherwise re-derive per byte).
+        let Some((class_id, key)) = direct_receiver_facts(vm, raw as usize) else {
+            break 'fast;
+        };
+        if !cratonvm_native_builtins::jca::message_digest::update_fastpath::class_is_ours(class_id)
+        {
+            break 'fast;
+        }
+        if jit_direct_helper_refused(vm) {
+            break 'fast;
+        }
+        // Cast: only the low 8 bits are the Java `byte`; the operand stack
+        // widened it to int.
+        if !cratonvm_native_builtins::jca::message_digest::update_fastpath::append_byte(
+            key, value as u8,
+        ) {
+            break 'fast;
+        }
+        cratonvm_jit::MD_UPDATE_BYTE_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    cratonvm_jit::MD_UPDATE_BYTE_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &MD_UPDATE_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
     )
 }
 
@@ -22822,6 +23425,13 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         }
         cratonvm_jit::set_preconditions_check_index_direct_fn(
             jit_preconditions_check_index_direct as *const () as usize,
+        );
+        cratonvm_jit::set_nio_bytebuffer_byte_direct_fns(
+            jit_dbb_put_byte_direct as *const () as usize,
+            jit_dbb_get_byte_direct as *const () as usize,
+        );
+        cratonvm_jit::set_md_update_byte_direct_fn(
+            jit_md_update_byte_direct as *const () as usize,
         );
         cratonvm_jit::set_reachability_fence_direct_fn(
             jit_reachability_fence_direct as *const () as usize,

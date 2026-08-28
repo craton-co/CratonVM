@@ -20877,15 +20877,76 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
 /// historical `null`-shaped default. `Err` = out of range, and HotSpot throws
 /// `ArrayIndexOutOfBoundsException` there — see `atomic_array_index` for the
 /// measured before/after table and for why the check belongs on a funnel.
+/// The backing array of an `AtomicReferenceArray`, with the `array` field
+/// index memoized per receiver class.
+///
+/// `get_field_by_name` takes the class-manager read lock and walks the
+/// hierarchy comparing field-name strings on EVERY call. That is affordable
+/// for a cold accessor and is not what these three are: netty's MPSC timeout
+/// queue is `AtomicReferenceArray`-backed, so the exact census
+/// (`--nojit CRATONVM_DISABLE_INTRINSICS=1`) puts `lazySet` at **2.00** and
+/// `get` at **1.00** calls per expired task on `HashedWheelTimerTest` —
+/// `offer` is one `soElement`, `poll` is one `lvElement` plus one
+/// `soElement(null)`. Measured from compiled code at 183 ns and 143 ns against
+/// HotSpot's 0.91 and 0.30 (`probes/FunnelRungRate.java`).
+///
+/// Same memo shape, and for the same reason, as
+/// `AbstractOwnableSynchronizer.setExclusiveOwnerThread`'s in `jmx.rs` and
+/// `time_unit_ordinal`'s in `lib.rs`. The index is a per-class constant, so it
+/// is keyed on the receiver's class id; a miss falls back to the resolving
+/// path, so an unexpected layout is slow rather than wrong, and the `None`
+/// answer for a missing/!reference `array` field is unchanged. Class
+/// redefinition needs no invalidation: it allocates a NEW `ClassId`, so a
+/// stale entry can never be consulted for the redefined class.
+///
+/// Two slots: `AtomicReferenceArray` is one class, and the second exists only
+/// for an image that subclasses it.
+fn ara_backing_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    const MEMO_SLOTS: usize = 2;
+    thread_local! {
+        static ARRAY_FIELD_INDEX: std::cell::RefCell<[(u32, u32); MEMO_SLOTS]> =
+            const { std::cell::RefCell::new([(u32::MAX, 0); MEMO_SLOTS]) };
+    }
+    let class_id = ctx.class_id_of_object(this);
+    let raw_cid = class_id.as_u32();
+    let cached = ARRAY_FIELD_INDEX.with(|memo| {
+        memo.borrow()
+            .iter()
+            .find(|(cid, _)| *cid == raw_cid)
+            .map(|(_, index)| *index as usize)
+    });
+    if let Some(index) = cached {
+        if let Value::Object(Some(o)) = ctx.get_field(this, index) {
+            return Some(o);
+        }
+    }
+    let index = ctx.resolve_field_index_by_class_id(class_id, "array")?;
+    match ctx.get_field(this, index) {
+        Value::Object(Some(o)) => {
+            ARRAY_FIELD_INDEX.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                // Take a free slot, else evict slot 0. The policy does not need
+                // to be clever at this size, but the table must not be able to
+                // grow without bound.
+                let victim = memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                // Cast: field counts are far below `u32::MAX`.
+                memo[victim] = (raw_cid, index as u32);
+            });
+            Some(o)
+        }
+        _ => None,
+    }
+}
+
 fn ara_slot(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> Result<Option<(ObjectRef, usize)>, MethodCallFailed> {
     let this = obj_arg(args, 0)?;
     let raw = atomic_array_raw_index(args);
-    let arr = match ctx.get_field_by_name(this, "array") {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let arr = match ara_backing_array(ctx, this) {
+        Some(o) => o,
+        None => return Ok(None),
     };
     Ok(Some((arr, atomic_array_index(ctx, arr, raw)?)))
 }

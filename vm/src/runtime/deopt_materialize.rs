@@ -196,6 +196,34 @@ pub(crate) fn materialize_virtual_objects(
     if states.is_empty() {
         return Ok(Vec::new());
     }
+    // Engagement census (`cratonvm_types::scalar_deopt_census`). Counted HERE,
+    // past the empty check, so the number means "objects the compiler deleted
+    // and a deopt had to put back" — the only evidence that a soak exercised
+    // the descriptor rather than merely the deletion.
+    cratonvm_types::scalar_deopt_census::note_materialized(states.len() as u64);
+
+    // ENGAGEMENT COUNTER. `CRATONVM_SCALAR_DEOPT` has two halves, and only one
+    // of them is exercised by simply running a workload: the producer elides
+    // more allocations (every run pays that), while the CONSUMER -- rebuilding
+    // an elided object at a precise resume -- only runs if a deopt actually
+    // lands on a frame that names one. A soak that never reaches this line has
+    // not tested the half that can hand the interpreter a wrong object, so a
+    // green result from it would be vacuous.
+    //
+    // One line per materialization, under the flag the feature already has, so
+    // `grep -c` is the whole instrument.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        let shells: usize = states.len();
+        let fields: usize = states.values().map(|s| s.num_fields).sum();
+        let arrays: usize = states
+            .values()
+            .filter(|s| s.array_element_type.is_some())
+            .count();
+        eprintln!(
+            "[DBG_SCALAR_DEOPT] MATERIALIZE bci={} objects={shells} (arrays={arrays}) slots={fields}",
+            frame.bci,
+        );
+    }
 
     let mut scope = TempRootScope::new(thread);
 

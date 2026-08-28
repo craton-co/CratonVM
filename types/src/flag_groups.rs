@@ -509,11 +509,26 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-site", on_key: Some("CRATONVM_DBG_FIELD_SITE"), off_key: None, off_word: None },
+    // Traces a field resolution that matched on NAME only after the
+    // name+descriptor lookup missed -- the separate-compilation shape where
+    // the JVMS key and the name key disagree. Read presence-only
+    // (`runtime_var_os(..).is_some()`) at vm/src/runtime/resolve/mod.rs, so no
+    // off_word. Declared here after `flag_declaration_guard` caught it reading
+    // through a live `getenv`, which is how a flag-dependent test ends up
+    // measuring the developer's ambient environment.
+    E { group: Group::DBG, token: "field-descriptor", on_key: Some("CRATONVM_DBG_FIELD_DESCRIPTOR"), off_key: None, off_word: None },
+    // Four more presence-only DBG traces from the 2026-08-27/28 JIT wave, all
+    // read through a live `getenv` until this declaration.
+    E { group: Group::DBG, token: "jit-direct-binds", on_key: Some("CRATONVM_DBG_JIT_DIRECT_BINDS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-elide-ctor", on_key: Some("CRATONVM_DBG_JIT_ELIDE_CTOR"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-field-sites", on_key: Some("CRATONVM_DBG_JIT_FIELD_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "remap-residue", on_key: Some("CRATONVM_DBG_REMAP_RESIDUE"), off_key: None, off_word: None },
     // Declared 2026-08-23. `jit-rootscan` reports the moving-young coverage
     // verdict as an aggregate `map_coverage=N` counter, which names neither the
     // METHOD nor WHICH of `fully_oop_covered`'s four terms said no. `oopcov`
@@ -925,6 +940,8 @@ pub const INVENTORY: &[E] = &[
     // AFTER `CRATONVM_JIT_FORCE_C2` in the admission chain).
     E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "census-direct-helpers", on_key: Some("CRATONVM_JIT_CENSUS_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "nio-byte-direct-helpers", on_key: Some("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "md-update-direct-helper", on_key: Some("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None },
@@ -1297,6 +1314,16 @@ pub const INVENTORY: &[E] = &[
     // because it has not published anything. Declared here after
     // `flag_declaration_guard` caught it reading through a live `getenv`.
     E { group: Group::JIT, token: "spill-args-published", on_key: Some("CRATONVM_JIT_SPILL_ARGS_PUBLISHED"), off_key: None, off_word: Some("0") },
+    // Default-ON kill switches from the same wave: each reads
+    // `runtime_var(..).map(|v| v != "0").unwrap_or(true)` or the `0`/`false`/
+    // `off` spelling of it, so `=0` is the off word and there is no on_key
+    // semantics beyond presence.
+    E { group: Group::JIT, token: "callee-identity", on_key: Some("CRATONVM_JIT_CALLEE_IDENTITY"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "elide-trivial-ctor", on_key: Some("CRATONVM_JIT_ELIDE_TRIVIAL_CTOR"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "site-cache-stubs", on_key: Some("CRATONVM_JIT_SITE_CACHE_STUBS"), off_key: None, off_word: Some("0") },
+    // Presence-only, and named as a NEGATIVE, so it is an off_key with no on
+    // spelling -- the same shape as `no-atomic-intrinsic` above it.
+    E { group: Group::JIT, token: "atomic-long-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
@@ -1625,6 +1652,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::IO, token: "socket-capture", on_key: Some("CRATONVM_SOCKET_CAPTURE"), off_key: None, off_word: None },
     E { group: Group::IO, token: "uri-strict-chars", on_key: Some("CRATONVM_URI_STRICT_CHARS"), off_key: None, off_word: Some("0") },
     E { group: Group::IO, token: "zip-max-entry-bytes", on_key: Some("CRATONVM_ZIP_MAX_ENTRY_BYTES"), off_key: None, off_word: None },
+    // `ThreadMXBean.getLockedSynchronizers` support; DEFAULT-ON, so a kill
+    // switch. THREADS rather than a JMX group because the group vocabulary
+    // has no JMX and this is a threading capability the bean exposes.
+    E { group: Group::THREADS, token: "jmx-owned-synchronizers", on_key: Some("CRATONVM_JMX_OWNED_SYNCHRONIZERS"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "assert-single-os-thread", on_key: Some("CRATONVM_ASSERT_SINGLE_OS_THREAD"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-handoff-sleep-floor-ms", on_key: Some("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-submit-grace-ms", on_key: Some("CRATONVM_ASYNC_SUBMIT_GRACE_MS"), off_key: None, off_word: None },
@@ -1708,6 +1739,13 @@ pub const INVENTORY: &[E] = &[
     // selects is which verifier sees which chain, and at what strength floor.
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
+    // A/B lever, never a supported configuration: restore the pre-2026-08-28
+    // LENIENT field resolution, which answered a fieldref whose (name,
+    // descriptor) pair is absent anywhere in the hierarchy with a same-named
+    // field of another type instead of raising NoSuchFieldError
+    // (JVMS 5.4.3.2). COMPAT because the only thing it can buy is letting an
+    // application whose classpath has that shape keep running.
+    E { group: Group::COMPAT, token: "field-resolution-name-only", on_key: Some("CRATONVM_FIELD_RESOLUTION_NAME_ONLY"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
     // The keySet-view rebuild elision, default-ON. `0` restores the
     // unconditional per-read rebuild, which is the A/B a same-binary

@@ -585,6 +585,11 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     // exits through `System.exit` and never reaches `vm-cli`'s normal-return
     // arm -- which is how a 1975-class sweep produced this line in zero logs
     // and read as a clean run.
+    // Whether `CRATONVM_SCALAR_DEOPT` actually reached this run. Same exit path
+    // and the same reason as the census below it: a JUnit runner leaves through
+    // `System.exit`, so a gauntlet sweep that reported engagement anywhere else
+    // would report it in zero logs.
+    cratonvm_types::scalar_deopt_census::exit_summary();
     cratonvm_types::cell_census::exit_summary();
     // Same argument, same exit path: the post-remap stale-frame-word detector
     // splits its hits into words something RESUMES from and words nothing
