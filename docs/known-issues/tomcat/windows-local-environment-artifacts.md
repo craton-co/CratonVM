@@ -44,7 +44,7 @@ Confirmed via HotSpot cross-check on `TestDeployTask` in an earlier session
 turn: HotSpot gets `NOSUMMARY` (can't even load the test class) with the
 identical classpath. `org.apache.tools.ant.Task` genuinely isn't on this
 fixture's classpath. Same category as the EasyMock/ByteBuddy gap
-(`easymock-bytebuddy-classpath-version-gap-not-a-cratonvm-bug-20260828.md`) —
+(`easymock-bytebuddy-classpath-version-gap-not-a-cratonvm-bug.md`) —
 a fixture dependency gap.
 
 ## `TestResponsePerformance.testToAbsolutePerformance`, `TestAsyncMessagesPerformance.testAsyncTiming` — relative-timing races
