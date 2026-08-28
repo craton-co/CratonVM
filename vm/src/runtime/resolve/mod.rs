@@ -1253,25 +1253,45 @@ impl<'a> MemberResolver<'a> {
                 // hierarchy. JVMS §5.4.3.2 makes that a `NoSuchFieldError`, and
                 // that is what this now raises — `None` here reaches the
                 // `NoSuchField` arm below.
+                let name_only = find_field_recursive(owner_id, field_name, cm.class_store());
+                // COUNT ONLY WHAT STRICTNESS CHANGES.
                 //
-                // Counted either way, so the two arms of the lever produce
-                // comparable numbers: this is the count of resolutions that
-                // USED to be answered by a same-named field of another type.
-                FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_DESCRIPTOR").is_some()
-                {
-                    tracing::warn!(
-                        target: "cratonvm::resolve",
-                        owner = owner_name,
-                        field = field_name,
-                        wanted_descriptor = d,
-                        lenient = field_resolution_name_only_fallback(),
-                        "no field of this name and descriptor exists in the hierarchy",
-                    );
+                // `None` from the descriptor search covers two situations, and
+                // only one of them is this fix's business:
+                //
+                //   * the NAME exists on some field of another type — the
+                //     lenient answer was that field, the strict answer is
+                //     `NoSuchFieldError`, and the behaviour differs;
+                //   * the name exists nowhere — `NoSuchFieldError` either way,
+                //     and nothing changed.
+                //
+                // Counting both conflates them, and the first thing this
+                // counter did after being made unconditional was report `1` on
+                // a workload where the answer had not changed at all
+                // (`org/slf4j/impl/StaticLoggerBinder.REQUESTED_API_VERSION`,
+                // a field that class does not declare — SLF4J's own version
+                // sanity check, which catches the error by design). A counter
+                // that fires on unchanged behaviour cannot be used to decide
+                // whether behaviour changed.
+                if name_only.is_some() {
+                    FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_DESCRIPTOR")
+                        .is_some()
+                    {
+                        tracing::warn!(
+                            target: "cratonvm::resolve",
+                            owner = owner_name,
+                            field = field_name,
+                            wanted_descriptor = d,
+                            found_descriptor = name_only.map(|(_, f, _)| f.descriptor.to_string()),
+                            lenient = field_resolution_name_only_fallback(),
+                            "a field of this NAME exists but not with this descriptor; strict                              resolution raises NoSuchFieldError where the name-only key returned                              the other field",
+                        );
+                    }
                 }
                 if field_resolution_name_only_fallback() {
-                    find_field_recursive(owner_id, field_name, cm.class_store())
+                    name_only
                 } else {
                     None
                 }
