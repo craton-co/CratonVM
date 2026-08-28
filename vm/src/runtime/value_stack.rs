@@ -727,6 +727,28 @@ impl ValueStack {
         matches!(kind, KIND_LONG | KIND_DOUBLE) || cv.is_category2()
     }
 
+    /// The `kinds` mark a genuine `long` producer writes.
+    ///
+    /// Published so the invoke-argument and field-store paths outside this
+    /// module can ask "did the push prove this slot is a category-2
+    /// primitive?" instead of re-deriving the answer from bits that, for a
+    /// verbatim `long` or `double`, carry no tag at all.
+    pub const KIND_MARK_LONG: u8 = KIND_LONG;
+
+    /// The `kinds` mark a genuine `double` producer writes. See
+    /// [`KIND_MARK_LONG`](Self::KIND_MARK_LONG) and
+    /// `CompactValue::double_raw`.
+    pub const KIND_MARK_DOUBLE: u8 = KIND_DOUBLE;
+
+    /// True when the top slot was pushed by a genuine `double` producer.
+    ///
+    /// `false` on an empty stack, so a caller can use it as a guard
+    /// immediately before the pop it is deciding about.
+    #[inline(always)]
+    pub fn peek_kind_is_double(&self) -> bool {
+        self.len > 0 && self.kinds[self.len - 1] == KIND_DOUBLE
+    }
+
     /// Push an int directly as a CompactValue (T10.9.D hot-path).
     ///
     /// Returns `Err` on overflow so the signature mirrors `push(Value)`.
@@ -897,8 +919,9 @@ impl ValueStack {
     /// Pop one slot and decode it as an `invoke*` argument of `desc_byte`,
     /// honoring the `KIND_LONG` mark.
     ///
-    /// A `J` parameter whose slot was pushed by a genuine long producer is
-    /// read bit-exact via [`CompactValue::as_long_unchecked`], so a
+    /// A `J` or `D` parameter whose slot was pushed by a genuine category-2
+    /// producer is read bit-exact via [`CompactValue::as_long_unchecked`] /
+    /// [`CompactValue::to_bits`], so a
     /// collision-shaped long (top bits `0xFFFC_…`, low 32-bit payload) keeps
     /// its high bits instead of being truncated by
     /// [`CompactValue::decode_by_descriptor`]'s i2l-widening fallback. All
@@ -906,51 +929,22 @@ impl ValueStack {
     /// the legacy widening for synthetic int-where-long).
     #[inline]
     pub fn pop_arg_for_descriptor_checked(&mut self, desc_byte: u8) -> Result<Value, RuntimeError> {
-        let (cv, is_long) = self.pop_compact_with_long_mark()?;
-        Ok(if is_long {
+        let (cv, kind) = self.pop_with_kind()?;
+        Ok(if matches!(kind, KIND_LONG | KIND_DOUBLE) {
             match desc_byte {
                 b'J' => Value::Long(cv.as_long_unchecked()),
-                b'D' => Value::Double(f64::from_bits(cv.as_long_unchecked() as u64)),
+                // Both marks mean the same thing here: the slot IS its 64
+                // bits. `CompactValue::double_raw` stores a double verbatim
+                // exactly as `CompactValue::long` stores a long, so a `D`
+                // parameter whose bits collide with the NaN-box tag space
+                // must be reinterpreted, not decoded by the sub-tag it
+                // happens to match.
+                b'D' => Value::Double(f64::from_bits(cv.to_bits())),
                 _ => cv.decode_by_descriptor(desc_byte),
             }
         } else {
             cv.decode_by_descriptor(desc_byte)
         })
-    }
-
-    /// Unchecked sibling of [`Self::pop_compact_with_long_mark`] for the hot
-    /// fast-path return handler. Panics (debug) on underflow like
-    /// [`Self::pop_compact`].
-    #[inline(always)]
-    pub fn pop_compact_with_long_mark_unchecked(&mut self) -> (CompactValue, bool) {
-        debug_assert!(
-            self.len > 0,
-            "stack underflow in pop_compact_with_long_mark_unchecked"
-        );
-        self.len -= 1;
-        (self.slots[self.len], self.kinds[self.len] == KIND_LONG)
-    }
-
-    /// Pop a raw `CompactValue` together with a flag indicating whether the
-    /// slot was marked `KIND_LONG` (i.e. pushed by a genuine long producer:
-    /// `lload`/`ladd`/long return/etc.).
-    ///
-    /// Needed by the `invoke*` argument marshalling, which pops every slot as
-    /// a raw `CompactValue` (descriptor known only after the reverse). When
-    /// the flag is `true`, a `J`-descriptor parameter must decode bit-exact
-    /// via [`CompactValue::as_long_unchecked`] — a collision-shaped long
-    /// (`0xFFFC_…` top bits with `payload < 2^32`, e.g. SHA-512 working
-    /// variables) is otherwise indistinguishable from a tagged int and gets
-    /// truncated by `decode_by_descriptor(b'J')`'s i2l-widening fallback.
-    #[inline(always)]
-    pub fn pop_compact_with_long_mark(&mut self) -> Result<(CompactValue, bool), RuntimeError> {
-        if self.len == 0 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "operand stack underflow".to_string(),
-            });
-        }
-        self.len -= 1;
-        Ok((self.slots[self.len], self.kinds[self.len] == KIND_LONG))
     }
 
     // ── AUDIT CRIT-4: int-specialised push/pop (no Value enum round-trip) ──

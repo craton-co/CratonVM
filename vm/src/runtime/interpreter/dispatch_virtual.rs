@@ -2372,12 +2372,12 @@ pub(super) fn execute_invokevirtual_cached(
                     if cached_string_lower || cached_map_get {
                         let argument = thread.frames[frame_idx]
                             .stack
-                            .pop_compact_with_long_mark()?
+                            .pop_with_kind()?
                             .0
                             .decode_by_descriptor(b'L');
                         let receiver = thread.frames[frame_idx]
                             .stack
-                            .pop_compact_with_long_mark()?
+                            .pop_with_kind()?
                             .0
                             .decode_by_descriptor(b'L');
                         let mut args = [receiver, argument];

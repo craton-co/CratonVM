@@ -3919,10 +3919,25 @@ mod tests {
                 cv.0, bits,
                 "{bits:#018x} must round-trip verbatim through double_raw",
             );
-            // `decode_by_descriptor` is the context-carrying read, and it agrees.
-            match cv.decode_by_descriptor(b'D') {
-                Value::Double(d) => assert_eq!(d.to_bits(), bits),
-                other => panic!("D-descriptor decode of {bits:#018x} gave {other:?}"),
+            // The descriptor-aware read agrees, EXCEPT inside the one
+            // sub-region a descriptor alone cannot separate: a `SUB_INT`
+            // pattern whose payload is under 2^32 is bit-for-bit what
+            // `CompactValue::int` produces for a small int, and a `SUB_NULL` /
+            // `SUB_UNINIT` pattern with payload 0 is bit-for-bit a real null or
+            // an unwritten slot. `decode_by_descriptor` has no kind mark to
+            // consult, so it keeps answering `Int`-widened / `0.0d` there. Every
+            // slot the interpreter actually stores a double in DOES carry that
+            // mark, which is why the two exceptions below cost nothing at
+            // runtime -- see `decode_arg_kind_aware` and `peek_kind_is_double`.
+            let payload = bits & PAYLOAD_MASK;
+            let sub = (bits >> SUBTAG_SHIFT) & SUBTAG_MASK;
+            let descriptor_alone_is_ambiguous = (sub == SUB_INT && payload >> 32 == 0)
+                || ((sub == SUB_NULL || sub == SUB_UNINIT) && payload == 0);
+            if !descriptor_alone_is_ambiguous {
+                match cv.decode_by_descriptor(b'D') {
+                    Value::Double(d) => assert_eq!(d.to_bits(), bits),
+                    other => panic!("D-descriptor decode of {bits:#018x} gave {other:?}"),
+                }
             }
             // And `from_value_kinded` is the same encode by another door.
             assert_eq!(
@@ -3935,6 +3950,25 @@ mod tests {
             0,
             "double_raw must never reach the collapse counter",
         );
+
+        // Name the ambiguous sub-region explicitly: exactly the patterns a
+        // *descriptor-only* decode still reads as something else. Both are
+        // SUB_INT with a payload a real int could have had.
+        for (bits, as_int) in [
+            (0xFFFC_0000_0000_0000u64, 0i32),
+            (0xFFFC_0000_0000_0001u64, 1i32),
+        ] {
+            assert_eq!(
+                CompactValue::double_raw(f64::from_bits(bits)).0,
+                bits,
+                "the slot still holds the bits",
+            );
+            assert_eq!(
+                CompactValue::int(as_int).0,
+                bits,
+                "…and they are bit-for-bit CompactValue::int({as_int}), which is                  why a decoder with no kind mark cannot tell them apart",
+            );
+        }
 
         // Non-colliding doubles are byte-identical through both constructors,
         // so nothing that already worked changes shape.

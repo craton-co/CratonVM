@@ -344,21 +344,17 @@ pub(super) fn execute_invokestatic(
     // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
     // by `to_value() -> Value::Object`. The descriptor-aware decode
     // path (`decode_by_descriptor(b'J')`) reinterprets the raw bits.
-    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
+    let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(
-            thread.frames[frame_idx]
-                .stack
-                .pop_compact_with_long_mark()?,
-        );
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     // ONE forward scan, hoisted out of the per-argument loop below.
     let param_tags = ParamTags::of(&method_descriptor);
-    for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
+    for (i, (cv, kind)) in tmp_cv.into_iter().enumerate() {
         let pd_byte = param_tags.get(&method_descriptor, i);
-        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
+        let v = decode_arg_kind_aware(cv, kind, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
@@ -730,12 +726,10 @@ pub(super) fn pop_coerced_invoke_args_intrinsic<'b>(
     // colliding with SUB_OBJECT survives intact (instead of being
     // converted to `Value::Object(None)` by `to_value()` and then
     // coerced to 0L).
-    let mut cv_buf: [(CompactValue, bool); MAX_INTRINSIC_ARGS] =
-        [(CompactValue::uninitialized(), false); MAX_INTRINSIC_ARGS];
+    let mut cv_buf: [(CompactValue, u8); MAX_INTRINSIC_ARGS] =
+        [(CompactValue::uninitialized(), 0u8); MAX_INTRINSIC_ARGS];
     for i in (0..total).rev() {
-        cv_buf[i] = thread.frames[frame_idx]
-            .stack
-            .pop_compact_with_long_mark()?;
+        cv_buf[i] = thread.frames[frame_idx].stack.pop_with_kind()?;
     }
     let base = if with_receiver {
         buf[0] = coerce_invoke_arg_for_descriptor(b'L', cv_buf[0].0.decode_by_descriptor(b'L'));
@@ -749,9 +743,9 @@ pub(super) fn pop_coerced_invoke_args_intrinsic<'b>(
             .map(|s| &**s)
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
-        let (cv, is_long) = cv_buf[base + i];
+        let (cv, kind) = cv_buf[base + i];
         buf[base + i] =
-            coerce_invoke_arg_for_descriptor(pd_byte, decode_arg_kind_aware(cv, is_long, pd_byte));
+            coerce_invoke_arg_for_descriptor(pd_byte, decode_arg_kind_aware(cv, kind, pd_byte));
     }
     refresh_stale_object_args(shared, &mut buf[..total]);
     Ok(&buf[..total])
