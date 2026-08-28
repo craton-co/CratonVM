@@ -16988,6 +16988,23 @@ pub fn osr_entry_reject_count() -> usize {
 pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Compiled call sites reclassified from `invokevirtual` to a direct,
+/// non-dispatching bind because the resolved method can never be overridden —
+/// it is `final`, or its class is.
+///
+/// Separate from [`PRIVATE_INVOKEVIRTUAL_PINNED`] on purpose. The two rules
+/// reach the same conclusion by different arguments and cover different code,
+/// so one counter for both could not answer the only question worth asking of
+/// either: did THIS rule engage on THIS workload. A shared tally that moves is
+/// indistinguishable from a rule that never fired.
+pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FINAL_INVOKEVIRTUAL_PINNED`].
+pub fn final_invokevirtual_pinned() -> u64 {
+    FINAL_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Snapshot of [`PRIVATE_INVOKEVIRTUAL_PINNED`].
 pub fn private_invokevirtual_pinned() -> u64 {
     PRIVATE_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)

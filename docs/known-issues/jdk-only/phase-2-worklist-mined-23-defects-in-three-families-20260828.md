@@ -1,8 +1,9 @@
-# Working Phase 2 from the report's `outcome` field: 14 defects in the first two families
+# Working Phase 2 from the report's `outcome` field: 23 defects in the first three families
 
-**Status: 14 FIXED 2026-08-28.** `java.util.Arrays` 10, `java.util.HashMap` 4.
-All identical in both modes, so none is a `--jdk-only` defect — they are ordinary
-correctness bugs that the strict-mode instrument found.
+**Status: 22 FIXED, 1 recorded OPEN, 2026-08-28.** `java.util.Arrays` 10,
+`java.util.HashMap` 4, `java.lang.Class`/`Module` 9 (8 fixed). All identical in
+both modes, so none is a `--jdk-only` defect — they are ordinary correctness bugs
+that the strict-mode instrument found.
 
 ## 1. The families were not chosen by hand
 
@@ -123,6 +124,71 @@ represents "absent" as null cannot make at all.
 The gaps are at the **constructor** and the **callback boundary** — the two
 places where a native's own code, rather than its data structure, has to
 reproduce a contract.
+
+## 4.5 Third family: `java.lang.Class` and `java.lang.Module` — 9
+
+261 probed rows against the 20 `Class` and 5 `Module` triples the report named.
+
+**Six are one bug.** `getPackageName()` answered `""` for every primitive and
+for `void`, where the JDK answers `"java.lang"`:
+
+```text
+int.class.getPackageName()   HotSpot "java.lang"   CratonVM ""
+```
+
+The JDK's body opens `if (isPrimitive()) return "java.lang";`, and the reason is
+not arbitrary — a primitive's wrapper and its `Class` mirror both live in
+`java.lang`, so anything grouping reflected types by package (a scanner, a doc
+generator, an access check keyed on package) puts primitives with the classes
+they belong to rather than into an anonymous default-package bucket. The check
+goes BEFORE the memo: `PACKAGE_NAME_CACHE` is keyed on `ClassId` and a primitive
+mirror has one, so a wrong answer would otherwise be cached for the life of the
+VM.
+
+**Two are null handling.** `Class.getResourceAsStream(null)` answered null and
+`Module.canRead(null)` answered false, where both throw NPE. `canRead` is the
+worse shape: answering `false` makes a caller testing `if (!m.canRead(other))`
+treat an accidentally-null argument as a legitimate "no" and take the failure
+branch for the wrong reason. And for `getResourceAsStream`, null and "absent"
+were otherwise the SAME answer, so a caller that builds a resource path could
+not tell a missing file from a bug in its own path construction.
+
+**One is recorded OPEN, deliberately.**
+
+```text
+java.base.canUse(Runnable.class)   HotSpot false   CratonVM true
+```
+
+`canUse` is true only when the module DECLARES `uses` for that service. A
+faithful implementation has to read the descriptor's `uses` set — and this
+native exists *precisely because* a named `Module` mirror can carry a **null
+`descriptor` field**, which is the one thing it would have to touch. Consulting
+it means calling back into Java (`getDescriptor().uses().contains(..)`) from the
+native written to avoid that field, i.e. re-entrancy on the path
+`ServiceLoader.checkCaller` takes during `Console.<clinit>`, for one row. The
+registrar now carries the measurement and the cost: application code on a NAMED
+module may load a service its descriptor never declared; code on the unnamed
+module — most code on this VM — is unaffected, because an unnamed module
+genuinely can use anything.
+
+**What passed is the bulk of the reflection surface**: every `getName` /
+`getSimpleName` / `descriptorString` special case across primitives, arrays,
+nested, enum and anonymous classes; all of `forName` (primitives correctly NOT
+findable by name, `[I` and `[[I` findable, the slash form rejected, a null
+loader scoping to bootstrap); `cast` including its null and primitive rules; and
+the whole public-vs-declared split for fields, methods and constructors.
+
+## 4.6 The pattern, now strong enough to state
+
+Three families, 448 probed rows, 23 defects — **and every one of them is on a
+contract edge.** Not one is a wrong answer to an ordinary call, in any of the
+three.
+
+That is worth stating as a finding rather than an impression, because it has two
+consequences. It predicts where the remaining ~300 triples will yield. And it
+means **a probe that exercises only the happy path will report a family clean
+when it is not** — which is how a shim's middle stays correct while its
+perimeter rots unnoticed.
 
 ## 5. The process error, because it cost a build
 

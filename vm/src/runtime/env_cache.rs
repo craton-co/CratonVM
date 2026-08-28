@@ -493,6 +493,28 @@ pub fn osr_exception_table_allowed() -> bool {
 /// restores the refusal, so one binary still has two arms. Read once and
 /// cached.
 #[inline]
+/// Bind an `invokevirtual` whose target is `final` (or whose class is) as a
+/// direct, non-dispatching call. Default ON; `CRATONVM_JIT_FINAL_DEVIRT=0`
+/// reverts to virtual dispatch at every such site.
+///
+/// The A/B lever for `invoke::invokevirtual_site_final_owner`. It engages in
+/// the three `cp_invokespecial_owner_resolver` closures, which feed BOTH the
+/// single-pass and the optimizing-tier invoke classification — so one switch
+/// moves both, and a measurement that moves only one arm means the site was
+/// reached through a door this rule does not sit in.
+pub fn jit_final_devirt() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_FINAL_DEVIRT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub fn jit_inline_calls() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

@@ -2957,9 +2957,24 @@ pub(crate) fn native_module_can_read(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let reader = read_module_name(ctx, this);
+    // A NULL `other` is a NullPointerException, not `false`.
+    //
+    // MEASURED in BOTH modes (`probes/ClassShadowSweep.java`): HotSpot NPE,
+    // this VM `no-throw` answering false. `Module.canRead` is specified as
+    // "returns true if this module reads the given module", and the JDK
+    // dereferences `other` to classify it before any answer is possible --
+    // there is no reading of null. Answering `false` is worse than throwing,
+    // because a caller testing `if (!m.canRead(other))` treats a null it did
+    // not mean to pass as a legitimate "no" and takes the failure branch for
+    // the wrong reason.
     let provider = match args.get(1) {
         Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.canRead: other is null".to_string()),
+            }
+            .into())
+        }
     };
     let can = ctx.reads_module(&reader, &provider);
     Ok(Some(Value::Int(if can { 1 } else { 0 })))
