@@ -12,7 +12,7 @@ the volatile stripe pool was **64 one-byte mutexes in a single cache line**
 
 The per-op VarHandle costs that remain, and the composition gap under them, are
 a separate page:
-[`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md).
+[`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md).
 
 What this page got WRONG: it predicted the CAS was "the only thing between this
 and the 872x" composition gap. With the CAS fast path serving 3.84 M calls on
@@ -384,7 +384,7 @@ database, no flake, 412 ms against 359 s.
 - `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
   — where the 872x actually was. Every fix on this page moved the primitive and
   not the workload, and that page is the reason.
-- [`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md)
+- [`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md)
   — what is left: `VarHandle` operations at 9-50x and `AtomicReference.CAS` at
   114x, measured against the same `AtomicInteger`-at-parity control this page
   used.
