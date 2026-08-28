@@ -1864,8 +1864,34 @@ impl CompactValue {
             },
             b'D' => match sub {
                 SUB_LONG_LO | SUB_LONG_HI => Value::Double(f64::from_bits(self.0)),
-                SUB_INT => Value::Double(((self.0 & PAYLOAD_MASK) as u32 as i32) as f64),
-                SUB_NULL | SUB_UNINIT => Value::Double(0.0),
+                // A genuine int slot has payload < 2^32 (`CompactValue::int`
+                // stores `v as u32 as u64`), so widen it the way an `i2d`
+                // would. A SUB_INT bit pattern whose payload has bits 32-46
+                // set cannot be an int at all — under a `D` descriptor it is a
+                // double whose raw bits collided into this sub-tag (see
+                // `CompactValue::double_raw`), so reinterpret them. Exactly
+                // the discrimination the `b'J'` arm above already applies for
+                // the long side of the same collision.
+                SUB_INT => {
+                    let payload = self.0 & PAYLOAD_MASK;
+                    if payload >> 32 == 0 {
+                        Value::Double((payload as u32 as i32) as f64)
+                    } else {
+                        Value::Double(f64::from_bits(self.0))
+                    }
+                }
+                // Null / Uninitialized with payload == 0 is JVMS §2.3's
+                // default `0.0d` for an unwritten slot. A NON-ZERO payload is
+                // impossible for a real null or uninitialized slot
+                // (`CompactValue::null`/`uninitialized` both store payload 0),
+                // so it is a collided double — again mirroring `b'J'`.
+                SUB_NULL | SUB_UNINIT => {
+                    if self.0 & PAYLOAD_MASK == 0 {
+                        Value::Double(0.0)
+                    } else {
+                        Value::Double(f64::from_bits(self.0))
+                    }
+                }
                 _ => Value::Double(f64::from_bits(self.0)),
             },
             b'F' => match sub {
