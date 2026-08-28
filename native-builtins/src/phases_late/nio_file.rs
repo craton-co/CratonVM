@@ -658,6 +658,48 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Host paths: compute the real relative path (with `..` backtracking)
             // off the shared root, not just a forward strip_prefix. Falls back to
             // `target` when the roots differ (can't be relativized).
+            //
+            // ...except that the JDK does NOT fall back there, it THROWS.
+            // `Path.relativize` is specified to raise IllegalArgumentException
+            // when "this path and the given path do not have the same root",
+            // and the plainest case of that is one path absolute and the other
+            // relative. MEASURED: `Paths.get("/x").relativize(Paths.get("y"))`
+            // returned `y` here against HotSpot's IllegalArgumentException, in
+            // both modes (`probes/TailFamilySweep.java`).
+            //
+            // Handing back the TARGET is the dangerous shape: the caller
+            // believes it holds a path relative to `base`, and resolving it
+            // against `base` yields something that was never asked for. A throw
+            // is the JDK's answer and is loud.
+            //
+            // The predicate is the ROOT, not absoluteness. `WindowsPath
+            // .relativize` opens `if (!this.getRoot().equals(other.getRoot()))
+            // throw`, and on Windows those are different questions: a
+            // driveless-rooted `\x` HAS a root and is NOT absolute --
+            // `p57_win_is_absolute` says so deliberately, for keycloak-15. A
+            // first version of this fix compared absoluteness and did not fire
+            // for `Paths.get("/x").relativize(Paths.get("y"))`, which is the
+            // very row that found the defect.
+            //
+            // Deliberately narrow: only a ROOT MISMATCH throws. The virtual-FS
+            // arm above keeps its fallback untouched -- javac's
+            // ArchiveContainer and JUnit5's ClasspathScanner depend on it, and
+            // that arm's roots are the jar sentinel, not a filesystem root.
+            let root_of = |s: &str| -> Option<String> {
+                if cfg!(windows) {
+                    p57_parse_win_root(s).0
+                } else if s.starts_with('/') {
+                    Some("/".to_string())
+                } else {
+                    None
+                }
+            };
+            if root_of(&base) != root_of(&target) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "'other' is different type of Path".to_string(),
+                }
+                .into());
+            }
             let relative = p57_relativize(&base, &target).unwrap_or_else(|| target.clone());
             let result = p57_alloc_path(ctx, &relative)?;
             Ok(Some(Value::Object(Some(result))))
@@ -6760,11 +6802,32 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (`try (Writer w = out) { flushBuffer(); }`). Swallowing it is how
             // a full disk turns into a clean `try`-with-resources exit and a
             // truncated file nobody hears about.
-            // `flush()` can move `out` before `close()` dereferences it.
+            // `flush()` can move `out` before `close()` dereferences it, and
+            // both calls can move `this` before the `out = null` write below --
+            // so BOTH are pinned. `this_pin` is taken FIRST so its handle is the
+            // lower one, which is what `unpin_native_roots` unwinds to.
+            let this_pin = ctx.pin_native_root(this);
             let out_pin = ctx.pin_native_root(out);
             ctx.invoke_virtual(out, "flush", "()V", &[])?;
             let out = ctx.read_native_pin(out_pin, out);
             ctx.invoke_virtual(out, "close", "()V", &[])?;
+            // NULL `out`, which is what makes the writer CLOSED. The real class
+            // ends `close()` with `finally { out = null; cb = null; }`, and
+            // every write method opens with `ensureOpen()` --
+            // `if (out == null) throw new IOException("Stream closed")`. The
+            // write arms above already raise `bw_stream_closed()` on that
+            // branch; without this line they never reach it, because
+            // `bw_delegate_out` kept answering the closed delegate.
+            //
+            // MEASURED: `bw.close(); bw.write("x")` returned normally against
+            // HotSpot's IOException, in both modes
+            // (`probes/TailFamilySweep.java`). It only shows with a sink whose
+            // own `close` is a no-op -- a `StringWriter` -- which is why a
+            // file-backed writer never surfaced it: there the delegate itself
+            // throws, so the missing state change was invisible.
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "out", Value::Object(None));
+            ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {

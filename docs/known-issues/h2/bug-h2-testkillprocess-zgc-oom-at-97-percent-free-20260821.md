@@ -1356,6 +1356,24 @@ single window would help.
 
 Ordered by what a next session should pick up first.
 
+> **Reconciled 2026-08-28.** Three items were removed as answered by
+> measurements taken later in this page, not by anyone fixing them:
+>
+> * *"a second, unidentified contributor to `ACTIVE_FRAME_MAP`"* — closed by
+>   the mirror-pairing repair, §"Follow-up 2026-08-26": `no_map` is 0 in all
+>   five `on` arms and the reason code tracks it exactly.
+> * *"`TestMVStoreTool`'s remaining blockers are the indy bridge and the
+>   cross-thread helper window"* — the indy attribution was WITHDRAWN
+>   (§"Follow-up 2026-08-26 (second)"; 30/28 vs 27/33 on an idle host) and
+>   the real answer is the targeted-compaction item above.
+> * *"`while_covered` is nonzero on `dev`"* — superseded by
+>   §"Follow-up 2026-08-27 (second)": the oracle cannot answer that question
+>   at all, and its guard was near-vacuous when the reading was taken.
+>
+> Listed because a stale Still-open entry is not neutral: the withdrawn indy
+> attribution alone sent one session down a two-build detour, and this page
+> is where that gets prevented.
+
 * **Compaction has no TARGETED mode, and that is the whole of
   `TestMVStoreTool`.** §"Follow-up 2026-08-27 (third)": the existing frag
   profile names **2 888 live bytes in 49 runs** — 34 objects, 1.1 %
@@ -1377,16 +1395,6 @@ Ordered by what a next session should pick up first.
   A real backstop needs liveness the map does not carry — the
   `LocalVariableTable` scopes, a type-aware filter, or codegen clearing
   reference locals as they die. See §"Follow-up 2026-08-27 (second)".
-* **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
-  bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
-  proven cycles 13 against 24. None of the five switches covers it. Almost
-  certainly the same question as the `no_map` residual below.
-* **`TestMVStoreTool`'s remaining blockers are the indy bridge and the
-  cross-thread helper window.** Its `ACTIVE_FRAME_MAP` / `no_map`
-  obligation is CLOSED — see §"Follow-up 2026-08-26" — but the class still
-  fails with `oom=4–6`, refusing on `compiled-frame-oop-not-published` and
-  `xt-helper-window-conservative-scan`. Those are the two items above this
-  one, and neither is touched by that repair.
 * **`TestCachedQueryResults` shows `incomplete=5`** — the first time anywhere
   that a map refuses on its OWN claim rather than being unlocatable. Different
   obligation from `no_map`, never investigated, and it sits alongside 9 962
@@ -1408,17 +1416,6 @@ Ordered by what a next session should pick up first.
   2 `OutOfMemoryError` in 31–43 s when this page first measured it). The face
   varies between runs, so reproduce it several times before believing any
   single one. Not this defect: no `arena allocation failed` in either era.
-* **A pre-existing, unrelated correctness gap the 2026-08-22 OSR fix's own
-  verification surfaced.** `CRATONVM_DBG_VERIFY_OOP_MAPS`'s
-  `never_mapped (while_covered=N)` counter is nonzero on `dev` with or without
-  that fix (1192 vs 1410 on the same class, same host) — some frame claims
-  `fully_oop_covered=true` while an in-band live oop goes unmapped, on the fast
-  tier's own bytecode-PC subset check. **Read that in the light of §"Follow-up
-  2026-08-24" §2 before re-opening it**: `fully_oop_covered` is the FRAME-SLOT
-  notion, and the direct-call staged-argument shape means it is routinely false
-  for reasons that are not a bug — so the interesting number is now the same
-  oracle measured against `fully_shadow_covered`, which nobody has taken. Only
-  23 distinct `code+offset` sites produce the 1410 baseline occurrences.
 * **The two small objects in the large-object region.** The fragmentation report
   placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`, where
   `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live, and they

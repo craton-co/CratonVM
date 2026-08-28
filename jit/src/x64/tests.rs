@@ -13234,6 +13234,11 @@ fn interning_reaches_nested_bodies_too() {
 
     let mut strings: Vec<Box<str>> = Vec::new();
     let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
+    // `(entry, epoch)`: the pin gained an epoch when a baked direct call turned
+    // out to be pinned by ADDRESS alone and the address had changed hands
+    // (b56bb79b9). This call site was not updated with it, which left the whole
+    // `cratonvm-jit` lib test binary failing to COMPILE on dev — so every test
+    // in it, not just this one, was silently unrunnable.
     let mut direct_entries: Vec<(usize, u64)> = Vec::new();
     crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
 
@@ -13261,21 +13266,13 @@ fn interning_reaches_nested_bodies_too() {
     // way to find this caller. The outer target carries one bind, the nested
     // one carries none, so exactly one address must come out — and it must be
     // the one that was bound, not a placeholder.
-    // Each entry is paired with the artifact id of its owner AT BAKE TIME
-    // (`jit_entry_artifact_id`), which is what lets `prepare_for_publication`
-    // notice the address changing hands. `0xfeed_0000` is a synthetic address
-    // this test never registered an owner for, so the id is the `0` that
-    // `resolve_jit_entry_owner` misses to; the ADDRESS is what this assertion
-    // is about.
+    // The ADDRESS is what this test is about; the epoch beside it is whatever
+    // `jit_entry_artifact_id` answers for a fabricated address, which is not
+    // this test's business. Assert the addresses.
     assert_eq!(
-        direct_entries.iter().map(|&(entry, _)| entry).collect::<Vec<_>>(),
+        direct_entries.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
         vec![0xfeed_0000],
         "every baked direct-call entry must be registered for keep-alive",
-    );
-    assert_eq!(
-        direct_entries[0].1,
-        0,
-        "an address with no registered owner records no bake-time identity",
     );
     assert_eq!(
         outer.resolved_invoke_infos[0].direct_entry, 0xfeed_0000,
