@@ -12,11 +12,17 @@ priced on one binary with its own kill switch:
 | both reverted (= dev tip) | 3 272 | 3 |
 
 `HibfixComposeProbe2` at the page's own headline configuration — 24 threads,
-4.8 M chains — went from **108.9 s to 27.6 s (3.95x)**, against HotSpot's
-244 ms: the gap this page opened at 442-872x is **113x**.
+4.8 M chains — went from **108.9 s to 27.6 s: 3.95x**, and that is the number
+this page is accountable for, because both arms are the same box on the same
+day, interleaved.
+
+The ratio against HotSpot is quoted more carefully than this page's original
+442-872x was. HotSpot runs that command in 216-421 ms depending on the run, so
+the honest statement is that a gap of roughly 450x became roughly 65-125x, and
+the residual page below is where that number is maintained.
 
 What remains is a different problem and has its own page:
-[`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md).
+[`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md).
 
 ## What the two defects were
 
@@ -146,7 +152,10 @@ All on an idle host (load 0.06), interleaved, against frozen binaries.
 | both fixes | 839 | **852** | 864 |
 | HotSpot | 41 | 44 | 51 |
 
-3.7x, and the gap to HotSpot goes 70x -> 19x.
+3.7x, and the gap to HotSpot goes ~70x -> ~19x. HotSpot's spread at this
+smaller configuration is 41-51 ms, tight enough for the ratio to mean something;
+at the 24-thread configuration below it is not, which is why that one is a
+range.
 
 **Composition, `-Dprobe.threads=24 -Dprobe.chains=200000` (4.8 M chains):**
 
@@ -156,7 +165,10 @@ All on an idle host (load 0.06), interleaved, against frozen binaries.
 | both fixes | 26 047 / 26 118 / 29 061 / 29 250 | **27 590** |
 | HotSpot | 229 / 259 | 244 |
 
-**3.95x**, and 446x -> 113x. `wrong=0` in every run of every arm.
+**3.95x**. `wrong=0` in every run of every arm. Against HotSpot's 229/259 ms
+here — and 216/421 ms on a re-measure two days later — that is ~450x -> ~110x,
+with the spread on HotSpot's side, not CratonVM's: the four CratonVM runs above
+span 12% and the two after the fix agree to 0.3%.
 
 **Attribution** is the table at the top of this page, taken on ONE binary with
 the two kill switches. Neither fix is the whole of it: disabling `dup_x2` alone
@@ -218,7 +230,7 @@ cratonvm --java-home <jdk> -cp <out> FjpStress     # @@FJPSTRESS PASS ... max_de
 - `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
   — the primitive work this page's first revision predicted would close the
   gap. It did not, and that page says so; this is where the gap actually was.
-- [`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md)
+- [`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md)
   — the residual: the 113x that is left, and the per-op costs under it.
 - [`../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md)
   sections 5.9-5.10 — where this was found.
