@@ -80,9 +80,12 @@ is expected back.
 * `RecursiveAction` — void, result through a shared array;
 * `CountedCompleter<Long>` — the third base, a different completion protocol.
 
-Clean at C1 and at C2 (`CRATONVM_JIT_FORCE_C2=1`): 9 interleaved arms on the
-first binary and 6 more on the final one, alongside `FjpProbe` (depth 10) and
-`FjpDeepSum` (depth 17), 12/12 and 3/3.
+Clean at C1 and at C2 (`CRATONVM_JIT_FORCE_C2=1`): three interleaved
+repetitions of {C1-with-blocklist-off, C2-with-blocklist-off, blocklist-on
+control} on the first binary, then three C1 and three C2 runs on the final one.
+Alongside it, `FjpProbe` (depth 10) and `FjpDeepSum` (depth 17) ran 12/12 at
+both tiers on the first binary and 3/3 each on the final one. Every arm gave the
+exact expected sum.
 
 **The witness matters more than the passes.** A green run in which `compute()`
 was never compiled proves nothing, so the compile state was read directly:

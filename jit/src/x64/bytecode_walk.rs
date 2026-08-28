@@ -2802,6 +2802,7 @@ impl Compiler {
                     }
                     pc += 1;
                 }
+
                 // dup2_x2 — the last category-dependent stack shuffle x64
                 // did not lower. `jit_scan` has always ADMITTED it (it just
                 // advances `pc`), so before this arm existed the method reached

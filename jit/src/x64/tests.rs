@@ -13234,7 +13234,7 @@ fn interning_reaches_nested_bodies_too() {
 
     let mut strings: Vec<Box<str>> = Vec::new();
     let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
-    let mut direct_entries: Vec<usize> = Vec::new();
+    let mut direct_entries: Vec<(usize, u64)> = Vec::new();
     crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
 
     assert_eq!(outer.resolved_invoke_infos.len(), 1);
@@ -13261,10 +13261,26 @@ fn interning_reaches_nested_bodies_too() {
     // way to find this caller. The outer target carries one bind, the nested
     // one carries none, so exactly one address must come out — and it must be
     // the one that was bound, not a placeholder.
+    // The pair, not just the address: b56bb79b9 widened this list to carry the
+    // owner artifact id resolved AT BAKE TIME, because pinning by address alone
+    // pins whatever holds that address LATER. Asserting only the length would
+    // pass against an entry for the wrong callee, and asserting only the
+    // address would pass against the widening being dropped again.
     assert_eq!(
-        direct_entries,
-        vec![0xfeed_0000],
+        direct_entries.len(),
+        1,
         "every baked direct-call entry must be registered for keep-alive",
+    );
+    assert_eq!(
+        direct_entries[0].0, 0xfeed_0000,
+        "and it must be the address that was bound, not a placeholder",
+    );
+    assert_eq!(
+        direct_entries[0].1,
+        crate::jit_entry_artifact_id(0xfeed_0000),
+        "paired with the owner resolved at bake time -- 0 here, because this \
+         synthetic address owns no artifact, which is the value \
+         `prepare_for_publication` reads as 'no identity recorded'",
     );
     assert_eq!(
         outer.resolved_invoke_infos[0].direct_entry, 0xfeed_0000,

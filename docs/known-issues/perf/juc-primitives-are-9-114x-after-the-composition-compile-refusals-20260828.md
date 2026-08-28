@@ -14,7 +14,10 @@ same week, and it is what is left after the thing that dominated both was fixed:
 
 Nothing on this page is a compile refusal any more. `CRATONVM_DBG=jit-method-stats`
 on the composition probe reports `hot_but_stuck_in_interpreter=0`. What is left
-is the per-operation cost of the primitives themselves.
+is the per-operation cost of the primitives themselves — and the single worst
+row is already diagnosed rather than merely measured: see "Where to look first"
+item 1, `AtomicReference.compareAndSet`, which is a synthetic stub shadowing a
+one-line delegation that would otherwise hit an existing fast path.
 
 ## Severity
 **HIGH and broad**, for the same reason the `VarHandle` page was: these are the
@@ -41,7 +44,7 @@ box got busier. Medians of six, with the min and max so the spread is visible:
 | `AtomicInteger.incrementAndGet` | 5.5 / **5.6** / 5.7 | 7.7 / 9.1 / 11.6 | **0.6x** |
 
 **`AtomicInteger` is still the control that makes this conclusive**, and it now
-says something stronger than it did in August: CratonVM is **faster** than
+says something stronger than it did on 2026-08-24: CratonVM is **faster** than
 HotSpot on it. So this is not "atomics are slow", not "the box is slow", and not
 "the JDK's j.u.c. classes are slow" — it is these specific operations.
 
@@ -125,11 +128,44 @@ Do not re-derive these.
 ## Where to look first
 
 1. **`AtomicReference.compareAndSet` at 114x, against `VarHandle.compareAndSet`
-   reference at 50x.** They should be the same operation — `AtomicReference` is
-   a thin wrapper over a `VarHandle` CAS on JDK 9+ — and one is 2.5x the other.
-   That difference is a route, and a route is cheaper to find than a cost. The
-   `AtomicInteger` twin being at parity says the wrapper itself is not the
-   problem.
+   reference at 50x — and the route is already identified.** On JDK 9+ that
+   method is a one-line delegation:
+
+   ```java
+   public final boolean compareAndSet(V expectedValue, V newValue) {
+       return VALUE.compareAndSet(this, expectedValue, newValue);
+   }
+   ```
+
+   so it should cost a `VarHandle` CAS plus a call, i.e. ~490 ns. It costs
+   1199 ns because **CratonVM registers a synthetic stub over it and the stub
+   wins even in real-JDK mode.** `--dump-native-registry` on the probe:
+
+   ```
+   2000  java/util/concurrent/atomic/AtomicReference.compareAndSet(...)Z  kind=synthetic-stub
+   2000  java/util/concurrent/atomic/AtomicReference.get()...             kind=synthetic-stub
+   ```
+
+   (`native-builtins/src/phases_early.rs`, the `let ar = ".../AtomicReference"`
+   block). The stub calls `compare_and_swap_field` on slot 0 — correct, but it
+   arrives through the FULL native funnel, whereas a `VarHandle` CAS is caught
+   by `try_varhandle_instance_field_cas` inside `jit_invoke_dispatch` and never
+   reaches a native at all. That is the 710 ns.
+
+   The fix has a direct precedent: §6 of the hibernate-reactive page
+   de-registered seven `CompletionStage` methods for being pure delegations over
+   a real JDK, and `native-collections/src/lib.rs` has the shape to copy —
+   `let skip_delegating_cf = r.real_jdk() && cf_delegating_yield_enabled();`,
+   a gate plus a kill switch so one binary can be A/B'd against itself. What has
+   to be checked before doing it: the stubs also cover `<init>`, `get`, `set`,
+   `lazySet`, `getAndSet` and `compareAndExchange`, all of which assume `value`
+   is instance slot 0; the real JDK class declares exactly one instance field,
+   so the assumption holds and dropping the whole block is the coherent move,
+   but `AtomicReference` is reached from everywhere and this wants its own gate
+   cycle rather than a ride-along.
+
+   The `AtomicInteger` twin being at parity (0.6x — FASTER than HotSpot) is what
+   says the wrapper pattern itself is fine: that one has its own intrinsic.
 2. **`VarHandle.get` reference at 20x, against `VarHandle.get` int at 9x.**
    `VARHANDLE_READ_DIRECT_FNS` binds reads of PRIMITIVE fields only, and its
    comment says `L` and `[` "are absent on purpose": a reference RETURN must be
