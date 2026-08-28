@@ -3429,6 +3429,25 @@ impl CompiledMethod {
     /// been removed; every VM and test caller now goes through
     /// `try_call_with_context` directly.
     ///
+    /// # A body that does NOT want a context is routed to [`Self::try_call`]
+    ///
+    /// The context is not an extra argument the callee ignores — it OCCUPIES
+    /// `ABI[0]`, and a body compiled without one reads its first Java argument
+    /// from that same register. Supplying it anyway shifts every argument by
+    /// one, so `int f(int n)` returns the CONTEXT POINTER where `n` belongs.
+    ///
+    /// The VM has always branched on [`Self::needs_context`] before choosing
+    /// between the two entry points, so this changes nothing for it. What it
+    /// fixes is a caller that cannot easily branch — a test harness that calls
+    /// one way for a whole corpus — and the reason that matters is that
+    /// `needs_context` is an OUTPUT OF OPTIMIZATION, not a property of the
+    /// source: it is false exactly when nothing left in the graph needs the
+    /// heap. So an optimization doing its job (escape analysis eliding the last
+    /// `Op::New`) can flip it, and a caller that assumed it was fixed starts
+    /// reading garbage — reported as a miscompile in the optimization, which is
+    /// where two sessions went looking. See
+    /// `docs/known-issues/jit/scalar-deopt-elision-returns-the-object-in-the-differential-harness-20260827.md`.
+    ///
     /// # Safety
     /// `vm_ptr` must be a valid pointer to a `SharedVm`. Args must match
     /// the method signature.
@@ -3438,6 +3457,13 @@ impl CompiledMethod {
         vm_ptr: i64,
         args: &[i64],
     ) -> Result<i64, CompileError> {
+        // See "A body that does NOT want a context" above. Routed rather than
+        // refused: every caller of this function wants "invoke this method",
+        // and there is no caller for whom forcing the context ABI onto a body
+        // that did not ask for one is the right thing.
+        if !self.needs_context() {
+            return self.try_call(args);
+        }
         // Read the entry ONCE — see [`CompiledMethod::try_call`] for why
         // validating one load and calling another is not the same check.
         let entry = self.entry;
@@ -21845,6 +21871,45 @@ fn try_compile_inner(
                     // the point is that it would stop being true if that
                     // changed.
                     compile_gate::note_backend_entry();
+                    // The graph the lowerer is about to see, node by node
+                    // (`CRATONVM_DBG_IR_GRAPH=1`). This tier had node COUNTS
+                    // (`CRATONVM_DBG_IR_SLOTS`) and per-pass verdicts, and no way
+                    // to see the graph itself — so every question of the form
+                    // "which node does this consumer actually read" was answered
+                    // by adding a temporary `eprintln` and rebuilding.
+                    //
+                    // Printed after every mutating pass (`ir_optimize`, the
+                    // escape-analysis rounds, the scheduler), i.e. at the last
+                    // moment the graph is still the compiler's rather than the
+                    // backend's — which is where a forwarding or elision defect
+                    // is visible and a disassembly no longer separates it from a
+                    // lowering one.
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_GRAPH").is_some() {
+                        eprintln!(
+                            "[ir-graph] {}.{}{} — {} node(s), entry={} exit={}",
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
+                            graph.nodes.len(),
+                            graph.entry,
+                            graph.exit,
+                        );
+                        for (id, n) in graph.nodes.iter().enumerate() {
+                            if n.op == ir::Op::Dead {
+                                continue;
+                            }
+                            eprintln!(
+                                "[ir-graph]   {id:3}: {:?} : {:?} <- {:?}  bci={:?}",
+                                n.op, n.ty, n.inputs.as_slice(), n.bytecode_pc,
+                            );
+                        }
+                        for (i, sp) in graph.safepoints.iter().enumerate() {
+                            eprintln!(
+                                "[ir-graph]   safepoint[{i}] bci={} locals={:?} stack={:?}",
+                                sp.bci, sp.locals, sp.stack,
+                            );
+                        }
+                    }
                     note_jit_pipeline_stage(JIT_STAGE_LOWER);
     let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     let lowered = ir_lower::lower_inner(
@@ -27784,6 +27849,21 @@ mod tests {
         });
         run_ea(&mut f.g);
 
+        // The premise — "no virtual-object descriptor will be emitted for it" —
+        // is the DEFAULT path's, and `CRATONVM_SCALAR_DEOPT` is the flag that
+        // makes it false. With the flag on the refusal this test is named for
+        // does not apply and the opposite is the correct answer, so assert that
+        // instead of asserting the default's behaviour into a build that does
+        // not have it.
+        if scalar_deopt_enabled() && deopt_real_enabled() {
+            assert_eq!(
+                f.g.nodes[f.newobj as usize].op,
+                Op::Dead,
+                "with a descriptor available the snapshot is no longer a reason \
+                 to keep the allocation"
+            );
+            return;
+        }
         assert!(
             matches!(f.g.nodes[f.newobj as usize].op, Op::New { .. }),
             "the allocation must survive: a deopt snapshot names it and no \
@@ -28416,6 +28496,26 @@ mod tests {
         // `FrameValue::Undefined` ⇒ `Value::Int(0)` ⇒ a NULL where a live object
         // was. `apply_ea_to_ir` refuses the elision instead; see the "May the
         // ALLOCATION itself go?" block in `plan_scalar_replacement`.
+        // The retention rule is the DEFAULT path's, and it inverts under
+        // `CRATONVM_SCALAR_DEOPT` — which is the flag whose entire job is to
+        // make this elision legal. Asserted per arm rather than left
+        // unconditional: stated as an invariant it reads as a property of the
+        // compiler, and it is a property of a flag.
+        if scalar_deopt_enabled() && deopt_real_enabled() {
+            assert!(
+                !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+                "with the deopt descriptor available the allocation is elided"
+            );
+            // A snapshot slot DOES still name the (now dead) node here, and
+            // that is the point rather than a leak: `build_scalar_replacement_map`
+            // describes it, and `ir_lower::frame_value_for_object` resolves the
+            // slot to a `FrameValue::VirtualObject` from that description. The
+            // map is not returned by `apply_ea_to_ir`, so this test cannot check
+            // the pairing — `ir_lower`'s own `test_scalar_deopt_emits_virtual_object`
+            // does, and `probes/ScalarDeoptProbe.java` checks the answers
+            // end-to-end.
+            return;
+        }
         assert!(
             graph.safepoints.iter().any(|sp| sp
                 .locals
@@ -28533,9 +28633,19 @@ mod tests {
             Op::Const(42),
             "the field load (via astore/aload local) must resolve to the stored value (42)"
         );
-        // Same rule as `ir_new_scalar_replaces_end_to_end`: the allocation is
-        // live in a deopt snapshot (here in local 0 as well as on the stack), so
-        // the elision is refused and the object stays real and initialised.
+        // Same rule as `ir_new_scalar_replaces_end_to_end`, and the same arm
+        // split: on the default path the allocation is live in a deopt snapshot
+        // (here in local 0 as well as on the stack) so the elision is refused
+        // and the object stays real and initialised; with the descriptor
+        // available it goes. The property this test is really about — the field
+        // load resolving to the stored value — is asserted above, in both arms.
+        if scalar_deopt_enabled() && deopt_real_enabled() {
+            assert!(
+                !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+                "with the deopt descriptor available the allocation is elided"
+            );
+            return;
+        }
         assert!(
             graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
             "the New is retained because a deopt snapshot names it"
