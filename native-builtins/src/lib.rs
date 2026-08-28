@@ -7967,12 +7967,33 @@ pub fn register_essential_natives_with_shims(
                 },
                 _ => None,
             };
-            let new_len = match args.get(1) {
+            let new_len_signed = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
                 _ => 0,
+            };
+            // "@throws IllegalArgumentException If the new size is negative"
+            // (`FileChannel.truncate(long)`). The abstract
+            // `java/nio/channels/FileChannel` copy of this method has carried
+            // the check since it was found there; this CONCRETE copy — the one
+            // a real `sun.nio.ch.FileChannelImpl` receiver actually reaches,
+            // and therefore the one `Files.newByteChannel(...).truncate(-1)`
+            // runs — still had the `.max(0)` clamp. MEASURED after the other
+            // copy was fixed: HotSpot `IllegalArgumentException: Negative
+            // size`, this VM no-throw. The half-fixed duplicate pair, exactly
+            // as the campaign's `owns_slot` note predicts.
+            //
+            // The clamp is the most destructive shape a refusal can take here:
+            // `truncate(-1)` — what an off-by-one length computation produces —
+            // became `truncate(0)`, i.e. it DELETED the file's contents and
+            // answered as if that had been asked for.
+            if new_len_signed < 0 {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("Negative size: {new_len_signed}"),
+                }
+                .into());
             }
-            .max(0) as u64;
+            let new_len = new_len_signed as u64;
             if let Some(fd) = fd_id {
                 // Real FileChannel.truncate() contract: a no-op when the
                 // requested size is >= the current file size (only ever
@@ -8828,17 +8849,54 @@ pub fn register_essential_natives_with_shims(
         "java/lang/Module",
         "canUse",
         "(Ljava/lang/Class;)Z",
-        |_ctx, args| {
-            match args.first() {
-                Some(Value::Object(Some(_))) => {}
-                _ => return Ok(Some(Value::Int(0))),
-            }
-            match args.get(1) {
-                Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
-                _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let Some(Value::Object(Some(service))) = args.get(1).copied() else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("Module.canUse: service class is null".into()),
                 }
-                .into()),
+                .into());
+            };
+            // `canUse` is true iff the module DECLARES `uses` for that service.
+            // An UNNAMED module uses everything; a NAMED one uses exactly what
+            // its descriptor says.
+            //
+            // MEASURED (`probes/ClassShadowSweep.java`), both modes:
+            //   java.base.canUse(Runnable.class)   HotSpot false   CratonVM true
+            //
+            // This used to answer `true` for any non-null service on any
+            // receiver, and the note here said a faithful version would have to
+            // call back into Java for `getDescriptor().uses()` -- the one thing
+            // this native exists to avoid, because a named Module mirror can
+            // carry a NULL `descriptor` field. That was wrong: the VM's own
+            // module registry already holds the `uses` set, reachable with no
+            // Java call and no re-entrancy, via `ctx.module_uses`.
+            //
+            // An unregistered or descriptor-less module yields an EMPTY uses
+            // list, which would answer false for everything -- so the unnamed
+            // case is decided first, and a named module with no registry entry
+            // keeps the permissive answer rather than newly refusing work that
+            // used to succeed.
+            let module_name = crate::phases_late::read_module_name(ctx, this);
+            if module_name.is_empty() {
+                return Ok(Some(Value::Int(1)));
+            }
+            if !ctx.module_is_registered(&module_name) {
+                return Ok(Some(Value::Int(1)));
+            }
+            let service_name = crate::lang_class::mirror_class_name(ctx, service)
+                .unwrap_or_default()
+                .replace('/', ".");
+            let uses = ctx.module_uses(&module_name);
+            let declared = uses
+                .iter()
+                .any(|u| u.replace('/', ".") == service_name);
+            return Ok(Some(Value::Int(i32::from(declared))));
+            #[allow(unreachable_code)]
+            {
+                Ok(Some(Value::Int(1)))
             }
         },
     );
@@ -15011,10 +15069,40 @@ pub fn register_essential_natives_with_shims(
                 _ => None,
             },
         };
-        if let Some(fd) = fd {
-            let _ = ctx.fd_table().flush(fd);
-            let _ = ctx.fd_table().rw_sync(fd, false);
-        }
+        // NO DESCRIPTOR AT ALL is the one case that must not be quiet.
+        // `new FileDescriptor().sync()` — a descriptor that was never opened —
+        // is `SyncFailedException: sync failed` on HotSpot, and answering
+        // normally told a caller its data was durable when nothing had been
+        // written anywhere. MEASURED.
+        //
+        // A descriptor that IS open but whose entry `rw_sync` declines (the
+        // buffered-stream case the comment above describes) keeps the
+        // deliberate swallow: there the flush did happen and only the fsync is
+        // unavailable, which is a host limitation rather than a lie about a
+        // handle that does not exist.
+        let Some(fd) = fd else {
+            let cls = "java/io/SyncFailedException";
+            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object(cls) {
+                let exc_pin = ctx.pin_native_root(exc);
+                let msg = ctx.create_string("sync failed");
+                let exc = ctx.read_native_pin(exc_pin, exc);
+                let _ = ctx.invoke(
+                    cls,
+                    "<init>",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(exc)), Value::Object(Some(msg))],
+                );
+                let exc = ctx.read_native_pin(exc_pin, exc);
+                ctx.unpin_native_roots(exc_pin);
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            }
+            return Err(cratonvm_types::error::RuntimeError::IOException {
+                message: "sync failed".into(),
+            }
+            .into());
+        };
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().rw_sync(fd, false);
         Ok(None)
     }, NativeKind::Bridge);
 
@@ -27349,6 +27437,130 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
     cratonvm_native_api::print_error_state::classify_write_failure(ctx, this, written).routed()
 }
 
+/// Encode `text` with the receiver's own charset.
+///
+/// **`PrintStream` has a charset and this VM was ignoring it.** Every text
+/// write funnelled `text.as_bytes()` — UTF-8, unconditionally — into the sink.
+/// MEASURED:
+///
+/// ```text
+///   new PrintStream(sink, true, ISO_8859_1).print("é中")
+///       HotSpot   e9 3f            (latin1: e-acute, '?' for the unmappable)
+///       CratonVM  c3 a9 e4 b8 ad   (UTF-8)
+///   new PrintStream(sink, true, US_ASCII).print("a中b")
+///       HotSpot   61 3f 62
+///       CratonVM  61 e4 b8 ad 62
+/// ```
+///
+/// The second row is the one that matters: a stream declared `US_ASCII`
+/// emitted a three-byte sequence with the high bit set. Anything downstream
+/// that trusts the declared encoding — a fixed-width record writer, a protocol
+/// framer, a terminal — is handed bytes it cannot represent, and the length in
+/// bytes no longer matches the length in characters.
+///
+/// `None` means "UTF-8, use `as_bytes()`" and is the fast path: the charset
+/// field is absent (a `PrintWriter` receiver, or a console stream), null, or
+/// resolves to UTF-8. The discriminator is the charset object's CLASS NAME,
+/// which `class_name_arc_of_id` answers without allocating — the standard
+/// charsets each have their own final class. Anything else takes the general
+/// path through `String.getBytes(Charset)`, which is the JDK's own encoder and
+/// therefore right for every charset this VM can load, at the cost of one
+/// String allocation on a path that is by construction rare.
+fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -> Option<Vec<u8>> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let cs = match ctx.get_field_by_name(this, "charset") {
+        Value::Object(Some(c)) => c,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(cs);
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        // The abstract stand-in `install_charset` stamps at bootstrap answers
+        // UTF-8 through `PrintStream.charset()`, so it means UTF-8 here too.
+        None | Some("sun/nio/cs/UTF_8") | Some("java/nio/charset/Charset") => None,
+        Some("sun/nio/cs/ISO_8859_1") => Some(
+            text.chars()
+                .map(|c| if (c as u32) < 0x100 { c as u8 } else { b'?' })
+                .collect(),
+        ),
+        Some("sun/nio/cs/US_ASCII") => Some(
+            text.chars()
+                .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+                .collect(),
+        ),
+        Some(_) => {
+            let s = ctx.create_string(text);
+            let bytes = ctx
+                .invoke_virtual(
+                    s,
+                    "getBytes",
+                    "(Ljava/nio/charset/Charset;)[B",
+                    &[Value::Object(Some(cs))],
+                )
+                .ok()
+                .flatten();
+            match bytes {
+                Some(Value::Object(Some(arr))) => {
+                    let len = ctx.array_length(arr);
+                    let mut out = vec![0u8; len];
+                    ctx.read_byte_array_into(arr, 0, &mut out);
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `PrintStream.ensureOpen()`: a write to a CLOSED stream sets the error flag.
+///
+/// `close()` nulls `out` in the JDK, and every write opens with
+/// `if (out == null) throw new IOException("Stream closed")` — caught by the
+/// same body into `trouble = true`. MEASURED: after `close()`, this VM's
+/// `print("z")` reached the sink (a `ByteArrayOutputStream.close()` is a
+/// no-op, so the write succeeded) and `checkError()` stayed FALSE, where
+/// HotSpot answers true. A `PrintStream` whose `checkError()` cannot become
+/// true is a `PrintStream` with no error reporting at all — the flag is the
+/// class's ONLY channel for failure.
+fn printstream_refuse_if_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return false;
+    };
+    if cratonvm_native_api::print_error_state::is_closing(&*ctx, this) {
+        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        return true;
+    }
+    false
+}
+
+/// `PrintStream`'s autoflush, which fires on more than a newline.
+///
+/// `PrintStream.write(byte[], int, int)` ends with `if (autoFlush)
+/// out.flush();` UNCONDITIONALLY, and every `print`/`println` overload reaches
+/// it through the internal `OutputStreamWriter`. `write(int b)` flushes only
+/// for `'\n'`. MEASURED on an autoflush stream over a counting sink:
+/// HotSpot's flush count was 1 after a single `print("a")` and this VM's was
+/// 0, so a `new PrintStream(sock.getOutputStream(), true)` — the ordinary way
+/// to write a line protocol — buffered indefinitely.
+fn printstream_autoflush(ctx: &mut dyn NativeContext, args: &[Value]) {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return;
+    };
+    if !matches!(ctx.get_field_by_name(this, "autoFlush"), Value::Int(v) if v != 0) {
+        return;
+    }
+    let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") else {
+        return;
+    };
+    // KEPT SWALLOW, at JDK parity: this flush lives inside `write`'s own
+    // `catch (IOException x) { trouble = true; }`.
+    if let Err(_e) = ctx.invoke_virtual(out, "flush", "()V", &[]) {
+        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+    }
+}
+
 fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // LOCK-SCOPE (2026-07-21): `surefire_forwarding_write` and
     // `route_write_through_out` recursively interpret Java bytecode
@@ -27357,14 +27569,20 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // themselves be blocked on this mutex (live gdb capture: WildFly boot
     // wedge at parallel-extension-add, 2026-07-20). Only the raw fd write
     // is serialized.
+    if printstream_refuse_if_closed(ctx, args) {
+        return;
+    }
     if surefire_forwarding_write(ctx, args, text, false) {
         return;
     }
-    if route_write_through_out(ctx, args, text.as_bytes()) {
+    let encoded = printstream_encode(ctx, args, text);
+    let bytes: &[u8] = encoded.as_deref().unwrap_or_else(|| text.as_bytes());
+    if route_write_through_out(ctx, args, bytes) {
+        printstream_autoflush(ctx, args);
         return;
     }
     if let Some(fd) = stream_fd(ctx, args) {
-        let ok = with_stdio_print_lock(|| ctx.fd_table().write_string(fd, text));
+        let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, bytes));
         // RECORDED since W7-64. The fd IS this stream's `out` — a console
         // `PrintStream` has no Java sink object — so a host write failure here
         // is exactly the `IOException` `PrintStream`'s private `write(String)`
@@ -27373,6 +27591,17 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
         if let Some(Value::Object(Some(this))) = args.first().copied() {
             cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
         }
+        return;
+    }
+    // NOWHERE TO WRITE IS AN ERROR, not a no-op. `PrintWriter.close()` and
+    // `PrintStream.close()` both null `out`, and every write method then
+    // reaches `ensureOpen()`'s `IOException("Stream closed")`, which the same
+    // body catches into `trouble = true`. Falling out of both routes here
+    // means exactly that state — no Java sink and no file descriptor — and
+    // returning quietly left `checkError()` FALSE forever. MEASURED on a
+    // `PrintWriter` after `close()`: HotSpot true, this VM false.
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
     }
 }
 
@@ -27454,13 +27683,24 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
     // helpers must not run under the stdio print mutex; only the fd write
     // pair (text + separator) stays atomic.
     let sep = host_line_separator(ctx);
+    if printstream_refuse_if_closed(ctx, args) {
+        return;
+    }
     if surefire_forwarding_write(ctx, args, text, true) {
         return;
     }
     // User/Tee streams: write text+separator as one buffer through `out`.
-    let mut buf = text.as_bytes().to_vec();
-    buf.extend_from_slice(sep.as_bytes());
+    // The SEPARATOR is encoded with the same charset as the text — it is
+    // ASCII in every charset this reaches, but encoding the pair together is
+    // what keeps a stateful encoder (a UTF-16 stream's BOM, say) consistent.
+    let line = format!("{text}{sep}");
+    let encoded = printstream_encode(ctx, args, &line);
+    let buf: Vec<u8> = match encoded {
+        Some(b) => b,
+        None => line.as_bytes().to_vec(),
+    };
     if route_write_through_out(ctx, args, &buf) {
+        printstream_autoflush(ctx, args);
         return;
     }
     if let Some(fd) = stream_fd(ctx, args) {
@@ -27468,14 +27708,25 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
             // Both writes are attempted regardless, as before — `and` keeps
             // the first failure without turning the pair into a short-circuit
             // that would drop the separator after a partial text write.
-            let text_written = ctx.fd_table().write_string(fd, text);
-            let sep_written = ctx.fd_table().write_string(fd, &sep);
+            let text_written = ctx.fd_table().write_bytes(fd, &buf);
+            let sep_written = Ok(());
             text_written.and(sep_written)
         });
         // RECORDED since W7-64 — see `stream_write`.
         if let Some(Value::Object(Some(this))) = args.first().copied() {
             cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
         }
+        return;
+    }
+    // NOWHERE TO WRITE IS AN ERROR, not a no-op. `PrintWriter.close()` and
+    // `PrintStream.close()` both null `out`, and every write method then
+    // reaches `ensureOpen()`'s `IOException("Stream closed")`, which the same
+    // body catches into `trouble = true`. Falling out of both routes here
+    // means exactly that state — no Java sink and no file descriptor — and
+    // returning quietly left `checkError()` FALSE forever. MEASURED on a
+    // `PrintWriter` after `close()`: HotSpot true, this VM false.
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
     }
 }
 
