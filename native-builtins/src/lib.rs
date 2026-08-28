@@ -12117,6 +12117,36 @@ pub fn register_essential_natives_with_shims(
                     None
                 };
 
+            // A modular jar reached through `-cp` is an UNNAMED-module citizen:
+            // a real JVM ignores its `module-info` outright, and `getModule()`
+            // answers the loader's unnamed module. This VM's registry scans the
+            // application class path for `module-info.class` and registers what
+            // it finds (so readability checks pass for e.g. `org.jboss.logging`),
+            // which made this accessor report `ch.qos.logback.classic` for a
+            // class-path class.
+            //
+            // MEASURED 2026-08-28, `probes/L7ModuleProbe`, both modes:
+            //
+            //   ch.qos.logback.classic.spi.LogbackServiceProvider
+            //     HotSpot   isNamed=false  name=null
+            //     CratonVM  isNamed=true   name=ch.qos.logback.classic
+            //
+            // It is not a labelling nicety. `ServiceLoader`'s classpath lookup
+            // iterator does `if (clazz.getModule().isNamed()) continue;` — a
+            // SILENT skip, no error and no report row — so every classpath SPI
+            // provider disappeared. Under `--jdk-only`, where the ServiceLoader
+            // synthetic stubs are refused and the real bytecode runs, that made
+            // SLF4J bind `NOPLoggerFactory` and every Spring Boot application
+            // die in `LogbackLoggingSystem.beforeInitialize`.
+            //
+            // Same rule, same predicate, as `populate_boot_layer_modules` and
+            // `ModuleRegistry::providers_for_service`; this is its fourth door.
+            // A `--module-path` module is re-registered `automatic = false` by
+            // `vm_init` immediately after `ClassManager::new`, so it is NOT
+            // class-path-only and is unaffected — which is what
+            // `regression-suite/src/RJdkModule.java` pins.
+            let module_name = module_name.filter(|n| !ctx.module_is_class_path_only(n));
+
             // Unnamed module (everything on the application classpath): route
             // through the shared builder so this mirror is identical to the one
             // `ClassLoader.getUnnamedModule()` and the `java.lang.Package`
@@ -21105,6 +21135,22 @@ pub fn register_essential_natives_with_shims(
             // `Integer` -- an array whose contents contradict its own type, which
             // every later reader is entitled to assume cannot exist. Skipped
             // when the component type is `java/lang/Object`, which accepts all.
+            //
+            // The check itself is the VM's `aastore` predicate, not a
+            // `ClassId` comparison. A `ClassId` comparison is wrong in both
+            // directions here. On a REFERENCE ARRAY the header's class id holds
+            // the COMPONENT class, so an element that is itself an array
+            // (`String[]`) answers `java/lang/String` while the destination
+            // component of a `String[][]` is `[Ljava/lang/String;` — they can
+            // never be equal, and `Arrays.copyOf(.., String[][].class)` threw a
+            // FALSE `ArrayStoreException` naming `java.lang.String`. That is
+            // the whole of H2's `SortOrder.sort` failure: `rows.toArray(new
+            // Value[0][])` reaches here once the `ArrayList.toArray` synthetic
+            // stub is refused under `--jdk-only`. It also misses every hedge the
+            // predicate carries for interface components, `$Proxy` values and
+            // cross-loader same-named classes — each of which was paid for by a
+            // regression. `None` is a mock with no hierarchy: keep the exact
+            // check there rather than silently widening it.
             let comp_is_object = comp_cid
                 .and_then(|c| ctx.class_name_of_id(c))
                 .as_deref()
@@ -21112,10 +21158,26 @@ pub fn register_essential_natives_with_shims(
             for i in 0..src_len.min(new_len) {
                 let e = ctx.get_array_element(src, i);
                 if let (Some(cid), Value::Object(Some(v)), false) = (comp_cid, e, comp_is_object) {
-                    let actual = ctx.class_id_of_object(v);
-                    if actual != cid && !ctx.is_subclass(actual, cid) {
+                    let assignable = match ctx.aastore_element_assignable(dst, v) {
+                        Some(verdict) => verdict,
+                        None => {
+                            let actual = ctx.class_id_of_object(v);
+                            actual == cid || ctx.is_subclass(actual, cid)
+                        }
+                    };
+                    if !assignable {
+                        // HotSpot reaches this exception through the
+                        // `System.arraycopy` inside `Arrays.copyOf`'s own
+                        // bytecode, so the text is arraycopy's. MEASURED:
+                        //   arraycopy: element type mismatch: can not cast one
+                        //   of the elements of java.lang.Object[] to the type
+                        //   of the destination array, java.lang.String
+                        // The old message was the offending element's class
+                        // name alone, which no HotSpot path produces.
                         return Err(RuntimeError::ArrayStoreException {
-                            message: ctx.class_name_of_id(actual).unwrap_or_default(),
+                            message: crate::lang_system::element_type_mismatch_message(
+                                ctx, src, cid,
+                            ),
                         }
                         .into());
                     }

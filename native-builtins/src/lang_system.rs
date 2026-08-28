@@ -793,7 +793,7 @@ fn external_class_name(internal: &str) -> String {
 /// It names the source ARRAY and the destination COMPONENT — not the offending
 /// index, which is why the previous "source element at index N" wording could
 /// not have come from HotSpot.
-fn element_type_mismatch_message(
+pub(crate) fn element_type_mismatch_message(
     ctx: &mut dyn NativeContext,
     src: ObjectRef,
     dst_elem_class: cratonvm_types::ClassId,
@@ -802,10 +802,22 @@ fn element_type_mismatch_message(
         .class_name_of_id(ctx.class_id_of_object(src))
         .unwrap_or_default();
     let dst_component = ctx.class_name_of_id(dst_elem_class).unwrap_or_default();
-    format!(
-        "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {}",
-        external_class_name(&src_component),
+    // The two halves are rendered in DIFFERENT dialects, and that is HotSpot's
+    // sentence rather than an inconsistency to tidy up. The source is the
+    // array's external name; the destination component is the component
+    // Klass's own dotted NAME, which for an array class is a descriptor.
+    // MEASURED on 25.0.4+7:
+    //   ... elements of java.lang.Object[] ... destination array, java.lang.String
+    //   ... elements of java.lang.Object[] ... destination array, [Ljava.lang.Integer;
+    //   ... elements of java.lang.Object[] ... destination array, [I
+    let dst_rendered = if dst_component.starts_with('[') {
+        dst_component.replace('/', ".")
+    } else {
         external_class_name(&dst_component)
+    };
+    format!(
+        "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {dst_rendered}",
+        external_class_name(&src_component),
     )
 }
 
@@ -1117,7 +1129,27 @@ pub(crate) fn native_system_arraycopy(
             // class. Fall back to a structural descriptor comparison so
             // e.g. an `int[]` element is accepted into an `int[][]` whose
             // component class is the loaded `[I` class.
+            // Ask the VM's own `aastore` predicate, which decides this case on
+            // descriptors and is the same one the interpreter opcode, the JIT
+            // helper and `java.lang.reflect.Array.set` use.
+            //
+            // It replaces a BLANKET: any array element used to be accepted
+            // into any array-of-array destination, so this succeeded where
+            // HotSpot throws (MEASURED 2026-08-28, `probes/L7AseMsg`):
+            //
+            //   System.arraycopy(new Object[]{new String[]{"s"}}, 0,
+            //                    new Integer[1][], 0, 1)
+            //     HotSpot   ArrayStoreException
+            //     CratonVM  copied
+            //
+            // The predicate is additive — it fails open for anything it cannot
+            // resolve precisely — so narrowing to it cannot manufacture a false
+            // `ArrayStoreException`. `None` means a context with no class
+            // hierarchy (mocks), where the old blanket is still the answer.
             if ctx.heap_kind_of(elem) == ObjectKind::Array {
+                if let Some(verdict) = ctx.aastore_element_assignable(dest, elem) {
+                    return verdict;
+                }
                 if let Some(dst_name) = ctx.class_name_of_id(dst_elem_class) {
                     // dst component is itself an array type.
                     if dst_name.starts_with('[') {
