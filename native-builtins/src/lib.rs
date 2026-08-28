@@ -18395,8 +18395,45 @@ pub fn register_essential_natives_with_shims(
     // `charAt` / `toString` / `getChars` / `reverse` on the parent where
     // real bytecode expects them to be inherited.
     lang_string::register_string_builder_natives(registry, "java/lang/StringBuilder");
-    lang_string::register_string_builder_natives(registry, "java/lang/StringBuffer");
     lang_string::register_string_builder_natives(registry, "java/lang/AbstractStringBuilder");
+
+    // `java/lang/StringBuffer` is DELIBERATELY ABSENT from this real-JDK list,
+    // and its 62 rows are the largest single retirement of this campaign.
+    //
+    // MEASURED, `javap -p -c --system <jdk-25.0.4+7> java.lang.StringBuffer`:
+    // every method of that class is either a `synchronized` delegation to
+    // `super` or a body that touches only its OWN `toStringCache` / `count`
+    // before delegating. NOT ONE of them reads `value` or `coder` — the two
+    // fields whose layout the natives on `AbstractStringBuilder` exist to
+    // serve. `writeObject` is the single exception and it is serialization,
+    // not dispatch.
+    //
+    // So the real bytecode is not merely safe to run here, it supplies two
+    // things a shared native body cannot:
+    //
+    //   * **the monitor.** `StringBuffer` is synchronized and `StringBuilder`
+    //     is not, and ONE registrar served both. `probes/
+    //     StringBuilderShadowSweep.java`'s `buffer append is mutually
+    //     exclusive` row measured what that cost: two threads appending 4000
+    //     characters each to one `StringBuffer` ended with FEWER than 8000,
+    //     with no exception anywhere. HotSpot answers 8000.
+    //   * **`toStringCache` invalidation.** The cache is `StringBuffer`'s own
+    //     field and every mutator nulls it in its own body. A native that
+    //     replaces the mutator never runs that line, so the moment anything
+    //     else populates the cache the buffer answers a stale `toString()` —
+    //     the quietest failure shape in this surface.
+    //
+    // The layout work still happens natively: `StringBuffer.append(String)` is
+    // `toStringCache = null; super.append(str); return this;`, and that
+    // `invokespecial` lands on `java/lang/AbstractStringBuilder.append`, which
+    // IS registered above. `is_string_builder_layout_native_override` drops
+    // `java/lang/StringBuffer` in the same commit so the force-native gate
+    // cannot short-circuit the walk and reach the inherited native directly —
+    // which would skip both the monitor and the cache invalidation and put the
+    // defect back with the registration gone.
+    //
+    // HANDOFF-20260828-L2-strings.md; the measurement is in
+    // `docs/known-issues/jdk-only/`.
 
     // --- java.lang.StringUTF16 static helpers ---
     // `<clinit>` queries `isBigEndian()` to pick a byte order for its

@@ -1769,6 +1769,23 @@ pub(crate) fn sb_append_str(
     sb_append_chars(ctx, this, &chars)
 }
 
+/// The `NullPointerException` a real `AbstractStringBuilder` body raises when it
+/// dereferences a null argument, with HotSpot's helpful-NPE wording.
+///
+/// Ten arms of this registrar used to answer a plausible NON-answer instead — an
+/// empty builder, an unchanged builder, `-1` — which is the fabricated-success
+/// shape `W2-7-fabricated-success-where-the-spec-mandates-failure.md`
+/// inventories: a caller that guards a loop with the exception never leaves it,
+/// and nothing anywhere throws. Every one of them is a `native-won` triple of
+/// the L2 lane and was MEASURED against jdk-25.0.4+7 by
+/// `probes/StringBuilderShadowSweep.java`.
+fn sb_npe(message: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(message.to_string()),
+    }
+    .into()
+}
+
 pub(crate) fn native_sb_init_default(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1802,8 +1819,17 @@ pub(crate) fn native_sb_init_string(
     // disagreed with the String it was constructed from
     // (`s.contentEquals(new StringBuilder(s))` answered false). MEASURED,
     // `scratchpad/g26/G26Builder.java` rows c1/c2/c3/c5/c7/e1/e4.
+    // `AbstractStringBuilder(String)` is `this(str.length() + 16); append(str);`
+    // so a null argument fails in `str.length()` — a NullPointerException, not
+    // a usable builder of length 0. MEASURED: `new StringBuilder((String) null)`
+    // throws on jdk-25.0.4+7 and answered `0` here.
     let chars: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => Vec::new(),
     };
     let cap = chars.len() + 16;
@@ -1854,8 +1880,17 @@ pub(crate) fn native_sb_init_charsequence(
     // The units form also carries an unpaired surrogate, which the `str` this
     // replaces could not: MEASURED rows c6/c8/c9 of
     // `scratchpad/g26/G26Builder.java`.
+    // The doc comment above already says it: "Real JDK
+    // `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a null
+    // sequence throws NPE". The code did not — this arm answered an empty
+    // builder. MEASURED.
     let chars: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(o))) => charsequence_chars(&mut *scope, *o, None)?,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"java.lang.CharSequence.length()\" because \"seq\" is null",
+            ))
+        }
         _ => Vec::new(),
     };
     let cap = chars.len() + 16;
@@ -2151,8 +2186,19 @@ pub(crate) fn native_sb_append_char_array_off_len(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `append(char[] str, int offset, int len)` opens with
+    // `checkRange(offset, offset + len, str.length)`, so the array is
+    // dereferenced BEFORE the window is judged: a null `str` is a
+    // NullPointerException whatever the offsets are, including the
+    // `(-1, -1)` pair that would otherwise be a range failure. This arm
+    // returned the builder unchanged. MEASURED.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot read the array length because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let off_i32 = match args.get(2) {
@@ -2198,8 +2244,17 @@ pub(crate) fn native_sb_append_char_array(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `append(char[] str)` is `int len = str.length;` — a null array throws,
+    // and this is the overload of the three null-append shapes that does NOT
+    // append the text "null" (`append(String)` and `append(CharSequence)` do).
+    // MEASURED: the three really do differ.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot read the array length because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let n = ctx.array_length(arr);
@@ -4089,8 +4144,15 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // Deferred, not read here: `insert(int index, char[] str, int offset,
+    // int len)` is `checkOffset(index, count); checkRangeSIOOBE(offset,
+    // offset + len, str.length);`, so a bad DESTINATION offset beats a null
+    // array. `insert(-1, (char[]) null, 0, 1)` is a
+    // StringIndexOutOfBoundsException and `insert(1, (char[]) null, 0, 1)` is a
+    // NullPointerException; both were a silent no-op. MEASURED, both orders.
     let arr = match args.get(2) {
-        Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(Some(a))) => Some(*a),
+        Some(Value::Object(None)) => None,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let src_off = match args.get(3) {
@@ -4108,6 +4170,11 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         return Err(failure);
     }
     let offset = offset as usize;
+    let Some(arr) = arr else {
+        return Err(sb_npe(
+            "Cannot read the array length because \"str\" is null",
+        ));
+    };
 
     let arr_len = ctx.array_length(arr) as i32;
     // `offset + len` is computed in i64 because a wrapped i32 sum would read as
@@ -4158,9 +4225,28 @@ pub(crate) fn native_sb_insert_char_array(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // `checkOffset(offset, count)` is the FIRST line of the real body and
+    // `int len = str.length;` the second, so the destination check precedes the
+    // dereference: `insert(9, (char[]) null)` on a 3-character builder is a
+    // StringIndexOutOfBoundsException, `insert(1, (char[]) null)` a
+    // NullPointerException. Reading the array up front — as this did — made
+    // both a silent no-op, so the source read now happens after the check.
+    // MEASURED, both orders.
     let arr = match args.get(2) {
-        Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(Some(a))) => Some(*a),
+        Some(Value::Object(None)) => None,
         _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+
+    let chars = sb_read_chars(ctx, this);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+    let Some(arr) = arr else {
+        return Err(sb_npe(
+            "Cannot read the array length because \"str\" is null",
+        ));
     };
     let arr_len = ctx.array_length(arr);
     let mut insert_chars = Vec::with_capacity(arr_len);
@@ -4170,12 +4256,6 @@ pub(crate) fn native_sb_insert_char_array(
             _ => 0,
         });
     }
-
-    let chars = sb_read_chars(ctx, this);
-    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
-        return Err(failure);
-    }
-    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -4434,8 +4514,18 @@ pub(crate) fn native_sb_index_of(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // `read_string_chars`, not `read_string`: the needle may itself hold an
     // unpaired surrogate.
+    //
+    // A null needle is a NullPointerException, not `-1`: `indexOf` reaches
+    // `String.indexOf(byte[], byte, int, String, int)`, whose first act is
+    // `tgt.length()`. `-1` is the answer for "not present", and a caller
+    // cannot tell it from "you passed null". MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -4451,8 +4541,16 @@ pub(crate) fn native_sb_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // The null needle beats the `fromIndex`, which is only clamped and never
+    // rejected: `indexOf(null, -1)` and `indexOf(null, 99)` are both NPE.
+    // MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -4497,8 +4595,15 @@ pub(crate) fn native_sb_last_index_of(
     };
     // `read_string_chars`: an unpaired surrogate in the needle cannot survive
     // `read_string().encode_utf16()`, which routes through a Rust `str`.
+    //
+    // A null needle throws, exactly as in `indexOf`. MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -4520,8 +4625,15 @@ pub(crate) fn native_sb_last_index_of_from(
     };
     // `read_string_chars`: an unpaired surrogate in the needle cannot survive
     // `read_string().encode_utf16()`, which routes through a Rust `str`.
+    //
+    // A null needle throws, exactly as in `indexOf`. MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
