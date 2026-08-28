@@ -122,15 +122,13 @@ notes explain how a HotSpot constant-folding artifact makes the CPU side of
 those two rows easy to misread. Full results, extra sizes, and methodology notes:
 [BENCHMARK.md](BENCHMARK.md) and [docs/gpu/README.md](docs/gpu/README.md).
 
-## What Runs Today
+## What to build on
 
 Boots, runs, and passes large real-world test suites:
 
 - **Spring / Spring Boot**
-- **Apache Tomcat**
-- **Netty** 
+- **Tomcat / Netty**
 - **Hibernate / Hibernate Reactive**
-- **Quarkus**
 - **H2 DB / PostgreSQL driver**
 - **Apache Commons Math** 
 - **Bouncy Castle Java**
