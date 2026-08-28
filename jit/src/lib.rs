@@ -15327,11 +15327,24 @@ fn plan_scalar_replacement(
     // object, which the materializer has always supported (it walks the field
     // graph and allocates a shell per distinct id). So the pin only bites when
     // this allocation cannot be described at all.
-    if descriptor_pinned.contains(&new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    // Engagement census. These two gates are the ONLY thing
+    // `CRATONVM_SCALAR_DEOPT` changes, so they are the only place that can say
+    // whether the flag reached a workload — see
+    // `cratonvm_types::scalar_deopt_census`. Counted once per allocation
+    // (`descriptor_decided`), not once per gate: an allocation can be both
+    // pinned by an earlier round and named by a snapshot, and counting it twice
+    // would inflate an engagement number a soak is about to reason from.
+    let mut descriptor_rescued = false;
+    let mut descriptor_blocked = false;
+    if descriptor_pinned.contains(&new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
     }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
@@ -15339,11 +15352,23 @@ fn plan_scalar_replacement(
         // to silently retarget it.
         elide_alloc = false;
     }
-    if ea_snapshot_names(ir_graph, new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    if ea_snapshot_names(ir_graph, new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
+    }
+    // BLOCKED wins over RESCUED: an allocation that hit both gates and failed
+    // either one is kept, so reporting it as engagement would be a lie in the
+    // direction that flatters the flag.
+    if descriptor_blocked {
+        cratonvm_types::scalar_deopt_census::note_blocked();
+    } else if descriptor_rescued {
+        cratonvm_types::scalar_deopt_census::note_rescued();
     }
     if !ea_splice_feasible(ir_graph, new_node)
         || stores.iter().any(|&s| !ea_splice_feasible(ir_graph, s))

@@ -196,6 +196,11 @@ pub(crate) fn materialize_virtual_objects(
     if states.is_empty() {
         return Ok(Vec::new());
     }
+    // Engagement census (`cratonvm_types::scalar_deopt_census`). Counted HERE,
+    // past the empty check, so the number means "objects the compiler deleted
+    // and a deopt had to put back" — the only evidence that a soak exercised
+    // the descriptor rather than merely the deletion.
+    cratonvm_types::scalar_deopt_census::note_materialized(states.len() as u64);
 
     // ENGAGEMENT COUNTER. `CRATONVM_SCALAR_DEOPT` has two halves, and only one
     // of them is exercised by simply running a workload: the producer elides
