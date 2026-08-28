@@ -14311,35 +14311,22 @@ unsafe fn try_varhandle_instance_field_cas(
     if vh_raw == 0 || recv_raw == 0 {
         return None;
     }
-    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
-    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
-    // Same GC-stable key the read path files handles under.
-    let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
-    let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // The call site's declared operand types have to agree with the variable's
     // own kind, for the reason the read path checks its return type: the
     // registered descriptor is the erased `([Ljava/lang/Object;)Z`, so the
-    // site's is the only statement of what the caller actually passed.
+    // site's is the only statement of what the caller actually passed. A BOUND
+    // site does not pay this parse — its slot is that statement, decided once
+    // at bind time. On this route it is per call, and a native profile put it
+    // at 10.3% of a reference CAS (`CharSearcher::next_match`) before the bind
+    // existed to take the hot sites away from it.
     let (expected_desc, new_desc) = varhandle_cas_operand_kinds(info.descriptor)?;
-    if expected_desc != plan.value_desc || new_desc != plan.value_desc {
+    if expected_desc != new_desc {
         return None;
     }
-    let expected = varhandle_operand_value(vm, args_slice[2], plan.value_desc)?;
-    let new_val = varhandle_operand_value(vm, args_slice[3], plan.value_desc)?;
-    let receiver = heap.load_and_forward(receiver);
-    // One implementation, shared with `VmExec::compare_and_swap_field`, so the
-    // SATB pre-barrier on `expected` and the post `write_barrier` on success
-    // cannot drift from the interpreter's copy.
-    let swapped = crate::vm::vm_exec::compare_and_swap_field_shared(
-        vm,
-        receiver,
-        plan.field_index as usize,
-        expected,
-        new_val,
-    );
+    // One implementation, shared with the thin direct helper, so what the two
+    // consider a servable handle cannot drift.
+    let swapped =
+        varhandle_instance_field_cas_shared(vm, vh_raw, recv_raw, expected_desc, args_slice[2], args_slice[3])?;
     Some(i64::from(swapped))
 }
 
@@ -14935,6 +14922,215 @@ const fn vh_write_info(mode: usize, kind: usize) -> JitInvokeInfo {
         descriptor: VARHANDLE_WRITE_DESCRIPTORS[kind],
         num_jit_args: 3,
         return_type: b'V',
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// `VarHandle` compareAndSet thin direct-call helpers.
+//
+// The callee half of `cratonvm_jit::VARHANDLE_CAS_DIRECT_FNS`: a
+// `(vm_ptr, varhandle, receiver, expected, new)` `extern "C"` function per
+// value kind. Five arguments — five of SysV's six `ARG_REGS`, and on Win64 the
+// fifth arrives on the stack, which `emit_stack_arg_setup` marshals.
+// ---------------------------------------------------------------------------
+
+/// Served / declined counts for the `VarHandle` CAS direct helpers.
+///
+/// Same contract as the read and write pairs beside them: `hits == 0` with a
+/// bound site is the specific failure this exists to name, and a non-zero
+/// `declines` beside a non-zero `hits` is normal — the first call on a handle
+/// resolves its field slot inside the native, so it declines and the second
+/// qualifies.
+pub static VARHANDLE_CAS_DIRECT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_CAS_DIRECT_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(served, declined)` counts for the `VarHandle` CAS direct helpers.
+pub fn varhandle_cas_direct_counts() -> (u64, u64) {
+    (
+        VARHANDLE_CAS_DIRECT_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_CAS_DIRECT_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The CAS itself, shared by the direct arm and the funnel-side twin so the two
+/// cannot drift apart in what they consider a servable handle.
+///
+/// `Some(swapped)` when the CAS happened; `None` declines to the caller's cold
+/// arm. The barrier ordering is not here — it is one level further down in
+/// `compare_and_swap_field_shared`, which both the interpreter and this share,
+/// because a CAS has more to get wrong than a store: the SATB pre-barrier fires
+/// on `expected` BEFORE the store and the post `write_barrier` only on success.
+///
+/// # SAFETY
+///
+/// `vh_raw` and `recv_raw` are raw references a compiled frame is holding.
+unsafe fn varhandle_instance_field_cas_shared(
+    vm: &SharedVm,
+    vh_raw: u64,
+    recv_raw: u64,
+    site_kind: u8,
+    expected_bits: i64,
+    new_bits: i64,
+) -> Option<bool> {
+    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
+    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
+    // The same GC-stable key `vh_meta_get` files the handle under.
+    let heap = &vm.mem.heap;
+    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
+        heap.next_identity_hash()
+    });
+    let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
+    // Reference/primitive agreement between the variable and the call site, the
+    // same test the read and write sides make. `site_kind` is the bound slot's
+    // constant here and the parsed descriptor's answer on the funnel side; both
+    // are statements about what the CALLER passed, which the erased registered
+    // descriptor cannot make.
+    let site_is_ref = site_kind == b'L';
+    let plan_is_ref = plan.value_desc == b'L';
+    if site_is_ref != plan_is_ref || (!site_is_ref && site_kind != plan.value_desc) {
+        return None;
+    }
+    let expected = varhandle_operand_value(vm, expected_bits, plan.value_desc)?;
+    let new_val = varhandle_operand_value(vm, new_bits, plan.value_desc)?;
+    let receiver = heap.load_and_forward(receiver);
+    Some(crate::vm::vm_exec::compare_and_swap_field_shared(
+        vm,
+        receiver,
+        plan.field_index as usize,
+        expected,
+        new_val,
+    ))
+}
+
+/// Body of every [`VARHANDLE_CAS_DIRECT_FNS`] slot.
+///
+/// Fast path: the handle describes a resolved instance field whose kind agrees
+/// with the call site's operands, and the answer is one barriered CAS.
+/// Everything else — a null handle or coordinate, an unresolved or
+/// non-instance-field handle, a kind disagreement, an operand word that is not
+/// a reference — falls through to the generic dispatcher with this slot's
+/// synthetic call site, so the exception and the `VarHandle` access-mode rules
+/// stay the registered native's rather than a copy of them.
+///
+/// # SAFETY
+///
+/// Called only from JIT-compiled code, with a `vm_ptr` compiled against this
+/// live VM and raw references the compiled frame is holding.
+unsafe fn varhandle_cas_direct_impl(
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    expected: i64,
+    new_val: i64,
+    slot: usize,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let site_kind = cratonvm_jit::VARHANDLE_CAS_KINDS[slot % cratonvm_jit::VARHANDLE_CAS_KINDS.len()];
+    if vh != 0 && receiver != 0 {
+        if let Some(swapped) = varhandle_instance_field_cas_shared(
+            vm,
+            vh as u64,
+            receiver as u64,
+            site_kind,
+            expected,
+            new_val,
+        ) {
+            VARHANDLE_CAS_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return i64::from(swapped);
+        }
+    }
+    VARHANDLE_CAS_DIRECT_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [vh, receiver, expected, new_val];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &VARHANDLE_CAS_INFOS[slot] as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        4,
+    )
+}
+
+/// The thin direct-call target for slot `SLOT` of
+/// `cratonvm_jit::VARHANDLE_CAS_DIRECT_FNS`.
+///
+/// One monomorphisation per slot, so the slot — and with it the site's value
+/// kind and the synthetic call site the cold arm uses — is a compile-time
+/// constant in the emitted `CALL`'s target.
+///
+/// # SAFETY
+///
+/// See [`varhandle_cas_direct_impl`].
+pub unsafe extern "C" fn jit_varhandle_cas_direct<const SLOT: usize>(
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    expected: i64,
+    new_val: i64,
+) -> i64 {
+    varhandle_cas_direct_impl(vm_ptr, vh, receiver, expected, new_val, SLOT)
+}
+
+/// Addresses of every [`jit_varhandle_cas_direct`] monomorphisation, in slot
+/// order.
+fn varhandle_cas_direct_fns() -> [usize; cratonvm_jit::VARHANDLE_CAS_SLOTS] {
+    macro_rules! slots {
+        ($($slot:literal),* $(,)?) => {
+            [$( jit_varhandle_cas_direct::<$slot> as *const () as usize ),*]
+        };
+    }
+    slots!(0, 1, 2, 3, 4, 5, 6, 7, 8)
+}
+
+/// The thin direct-call helper address for one CAS slot, for the OSR door.
+pub fn varhandle_cas_direct_fn(slot: usize) -> usize {
+    varhandle_cas_direct_fns()[slot]
+}
+
+/// Erased call-site descriptors for [`VARHANDLE_CAS_INFOS`], indexed by slot.
+///
+/// A baked direct call has no `JitInvokeInfo` of its own, so the cold arm
+/// cannot hand the generic dispatcher the site's real descriptor. These stand
+/// in for it, and the substitution is unobservable for the same reason it is on
+/// the write side: the descriptor's readers are the argument decode — one
+/// reference coordinate and two values of this kind either way — and the return
+/// handling, which is a `boolean` in every slot.
+const VARHANDLE_CAS_DESCRIPTORS: [&str; 9] = [
+    "(Ljava/lang/Object;ZZ)Z",
+    "(Ljava/lang/Object;BB)Z",
+    "(Ljava/lang/Object;CC)Z",
+    "(Ljava/lang/Object;SS)Z",
+    "(Ljava/lang/Object;II)Z",
+    "(Ljava/lang/Object;JJ)Z",
+    "(Ljava/lang/Object;FF)Z",
+    "(Ljava/lang/Object;DD)Z",
+    "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+];
+
+/// Synthetic call sites for the cold arm of the `VarHandle` CAS helpers, one
+/// per slot. `static` for the same reason [`VARHANDLE_WRITE_INFOS`] is:
+/// `jit_invoke_dispatch` keys its per-site memos on `(vm_identity, info
+/// address)`, so the address has to be process-stable.
+static VARHANDLE_CAS_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_CAS_SLOTS] = [
+    vh_cas_info(0), vh_cas_info(1), vh_cas_info(2), vh_cas_info(3), vh_cas_info(4),
+    vh_cas_info(5), vh_cas_info(6), vh_cas_info(7), vh_cas_info(8),
+];
+
+/// One entry of [`VARHANDLE_CAS_INFOS`]. `num_jit_args: 4` counts the receiver
+/// — the `VarHandle` itself — plus the coordinate, `expected` and `new`.
+const fn vh_cas_info(kind: usize) -> JitInvokeInfo {
+    JitInvokeInfo {
+        class_name: "java/lang/invoke/VarHandle",
+        method_name: "compareAndSet",
+        descriptor: VARHANDLE_CAS_DESCRIPTORS[kind],
+        num_jit_args: 4,
+        return_type: b'Z',
         invoke_kind: 0,
         declaring_class_id: 0,
     }
@@ -23444,6 +23640,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // Same contract, one table over: the write slots are in
         // `varhandle_write_helper_slot`'s order by construction.
         cratonvm_jit::set_varhandle_write_direct_fns(&varhandle_write_direct_fns());
+        cratonvm_jit::set_varhandle_cas_direct_fns(&varhandle_cas_direct_fns());
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
