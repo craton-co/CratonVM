@@ -6821,57 +6821,71 @@ unsafe fn report_jit_punned_putfield(obj_ptr: i64, field_index: i64, value: Valu
 /// cannot fabricate an answer, because `pin_jit_code_range_owner` returns a
 /// body only for an address a LIVE compiled artifact actually covers.
 fn compiled_frames_above() -> String {
-    // 64 KiB of stack is far more than the few frames between a compiled
-    // putfield and its method's own frame, and bounds the scan on a thread
-    // whose stack base this function does not know.
-    const WORDS: usize = 8192;
-    let anchor = 0usize;
-    let base = &anchor as *const usize;
-    // The range table, not the pinned owner. `register_jit_code_range` (the
-    // non-owning spelling) stores a `Weak::new()` that can never upgrade, so
-    // `pin_jit_code_range_owner` answers `None` for every range registered
-    // that way -- which is why the first version of this printed an empty
-    // list on a live positive control. The ENTRY address is enough: it is
-    // what `CRATONVM_DBG=jitc` prints beside the method name on
-    // `full-compile <method> entry=0x...`.
+    // EXACT, via the frame-pointer chain -- not a conservative sweep.
+    //
+    // The scan this replaced tested every stack word in a window against the
+    // JIT code-range table. It found frames sometimes and nothing at other
+    // times on the same build, which is the worst property a witness can have:
+    // its silence meant nothing. The chain answers the actual question -- which
+    // return addresses are on this stack -- and answers it the same way every
+    // time.
+    //
+    // Requires frame pointers in the Rust frames between here and
+    // `jit_putfield_int`; build the diagnostic binary with
+    // `RUSTFLAGS="-C force-frame-pointers=yes"`. Compiled JIT frames maintain
+    // RBP already (`emit_post_call_rbp_republish` exists to keep it correct
+    // across a raw JIT-to-JIT return), so the chain continues into them.
     let ranges = cratonvm_jit::jit_code_ranges_snapshot();
+    if ranges.is_empty() {
+        return "none: code-range table empty".to_string();
+    }
+    let mut rbp: usize;
+    // SAFETY: reads a register. No memory is accessed by the asm itself.
+    unsafe {
+        std::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
     let mut out: Vec<String> = Vec::new();
-    let mut seen: Vec<usize> = Vec::new();
-    for i in 0..WORDS {
-        // SAFETY: reading our own stack upward. `base` is a local of this
-        // frame, so `base + i` over this range stays inside the thread's stack
-        // mapping for any reasonable stack size; the word is treated as an
-        // opaque integer and never dereferenced.
-        let word = unsafe { std::ptr::read(base.add(i)) };
-        if word < 0x1000 {
-            continue;
-        }
-        let Some(&(entry, _)) = ranges.iter().find(|(e, end)| word >= *e && word < *end) else {
-            continue;
+    let mut depth = 0usize;
+    // 64 links is far past the handful of frames between this helper and the
+    // compiled body that called it, and bounds a chain a clobbered RBP could
+    // otherwise make cyclic.
+    while depth < 64 && rbp > 0xffff && rbp % 8 == 0 {
+        // SAFETY: `rbp` is a frame-pointer value read from the chain; each link
+        // is `[saved_rbp, return_address]`. The bounds tests above reject the
+        // obviously-invalid values a clobbered register would produce, and the
+        // loop is depth-bounded.
+        let (next, ret) = unsafe {
+            (
+                std::ptr::read_volatile(rbp as *const usize),
+                std::ptr::read_volatile((rbp + 8) as *const usize),
+            )
         };
-        if seen.contains(&entry) {
-            continue;
+        if let Some(&(entry, _)) = ranges.iter().find(|(e, end)| ret >= *e && ret < *end) {
+            let name = cratonvm_jit::jit_code_range_method_key(ret).unwrap_or_default();
+            out.push(format!(
+                "{entry:#x}+{:#x}{}",
+                ret - entry,
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("({name})")
+                }
+            ));
+            if out.len() >= 6 {
+                break;
+            }
         }
-        seen.push(entry);
-        let name = cratonvm_jit::jit_code_range_method_key(word).unwrap_or_default();
-        out.push(format!("{entry:#x}+{:#x}{}", word - entry,
-            if name.is_empty() { String::new() } else { format!("({name})") }));
-        if out.len() >= 8 {
-            break;
+        if next <= rbp {
+            break; // the chain must grow upward; anything else is not a frame
         }
+        rbp = next;
+        depth += 1;
     }
     if out.is_empty() {
-        // A blank list has two readings and they want different fixes: the
-        // range table was empty, or no stack word in the window fell inside a
-        // range. Say which.
-        let lo = ranges.iter().map(|(e, _)| *e).min().unwrap_or(0);
-        let hi = ranges.iter().map(|(_, e)| *e).max().unwrap_or(0);
-        return format!(
-            "none: ranges={} span={lo:#x}..{hi:#x} stack_base={base:?}",
-            ranges.len()
-        );
+        format!("none: walked {depth} frames, {} ranges live", ranges.len())
+    } else {
+        out.join(", ")
     }
-    out.join(", ")
 }
 
 /// Armed-check for [`report_jit_punned_putfield`], inlined into the four

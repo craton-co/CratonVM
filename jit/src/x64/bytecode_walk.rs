@@ -45,6 +45,23 @@ pub(super) fn dbg_field_sites() -> Option<&'static str> {
 }
 
 /// Emit one `[jit-field-site]` line when the method matches the filter.
+/// Emit one `[jit-emit-direct]` line per raw direct CALL this backend bakes.
+///
+/// The bind-time tracer (`CRATONVM_DBG_JIT_DIRECT_BINDS`) sees only the one
+/// bind path it was added to. This sees the EMITTER, which is the thing that
+/// actually puts an address in the code -- and the set it prints, compared
+/// against `_direct_callee_entries`, is what says whether that address is
+/// kept alive and invalidated with its callee.
+pub(super) fn note_emit_direct(method_key: &str, pc: usize, entry: usize) {
+    let Some(filter) = dbg_field_sites() else {
+        return;
+    };
+    if !method_key.contains(filter) {
+        return;
+    }
+    eprintln!("[jit-emit-direct] caller={method_key} pc={pc} entry={entry:#x}");
+}
+
 pub(super) fn note_field_site(method_key: &str, what: &str, pc: usize, slot: usize, tag: u8) {
     let Some(filter) = dbg_field_sites() else {
         return;
@@ -5569,6 +5586,7 @@ impl Compiler {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self.direct_calls_idx.get(&pc).map(|&i| {
                         let dc = &self.direct_calls[i].1;
+                        note_emit_direct(&self.method_key, pc, dc.entry);
                         (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
                     });
 
@@ -8391,6 +8409,7 @@ impl Compiler {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self.direct_calls_idx.get(&pc).map(|&i| {
                         let dc = &self.direct_calls[i].1;
+                        note_emit_direct(&self.method_key, pc, dc.entry);
                         (
                             dc.entry,
                             dc.needs_context,

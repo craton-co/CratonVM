@@ -1015,6 +1015,13 @@ pub static COMMITTED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
 /// deliberately generous bound that real workloads rarely approach.
 const DEFAULT_JIT_CODE_CACHE_CAP_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hands out [`CompiledMethod::artifact_id`]. Monotonic for the life of the
+/// process; `0` is reserved for "not recorded".
+fn next_artifact_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of `try_compile` calls refused because the code-cache cap was hit.
 static JIT_CODE_CACHE_CAP_REFUSALS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2564,6 +2571,26 @@ pub struct CompiledMethod {
     /// Native entries of compiled callees referenced by baked direct calls.
     /// Filled by the compile driver before publication.
     pub _direct_callee_entries: Vec<usize>,
+    /// `(entry, artifact_id)` for every raw direct CALL baked into this body:
+    /// the address, and WHICH artifact owned it when the address was baked.
+    ///
+    /// Without the second half, `prepare_for_publication` can only ask whether
+    /// something live owns the address now. Measured on
+    /// `TestWebdavPropertyStore` 2026-08-28, one run's log, in order:
+    ///
+    /// ```text
+    /// full-compile SQLChar.<init>()V     entry=E len=1362
+    /// [jit-code-free] base=E published=true authorised=false
+    /// full-compile SQLInteger.<init>()V  entry=E len=657      <- E recycled
+    /// full-compile DataValueFactoryImpl.getNullDVDWithUCS_BASICcollation
+    /// [punned-store-jit] ... executing at E+0x224
+    /// ```
+    ///
+    /// The caller baked `CALL E` for `SQLChar.<init>`; by publication E was
+    /// `SQLInteger.<init>`, whose body opens `putfield isnull:Z` -- field
+    /// index 1, `Int(1)`. `SQLChar` slot 1 is `rawData`, declared `[C`, so
+    /// Derby then read that field as the pointer `1`.
+    pub _direct_callee_expected: Vec<(usize, u64)>,
     /// Strong ownership matching `_direct_callee_entries`. A loaded caller can
     /// therefore never outlive executable code reached by one of its baked
     /// calls, even after the callee is invalidated and removed from the cache.
@@ -2913,6 +2940,19 @@ pub struct CompiledMethod {
     /// the compile-wide thread-local witness [`open_compile_epoch_witness`]
     /// opens (so the stamp is the epoch at compile START, not at finalize).
     pub install_epoch: u64,
+    /// Process-unique identity for this artifact.
+    ///
+    /// Neither the entry ADDRESS nor the `CompiledMethod`'s own address
+    /// identifies a body: an executable buffer is recycled to the next
+    /// compile of a similar size, and the `Arc`'s allocation is recycled by
+    /// the global allocator just as readily. A check built on either is an
+    /// ABA -- it compares equal across two different artifacts. This is a
+    /// monotonic counter, so it never repeats.
+    ///
+    /// Read by [`JitCache::prepare_for_publication`], which has to answer
+    /// "is the body at this baked address still the one it was baked for",
+    /// not merely "is something alive there".
+    pub artifact_id: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -3014,6 +3054,7 @@ impl CompiledMethod {
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
             _direct_callee_entries: Vec::new(),
+            _direct_callee_expected: Vec::new(),
             _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
@@ -3069,6 +3110,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            artifact_id: next_artifact_id(),
         }
     }
 
@@ -3088,6 +3130,7 @@ impl CompiledMethod {
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
             _direct_callee_entries: Vec::new(),
+            _direct_callee_expected: Vec::new(),
             _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
@@ -3143,6 +3186,7 @@ impl CompiledMethod {
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
             compile_id: 0,
             install_epoch: current_compile_install_epoch(),
+            artifact_id: next_artifact_id(),
         }
     }
 
@@ -6282,7 +6326,7 @@ fn append_ir_inline_site(
     tables: &mut ir::IrInlineTables,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
-    direct_callee_entries: &mut Vec<usize>,
+    direct_callee_entries: &mut Vec<(usize, u64)>,
     budget: &mut usize,
     // `(combined pc, num_jit_args)` for each virtual/interface call the spliced
     // bodies leave behind. The planner gives each its own MIC/PIC — without one
@@ -6448,7 +6492,7 @@ pub(crate) fn intern_inline_invoke_targets(
     site: &mut InlineSite,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
-    direct_callee_entries: &mut Vec<usize>,
+    direct_callee_entries: &mut Vec<(usize, u64)>,
 ) {
     // Wholesale, never additive: an `InlineSite` may have been CLONED from
     // a cached plan that already carries pointers from an earlier compile,
@@ -6490,7 +6534,9 @@ pub(crate) fn intern_inline_invoke_targets(
         // does and needs the same registration; skipping it leaves a raw `CALL`
         // into freed code.
         if direct_entry != 0 {
-            direct_callee_entries.push(direct_entry);
+            // The owner AT BAKE TIME -- see `_direct_callee_expected`.
+            direct_callee_entries
+                .push((direct_entry, jit_entry_artifact_id(direct_entry)));
         }
         site.resolved_invoke_infos.push(ResolvedInlineInvoke {
             callee_pc: *callee_pc,
@@ -13006,6 +13052,36 @@ pub(crate) fn register_jit_entry_owner_for_adapter(entry: usize, arc: &Arc<Compi
     jit_entry_owners().lock().insert(entry, Arc::downgrade(arc));
 }
 
+/// The identity of whatever owns `entry` right now, for recording beside a
+/// baked direct-call address. `0` means "nothing owns it", which
+/// `prepare_for_publication` treats as "no identity recorded".
+pub(crate) fn jit_entry_artifact_id(entry: usize) -> u64 {
+    let id = resolve_jit_entry_owner(entry).map_or(0, |o| o.artifact_id);
+    // `CRATONVM_JIT_CALLEE_IDENTITY=0` keeps this lookup -- and the
+    // `jit_entry_owners` lock it takes -- but records NO identity, so
+    // `prepare_for_publication` falls back to its historical liveness-only
+    // answer. That is the control the fix needs: a lock taken on a compile path
+    // can serialise a race away by itself, and this session has already watched
+    // a `Mutex` in a diagnostic make the defect vanish. If the defect stays away
+    // with the check disabled, the check is not what fixed it.
+    if callee_identity_check_enabled() {
+        id
+    } else {
+        0
+    }
+}
+
+/// `CRATONVM_JIT_CALLEE_IDENTITY=0` -- record no bake-time callee identity.
+/// Default ON. See [`jit_entry_artifact_id`] for why the switch exists.
+fn callee_identity_check_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALLEE_IDENTITY")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
     jit_entry_owners().lock().get(&entry)?.upgrade()
 }
@@ -13415,6 +13491,12 @@ pub static UNPINNED_JIT_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Baked direct-call targets whose entry address changed hands between bake
+/// and publication. `UNROOTED_DIRECT_CALLEES` cannot see these: the pin
+/// succeeds, on the wrong body.
+pub static REBOUND_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
@@ -13789,10 +13871,43 @@ flushed at epoch {barrier}",
     /// `call` to an address nothing keeps alive.
     fn prepare_for_publication(compiled: &mut CompiledMethod) -> bool {
         let wanted = compiled._direct_callee_entries.len();
+        // IDENTITY, not liveness. `resolve_jit_entry_owner` answers "what owns
+        // this ADDRESS now"; `_direct_callee_expected` says which artifact owned
+        // it when the address was baked into this code. A recycled buffer makes
+        // those two different bodies and the pin then SUCCEEDS on the wrong one,
+        // so the old liveness-only test let the caller publish a `CALL` into a
+        // method it never resolved. Compared by `artifact_id` and not by
+        // pointer: the freed `Arc` allocation is recycled too, so an address
+        // comparison is an ABA and reads as a match.
+        let expected: Vec<(usize, u64)> = compiled._direct_callee_expected.clone();
+        let expected_of = |entry: usize| -> Option<u64> {
+            expected.iter().find(|(e, _)| *e == entry).map(|(_, id)| *id)
+        };
         compiled._direct_callee_roots = compiled
             ._direct_callee_entries
             .iter()
-            .filter_map(|&entry| resolve_jit_entry_owner(entry))
+            .filter_map(|&entry| {
+                let owner = resolve_jit_entry_owner(entry)?;
+                match expected_of(entry) {
+                    // Baked with no recorded identity (a synthetic range): keep
+                    // the historical liveness-only answer rather than refuse a
+                    // body that was fine before.
+                    None | Some(0) => Some(owner),
+                    Some(want) if owner.artifact_id == want => Some(owner),
+                    Some(_) => {
+                        REBOUND_DIRECT_CALLEES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dbg_jit_pin_enabled() {
+                            eprintln!(
+                                "[jit-rebound-callee] entry {entry:#x} now belongs to a \
+different artifact than the one baked into this body: its buffer was recycled before \
+publication"
+                            );
+                        }
+                        None
+                    }
+                }
+            })
             .collect();
         let got = compiled._direct_callee_roots.len();
         if got == wanted {
@@ -19935,7 +20050,7 @@ fn try_compile_inner(
         // `_direct_callee_entries` — keep-alive + invalidation closure).
         let mut ir_direct_calls: std::collections::HashMap<usize, (usize, bool)> =
             std::collections::HashMap::new();
-        let mut ir_direct_callee_entries: Vec<usize> = Vec::new();
+        let mut ir_direct_callee_entries: Vec<(usize, u64)> = Vec::new();
         // IR inline caches (jit-inlining-and-ir-calls): `pc → (mic_addr,
         // pic_addr)` for each virtual/interface site the IR lowerer may serve
         // from a MIC + 4-way-PIC cascade, plus the owning boxes, which are moved
@@ -20565,7 +20680,8 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             if !direct_target_is_thin_helper {
-                                ir_direct_callee_entries.push(entry);
+                                ir_direct_callee_entries
+                                    .push((entry, jit_entry_artifact_id(entry)));
                             }
                         } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
                             .is_some()
@@ -21525,8 +21641,10 @@ fn try_compile_inner(
                             // CALL to an address nothing keeps mapped. The
                             // lowerer records none today, which is exactly why
                             // the assignment looked safe.
+                            compiled._direct_callee_entries
+                                .extend(ir_direct_callee_entries.iter().map(|(e, _)| *e));
                             compiled
-                                ._direct_callee_entries
+                                ._direct_callee_expected
                                 .append(&mut ir_direct_callee_entries);
                             compiled._direct_callee_entries.sort_unstable();
                             compiled._direct_callee_entries.dedup();
@@ -21942,7 +22060,7 @@ fn try_compile_inner(
     let mut invoke_info: Vec<(usize, *const JitInvokeInfo)> = Vec::new();
     let mut owned_invoke_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
     let mut direct_calls: Vec<(usize, JitDirectCall)> = Vec::new();
-    let mut direct_callee_entries: Vec<usize> = Vec::new();
+    let mut direct_callee_entries: Vec<(usize, u64)> = Vec::new();
     let mut mic_slots: Vec<(usize, *const JitMICSlot)> = Vec::new();
     let mut owned_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
     // HIGH-7 — Eager PIC allocation strategy.
@@ -22811,7 +22929,8 @@ fn try_compile_inner(
                                     let info_ptr: *const JitInvokeInfo = &*info;
                                     owned_invoke_infos.push(info);
                                     invoke_info.push((pc, info_ptr));
-                                    direct_callee_entries.push(entry);
+                                    direct_callee_entries
+                                        .push((entry, jit_entry_artifact_id(entry)));
                                     direct_calls.push((
                                         pc,
                                         JitDirectCall {
@@ -22956,7 +23075,8 @@ fn try_compile_inner(
                                     &descriptor,
                                     entry,
                                 );
-                                direct_callee_entries.push(entry);
+                                direct_callee_entries
+                                    .push((entry, jit_entry_artifact_id(entry)));
                                 direct_calls.push((
                                     pc,
                                     JitDirectCall {
@@ -24092,7 +24212,21 @@ fn try_compile_inner(
     compiled._jit_pic_slots.extend(owned_pic_slots);
     direct_callee_entries.sort_unstable();
     direct_callee_entries.dedup();
-    compiled._direct_callee_entries = direct_callee_entries;
+    if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_FIELD_SITES") {
+        let key = format!(
+            "{}.{}{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        );
+        if key.contains(&want) {
+            eprintln!(
+                "[jit-kept-callees] method={key} entries={:x?}",
+                direct_callee_entries
+            );
+        }
+    }
+    compiled._direct_callee_entries =
+        direct_callee_entries.iter().map(|(e, _)| *e).collect();
+    compiled._direct_callee_expected = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
     // C2-review P1 — publish the inlining decision totals on the artifact so
     // `metrics::CompileRecorder::installed` can harvest them alongside
