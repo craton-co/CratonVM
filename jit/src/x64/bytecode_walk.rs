@@ -12502,7 +12502,172 @@ impl Compiler {
                         .map(|&i| self.typecheck_info[i])
                         .unwrap_or((pc, std::ptr::null(), 0));
 
+                    // ---- inline class-id fast path (see `checkcast_inline_enabled`) ----
+                    //
+                    // The target `ClassId` needs NO new plumbing: the main
+                    // compile door already resolves it and interns the site's
+                    // name under that identity, precisely so the runtime helper
+                    // can compare ids instead of re-resolving a name, and
+                    // `typecheck_target_for_site` is the public read of that
+                    // table. The id and the name pointer baked into the helper
+                    // call below are therefore the SAME pair — they cannot
+                    // disagree about which class this site means.
+                    //
+                    // A `ClassId` is per-VM and that table is process-wide, but
+                    // `intern_typecheck_target` keys its intern on the id, so
+                    // two VMs resolving one name differently get two DISTINCT
+                    // pointers and two distinct rows. The `JitCache` is a
+                    // per-VM field (`vm_init`), so a body only ever runs in the
+                    // VM whose compile baked the immediate.
+                    //
+                    // The doors that do not intern (OSR, eager first-call) get
+                    // `None` here and keep the unconditional call. That is a
+                    // real coverage gap and it is COUNTED rather than assumed —
+                    // see `CHECKCAST_INLINE_NO_TARGET_ID`.
+                    let target_class_id = if name_ptr.is_null() {
+                        None
+                    } else {
+                        crate::typecheck_target_for_site(name_ptr)
+                    }
+                    .filter(|&id| id != 0);
+
+                    // Read BEFORE the pop: `stack_oop_marks` is parallel to
+                    // `stack`, so the operand's mark is the last one only while
+                    // the operand is still on it. Same three clauses, read the
+                    // same way, as the compact inline `getfield` arm above —
+                    // whose fast path raw-dereferences these same references at
+                    // a FIELD offset behind a bare null test, which is why
+                    // reading the class id at offset 0 asks nothing new of them.
+                    let trusted_have_key = !self.method_key.is_empty();
+                    let trusted_marks_exact = self.stack_oop_marks_exact;
+                    let trusted_top_is_oop =
+                        self.stack_oop_marks.last().copied().unwrap_or(false);
+                    let operand_is_trusted_oop =
+                        trusted_have_key && trusted_marks_exact && trusted_top_is_oop;
+
                     let obj_slot = self.pop_stack();
+
+                    // The 1-D primitive-array variant. It needs NO class id —
+                    // it proves its answer from the header's kind/element tags —
+                    // which is the whole point, because a primitive array's
+                    // class id is 0 and could never have matched.
+                    // SAFETY: `name_ptr`/`name_len` are an `intern_typecheck_target`
+                    // pair, leaked for the life of the process.
+                    let prim_array_tag = unsafe {
+                        crate::typecheck_site_name(name_ptr, name_len)
+                    }
+                    .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                    .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
+                    let inline_target = target_class_id
+                        .filter(|_| {
+                            checkcast_inline_enabled()
+                                && operand_is_trusted_oop
+                                && prim_array_tag.is_none()
+                        });
+                    if checkcast_inline_enabled() {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        // Name the refusal per CAUSE. "Not inlined" is a
+                        // verdict; these two are the reasons, and they want
+                        // opposite fixes.
+                        if prim_array_tag.is_some() {
+                            crate::CHECKCAST_INLINE_SITES_PRIM_ARRAY.fetch_add(1, Relaxed);
+                        } else if inline_target.is_some() {
+                            crate::CHECKCAST_INLINE_SITES.fetch_add(1, Relaxed);
+                        } else if target_class_id.is_none() {
+                            crate::CHECKCAST_INLINE_NO_TARGET_ID.fetch_add(1, Relaxed);
+                        } else {
+                            crate::CHECKCAST_INLINE_UNTRUSTED.fetch_add(1, Relaxed);
+                        }
+                        if inline_target.is_none()
+                            && prim_array_tag.is_none()
+                            && cratonvm_types::flags::runtime_var_os(
+                                "CRATONVM_DBG_CHECKCAST_INLINE",
+                            )
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[checkcast-inline] pc={pc} REFUSED target_id={target_class_id:?} have_key={trusted_have_key} marks_exact={trusted_marks_exact} top_is_oop={trusted_top_is_oop} method={}",
+                                self.method_key,
+                            );
+                        }
+                    }
+                    let mut hit_patches: Vec<usize> = Vec::new();
+                    if let Some(tag) = prim_array_tag {
+                        // ONE comparison settles a 1-D primitive array: the
+                        // KIND_TAGS byte is `kind | (element_type << 2)` with
+                        // bits 6..7 reserved zero, so `byte[]` is exactly 0x21
+                        // and nothing else is. No null test is needed BEFORE it
+                        // — but the load would fault on null, so it still comes
+                        // first.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        let mut slow = self.emit_trusted_oop_receiver_check();
+                        self.buf.emit(&[
+                            0x80,
+                            0x78,
+                            cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                            tag,
+                        ]);
+                        hit_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → done
+                        for p in slow.drain(..) {
+                            self.patch_rel32_to_here(p);
+                        }
+                    } else if let Some(target_class_id) = inline_target {
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        // Null is a LEGAL cast and the helper already returns 0
+                        // for it, so null goes to the helper rather than growing
+                        // a second null path here. `emit_trusted_oop_receiver_check`
+                        // is that bare `TEST/JZ`, shared with the `getfield` arm.
+                        // ARRAY RECEIVERS MUST NOT REACH THE COMPARE.
+                        // `regression-suite` `RJitArrayTypecheck` caught this
+                        // version of the fix before it left the branch, and the
+                        // vector it caught it with is the one written for
+                        // BUG-JIT-ARRAY-INSTANCEOF-20260726 — the same defect,
+                        // reintroduced by the same reasoning.
+                        //
+                        // An array's header does NOT hold its own class id: a
+                        // reference array holds its COMPONENT's, and a primitive
+                        // array holds 0 (it has no class entry at all). So
+                        // `checkcast java/lang/String` on a `String[]` receiver
+                        // finds `String`'s id in the header, matches the baked
+                        // target, and accepts a cast that must throw. That is
+                        // exactly why the runtime helper screens its own
+                        // recorded-id shortcut with `!recv_is_array` and answers
+                        // arrays from `array_descriptor_of` instead.
+                        //
+                        // One instruction settles it: a plain object's KIND_TAGS
+                        // byte is zero — `ObjectKind::Object` and
+                        // `ArrayElementType::Reference` are both 0, pinned by
+                        // `const _: () = assert!` in `heap_types.rs` precisely so
+                        // JIT guards may do this. Arrays take the helper, which
+                        // is authoritative for them.
+                        let mut slow = self.emit_trusted_oop_receiver_check();
+                        // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 (80 /7 ib,
+                        // ModRM 0x78 = mod01 disp8 /7 rm=RAX).
+                        self.buf.emit(&[
+                            0x80,
+                            0x78,
+                            cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                            0x00,
+                        ]);
+                        slow.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+                        // CMP DWORD [RAX+class_id_off], target_class_id.
+                        // 81 /7 id with ModRM 0xB8 = mod10 (disp32) /7 rm=RAX —
+                        // the disp32 twin of the `0x81, 0x78` (disp8) form the
+                        // guarded-virtual inline arm emits.
+                        let cid_off = self.helpers.class_id_offset_in_obj as i32; // Cast: x86-64 disp32
+                        let cid_off_bytes = cid_off.to_le_bytes();
+                        let target_bytes = target_class_id.to_le_bytes();
+                        self.buf.emit(&[0x81, 0xB8]);
+                        self.buf.emit(&cid_off_bytes);
+                        self.buf.emit(&target_bytes);
+                        // Equal ⇒ the receiver IS the target class ⇒ the cast
+                        // succeeds and its result is the reference we already
+                        // hold, which is exactly what the helper would return.
+                        hit_patches.push(self.emit_jcc_rel32_patch(0x84)); // JE → done
+                        for p in slow.drain(..) {
+                            self.patch_rel32_to_here(p);
+                        }
+                    }
 
                     // Call jit_checkcast(vm_ptr, obj_ptr, class_name_ptr, class_name_len) → obj_ptr
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset); // vm_ptr
@@ -12528,6 +12693,14 @@ impl Compiler {
                     // drains the pending exception.
                     self.emit_post_invoke_exception_check(b'L');
                     self.emitted_checkcast_throw = true;
+                    // Join. The fast path jumps here with the receiver still in
+                    // RAX — the same value the helper returns on a hit — having
+                    // skipped the blind spill, the safepoint's oop map and the
+                    // exception check, none of which a path that makes no call
+                    // and cannot throw is owed.
+                    for p in hit_patches {
+                        self.patch_rel32_to_here(p);
+                    }
                     // Result (obj_ptr or 0 for null) is in RAX — push onto stack
                     self.push_from_rax();
                     // checkcast returns the same reference (or null).
