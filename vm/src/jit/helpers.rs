@@ -10954,10 +10954,14 @@ fn resolve_native_site(
         // deliberately WITHOUT asking the arbitration. §1.3 forbids invoking a
         // fake at all, so the yield question is moot — and asking it anyway
         // would route the site into `admit_jit_fast_native_resolved`'s strict
-        // arm, which records a structured violation per site. That record is
-        // reported by `--jdk-only-report`, so taking this early exit keeps
-        // strict mode's observable output identical rather than growing it a
-        // new entry for a decision that has not changed.
+        // arm, which calls `record_jdk_only_fastpath_refusal` and grows the
+        // bounded violation list `--jdk-only-report` prints. This early exit is
+        // scoped to that one report: it keeps the fast-path refusal record from
+        // gaining an entry for a decision that has not changed. It is NOT a
+        // claim about the whole strict-mode census — `native-shadows-bytecode`
+        // is recorded by the INTERPRETER's Step 1 door
+        // (`record_native_shadow_ran_over_bytecode`), which this path does not
+        // reach in either direction.
         if crate::vm::dispatch_policy(vm).is_jdk_only() {
             return site_refusal::note(6);
         }

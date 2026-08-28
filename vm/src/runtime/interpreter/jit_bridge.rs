@@ -1329,6 +1329,51 @@ pub(super) fn compile_osr_artifact(
                     }
                     // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
+                    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+                    // The OSR door's copy of the 64-bit family. It has to be
+                    // here as well as in `jit::try_compile`: an intrinsic
+                    // registered in one compile door is INERT in the others,
+                    // which is the failure this file's own
+                    // `Thread.currentThread` and String binds each record once.
+                    //
+                    // It matters most exactly where OSR matters: a
+                    // single-invocation method whose whole life is one hot
+                    // loop. `HashedWheelTimer`'s worker is that shape, and its
+                    // `pendingTimeouts` is an `AtomicLong` incremented once per
+                    // scheduled timeout and decremented once per expiry.
+                    if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
+                    {
+                        let atomic_long_cid = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
+                            .map(|id| id.as_u32());
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_long_cid.and_then(|cid| {
+                                cratonvm_jit::try_resolve_atomic_long_intrinsic(
+                                    &target_class,
+                                    &mn,
+                                    &desc,
+                                    cid,
+                                )
+                            })
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
+
                     // `Integer.intValue()` thin direct call — `Integer` is
                     // `final`, so a site declared against it is statically
                     // monomorphic (guard-free); the helper handles the
