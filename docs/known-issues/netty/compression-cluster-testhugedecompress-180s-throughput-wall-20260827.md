@@ -1,4 +1,4 @@
-# `codec.compression.*IntegrationTest` — three classes PASS, four are inside the cap, four are not, and the wall is now PRICED
+# `codec.compression.*IntegrationTest` — four defects fixed, three classes PASS, four are still over, and the rest of the wall is PRICED
 
 ## Status
 
@@ -127,43 +127,84 @@ and the chain is worth 2.2x.
 
 Measured on the same 1 MiB fastlz round trip (768 ms/MiB encode+decode).
 
-| lever | share | note |
+| lever | share | status |
 |---|---:|---|
-| `checkcast` has no inline fast path | **~10 %** | see below |
-| the `RefCnt` `VarHandle` read in `ensureAccessible` | ~8 % | `jit_varhandle_read_direct::<4>` + `varhandle_instance_field_read_bits` + `direct_receiver_facts` |
-| the `"index"` string literal in `checkIndex0` | ~6 % | `jit_ldc_string_cp` -> `MemberResolver::probe_constant` per byte, for a message never used |
+| `checkcast` has no inline fast path | ~10 % | **FIXED** — see below, measured **1.21x** on this workload |
+| the `RefCnt` `VarHandle` read in `ensureAccessible` | ~8 % | open — `jit_varhandle_read_direct::<4>` + `varhandle_instance_field_read_bits` + `direct_receiver_facts` |
+| the `"index"` string literal in `checkIndex0` | ~6 % | open — `jit_ldc_string_cp` -> `MemberResolver::probe_constant` per byte, for a message never used |
 | compiled `getfield` | **not a factor** | 1222 helper calls in 3 MiB — the compact inline path is working |
 
 They sum to about 1.3x. **No combination of them reaches 2.4x**; the profile is
 flat by construction, because the cost is one small fixed charge repeated nine
 times per byte.
 
-### `checkcast` — 136x, and the largest single named item
+## Defect 4 — `checkcast` was an unconditional helper call, at 136x
 
-`bytecode_walk.rs`'s `0xc0` arm emits an **unconditional** call to
+`bytecode_walk.rs`'s `0xc0` arm emitted an **unconditional** call to
 `jit_checkcast`: a `flush_scratch_registers`, an `emit_pre_safepoint_spill`, the
 CALL, an `emit_oop_map_for_safepoint` and a post-invoke exception check. Inside
-the helper, every call takes a heap-membership walk
-(`ZObjectStarts::contains` -> `ZgcRealHeap::is_object_address`) before it can
-read the header. There is no inline class-id compare anywhere on the path.
+the helper, every call took a heap-membership walk (`ZObjectStarts::contains` ->
+`ZgcRealHeap::is_object_address`) before it could read the header. There was no
+inline class-id compare anywhere on the path — though the guarded-virtual inline
+arm has emitted `CMP DWORD [recv+0], class_id` for months.
 
 ```
-CcProbe, 20,000,000 casts of an Object to byte[]:
-    CratonVM  38.2 ns/iter        HotSpot  0.28 ns/iter        136x
-    membership walks by JIT site: checkcast=99,993,000
+20,000,000 casts, before:  CratonVM 38.2 ns/iter   HotSpot 0.28 ns/iter   136x
 ```
 
-fastlz pays 2,001,514 of them per MiB — `PooledByteBuf<T>` is generic, so
-`_getByte` casts its erased `memory` field to `byte[]` on **every byte** — which
-is ~76 ms/MiB, the ~10 % above. The fix is the shape the getfield path already
-has (`sp-compact-inline-slowpath`): an inline compare against the target class
-id, falling through to today's helper on a miss. It is a general VM improvement,
-not a netty one, and it is the recommended next change on this page.
+Fixed by `perf(jit): inline fast path for checkcast`, in two shapes, each
+proving its answer from the header alone:
+
+* **plain object** — class-id equality. An object whose class id equals the
+  target's is assignable to it, full stop. Subclasses, interfaces, lambda
+  proxies and synthetics all have different ids and keep the helper, so this can
+  only turn a slow YES into a fast YES.
+* **1-D primitive array** — the `KIND_TAGS` byte. A class-id compare provably
+  CANNOT serve `[B`: a primitive array carries `class_id == 0` and a reference
+  array carries its COMPONENT's. The header's own `kind | (element_type << 2)`
+  byte does, in one comparison — a `byte[]` is `0x21` and nothing else is. One
+  dimension only, which is what makes it sound: `byte[][]` holds references, so
+  its element type is `Reference`.
+
+| same binary, kill switch the only difference | before | after | HotSpot |
+|---|---:|---:|---:|
+| plain-object cast | 20.04 ns | **1.55 ns** | 0.27 ns |
+| `byte[]` cast | 38.11 ns | **1.35 ns** | 0.27 ns |
+| netty fastlz, 1 MiB, CPU user, 3 interleaved pairs | 11.12 s | **9.16 s** | — |
+| `membership walks by JIT site: checkcast=` | 12,002,214 | **276** | — |
+
+**Two near-misses are the reusable part.**
+
+`RJitArrayTypecheck` caught the first version reintroducing
+BUG-JIT-ARRAY-INSTANCEOF-20260726 — an array's header does NOT hold its own
+class id, so `checkcast java/lang/String` on a `String[]` receiver found
+`String`'s id there, matched the baked target, and accepted a cast that must
+throw. The vector written for that 2026-07-26 defect caught the same reasoning
+returning by a different route, four weeks later.
+
+And **three doors, again**. The first version patched only the single-pass
+backend's `0xc0` arm and measured EXACTLY ZERO on a four-million-cast probe —
+`checkcast=3,203,236` walks with it on against `3,203,316` with it off — because
+every body that mattered had tiered up into the optimizing pipeline, whose
+`Op::CheckCast` lowering is a separate emitter. Then the OSR door, the one a hot
+LOOP reaches, turned out to be the last of the three still handing the runtime
+helper a bare name with no `ClassId` recorded at all: `CcProbe2`, a
+20-million-iteration loop whose body is one `(Node) o` cast, reported
+`refused-no-target-id=2` and 63,989,000 unserved walks. Both are fixed. That is
+the third time this page has recorded the shape — the thin native binds and the
+`String` call-site intrinsics were the first two.
 
 ## Where the eleven stand
 
 Solo, uncapped, one run each, merged `dev` 2026-08-28.
 `regression-suite/run.sh` **72/72** on this binary.
+
+**These rows predate defect 4.** They were taken on merged `dev` before the
+inline `checkcast` fix, which is worth 1.21x on this workload's CPU time; no
+quiet host has been available since to retake them, and a contended one cannot
+(see immediately below). The three that PASS still pass — `JdkZlibIntegrationTest`
+measured 87 s `ok=11` at load 5.1 on the fixed binary, against 94 s at load ~0
+before it.
 
 **Measure these on a QUIET host.** The same `FastLzIntegrationTest` binary
 measured 322 s at load ~0 and 407 s at load ~6 — 26 %, which is larger than any
