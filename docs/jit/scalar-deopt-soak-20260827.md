@@ -8,6 +8,12 @@ soak.
 **Verdict: do not flip.** Two independent reasons, and neither is a timing
 result:
 
+0. **It would not buy anything.** Across the 651-class Tomcat suite the flag
+   fires ZERO times — in every arm, including the two that lift the gates
+   upstream of it. Real server code's allocations escape (22 of 22 in a sampled
+   class, all `GlobalEscape`), so the predicate the flag controls is never
+   reached. Flipping it default-on would change no compiled code on that
+   workload while carrying reason 1 below.
 1. **The designated pre-flip gate is RED.** `jit/tests/ir_vs_singlepass.rs`
    fails with the flag on and passes with it off, returning a heap address where
    an `int` belongs — `docs/known-issues/jit/scalar-deopt-elision-returns-the-object-in-the-differential-harness-20260827.md`.
@@ -110,7 +116,60 @@ the corpus. See the known-issues page.
 
 ### Tomcat suite (651 classes, one process per class)
 
-*(filled in below when the arms complete)*
+Same binary, same host, `-Parallel 6`, 300 s cap, run back to back.
+
+| arm | PASS | FAIL | HANG | CRASH | wall | **allocations elided** |
+|---|---:|---:|---:|---:|---:|---:|
+| A (none) | 620 | 27 | 4 | 0 | 45.9 min | **0** |
+| B `SCALAR_DEOPT` | 617 | 28 | 5 | 1 | 44.8 min | **0** |
+| C `+ C2_ALLOC_UPGRADE` | 611 | 30 | 10 | 0 | 49.1 min | **0** |
+| D `+ IR_INLINE` | 618 | 27 | 6 | 0 | 48.0 min | **0** |
+
+**The flag never fired once, in any arm, across 651 classes.** The last column is
+the census, and it is the only column that licenses a reading of the others: with
+engagement zero the treatment arms compiled the same code as the baseline, so
+every status difference between them is noise by construction.
+
+The flags did reach the workers — each arm's logs carry the launcher's own
+deprecation line naming them (`CRATONVM_JIT=scalar-deopt`,
+`CRATONVM_JIT=c2-alloc-upgrade`, `CRATONVM_JIT=ir-inline`) — so this is a real
+result about the flag, not a broken experiment.
+
+#### Why it never fires: the allocations escape
+
+One Tomcat class run by hand with `CRATONVM_DBG_SCALAR_NEW=1` and both C-arm
+flags (`org.apache.catalina.mapper.TestMapperPerformance`):
+
+```
+11 allocation-bearing methods reached escape analysis at C2
+22 allocations, every one:  refused Escapes(GlobalEscape)
+0 scalar-replaceable  ->  plan_scalar_replacement never runs
+                      ->  the flag's gate is never reached
+```
+
+`java.util.Objects.requireNonNull`, `MessageBytes.<init>`,
+`CopyOnWriteArrayList.<init>`, `StringUTF16.getChar` — ordinary server code, and
+not one allocation stays local. That is the structural reason the flag is inert
+here, and it is worth more than the pass counts: the scalar-replacement lane
+works on the accessor-wrapper shape it was built for (kfusion's `Short2`) and
+finds **nothing at all** in a real Tomcat class.
+
+#### A free noise floor for this suite
+
+Four runs of effectively identical code gave 620 / 617 / 611 / 618 PASS — a
+**±9-class swing with no code change**. The classes that churned are the ones
+the harness header warns about, and they moved in BOTH directions (two arms
+"fixed" a class the baseline failed):
+
+```
+TestMulticastPackages, TestTcpFailureDetector, TestNonBlockingAPI,
+TestHostConfigAutomaticDeployment{Addition,Modification}, TestOcsp*,
+TestGenerator, TestDefaultServletEncoding*
+```
+
+multicast, TCP failure detection, file-watching with sleeps, an OCSP responder.
+Anyone reading a future Tomcat A/B on this host should treat a swing of this
+size as nothing, and should say which classes moved rather than only how many.
 
 ## Reproducing
 
