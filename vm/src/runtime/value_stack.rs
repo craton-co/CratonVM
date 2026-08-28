@@ -453,7 +453,10 @@ impl ValueStack {
         }
         Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
-        self.slots[self.len] = CompactValue::from_value(value);
+        // The line above marks a `Value::Double` slot `KIND_DOUBLE`, which is
+        // exactly the out-of-band mark `from_value_kinded` requires in order to
+        // keep a NaN payload that collides with the tag space.
+        self.slots[self.len] = CompactValue::from_value_kinded(value);
         self.len += 1;
         Ok(())
     }
@@ -485,7 +488,10 @@ impl ValueStack {
         debug_assert!(self.len < self.max_size, "stack overflow in push_unchecked");
         Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
-        self.slots[self.len] = CompactValue::from_value(value);
+        // The line above marks a `Value::Double` slot `KIND_DOUBLE`, which is
+        // exactly the out-of-band mark `from_value_kinded` requires in order to
+        // keep a NaN payload that collides with the tag space.
+        self.slots[self.len] = CompactValue::from_value_kinded(value);
         self.len += 1;
     }
 
@@ -501,7 +507,10 @@ impl ValueStack {
         }
         Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
-        self.slots[self.len] = CompactValue::from_value(value);
+        // The line above marks a `Value::Double` slot `KIND_DOUBLE`, which is
+        // exactly the out-of-band mark `from_value_kinded` requires in order to
+        // keep a NaN payload that collides with the tag space.
+        self.slots[self.len] = CompactValue::from_value_kinded(value);
         self.len += 1;
         Ok(())
     }
@@ -718,6 +727,28 @@ impl ValueStack {
         matches!(kind, KIND_LONG | KIND_DOUBLE) || cv.is_category2()
     }
 
+    /// The `kinds` mark a genuine `long` producer writes.
+    ///
+    /// Published so the invoke-argument and field-store paths outside this
+    /// module can ask "did the push prove this slot is a category-2
+    /// primitive?" instead of re-deriving the answer from bits that, for a
+    /// verbatim `long` or `double`, carry no tag at all.
+    pub const KIND_MARK_LONG: u8 = KIND_LONG;
+
+    /// The `kinds` mark a genuine `double` producer writes. See
+    /// [`KIND_MARK_LONG`](Self::KIND_MARK_LONG) and
+    /// `CompactValue::double_raw`.
+    pub const KIND_MARK_DOUBLE: u8 = KIND_DOUBLE;
+
+    /// True when the top slot was pushed by a genuine `double` producer.
+    ///
+    /// `false` on an empty stack, so a caller can use it as a guard
+    /// immediately before the pop it is deciding about.
+    #[inline(always)]
+    pub fn peek_kind_is_double(&self) -> bool {
+        self.len > 0 && self.kinds[self.len - 1] == KIND_DOUBLE
+    }
+
     /// Push an int directly as a CompactValue (T10.9.D hot-path).
     ///
     /// Returns `Err` on overflow so the signature mirrors `push(Value)`.
@@ -799,7 +830,7 @@ impl ValueStack {
             return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_DOUBLE;
-        self.slots[self.len] = CompactValue::double(v);
+        self.slots[self.len] = CompactValue::double_raw(v);
         self.len += 1;
         Ok(())
     }
@@ -888,8 +919,9 @@ impl ValueStack {
     /// Pop one slot and decode it as an `invoke*` argument of `desc_byte`,
     /// honoring the `KIND_LONG` mark.
     ///
-    /// A `J` parameter whose slot was pushed by a genuine long producer is
-    /// read bit-exact via [`CompactValue::as_long_unchecked`], so a
+    /// A `J` or `D` parameter whose slot was pushed by a genuine category-2
+    /// producer is read bit-exact via [`CompactValue::as_long_unchecked`] /
+    /// [`CompactValue::to_bits`], so a
     /// collision-shaped long (top bits `0xFFFC_…`, low 32-bit payload) keeps
     /// its high bits instead of being truncated by
     /// [`CompactValue::decode_by_descriptor`]'s i2l-widening fallback. All
@@ -897,51 +929,22 @@ impl ValueStack {
     /// the legacy widening for synthetic int-where-long).
     #[inline]
     pub fn pop_arg_for_descriptor_checked(&mut self, desc_byte: u8) -> Result<Value, RuntimeError> {
-        let (cv, is_long) = self.pop_compact_with_long_mark()?;
-        Ok(if is_long {
+        let (cv, kind) = self.pop_with_kind()?;
+        Ok(if matches!(kind, KIND_LONG | KIND_DOUBLE) {
             match desc_byte {
                 b'J' => Value::Long(cv.as_long_unchecked()),
-                b'D' => Value::Double(f64::from_bits(cv.as_long_unchecked() as u64)),
+                // Both marks mean the same thing here: the slot IS its 64
+                // bits. `CompactValue::double_raw` stores a double verbatim
+                // exactly as `CompactValue::long` stores a long, so a `D`
+                // parameter whose bits collide with the NaN-box tag space
+                // must be reinterpreted, not decoded by the sub-tag it
+                // happens to match.
+                b'D' => Value::Double(f64::from_bits(cv.to_bits())),
                 _ => cv.decode_by_descriptor(desc_byte),
             }
         } else {
             cv.decode_by_descriptor(desc_byte)
         })
-    }
-
-    /// Unchecked sibling of [`Self::pop_compact_with_long_mark`] for the hot
-    /// fast-path return handler. Panics (debug) on underflow like
-    /// [`Self::pop_compact`].
-    #[inline(always)]
-    pub fn pop_compact_with_long_mark_unchecked(&mut self) -> (CompactValue, bool) {
-        debug_assert!(
-            self.len > 0,
-            "stack underflow in pop_compact_with_long_mark_unchecked"
-        );
-        self.len -= 1;
-        (self.slots[self.len], self.kinds[self.len] == KIND_LONG)
-    }
-
-    /// Pop a raw `CompactValue` together with a flag indicating whether the
-    /// slot was marked `KIND_LONG` (i.e. pushed by a genuine long producer:
-    /// `lload`/`ladd`/long return/etc.).
-    ///
-    /// Needed by the `invoke*` argument marshalling, which pops every slot as
-    /// a raw `CompactValue` (descriptor known only after the reverse). When
-    /// the flag is `true`, a `J`-descriptor parameter must decode bit-exact
-    /// via [`CompactValue::as_long_unchecked`] — a collision-shaped long
-    /// (`0xFFFC_…` top bits with `payload < 2^32`, e.g. SHA-512 working
-    /// variables) is otherwise indistinguishable from a tagged int and gets
-    /// truncated by `decode_by_descriptor(b'J')`'s i2l-widening fallback.
-    #[inline(always)]
-    pub fn pop_compact_with_long_mark(&mut self) -> Result<(CompactValue, bool), RuntimeError> {
-        if self.len == 0 {
-            return Err(RuntimeError::IllegalStateException {
-                message: "operand stack underflow".to_string(),
-            });
-        }
-        self.len -= 1;
-        Ok((self.slots[self.len], self.kinds[self.len] == KIND_LONG))
     }
 
     // ── AUDIT CRIT-4: int-specialised push/pop (no Value enum round-trip) ──
@@ -1045,14 +1048,16 @@ impl ValueStack {
             "stack overflow in push_double_unchecked"
         );
         self.kinds[self.len] = KIND_DOUBLE;
-        self.slots[self.len] = CompactValue::double(v);
+        self.slots[self.len] = CompactValue::double_raw(v);
         self.len += 1;
     }
 
     /// Pop an f64 directly from a `CompactValue::double(_)` slot.
     ///
-    /// Doubles are stored as raw f64 bits in the CompactValue (with NaN-tag
-    /// collisions canonicalised on write).  Verified bytecode guarantees this
+    /// Doubles are stored as raw f64 bits in the CompactValue, verbatim: the
+    /// `KIND_DOUBLE` mark the matching push writes is what lets
+    /// `CompactValue::double_raw` skip the collision canonicalization, so a
+    /// NaN payload arrives here intact.  Verified bytecode guarantees this
     /// slot was produced by a Double-producing opcode (dconst, dload, dadd …),
     /// so reading the raw bits is the JVMS-correct decode.
     ///
@@ -1062,10 +1067,9 @@ impl ValueStack {
     pub fn pop_double_unchecked(&mut self) -> f64 {
         debug_assert!(self.len > 0, "stack underflow in pop_double_unchecked");
         self.len -= 1;
-        // CompactValue::double(v) stores `v.to_bits()` verbatim (or canonical
-        // NaN on collision), and there is no separate Double sub-tag — the
-        // slot's raw u64 IS the double's bit pattern. Same decode policy as
-        // pop_double's CompactTag::Double arm.
+        // CompactValue::double_raw(v) stores `v.to_bits()` verbatim, and there
+        // is no separate Double sub-tag — the slot's raw u64 IS the double's
+        // bit pattern. Same decode policy as pop_double's KIND_DOUBLE arm.
         f64::from_bits(self.slots[self.len].to_bits())
     }
 
@@ -3228,5 +3232,94 @@ mod tests {
         // And an object-shaped push is still scannable as a reference.
         fresh.push(Value::Int(7)).expect("push");
         assert_eq!(fresh.pop_int().expect("pop"), 7);
+    }
+
+    /// Every double whose raw bits collide with the NaN-box tag space survives
+    /// the operand stack bit-exact, by all four doors.
+    ///
+    /// These are the patterns `probes/F2dCensus.java` measured as lost — an
+    /// `f2d` of a negative float NaN with mantissa bits 22 and 21 set — and the
+    /// reason they survive is the `KIND_DOUBLE` mark, not the bits.
+    #[test]
+    fn tag_colliding_double_payloads_survive_the_operand_stack() {
+        let patterns: [u64; 5] = [
+            0xFFFC_0000_0000_0000,
+            0xFFFC_541A_8000_0000, // census sample: in=ffe2a0d4
+            0xFFFE_5E0E_8000_0000, // census sample: in=ffb2f074
+            0xFFFF_AF30_A000_0000, // census sample: in=fffd7985
+            0xFFFF_FFFF_FFFF_FFFF,
+        ];
+        for bits in patterns {
+            let d = f64::from_bits(bits);
+
+            let mut s = ValueStack::new(8);
+            s.push_double(d).expect("push_double");
+            assert_eq!(s.peek_compact().raw_bits(), bits, "slot bits {bits:#018x}");
+            match s.peek() {
+                Value::Double(x) => assert_eq!(x.to_bits(), bits, "peek {bits:#018x}"),
+                other => panic!("peek of a KIND_DOUBLE slot gave {other:?}"),
+            }
+            assert_eq!(
+                s.pop_double().expect("pop_double").to_bits(),
+                bits,
+                "pop_double {bits:#018x}",
+            );
+
+            let mut s = ValueStack::new(8);
+            s.push_double_unchecked(d);
+            assert_eq!(s.pop_double_unchecked().to_bits(), bits);
+
+            let mut s = ValueStack::new(8);
+            s.push(Value::Double(d)).expect("push");
+            match s.pop().expect("pop") {
+                Value::Double(x) => assert_eq!(x.to_bits(), bits, "push/pop {bits:#018x}"),
+                other => panic!("pop of a Value::Double push gave {other:?}"),
+            }
+
+            // dup must copy bits AND kind, or the copy would be re-decoded by
+            // its sub-tag and (worse) offered to the root scan.
+            let mut s = ValueStack::new(8);
+            s.push_double(d).expect("push_double");
+            let (cv, k) = s.peek_with_kind().expect("peek_with_kind");
+            s.push_with_kind(cv, k).expect("push_with_kind");
+            assert_eq!(s.pop_double().expect("pop dup").to_bits(), bits);
+            assert_eq!(s.pop_double().expect("pop orig").to_bits(), bits);
+        }
+    }
+
+    /// The GC half: a tag-colliding double on the operand stack is never a
+    /// root, even when its 47-bit payload is a live object's address.
+    ///
+    /// This is the hazard that made storing doubles verbatim look unsafe. It is
+    /// closed by the same `KIND_DOUBLE` gate that already closed it for the
+    /// primitive `long` whose bits collide the same way (`CompactValue::long`
+    /// has stored verbatim since the BC SM2 fix of 2026-05-28).
+    #[test]
+    fn scan_object_refs_skips_a_tag_colliding_double_aliasing_a_live_object() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+        // Bit-identical to `CompactValue::object(addr)` — but a double.
+        let bits = CompactValue::object(addr).raw_bits();
+        assert!(CompactValue::double_raw(f64::from_bits(bits)).is_object());
+
+        let mut s = ValueStack::new(8);
+        s.push_double(f64::from_bits(bits)).expect("push_double");
+        let mut roots = Vec::new();
+        s.scan_object_refs(&mut roots, &heap);
+        assert!(
+            roots.is_empty(),
+            "a KIND_DOUBLE slot must never be rooted, got {roots:?}",
+        );
+
+        // Control: the same address pushed as a genuine reference IS a root.
+        let mut s = ValueStack::new(8);
+        s.push(Value::Object(Some(obj))).expect("push object");
+        let mut roots = Vec::new();
+        s.scan_object_refs(&mut roots, &heap);
+        assert_eq!(roots.len(), 1, "the control push must root");
     }
 }

@@ -104,7 +104,7 @@ and three not. `grep total_cmp` over the workspace now returns only prose.
   double whose bit pattern is `0xFFFC_…` or above (sign + exponent + quiet +
   marker all set), which is bit-for-bit the tag pattern, so the slot stores the
   canonical NaN instead. Filed separately and independently root-caused as
-  `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816`; this census
+  `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828`; this census
   reached it from the opposite direction and agrees with it exactly. Payload
   only: every value still IS NaN and still compares, hashes and prints as one.
 * **137 — `drem` NaN payload propagation.** `a % b` where both are NaN returns a

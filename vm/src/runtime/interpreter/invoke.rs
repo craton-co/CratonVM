@@ -548,19 +548,11 @@ pub(super) fn execute_invoke_kind(
     // then widened — corrupting `J` args to invokevirtual/special callees.
     // Mirrors `pop_coerced_invoke_args_virtual`. See
     // gaps/bc-ec-mod-mododdinverse-investigation.md.
-    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
+    let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(
-            thread.frames[frame_idx]
-                .stack
-                .pop_compact_with_long_mark()?,
-        );
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
     }
-    tmp_cv.push(
-        thread.frames[frame_idx]
-            .stack
-            .pop_compact_with_long_mark()?,
-    ); // receiver
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?); // receiver
     tmp_cv.reverse();
     let recv_val = tmp_cv[0].0.decode_by_descriptor(b'L');
     if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
@@ -575,8 +567,8 @@ pub(super) fn execute_invoke_kind(
     let param_tags = ParamTags::of(&method_descriptor);
     for i in 0..num_params {
         let pd_byte = param_tags.get(&method_descriptor, i);
-        let (cv, is_long) = tmp_cv[i + 1];
-        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
+        let (cv, kind) = tmp_cv[i + 1];
+        let v = decode_arg_kind_aware(cv, kind, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 

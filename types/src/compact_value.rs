@@ -9,9 +9,22 @@
 //!
 //! # Encoding
 //!
-//! **Double**: stored as raw IEEE 754 f64 bits. Any quiet NaN produced by
-//! floating-point operations is canonicalized to avoid collisions with the
-//! tagged encoding space.
+//! **Double**: stored as raw IEEE 754 f64 bits. A double whose bits collide
+//! with the tagged encoding space (a NEGATIVE quiet NaN with mantissa bit 50
+//! set — `bits & 0xFFFC_0000_0000_0000 == 0xFFFC_0000_0000_0000`) cannot be
+//! told apart from a tagged slot by the bits alone, so there are two
+//! constructors and the caller picks by what it can prove:
+//!
+//! * [`CompactValue::double_raw`] stores the bits verbatim and is for a slot
+//!   whose store also writes an out-of-band "this is a double" mark
+//!   (`ValueStack::kinds`, `Frame::local_kinds`, `SlotType::Double`). This is
+//!   what every operand-stack, local-variable and argument store uses, so a
+//!   NaN payload survives `f2d` / `dstore` / `dload` / a call boundary
+//!   bit-exact, the way HotSpot's does.
+//! * [`CompactValue::double`] canonicalizes the colliding patterns to the
+//!   canonical quiet NaN and counts the loss
+//!   ([`nan_payload_collapse_count`]). It is the context-free constructor:
+//!   correct anywhere, lossy only for the collision set.
 //!
 //! **Long**: stored as raw i64 bits (reinterpreted as u64). Since Long and
 //! Double both use all 64 bits, they cannot be distinguished by bit pattern
@@ -855,18 +868,25 @@ impl CompactValue {
     /// Keeping the check is still right — without it a tagged slot would be
     /// indistinguishable from a double, which is a memory-safety problem rather
     /// than a payload one. What is wrong is calling the loss free. See
-    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816` for the
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828` for the
     /// write-up and the candidate fixes, all of which are changes to this
     /// encoding.
     ///
     /// The loss is no longer *silent*: every collapse is counted by
     /// [`note_nan_payload_collapse`], so
     /// [`nan_payload_collapse_count`] answers "did this workload hit it at
-    /// all?" without a rebuild. That was the cheapest item on the write-up's
-    /// own fix list and it is the one that turns an unbounded unknown into a
-    /// number. The counter is a single relaxed increment on a branch that is
-    /// already taken, so the common path — every non-NaN double, and every
-    /// positive NaN — pays nothing.
+    /// all?" without a rebuild. The counter is a single relaxed increment on
+    /// a branch that is already taken, so the common path — every non-NaN
+    /// double, and every positive NaN — pays nothing.
+    ///
+    /// **This is no longer the constructor the interpreter uses.** Every
+    /// operand-stack push, local store and argument copy writes a kind mark
+    /// beside the slot and therefore goes through
+    /// [`double_raw`](Self::double_raw), which keeps the payload. What is
+    /// left here is the *context-free* encode: a caller with no mark to
+    /// offer, and any future one. So the counter is now a ratchet — a
+    /// non-zero reading means a new context-free double encode has appeared,
+    /// and the fix is to give that call site a mark, not to accept the loss.
     #[inline]
     pub fn double(v: f64) -> Self {
         let bits = v.to_bits();
@@ -877,6 +897,68 @@ impl CompactValue {
             Self(CANONICAL_NAN)
         } else {
             Self(bits)
+        }
+    }
+
+    /// Store a double's bits **verbatim**, with no collision canonicalization.
+    ///
+    /// # Caller contract - the slot must carry an out-of-band double mark
+    ///
+    /// This is only sound where the store that writes this slot *also* writes
+    /// a "this slot is a double" mark next to it, in the same operation:
+    ///
+    /// * `ValueStack` - `kinds[i] == KIND_DOUBLE`
+    /// * `Frame` locals - `local_kinds[i] == LKIND_DOUBLE`
+    /// * `RawSlot` - the caller-supplied `SlotType::Double`
+    ///
+    /// Those marks already exist and are already load-bearing: they were added
+    /// for the *long* side of the same ambiguity (a `long` is stored verbatim
+    /// by [`long`](Self::long), so a long whose bits land in the `SUB_OBJECT`
+    /// sub-tag would otherwise be rooted and relocated as a reference). Every
+    /// consumer that a raw 64-bit pattern could confuse is already gated on
+    /// them:
+    ///
+    /// * the GC root scans (`ValueStack::scan_object_refs`,
+    ///   `ValueStack::update_object_refs`, `Frame::scan_local_objects`,
+    ///   `Frame::update_local_refs`) skip a `KIND_DOUBLE` / `LKIND_DOUBLE`
+    ///   slot outright, so a verbatim double can never be mistaken for a root
+    ///   or rewritten by a moving collector;
+    /// * the decoders that matter (`ValueStack::value_at`,
+    ///   `ValueStack::pop_double`, `Frame::get_local`, `Frame::get_local_raw`,
+    ///   `decode_by_descriptor(b'D')`) read the raw bits when the mark says
+    ///   double, rather than consulting the NaN-box sub-tag.
+    ///
+    /// A caller that does **not** write such a mark must use
+    /// [`double`](Self::double) instead: without the mark the slot is
+    /// context-free, and a `0xFFFC_...` double is bit-for-bit a tagged value.
+    ///
+    /// # Why this exists
+    ///
+    /// `double()` canonicalizes exactly the negative quiet NaNs with mantissa
+    /// bit 50 set - 2^50 patterns, a quarter of the NaN space, and precisely
+    /// the ones an `f2d` of a negative float NaN with mantissa bits 22 and 21
+    /// set produces. `Double.doubleToRawLongBits` observes the loss and
+    /// HotSpot does not lose it. See
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828` for the
+    /// census: 49 667 / 200 000 widened NaNs flattened before this constructor
+    /// existed, 0 after.
+    #[inline]
+    pub fn double_raw(v: f64) -> Self {
+        Self(v.to_bits())
+    }
+
+    /// [`from_value`](Self::from_value) for a store that writes a kind mark
+    /// alongside the slot.
+    ///
+    /// Identical to `from_value` for every variant except `Value::Double`,
+    /// which is stored verbatim via [`double_raw`](Self::double_raw). Use it
+    /// only where the call site also records `KIND_DOUBLE` / `LKIND_DOUBLE` -
+    /// see `double_raw`'s contract, which this inherits wholesale.
+    #[inline]
+    pub fn from_value_kinded(v: Value) -> Self {
+        match v {
+            Value::Double(d) => Self::double_raw(d),
+            other => Self::from_value(other),
         }
     }
 
@@ -1782,8 +1864,34 @@ impl CompactValue {
             },
             b'D' => match sub {
                 SUB_LONG_LO | SUB_LONG_HI => Value::Double(f64::from_bits(self.0)),
-                SUB_INT => Value::Double(((self.0 & PAYLOAD_MASK) as u32 as i32) as f64),
-                SUB_NULL | SUB_UNINIT => Value::Double(0.0),
+                // A genuine int slot has payload < 2^32 (`CompactValue::int`
+                // stores `v as u32 as u64`), so widen it the way an `i2d`
+                // would. A SUB_INT bit pattern whose payload has bits 32-46
+                // set cannot be an int at all — under a `D` descriptor it is a
+                // double whose raw bits collided into this sub-tag (see
+                // `CompactValue::double_raw`), so reinterpret them. Exactly
+                // the discrimination the `b'J'` arm above already applies for
+                // the long side of the same collision.
+                SUB_INT => {
+                    let payload = self.0 & PAYLOAD_MASK;
+                    if payload >> 32 == 0 {
+                        Value::Double((payload as u32 as i32) as f64)
+                    } else {
+                        Value::Double(f64::from_bits(self.0))
+                    }
+                }
+                // Null / Uninitialized with payload == 0 is JVMS §2.3's
+                // default `0.0d` for an unwritten slot. A NON-ZERO payload is
+                // impossible for a real null or uninitialized slot
+                // (`CompactValue::null`/`uninitialized` both store payload 0),
+                // so it is a collided double — again mirroring `b'J'`.
+                SUB_NULL | SUB_UNINIT => {
+                    if self.0 & PAYLOAD_MASK == 0 {
+                        Value::Double(0.0)
+                    } else {
+                        Value::Double(f64::from_bits(self.0))
+                    }
+                }
                 _ => Value::Double(f64::from_bits(self.0)),
             },
             b'F' => match sub {
@@ -3778,6 +3886,102 @@ mod tests {
             collapsed.len() as u64,
             "every collapse must be counted exactly once",
         );
+        reset_nan_payload_collapse_count();
+    }
+
+    /// The other half of the pair: the SAME patterns `double()` collapses go
+    /// through `double_raw()` verbatim, and nothing is counted.
+    ///
+    /// This is what the interpreter actually uses. Every store that reaches it
+    /// writes a `KIND_DOUBLE` / `LKIND_DOUBLE` / `SlotType::Double` mark beside
+    /// the slot, which is why dropping the canonicalization here is a fidelity
+    /// win rather than a type-confusion bug — see `double_raw`'s contract, and
+    /// `cratonvm_vm::runtime::frame`'s
+    /// `tag_colliding_double_local_round_trips_and_is_never_a_root` for the
+    /// GC half of the proof.
+    #[test]
+    fn double_raw_keeps_every_tag_colliding_payload_and_counts_nothing() {
+        reset_nan_payload_collapse_count();
+        // The four `double()` flattens, plus the boundary of the collision set
+        // and the two `f2d` samples the census printed.
+        let colliding: [u64; 7] = [
+            0xFFFC_0000_0000_0000,
+            0xFFFC_0000_0000_0001,
+            0xFFFE_5E0E_8000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xFFFC_541A_8000_0000,
+            0xFFFD_A846_C000_0000,
+            0xFFFF_AF30_A000_0000,
+        ];
+        for bits in colliding {
+            let cv = CompactValue::double_raw(f64::from_bits(bits));
+            assert_eq!(
+                cv.0, bits,
+                "{bits:#018x} must round-trip verbatim through double_raw",
+            );
+            // The descriptor-aware read agrees, EXCEPT inside the one
+            // sub-region a descriptor alone cannot separate: a `SUB_INT`
+            // pattern whose payload is under 2^32 is bit-for-bit what
+            // `CompactValue::int` produces for a small int, and a `SUB_NULL` /
+            // `SUB_UNINIT` pattern with payload 0 is bit-for-bit a real null or
+            // an unwritten slot. `decode_by_descriptor` has no kind mark to
+            // consult, so it keeps answering `Int`-widened / `0.0d` there. Every
+            // slot the interpreter actually stores a double in DOES carry that
+            // mark, which is why the two exceptions below cost nothing at
+            // runtime -- see `decode_arg_kind_aware` and `peek_kind_is_double`.
+            let payload = bits & PAYLOAD_MASK;
+            let sub = (bits >> SUBTAG_SHIFT) & SUBTAG_MASK;
+            let descriptor_alone_is_ambiguous = (sub == SUB_INT && payload >> 32 == 0)
+                || ((sub == SUB_NULL || sub == SUB_UNINIT) && payload == 0);
+            if !descriptor_alone_is_ambiguous {
+                match cv.decode_by_descriptor(b'D') {
+                    Value::Double(d) => assert_eq!(d.to_bits(), bits),
+                    other => panic!("D-descriptor decode of {bits:#018x} gave {other:?}"),
+                }
+            }
+            // And `from_value_kinded` is the same encode by another door.
+            assert_eq!(
+                CompactValue::from_value_kinded(Value::Double(f64::from_bits(bits))).0,
+                bits,
+            );
+        }
+        assert_eq!(
+            nan_payload_collapse_count(),
+            0,
+            "double_raw must never reach the collapse counter",
+        );
+
+        // Name the ambiguous sub-region explicitly: exactly the patterns a
+        // *descriptor-only* decode still reads as something else. Both are
+        // SUB_INT with a payload a real int could have had.
+        for (bits, as_int) in [
+            (0xFFFC_0000_0000_0000u64, 0i32),
+            (0xFFFC_0000_0000_0001u64, 1i32),
+        ] {
+            assert_eq!(
+                CompactValue::double_raw(f64::from_bits(bits)).0,
+                bits,
+                "the slot still holds the bits",
+            );
+            assert_eq!(
+                CompactValue::int(as_int).0,
+                bits,
+                "…and they are bit-for-bit CompactValue::int({as_int}), which is                  why a decoder with no kind mark cannot tell them apart",
+            );
+        }
+
+        // Non-colliding doubles are byte-identical through both constructors,
+        // so nothing that already worked changes shape.
+        for bits in [
+            0x3ff0_0000_0000_0000u64,
+            0x7ff8_0000_0000_0000,
+            0xfff8_0000_0000_0000,
+            0x0000_0000_0000_0000,
+        ] {
+            let d = f64::from_bits(bits);
+            assert_eq!(CompactValue::double(d).0, CompactValue::double_raw(d).0);
+        }
+        assert_eq!(nan_payload_collapse_count(), 0);
         reset_nan_payload_collapse_count();
     }
 }

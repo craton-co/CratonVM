@@ -1,19 +1,27 @@
 # `VarHandle` writes and CAS have no fast path — 35-303x, and it is most of `java.util.concurrent`
 
 ## Status
-**FIXED for the VarHandle path itself (2026-08-24), and the downstream premise
-is REFUTED.** All three steps are done: `set` is bound (698 000 native
+**FIXED and CLOSED (2026-08-27).** Four steps, the first three landed on
+2026-08-24 and the last on 2026-08-27: `set` is bound (698 000 native
 dispatches -> 0, 246.5 -> 64.8 ns), the per-call global mutex is gone (**10.9x
-at 24 threads**, and the anti-scaling with it), and the CAS is served inside the
-funnel (**4 396 000 served, 0 declined**, 1.27-1.39x).
+at 24 threads**, and the anti-scaling with it), the CAS is served inside the
+funnel (**4 396 000 served, 0 declined**, 1.27-1.39x), and the flat-throughput
+residual this page named as its last open item is root-caused and fixed —
+the volatile stripe pool was **64 one-byte mutexes in a single cache line**
+(**1.64x at 24 threads**, and the curve scales again).
+
+The per-op VarHandle costs that remain, and the composition gap under them, are
+a separate page:
+[`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md).
 
 What this page got WRONG: it predicted the CAS was "the only thing between this
 and the 872x" composition gap. With the CAS fast path serving 3.84 M calls on
 that workload, composition does not move — 4 CAS per chain at ~65 ns saved is
-0.5% of a 54 us chain. `CompletableFuture` composition is not VarHandle-bound,
-and where its 872x lives is now an open question. The defect was a
-gap in an existing optimisation rather than a bug: `VARHANDLE_READ_DIRECT_FNS`
-bound READS of PRIMITIVE fields and nothing else.
+0.5% of a 54 us chain. `CompletableFuture` composition is not VarHandle-bound.
+Where its 872x lived was an open question when that was written and is now
+answered: two compile refusals, neither of them here. The defect this page IS
+about was a gap in an existing optimisation rather than a bug —
+`VARHANDLE_READ_DIRECT_FNS` bound READS of PRIMITIVE fields and nothing else.
 
 ## Severity
 **HIGH, and broad.** `VarHandle` is the primitive under `CompletableFuture`,
@@ -166,9 +174,11 @@ generation:
 | 24 | 603 694 | 6 573 526 | **10.9x** |
 
 The collapse is gone: throughput holds ~7M ops/s from 4 threads to 24 instead
-of falling to 0.07x of single-threaded. It is now FLAT rather than scaling, so
-a shared bottleneck remains — the volatile store's stripe lock and
-`java_identity_hash` are the candidates — but the convoy is not it.
+of falling to 0.07x of single-threaded. It was FLAT rather than scaling after
+this, so a shared bottleneck remained; this page named the volatile store's
+stripe lock and `java_identity_hash` as the candidates. **It was the stripe
+lock, and not for the reason the name suggests** — see "The stripe pool was one
+cache line" below, which closes that residual.
 
 71/71 regression vectors and 4149 native-builtins tests pass.
 
@@ -197,6 +207,64 @@ measured before it — apparently a regression. The unrelated controls had moved
 too (plain field store 15.7 -> 19.8 ns, `AtomicInteger` 6.4 -> 10.7 ns), i.e.
 the box was ~1.5x busier. Only back-to-back comparisons on the same binary pair
 are usable here; the scaling table above is one.
+
+## The stripe pool was one cache line (2026-08-27), and that was the flat curve
+
+With the `vh_meta_table` convoy gone, `HibfixVarHandleScale` still did not
+scale: each thread owns its own object and its own field, so there is no
+contention on the data and none left on the metadata, and throughput still
+stopped rising past 4 threads. This page nominated two candidates. It was the
+first one, by a mechanism its own name hides.
+
+`parking_lot::Mutex<()>` is **one byte** — its `RawMutex` is an `AtomicU8` and
+the `()` payload is zero-sized. So `[parking_lot::Mutex<()>; 64]`, which is what
+the pool was, occupied exactly **64 bytes: one cache line, for every stripe of
+every object of every field**. Striping by `(obj_ref, index)` removed the
+LOGICAL contention — two threads rarely pick the same stripe — and left the
+HARDWARE contention completely untouched: a `lock()`/`unlock()` pair is two
+atomic read-modify-writes, each of which takes that single line exclusive, so N
+threads storing to N different volatile fields of N different objects serialised
+on the coherence protocol exactly as if the pool had one stripe.
+
+The comment that sat above it reasoned about "false-sharing" meaning stripe
+COLLISION, and put the pool's whole size at "64 x ~5 bytes is negligible" —
+which is precisely the property that made every stripe share one line. Each
+stripe is now `#[repr(align(128))]` (128 rather than 64 because x86-64's
+adjacent-cache-line prefetcher pulls lines in pairs); the whole pool is 8 KiB.
+
+Measured on an idle host, two frozen binaries differing ONLY in the padding,
+ABBA-interleaved, three repetitions each, medians:
+
+| threads | unpadded | padded | gain |
+|---:|---:|---:|---:|
+| 1 | 17 630 000 ops/s | 17 620 000 | **1.00x** |
+| 2 | 14 920 000 | 18 230 000 | 1.22x |
+| 4 | 22 190 000 | 25 820 000 | 1.16x |
+| 8 | 27 870 000 | 40 550 000 | 1.46x |
+| 16 | 29 480 000 | 43 170 000 | 1.46x |
+| 24 | 31 120 000 | 50 970 000 | **1.64x** |
+
+**The single-thread row is the control that makes this a cache-line result.** A
+cache line cannot be contended by one thread, and one thread measures 1.00x —
+17.63 M against 17.62 M, closer than the run-to-run spread of either arm. Every
+gain appears exactly where the mechanism predicts it: nowhere at 1 thread, and
+growing with the number of threads. Scaling `vs 1 thread` goes from 1.76x to
+2.88x at 24 threads, and the 2-thread arm stops being SLOWER than 1 thread
+(0.85x -> 1.04x).
+
+`gc/src/collector.rs` carries a gate for it that asserts both halves — that a
+bare `Mutex<()>` is tiny (the reason padding is needed, and the thing that would
+make a future "simplification" back to `[Mutex<()>; N]` look harmless) and that
+each stripe both starts on and OCCUPIES its own 128 bytes.
+
+### What HotSpot is not a baseline for here
+
+`HibfixVarHandleScale` on HotSpot reports 257 M ops/s at one thread and
+**42 000 M ops/s at 8-24 threads** — 164x from one thread on an eight-core box,
+which is not a speedup that exists. The probe stores into an object nothing
+subsequently reads, so C2 deletes the loop. The cross-VM ratio on this probe is
+meaningless; the CratonVM-against-CratonVM comparison above, on one probe and
+two binaries that differ in one attribute, is the measurement.
 
 ## The CAS is served inside the funnel now (2026-08-24), and it does NOT fix composition
 
@@ -280,9 +348,15 @@ binary, **0.32% in JIT code**), because its two hottest methods —
 `UniCompose.tryFire` and `UniRelay.tryFire` — are ASKED and REFUSED by the
 compiler with `reason=unrecorded`. (The native-shadow seal was the first
 explanation and is retracted: turning it off changes nothing.) On
-the current binary `--nojit` is marginally FASTER than JIT, which is what "never
-compiled" looks like. See
-[`completablefuture-composition-is-interpreted-tryfire-compile-refused-20260824.md`](completablefuture-composition-is-interpreted-tryfire-compile-refused-20260824.md).
+the binary current at the time `--nojit` was marginally FASTER than JIT, which
+is what "never compiled" looks like.
+
+**That was ANSWERED and FIXED on 2026-08-27**, and it was not the native-shadow
+seal either: `UniCompose.tryFire` and `UniRelay.tryFire` were refused by a
+`ForkJoinTask`-subclass blocklist whose own comment claimed it left
+`CompletableFuture` alone, plus a `dup_x2` shape the single-pass backend could
+not prove. Composition went 3.95x, and 446x -> 113x against HotSpot. See
+`performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
 
 That is why every fix on this page moved the primitive and not the workload.
 The old text below is kept as written:
@@ -307,10 +381,17 @@ database, no flake, 412 ms against 359 s.
 
 ## Related
 
-- [`../hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](../hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md)
+- `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
+  — where the 872x actually was. Every fix on this page moved the primitive and
+  not the workload, and that page is the reason.
+- [`../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-are-9-114x-after-the-composition-compile-refusals-20260828.md)
+  — what is left: `VarHandle` operations at 9-50x and `AtomicReference.CAS` at
+  114x, measured against the same `AtomicInteger`-at-parity control this page
+  used.
+- [`../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md)
   §5.9 — where this was found. The reactive composition cost there is this
   defect, and it is the likely enabling condition for that page's correctness
   failure: a sequence-allocation race HotSpot settles in microseconds is run
   through machinery two orders of magnitude slower.
-- [`bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`](bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md)
+- [`../../known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md`](../../known-issues/perf/bigdecimal-arithmetic-is-50-60x-slower-than-hotspot-20260817.md)
   — the same shape of finding: a hot JDK primitive left on the generic funnel.

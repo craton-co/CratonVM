@@ -732,7 +732,9 @@ fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Va
     let mut slot = 0;
     for arg in args {
         if slot < locals.len() {
-            locals[slot] = CompactValue::from_value(*arg);
+            // Paired with the `lkind_of_value` mark below - a `double`
+            // argument keeps its NaN payload across the call boundary.
+            locals[slot] = CompactValue::from_value_kinded(*arg);
             // `kinds` is always the same length as `locals` (both sized to
             // `n` by every caller), so this index is in bounds whenever the
             // `locals` write above is.
@@ -1415,10 +1417,22 @@ impl Frame {
     }
 
     /// Get a local variable by index.
+    ///
+    /// Honors the `local_kinds` mark for a category-2 primitive the same way
+    /// `ValueStack::value_at` honors `kinds`: a `double` whose raw bits collide
+    /// with the NaN-box tag space is stored verbatim (see
+    /// `CompactValue::double_raw`) and must not be re-read through the
+    /// context-free `to_value()`, which would report the sub-tag's type. For
+    /// every pattern that predates the verbatim store this arm is a no-op -
+    /// an untagged double already decodes as `Value::Double` with the same
+    /// bits.
     pub fn get_local(&self, index: u16) -> Value {
         let i = index as usize;
         if i >= self.locals.len() {
             return Value::Uninitialized;
+        }
+        if self.local_kinds[i] == LKIND_DOUBLE {
+            return Value::Double(f64::from_bits(self.locals[i].raw_bits()));
         }
         self.locals[i].to_value()
     }
@@ -1430,6 +1444,10 @@ impl Frame {
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn get_local_unchecked(&self, index: usize) -> Value {
+        // Kind-aware for the same reason as `get_local` - see its doc.
+        if self.local_kinds[index] == LKIND_DOUBLE {
+            return Value::Double(f64::from_bits(self.locals[index].raw_bits()));
+        }
         self.locals[index].to_value()
     }
 
@@ -1479,7 +1497,10 @@ impl Frame {
                 }
             }
             self.note_local_write();
-            self.locals[i] = CompactValue::from_value(value);
+            // `lkind_of_value` marks a `Value::Double` LKIND_DOUBLE two lines
+            // below, which is the mark `from_value_kinded` needs to store a
+            // tag-colliding NaN payload verbatim instead of flattening it.
+            self.locals[i] = CompactValue::from_value_kinded(value);
             let k = lkind_of_value(&value);
             self.local_kinds[i] = k;
             self.invalidate_cat2_upper_half(i, k);
@@ -1528,7 +1549,9 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_unchecked(&mut self, index: usize, value: Value) {
         self.note_local_write();
-        self.locals[index] = CompactValue::from_value(value);
+        // See `set_local`: the LKIND_DOUBLE mark written below is what makes
+        // the verbatim double store sound.
+        self.locals[index] = CompactValue::from_value_kinded(value);
         let k = lkind_of_value(&value);
         self.local_kinds[index] = k;
         // Invalidate the reserved upper half of a cat-2 store — see
@@ -3139,6 +3162,99 @@ mod tests {
         // …yet only the reference slot is rooted; the collision long is not.
         assert_eq!(roots.len(), 1, "only the genuine reference is a GC root");
         assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    /// A `double` whose raw bits collide with the NaN-box tag space round-trips
+    /// through a local slot bit-exact, and is never a GC root even when its
+    /// 47-bit payload is a live object's address.
+    ///
+    /// The sibling of `scan_local_objects_skips_collision_long_aliasing_live_object`
+    /// for the other category-2 primitive. `CompactValue::long` has stored
+    /// verbatim since the BC SM2 fix (2026-05-28) and the `local_kinds` gate is
+    /// what makes that safe; doubles now store verbatim through
+    /// `CompactValue::double_raw` for the same reason, which is what keeps a NaN
+    /// payload alive across `dstore` / `dload` (see
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828`).
+    #[test]
+    fn tag_colliding_double_local_round_trips_and_is_never_a_root() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+        // Bit-identical to a genuine reference — but stored as a double.
+        let collision_bits = CompactValue::object(addr).raw_bits();
+
+        //   0: dload_0 ; 1: pop2 ; 2: aload_2 ; 3: pop ; 4: return
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x26, 0x58, 0x2c, 0x57, 0xb1],
+            vec![],
+            10,
+            4,
+            &[],
+        );
+        frame.set_local_unchecked(0, Value::Double(f64::from_bits(collision_bits)));
+        frame.set_local_unchecked(2, Value::Object(Some(obj)));
+
+        // The payload survived the store…
+        assert_eq!(frame.get_local_raw(0), collision_bits);
+        match frame.get_local(0) {
+            Value::Double(d) => assert_eq!(d.to_bits(), collision_bits),
+            other => panic!("a double local decoded as {other:?}"),
+        }
+        match frame.get_local_unchecked(0) {
+            Value::Double(d) => assert_eq!(d.to_bits(), collision_bits),
+            other => panic!("a double local decoded as {other:?}"),
+        }
+        // …and the slot really does carry the SUB_OBJECT bit pattern.
+        assert!(frame.get_local_compact(0).is_object());
+        assert_eq!(frame.get_local_compact(0).as_object_ptr(), Some(addr));
+
+        let mut roots = Vec::new();
+        frame.scan_local_objects(&mut roots, &heap);
+        assert_eq!(roots.len(), 1, "only the genuine reference is a GC root");
+        assert_eq!(roots[0].as_ptr() as u64, addr);
+
+        // A moving collector must not rewrite the double either.
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(addr as usize, (addr + 0x1000) as usize);
+        frame.update_local_refs(&map, &heap);
+        assert_eq!(
+            frame.get_local_raw(0),
+            collision_bits,
+            "relocation must not touch a LKIND_DOUBLE slot",
+        );
+    }
+
+    /// An argument passed by value keeps a tag-colliding NaN payload across the
+    /// call boundary — `copy_args_to_locals` writes the LKIND_DOUBLE mark, so it
+    /// can store the bits verbatim.
+    #[test]
+    fn tag_colliding_double_argument_survives_the_call_boundary() {
+        let bits: u64 = 0xFFFE_5E0E_8000_0000;
+        let frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "(D)V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            4,
+            &[Value::Double(f64::from_bits(bits))],
+        );
+        assert_eq!(frame.get_local_raw(0), bits);
+        match frame.get_local(0) {
+            Value::Double(d) => assert_eq!(d.to_bits(), bits),
+            other => panic!("a double argument decoded as {other:?}"),
+        }
     }
 
     /// A category-2 (`long`/`double`) store must INVALIDATE the reserved upper

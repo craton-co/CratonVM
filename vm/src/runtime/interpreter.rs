@@ -1997,10 +1997,8 @@ pub fn execute(
             // consulted for `<init>`/`<clinit>`).
             let _ = policy;
             let static_skip_reason: Option<()> = None;
-            // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
-            // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
-            // under deep recursion and must run in the interpreter pending a
-            // proper regalloc fix.
+            // RFJP.1 (RETIRED, lever-only) — see `is_fjp_subclass_blocklisted`.
+            // Inert unless `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`.
             let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str, Some(class_id));
             // S111r15 - refuse to JIT a method directly backed by a Rust native at
             // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
@@ -6108,7 +6106,7 @@ fn execute_frame_from_index(
                             ),
                         }));
                     }
-                    let (cv, is_long) = frame.stack.pop_compact_with_long_mark_unchecked();
+                    let (cv, kind) = frame.stack.pop_with_kind_unchecked();
                     let desc_byte = match opcode {
                         0xad => b'J', // lreturn
                         0xae => b'F', // freturn
@@ -6126,7 +6124,7 @@ fn execute_frame_from_index(
                         let ret = crate::jit::return_type(frame.method_descriptor());
                         coerce_value_for_return_validated(shared, cv.to_value(), ret)
                     } else {
-                        decode_arg_kind_aware(cv, is_long, desc_byte)
+                        decode_arg_kind_aware(cv, kind, desc_byte)
                     };
                     if crate::runtime::env_cache::trace_sb_filter() {
                         let cn = frame.class_name();
@@ -6234,9 +6232,9 @@ fn execute_frame_from_index(
                             thread.frames[frame_idx].stack.push_unchecked(value);
                         } else if opcode == 0xad {
                             // lreturn: `push_compact` alone marks the parent
-                            // slot KIND_UNKNOWN, discarding the `is_long`
+                            // slot KIND_UNKNOWN, discarding the kind mark
                             // distinction this arm just computed via
-                            // `pop_compact_with_long_mark_unchecked`. A
+                            // `pop_with_kind_unchecked`. A
                             // collision-shaped long (bits alias the NaN-tag
                             // int space, e.g. `0xFFFC_...` whose masked
                             // payload also fits 32 bits) is then
@@ -6981,12 +6979,19 @@ fn execute_frame_from_index(
                 // Inspect the opcode and coerce to the JVMS-declared type
                 // so the operand-stack tag-erasure cannot regress here.
                 0x4f..=0x52 | 0x54..=0x56 => {
-                    let cv = frame.stack.pop_compact();
+                    let (cv, kind_of_popped) = frame.stack.pop_with_kind_unchecked();
                     let value = match opcode {
                         0x50 => Value::Long(cv.as_long_unchecked()),
                         0x52 => {
-                            // dastore: untagged slot is raw f64 bits.
+                            // dastore: untagged slot is raw f64 bits, and a slot
+                            // the push marked KIND_DOUBLE is raw f64 bits too
+                            // even when they collide with the NaN-box tag space
+                            // — which is why the mark is consulted before the
+                            // tag (see `CompactValue::double_raw`).
                             use crate::types::CompactTag;
+                            if kind_of_popped == crate::runtime::ValueStack::KIND_MARK_DOUBLE {
+                                Value::Double(f64::from_bits(cv.to_bits()))
+                            } else {
                             match cv.tag() {
                                 CompactTag::Double => Value::Double(f64::from_bits(cv.to_bits())),
                                 CompactTag::Long => {
@@ -6995,6 +7000,7 @@ fn execute_frame_from_index(
                                     Value::Double(f64::from_bits(cv.to_bits()))
                                 }
                                 _ => cv.to_value(),
+                            }
                             }
                         }
                         // iastore / fastore / bastore / castore / sastore —
