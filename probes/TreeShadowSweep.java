@@ -122,8 +122,8 @@ public class TreeShadowSweep {
     // ------------------------------------------------------------------
     static void ends() {
         TreeMap<String, Integer> e = new TreeMap<>();
-        t("empty firstKey", e::firstKey);
-        t("empty lastKey", e::lastKey);
+        t("empty firstKey", () -> e.firstKey());
+        t("empty lastKey", () -> e.lastKey());
         p("empty firstEntry", e.firstEntry());
         p("empty lastEntry", e.lastEntry());
         p("empty pollFirstEntry", e.pollFirstEntry());
@@ -270,8 +270,8 @@ public class TreeShadowSweep {
     // ------------------------------------------------------------------
     static void treeSet() {
         TreeSet<String> e = new TreeSet<>();
-        t("empty first", e::first);
-        t("empty last", e::last);
+        t("empty first", () -> e.first());
+        t("empty last", () -> e.last());
         p("empty pollFirst", e.pollFirst());
         p("empty pollLast", e.pollLast());
         p("empty ceiling", e.ceiling("a"));
@@ -333,7 +333,7 @@ public class TreeShadowSweep {
         i.next();
         i.remove();
         p("iterator remove", it.toString());
-        t("iterator remove twice", i::remove);
+        t("iterator remove twice", () -> i.remove());
         TreeSet<String> ff = new TreeSet<>(Arrays.asList("a", "b", "c"));
         t("fail fast on add during iteration", () -> {
             for (String x : ff) { ff.add("z" + x); }

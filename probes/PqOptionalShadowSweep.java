@@ -62,8 +62,8 @@ public class PqOptionalShadowSweep {
         PriorityQueue<Integer> q = new PriorityQueue<>();
         p("empty peek", q.peek());
         p("empty poll", q.poll());
-        t("empty element", q::element);
-        t("empty remove()", q::remove);
+        t("empty element", () -> q.element());
+        t("empty remove()", () -> q.remove());
         p("empty size", q.size());
         p("empty isEmpty", q.isEmpty());
         p("empty contains", q.contains(1));
@@ -171,8 +171,8 @@ public class PqOptionalShadowSweep {
         p("empty isEmpty", e.isEmpty());
         p("present isPresent", v.isPresent());
         p("present get", v.get());
-        t("empty get", e::get);
-        t("empty orElseThrow", e::orElseThrow);
+        t("empty get", () -> e.get());
+        t("empty orElseThrow", () -> e.orElseThrow());
         t("empty orElseThrow(supplier)", () -> e.orElseThrow(IllegalStateException::new));
         t("empty orElseThrow(null supplier)", () -> e.orElseThrow((Supplier<RuntimeException>) null));
         t("present orElseThrow(null supplier)", () -> v.orElseThrow((Supplier<RuntimeException>) null));

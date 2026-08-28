@@ -497,9 +497,18 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         if !variant.is_empty() {
             // Locale stores multiple variants "_"-joined; BCP-47 uses "-".
+            //
+            // VERBATIM, not lower-cased. MEASURED: `Locale.of("en","US","POSIX")`
+            // tags as `en-US-POSIX` on HotSpot, and this branch answered
+            // `en-US-posix` while `getVariant()` and `toString()` on the SAME
+            // object answered `POSIX` -- so the locale disagreed with its own
+            // tag. BCP-47 subtags compare case-insensitively, which is why this
+            // survives every test that parses the tag back and fails only a
+            // string comparison against one the JDK wrote. The side-table
+            // branch above already pushed the subtag as stored.
             for sub in variant.split('_').filter(|s| !s.is_empty()) {
                 tag.push('-');
-                tag.push_str(&sub.to_ascii_lowercase());
+                tag.push_str(sub);
             }
         }
         // Append BCP-47 extension subtags (e.g. "-u-ca-japanese", "-x-foo-bar").
@@ -1537,6 +1546,17 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "forLanguageTag",
         "(Ljava/lang/String;)Ljava/util/Locale;",
         |ctx, args| {
+            // `Locale.forLanguageTag(null)` is `LanguageTag.parse(null, ..)`,
+            // which dereferences it. Substituting `""` handed a caller with a
+            // null variable a usable `Locale.ROOT` instead of the NPE that names
+            // the mistake. MEASURED no-throw
+            // (probes/LocaleDateTzShadowSweep 39).
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let tag = match args.first() {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),

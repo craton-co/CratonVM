@@ -262,8 +262,8 @@ public class LinkedSequencedShadowSweep {
     // ------------------------------------------------------------------
     static void sequenced() {
         LinkedHashMap<String, Integer> m = m4();
-        tv("firstEntry", m::firstEntry);
-        tv("lastEntry", m::lastEntry);
+        tv("firstEntry", () -> m.firstEntry());
+        tv("lastEntry", () -> m.lastEntry());
         tv("reversed", () -> m.reversed().toString());
         tv("sequencedKeySet reversed", () -> m.sequencedKeySet().reversed().toString());
         tv("sequencedValues reversed", () -> m.sequencedValues().reversed().toString());
@@ -274,12 +274,12 @@ public class LinkedSequencedShadowSweep {
         LinkedHashMap<String, Integer> pl = m4();
         tv("putLast existing key moves it", () -> { pl.putLast("d", 4); return pl.toString(); });
         LinkedHashMap<String, Integer> po = m4();
-        tv("pollFirstEntry", po::pollFirstEntry);
-        tv("pollLastEntry", po::pollLastEntry);
-        tv("after polls", po::toString);
+        tv("pollFirstEntry", () -> po.pollFirstEntry());
+        tv("pollLastEntry", () -> po.pollLastEntry());
+        tv("after polls", () -> po.toString());
         LinkedHashMap<String, Integer> e = new LinkedHashMap<>();
-        tv("empty firstEntry", e::firstEntry);
-        tv("empty pollFirstEntry", e::pollFirstEntry);
+        tv("empty firstEntry", () -> e.firstEntry());
+        tv("empty pollFirstEntry", () -> e.pollFirstEntry());
         tv("reversed of empty", () -> e.reversed().toString());
         tv("reversed is a live view", () -> {
             LinkedHashMap<String, Integer> r = m4();
@@ -289,8 +289,8 @@ public class LinkedSequencedShadowSweep {
         });
 
         LinkedHashSet<String> s = new LinkedHashSet<>(Arrays.asList("a", "b", "c"));
-        tv("set getFirst", s::getFirst);
-        tv("set getLast", s::getLast);
+        tv("set getFirst", () -> s.getFirst());
+        tv("set getLast", () -> s.getLast());
         tv("set reversed", () -> s.reversed().toString());
         tv("set addFirst", () -> { LinkedHashSet<String> x =
                 new LinkedHashSet<>(Arrays.asList("a", "b")); x.addFirst("z"); return x.toString(); });
@@ -303,8 +303,8 @@ public class LinkedSequencedShadowSweep {
         tv("set removeLast", () -> { LinkedHashSet<String> x =
                 new LinkedHashSet<>(Arrays.asList("a", "b")); return x.removeLast() + " " + x; });
         LinkedHashSet<String> es = new LinkedHashSet<>();
-        tv("empty set getFirst", es::getFirst);
-        tv("empty set removeFirst", es::removeFirst);
+        tv("empty set getFirst", () -> es.getFirst());
+        tv("empty set removeFirst", () -> es.removeFirst());
     }
 
     public static void main(String[] args) {

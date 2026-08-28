@@ -174,7 +174,7 @@ public class HashtableVectorShadowSweep {
         p("enumeration hasMoreElements", en.hasMoreElements());
         en.nextElement();
         p("enumeration exhausted", en.hasMoreElements());
-        t("enumeration past end", en::nextElement);
+        t("enumeration past end", () -> en.nextElement());
 
         // views write through
         Hashtable<String, String> v = new Hashtable<>();
@@ -234,8 +234,8 @@ public class HashtableVectorShadowSweep {
         t("v subList out of range", () -> v.subList(0, 9));
 
         Vector<String> e = new Vector<>();
-        t("v firstElement on empty", e::firstElement);
-        t("v lastElement on empty", e::lastElement);
+        t("v firstElement on empty", () -> e.firstElement());
+        t("v lastElement on empty", () -> e.lastElement());
         p("v empty isEmpty", e.isEmpty());
         p("v empty size", e.size());
         t("v new Vector(-1)", () -> new Vector<String>(-1));
@@ -269,8 +269,8 @@ public class HashtableVectorShadowSweep {
         t("v copyInto null", () -> new Vector<>(Arrays.asList("a")).copyInto(null));
 
         Stack<String> s = new Stack<>();
-        t("stack empty pop", s::pop);
-        t("stack empty peek", s::peek);
+        t("stack empty pop", () -> s.pop());
+        t("stack empty peek", () -> s.peek());
         p("stack empty empty()", s.empty());
         p("stack search absent", s.search("a"));
         s.push("a"); s.push("b");

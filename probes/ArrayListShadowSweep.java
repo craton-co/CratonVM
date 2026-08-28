@@ -99,7 +99,7 @@ public class ArrayListShadowSweep {
                                               z.add("a"); return z.toString(); });
         t("new ArrayList(null)", () -> new ArrayList<String>((Collection<String>) null));
         t("ensureCapacity negative", () -> l.ensureCapacity(-1));
-        t("trimToSize", l::trimToSize);
+        t("trimToSize", () -> l.trimToSize());
         p("after trimToSize", l.toString());
 
         // nulls are ordinary elements in an ArrayList
@@ -122,13 +122,13 @@ public class ArrayListShadowSweep {
     static void iterators() {
         ArrayList<String> l = l4();
         Iterator<String> it = l.iterator();
-        t("iterator remove before next", it::remove);
+        t("iterator remove before next", () -> it.remove());
         p("iterator next", it.next());
         it.remove();
         p("after iterator remove", l.toString());
-        t("iterator remove twice", it::remove);
+        t("iterator remove twice", () -> it.remove());
         while (it.hasNext()) it.next();
-        t("iterator next past end", it::next);
+        t("iterator next past end", () -> it.next());
 
         ArrayList<String> ff = l4();
         t("fail fast on add during iteration", () -> { for (String x : ff) ff.add("z"); });
@@ -147,7 +147,7 @@ public class ArrayListShadowSweep {
         p("listIterator nextIndex at start", li.nextIndex());
         p("listIterator previousIndex at start", li.previousIndex());
         p("listIterator hasPrevious at start", li.hasPrevious());
-        t("listIterator previous at start", li::previous);
+        t("listIterator previous at start", () -> li.previous());
         t("listIterator set before next", () -> li.set("x"));
         li.next();
         li.set("A");
@@ -216,14 +216,14 @@ public class ArrayListShadowSweep {
         List<String> stale = par.subList(1, 3);
         par.add("e");
         t("stale view get", () -> stale.get(0));
-        t("stale view size", stale::size);
+        t("stale view size", () -> stale.size());
         t("stale view iterator", () -> stale.iterator().next());
         t("stale view set", () -> stale.set(0, "x"));
         // ... but a non-structural parent write does not
         ArrayList<String> par2 = l4();
         List<String> live = par2.subList(1, 3);
         par2.set(0, "A");
-        tv("view after non-structural parent write", live::toString);
+        tv("view after non-structural parent write", () -> live.toString());
 
         p("view equals a plain list", l4().subList(1, 3).equals(Arrays.asList("b", "c")));
         p("view hashCode agrees",
@@ -269,7 +269,7 @@ public class ArrayListShadowSweep {
         t("asList add(int)", () -> al.add(0, "d"));
         t("asList remove(Object)", () -> al.remove("a"));
         t("asList remove(int)", () -> al.remove(0));
-        t("asList clear", al::clear);
+        t("asList clear", () -> al.clear());
         t("asList addAll", () -> al.addAll(Arrays.asList("d")));
         t("asList removeIf that matches nothing", () -> al.removeIf(x -> false));
         t("asList removeIf that matches", () -> al.removeIf(x -> x.equals("a")));

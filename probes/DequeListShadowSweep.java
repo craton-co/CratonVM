@@ -95,13 +95,13 @@ public class DequeListShadowSweep {
     // ------------------------------------------------------------------
     static void emptyPair() {
         ArrayDeque<String> d = new ArrayDeque<>();
-        t("ad empty getFirst", d::getFirst);
-        t("ad empty getLast", d::getLast);
-        t("ad empty element", d::element);
-        t("ad empty removeFirst", d::removeFirst);
-        t("ad empty removeLast", d::removeLast);
-        t("ad empty remove()", d::remove);
-        t("ad empty pop", d::pop);
+        t("ad empty getFirst", () -> d.getFirst());
+        t("ad empty getLast", () -> d.getLast());
+        t("ad empty element", () -> d.element());
+        t("ad empty removeFirst", () -> d.removeFirst());
+        t("ad empty removeLast", () -> d.removeLast());
+        t("ad empty remove()", () -> d.remove());
+        t("ad empty pop", () -> d.pop());
         p("ad empty peek", d.peek());
         p("ad empty peekFirst", d.peekFirst());
         p("ad empty peekLast", d.peekLast());
@@ -114,13 +114,13 @@ public class DequeListShadowSweep {
         p("ad empty descendingIterator hasNext", d.descendingIterator().hasNext());
 
         LinkedList<String> l = new LinkedList<>();
-        t("ll empty getFirst", l::getFirst);
-        t("ll empty getLast", l::getLast);
-        t("ll empty element", l::element);
-        t("ll empty removeFirst", l::removeFirst);
-        t("ll empty removeLast", l::removeLast);
-        t("ll empty remove()", l::remove);
-        t("ll empty pop", l::pop);
+        t("ll empty getFirst", () -> l.getFirst());
+        t("ll empty getLast", () -> l.getLast());
+        t("ll empty element", () -> l.element());
+        t("ll empty removeFirst", () -> l.removeFirst());
+        t("ll empty removeLast", () -> l.removeLast());
+        t("ll empty remove()", () -> l.remove());
+        t("ll empty pop", () -> l.pop());
         p("ll empty peek", l.peek());
         p("ll empty peekFirst", l.peekFirst());
         p("ll empty poll", l.poll());
@@ -195,7 +195,7 @@ public class DequeListShadowSweep {
         it.next();
         it.remove();
         p("ad iterator remove", ir.toString());
-        t("ad iterator remove twice", it::remove);
+        t("ad iterator remove twice", () -> it.remove());
 
         // clear / retainAll / removeAll / removeIf
         ArrayDeque<String> ops = new ArrayDeque<>(Arrays.asList("a", "b", "c", "d"));
@@ -304,7 +304,7 @@ public class DequeListShadowSweep {
         LinkedList<String> li = new LinkedList<>(Arrays.asList("a", "b", "c"));
         ListIterator<String> lit = li.listIterator();
         t("listIterator set before next", () -> lit.set("x"));
-        t("listIterator remove before next", lit::remove);
+        t("listIterator remove before next", () -> lit.remove());
         lit.next();
         lit.set("A");
         lit.add("A2");
@@ -313,7 +313,7 @@ public class DequeListShadowSweep {
         p("listIterator previousIndex", lit.previousIndex());
         p("listIterator hasPrevious", lit.hasPrevious());
         p("listIterator previous", lit.previous());
-        t("listIterator remove after add", lit::remove);
+        t("listIterator remove after add", () -> lit.remove());
 
         // fail-fast
         LinkedList<String> ff = new LinkedList<>(Arrays.asList("a", "b", "c"));

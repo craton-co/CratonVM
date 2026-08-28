@@ -470,7 +470,7 @@ public class PropertiesShadowSweep {
         v2.setProperty("y", "2");
         Iterator<Object> it = v2.keySet().iterator();
         it.next();
-        t("keySet iterator remove", it::remove);
+        t("keySet iterator remove", () -> it.remove());
         p("keySet iterator remove size", v2.size());
 
         Properties v3 = new Properties();

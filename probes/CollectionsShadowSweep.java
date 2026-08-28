@@ -164,20 +164,20 @@ public class CollectionsShadowSweep {
 
         Iterator<String> ei = Collections.emptyIterator();
         p("emptyIterator hasNext", ei.hasNext());
-        t("emptyIterator next", ei::next);
-        t("emptyIterator remove", ei::remove);
+        t("emptyIterator next", () -> ei.next());
+        t("emptyIterator remove", () -> ei.remove());
         ListIterator<String> eli = Collections.emptyListIterator();
         p("emptyListIterator hasNext", eli.hasNext());
         p("emptyListIterator hasPrevious", eli.hasPrevious());
         p("emptyListIterator nextIndex", eli.nextIndex());
         p("emptyListIterator previousIndex", eli.previousIndex());
-        t("emptyListIterator next", eli::next);
-        t("emptyListIterator previous", eli::previous);
+        t("emptyListIterator next", () -> eli.next());
+        t("emptyListIterator previous", () -> eli.previous());
         t("emptyListIterator add", () -> Collections.emptyListIterator().add("a"));
         t("emptyListIterator set", () -> Collections.<String>emptyListIterator().set("a"));
         Enumeration<String> ee = Collections.emptyEnumeration();
         p("emptyEnumeration hasMoreElements", ee.hasMoreElements());
-        t("emptyEnumeration nextElement", ee::nextElement);
+        t("emptyEnumeration nextElement", () -> ee.nextElement());
 
         List<String> sl = Collections.singletonList("a");
         p("singletonList", sl.toString());
@@ -221,7 +221,7 @@ public class CollectionsShadowSweep {
         t("unmodifiableList add", () -> ul.add("z"));
         t("unmodifiableList set", () -> ul.set(0, "z"));
         t("unmodifiableList remove", () -> ul.remove(0));
-        t("unmodifiableList clear", ul::clear);
+        t("unmodifiableList clear", () -> ul.clear());
         t("unmodifiableList sort", () -> ul.sort(null));
         t("unmodifiableList removeIf", () -> ul.removeIf(x -> true));
         t("unmodifiableList replaceAll", () -> ul.replaceAll(x -> x));
@@ -254,7 +254,7 @@ public class CollectionsShadowSweep {
         Map<String, String> um = Collections.unmodifiableMap(msrc);
         t("unmodifiableMap put", () -> um.put("a", "b"));
         t("unmodifiableMap remove", () -> um.remove("k"));
-        t("unmodifiableMap clear", um::clear);
+        t("unmodifiableMap clear", () -> um.clear());
         t("unmodifiableMap putAll", () -> um.putAll(new HashMap<>()));
         t("unmodifiableMap computeIfAbsent", () -> um.computeIfAbsent("z", x -> "y"));
         t("unmodifiableMap merge", () -> um.merge("k", "y", (a, b) -> a));
@@ -283,7 +283,7 @@ public class CollectionsShadowSweep {
         NavigableSet<String> nss = new TreeSet<>(Arrays.asList("b", "a"));
         NavigableSet<String> uns = Collections.unmodifiableNavigableSet(nss);
         p("unmodifiableNavigableSet ceiling", uns.ceiling("a"));
-        t("unmodifiableNavigableSet pollFirst", uns::pollFirst);
+        t("unmodifiableNavigableSet pollFirst", () -> uns.pollFirst());
 
         // The synchronized wrappers delegate; they are NOT immutable.
         List<String> syl = Collections.synchronizedList(new ArrayList<>(Arrays.asList("a")));
