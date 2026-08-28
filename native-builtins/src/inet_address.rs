@@ -538,6 +538,35 @@ const INET6_IMPL: &str = "java/net/Inet6AddressImpl";
 const INET_ADDRESS: &str = "java/net/InetAddress";
 const INET_IMPL_FACTORY: &str = "java/net/InetAddressImplFactory";
 
+/// `InetAddress.getCanonicalHostName()`: the reverse lookup, with the JDK's own
+/// fallback to the numeric literal.
+///
+/// The two methods are NOT the same question, and this VM used to answer them
+/// with one body. `getHostName()` returns the name the mirror was CONSTRUCTED
+/// with -- `getByAddress("h", addr)` remembers `"h"` and must hand it straight
+/// back. `getCanonicalHostName()` IGNORES that name and performs its own
+/// reverse lookup, returning the textual address when there is no PTR record.
+///
+/// MEASURED against HotSpot 25.0.3+9 (`probes/InetFamilySweep.java`), asked as
+/// a property so no resolver answer enters the diff:
+///
+/// ```text
+/// InetAddress.getByAddress("h", 192.0.2.1).getCanonicalHostName().equals("h")
+///   HotSpot  false     CratonVM  true
+/// ```
+///
+/// That row is false on HotSpot for EVERY resolver outcome -- a real PTR name
+/// is not `"h"`, and neither is `"192.0.2.1"` -- and true exactly on a VM that
+/// routes both methods to one body, which is what `net_phase_e.rs` did for both
+/// `Inet4Address` and `Inet6Address`.
+///
+/// `ptr_lookup` uses `NI_NAMEREQD`, so it FAILS rather than handing back the
+/// numeric form when no PTR exists; that failure is what selects the fallback
+/// here, and it is why this cannot be written as "whatever getnameinfo says".
+pub(crate) fn canonical_host_name(ip: &IpAddr) -> String {
+    ptr_lookup(ip).unwrap_or_else(|_| ip.to_string())
+}
+
 pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);

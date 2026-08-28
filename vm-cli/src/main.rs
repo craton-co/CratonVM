@@ -5431,6 +5431,14 @@ fn run() -> Result<()> {
              invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
         );
+        // JNI up-calls that found no thread context. Non-zero means some native
+        // called back into Java with the context torn down under it — the shape
+        // that lost netty's TLSv1.3 client certificate. Zero is expected for any
+        // run whose native calls all originate from Java.
+        eprintln!(
+            "[cratonvm] JNI up-calls answered with NO thread context: {}",
+            cratonvm_vm::native::jni::jni_upcalls_without_context()
+        );
         // Why a compiled callee is reached through a Rust helper at all.
         //
         // The netty census (`[DISP_CENSUS]`, `CRATONVM_DBG=mic-prof`) says 98.4%

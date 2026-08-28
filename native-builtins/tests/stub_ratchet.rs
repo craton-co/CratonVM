@@ -1149,7 +1149,53 @@ use cratonvm_types::compat::CompatibilityMode;
 /// stub -- which is exactly the behaviour that makes the fallback path run
 /// there. Re-freezing records it; leaving the gate red would only hide the next
 /// one.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1585;
+/// **RE-FROZEN 2026-08-27: 1585 -> 1587 (management), 1574 -> 1576 (default).
+/// This is CASE ONE -- a RELABEL, not an addition -- and it is the good case:
+/// the two rows moved OUT of a kind that runs a native and INTO the kind
+/// `--jdk-only` refuses, so the strict arm now runs the real JDK cursor where it
+/// used to run ours.**
+///
+/// MEASURED: stubs +2 in BOTH arms, `BASELINE_INTRINSICS` unchanged at 1387
+/// (read with `--nocapture`; it is a CEILING and would not have said so on its
+/// own). The source delta is +3 register calls, all three on the new synthetic
+/// class `cratonvm/internal/ArrayListViewItr` and all three default-kind, so
+/// none of them is a stub. The +2 is therefore accounted for entirely by
+///
+/// ```text
+/// java/util/ArrayList$Itr.hasNext ()Z                   Bridge -> SyntheticStub
+/// java/util/ArrayList$Itr.next    ()Ljava/lang/Object;  Bridge -> SyntheticStub
+/// ```
+///
+/// from dev's `088193e2c` *perf(collections): ArrayList iteration yields to real
+/// JDK bytecode -- 6.8x -- behind a mint-time modCount check*, which wraps
+/// exactly those two in `r.with_category(itr_kind, ..)`. `remove` deliberately
+/// stays `Bridge`: it is the one of the three that writes through to the backing
+/// list.
+///
+/// Why a stub is the RIGHT kind here, which is the whole point:
+///
+/// * a registered native pins its method out of the JIT entirely -- the tier-up
+///   counter lives only in the `VirtualBytecode` arm of `dispatch_virtual`, so a
+///   site serving a `VirtualNative` target is never counted, nominated or
+///   compiled. Its author measured `ArrayList$Itr.next` entered 2 000 000 times
+///   on a 2000x1000 walk and never once appearing in `CRATONVM_DBG_JITC`.
+/// * `SyntheticStub` is what the yield predicate reads, so making these two
+///   stubs is how the real JDK cursor gets to run and be compiled.
+///
+/// CHECKED, because this is the exact shape of
+/// `a-refused-syntheticstub-falls-through-to-an-older-native-not-to-bytecode`:
+/// a refused stub leaves an EARLIER registration of the same triple winning, and
+/// then the retirement never happens. `java/util/ArrayList$Itr` has **no other
+/// registrar** anywhere in the tree -- the only other mentions are the class
+/// manager's layout tables, the JIT's escape-analysis comments, and
+/// `retired_shadow.rs`, which lists the same triple on the protected-stub side
+/// that this change is designed to pair with. So the refusal under `--jdk-only`
+/// genuinely reaches bytecode.
+///
+/// Not attributable to this branch, and not this branch's win either; it is
+/// recorded here because the ratchet has zero slack and a merged tree has to be
+/// accounted for by whoever lands it.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1587;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1164,7 +1210,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1585;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1574;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1576;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1207,13 +1253,20 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1574;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13769;
+/// **REFRESHED 2026-08-27: 13769 -> 13775, 13401 -> 13407.** These two are
+/// ungated documentation -- nothing asserts on them, they only appear in the
+/// failure message -- so unlike the stub baseline beside them they DRIFT: only
+/// +3 of the +6 comes from the merge that moved the stub count (the three
+/// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
+/// across merges nobody had to re-freeze for. An ungated constant used to
+/// classify a gated one is worth only as much as its last refresh.
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13775;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13401;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13407;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

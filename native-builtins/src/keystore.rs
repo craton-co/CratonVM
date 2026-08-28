@@ -2475,6 +2475,15 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
 
     // engineSize() -> int
     r.register(fqn, "engineSize", "()I", engine_size);
+    // The seventeenth `engine*`. Missing, it did not degrade -- it reached
+    // real `KeyStoreDelegator` bytecode and raised NPE on a field this module
+    // never populates. See `engine_get_certificate_alias`.
+    r.register(
+        fqn,
+        "engineGetCertificateAlias",
+        "(Ljava/security/cert/Certificate;)Ljava/lang/String;",
+        engine_get_certificate_alias,
+    );
 
     // engineContainsAlias(String) -> boolean
     r.register(
@@ -2573,6 +2582,51 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
 // ---------------------------------------------------------------------------
 // `engine*` callback implementations
 // ---------------------------------------------------------------------------
+
+/// The alias, as the JDK's own keystore SPIs key it: **NPE on null, lowercased
+/// otherwise**.
+///
+/// Both halves are measured, in both modes
+/// (`probes/KeyStoreFamilySweep.java`, HotSpot 25.0.3+9):
+///
+/// ```text
+/// setCertificateEntry("MixedCaseAlias", c); aliases()
+///   HotSpot  [mixedcasealias]      CratonVM  [MixedCaseAlias]
+/// containsAlias("mixedcasealias")
+///   HotSpot  true                  CratonVM  false
+/// containsAlias(null)
+///   HotSpot  NullPointerException  CratonVM  no-throw
+/// ```
+///
+/// `PKCS12KeyStore` and `JavaKeyStore` both do `alias.toLowerCase(Locale
+/// .ENGLISH)` before touching their map, which is where both behaviours come
+/// from at once: the null dereference and the case folding. This VM read the
+/// alias with `.unwrap_or_default()`, so a null alias silently became `""` and
+/// a mixed-case one stayed mixed.
+///
+/// Why the case matters beyond a probe row: aliases are how a keystore file
+/// written by `keytool` is addressed. A store written elsewhere and read here
+/// (or the reverse) disagreed about every alias that was not already lower
+/// case, and `containsAlias` answered false for a name the store really held.
+///
+/// `to_lowercase` rather than `to_ascii_lowercase`: Rust's is locale-INDEPENDENT
+/// Unicode lowercasing, which is what `Locale.ENGLISH` selects; the ASCII form
+/// would diverge on a non-ASCII alias, and the locale-sensitive form is the
+/// Turkish-dotless-I trap the JDK pins `Locale.ENGLISH` to avoid.
+fn alias_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<String, MethodCallFailed> {
+    match args.get(1) {
+        Some(v @ Value::Object(Some(_))) => match read_string_arg(ctx, v) {
+            Some(a) => Ok(a.to_lowercase()),
+            // A non-null object that is not a readable String: keep the old
+            // lenient behaviour rather than inventing a second failure mode.
+            None => Ok(String::new()),
+        },
+        _ => Err(RuntimeError::NullPointerException {
+            message: Some("KeyStore alias is null".into()),
+        }
+        .into()),
+    }
+}
 
 fn this_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     match args.first() {
@@ -2811,10 +2865,7 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // the entry at the API boundary that actually receives it, so consumers
     // never receive an EncryptedPrivateKeyInfo masquerading as PKCS#8.
     keystore_unlock_private_keys(id, &password);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
     };
@@ -2952,10 +3003,7 @@ pub(crate) fn engine_get_certificate(
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
 
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
@@ -2984,10 +3032,7 @@ pub(crate) fn engine_get_certificate_chain(
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
 
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
@@ -3111,10 +3156,7 @@ pub(crate) fn engine_contains_alias(
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let present = keystore_lookup(id)
         .map(|s| s.entries.contains_key(&alias))
         .unwrap_or(false);
@@ -3124,10 +3166,7 @@ pub(crate) fn engine_contains_alias(
 pub(crate) fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let yes = keystore_lookup(id)
         .and_then(|s| {
             s.entries.get(&alias).map(|e| {
@@ -3147,10 +3186,7 @@ pub(crate) fn engine_is_certificate_entry(
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let yes = keystore_lookup(id)
         .and_then(|s| {
             s.entries
@@ -3164,13 +3200,24 @@ pub(crate) fn engine_is_certificate_entry(
 fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
-    let ms = keystore_lookup(id)
+    let alias = alias_arg(ctx, args)?;
+    // An ABSENT alias is null, not the epoch. `.unwrap_or(0)` handed back a
+    // `Date` at time 0, so a caller testing `getCreationDate(a) != null` to ask
+    // "does this entry exist" got true for every alias in existence.
+    //
+    // MEASURED in both modes (`probes/KeyStoreFamilySweep.java`):
+    //
+    //   getCreationDate("nope")
+    //     HotSpot   null
+    //     CratonVM  Wed Dec 31 21:00:00 UTC 1969
+    //
+    // Note the rendered date is the LOCAL-time face of epoch 0, which is what
+    // made it read like a real timestamp rather than a default.
+    let Some(ms) = keystore_lookup(id)
         .and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms))
-        .unwrap_or(0);
+    else {
+        return Ok(Some(Value::Object(None)));
+    };
 
     // java/util/Date has a single `fastTime` long field in real-JDK layout
     // (slot 0 in our synthetic mirror).
@@ -3188,16 +3235,81 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// it and write the same side-table the reads consult. The cert DER comes from
 /// [`certificate_der`] (real `Certificate.getEncoded()`, with a fallback for
 /// this module's own synthetic X.509 mirror).
+/// `KeyStoreSpi.engineGetCertificateAlias(Certificate)` — the first alias whose
+/// stored certificate has the SAME ENCODING as the argument, or null.
+///
+/// MEASURED 2026-08-27 (`probes/KeyStoreFamilySweep.java`), both modes, and it
+/// was FATAL rather than merely wrong:
+///
+/// ```text
+/// KeyStore.getCertificateAlias(cert)
+///   HotSpot   "mixedcasealias"
+///   CratonVM  NullPointerException: Cannot invoke
+///             "java.security.KeyStoreSpi.engineGetCertificateAlias(..)"
+///             because "this.keystore" is null
+///             at sun/security/util/KeyStoreDelegator.engineGetCertificateAlias
+/// ```
+///
+/// The probe died at row 33 of 160, so 128 rows never ran.
+///
+/// Why it happened, which is the reusable part: this module registers SIXTEEN
+/// `engine*` methods and this was the seventeenth. An unregistered one does not
+/// fall back to something harmless — it reaches the REAL `KeyStoreDelegator`
+/// bytecode, which dereferences `this.keystore`, a field the natives never
+/// populate because this module keeps its state in its own side table. So the
+/// cost of a missing registration in a half-shimmed class is a
+/// `NullPointerException` from inside the JDK, not a missing feature. That is
+/// the shape recorded at `a-shim-registered-for-a-descriptor-it-half-implements`.
+///
+/// Comparison is by DER, not by mirror identity: the argument is whatever
+/// `Certificate` the caller holds, which in general is a different object from
+/// the one `engineGetCertificate` would mint for the same entry.
+pub(crate) fn engine_get_certificate_alias(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let Some(Value::Object(Some(cert))) = args.get(1) else {
+        // The JDK's own body answers null for a null certificate rather than
+        // throwing: `engineGetCertificateAlias` has no null check and the scan
+        // simply matches nothing.
+        return Ok(Some(Value::Object(None)));
+    };
+    let want = certificate_der(ctx, *cert);
+    if want.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let Some(store) = keystore_lookup(id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // `entries` is a BTreeMap, so the scan order is deterministic; the JDK's
+    // own order is its hash table's and is unspecified, which is why the probe
+    // only ever puts ONE certificate in the store before asking.
+    for (alias, entry) in &store.entries {
+        let have = match &entry.kind {
+            EntryKind::TrustedCert { cert_der } => cert_der.clone(),
+            EntryKind::PrivateKey { chain, .. } => match chain.first() {
+                Some(d) => d.clone(),
+                None => continue,
+            },
+            EntryKind::SecretKey { .. } => continue,
+        };
+        if have == want {
+            let alias = alias.clone();
+            return Ok(Some(Value::Object(Some(ctx.create_string(&alias)))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
 pub(crate) fn engine_set_certificate_entry(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let cert = match args.get(2) {
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(None),
@@ -3227,10 +3339,7 @@ pub(crate) fn engine_set_key_entry(
 ) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let key = match args.get(2) {
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(None),
@@ -3448,10 +3557,7 @@ fn protection_password(
 /// the overwhelmingly common case).
 fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     let entry = match args.get(2) {
         Some(Value::Object(Some(e))) => *e,
         _ => {
@@ -3655,10 +3761,7 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn engine_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
 
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
@@ -3762,10 +3865,7 @@ fn engine_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 pub(crate) fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args
-        .get(1)
-        .and_then(|v| read_string_arg(ctx, v))
-        .unwrap_or_default();
+    let alias = alias_arg(ctx, args)?;
     keystore_delete_entry(id, &alias);
     Ok(None)
 }
@@ -3784,6 +3884,34 @@ pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // JKS DEMANDS a store password; PKCS#12 permits a null one.
+    //
+    // MEASURED in both modes (`probes/KeyStoreFamilySweep.java`), and it is one
+    // of the places the module's own header claim -- "PKCS12 + JKS share the
+    // same `engine*` surface" -- is false:
+    //
+    //   ks.store(out, null)
+    //     JKS      HotSpot IllegalArgumentException   CratonVM no-throw
+    //     PKCS12   HotSpot no-throw                   CratonVM no-throw
+    //
+    // Real `JavaKeyStore.engineStore` opens with `if (password == null) throw
+    // new IllegalArgumentException("password can't be null")`; `PKCS12KeyStore`
+    // has no such line and treats null as "no encryption of the MAC". Keyed on
+    // the receiver class for the same reason `spi_supports_secret_keys` is --
+    // `NativeCallback` is a bare `fn` pointer and cannot capture the FQN it was
+    // registered under.
+    //
+    // Note this is NOT the same axis as the format choice below: that one is
+    // decided by CONTENT (a SecretKeyEntry forces PKCS#12), while the refusal
+    // is decided by the SPI the caller actually asked for.
+    if matches!(args.get(2), None | Some(Value::Object(None)))
+        && class_name_of(ctx, this).starts_with("sun/security/provider/JavaKeyStore")
+    {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "password can't be null".to_string(),
+        }
+        .into());
+    }
     let password = match args.get(2) {
         Some(v) => read_password(ctx, v),
         None => Vec::new(),

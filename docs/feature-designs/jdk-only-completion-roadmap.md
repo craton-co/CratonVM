@@ -1,5 +1,37 @@
 # `--jdk-only`: the completion roadmap
 
+> **RE-ADJUDICATED 2026-08-27, fifteen days on, and this page is now STALE in
+> three places.** Full evidence and six fixes in
+> `docs/known-issues/jdk-only/the-roadmaps-phase-1-and-3-re-adjudicated-and-six-fixes-20260827.md`.
+> Read that before starting any lane below.
+>
+> * **PHASE 3 IS CLOSED.** All four items, 35 probe rows, 0 differing lines in
+>   BOTH modes (`probes/Phase3Sweep.java`) — including P3-A, which this page
+>   still calls "the one live red in the suite": `aastore` covariance now holds
+>   on the compiled tier, checked after 400 000 warming stores.
+> * **PHASE 1 IS FIVE-NINTHS CLOSED, AND THE MECHANISM HAS INVERTED.**
+>   A/B/D/G/I clear; not one `NoClassDefFoundError` in 80 rows
+>   (`probes/Phase1Sweep.java`). What is left is the opposite shape: strict mode
+>   has **12** differing lines and COMPATIBLE mode has **18**, every extra one a
+>   place where declining to fabricate got the real JDK and the default did not.
+>   `probes/AtomicUpdaterSweep.java` is 87/87 clean under `--jdk-only` and DIES
+>   in compatible mode.
+> * **§5's "`--jdk-only-report` is a complete census and nothing was using it"
+>   is no longer true.** `difftest/src/census.rs` and `difftest/src/ledger.rs`
+>   consume it today, folding the violation tallies onto the ledger row.
+>
+> §5's own instrument rules are still exactly right and cost real time to
+> re-learn: a dump flag AFTER the main class is silently ignored; the report path
+> must be Windows-shaped on this host; and the report is not written when the
+> program calls `System.exit`.
+>
+> The **definition of done** in §6 is untouched by any of this, and is still the
+> bar: a Spring Boot application, a servlet container serving HTTPS, and a JDBC
+> workload each running to completion under `--jdk-only` with no fabricated class
+> instantiated, whatever its package. None of those three workloads is checked
+> out on this host — only their runners are — so nothing above should be read as
+> evidence about it.
+
 **Status: FINAL. Written 2026-08-12 from measurement, not from record titles.
 UPDATED the same day by a second measurement wave that falsified several of this
 document's own claims.** Each is corrected in place — what was believed, what

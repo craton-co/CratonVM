@@ -6302,13 +6302,21 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// 43.9 ns/voxel, converging on its own no-wrapper control at 39.2; see
 /// `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
 ///
-/// What keeps it off is the ordinary flag-flip discipline: the trades it makes
-/// — more nodes per compile, a spliced body's surviving calls losing their
-/// profile seed, compile time — are still priced on one probe and the
-/// regression suite (72/72 green with this on), not on the
-/// kafka/spring/tomcat/hibernate gauntlet. Note also that on its own it buys
-/// 2.1x here and only reaches 10.9x alongside `CRATONVM_SCALAR_DEOPT=1`, which
-/// has a soak debt of its own, so the two want pricing together.
+/// What keeps it off is no longer the pricing — the 2026-08-28 gauntlet soak
+/// (`docs/internal/performance/ir-inline-gauntlet-soak-20260828.md`) did that,
+/// and the trades came out in the flag's favour: 11 030 methods spliced across
+/// 200 netty classes, 8% faster on a serial netty slice and 15-26% on
+/// hibernate, with the sharded run's apparent +18% traced to contention rather
+/// than to compile cost.
+///
+/// What keeps it off is a CORRECTNESS regression the soak found:
+/// `docs/known-issues/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-20260828.md`.
+/// A 3-byte out-of-bounds read through a spliced accessor raises
+/// `InternalError` ("precise deoptimization unavailable … reason
+/// UnreachedCode") instead of `IndexOutOfBoundsException` — deterministically,
+/// 5 reps per arm. Flip this once that is fixed, and note that the designated
+/// differential gate cannot see this flag at all (it splices zero times in
+/// `ir_vs_singlepass`, which has no VM to supply callee bodies).
 pub fn ir_inline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
