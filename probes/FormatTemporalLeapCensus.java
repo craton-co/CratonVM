@@ -89,16 +89,32 @@ public final class FormatTemporalLeapCensus {
             census(out, "farFuture", millis);
         }
 
-        // 4. Negative epoch millis — before 1970, and BC.
+        // 4. Negative epoch millis — before 1970.
         for (long millis : new long[] {
                 -1L,
                 -DAY,
                 utcMillis(1969, 12, 31),
                 utcMillis(1900, 1, 1),
                 utcMillis(1600, 2, 29),
-                utcMillis(1, 1, 1),
+                utcMillis(1583, 1, 1),
         }) {
             census(out, "past", millis);
+        }
+
+        // 5. BEFORE THE GREGORIAN CUTOVER, where the two runtimes are expected
+        //    to differ and a diff here is NOT this bug. HotSpot's `Formatter`
+        //    goes through `GregorianCalendar`, which switches to the JULIAN
+        //    calendar before 1582-10-15; CratonVM is proleptic Gregorian
+        //    throughout, so the same instant is two days apart at year 1.
+        //    Measured identical on CratonVM before and after the leap-year fix
+        //    (`0001-01-01` both times, against HotSpot's `0001-01-03`), so it is
+        //    a separate, pre-existing modelling difference. Kept in the census,
+        //    labelled, so nobody re-diagnoses it as a regression.
+        for (long millis : new long[] {
+                utcMillis(1582, 10, 4),
+                utcMillis(1, 1, 1),
+        }) {
+            census(out, "preGregorianCutover.EXPECTED-DIFF", millis);
         }
 
         System.out.print(out);
