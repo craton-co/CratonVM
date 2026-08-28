@@ -277,6 +277,14 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/String;",
         builtin_future_get_error_message,
     );
+    // `GpuFuture.cancel(boolean)` calls this. It was never registered, so
+    // every cancel attempt on a real CratonVM died with
+    // `UnsatisfiedLinkError: Native.futureCancel` instead of returning the
+    // documented "could not cancel" answer -- and it died from inside
+    // `cancel()`, which the Java side documents as returning `false` rather
+    // than throwing. Registered now; see `builtin_future_cancel` for why the
+    // answer is always "rejected".
+    registry.register(KLASS, "futureCancel", "(JZ)I", builtin_future_cancel);
 
     registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
@@ -1332,6 +1340,38 @@ fn builtin_close_stream(
 /// Status codes (mirrors the Java side enum-ordinal layout in the spec):
 ///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
 #[cfg(feature = "gpu-offload")]
+/// `Native.futureCancel(long handle, boolean mayInterruptIfRunning) -> int`
+///
+/// Returns `1` if the cancellation request was accepted and `0` if it was
+/// rejected. This implementation always answers `0`.
+///
+/// That is not a stub: there is no device-side cancellation primitive anywhere
+/// in this workspace. `NativeContext` exposes dispatch, status, synchronize,
+/// take-result and release for a GPU submission, and nothing that revokes one.
+/// CUDA itself offers no way to abort a launched kernel short of tearing down
+/// the context, which would take every other submission on the device with it.
+///
+/// Answering `0` is the honest report of that, and it is exactly the contract
+/// the Java side documents: `GpuFuture.cancel` returns `false` when the work
+/// "could not be cancelled for some other GPU-specific reason (e.g. ... no
+/// cancellation primitive is implemented for this future kind)".
+///
+/// What matters is that the method is *registered*. Before this, `cancel()`
+/// raised `UnsatisfiedLinkError: Native.futureCancel` -- a hard failure out of
+/// a method whose whole documented behaviour is to answer `false` when it
+/// cannot do the job.
+///
+/// When a cancellation primitive does land, this is the single place to change:
+/// accept the request, mark the submission failed so `futureStatus` reports
+/// `2`, and return `1`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_cancel(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
