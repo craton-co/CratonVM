@@ -1317,7 +1317,7 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
             };
             thread.frames[frame_idx]
                 .stack
-                .push_compact_double_checked(CompactValue::double(number))?;
+                .push_compact_double_checked(CompactValue::double_raw(number))?;
         }
         _ => {
             if field.is_reference {

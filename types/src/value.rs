@@ -1363,7 +1363,9 @@ impl RawSlot {
             SlotType::Int => CompactValue::int(self.0 as i32),
             SlotType::Long => CompactValue::long(self.0 as i64),
             SlotType::Float => CompactValue::float(f32::from_bits(self.0 as u32)),
-            SlotType::Double => CompactValue::double(f64::from_bits(self.0)),
+            // The caller named the slot type, so the double's bits need no
+            // collision canonicalization - see `CompactValue::double_raw`.
+            SlotType::Double => CompactValue::double_raw(f64::from_bits(self.0)),
             SlotType::Reference => {
                 if self.0 != 0 && plausible_heap_pointer(self.0) {
                     CompactValue::object(self.0)

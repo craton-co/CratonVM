@@ -4354,7 +4354,7 @@ pub(super) fn op_getfield(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact_double_checked(CompactValue::double(d))?;
+                    .push_compact_double_checked(CompactValue::double_raw(d))?;
             } else {
                 // T12/T14: Coerce zero-initialized heap slots for reference fields.
                 // The GC heap zeroes memory on allocation; for reference-typed

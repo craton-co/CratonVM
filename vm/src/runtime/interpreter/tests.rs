@@ -4357,7 +4357,8 @@ fn t18_k5_ldc2_w_double_round_trip() {
         assert_eq!(top.tag(), CompactTag::Double);
         assert_eq!(stack.pop_double().expect("pop_double"), v);
     }
-    // NaN: canonicalised by push_double, but the popped value is still NaN.
+    // NaN round-trips bit-exact through push_double; this one is the
+    // canonical quiet NaN, which never collided with the tag space anyway.
     let mut stack = ValueStack::new(2);
     stack.push_double(f64::NAN).expect("push_double NaN");
     assert!(stack.pop_double().expect("pop_double NaN").is_nan());

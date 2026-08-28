@@ -809,7 +809,7 @@ pub(super) fn push_static_field_value(
                     .into());
                 }
             };
-            stack.push_compact_double(crate::types::CompactValue::double(dv));
+            stack.push_compact_double(crate::types::CompactValue::double_raw(dv));
             Ok(())
         }
         _ => {
@@ -941,7 +941,7 @@ pub(super) fn push_invoke_return_value(
             Ok(())
         }
         Value::Double(d) => {
-            stack.push_compact_double(crate::types::CompactValue::double(d));
+            stack.push_compact_double(crate::types::CompactValue::double_raw(d));
             Ok(())
         }
         other => stack.push(other),
