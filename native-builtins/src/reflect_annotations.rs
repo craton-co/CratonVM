@@ -848,14 +848,21 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                 Some(Value::Int(v)) => *v as i64,
                 _ => 0,
             };
+            // Through the shared `time_unit_ordinal`, not a second copy of the
+            // read: that helper memoizes the `ordinal` field index per receiver
+            // class, and this overload is 1.00 call per expired task on
+            // `HashedWheelTimerTest`. The copy here read the name on every
+            // call, which takes the class-manager lock and walks the hierarchy
+            // comparing field-name strings.
+            //
+            // The fallback differs from the helper's and is kept: this one
+            // answers MINUTES (4) for a missing receiver, because
+            // `SpringApplicationShutdownHook`'s static `TIMEOUT` is
+            // `TimeUnit.MINUTES.toMillis(10)` during a partial boot in which
+            // the enum constant can be absent. The helper's own slot-0/2
+            // fallbacks only apply once there IS a receiver.
             let ordinal = match recv {
-                Value::Object(Some(o)) => match ctx.get_field_by_name(o, "ordinal") {
-                    Value::Int(i) => i,
-                    _ => match ctx.get_field(o, 0) {
-                        Value::Int(i) => i,
-                        _ => 4i32,
-                    },
-                },
+                Value::Object(Some(o)) => time_unit_ordinal(ctx, o),
                 _ => 4,
             };
             Ok(Some(Value::Long(convert_time_unit_to_millis(dur, ordinal))))

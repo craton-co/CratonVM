@@ -8692,6 +8692,61 @@ impl AtomicIntFieldLayout {
     }
 }
 
+/// `AtomicLong.value`'s addresses — the 64-bit twin of
+/// [`AtomicIntFieldLayout`], and different from it in exactly two places: the
+/// legacy payload sits at [`cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET`]
+/// rather than the 32-bit one, and a compact storage width that is not exactly
+/// **8** bytes is refused.
+///
+/// Both differences are load-bearing rather than cosmetic. The emitted
+/// instruction is a REX.W `LOCK XADD`, so pointing it at the 32-bit payload
+/// offset would read four bytes of the cell's TAG along with half the value,
+/// and admitting a narrower storage width would have it write past the field.
+/// Refusing returns `None` and the call simply keeps its native dispatch.
+pub struct AtomicLongFieldLayout {
+    /// Abstract field slot index of `AtomicLong.value`.
+    pub value_field_index: usize,
+    /// Byte offset of `value`'s 8-byte payload in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 8-byte payload in a LEGACY instance.
+    pub value_legacy_offset: i32,
+    /// `ObjectHeader` class id of `java/util/concurrent/atomic/AtomicLong`,
+    /// used as the receiver guard. `AtomicLong` is not final and its methods
+    /// are not final, so a subclass could override them — the guard is what
+    /// makes inlining the field access sound, and a mismatch falls back to
+    /// ordinary dispatch, which runs the override.
+    pub class_id: u32,
+}
+
+impl AtomicLongFieldLayout {
+    pub fn new(value_field_index: usize, class_id: u32) -> Option<Self> {
+        if class_id == 0 {
+            return None;
+        }
+        // LEGACY: uniform 16-byte `Value` cell, 8-byte long payload inside it.
+        let legacy = (cratonvm_types::HEADER_SIZE
+            + value_field_index * cratonvm_types::SLOT_SIZE) as i32
+            + cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32;
+        let mut compact = legacy;
+        if cratonvm_types::compact_ref_fields_enabled() {
+            if let Some((body_off, storage)) =
+                cratonvm_types::compact_field_storage(class_id, value_field_index)
+            {
+                if storage.size_runtime() != 8 {
+                    return None;
+                }
+                compact = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+            }
+        }
+        Some(Self {
+            value_field_index,
+            value_compact_offset: compact,
+            value_legacy_offset: legacy,
+            class_id,
+        })
+    }
+}
+
 impl StringFieldLayout {
     /// Build a layout from raw field indices, precomputing, for each of
     /// `value`/`coder`/`hash`, the two byte offsets the codegen needs: the
@@ -9072,6 +9127,41 @@ pub enum JitIntrinsic {
     AtomicIntGetAndAdd,        // getAndAdd(I)I       -> old
     AtomicIntAddAndGet,        // addAndGet(I)I       -> old + delta
     // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+    // The 64-bit twin of the region above, emitted as one REX.W `LOCK XADD`.
+    //
+    // It exists because the `AtomicInteger` ladder was measured and its
+    // `AtomicLong` counterpart was not written: the exact census
+    // (`--nojit CRATONVM_DISABLE_INTRINSICS=1`) of
+    // `HashedWheelTimerTest#testExecutionOnTime` puts
+    // `AtomicLong.incrementAndGet` and `.decrementAndGet` at **1.00 call per
+    // expired task each**, and netty's `HashedWheelTimer.pendingTimeouts` is
+    // exactly that pair — one increment per `newTimeout`, one decrement per
+    // expiry. Each was a full native dispatch, measured at ~154 ns/call on
+    // this branch against the ~1 ns an uncontended `lock xadd` costs.
+    //
+    // Soundness rests on the same three things the 32-bit region names, and
+    // each was re-checked for this class rather than assumed:
+    //   * the registered natives keep their state in the SAME memory —
+    //     `native_atomic_long_get` is `get_field_volatile(this, 0)` and
+    //     `native_atomic_long_increment_and_get` is
+    //     `atomic_fetch_add_long(this, 0, 1)` — so an interpreted caller and a
+    //     compiled caller still agree on one location;
+    //   * the receiver class-id guard, because `AtomicLong` is not final;
+    //   * the per-object COMPACT/LEGACY branch.
+    AtomicLongGetAndIncrement, // getAndIncrement()J  -> old
+    /// `get()J` / `getPlain()J` / `getAcquire()J` — a plain aligned 64-bit
+    /// load. On x86-64 TSO an aligned `MOV` IS a correct volatile/acquire load
+    /// and is atomic at 8 bytes, so no fence and no `LOCK` is owed. (`set` is
+    /// deliberately NOT here: a volatile STORE owes StoreLoad.)
+    AtomicLongGet,
+    AtomicLongGetAndDecrement, // getAndDecrement()J  -> old
+    AtomicLongIncrementAndGet, // incrementAndGet()J  -> old + 1
+    AtomicLongDecrementAndGet, // decrementAndGet()J  -> old - 1
+    AtomicLongGetAndAdd,       // getAndAdd(J)J       -> old
+    AtomicLongAddAndGet,       // addAndGet(J)J       -> old + delta
+    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
     /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
@@ -11430,6 +11520,95 @@ pub fn try_resolve_atomic_intrinsic(
         );
     }
     Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+}
+
+/// Call sites the `AtomicLong` intrinsic has claimed this process.
+///
+/// The acceptance criterion, and not the ns/op: the 32-bit twin's own doc says
+/// "a perf claim about this family is not believable without checking that this
+/// is non-zero — the intrinsic answering the same values as the native it
+/// replaced proves nothing about whether it actually ran."
+/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each site.
+pub static ATOMIC_LONG_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC=1` — keep every `AtomicLong` RMW call
+/// on ordinary native dispatch.
+///
+/// Separate from `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` on purpose: the two
+/// families are emitted by different code and a bisect that cannot tell them
+/// apart is not a bisect. Default off.
+fn atomic_long_intrinsic_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC").is_some()
+    })
+}
+
+/// Matcher for the ATOMIC_LONG region — the 64-bit twin of
+/// [`try_resolve_atomic_intrinsic`], with the same contract: returns the
+/// intrinsic entry, the parameter count excluding the receiver, the return
+/// type tag, and the receiver class id to guard on.
+///
+/// The guard is ALWAYS emitted for this family, for the same reason:
+/// `AtomicLong` is not final, so a receiver could be a subclass that overrides
+/// `incrementAndGet`, and only an exact class-id match may take the inline
+/// path.
+///
+/// `num_params` is 1 for `getAndAdd(J)J` / `addAndGet(J)J` and not 2: this
+/// JIT's operand stack is one 64-bit slot per value, not JVMS category-2
+/// pairs — the same counting `LONG_VALUE_OF_DIRECT_FN`'s bind documents.
+pub fn try_resolve_atomic_long_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if class != "java/util/concurrent/atomic/AtomicLong" {
+        return None;
+    }
+    if atomic_long_intrinsic_disabled() {
+        return None;
+    }
+    // Derived from the SITE's declared class id and field slot 0 — the same
+    // two inputs the codegen re-derives it from, and the same slot the
+    // registered natives address (`get_field_volatile(this, 0)` /
+    // `atomic_fetch_add_long(this, 0, ..)`). `AtomicLongFieldLayout::new`
+    // returns `None` when the compact storage width is not exactly 8 bytes, so
+    // a layout this 64-bit `LOCK XADD` could not address never reaches codegen.
+    let layout = AtomicLongFieldLayout::new(0, guard_class_id)?;
+    if layout.class_id == 0 {
+        return None;
+    }
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+    let hit: Option<(JitIntrinsic, usize)> = match (name, descriptor) {
+        ("get", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getPlain", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getAcquire", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("longValue", "()J") => Some((JitIntrinsic::AtomicLongGet, 0)),
+        ("getAndIncrement", "()J") => Some((JitIntrinsic::AtomicLongGetAndIncrement, 0)),
+        ("getAndDecrement", "()J") => Some((JitIntrinsic::AtomicLongGetAndDecrement, 0)),
+        ("incrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongIncrementAndGet, 0)),
+        ("decrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongDecrementAndGet, 0)),
+        ("getAndAdd", "(J)J") => Some((JitIntrinsic::AtomicLongGetAndAdd, 1)),
+        ("addAndGet", "(J)J") => Some((JitIntrinsic::AtomicLongAddAndGet, 1)),
+        _ => None,
+    };
+    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
+    let (intrinsic, num_params) = hit?;
+    ATOMIC_LONG_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+        eprintln!(
+            "[atomic-long-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
+            class,
+            name,
+            descriptor,
+            layout.class_id,
+            layout.value_compact_offset,
+            layout.value_legacy_offset,
+        );
+    }
+    Some((intrinsic.as_entry(), num_params, b'J', layout.class_id))
 }
 
 #[cfg(test)]
@@ -15283,11 +15462,24 @@ fn plan_scalar_replacement(
     // object, which the materializer has always supported (it walks the field
     // graph and allocates a shell per distinct id). So the pin only bites when
     // this allocation cannot be described at all.
-    if descriptor_pinned.contains(&new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    // Engagement census. These two gates are the ONLY thing
+    // `CRATONVM_SCALAR_DEOPT` changes, so they are the only place that can say
+    // whether the flag reached a workload — see
+    // `cratonvm_types::scalar_deopt_census`. Counted once per allocation
+    // (`descriptor_decided`), not once per gate: an allocation can be both
+    // pinned by an earlier round and named by a snapshot, and counting it twice
+    // would inflate an engagement number a soak is about to reason from.
+    let mut descriptor_rescued = false;
+    let mut descriptor_blocked = false;
+    if descriptor_pinned.contains(&new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
     }
     if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
@@ -15295,11 +15487,23 @@ fn plan_scalar_replacement(
         // to silently retarget it.
         elide_alloc = false;
     }
-    if ea_snapshot_names(ir_graph, new_node)
-        && !(deopt_descriptor_available
-            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
-    {
-        elide_alloc = false;
+    if ea_snapshot_names(ir_graph, new_node) {
+        if deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
+        {
+            descriptor_rescued = true;
+        } else {
+            descriptor_blocked = true;
+            elide_alloc = false;
+        }
+    }
+    // BLOCKED wins over RESCUED: an allocation that hit both gates and failed
+    // either one is kept, so reporting it as engagement would be a lie in the
+    // direction that flatters the flag.
+    if descriptor_blocked {
+        cratonvm_types::scalar_deopt_census::note_blocked();
+    } else if descriptor_rescued {
+        cratonvm_types::scalar_deopt_census::note_rescued();
     }
     if !ea_splice_feasible(ir_graph, new_node)
         || stores.iter().any(|&s| !ea_splice_feasible(ir_graph, s))
@@ -20273,6 +20477,8 @@ fn try_compile_inner(
                         let is_intrinsic_site = try_resolve_intrinsic(&cn, &mn, &desc).is_some()
                             || try_resolve_atomic_intrinsic(&cn, &mn, &desc, 0).is_some()
                             || cn == "java/util/concurrent/atomic/AtomicInteger"
+                            || try_resolve_atomic_long_intrinsic(&cn, &mn, &desc, 0).is_some()
+                            || cn == "java/util/concurrent/atomic/AtomicLong"
                             || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
                             || cn == "java/lang/String"
                             // FFM element accessors. Registered by their OWN
@@ -23641,6 +23847,37 @@ fn try_compile_inner(
                     continue;
                 }
                 // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
+                // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+                // The 64-bit twin, on exactly the same terms: registered only
+                // with a resolved receiver class id, because `AtomicLong` is
+                // not final and a subclass override must keep ordinary
+                // dispatch.
+                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
+                    .and_then(|r| r(cp_idx))
+                    .and_then(|cid| {
+                        try_resolve_atomic_long_intrinsic(
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                            cid,
+                        )
+                    })
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                            guard_class_id,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
                 // Then the `java/lang/String` intrinsics — registered only
                 // when the String field layout has resolved (and carries a

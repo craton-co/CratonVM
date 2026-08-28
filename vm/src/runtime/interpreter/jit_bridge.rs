@@ -1425,6 +1425,51 @@ pub(super) fn compile_osr_artifact(
                     }
                     // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
+                    // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+                    // The OSR door's copy of the 64-bit family. It has to be
+                    // here as well as in `jit::try_compile`: an intrinsic
+                    // registered in one compile door is INERT in the others,
+                    // which is the failure this file's own
+                    // `Thread.currentThread` and String binds each record once.
+                    //
+                    // It matters most exactly where OSR matters: a
+                    // single-invocation method whose whole life is one hot
+                    // loop. `HashedWheelTimer`'s worker is that shape, and its
+                    // `pendingTimeouts` is an `AtomicLong` incremented once per
+                    // scheduled timeout and decremented once per expiry.
+                    if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
+                    {
+                        let atomic_long_cid = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
+                            .map(|id| id.as_u32());
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_long_cid.and_then(|cid| {
+                                cratonvm_jit::try_resolve_atomic_long_intrinsic(
+                                    &target_class,
+                                    &mn,
+                                    &desc,
+                                    cid,
+                                )
+                            })
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    // ===== INTRINSIC REGION END: ATOMIC_LONG =====
+
                     // `Integer.intValue()` thin direct call — `Integer` is
                     // `final`, so a site declared against it is statically
                     // monomorphic (guard-free); the helper handles the
@@ -3842,6 +3887,40 @@ pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
         )
 }
 
+/// # A negative result, kept so it is not re-derived
+///
+/// `AbstractOwnableSynchronizer.setExclusiveOwnerThread` looks like it belongs
+/// beside the two exemptions above, and the argument for it is sound as far as
+/// it goes. The seal is not a tier-up delay — `jit_method_calls_native_shadowed`
+/// memoizes its verdict through `mark_jit_bail_listed`, so a method containing
+/// such a call is JIT-denied for the lifetime of the process — and three
+/// methods on the JDK's uncontended `ReentrantLock` path contain one:
+/// `ReentrantLock$NonfairSync.initialTryLock`, `.tryAcquire` and
+/// `ReentrantLock$Sync.tryRelease`. That is every `LinkedBlockingQueue.add`
+/// and `.take`. The seal's own reason ("a compiled direct call bypasses the
+/// interpreter's native-vs-bytecode decision") does not apply to that triple:
+/// the callee is never compiled (`registered_native_will_run` refuses it),
+/// never spliced (`resolve_inline_site_from` refuses any site whose selected
+/// method's declaring class carries a registered native, unconditionally), and
+/// cannot be direct-bound (the call is `invokevirtual`, and
+/// `pending_callee_compiles` admits kinds 1 and 3 only).
+///
+/// It was implemented on 2026-08-27, and it is not here because it **bought
+/// nothing measurable**. The exemption engaged — `aqs-owner-exempt=4`, and the
+/// skip-seal census went `calls-native-shadowed-method=36` to `32`, so four
+/// methods really did stop being sealed — and then:
+///
+/// | | seal lifted | seal kept |
+/// |---|---:|---:|
+/// | `AqsAttributionProbe` ReentrantLock lock+unlock | 2349 ns | 2336 ns |
+/// | `HwtScaleProbe` n=100 000 drain | 767 / 718 ms | 745 / 647 ms |
+///
+/// One binary, the switch the only variable, interleaved. Unsealing a method
+/// is not the same as compiling it, and nothing here says those four ever
+/// reached a tier — that is the question anyone reviving this should answer
+/// FIRST, with a compile counter, rather than by re-writing the exemption.
+/// A relaxation that widens what the JIT will compile is not free of risk, and
+/// this one has no measurement to pay for it.
 pub(super) fn jit_invoke_targets_native_shadow(
 
     shared: &SharedVm,
@@ -4201,13 +4280,23 @@ pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
 /// Does the resolved field's own descriptor agree with the one the constant
 /// pool's `NameAndType` spells for this site?
 ///
-/// # Why this has to be asked at all
+/// # Why this was asked at all
 ///
-/// JVMS §5.4.3.2 resolves a field by **name and descriptor**. This VM's field
-/// resolution — `MemberResolver::locate_field`, `ClassFile::find_own_field` and
-/// `find_field_recursive` underneath it — matches on the **name alone** and
-/// returns the first field of that name it meets walking the class, its
-/// superinterfaces and its superclass chain.
+/// **The premise below is now historical.** When this guard was written, this
+/// VM's field resolution — `MemberResolver::locate_field`,
+/// `ClassFile::find_own_field` and `find_field_recursive` underneath it —
+/// matched on the **name alone** and returned the first field of that name it
+/// met walking the class, its superinterfaces and its superclass chain, while
+/// JVMS §5.4.3.2 resolves by name **and** descriptor.
+///
+/// Resolution applies the full key since 2026-08-27, and raises
+/// `NoSuchFieldError` when the pair is absent since 2026-08-28
+/// (`CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` restores the old answer). So a
+/// disagreement can no longer arise from the resolver, and this guard should
+/// count zero forever. It is kept as the tripwire for that: a non-zero here
+/// now means the descriptor key was NOT applied on some path — the lenient
+/// lever is armed, or a caller reached `locate_field` with `descriptor: None`
+/// where it should have passed one.
 ///
 /// For the interpreter that is almost always harmless: it reads and writes a
 /// dynamically-tagged 16-byte cell, so landing on a same-named field of another
@@ -4225,10 +4314,9 @@ pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
 /// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
 ///
 /// Refusing the site is the conservative answer: the method falls back to a
-/// tier that reads the cell's own tag, so the disagreement costs compilation
-/// rather than correctness. Fixing the resolver to match on the descriptor too
-/// is the larger change this guard makes safe to defer — and the counter says
-/// whether it is ever needed.
+/// tier that reads the cell's own tag, so a disagreement costs compilation
+/// rather than correctness. That was worth keeping after the resolver was
+/// fixed, because it is cheap and it fails in the safe direction.
 ///
 /// A `desc_byte` of 0 means the resolver had no descriptor to report (an empty
 /// descriptor string); that is a missing observation, not a disagreement, so it

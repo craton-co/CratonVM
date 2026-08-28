@@ -13536,6 +13536,25 @@ pub fn register_essential_natives_with_shims(
         };
         Ok(Some(Value::Int(if interrupted { 1 } else { 0 })))
     });
+    // LEAF: the body is one `Acquire` load of THIS thread's own `interrupted`
+    // flag and, when set, one `Release` store clearing it
+    // (`NativeContextImpl::is_interrupted`). No argument to pin, nothing that
+    // allocates, blocks, safepoints or throws — `NativeMethodRegistry::set_leaf`'s
+    // four terms hold on every path, including the `false` one.
+    //
+    // Worth claiming because AQS polls it: the exact census configuration
+    // (`--nojit CRATONVM_DISABLE_INTRINSICS=1`) puts it at **1.69 calls per
+    // expired task** on `HashedWheelTimerTest#testExecutionOnTime`, third
+    // behind `Thread.currentThread` and `setExclusiveOwnerThread`. Measured
+    // from compiled code at 55.8 ns/call against HotSpot's 0.20
+    // (`probes/FunnelRungRate.java`), essentially all of it the funnel.
+    //
+    // The INSTANCE twin `isInterrupted()` above is deliberately NOT claimed:
+    // its cross-thread arm resolves the target through the registry's
+    // `java_tid_to_id` mutex, which leaf contract item 2 forbids, and it is
+    // 0.27 calls per task — a sixth of the traffic for a term that would have
+    // to be argued rather than read off the body.
+    registry.set_leaf(true);
     registry.register("java/lang/Thread", "interrupted", "()Z", |ctx, _args| {
         // Static method: read+clear the CURRENT thread's interrupt status.
         Ok(Some(Value::Int(if ctx.is_interrupted(true) {
@@ -13544,6 +13563,7 @@ pub fn register_essential_natives_with_shims(
             0
         })))
     });
+    registry.set_leaf(false);
     // getPriority / isDaemon / setDaemon: in real-JDK mode these live on
     // `Thread.holder` (a `Thread$FieldHolder`).  These natives shadow the
     // real Java methods, so they must read/write through `holder` when it
@@ -31752,11 +31772,61 @@ const CB_FIELD_BROKEN: usize = 2;
 /// of `N` seconds — so `CountDownLatch.await(10, SECONDS)` returned `false`
 /// almost immediately (ES `RestClient*IntegTests` async assertions). Prefer the
 /// named `ordinal` field; fall back to slot 0 for the synthetic test object.
+/// The `ordinal` of a `TimeUnit` constant, with the field index memoized per
+/// receiver class.
+///
+/// `get_field_by_name` takes the class-manager read lock and walks the
+/// hierarchy comparing field-name strings on EVERY call — the same cost the
+/// `setExclusiveOwnerThread` native memoized away for the same reason, and
+/// this native is on the same path: the exact census
+/// (`--nojit CRATONVM_DISABLE_INTRINSICS=1`) puts `toNanos` + `toMillis` at
+/// **2.00 calls per expired task** on `HashedWheelTimerTest`, because
+/// `HashedWheelTimer.newTimeout` converts the delay and every fired task
+/// converts the elapsed nanos back. Measured as a pair from compiled code at
+/// 258 ns against HotSpot's 2.0 (`probes/FunnelRungRate.java`).
+///
+/// The index is a per-class constant, so the memo is keyed on the receiver's
+/// class id. `java/util/concurrent/TimeUnit` is one class with seven
+/// constants and no constant bodies in JDK 25, so two slots is already
+/// generous; the second exists for an image that gives the constants their own
+/// subclasses. A miss falls back to the resolving path, so an unexpected
+/// layout is slow rather than wrong, and the pre-existing slot-0 fallback is
+/// untouched. Class redefinition needs no invalidation: it allocates a NEW
+/// `ClassId`, so a stale entry can never be consulted for the redefined class.
 fn time_unit_ordinal(ctx: &dyn NativeContext, u: ObjectRef) -> i32 {
-    match ctx.get_field_by_name(u, "ordinal") {
-        Value::Int(o) => o,
-        _ => ctx.get_field(u, 0).as_int().unwrap_or(2),
+    const MEMO_SLOTS: usize = 2;
+    thread_local! {
+        static ORDINAL_FIELD_INDEX: std::cell::RefCell<[(u32, u32); MEMO_SLOTS]> =
+            const { std::cell::RefCell::new([(u32::MAX, 0); MEMO_SLOTS]) };
     }
+    let class_id = ctx.class_id_of_object(u);
+    let raw_cid = class_id.as_u32();
+    let cached = ORDINAL_FIELD_INDEX.with(|memo| {
+        memo.borrow()
+            .iter()
+            .find(|(cid, _)| *cid == raw_cid)
+            .map(|(_, index)| *index as usize)
+    });
+    if let Some(index) = cached {
+        if let Some(o) = ctx.get_field(u, index).as_int() {
+            return o;
+        }
+    }
+    if let Some(index) = ctx.resolve_field_index_by_class_id(class_id, "ordinal") {
+        if let Some(o) = ctx.get_field(u, index).as_int() {
+            ORDINAL_FIELD_INDEX.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                // Take a free slot, else evict slot 0. The policy does not need
+                // to be clever at this size, but the table must not be able to
+                // grow without bound.
+                let victim = memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                // Cast: field counts are far below `u32::MAX`.
+                memo[victim] = (raw_cid, index as u32);
+            });
+            return o;
+        }
+    }
+    ctx.get_field(u, 0).as_int().unwrap_or(2)
 }
 
 fn time_unit_nanos_per(ordinal: i32) -> i128 {
