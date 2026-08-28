@@ -9230,67 +9230,26 @@ fn fmt_line_separator_units() -> Vec<u16> {
 /// than reusing `util_time`'s equivalents: that module sits behind the
 /// `synthetic-jdk` feature, but `String.format`/`Formatter` (this file) is a
 /// core native available regardless of feature flags.
-const TEMPORAL_DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+use crate::civil_date;
 
 fn temporal_is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    civil_date::is_leap_year(year)
 }
 
 fn temporal_days_in_month(year: i32, month: i32) -> i32 {
-    if month == 2 && temporal_is_leap_year(year) {
-        29
-    } else {
-        TEMPORAL_DAYS_IN_MONTH[(month - 1) as usize]
-    }
+    civil_date::days_in_month(year, month)
 }
 
 fn temporal_day_of_year(year: i32, month: i32, day: i32) -> i32 {
-    let mut doy = day;
-    for m in 1..month {
-        doy += temporal_days_in_month(year, m);
-    }
-    doy
+    civil_date::day_of_year(year, month, day)
 }
 
 fn temporal_to_epoch_day(year: i32, month: i32, day: i32) -> i64 {
-    let y = year as i64;
-    let mut total: i64 = 365 * y + y / 4 - y / 100 + y / 400;
-    for m in 1..month {
-        total += temporal_days_in_month(year, m) as i64;
-    }
-    total += day as i64;
-    total - 719_528 // days from year 0 to 1970-01-01
+    civil_date::to_epoch_day(year, month, day)
 }
 
 fn temporal_from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
-    let abs_day = epoch_day + 719_528;
-    let mut y = ((abs_day * 400) / 146_097) as i32;
-    loop {
-        let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
-        if year_start >= abs_day {
-            y -= 1;
-        } else {
-            let next_start = 365 * (y + 1) as i64 + (y + 1) as i64 / 4 - (y + 1) as i64 / 100
-                + (y + 1) as i64 / 400;
-            if next_start < abs_day {
-                y += 1;
-            } else {
-                break;
-            }
-        }
-    }
-    let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
-    let mut remaining = (abs_day - year_start) as i32;
-    let mut month = 1;
-    loop {
-        let dim = temporal_days_in_month(y, month);
-        if remaining <= dim {
-            break;
-        }
-        remaining -= dim;
-        month += 1;
-    }
-    (y, month, remaining)
+    civil_date::from_epoch_day(epoch_day)
 }
 
 /// Extract the wall-clock `(year, month[1-12], day, hour[0-23], minute,
