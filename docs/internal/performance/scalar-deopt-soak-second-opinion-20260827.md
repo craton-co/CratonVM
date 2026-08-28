@@ -1,43 +1,45 @@
-# `CRATONVM_SCALAR_DEOPT`: a second, independent soak — same verdict, one new blocker
+# `CRATONVM_SCALAR_DEOPT`: a second, independent soak — same verdict
 
 `scalar-deopt-gauntlet-soak-20260827.md` (netty + hibernate) and this one ran in
 parallel without knowing about each other. **They agree on the verdict and on
 the reason** — the flag is green everywhere and the green is vacuous, because
 the feature never executes. That page is the record; this one carries only what
-it does not, and narrows one word in it.
+it does not.
 
-## New: the designated pre-flip gate is RED
+It also, in an earlier revision, raised an objection to that record and got it
+wrong. The objection and its withdrawal are both kept below rather than edited
+away.
 
-`docs/feature-designs/activate-ir-optimizer.md` names the differential harness as
-the gate for this class of change — *"Every widening shipped behind its own flag
-with a differential test"*. It was not run. It fails:
+## The gate nobody had run — RED, then diagnosed, and it was the harness
 
-```
-$ CRATONVM_SCALAR_DEOPT=1 cargo test -p cratonvm-jit --test ir_vs_singlepass
----- ir_elidable_trivial_init_on_fresh_new_is_still_elided ----
-assertion `left == right` failed: the field written is the field read back
-  left: 969312034704        <- varies per run; an address
- right: 11
-test result: FAILED. 141 passed; 1 failed
-```
+`docs/feature-designs/activate-ir-optimizer.md` names the differential harness
+as the gate for this class of change — *"Every widening shipped behind its own
+flag with a differential test"*. It had not been run for this flag. It failed:
+`int f(int n)` returned a heap address instead of `n`.
 
-`int f(int n) { Corpus c = new Corpus(); c.f0 = n; return c.f0; }` returns a
-heap-address-shaped value. Still red on `d967c2515`, i.e. after the other soak
-merged. Full write-up — including the control that isolates the elision as the
-trigger, and the end-to-end run that does NOT reproduce it — in
-`docs/known-issues/jit/scalar-deopt-elision-returns-the-object-in-the-differential-harness-20260827.md`.
+**Resolved 2026-08-28, and the compiler was never wrong.** The harness passed
+the VM context to a body that had stopped wanting one, shifting every argument
+by a register — and what made the body stop wanting one was escape analysis
+eliding the last `Op::New`, i.e. the flag doing its job.
+`scalar-deopt-elision-returns-the-object-in-the-differential-harness-FIXED-20260828.md`
+has the full account. The harness is now 142/142 in both arms, and
+`cargo test -p cratonvm-jit --lib` gives the same result either way.
 
-### The word this narrows
+### The correction this page made, WITHDRAWN
 
-That record concludes *"every deopt takes the whole-method re-run it always did
-— which is also why the flag is safe."* The reasoning is right and the scope is
-one step too wide. It establishes that no descriptor is ever CONSUMED, so no
-resume can be misled by one. It does not cover the compiler emitting a wrong
-value in a graph where the elision does happen — which is what the differential
-catches, and which needs no deopt at all to hurt.
+An earlier revision of this page objected to
+`scalar-deopt-gauntlet-soak-20260827.md`'s conclusion — *"every deopt takes the
+whole-method re-run it always did, which is also why the flag is safe"* — on the
+grounds that it did not cover a compiler emitting a wrong value where the
+elision does happen.
 
-"Safe **because nothing it produces is ever read**" is the supported claim;
-"safe" unqualified is not, while that test is red.
+**There is no such wrong value.** That objection rested entirely on the
+differential failure, and the differential failure was the harness's calling
+convention. The other record's claim stands as written; this page's narrowing of
+it was wrong and is withdrawn rather than quietly edited, because it was
+published against another session's work.
+
+The verdict on the flip is unchanged and rests on the two reasons below.
 
 ## New: Tomcat, 651 classes, four arms
 
