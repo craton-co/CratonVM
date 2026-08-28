@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-501 tokens.
+502 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -289,6 +289,7 @@ export inherited from a parent shell.
 | `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
 | `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
+| `zgc-target` | `CRATONVM_DBG_ZGC_TARGET` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
 | `jit-field-sites` | `CRATONVM_DBG_JIT_FIELD_SITES` |
 | `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
@@ -817,7 +818,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-77 tokens.
+78 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -857,6 +858,7 @@ export inherited from a parent shell.
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
 | `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `targeted-compaction` | `CRATONVM_ZGC_TARGETED_COMPACTION` |
 | `band-map-liveness` | `CRATONVM_GC_NO_BAND_MAP_LIVENESS` |
 | `cm-id-pairing` | `CRATONVM_GC_NO_CM_ID_PAIRING` |
 | `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |

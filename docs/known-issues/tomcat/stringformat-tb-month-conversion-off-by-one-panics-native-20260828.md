@@ -50,7 +50,7 @@ look up the month for this particular `timestamp`.
 - The "index == length" shape is the same signature this session's testing
   has already found once elsewhere today (the ecj `StackMapFrameCodeStream`
   bug, now FIXED — see
-  `docs/internal/fixed-suite-bugs/ecj-stackmapframe-aioobe-was-an-int-keyed-hashmap-that-never-reported-a-change-FIXED-20260827.md`)
+  `fixed-suite-bugs/ecj-stackmapframe-aioobe-was-an-int-keyed-hashmap-that-never-reported-a-change-FIXED-20260827.md`)
   — worth checking whether this is the SAME underlying mechanism (some shared
   off-by-one helper, e.g. an int-keyed collection or index-computation
   utility both native paths route through) before assuming it's unrelated.
