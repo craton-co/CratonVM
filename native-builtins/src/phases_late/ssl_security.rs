@@ -5017,6 +5017,33 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // NOT CONNECTED is a `SocketException`, before any handshake.
+            //
+            // MEASURED in BOTH modes against HotSpot 25.0.3+9
+            // (`probes/Phase1Sweep.java`, the P1-C lane):
+            //
+            //   f.createSocket();  s.getOutputStream()
+            //     HotSpot   SocketException      CratonVM  no-throw
+            //
+            // The probe's own CONTROL -- the same question on a plain
+            // `java.net.Socket` -- already agreed, so this is SSL-specific:
+            // `net_phase_e.rs`'s `java/net/Socket` pair screens `stream_id < 0`
+            // and these two did not. The handshake starter was happy to mint an
+            // id for a socket that had never been connected, so the caller got a
+            // live-looking stream over nothing and the failure surfaced later,
+            // somewhere else.
+            //
+            // `new13_socket_ever_connected` is the SAME predicate this file's
+            // `isConnected` native answers with, so the two cannot disagree --
+            // and `isConnected` already matched HotSpot on this receiver, which
+            // is what says the information was present and simply unread.
+            if !new13_socket_ever_connected(ctx, this) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/net/SocketException",
+                    "Socket is not connected",
+                ));
+            }
             // Real JSSE: the first I/O call implicitly starts the handshake
             // if one hasn't run yet — this socket may still be pending (see
             // `createSocket(Socket wrapped, ...)`'s doc comment).
@@ -5072,6 +5099,33 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // NOT CONNECTED is a `SocketException`, before any handshake.
+            //
+            // MEASURED in BOTH modes against HotSpot 25.0.3+9
+            // (`probes/Phase1Sweep.java`, the P1-C lane):
+            //
+            //   f.createSocket();  s.getOutputStream()
+            //     HotSpot   SocketException      CratonVM  no-throw
+            //
+            // The probe's own CONTROL -- the same question on a plain
+            // `java.net.Socket` -- already agreed, so this is SSL-specific:
+            // `net_phase_e.rs`'s `java/net/Socket` pair screens `stream_id < 0`
+            // and these two did not. The handshake starter was happy to mint an
+            // id for a socket that had never been connected, so the caller got a
+            // live-looking stream over nothing and the failure surfaced later,
+            // somewhere else.
+            //
+            // `new13_socket_ever_connected` is the SAME predicate this file's
+            // `isConnected` native answers with, so the two cannot disagree --
+            // and `isConnected` already matched HotSpot on this receiver, which
+            // is what says the information was present and simply unread.
+            if !new13_socket_ever_connected(ctx, this) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/net/SocketException",
+                    "Socket is not connected",
+                ));
+            }
             let fd_id = ensure_layered_handshake_started(ctx, this)?;
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
