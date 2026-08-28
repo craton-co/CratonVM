@@ -22,6 +22,59 @@ pub static UNRESOLVED_FIELD_SITE_BAILS: std::sync::atomic::AtomicU64 =
 /// no entry in the resolved field tables, so this backend has no slot index and
 /// no type tag for it. Returns `false`, the walker's "stay interpreted" answer.
 ///
+/// `CRATONVM_DBG_JIT_FIELD_SITES=<method-key substring>` — print every field
+/// site this backend emits for a matching method: the pc, the slot index it
+/// resolved to, and the type tag it will lower with.
+///
+/// A wrong-slot store leaves no trace in the generated code, which is why the
+/// punned `SQLChar.rawData` cell could be caught at the helper door
+/// (`jit_putfield_int(this, 1, Int(1))` on a slot declared `[C`) without the
+/// SITE that emitted it ever being nameable. The runtime report cannot name it
+/// — a raw JIT-to-JIT direct call sets no callee identity, and there is no
+/// compiled return address for the stack walk to resolve. This says what the
+/// COMPILER decided, per method and per pc, which is the same question asked
+/// where the answer is still attributable.
+///
+/// Compare the output against `javap -c` on the same method: a line whose
+/// `slot=` disagrees with the bytecode's field is the defect, and one whose
+/// `tag=` disagrees is the punning half of it.
+pub(super) fn dbg_field_sites() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_FIELD_SITES").ok())
+        .as_deref()
+}
+
+/// Emit one `[jit-field-site]` line when the method matches the filter.
+/// Emit one `[jit-emit-direct]` line per raw direct CALL this backend bakes.
+///
+/// The bind-time tracer (`CRATONVM_DBG_JIT_DIRECT_BINDS`) sees only the one
+/// bind path it was added to. This sees the EMITTER, which is the thing that
+/// actually puts an address in the code -- and the set it prints, compared
+/// against `_direct_callee_entries`, is what says whether that address is
+/// kept alive and invalidated with its callee.
+pub(super) fn note_emit_direct(method_key: &str, pc: usize, entry: usize) {
+    let Some(filter) = dbg_field_sites() else {
+        return;
+    };
+    if !method_key.contains(filter) {
+        return;
+    }
+    eprintln!("[jit-emit-direct] caller={method_key} pc={pc} entry={entry:#x}");
+}
+
+pub(super) fn note_field_site(method_key: &str, what: &str, pc: usize, slot: usize, tag: u8) {
+    let Some(filter) = dbg_field_sites() else {
+        return;
+    };
+    if !method_key.contains(filter) {
+        return;
+    }
+    eprintln!(
+        "[jit-field-site] {what} method={method_key} pc={pc} slot={slot} tag={}",
+        tag as char
+    );
+}
+
 /// # Why a refusal and not a default
 ///
 /// These four sites each used to substitute `(pc, 0, b'I')` — **slot 0, tagged
@@ -5256,6 +5309,13 @@ impl Compiler {
                                 (pc, 0, b'I')
                             }
                         };
+                        note_field_site(
+                            &self.method_key,
+                            "putfield/scalar",
+                            pc,
+                            field_index,
+                            b'?',
+                        );
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -5286,6 +5346,7 @@ impl Compiler {
                                 (pc, 0, b'I')
                             }
                         };
+                        note_field_site(&self.method_key, "putfield", pc, field_index, type_tag);
                         let receiver_mark_index = self.stack_oop_marks.len().checked_sub(2);
                         let receiver_is_trusted_oop = !self.method_key.is_empty()
                             && self.stack_oop_marks_exact
@@ -5648,6 +5709,7 @@ impl Compiler {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self.direct_calls_idx.get(&pc).map(|&i| {
                         let dc = &self.direct_calls[i].1;
+                        note_emit_direct(&self.method_key, pc, dc.entry);
                         (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
                     });
 
@@ -8470,6 +8532,7 @@ impl Compiler {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let direct = self.direct_calls_idx.get(&pc).map(|&i| {
                         let dc = &self.direct_calls[i].1;
+                        note_emit_direct(&self.method_key, pc, dc.entry);
                         (
                             dc.entry,
                             dc.needs_context,
@@ -8976,6 +9039,159 @@ impl Compiler {
                             }
                         }
                         // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
+                        // `AtomicLong`, emitted as ONE REX.W `LOCK XADD
+                        // [value], RCX`. Structurally identical to the 32-bit
+                        // region above -- same null check, same exact class-id
+                        // guard, same per-object COMPACT/LEGACY branch, same
+                        // deopt stub for every uncertain case -- and different
+                        // only in operand width.
+                        //
+                        // The width differences are the whole risk surface, so
+                        // they are spelled out:
+                        //   * every access carries REX.W (0x48), so it reads
+                        //     and writes 8 bytes;
+                        //   * the layout's LEGACY offset is the 64-bit payload
+                        //     offset inside the `Value` cell, not the 32-bit
+                        //     one, and a compact storage width other than 8 is
+                        //     refused by `AtomicLongFieldLayout::new`;
+                        //   * the delta immediate is `MOV RDX, imm32`
+                        //     sign-extended, which is exact for the only
+                        //     immediates this region uses, +1 and -1;
+                        //   * no `MOVSXD` at the end -- the value is already
+                        //     64-bit in RCX, and sign-extending it would be
+                        //     both wrong and unnecessary.
+                        //
+                        // An aligned 8-byte `MOV` is atomic on x86-64 and is a
+                        // correct volatile/acquire load, so the `get` arm owes
+                        // no `LOCK` and no fence.
+                        if !intrinsic_handled {
+                            let is_load =
+                                callee_entry == crate::JitIntrinsic::AtomicLongGet.as_entry();
+                            // (delta_imm, return_post_add, delta_is_arg)
+                            let plan: Option<(i32, bool, bool)> = if is_load {
+                                Some((0, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongGetAndIncrement.as_entry()
+                            {
+                                Some((1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongGetAndDecrement.as_entry()
+                            {
+                                Some((-1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongIncrementAndGet.as_entry()
+                            {
+                                Some((1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongDecrementAndGet.as_entry()
+                            {
+                                Some((-1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongGetAndAdd.as_entry()
+                            {
+                                Some((0, false, true))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicLongAddAndGet.as_entry()
+                            {
+                                Some((0, true, true))
+                            } else {
+                                None
+                            };
+                            if let Some((delta_imm, return_post_add, delta_is_arg)) = plan {
+                                // Recomputed from the same two inputs the
+                                // matcher used; `None` cannot happen for a
+                                // registered site, and bailing keeps the plain
+                                // direct-call path rather than emitting a CALL
+                                // to an intrinsic sentinel.
+                                if let Some(layout) =
+                                    crate::AtomicLongFieldLayout::new(0, guard_class_id)
+                                {
+                                    self.flush_scratch_registers();
+                                    if crate::deopt_real_enabled() {
+                                        self.snapshot_pre_intrinsic_call(
+                                            pc,
+                                            crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                        );
+                                    }
+                                    let mut bail: Vec<usize> = Vec::new();
+                                    // Operands: delta (if any) is shallower,
+                                    // the receiver is deepest.
+                                    let delta_slot =
+                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    // RAX = receiver; null -> deopt.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // Exact receiver class guard:
+                                    // CMP DWORD [RAX + 0], guard_class_id ; JNE
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    // RDX = delta (kept for the *AndGet fixup,
+                                    // since XADD overwrites its source with the
+                                    // pre-add value).
+                                    if !is_load {
+                                        match delta_slot {
+                                            Some(slot) => self.load_slot_to_reg(RDX, slot),
+                                            None => {
+                                                // MOV RDX, imm32 (sign-extended)
+                                                self.buf.emit(&[0x48, 0xC7, 0xC2]);
+                                                self.buf.emit(&delta_imm.to_le_bytes());
+                                            }
+                                        }
+                                        self.buf.emit(&[0x48, 0x89, 0xD1]); // MOV RCX, RDX
+                                    }
+
+                                    // Per-object layout branch.
+                                    self.emit_test_mem8_imm8(
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                        cratonvm_types::GC_FLAG_COMPACT,
+                                    );
+                                    let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                    if is_load {
+                                        // MOV RCX, [RAX + compact]
+                                        self.buf.emit(&[0x48, 0x8B, 0x88]);
+                                        self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    } else {
+                                        // LOCK XADD [RAX + compact], RCX
+                                        self.buf.emit(&[0xF0, 0x48, 0x0F, 0xC1, 0x88]);
+                                        self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    }
+                                    let done = self.emit_jmp_rel32_patch();
+                                    self.patch_rel32_to_here(legacy);
+                                    if is_load {
+                                        // MOV RCX, [RAX + legacy]
+                                        self.buf.emit(&[0x48, 0x8B, 0x88]);
+                                        self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    } else {
+                                        // LOCK XADD [RAX + legacy], RCX
+                                        self.buf.emit(&[0xF0, 0x48, 0x0F, 0xC1, 0x88]);
+                                        self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    }
+                                    self.patch_rel32_to_here(done);
+
+                                    // RCX now holds the PRE-add value.
+                                    if return_post_add {
+                                        self.buf.emit(&[0x48, 0x01, 0xD1]); // ADD RCX, RDX
+                                    }
+                                    self.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
+                                    self.push_from_rax();
+
+                                    for p in bail {
+                                        self.deopt_stubs.push((p, pc, 6));
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):

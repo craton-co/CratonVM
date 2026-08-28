@@ -475,6 +475,92 @@ pub mod stale_remap_census {
     }
 }
 
+/// Did `CRATONVM_SCALAR_DEOPT` actually DO anything on this run?
+///
+/// The flag's whole effect is one predicate — `deopt_descriptor_available` in
+/// `jit`'s `plan_scalar_replacement`. An allocation escape analysis has already
+/// proved replaceable is DELETED when a deopt snapshot naming it can be handed
+/// a recipe, and KEPT when it cannot. Nothing else changes: the analysis, the
+/// loads it forwards and the stores it kills are identical either way.
+///
+/// So a gauntlet that reports "green with the flag on" says nothing until it
+/// also says the flag reached the workload. `rescued` is the flag's engagement
+/// count — allocations deleted that the default path keeps — and `blocked` is
+/// the same population seen from the OTHER arm, which is what makes a zero
+/// readable: `rescued=0 blocked=0` means the workload has no allocation in this
+/// shape at all and the arm proves nothing, while `rescued=0 blocked=N` would
+/// mean the flag was on and still could not describe them.
+///
+/// Reported from the `System.exit` path for the same reason
+/// [`cell_census::exit_summary`] is: a JUnit runner never reaches `vm-cli`'s
+/// normal-return arm, and a census printed there produces zero lines across a
+/// whole suite sweep.
+pub mod scalar_deopt_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RESCUED: AtomicU64 = AtomicU64::new(0);
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+    /// One allocation elided BECAUSE a deopt descriptor was available for it —
+    /// i.e. one the default path would have kept.
+    #[inline]
+    pub fn note_rescued() {
+        RESCUED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One allocation proved replaceable and kept anyway, because no deopt
+    /// descriptor was available for it. This is what the OFF arm counts.
+    #[inline]
+    pub fn note_blocked() {
+        BLOCKED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One RUNTIME reconstruction of scalar-replaced objects — a deopt that
+    /// actually had to rebuild what the compiler deleted.
+    ///
+    /// This is the engagement number that matters most, and it is a different
+    /// question from `rescued`. `rescued` says the compiler took the flag's
+    /// path; only this says the RECIPE was executed. A soak with `rescued=N`
+    /// and `materialized=0` has proved that deleting those allocations does not
+    /// break the program — it has NOT tested the descriptor that exists to put
+    /// them back, because nothing asked for them back.
+    #[inline]
+    pub fn note_materialized(n: u64) {
+        if n != 0 {
+            MATERIALIZED.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// `(rescued, blocked, materialized)`.
+    #[inline]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            RESCUED.load(Ordering::Relaxed),
+            BLOCKED.load(Ordering::Relaxed),
+            MATERIALIZED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, UNCONDITIONAL when either counter is non-zero.
+    ///
+    /// Not behind a debug flag, and deliberately: the numbers are two relaxed
+    /// atomics bumped once per scalar-replacement plan (a compile-time event,
+    /// not a per-execution one), so the cost of always having them is nil, and
+    /// the alternative — an engagement census you have to know to ask for — is
+    /// how a soak gets run without one.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (r, b, m) = totals();
+        if r == 0 && b == 0 && m == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!("[scalar-deopt] census: rescued={r} blocked={b} materialized={m}");
+        });
+    }
+}
+
 pub mod cell_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

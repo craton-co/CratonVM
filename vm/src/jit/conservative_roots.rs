@@ -4957,6 +4957,16 @@ fn remap_one_jit_frame(
 ) -> (bool, usize, usize) {
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
+        if remap_residue_dbg() {
+            eprintln!(
+                "[remap-frame] method={} NO_SP_ID_SLOT inlined={:?}",
+                cm.method_label,
+                cm.inlined_methods
+                    .iter()
+                    .map(|(c, m, d)| format!("{c}.{m}{d}"))
+                    .collect::<Vec<_>>()
+            );
+        }
         return (false, 0, 0);
     }
     let id_addr = rbp.wrapping_sub(sp_id_off as usize);
@@ -4965,26 +4975,175 @@ fn remap_one_jit_frame(
     }
     // SAFETY: aligned frame slot of a live JIT frame on this thread.
     let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
-    let Some(map) = cm.oop_maps.iter().find(|m| m.bytecode_pc == sp_id) else {
-        return (false, 0, 0);
-    };
-    let examined = map.frame_slot_offsets.len();
+    // EVERY map recorded at this bytecode pc, not the first one.
+    //
+    // `bytecode_pc` identifies the SAFEPOINT'S BCI, and one bci can carry more
+    // than one safepoint: a call-carrying inline splice emits a real call for
+    // every `invoke*` in the spliced body while `cur_bc_pc` stays pinned to the
+    // enclosing invoke's bci, so `AbstractLongAssert.<init>` spliced into
+    // `LongAssert.<init>` produces two maps under one id with different live
+    // sets. `find` took whichever was recorded first and silently left the
+    // other safepoint's slots unrewritten.
+    //
+    // The union is the fail-safe direction and the direction every other reader
+    // of this table already takes (`moving_young_frame_coverage_complete_at`
+    // and the band verifier both `filter`). Rewriting a slot that is not live
+    // at this particular safepoint can only replace a word that already equals
+    // a from-space base with that object's new base -- which is what the
+    // conservative sweep this path replaces did to every such word in the
+    // frame.
+    let mut examined = 0usize;
     let mut rewritten = 0usize;
-    for &off in &map.frame_slot_offsets {
-        // Slots are positive offsets; the value lives at `[rbp - off]`.
-        let slot_addr = rbp.wrapping_sub(off as usize);
-        if slot_addr & 0x7 != 0 {
-            continue;
-        }
-        // SAFETY: aligned frame slot of a live JIT frame on this thread.
-        let old = unsafe { (slot_addr as *const usize).read() };
-        if let Some(&new) = pointer_map.get(&old) {
-            // SAFETY: same slot, rewriting the relocated reference.
-            unsafe { (slot_addr as *mut usize).write(new) };
-            rewritten += 1;
+    let mut found = false;
+    let mut seen: [i16; 64] = [0; 64];
+    let mut seen_len = 0usize;
+    let mut coverage_complete = true;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        found = true;
+        coverage_complete &= map.moving_young_coverage_complete;
+        for &off in &map.frame_slot_offsets {
+            // Two maps at one bci overlap heavily (`this` is live at both), and
+            // rewriting a slot twice would take the already-moved value as a
+            // fresh key. The map is small and bounded, so a linear scan over
+            // what has been done is cheaper than a set; past the bound, fall
+            // through to rewriting again, which is safe because the second
+            // lookup of a to-space address misses.
+            let mut already = false;
+            for s in seen.iter().take(seen_len) {
+                if *s == off {
+                    already = true;
+                    break;
+                }
+            }
+            if already {
+                continue;
+            }
+            if seen_len < seen.len() {
+                seen[seen_len] = off;
+                seen_len += 1;
+            }
+            examined += 1;
+            // Slots are positive offsets; the value lives at `[rbp - off]`.
+            let slot_addr = rbp.wrapping_sub(off as usize);
+            if slot_addr & 0x7 != 0 {
+                continue;
+            }
+            // SAFETY: aligned frame slot of a live JIT frame on this thread.
+            let old = unsafe { (slot_addr as *const usize).read() };
+            if let Some(&new) = pointer_map.get(&old) {
+                // SAFETY: same slot, rewriting the relocated reference.
+                unsafe { (slot_addr as *mut usize).write(new) };
+                rewritten += 1;
+            }
         }
     }
+    if !found {
+        if remap_residue_dbg() {
+            eprintln!(
+                "[remap-frame] method={} sp_id={} NO_MAP_FOR_SP_ID maps={}",
+                cm.method_label,
+                sp_id,
+                cm.oop_maps.len()
+            );
+        }
+        return (false, 0, 0);
+    }
+    if remap_residue_dbg() {
+        report_remap_residue(
+            rbp,
+            cm,
+            pointer_map,
+            sp_id,
+            &seen[..seen_len],
+            rewritten,
+            coverage_complete,
+        );
+    }
     (true, examined, rewritten)
+}
+
+/// `CRATONVM_DBG=remap-residue` -- after a frame's oop map has been applied,
+/// walk the WHOLE frame band and report any aligned word that is still a KEY of
+/// the pointer map, i.e. still names a from-space address the slide moved.
+///
+/// This is the direct instrument for "which frame word did the oop map fail to
+/// name". The map-driven rewrite has already run when this fires, so every hit
+/// is a word the moving cycle left pointing at vacated memory; it prints the
+/// method, the offset from RBP, the stale value and where the object went, plus
+/// the frame's mapped slots and its coverage claim.
+///
+/// A hit is EVIDENCE, not a verdict: a compiled frame's band also holds dead
+/// spill residue, and a stale word nothing will read harms nobody. What makes
+/// it decisive is the method name beside it -- a spliced constructor listed here
+/// while its `this` is live is the shape of
+/// `known-issues/netty/longlonghashmaptest-nullpointerexception...`, and it is
+/// how that page was root-caused.
+fn remap_residue_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REMAP_RESIDUE").is_some()
+    })
+}
+
+fn report_remap_residue(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &cratonvm_types::PointerMap,
+    sp_id: u32,
+    mapped: &[i16],
+    rewritten: usize,
+    coverage_complete: bool,
+) {
+    let frame_size = cm.osr_frame_size;
+    let mut hits = 0usize;
+    let mut detail = String::new();
+    if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
+        let frame_size = frame_size as usize;
+        let lo = (rbp - frame_size + 7) & !7usize;
+        let mut addr = lo;
+        while addr + 8 <= rbp {
+            // SAFETY: aligned word inside this thread's own live JIT frame band.
+            let w = unsafe { (addr as *const usize).read() };
+            if let Some(&new) = pointer_map.get(&w) {
+                hits += 1;
+                if hits <= 12 {
+                    detail.push_str(&format!(
+                        " [off={} stale=0x{:x}->0x{:x}]",
+                        rbp - addr,
+                        w,
+                        new
+                    ));
+                }
+            }
+            addr += 8;
+        }
+    }
+    let mut mapped_desc = String::new();
+    for &off in mapped {
+        let a = rbp.wrapping_sub(off as usize);
+        let v = if a & 0x7 == 0 {
+            // SAFETY: aligned frame slot of a live JIT frame on this thread.
+            unsafe { (a as *const usize).read() }
+        } else {
+            0
+        };
+        mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
+    }
+    eprintln!(
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} mapped=[{}] rewritten={} inlined={:?} stale_words={}{}",
+        cm.method_label,
+        sp_id,
+        frame_size,
+        coverage_complete,
+        mapped_desc,
+        rewritten,
+        cm.inlined_methods
+            .iter()
+            .map(|(c, m, d)| format!("{c}.{m}{d}"))
+            .collect::<Vec<_>>(),
+        hits,
+        detail,
+    );
 }
 
 /// NEW-12: enumerate exact oops in a JIT frame using the compiled

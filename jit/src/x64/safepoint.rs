@@ -69,10 +69,14 @@ pub mod map_incomplete_cause {
     /// A reference was staged somewhere no map can name (native-ABI outgoing
     /// args, direct-call service slots, inlined-callee parameter locals).
     pub static STAGED_ARG_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
+    /// A live inline (spliced-callee) scope could not be named: its local home
+    /// sits further than `i16::MAX` from `rbp`, or its dataflow could not
+    /// classify the callee pc at all. See `Compiler::inline_oop_scopes`.
+    pub static INLINE_LOCAL_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
 
     /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
-    /// staged_unmappable)`.
-    pub fn snapshot() -> [usize; 6] {
+    /// staged_unmappable, inline_local_unmappable)`.
+    pub fn snapshot() -> [usize; 7] {
         use std::sync::atomic::Ordering::Relaxed;
         [
             MARKS_INEXACT.load(Relaxed),
@@ -81,6 +85,7 @@ pub mod map_incomplete_cause {
             LOCAL_OFF_TOO_DEEP.load(Relaxed),
             STAGED_ARG_OFF_TOO_DEEP.load(Relaxed),
             STAGED_ARG_UNMAPPABLE.load(Relaxed),
+            INLINE_LOCAL_UNMAPPABLE.load(Relaxed),
         ]
     }
 }
@@ -112,10 +117,14 @@ pub mod shadow_incomplete_cause {
     /// The push was not emitted at all (shadow gate off, helper unwired, or the
     /// prologue reserved no thread slot).
     pub static PUSH_NOT_EMITTED: AtomicUsize = AtomicUsize::new(0);
+    /// A live inline (spliced-callee) scope could not say which of its locals
+    /// hold references at the callee pc being emitted, so the splice's frame
+    /// slots cannot be published. See `Compiler::inline_oop_scopes`.
+    pub static INLINE_SCOPE_UNMAPPED: AtomicUsize = AtomicUsize::new(0);
 
     /// `(gate_off, desync, marks_inexact, oop_in_scratch, too_many_locals,
-    /// dataflow_unreached, push_not_emitted)`.
-    pub fn snapshot() -> [usize; 7] {
+    /// dataflow_unreached, push_not_emitted, inline_scope_unmapped)`.
+    pub fn snapshot() -> [usize; 8] {
         use std::sync::atomic::Ordering::Relaxed;
         [
             GATE_OFF_OR_FAILED.load(Relaxed),
@@ -125,6 +134,7 @@ pub mod shadow_incomplete_cause {
             TOO_MANY_LOCALS.load(Relaxed),
             LOCAL_OOP_DATAFLOW_UNREACHED.load(Relaxed),
             PUSH_NOT_EMITTED.load(Relaxed),
+            INLINE_SCOPE_UNMAPPED.load(Relaxed),
         ]
     }
 }
@@ -867,6 +877,17 @@ impl Compiler {
             shadow_incomplete_cause::TOO_MANY_LOCALS.fetch_add(1, Relaxed);
             return false;
         }
+        // A live splice's callee locals are published by `collect_live_oop_homes`
+        // only when its dataflow can classify them. When it cannot, this frame
+        // holds references in slots nothing rewrites, so the safepoint must not
+        // claim complete coverage -- which is what keeps the collector on its
+        // conservative (pinning) sweep for the cycle.
+        for scope in &self.inline_oop_scopes {
+            if scope.mask_at_cur().is_none() {
+                shadow_incomplete_cause::INLINE_SCOPE_UNMAPPED.fetch_add(1, Relaxed);
+                return false;
+            }
+        }
         if self.num_locals == 0 {
             return true;
         }
@@ -972,6 +993,23 @@ impl Compiler {
             if staged_arg_shadow_enabled() {
                 for off in &self.pending_staged_arg_oops {
                     homes.push(ShadowHome::Frame(*off));
+                }
+            }
+            // THE LOCALS OF EVERY LIVE SPLICE. A call-carrying inline body
+            // keeps the callee's JVM locals in this frame's spill area and then
+            // makes a real GC-capable call from inside that body; neither loop
+            // above can see those slots (the marks describe operands, the mask
+            // describes the ENCLOSING method's locals), so without this the
+            // spliced callee's `this` was published on no rewritable channel at
+            // all. See `Compiler::inline_oop_scopes`.
+            for scope in &self.inline_oop_scopes {
+                let mask = scope.mask_at_cur().unwrap_or(0);
+                for k in 0..scope.num_locals.min(64) {
+                    if mask & (1u64 << k) == 0 {
+                        continue;
+                    }
+                    // Cast: a JVM local index times 8, added to a frame offset.
+                    homes.push(ShadowHome::Frame(scope.local_base + (k as i32) * 8));
                 }
             }
             // A local and an operand entry can share the same home register (or two
@@ -1559,6 +1597,42 @@ impl Compiler {
             map_incomplete = true;
             map_incomplete_cause::STAGED_ARG_UNMAPPABLE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Stage 3b -- THE LOCALS OF EVERY LIVE SPLICE. The same set
+        // `collect_live_oop_homes` publishes, named here for the same reason
+        // Stage 3 names staged arguments: the shadow stack is the channel a
+        // parked mutator remaps itself through, the map is what
+        // `remap_active_jit_frames` rewrites, and a moving cycle needs BOTH.
+        // A scope that cannot classify its locals fails the safepoint closed.
+        for scope in &self.inline_oop_scopes {
+            match scope.mask_at_cur() {
+                Some(mask) => {
+                    for k in 0..scope.num_locals.min(64) {
+                        if mask & (1u64 << k) == 0 {
+                            continue;
+                        }
+                        // Cast: a JVM local index times 8, plus a frame offset.
+                        let off = scope.local_base + (k as i32) * 8;
+                        match i16::try_from(off) {
+                            Ok(i16_off) => {
+                                if !slots.contains(&i16_off) {
+                                    slots.push(i16_off);
+                                }
+                            }
+                            Err(_) => {
+                                map_incomplete = true;
+                                map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    map_incomplete = true;
+                    map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
 
         // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record

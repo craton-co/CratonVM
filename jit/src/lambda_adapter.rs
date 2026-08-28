@@ -495,6 +495,11 @@ pub fn lambda_adapter_entry(
     // `_direct_callee_entries` is what lets the cache's invalidation closure
     // reach the thunk through `adapters_reaching`.
     cm._direct_callee_entries.push(impl_entry);
+    // This path has always captured the owner at bake time -- exactly what
+    // the method paths were missing. Record its identity too, so
+    // `prepare_for_publication` checks an adapter the same way.
+    cm._direct_callee_expected
+        .push((impl_entry, impl_owner.artifact_id));
     cm._direct_callee_roots.push(Arc::clone(impl_owner));
     cm.method_label = format!("lambda-adapter->{impl_entry:#x}");
     let arc = Arc::new(cm);
