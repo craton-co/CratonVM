@@ -3420,6 +3420,12 @@ pub(super) fn op_putfield(
                 }
                 Some(b'D') => {
                     use crate::types::CompactTag;
+                    // Kinds-aware bit-exact pop — see `pop_static_field_value`'s
+                    // D arm, which this mirrors for putfield.
+                    if thread.frames[frame_idx].stack.peek_kind_is_double() {
+                        let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                        Value::Double(f64::from_bits(cv.raw_bits()))
+                    } else {
                     let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
                     let dv = match cv.tag() {
                         CompactTag::Double => f64::from_bits(cv.raw_bits()),
@@ -3441,6 +3447,7 @@ pub(super) fn op_putfield(
                         }
                     };
                     Value::Double(dv)
+                    }
                 }
                 _ => {
                     let v = thread.frames[frame_idx].stack.pop()?;
@@ -4354,7 +4361,7 @@ pub(super) fn op_getfield(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact_double_checked(CompactValue::double(d))?;
+                    .push_compact_double_checked(CompactValue::double_raw(d))?;
             } else {
                 // T12/T14: Coerce zero-initialized heap slots for reference fields.
                 // The GC heap zeroes memory on allocation; for reference-typed

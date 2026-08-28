@@ -9457,7 +9457,7 @@ pub fn parse_aioobe_index(msg: &str) -> i32 {
 }
 
 /// Reconstruct a JIT'd method's incoming locals (`this` + declared params) as
-/// `Value`s from the bit-exact `(CompactValue, is_long)` arg slots that
+/// `Value`s from the bit-exact `(CompactValue, kind)` arg slots that
 /// `execute_jit_call` saved before dispatch. Used only on the cold
 /// exception-routing path to repopulate the handler frame's locals (see
 /// `route_jit_exception_through_method`). Mirrors the descriptor-aware decode
@@ -9465,7 +9465,7 @@ pub fn parse_aioobe_index(msg: &str) -> i32 {
 /// method descriptor's parameter tags.
 pub(super) fn jit_saved_args_to_values(
     cached: &CachedBytecodeMethod,
-    saved_args: &[(CompactValue, bool)],
+    saved_args: &[(CompactValue, u8)],
     np: usize,
 ) -> Vec<Value> {
     let is_static = cached.is_static;
@@ -9473,13 +9473,13 @@ pub(super) fn jit_saved_args_to_values(
     // ONE forward scan, hoisted out of this per-argument loop.
     let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in 0..np {
-        let (cv, is_long) = saved_args[i];
+        let (cv, kind) = saved_args[i];
         let desc_byte = if is_static {
             param_tags.get(&cached.method_descriptor, i)
         } else {
             param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
-        out.push(decode_arg_kind_aware(cv, is_long, desc_byte));
+        out.push(decode_arg_kind_aware(cv, kind, desc_byte));
     }
     out
 }
@@ -9654,21 +9654,19 @@ pub(super) fn execute_jit_call(
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
     // that arm for the underflow this prevents.
-    let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
-        [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
+    let mut saved_args: [(CompactValue, u8); JIT_ABI_MAX_JAVA_ARGS] =
+        [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
     let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in (0..np).rev() {
-        let (cv, is_long) = thread.frames[frame_idx]
-            .stack
-            .pop_compact_with_long_mark_unchecked();
-        saved_args[i] = (cv, is_long);
+        let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
+        saved_args[i] = (cv, kind);
         let desc_byte = if is_static {
             param_tags.get(&cached.method_descriptor, i)
         } else {
             param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
-        let v = decode_arg_kind_aware(cv, is_long, desc_byte);
+        let v = decode_arg_kind_aware(cv, kind, desc_byte);
         jit_args[i] = match v {
             // Widening: i32 -> i64 (sign-extended, JVM i2l)
             Value::Int(x) => x as i64,
@@ -10050,12 +10048,12 @@ pub(super) fn execute_jit_call(
                 }
             }
             for i in 0..np {
-                let (cv, is_long) = saved_args[i];
-                if is_long {
-                    thread.frames[frame_idx].stack.push_compact_long(cv);
-                } else {
-                    thread.frames[frame_idx].stack.push_compact(cv);
-                }
+                // Restore the mark as well as the bits: a `KIND_DOUBLE` slot
+                // re-pushed as `KIND_UNKNOWN` would be re-read by its NaN-box
+                // sub-tag on the slow path, which is how a double carrying a
+                // NaN payload lost it across a deopt.
+                let (cv, kind) = saved_args[i];
+                thread.frames[frame_idx].stack.push_with_kind_unchecked(cv, kind);
             }
             return Ok(CachedCallResult::CacheMiss);
         }
@@ -10122,12 +10120,9 @@ pub(super) fn execute_jit_call(
         // etc.) pops a now-missing slot and panics with a value_stack
         // underflow (len 0 → usize::MAX index).
         for i in 0..np {
-            let (cv, is_long) = saved_args[i];
-            if is_long {
-                thread.frames[frame_idx].stack.push_compact_long(cv);
-            } else {
-                thread.frames[frame_idx].stack.push_compact(cv);
-            }
+            // See the sibling restore above: bits AND mark.
+            let (cv, kind) = saved_args[i];
+            thread.frames[frame_idx].stack.push_with_kind_unchecked(cv, kind);
         }
         return Ok(CachedCallResult::CacheMiss);
     }

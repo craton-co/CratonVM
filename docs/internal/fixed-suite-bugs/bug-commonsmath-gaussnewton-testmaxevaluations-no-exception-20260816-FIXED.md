@@ -138,7 +138,7 @@ not to be a `Math` problem at all. It is
 `(float)((double) f * 2^k)`, and the intermediate double passes through a
 `CompactValue` slot, whose NaN-boxed encoding flattens exactly the negative
 quiet NaNs with mantissa bit 50 set. Root-caused and filed separately as
-`nan-payloads-lost-to-the-compactvalue-tag-collision-20260816`; it is
+`nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828`; it is
 payload-only, predates this change, and is unaffected by it.
 
 ## Verification

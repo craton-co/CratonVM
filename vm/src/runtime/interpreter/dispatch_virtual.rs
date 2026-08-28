@@ -1317,7 +1317,7 @@ pub(super) fn try_execute_cached_trivial_instance_getter(
             };
             thread.frames[frame_idx]
                 .stack
-                .push_compact_double_checked(CompactValue::double(number))?;
+                .push_compact_double_checked(CompactValue::double_raw(number))?;
         }
         _ => {
             if field.is_reference {
@@ -2372,12 +2372,12 @@ pub(super) fn execute_invokevirtual_cached(
                     if cached_string_lower || cached_map_get {
                         let argument = thread.frames[frame_idx]
                             .stack
-                            .pop_compact_with_long_mark()?
+                            .pop_with_kind()?
                             .0
                             .decode_by_descriptor(b'L');
                         let receiver = thread.frames[frame_idx]
                             .stack
-                            .pop_compact_with_long_mark()?
+                            .pop_with_kind()?
                             .0
                             .decode_by_descriptor(b'L');
                         let mut args = [receiver, argument];

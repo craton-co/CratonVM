@@ -6303,7 +6303,7 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
 ///
 /// What keeps it off is no longer the pricing — the 2026-08-28 gauntlet soak
-/// (`docs/internal/performance/ir-inline-gauntlet-soak-20260828.md`) did that,
+/// (`performance/ir-inline-gauntlet-soak-20260828.md`) did that,
 /// and the trades came out in the flag's favour: 11 030 methods spliced across
 /// 200 netty classes, 8% faster on a serial netty slice and 15-26% on
 /// hibernate, with the sharded run's apparent +18% traced to contention rather

@@ -110,8 +110,9 @@ fn dummy_helpers() -> JitRuntimeHelpers {
 /// Bit patterns worth a round trip: zeroes and infinities, the canonical NaN,
 /// and a spread of NaN payloads INCLUDING the negative-signed ones
 /// (`0xFFFC_…` and up) that `nan-payloads-lost-to-the-compactvalue-tag-
-/// collision-20260816` records the value encoding destroying elsewhere. If the
-/// lowering ever stops being a raw move, those are the rows that catch it.
+/// collision-FIXED-20260828` records the value encoding having destroyed
+/// elsewhere until 2026-08-28. If the lowering ever stops being a raw move,
+/// those are the rows that catch it.
 fn bit_patterns() -> Vec<i64> {
     let mut v: Vec<i64> = vec![
         0x0000_0000_0000_0000u64 as i64, // +0.0

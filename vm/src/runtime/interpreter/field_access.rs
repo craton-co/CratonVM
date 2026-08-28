@@ -809,7 +809,7 @@ pub(super) fn push_static_field_value(
                     .into());
                 }
             };
-            stack.push_compact_double(crate::types::CompactValue::double(dv));
+            stack.push_compact_double(crate::types::CompactValue::double_raw(dv));
             Ok(())
         }
         _ => {
@@ -868,6 +868,14 @@ pub(super) fn pop_static_field_value(
             Ok(Value::Long(stack.pop_long()?))
         }
         Some(b'D') => {
+            // Kinds-aware bit-exact pop (mirrors the J arm above): a slot the
+            // push marked KIND_DOUBLE IS the double's 64 bits, so a NaN
+            // payload that collides with the NaN-box tag space survives
+            // putstatic instead of being decoded as the sub-tag it matches.
+            if stack.peek_kind_is_double() {
+                let cv = stack.pop_compact();
+                return Ok(Value::Double(f64::from_bits(cv.raw_bits())));
+            }
             let cv = stack.pop_compact();
             let dv = match cv.tag() {
                 CompactTag::Double => f64::from_bits(cv.raw_bits()),
@@ -941,7 +949,7 @@ pub(super) fn push_invoke_return_value(
             Ok(())
         }
         Value::Double(d) => {
-            stack.push_compact_double(crate::types::CompactValue::double(d));
+            stack.push_compact_double(crate::types::CompactValue::double_raw(d));
             Ok(())
         }
         other => stack.push(other),
@@ -997,9 +1005,10 @@ pub(super) fn coerce_invoke_arg_for_descriptor(b: u8, v: Value) -> Value {
 }
 
 /// Decode a popped argument slot to a `Value`, honoring the operand stack's
-/// `KIND_LONG` mark.
+/// `KIND_LONG` / `KIND_DOUBLE` mark.
 ///
-/// When `is_long` is set the slot was pushed by a genuine long producer, so a
+/// When `kind` is a category-2 mark the slot was pushed by a genuine long or
+/// double producer, so a
 /// `J`-descriptor parameter reads the raw 64 bits verbatim — a collision-shaped
 /// long (top bits `0xFFFC_…`, low 32-bit payload, indistinguishable from a
 /// tagged int by bit pattern alone) keeps its high bits instead of being
@@ -1007,12 +1016,21 @@ pub(super) fn coerce_invoke_arg_for_descriptor(b: u8, v: Value) -> Value {
 /// any non-long-marked slot) fall through to the descriptor-aware decode, which
 /// preserves the legacy i2l-widening behavior for synthetic int-where-long.
 #[inline]
-pub(super) fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value {
-    if is_long {
+pub(super) fn decode_arg_kind_aware(cv: CompactValue, kind: u8, pd_byte: u8) -> Value {
+    // A slot the push marked as a category-2 primitive IS its own 64 bits:
+    // `CompactValue::long` and `CompactValue::double_raw` both store verbatim,
+    // so whichever NaN-box sub-tag those bits happen to match says nothing
+    // about them. Read them directly instead of letting
+    // `decode_by_descriptor`'s int / null / uninitialized heuristics interpret
+    // a collision — that is how a `double` argument carrying a NaN payload
+    // used to arrive at `Double.doubleToRawLongBits` as `1.0`.
+    if kind == crate::runtime::ValueStack::KIND_MARK_LONG
+        || kind == crate::runtime::ValueStack::KIND_MARK_DOUBLE
+    {
         match pd_byte {
             b'J' => return Value::Long(cv.as_long_unchecked()),
             // Cast: integer word reinterpreted as float/double bit pattern
-            b'D' => return Value::Double(f64::from_bits(cv.as_long_unchecked() as u64)),
+            b'D' => return Value::Double(f64::from_bits(cv.to_bits())),
             _ => {}
         }
     }
@@ -1173,19 +1191,11 @@ pub(super) fn pop_coerced_invoke_args_virtual(
     // top bits, low 32-bit payload — e.g. a SHA-512 working variable passed
     // to `Long.rotateRight`) decode bit-exact instead of being truncated by
     // `decode_by_descriptor(b'J')`'s i2l-widening fallback.
-    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
+    let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(
-            thread.frames[frame_idx]
-                .stack
-                .pop_compact_with_long_mark()?,
-        );
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
     }
-    tmp_cv.push(
-        thread.frames[frame_idx]
-            .stack
-            .pop_compact_with_long_mark()?,
-    );
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
@@ -1196,8 +1206,8 @@ pub(super) fn pop_coerced_invoke_args_virtual(
     let param_tags = ParamTags::of(&method_descriptor);
     for i in 0..num_params {
         let pd_byte = param_tags.get(&method_descriptor, i);
-        let (cv, is_long) = tmp_cv[i + 1];
-        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
+        let (cv, kind) = tmp_cv[i + 1];
+        let v = decode_arg_kind_aware(cv, kind, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     refresh_stale_object_args(shared, &mut args);
@@ -1225,21 +1235,17 @@ pub(super) fn pop_coerced_invoke_args_static(
     // with the parameter descriptor. `CompactValue::to_value()` would
     // mis-decode a Long whose bits collide with SUB_OBJECT as
     // Value::Object — the descriptor-aware decode keeps the long bits.
-    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
+    let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(
-            thread.frames[frame_idx]
-                .stack
-                .pop_compact_with_long_mark()?,
-        );
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     // ONE forward scan, hoisted out of this per-argument loop.
     let param_tags = ParamTags::of(&method_descriptor);
-    for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
+    for (i, (cv, kind)) in tmp_cv.into_iter().enumerate() {
         let pd_byte = param_tags.get(&method_descriptor, i);
-        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
+        let v = decode_arg_kind_aware(cv, kind, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     refresh_stale_object_args(shared, &mut args);
