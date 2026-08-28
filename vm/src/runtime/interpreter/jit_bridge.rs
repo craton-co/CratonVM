@@ -152,6 +152,38 @@ pub(super) fn osr_callee_bars_direct_call(
     }
 }
 
+thread_local! {
+    /// The last checkpoint [`compile_osr_artifact`] reached on this thread.
+    ///
+    /// That function has ~25 bare `return None`s and as many `?` operators, and
+    /// an OSR refusal is SILENT: the loop just runs interpreted forever while
+    /// `OSR-recompile reason=no-cached-artifact` repeats. The comment on
+    /// `pending_callee_compiles` already records one defect that cost 5x and
+    /// looked exactly like its own fix; this is the same failure mode with no
+    /// diagnostic at all.
+    ///
+    /// Measured on netty's `FastLz.compress` — a 1617-byte method whose whole
+    /// job is one loop, so OSR is its ONLY route to compiled code. It refuses,
+    /// is marked OSR-denied for the process, and 256 MiB of compression runs in
+    /// the interpreter at 138x HotSpot. The named denies (athrow, indy,
+    /// exception table, newarray) all printed nothing, because none of them was
+    /// the one that fired.
+    static OSR_STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("entry") };
+}
+
+/// Record the region [`compile_osr_artifact`] has reached.
+#[inline]
+fn osr_stage(stage: &'static str) {
+    OSR_STAGE.with(|c| c.set(stage));
+}
+
+/// The last region [`compile_osr_artifact`] reached on this thread, for the
+/// refusal report. Read on the SAME thread that ran the compile — the
+/// background worker — which is where the `if !published` arm runs.
+fn osr_stage_get() -> &'static str {
+    OSR_STAGE.with(std::cell::Cell::get)
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -163,6 +195,7 @@ pub(super) fn compile_osr_artifact(
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
     let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
+    osr_stage("entry");
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
@@ -247,6 +280,7 @@ pub(super) fn compile_osr_artifact(
         return None;
     }
 
+    osr_stage("past-early-gates");
     // Check if already compiled
     let class_name_arc: Arc<str> = Arc::from(class_name.as_str());
     let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
@@ -322,13 +356,42 @@ pub(super) fn compile_osr_artifact(
             // a redefinition landing in that window produced a body stamped
             // with the CURRENT epoch, which the install barrier then accepted.
             // Holding the token from here is what closes it.
-            let admission = cratonvm_jit::compile_gate::admit(
+            let admission = match cratonvm_jit::compile_gate::admit(
                 &class_name,
                 &method_name,
                 &method_descriptor,
                 cratonvm_jit::compile_gate::CompileDoor::Osr,
-            )
-            .ok()?;
+            ) {
+                Ok(a) => a,
+                Err(reason) => {
+                    // NAME the refusal. `.ok()?` threw the `CompileRefusal`
+                    // away, and the four it can carry want opposite responses:
+                    // `PermanentlyBailListed` points at an EARLIER compile of
+                    // this method that the backend refused (and whose cause
+                    // `jit_bail_reason_for` still holds), `CodeCacheAtCapacity`
+                    // is transient, and the other two are configuration. An OSR
+                    // refusal is silent and permanent, so the one that fired is
+                    // the whole diagnosis.
+                    osr_stage("admission-refused");
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] osr-DENY (admission: {}) {}.{}{} — earlier bail: {}",
+                            reason,
+                            class_name,
+                            method_name,
+                            method_descriptor,
+                            cratonvm_jit::jit_bail_reason_for(
+                                &class_name,
+                                &method_name,
+                                &method_descriptor,
+                            )
+                            .unwrap_or_else(|| "none recorded".to_string()),
+                        );
+                    }
+                    return None;
+                }
+            };
+            osr_stage("past-admission");
             // A previous compile for exactly this back-edge produced a body
             // whose `osr_dead_mask` refuses entry there. That verdict is a pure
             // function of a deterministic compile, so re-running the pipeline
@@ -347,10 +410,29 @@ pub(super) fn compile_osr_artifact(
                 Some(s) => s,
                 None => {
                     // RBC.4 — scan rejects are permanent (see jit::try_compile_inner).
+                    //
+                    // NAME the opcode. A scan reject here bail-lists the method
+                    // for EVERY door, so a method whose only route to compiled
+                    // code is OSR — one big method that is one big loop — runs
+                    // interpreted for the life of the process, and until this
+                    // line existed it did so with no output whatsoever.
+                    // `jit_scan` records the site it refused at; taking it is
+                    // the difference between "OSR failed" and a bytecode to go
+                    // look at.
+                    osr_stage("jit-scan-refused");
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        let (site, pc, op) = cratonvm_jit::take_jit_bail_site()
+                            .unwrap_or(("<unrecorded>", 0, 0));
+                        eprintln!(
+                            "[cratonvm-jitc] osr-DENY (jit_scan refused: {site} @pc={pc} op=0x{op:02x}) {}.{}{}",
+                            class_name, method_name, method_descriptor,
+                        );
+                    }
                     crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
                     return None;
                 }
             };
+            osr_stage("past-jit-scan");
             // This method's own exception table. Read ONCE, here, because both
             // of the RBC gates below need it: RBC.6 (immediately below) admits
             // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)
@@ -2488,6 +2570,7 @@ pub(super) fn compile_osr_artifact(
             // this line covered only the backend call, so a redefinition that
             // landed while the resolvers ran produced a body the install
             // barrier could not tell from a current one.
+            osr_stage("backend");
             let mut cm = crate::jit::x64::compile_with_param_slots(
                 &admission,
                 &code,
@@ -2637,6 +2720,7 @@ pub(super) fn compile_osr_artifact(
         Some(c) => c,
         None => return None,
     };
+    osr_stage("published");
 
     // The compile succeeded but the body may still refuse to enter at the PC it
     // was compiled for: no published native offset (the codegen writes -1 for a
@@ -7661,11 +7745,21 @@ pub(super) fn background_compile_task(
             // diagnostics — found the hard way, perf/halfgap-20260717).
             if crate::runtime::env_cache::dbg_jitc() {
                 eprintln!(
-                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} — method marked OSR-denied for the rest of this process",
+                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} stage={} — method marked OSR-denied for the rest of this process",
                     task.method_key.class_name,
                     task.method_key.method_name,
                     task.method_key.descriptor,
                     osr_bci,
+                    osr_stage_get(),
+                );
+                eprintln!(
+                    "[cratonvm-jitc]   …and the bail this method last recorded: {}",
+                    cratonvm_jit::jit_bail_reason_for(
+                        &task.method_key.class_name,
+                        &task.method_key.method_name,
+                        &task.method_key.descriptor,
+                    )
+                    .unwrap_or_else(|| "none recorded".to_string()),
                 );
             }
             crate::jit::tiered::mark_osr_denied(task.method_key.clone());
