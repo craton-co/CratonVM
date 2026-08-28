@@ -143,6 +143,26 @@ impl Compiler {
         self.emit_pre_safepoint_spill_impl(true);
     }
 
+    /// [`Self::emit_pre_safepoint_spill`] for a site that has already written
+    /// every Java argument of its call into a frame slot, so the blind spill
+    /// may drop `RAX` and `ARG_REGS` from its selection.
+    ///
+    /// The one-shot is set and consumed in the same breath — this function is
+    /// the only writer, and the spill it calls takes the flag at its top — so a
+    /// site that stages and then does NOT reach the spill (the elision wins)
+    /// cannot leak the claim into the next safepoint. See
+    /// [`spill_args_published_enabled`] for what the four opting-in sites have
+    /// actually done by this point.
+    pub(super) fn emit_pre_safepoint_spill_args_published(
+        &mut self,
+        arg_regs_published: bool,
+        rax_published: bool,
+    ) {
+        let on = spill_args_published_enabled();
+        self.args_published_for_next_spill = (arg_regs_published && on, rax_published && on);
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
     /// Publish a cold safepoint without claiming moving-young shadow coverage.
     /// This is used only by the overflow guard of a GC-inert recursive method;
     /// an exceptional collection safely falls back to the non-moving sweep.
@@ -165,6 +185,11 @@ impl Compiler {
         // indexed rather than `ALL_SPILL_GPRS`-indexed) leaves the consumer with
         // nothing to emit and the full spill in place.
         let sink = std::mem::take(&mut self.sink_alloc_blind_spill);
+        // Taken here, next to `sink`, and for the same reason: a claim that
+        // outlives the safepoint it was made for is a claim about the wrong
+        // frame. Cleared even on the `failed` return below.
+        let (arg_regs_published, rax_published) =
+            std::mem::take(&mut self.args_published_for_next_spill);
         self.deferred_alloc_blind_spill = false;
         if self.failed {
             return;
@@ -250,7 +275,7 @@ impl Compiler {
             // arg registers here does not perturb the pending call's arguments.
             // Default path is unchanged (`=1` → callee-saved only).
             if self.safepoint_reg_spill_all {
-                let narrow = self.oop_capable_spill_regs();
+                let narrow = self.oop_capable_spill_regs(arg_regs_published, rax_published);
                 self.pending_narrow_spill = narrow;
                 // Cast: `count_ones` is at most 14, well inside u64.
                 let kept = narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| {
@@ -333,7 +358,11 @@ impl Compiler {
     /// (R10/R11 on SysV, plus unused local homes). See
     /// [`narrow_safepoint_spill_enabled`] for what that gives up and why the
     /// stale slot it leaves behind is safe.
-    fn oop_capable_spill_regs(&self) -> Option<u16> {
+    fn oop_capable_spill_regs(
+        &self,
+        arg_regs_published: bool,
+        rax_published: bool,
+    ) -> Option<u16> {
         if !narrow_safepoint_spill_enabled() {
             return None;
         }
@@ -356,9 +385,22 @@ impl Compiler {
                 None => 0,
             }
         };
-        let mut keep = bit(RAX);
-        for &r in ARG_REGS.iter() {
-            keep |= bit(r);
+        // Sources 1 and 2 -- RAX and the ABI argument registers -- each kept
+        // unless the site has already written its contents to the frame, in
+        // which case the register copy duplicates a publication that already
+        // happened. The two are asked separately because different code
+        // publishes them: see `args_published_for_next_spill`.
+        let mut keep = 0u16;
+        if !rax_published {
+            keep |= bit(RAX);
+        }
+        if !arg_regs_published {
+            for &r in ARG_REGS.iter() {
+                keep |= bit(r);
+            }
+        }
+        if arg_regs_published || rax_published {
+            crate::metrics::note_spill_args_published();
         }
         let refs = plan.register_homed_reference_locals;
         for (idx, home) in self.local_assignments.iter().enumerate().take(64) {

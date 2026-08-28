@@ -1,10 +1,137 @@
-# Hibernate ORM on MySQL — CratonVM leaves stale table schema behind across classes sharing a worker DB
+# Hibernate ORM on MySQL — the "stale schema" cascade: a killed class leaks its schema into a worker database the harness never reset
 
 ## Status
-**OPEN** (2026-08-22). Confirmed real (HotSpot A/B + isolation control both done), not
-yet root-caused to the exact DDL/JDBC step. **Re-confirmed at ~2.5x the original scale
-on 2026-08-24/25** — see "2026-08-24/25 update" below; still the same mechanism, no new
-root-cause information.
+
+**RETIRED 2026-08-27 — root-caused and fixed, and the cause is not the one this
+page proposed.** It is not a DDL or JDBC defect, and it is not
+CratonVM-specific in the way the title used to claim. It is a harness one, with
+a genuine VM slowness underneath it:
+
+> A class too slow for the wall cap is KILLED, so it never reaches the test
+> framework's schema drop. `run-hib.sh` gave each shard one worker database and
+> **never reset it**, so that class's tables outlived the shard *and the run* —
+> and dozens of Hibernate classes declare their own `Person`, `Product`,
+> `Animal` and `User` with different column sets, so every later collision fails
+> on a schema it did not create.
+
+So **~119 of the 122 failures are one cascade, not 119 defects.** Fixed in
+`run-hib.sh` + `DbReset.java`; measurements below.
+
+### The two hypotheses this page had, and why both are wrong
+
+It proposed *"(a) CratonVM's schema bootstrap not fully executing/committing its
+DROP+CREATE DDL against MySQL specifically, or (b) some MySQL-server-side
+statement/metadata caching that a CratonVM-originated connection trips
+differently"*. Neither survives one measurement:
+
+**A class that exits normally drops its own schema, on CratonVM, even when its
+tests fail.** `hql.ASTParserLoadingTest` on a fresh database under CratonVM
+finishes **21 tests down** and still leaves `tables left: 0`. There is no
+general "CratonVM does not drop" behaviour to find. The leak needs the process
+to be *killed*.
+
+### The chain, each link measured
+
+1. **CratonVM is ~25x slower on the leaking class.** `hql.ASTParserLoadingTest`:
+   **1447 s** on CratonVM against seconds on HotSpot, on the same fresh
+   database. The suite runs `--timeout 300`. The class is duly recorded `HANG`.
+2. **A killed process leaks its schema.** Reproduced exactly as the harness does
+   it — `timeout 300 cratonvm ... CratonRunner hql.ASTParserLoadingTest` →
+   `rc=124`, and **54 tables left behind**: `Animal`, `Human`, `Zoo`,
+   `Customer`, `Product`, `User`, `LineItem`, `employee`, `department`, …
+3. **The worker databases were never reset.** `run-hib.sh` contained no
+   `DROP DATABASE` / `CREATE DATABASE` at all; it only pointed shard *N* at
+   `hibernate_orm_test_N`. Debris therefore accumulated **across runs**. That is
+   why this page's own `ComponentTest` example collided with a stale `T_USER`
+   that **no earlier class in its shard had created** — it was left by an
+   earlier run. At the time of writing, `hibernate_orm_test_1` still held 81
+   such tables while workers 2–18 held none.
+4. **The debris fails later classes.** Same class, same binary, only the
+   database differing:
+
+   | | result |
+   | --- | --- |
+   | `jpa.compliance.CriteriaMutationQueryTableTest` on the poisoned database | **0 / 2** — `Table 'Animal' already exists`, `Unknown column 'age'` |
+   | the same class on a fresh database | **2 / 2 PASS** |
+
+   And on the 2026-08-24 G1 run, on the leaker's own shard: **45 FAILs after it,
+   17 before**.
+
+## The fix
+
+`DbReset` drops every table in the worker schema. `run-hib.sh` calls it at
+**shard start** (clearing debris from previous runs) and **after any class whose
+process died**. `--no-db-reset` A/Bs the cascade.
+
+Two choices in it that are deliberate:
+
+* **Not before every class.** That would be 4548 resets instead of ~7, and it
+  would silently paper over a leak on a CLEAN exit — which would be a real VM
+  defect, and one this harness should keep surfacing rather than hide. Point 1
+  above is the measurement that says the kill path is the only one that leaks.
+* **It runs on the STOCK JDK**, never on the binary under test. When the VM
+  being measured is the thing that just got killed, it is also the last thing
+  that should be trusted to clean up after itself.
+
+Measured, two classes, one shard, same binary, same database, only the flag
+differing:
+
+| arm | leaker | victim | tables left |
+| --- | --- | --- | ---: |
+| `--no-db-reset` (the behaviour this page documents) | `HANG` | **FAIL 0/2** | 54 |
+| db-reset on | `HANG` | **PASS 2/2** | 0 |
+
+and the log shows it firing only where intended:
+
+```text
+[db-reset] shard 0 start :: @@DBRESET clean tables=0
+[db-reset] org.hibernate.orm.test.hql.ASTParserLoadingTest died (HANG rc=124) :: @@DBRESET reset tables_dropped=54
+```
+
+### A cleanup step that could not fail loudly, and nearly did not fail legibly
+
+The first version built `DbReset`'s classpath from `$SELF_DIR`, which under Git
+Bash is `/c/craton/...`. The JVM answered `Could not find or load main class
+DbReset`, the reset logged that at both call sites, and all 54 tables stayed —
+an arm that looked like it ran and changed nothing. `to_native_path` (a
+`cygpath -m`) is the fix. **Worth keeping written down**: the A/B only caught it
+because the arm printed what the reset actually said instead of assuming it
+worked.
+
+## What this does NOT fix, and what it unmasks
+
+The cascade is gone; the two things underneath it are real and now visible:
+
+* **`hql.ASTParserLoadingTest` costs 1447 s on CratonVM against seconds on
+  HotSpot** — that slowness is what puts it over the cap in the first place.
+  Raising its cap in `class-overrides.tsv` would stop the HANG but not the cost.
+* **It fails 21 of 104 tests on a FRESH database** (HotSpot: 104/104). Those are
+  genuine defects that the cascade has been hiding — they are not schema
+  artifacts, and nothing in this page's original 122-class accounting separated
+  them out.
+
+Both are tracked in
+`known-issues/hibernate/astparserloadingtest-slow-and-21-real-failures-20260827.md`.
+
+## A configuration gap found on the way
+
+`hibernate-core/target/resources/test/hibernate.properties` has since been
+reverted to **H2**, so the MySQL suite is not reproducible from the harness
+alone any more: dialect, driver and credentials have to come from somewhere. The
+runs here supplied them through the tracked `required-sysprops.tsv` hook
+(`HIB_REQUIRED_SYSPROPS=...`). Reading a run without noticing is easy and
+expensive — the first A/B attempt here reported `found=106 ok=0` in 9.7 s, which
+is not a result, it is an H2 dialect pointed at a MySQL URL.
+
+---
+
+# The evidence as it was gathered
+
+Everything below is the original page, kept because its measurements are sound
+and are what the root cause above explains. Two claims in it are superseded:
+the "Not yet root-caused" section's two hypotheses (both refuted above), and the
+framing of the isolation sweep's 46/52 as "one mechanism appearing 46 times" —
+correct, and the mechanism is the cascade, not a VM DDL defect.
 
 ## 2026-08-24/25 update: complete-suite MySQL run after `dev` update, ~2.5x more classes hit
 
@@ -178,7 +305,7 @@ So of the original 50 FAIL, the accounting is: **46 stale-schema artifact + 3
 pre-existing/not-CratonVM (excluded here) + 1 real, new, MySQL-specific
 performance defect** (`BatchTest`, its own doc).
 
-## Not yet root-caused
+## Not yet root-caused *(SUPERSEDED — see the root cause at the top)*
 
 `MySQL8DatabaseCleaner`/`MySQL5DatabaseCleaner`
 (`hibernate-testing/.../cleaner/MySQL8DatabaseCleaner.java`) only issue
@@ -194,7 +321,7 @@ specifically, or (b) some MySQL-server-side statement/metadata caching that a
 CratonVM-originated connection trips differently than a HotSpot-originated
 one issuing the ostensibly same DDL sequence.
 
-## Next steps
+## Next steps *(SUPERSEDED — all three are answered above; none needed a general_log diff)*
 
 1. Enable MySQL's `general_log` and diff the exact DDL statement sequence
    CratonVM issues around a class's `SessionFactory` bootstrap/shutdown

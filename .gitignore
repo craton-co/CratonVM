@@ -118,6 +118,12 @@ spring-suite/build/
 probes/out/
 # A second probe build dir, so two branches' probe classes cannot collide.
 probes/out-funnel/
+# `VoxelAlloc2`'s nested classes compile to `VoxelAlloc2$*.class`, which the
+# `probes/*.class` line below does not cover once they are put in their own
+# output directory (the probe's doc comment uses `-d probes/voxout`).
+probes/voxout/
+# ...and `EntryAbiArgSlotProbe`'s, for the same reason.
+probes/abiout/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class

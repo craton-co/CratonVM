@@ -1,8 +1,26 @@
 # The 14-store blind GPR spill at every compiled call — halved for oop-clean frames, OPEN for every other frame
 
-**Status: OPEN, throughput — but both of this page's levers are now spent.**
-Two changes, a day apart, against the same 14-store blind copy of the whole GPR
-file that `emit_pre_safepoint_spill` emitted at every GC-capable call:
+**Status: OPEN, throughput — all three of this page's levers are now spent.**
+Three changes against the same 14-store blind copy of the whole GPR file that
+`emit_pre_safepoint_spill` emitted at every GC-capable call. Together, on
+`CallArgCostProbe` with all three off against all three on — one binary, six
+interleaved readings per arm, **idle host (load 2.2–2.3)**, minimum of each,
+deltas over `control`:
+
+| call shape | none of the three | all three | |
+|---|---:|---:|---|
+| `int0()` static | 3.05 ns | **1.42 ns** | **−53%** |
+| `int1(int)` | 3.33 | **1.30** | **−61%** |
+| `int2(int,int)` | 3.62 | **1.71** | −53% |
+| `ref1(Object)` | 5.09 | **2.13** | **−58%** |
+| `ref2(Object,Object)` | 4.23 | **2.38** | −44% |
+| `refRet(Object)->Object` | 3.56 | **1.59** | −55% |
+| `virtInt` | 5.02 | **3.64** | −27% |
+| `virtRef` | 6.68 | **4.72** | −29% |
+
+Every row separates completely — the `all` arm's *maximum* `int0` reading (1.92)
+is far below the `none` arm's *minimum* (3.51) — and the blind spill itself goes
+**476 → 198 stores (−58%)**.
 
 * **2026-08-26, elision** (`CRATONVM_JIT_CALL_SPILL_ELISION`, default `mic`) —
   where the caller frame is provably oop-clean the spill is replaced by a
@@ -13,13 +31,18 @@ file that `emit_pre_safepoint_spill` emitted at every GC-capable call:
   hold an oop: **476 → 260 stores** on `CallArgCostProbe`, **1344 → 830** on
   netty's own loop, and **8–24% off a compiled call's overhead** on top of the
   elision, on frames the elision cannot touch.
+* **2026-08-27, the staging IS the publication**
+  (`CRATONVM_JIT_SPILL_ARGS_PUBLISHED`, default ON) — the last of the three, and
+  the only one that touches the population the full-file spill was introduced
+  for. At the four sites that stage their arguments to the frame before the
+  safepoint, the register copy of those same values is a duplicate: **260 → 210
+  stores** and a further **16–26%** off a call of any shape.
 
-The page stays open because the wall is narrowed, not closed: a call in a
-reference-carrying frame still spills RAX, the six `ARG_REGS` and the register
-homes of reference-capable locals — around 8–9 stores — and dropping any of
-those means giving up the population `=all` was added for. What is left is
-described in [What is still there](#what-is-still-there), and it is a different
-kind of change from either of these two.
+The page stays open because the wall is narrowed, not closed: what a compiled
+call still pays is the frame-slot writes it genuinely needs plus the call
+sequence itself, and the two netty classes this family is named for still miss
+their walls by roughly an order of magnitude. There is no fourth lever of this
+shape left — see [What is still there](#what-is-still-there).
 
 All numbers: **Azure Linux host `vm1`, quiet (load 3.9–4.7)**, 2026-08-26,
 release build, real-JDK mode, ONE binary with the flag off and on, eight
@@ -214,29 +237,82 @@ safepoint against a ~100 ns iteration is ~2–3%, and twelve interleaved reading
 per arm on this host could not separate the arms in either direction. Recorded
 so nobody re-runs it expecting otherwise.
 
+### DONE 2026-08-27: the argument staging IS the publication
+
+The narrowing's residual was RAX + the six `ARG_REGS` + the reference-local
+homes, and the first two are exactly the population `=all` was introduced for.
+They are also the two the call site has *already written to the frame* by the
+time the spill runs, so the register copy is a duplicate of a publication that
+already happened. `CRATONVM_JIT_SPILL_ARGS_PUBLISHED` (default ON, `=0` keeps
+copying them) drops them — **per site, never globally**, and as **two separate
+claims**, because different code publishes each:
+
+| site | `ARG_REGS` published | `RAX` published |
+|---|---|---|
+| `invokestatic` direct | when `service_args_base.is_some()` | **no** — that site stages through `R11` |
+| `invokespecial`/`virtual` direct | when `service_args_base.is_some()` | **no** — same |
+| `jit_invoke_dispatch` helper | always (they carry the helper ABI, never a Java oop) | when `n > 0` |
+| MIC/PIC cascade | always | when `n > 0` |
+
+The `service_args_base.is_some()` condition is the one that matters: with no
+service slots reserved the arguments live in `ARG_REGS` **and nowhere else**,
+and the claim would be false. The first cut of this change asserted both claims
+unconditionally at all four sites and was rebuilt before it was ever gated —
+the tell was reading the staging loops and noticing that two of them use `R11`
+while two use `RAX`, which is the difference between "RAX holds a staged
+argument" and "RAX holds whatever it held".
+
+The one-shot carrying the claim is set by
+`emit_pre_safepoint_spill_args_published` and taken at the top of the spill, in
+the same breath, so a site that stages and then does *not* reach the spill
+(because the elision won) cannot leak the claim into the next safepoint.
+
+**What it is worth**, with the ELISION PINNED OFF so every call keeps a spill
+and this cut is the only difference — ten interleaved readings per arm, **idle
+host (load 2.3–2.4)**, minimum of each, deltas over `control`:
+
+| call shape | keeping RAX+ARG_REGS | published |  |
+|---|---:|---:|---|
+| `int0()` | 2.41 ns | **1.89 ns** | −22% |
+| `int1(int)` | 2.53 | **1.90** | −25% |
+| `int2(int,int)` | 2.84 | **2.10** | −26% |
+| `ref1(Object)` | 3.24 | **2.57** | −21% |
+| `ref2(Object,Object)` | 3.57 | **2.93** | −18% |
+| `refRet(Object)->Object` | 2.89 | **2.24** | −22% |
+| `virtInt` | 4.43 | **3.62** | −18% |
+| `virtRef` | 5.61 | **4.71** | −16% |
+
+`int0`, `int1`, `int2`, `virtInt` and `virtRef` separate completely — `int0`
+`on` max 2.44 against `off` min 2.87. Width: 260 → 210 stores; on netty's own
+loop 830 → 522, i.e. **1344 → 522 cumulative**.
+
+*A first pass at this measurement ran at load ~11 and read −1% to −13%, with
+`virtRef` apparently unmoved. Same binary, same protocol; the host was simply
+not quiet. The load figure is printed with every reading on this page for that
+reason — a per-call cost of a couple of nanoseconds is not measurable against a
+loaded machine's noise, and reporting it as a small effect rather than an
+unmeasured one is the error to avoid.*
+
 ## What is still there
 
-After both levers, a call in a reference-carrying frame spills RAX + six
-`ARG_REGS` + the reference-local homes — around 8–9 stores. Cutting further
-means dropping exactly the population the full-file spill was introduced for
-(Keycloak Gap 9: a live oop in a caller-saved / argument / RAX register at an
-invoke safepoint), so it is not a filter change. It would need the *staging* to
-be the publication — the direct sites already copy every argument into the
-callee-sentinel service slots and the dispatch/MIC sites already name their
-argument oops in the map, so the information exists; what is missing is a proof
-that every path reaching a safepoint has done one of those before it gets there.
-That is a different kind of change from either of these two, and it wants its
-own page rather than a third section here.
+No fourth lever of this shape. What a call still writes is the reference-local
+homes it genuinely has to publish, plus the operand-stack registers, plus the
+call sequence itself; the remaining gap to HotSpot on these rows is that HotSpot
+*inlines* them, which is a different page. The two netty classes this family is
+named for still miss their walls by roughly an order of magnitude, and this
+work did not measurably move either of them — their loops are dominated by
+per-iteration costs that are not the spill.
 
-The other caution, unchanged: **the gate that matters is not a test suite. It is
+The caution, unchanged: **the gate that matters is not a test suite. It is
 relocation under moving young** — see below.
 
 ## Gates
 
-Both changes are GC-root-visibility changes, so the correctness argument is the
-gate list, not the diff. Everything below was run for the elision (2026-08-26)
-and re-run for the narrowing (2026-08-27, `CRATONVM_JIT_SPILL_NARROW` off and
-on); the numbers quoted are the narrowing's, and the elision's were the same.
+All three are GC-root-visibility changes, so the correctness argument is the
+gate list, not the diff. Everything below was run for the elision (2026-08-26),
+re-run for the narrowing and re-run again for the staging claim (2026-08-27,
+each flag off and on); the numbers quoted are the staging claim's, and the
+earlier two were the same.
 
 * **Relocation under moving young**, `-XX:+UseGenerationalGC`, three interleaved
   rounds per arm, checksums compared against HotSpot on the same host:
@@ -281,6 +357,16 @@ CRATONVM_JIT_CALL_SPILL_ELISION=0 cratonvm --java-home <jdk> -cp . CallArgCostPr
 
 ```bash
 CRATONVM_JIT_CALL_SPILL_ELISION=0 CRATONVM_JIT_SPILL_NARROW=0 cratonvm --java-home <jdk> -cp . CallArgCostProbe 40000000
+```
+
+The staging claim on its own, and all three against none of them:
+
+```bash
+CRATONVM_JIT_CALL_SPILL_ELISION=0 CRATONVM_JIT_SPILL_ARGS_PUBLISHED=0 cratonvm --java-home <jdk> -cp . CallArgCostProbe 40000000
+```
+
+```bash
+CRATONVM_JIT_CALL_SPILL_ELISION=0 CRATONVM_JIT_SPILL_NARROW=0 CRATONVM_JIT_SPILL_ARGS_PUBLISHED=0 cratonvm --java-home <jdk> -cp . CallArgCostProbe 40000000
 ```
 
 ```bash

@@ -594,6 +594,42 @@ pub struct MemberResolver<'a> {
     vm: VmId,
 }
 
+/// How many field resolutions asked for a (name, descriptor) pair the hierarchy
+/// does not contain and fell back to the name-only match.
+///
+/// This is the ENGAGEMENT counter for tightening `locate_field` to the strict
+/// JVMS §5.4.3.2 answer (`NoSuchFieldError`). A run that reports `0` is a run in
+/// which the fallback could be deleted with no behaviour change at all; a
+/// non-zero count names the number of sites that would start throwing, and
+/// `CRATONVM_DBG_FIELD_DESCRIPTOR=1` names them.
+pub static FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS`].
+pub fn field_resolution_descriptor_fallbacks() -> u64 {
+    FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many field resolutions the JVMS §5.4.3.2 key answered **differently**
+/// from the name-only key this VM used before 2026-08-27.
+///
+/// This is the ENGAGEMENT counter for the fix itself, and it is the only number
+/// that separates "the descriptor key is now applied" from "the descriptor key
+/// changed an answer". Every one of these is a field access that used to reach
+/// a same-named field of another type — and, in compiled code, to pair that
+/// field's slot index with the constant pool's type tag.
+///
+/// A `0` on a workload means the fix is inert there, not that it is unnecessary:
+/// the shape needs a class declaring two fields of one name, or a subclass
+/// shadowing an inherited field name with a different type.
+pub static FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS`].
+pub fn field_resolution_descriptor_corrections() -> u64 {
+    FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<'a> MemberResolver<'a> {
     /// Bind a resolver to `shared`.
     ///
@@ -1042,6 +1078,36 @@ impl<'a> MemberResolver<'a> {
     /// *static* slot index — `find_field_recursive` returns the absolute
     /// instance index and the static index is only derivable while walking the
     /// declaring class's own field list in order.
+    ///
+    /// # `descriptor` — the other half of the JVMS key
+    ///
+    /// JVMS §5.4.3.2 resolves a `CONSTANT_Fieldref` by name **and** descriptor,
+    /// and JVMS §4.5 forbids only the pair from repeating: one class may
+    /// legally declare several fields sharing a NAME. This function used to
+    /// match on the name alone and return the first hit, so on such a class it
+    /// returned a field of the wrong type — and handed the caller its slot
+    /// index and its static/instance flag.
+    ///
+    /// For the interpreter that mostly degrades to a wrong value, because it
+    /// reads and writes a dynamically tagged cell. For the JIT it does not: the
+    /// slot index comes from this search and the type tag comes from the
+    /// constant-pool descriptor, so the two halves of a compiled field access
+    /// describe different fields, and a `putfield` writes one field's tag at
+    /// another field's slot.
+    ///
+    /// `Some(descriptor)` applies the full key. `None` keeps the historical
+    /// name-only behaviour for the callers that pass a name they own and know
+    /// to be unique.
+    ///
+    /// **Fallback, and why there is one.** When the full key matches nothing,
+    /// this does not fail — it retries name-only, counts the retry in
+    /// [`FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS`] and returns that answer, which
+    /// is exactly what it would have returned before. JVMS says a missing
+    /// (name, descriptor) pair is a `NoSuchFieldError`, but this VM substitutes
+    /// and synthesises JDK classes whose field descriptors need not match the
+    /// classfile a caller was compiled against, and failing those closed would
+    /// trade a rare wrong slot for a common hard error. The counter is what
+    /// turns "we could tighten this" from a guess into a measurement.
     pub fn locate_field(
         &self,
         cm: &ClassManager,
@@ -1049,6 +1115,7 @@ impl<'a> MemberResolver<'a> {
         owner: VmScoped<ClassId>,
         owner_name: &str,
         field_name: &str,
+        descriptor: Option<&str>,
         policy: AccessPolicy,
     ) -> Result<VmScoped<ResolvedField>, ResolveError> {
         let accessor_id = self.adopt(accessor)?;
@@ -1057,8 +1124,28 @@ impl<'a> MemberResolver<'a> {
         if let Some(class) = cm.get_class(owner_id) {
             let mut static_idx = 0usize;
             let mut instance_idx = 0usize;
+            // What the name-only key WOULD have answered on this class, so a
+            // changed answer can be counted rather than assumed. Computed only
+            // when a descriptor was supplied, and only on this cold
+            // resolution-cache-miss path.
+            let name_only_here: Option<&str> = descriptor.and_then(|_| {
+                class
+                    .fields
+                    .iter()
+                    .find(|f| &*f.name == field_name)
+                    .map(|f| &*f.descriptor)
+            });
             for f in &class.fields {
-                if &*f.name == field_name {
+                // JVMS §5.4.3.2 — name AND descriptor. `descriptor: None` is
+                // the historical name-only key, kept for callers that own the
+                // name; see this function's doc.
+                if &*f.name == field_name
+                    && descriptor.is_none_or(|d| &*f.descriptor == d)
+                {
+                    if name_only_here.is_some_and(|d| d != &*f.descriptor) {
+                        FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let (index, is_static) = if f.is_static() {
                         (static_idx, true)
                     } else {
@@ -1104,9 +1191,54 @@ impl<'a> MemberResolver<'a> {
             }
         }
 
-        let Some((field_index, field, declaring_id)) =
-            find_field_recursive(owner_id, field_name, cm.class_store())
-        else {
+        // The full JVMS key first. Only when no field of this exact name AND
+        // descriptor exists anywhere in the hierarchy does the name-only search
+        // run, and that retry is counted — see this function's doc for why it
+        // exists at all rather than raising `NoSuchFieldError`.
+        let located = match descriptor {
+            Some(d) => crate::classloading::find_field_recursive_by_descriptor(
+                owner_id,
+                field_name,
+                d,
+                cm.class_store(),
+            )
+            .inspect(|(_, field, declaring)| {
+                // Did the full key land somewhere the name-only key would not?
+                // Counted, not assumed — see
+                // `FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS`.
+                if let Some((_, name_field, name_declaring)) =
+                    find_field_recursive(owner_id, field_name, cm.class_store())
+                {
+                    if name_declaring != *declaring
+                        || &*name_field.descriptor != &*field.descriptor
+                    {
+                        FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+            .or_else(|| {
+                let name_only = find_field_recursive(owner_id, field_name, cm.class_store());
+                if name_only.is_some() {
+                    FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_DESCRIPTOR")
+                        .is_some()
+                    {
+                        tracing::warn!(
+                            target: "cratonvm::resolve",
+                            owner = owner_name,
+                            field = field_name,
+                            wanted_descriptor = d,
+                            "no field of this name and descriptor exists in the hierarchy;                              falling back to the name-only match this VM used before                              2026-08-27",
+                        );
+                    }
+                }
+                name_only
+            }),
+            None => find_field_recursive(owner_id, field_name, cm.class_store()),
+        };
+        let Some((field_index, field, declaring_id)) = located else {
             return Err(ResolveError::NoSuchField {
                 class_name: owner_name.to_string(),
                 field_name: field_name.to_string(),

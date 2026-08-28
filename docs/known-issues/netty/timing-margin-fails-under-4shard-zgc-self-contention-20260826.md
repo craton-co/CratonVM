@@ -51,6 +51,32 @@ Its second failure this run,
 `testNewTimeoutShouldStopThrowingRejectedExecutionExceptionWhenExistingTimeoutIsExecuted`
 timing out after 3000ms, fits this contention bucket instead.)
 
+## Update 2026-08-27: three of these reproduced again on a quiet host — not contention after all
+
+Retested this run's full non-passing set on a quiet single-shard host
+(2026-08-27, twice, including after a fresh `dev` rebuild). Most of this page's
+rows did NOT reproduce (genuinely contention, as this page guessed). Three did,
+consistently:
+
+- **`util.ResourceLeakDetectorTest.testConcurrentUsage`** — this is the
+  already-known "slow, not hung" throughput characteristic
+  (`resourceleakdetector-concurrentusage-is-slow-not-hung-CLOSED-20260817.md`),
+  not contention. The 60s timeout in this test is just tight enough that any
+  slowdown — contended host OR the VM's own baseline throughput — pushes it
+  over.
+- **`util.RecyclerTest`** (`testThreadCanBeCollectedEvenIfHandledObjectIsReferenced`)
+  — reproduces on a quiet host too. Not yet root-caused beyond that; the
+  original guess (GC-timing-sensitive test, plausible contention) is no longer
+  supported by the evidence and this needs its own look.
+- **`test.udt.nio.NioUdtByteRendezvousChannelTest.basicEcho`** — reproduces on a
+  quiet host too (byte-count mismatch, ~98% of expected data transferred). Also
+  not yet root-caused beyond the original report.
+
+Treat these three as **not** contention-explained any more; they need
+individual investigation. The rest of the table's rows are unaffected by this
+update — they were not re-tested and the original caveat below still applies to
+them.
+
 ## Caveat — this is a pattern, not 17 individual confirmations
 
 None of these were re-run in isolation on a quiet host this session, so this

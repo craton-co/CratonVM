@@ -1609,9 +1609,56 @@ pub unsafe fn read_value_atomic(slot: *const Value) -> Value {
 /// `slot` must be a valid, 8-byte-aligned pointer to a 16-byte `Value` slot.
 #[inline]
 pub unsafe fn write_value_atomic(slot: *mut Value, value: Value) {
-    let [w0, w1] = std::mem::transmute::<Value, [u64; 2]>(value);
+    let [w0, w1] = value_words(value);
     (*(slot as *const AtomicU64)).store(w0, Ordering::Relaxed);
     (*((slot as *const u8).add(8) as *const AtomicU64)).store(w1, Ordering::Relaxed);
+}
+
+/// The two 64-bit words a [`Value`] occupies in a 16-byte cell, with every byte
+/// the variant does not use written as **zero**.
+///
+/// # Why this is not `transmute::<Value, [u64; 2]>`
+///
+/// `Value` is `repr(u32)` with a 32-bit payload at byte 4 and a 64-bit payload
+/// at byte 8, so a narrow variant — `Int`, `Float`, `ReturnAddress`,
+/// `Uninitialized` — leaves bytes 8..16 as **padding**. Transmuting the whole
+/// value reads that padding: formally UB (a `transmute` out of a type with
+/// padding produces uninitialised bytes), and in practice whatever the caller's
+/// stack temp happened to hold. `write_value_atomic` then commits those bytes
+/// to the cell's `FIELD_CELL_PAYLOAD64_OFFSET` word.
+///
+/// That word is not inert. It is the word a compiled reference `getfield`
+/// **dereferences**: the inline arm loads the cell's 8-byte payload and uses it
+/// as the object pointer. The VM's own containment argument for a primitive
+/// that lands in a declared-reference slot (the G30-1 species) is that the
+/// payload word is zero — "a reference field of a freshly allocated object,
+/// whose cell is still zero-filled and so decodes as `Int(0)` — that word is 0,
+/// i.e. the correct null, by accident" (`jit_getfield_impl`). Garbage padding
+/// is exactly what turns that benign null into a wild pointer, and it is why a
+/// punned `SQLChar.rawData` cell was reported as `tag=0 payload32=0x1
+/// payload64=0x1` rather than `payload64=0x0`, and why the compiled
+/// `arraylength` that followed faulted at `addr=0x5` instead of throwing
+/// NullPointerException
+/// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
+///
+/// Zeroing the unused half does not make a punned store correct — it makes it
+/// **contained and diagnosable**, which is what every other reader on this path
+/// already assumes.
+#[inline]
+pub fn value_words(value: Value) -> [u64; 2] {
+    match value {
+        // Narrow variants: discriminant in the low half of word 0, the 32-bit
+        // payload in the high half, word 1 explicitly zero.
+        Value::Int(i) => [(i as u32 as u64) << 32, 0],
+        Value::Float(f) => [2u64 | ((f.to_bits() as u64) << 32), 0],
+        Value::ReturnAddress(a) => [5u64 | ((a as u64) << 32), 0],
+        Value::Uninitialized => [6, 0],
+        // Wide variants: the 64-bit payload IS word 1, and bytes 4..8 are the
+        // padding this time — zeroed for the same reason.
+        Value::Long(l) => [1, l as u64],
+        Value::Double(d) => [3, d.to_bits()],
+        Value::Object(o) => [4, o.map_or(0, |r| r.as_ptr() as u64)],
+    }
 }
 
 /// The largest valid discriminant of [`Value`] — the index of the last variant
@@ -1773,6 +1820,75 @@ mod tests {
             );
             assert!(disc <= VALUE_MAX_DISCRIMINANT);
         }
+    }
+
+    /// [`value_words`] agrees with the compiler's own layout for every byte
+    /// the variant actually USES, and writes zero for every byte it does not.
+    ///
+    /// Asserted as a round trip through the real reader rather than against a
+    /// hand-written byte pattern: a hand-written pattern would re-state the
+    /// layout this file already pins in `value_discriminant_is_byte0_low32`,
+    /// and would pass even if `value_words` and `read_value_atomic` drifted
+    /// together. The round trip fails the moment they disagree.
+    #[test]
+    fn value_words_round_trips_through_the_atomic_reader() {
+        for v in [
+            Value::Int(i32::MIN),
+            Value::Int(1),
+            Value::Long(i64::MIN),
+            Value::Float(-0.0),
+            Value::Double(f64::NAN),
+            Value::Object(None),
+            Value::ReturnAddress(u32::MAX),
+            Value::Uninitialized,
+        ] {
+            let mut cell = value_words(v);
+            // SAFETY: `cell` is a 16-byte, 8-aligned buffer holding the words
+            // `value_words` produced for a valid `Value`.
+            let got = unsafe { read_value_atomic(cell.as_mut_ptr() as *const Value) };
+            match (v, got) {
+                // NaN is not `==` itself, so compare the bit pattern.
+                (Value::Double(a), Value::Double(b)) => assert_eq!(a.to_bits(), b.to_bits()),
+                (Value::Float(a), Value::Float(b)) => assert_eq!(a.to_bits(), b.to_bits()),
+                _ => assert_eq!(got, v, "value_words({v:?}) did not round-trip"),
+            }
+        }
+    }
+
+    /// The invariant the containment argument rests on: a **narrow** variant
+    /// leaves the cell's 64-bit payload word — the word a compiled reference
+    /// `getfield` dereferences — as a hard zero, not as stack padding.
+    ///
+    /// Written against a deliberately DIRTIED destination, because that is the
+    /// failure this pins: `transmute::<Value, [u64; 2]>` propagated whatever
+    /// the caller's temp held into `FIELD_CELL_PAYLOAD64_OFFSET`, so a cell
+    /// that already held a pointer-shaped word could keep it under an `Int`
+    /// tag. Zero here is what turns a punned slot into a benign null instead of
+    /// a wild pointer.
+    #[test]
+    fn narrow_variants_zero_the_payload64_word() {
+        for v in [
+            Value::Int(1),
+            Value::Int(-1),
+            Value::Float(1.0),
+            Value::ReturnAddress(9),
+            Value::Uninitialized,
+        ] {
+            let mut cell: [u64; 2] = [0xDEAD_BEEF_DEAD_BEEF, 0xCAFE_F00D_CAFE_F00D];
+            // SAFETY: `cell` is a 16-byte, 8-aligned writable buffer.
+            unsafe { write_value_atomic(cell.as_mut_ptr() as *mut Value, v) };
+            assert_eq!(
+                cell[1], 0,
+                "{v:?} left the payload64 word non-zero — a compiled reference \
+                 getfield would dereference {:#x}",
+                cell[1]
+            );
+        }
+        // And the wide variants still carry their payload in that word.
+        let mut cell: [u64; 2] = [0, 0];
+        // SAFETY: as above.
+        unsafe { write_value_atomic(cell.as_mut_ptr() as *mut Value, Value::Long(0x1234_5678)) };
+        assert_eq!(cell[1], 0x1234_5678);
     }
 
     #[test]

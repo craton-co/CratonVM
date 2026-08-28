@@ -41,6 +41,97 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
     std::sync::atomic::AtomicUsize::new(0),
 ];
 
+/// The largest slot index any receiver this file builds actually has. Nothing
+/// here allocates a wide object; `make_object` is called with at most a handful
+/// of fields.
+const STUB_MAX_FIELD_SLOT: i64 = 64;
+
+/// Faults recorded by the helper stubs below, as human-readable lines.
+///
+/// A stub is an `extern "C"` fn, so a panic inside one CANNOT unwind: it aborts
+/// the process. That is not a test failure, it is the loss of every test after
+/// it in the file — which is exactly what happened here (see
+/// [`stub_field_slot`]). So a stub never panics and never indexes with a value
+/// it has not checked; it records the fault, returns a benign answer, and lets
+/// the calling test's own assertion fail with a real message. The recorded line
+/// is what says WHY.
+fn stub_faults() -> &'static std::sync::Mutex<Vec<String>> {
+    static FAULTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Decode a field-helper slot argument, or record a fault and answer `None`.
+///
+/// # The decode
+///
+/// `jit_getfield`'s third argument is a slot index PLUS the flag bits in
+/// `GETFIELD_FLAG_BITS` — `GETFIELD_RECEIVER_PROVEN_OOP` (bit 62) and, since
+/// 2026-08-23, `GETFIELD_EXPECT_REFERENCE` (bit 61). A stub is a test double
+/// for that helper and has to decode its argument the same way, through the one
+/// decoder `cratonvm_jit_api::getfield_index_of`.
+///
+/// Missing that strip is what made
+/// `ir_vs_singlepass_reference_putfield_then_getfield` abort the whole test
+/// binary: `getfield_index_arg` sets `GETFIELD_EXPECT_REFERENCE` on the
+/// REFERENCE path only, so every int test in this file passed while the one
+/// reference read arrived with `idx = 0x2000_0000_0000_0000` and
+/// `idx as usize * SLOT_SIZE` overflowed. The identical defect had already been
+/// found and fixed in `jit/src/x64/tests.rs`'s `stub_getfield` four days
+/// earlier; this file's twin was not updated with it.
+///
+/// # The bound
+///
+/// Stripping alone would have turned that abort into a wrong answer rather than
+/// a crash, which is better but still not a diagnosis. The bound is what makes
+/// a future bad argument REPORT itself: anything outside `0..STUB_MAX_FIELD_SLOT`
+/// is a fault, not an address.
+fn stub_field_slot(who: &str, raw: i64) -> Option<usize> {
+    if let Some(idx) = decode_field_slot(raw) {
+        return Some(idx);
+    }
+    let idx = cratonvm_jit_api::getfield_index_of(raw);
+    if let Ok(mut faults) = stub_faults().lock() {
+        faults.push(format!(
+            "{who}: slot argument {raw:#x} decodes to {idx}, which is not a field slot \
+             (0..{STUB_MAX_FIELD_SLOT}). If a new flag bit joined GETFIELD_FLAG_BITS, \
+             `cratonvm_jit_api::getfield_index_of` is the one place that has to learn it."
+        ));
+    }
+    None
+}
+
+/// The pure half of [`stub_field_slot`]: decode and bounds-check, no recording.
+///
+/// Split out so it can be tested directly — the fault list is process-wide and
+/// the harness runs tests in parallel threads, so a test that deliberately
+/// provoked a recording could clear another test's list.
+fn decode_field_slot(raw: i64) -> Option<usize> {
+    let idx = cratonvm_jit_api::getfield_index_of(raw);
+    (0..STUB_MAX_FIELD_SLOT)
+        .contains(&idx)
+        .then_some(idx as usize)
+}
+
+/// Fail the calling test if any stub recorded a fault, and clear the list.
+///
+/// Call this from a test that drives the field helpers. It turns "the stub was
+/// handed something it could not use" into a named assertion failure at the
+/// point of use, instead of a wrong value the test then reports as a backend
+/// divergence — or, before the bound existed, a process abort.
+#[track_caller]
+fn assert_no_stub_faults() {
+    let taken: Vec<String> = match stub_faults().lock() {
+        Ok(mut faults) => std::mem::take(&mut *faults),
+        Err(_) => return,
+    };
+    assert!(
+        taken.is_empty(),
+        "a JIT runtime-helper stub was handed an argument it could not decode:\n  {}",
+        taken.join("\n  "),
+    );
+}
+
 /// `jit_getfield` for this harness's synthetic receivers, which use the LEGACY
 /// uniform layout (`HEADER_SIZE + field_index * SLOT_SIZE`) that `make_object`
 /// writes — see `compile_opt_fields`: "no registered CompactLayout for this
@@ -54,8 +145,10 @@ unsafe extern "C" fn legacy_getfield(_vm: i64, obj: i64, idx: i64) -> i64 {
     if obj == 0 {
         return 0;
     }
-    let at = (obj as *const u8)
-        .add(HEADER_SIZE + idx as usize * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
+    let Some(idx) = stub_field_slot("legacy_getfield", idx) else {
+        return 0;
+    };
+    let at = (obj as *const u8).add(HEADER_SIZE + idx * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
     std::ptr::read_unaligned(at as *const i32) as i64
 }
 
@@ -69,7 +162,10 @@ unsafe extern "C" fn legacy_putfield_int(obj: i64, idx: i64, val: i64) {
     if obj == 0 {
         return;
     }
-    let base = (obj as *mut u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE);
+    let Some(idx) = stub_field_slot("legacy_putfield_int", idx) else {
+        return;
+    };
+    let base = (obj as *mut u8).add(HEADER_SIZE + idx * SLOT_SIZE);
     std::ptr::write_unaligned(base as *mut u32, 0);
     std::ptr::write_unaligned(base.add(FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32, val as i32);
     std::ptr::write_unaligned(base.add(8) as *mut u64, 0);
@@ -2041,7 +2137,10 @@ unsafe extern "C" fn legacy_getfield_ref(_vm: i64, obj: i64, idx: i64) -> i64 {
     if obj == 0 {
         return 0;
     }
-    let at = (obj as *const u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE + 8);
+    let Some(idx) = stub_field_slot("legacy_getfield_ref", idx) else {
+        return 0;
+    };
+    let at = (obj as *const u8).add(HEADER_SIZE + idx * SLOT_SIZE + 8);
     std::ptr::read_unaligned(at as *const i64)
 }
 
@@ -2059,7 +2158,13 @@ unsafe extern "C" fn legacy_putfield_object(_vm: i64, obj: i64, idx: i64, val: i
     if obj == 0 {
         return;
     }
-    let base = (obj as *mut u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE);
+    // No decode here: `jit_putfield_object`'s index argument carries no flag
+    // bits (there is no `putfield_index_arg`), so this is a plain slot. The
+    // bound is still checked — see `stub_field_slot`.
+    let Some(idx) = stub_field_slot("legacy_putfield_object", idx) else {
+        return;
+    };
+    let base = (obj as *mut u8).add(HEADER_SIZE + idx * SLOT_SIZE);
     std::ptr::write_unaligned(base as *mut u32, 4); // Value::Object tag
     std::ptr::write_unaligned(base.add(8) as *mut i64, val);
 }
@@ -2077,6 +2182,49 @@ fn read_ref_field(buf: &[u64], i: usize) -> i64 {
     let base = buf.as_ptr() as *const u8;
     // SAFETY: off + 8 is within the buffer by make_object's construction.
     unsafe { std::ptr::read_unaligned(base.add(off) as *const i64) }
+}
+
+/// A helper stub decodes `jit_getfield`'s slot argument the way the real helper
+/// does — flags stripped — and refuses anything that is not a slot instead of
+/// indexing with it.
+///
+/// This is the unit-level guard on the defect that aborted this whole test
+/// binary: `getfield_index_arg` sets `GETFIELD_EXPECT_REFERENCE` on the
+/// reference path, the stub multiplied the raw argument by `SLOT_SIZE`, and
+/// `0x2000_0000_0000_0000 * 16` overflows. Every int test in the file passed
+/// while the one reference read killed the process, because the flag is only
+/// set for references.
+#[test]
+fn a_stub_decodes_the_getfield_slot_argument_like_the_real_helper() {
+    // Every flag combination the encoder can produce must decode back to the
+    // slot. `receiver_proven_oop` is only encoded on the reference path, which
+    // is why the (false, true) row still decodes to a bare slot.
+    for slot in [0u32, 1, 7, 63] {
+        for is_ref in [false, true] {
+            for proven in [false, true] {
+                let arg = cratonvm_jit_api::getfield_index_arg(slot, is_ref, proven) as i64;
+                assert_eq!(
+                    decode_field_slot(arg),
+                    Some(slot as usize),
+                    "slot {slot} (is_ref={is_ref}, proven={proven}) must survive the round trip",
+                );
+            }
+        }
+    }
+
+    // The exact argument that used to abort the process: slot 0 with
+    // `GETFIELD_EXPECT_REFERENCE`. Decoding it is the difference between a
+    // read of field 0 and a multiply overflow.
+    let flagged = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
+    assert_eq!(flagged as u64, cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE);
+    assert_eq!(decode_field_slot(flagged), Some(0));
+
+    // And an argument that is not a slot at all is REFUSED rather than used.
+    // Before this, the stub indexed with it — inside an `extern "C"` fn, where
+    // the resulting panic cannot unwind and takes the process down.
+    assert_eq!(decode_field_slot(-1), None);
+    assert_eq!(decode_field_slot(STUB_MAX_FIELD_SLOT), None);
+    assert_eq!(decode_field_slot(i64::MAX), None);
 }
 
 /// The COV-03 differential: `static Object setget(Corpus o, Object v) { o.r = v;
@@ -2129,6 +2277,10 @@ fn ir_vs_singlepass_reference_putfield_then_getfield() {
         };
         let (r_sp, cell_sp) = run(&sp);
         let (r_ir, cell_ir) = run(&ir);
+        // Before the divergence assertions: a stub that could not decode its
+        // argument answers 0, which would otherwise be reported as "the IR tier
+        // returned null" — the wrong defect.
+        assert_no_stub_faults();
         assert_eq!(
             r_ir, r_sp,
             "ref_setget: returned reference DIVERGES for value={value:#x}: IR={r_ir:#x}, sp={r_sp:#x}",

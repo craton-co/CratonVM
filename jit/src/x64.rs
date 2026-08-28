@@ -206,7 +206,7 @@ mod driver;
 pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
-mod bytecode_walk;
+pub mod bytecode_walk;
 /// Test-only view of the E27-1 N2b compile-time needle screen.
 ///
 /// The screen decides which `String.indexOf(int)` sites the backend will
@@ -357,6 +357,26 @@ struct Compiler {
     /// `local_assignments` is final once `new` returns and is never mutated
     /// afterwards, so the plan cannot go stale.
     safepoint_publish: Option<super::regalloc::SafepointPublishPlan>,
+    /// One-shot, and TWO independent claims because the two registers are
+    /// published by different code:
+    ///
+    /// * `.0` — every Java argument of this call is in a frame slot, so
+    ///   `ARG_REGS` hold nothing that is not already published;
+    /// * `.1` — the site's own staging loop wrote through `RAX`, so RAX's last
+    ///   value is one of those staged arguments.
+    ///
+    /// The direct-call sites stage through `R11`, not RAX, so they claim `.0`
+    /// only — and only when `reserve_direct_call_service_slots` actually
+    /// reserved (`service_args_base.is_some()`); with no service slots the
+    /// arguments live in `ARG_REGS` and NOWHERE else, and the claim is false.
+    /// The dispatch and MIC/PIC sites stage through RAX and claim both, `.1`
+    /// only when `n > 0` so the loop really ran.
+    ///
+    /// Set ONLY by `emit_pre_safepoint_spill_args_published`, which calls the
+    /// spill immediately afterwards, and taken at the top of the spill — so
+    /// there is no path on which a claim survives into a later safepoint that
+    /// staged nothing. See `spill_args_published_enabled`.
+    args_published_for_next_spill: (bool, bool),
     /// Narrowed blind-spill selection captured at the safepoint that raised
     /// `sink_alloc_blind_spill`, as a bitmask over `ALL_SPILL_GPRS` positions
     /// (`None` = spill every register). The inline-TLAB `new` site splits its
@@ -2465,6 +2485,7 @@ impl Compiler {
             // which this constructor does not). `None` = conservative fallback.
             safepoint_publish: None,
             pending_narrow_spill: None,
+            args_published_for_next_spill: (false, false),
             osr_block_live_in,
             alloc_used_regs,
             xmm_assignments,
