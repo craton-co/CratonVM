@@ -274,15 +274,16 @@ fn maybe_dump_shutdown_reports() {
             "[cratonvm] invokevirtual sites pinned to a private target: {}",
             cratonvm_jit::private_invokevirtual_pinned()
         );
-        // ENGAGEMENT counter for tightening field resolution to the strict
-        // JVMS 5.4.3.2 answer. Resolution now asks for (name, descriptor) and
-        // only falls back to the historical name-only match when the hierarchy
-        // contains no such pair. A `0` here means the fallback could be
-        // deleted -- and `NoSuchFieldError` raised, as the spec says -- with no
-        // behaviour change at all on this workload.
+        // Fieldrefs whose (name, descriptor) pair exists nowhere in the
+        // hierarchy. Since 2026-08-28 each of these RAISES NoSuchFieldError,
+        // which is what JVMS 5.4.3.2 says; before it, each was answered by a
+        // same-named field of another type. The count is the same either way,
+        // so it stays comparable across the
+        // `CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` lever -- and a non-zero here
+        // on a workload that used to pass is the first place to look.
         // `CRATONVM_DBG_FIELD_DESCRIPTOR=1` names each one.
         eprintln!(
-            "[cratonvm] field resolutions that fell back from (name, descriptor)              to name-only: {}",
+            "[cratonvm] fieldrefs with no (name, descriptor) match in the hierarchy              (now NoSuchFieldError): {}",
             cratonvm_vm::runtime::resolve::field_resolution_descriptor_fallbacks()
         );
         // And the number that says whether applying the descriptor CHANGED an

@@ -881,6 +881,11 @@ pub const INVENTORY: &[E] = &[
     // resolver declined. Declared so the arm can be spelled, and so that
     // `flags` reports it as SET when somebody leaves it on by accident.
     E { group: Group::JIT, token: "unresolved-field-substitute", on_key: Some("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE"), off_key: None, off_word: None },
+    // A/B lever, never a supported configuration: restore the pre-2026-08-28
+    // LENIENT field resolution, which answered a fieldref whose (name,
+    // descriptor) pair is absent with a same-named field of another type
+    // instead of raising NoSuchFieldError (JVMS 5.4.3.2).
+    E { group: Group::VM, token: "field-resolution-name-only", on_key: Some("CRATONVM_FIELD_RESOLUTION_NAME_ONLY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-inline-mega", on_key: Some("CRATONVM_JIT_SP_INLINE_MEGA"), off_key: None, off_word: None },

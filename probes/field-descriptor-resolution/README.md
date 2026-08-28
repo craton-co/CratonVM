@@ -30,6 +30,22 @@ the punned-cell containment path, so the defect surfaced as "this reference
 cannot be null" — the same species as the two known-issue pages closed the same
 day.
 
+## The other half: the pair is absent
+
+`StrictMain` + `Cv1.java` / `Cv2.java` build the case where the recorded
+`(name, descriptor)` exists **nowhere**: compiled against a `C` declaring
+`Object x`, run against a `C` whose `x` is an `int`. JVMS §5.4.3.2 makes that a
+`NoSuchFieldError`.
+
+| | result |
+|---|---|
+| HotSpot 25 | `NoSuchFieldError` |
+| CratonVM before 2026-08-28 | resolved to `C.x:I` and read an int through a reference field |
+| CratonVM after | `NoSuchFieldError` |
+
+`CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` restores the lenient answer, for a
+single-binary A/B.
+
 ## Run
 
 ```bash
@@ -39,6 +55,14 @@ JDK=/path/to/jdk-25
 "$JDK/bin/javac" -cp v1c -d v2c Bv2.java && cp v1c/A.class v2c/A.class
 "$JDK/bin/java"      -cp "mainc:v2c" Main     # oracle
 <cratonvm> --java-home "$JDK" -cp "mainc:v2c" Main
+
+# the strict half
+"$JDK/bin/javac" -d c1c Cv1.java
+"$JDK/bin/javac" -cp c1c -d smainc StrictMain.java
+"$JDK/bin/javac" -d c2c Cv2.java
+"$JDK/bin/java"      -cp "smainc:c2c" StrictMain   # oracle
+<cratonvm> --java-home "$JDK" -cp "smainc:c2c" StrictMain
+CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1 <cratonvm> ... StrictMain   # the old answer
 ```
 
 `Bv1.java` and `Bv2.java` both declare `class B`; compile them into the separate

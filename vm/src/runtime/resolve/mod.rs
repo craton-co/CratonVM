@@ -625,6 +625,37 @@ pub fn field_resolution_descriptor_fallbacks() -> u64 {
 pub static FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` — restore the pre-2026-08-28 lenient
+/// answer: when no field of the constant pool's (name, descriptor) pair exists
+/// anywhere in the hierarchy, return a same-named field of another type instead
+/// of raising `NoSuchFieldError`.
+///
+/// # Why a lever on a conformance fix
+///
+/// Strictness is what JVMS §5.4.3.2 says, and the measurement that justified
+/// turning it on is [`FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS`] reading **0**
+/// across the regression suite, seven `TechEmpowerTest` runs and sixty
+/// hibernate-reactive classes — i.e. the lenient path was never taken, so
+/// deleting it changed nothing that was measured.
+///
+/// What that measurement cannot cover is every classpath. This VM substitutes
+/// and synthesises JDK classes, and a substituted class whose field descriptor
+/// differs from the one an application was compiled against would now throw
+/// where it used to limp. When that happens the symptom is a hard
+/// `NoSuchFieldError` naming the field, which is diagnosable — but the lever is
+/// here so a bisect can prove it in one binary rather than by rebuilding, and
+/// so a workload blocked by it has a way to run while the real fix is made.
+///
+/// It is not a supported configuration: arming it restores a resolution that
+/// can hand compiled code one field's slot index under another field's type
+/// tag.
+fn field_resolution_name_only_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_FIELD_RESOLUTION_NAME_ONLY").is_some()
+    })
+}
+
 /// Snapshot of [`FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS`].
 pub fn field_resolution_descriptor_corrections() -> u64 {
     FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS.load(std::sync::atomic::Ordering::Relaxed)
@@ -1218,23 +1249,32 @@ impl<'a> MemberResolver<'a> {
                 }
             })
             .or_else(|| {
-                let name_only = find_field_recursive(owner_id, field_name, cm.class_store());
-                if name_only.is_some() {
-                    FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_DESCRIPTOR")
-                        .is_some()
-                    {
-                        tracing::warn!(
-                            target: "cratonvm::resolve",
-                            owner = owner_name,
-                            field = field_name,
-                            wanted_descriptor = d,
-                            "no field of this name and descriptor exists in the hierarchy;                              falling back to the name-only match this VM used before                              2026-08-27",
-                        );
-                    }
+                // No field of this name AND descriptor anywhere in the
+                // hierarchy. JVMS §5.4.3.2 makes that a `NoSuchFieldError`, and
+                // that is what this now raises — `None` here reaches the
+                // `NoSuchField` arm below.
+                //
+                // Counted either way, so the two arms of the lever produce
+                // comparable numbers: this is the count of resolutions that
+                // USED to be answered by a same-named field of another type.
+                FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_DESCRIPTOR").is_some()
+                {
+                    tracing::warn!(
+                        target: "cratonvm::resolve",
+                        owner = owner_name,
+                        field = field_name,
+                        wanted_descriptor = d,
+                        lenient = field_resolution_name_only_fallback(),
+                        "no field of this name and descriptor exists in the hierarchy",
+                    );
                 }
-                name_only
+                if field_resolution_name_only_fallback() {
+                    find_field_recursive(owner_id, field_name, cm.class_store())
+                } else {
+                    None
+                }
             }),
             None => find_field_recursive(owner_id, field_name, cm.class_store()),
         };
