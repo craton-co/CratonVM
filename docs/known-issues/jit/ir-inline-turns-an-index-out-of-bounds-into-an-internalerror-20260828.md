@@ -3,7 +3,7 @@
 ## Status
 
 **OPEN, 2026-08-28, and it blocks the flag's default-on flip.** Found by the
-gauntlet soak (`docs/internal/performance/ir-inline-gauntlet-soak-20260828.md`).
+gauntlet soak (`performance/ir-inline-gauntlet-soak-20260828.md`).
 
 Deterministic — 5 reps per arm, serial, one binary, nothing but the flag
 changing:
@@ -101,5 +101,5 @@ three-`getByte` accessor, which is exactly the shape the inliner admits.
 
 ## Related
 
-- `docs/internal/performance/ir-inline-gauntlet-soak-20260828.md` — the soak
+- `performance/ir-inline-gauntlet-soak-20260828.md` — the soak
 - `docs/jit/ir-tier-inlining.md` — the design note, its admission set and opens
