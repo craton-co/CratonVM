@@ -174,10 +174,21 @@ it separated "this change is neutral" (A 5.54/6.36/5.49 s user against B
 
 Contention does not merely blur these numbers, it **changes the verdict**.
 `LengthAwareLzfIntegrationTest` sits just under netty's 120 s per-method
-timeout, and one run taken while two other sessions were each holding a core at
-100 % reported `143 s ok=10 failed=1` — a PASS turned into a FAIL. Three repeats
-of the identical binary: 107 s `ok=11`, 115 s `ok=11`, 105 s `ok=11`. Check
-`uptime` and `ps aux --sort=-%cpu` before recording any row in the table below.
+timeout, so load walks it across the line. One binary, one host, four runs:
+
+| 1-min load | wall | verdict |
+|---:|---:|---|
+| 3.30 | 107 s | `ok=11 failed=0` |
+| 4.56 | 115 s | `ok=11 failed=0` |
+| ~6 | 143 s | `ok=10 failed=1` |
+| 7.80 | 170 s | `ok=10 failed=1` |
+
+Monotonic in the load, and it crosses netty's 120 s method timeout between the
+second row and the third. Two of those runs would have been recorded as a
+regression in whatever landed just before them. Check `uptime` AND
+`ps aux --sort=-%cpu` — the competing load here was two other sessions running
+their own `cratonvm` binaries, which a load average alone does not attribute —
+before recording any row in the table below.
 
 | class | wall | |
 |---|---:|---|
