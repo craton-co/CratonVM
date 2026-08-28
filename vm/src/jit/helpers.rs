@@ -7281,7 +7281,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // payload of whatever `Value` variant the slot holds, and a reference field
     // punned to a primitive becomes a wild pointer.
     let expect_ref = raw & cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE != 0;
-    let field_index = (raw & !cratonvm_jit_api::GETFIELD_FLAG_BITS) as i64;
+    let field_index = cratonvm_jit_api::getfield_index_of(field_index);
     jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop, expect_ref)
 }
 
