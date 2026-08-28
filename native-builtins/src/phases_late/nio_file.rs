@@ -21081,7 +21081,13 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         sfv,
         "visitFileFailed",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        |ctx, args| match args.get(1) {
+        // ARGUMENT INDEX. `args[0]` is the RECEIVER, so the `IOException` is
+        // `args[2]`, not `args[1]`. The first version of this read `args[1]`
+        // and therefore threw the PATH -- a `java/nio/file/Path` handed to the
+        // interpreter as a Throwable, which surfaced as
+        // `Exception in thread "main" java/nio/file/Path` with no message and
+        // no stack frames, and killed the probe 79 rows before its end.
+        |ctx, args| match args.get(2) {
             Some(Value::Object(Some(exc))) => Err(MethodCallFailed::ExceptionThrown(*exc)),
             _ => {
                 let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
@@ -21093,7 +21099,13 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         sfv,
         "postVisitDirectory",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        |ctx, args| match args.get(1) {
+        // ARGUMENT INDEX. `args[0]` is the RECEIVER, so the `IOException` is
+        // `args[2]`, not `args[1]`. The first version of this read `args[1]`
+        // and therefore threw the PATH -- a `java/nio/file/Path` handed to the
+        // interpreter as a Throwable, which surfaced as
+        // `Exception in thread "main" java/nio/file/Path` with no message and
+        // no stack frames, and killed the probe 79 rows before its end.
+        |ctx, args| match args.get(2) {
             Some(Value::Object(Some(exc))) => Err(MethodCallFailed::ExceptionThrown(*exc)),
             _ => {
                 let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;

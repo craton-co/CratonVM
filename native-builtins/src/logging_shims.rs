@@ -1042,6 +1042,19 @@ fn native_printstream_init_outputstream(
     }
     ctx.set_field(this, 0, out_val.clone());
     ctx.set_field_by_name(this, "out", out_val);
+    // STORE `autoFlush`. This native serves BOTH the one- and the two-argument
+    // constructor, and it never wrote the flag — so `new PrintStream(sink,
+    // true)` produced a stream whose `autoFlush` field stayed null and whose
+    // autoflush therefore never fired, however faithfully the write path
+    // consulted it. MEASURED: HotSpot flushed the sink once per `print` and
+    // once per `println`; this VM never flushed at all, so a line protocol
+    // written through `new PrintStream(socket.getOutputStream(), true)` sat in
+    // the buffer until something else happened to flush it.
+    //
+    // The one-argument form is `this(false, out)`, so an absent third argument
+    // means false — which is also what the field already held.
+    let auto_flush = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    ctx.set_field_by_name(this, "autoFlush", Value::Int(i32::from(auto_flush)));
     if let Ok(Some(Value::Object(Some(lock_ref)))) = ctx.new_object("java/lang/Object") {
         ctx.set_field_by_name(this, "lock", Value::Object(Some(lock_ref)));
     }
