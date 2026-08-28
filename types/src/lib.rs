@@ -98,7 +98,8 @@ pub use handle::{HandleScope, HandleStorage, RootedHandle};
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     element_type_tag_at, kind_tag_at,
-    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    object_kind_from_tag, primitive_array_kind_tags_byte,
+    ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
     GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
@@ -294,6 +295,27 @@ mod tests {
         // The last header field that had no named constant. `jit/src/x64.rs`
         // derived its own via `offset_of!` and `vm/src/jit/helpers.rs` still
         // writes a bare `raw_ptr.add(8)`; both should use this.
+
+        // The JIT's inline `checkcast` fast path bakes this byte as an
+        // immediate, so the packing it assumes is asserted here rather than
+        // trusted: `kind` in bits 0..1, `element_type` in bits 2..5, bits 6..7
+        // reserved zero. A `byte[]` is 0x21 and nothing else is.
+        assert_eq!(primitive_array_kind_tags_byte("[B"), Some(0x21));
+        assert_eq!(
+            primitive_array_kind_tags_byte("[I"),
+            Some(ObjectKind::Array as u8 | ((ArrayElementType::Int as u8) << 2)),
+        );
+        for d in ["[Z", "[C", "[F", "[D", "[B", "[S", "[I", "[J"] {
+            let tag = primitive_array_kind_tags_byte(d).expect(d);
+            assert_eq!(tag & KIND_TAG_BYTE_MASK, ObjectKind::Array as u8);
+            assert_eq!(tag & 0xC0, 0, "bits 6..7 are reserved zero: {d}");
+        }
+        // ONE dimension only. `[[B` holds references to `byte[]` objects, so
+        // its element type is `Reference` and this predicate must not claim it;
+        // reference arrays and plain classes have no answer here either.
+        for d in ["[[B", "[Ljava/lang/String;", "java/lang/String", "[", "", "B"] {
+            assert_eq!(primitive_array_kind_tags_byte(d), None, "{d}");
+        }
     }
 
     #[test]
