@@ -282,7 +282,7 @@ was one call that discovered there was nothing to do. The fix reads netty's
 `ReferenceCountedOpenSslEngine` — no Java, no allocation, no native — and keeps
 the method route for engines that have no such field. The underlying VM
 sensitivity is NOT fixed, only avoided at this call site, and is written up in
-`known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`.
+`nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`.
 
 **A note on the control that nearly hid this.** The first attempt to decide
 "pre-existing or regression" ran the pre-fix binary with
@@ -332,7 +332,7 @@ check the same property in two seconds and pass.
 the one real failure left in the class: **the same twelve invocations fail on
 the pre-fix and post-fix binaries**, HotSpot passes 48/48, and it installs its
 own trust manager so it never reaches the code this page changed. It has its own
-page: `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`.
+page: `nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`.
 
 **Scope of the inventory, stated rather than implied.** 707 of the class's
 3 992 cases were run to completion on a quiet host — 17 of its 19 methods, whole

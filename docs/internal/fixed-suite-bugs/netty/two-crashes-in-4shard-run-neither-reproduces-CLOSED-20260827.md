@@ -154,6 +154,55 @@ two reruns: **a `CRASH` row with zero bytes of output should be re-run with
 the class ends, so "no output" from it is not evidence about where the process
 got to — and both of this page's classes were misread that way once.
 
+## Second host: the same three answers on Linux (2026-08-28)
+
+Everything above was taken on the Windows host. The same three items were
+answered independently on Azure host 2 (Linux, ZGC, `dev` `90c4307ca`) while
+this page was being written, and every answer agrees. Recorded because the
+original 4-shard run was on Windows, and "it does not reproduce" is worth
+having from both supported hosts rather than one.
+
+**`NativeImageHandlerMetadataTest` — five runs, five clean `@@RESULT` lines.**
+
+| runs | rc | wall | stdout bytes | `@@RESULT` |
+|---|---:|---:|---:|---|
+| 1-5 | 1 | 9-11 s | 1386-1387 | present, every run |
+
+`found=1 started=1 ok=0 failed=1` every time. Zero crashes in five.
+
+**`BrotliIntegrationTest` — CPU sampled every 5 s for the whole run**, rather
+than as a before/after pair:
+
+```
+T+35s   Sl  95.0%    T+125s  Sl  98.3%    T+215s  Sl  99.0%
+T+65s   Sl  97.0%    T+155s  Sl  98.6%    T+230s  Sl  99.1%
+T+95s   Sl  97.6%    T+185s  Sl  98.8%    T+240s  Sl  99.1%
+```
+
+Continuously busy, never idle, for the entire window — the same conclusion as
+the 0.99-cores figure above, with the shape of the whole interval instead of
+its endpoints.
+
+`PerTestProgressRunner` gives the Linux timings behind it:
+
+| test | result | ms |
+|---|---|---:|
+| `testLargeRandom` | SUCCESSFUL | 1544 |
+| `testLongBlank` | SUCCESSFUL | 96 |
+| eight more (`testRegular`, `testSequential`, `testEmpty`, `testTwoBytes`, `testCompressible`, ...) | SUCCESSFUL | 19-35 each |
+| **`testHugeDecompress`** | **FAILED** | **238 437** |
+
+— 10 of 11 in under two seconds combined, the eleventh at 238 s, failing on
+netty's own `-Djunit.jupiter.execution.timeout.default=120s`. Faster than the
+Windows 406 s / 234 s, same shape.
+
+Five `CratonRunner` reruns at the harness's 180 s class cap straddle it, which
+is worth knowing before reading a suite row for this class: `rc=124` (HANG)
+three times, and `rc=1 ... ok=10 failed=1` twice at 174 s. **Never `CRASH`.**
+Whether this class reads as HANG or FAIL in a given suite run is decided by
+where 238 s of work lands against a 180 s cap under that run's load, not by
+anything about the class.
+
 ## Repro
 
 ```bash
