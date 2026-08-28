@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-500 tokens.
+501 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -288,6 +288,7 @@ export inherited from a parent shell.
 | `field-descriptor` | `CRATONVM_DBG_FIELD_DESCRIPTOR` |
 | `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
+| `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
 | `jit-field-sites` | `CRATONVM_DBG_JIT_FIELD_SITES` |
 | `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
