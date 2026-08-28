@@ -116,6 +116,8 @@ spring-suite/build/
 # output does not (the same rule `bench/` and `spring-suite/build/` already
 # have; `probes/` itself is tracked, so it needs its own line).
 probes/out/
+# A second probe build dir, so two branches' probe classes cannot collide.
+probes/out-funnel/
 # `VoxelAlloc2`'s nested classes compile to `VoxelAlloc2$*.class`, which the
 # `probes/*.class` line below does not cover once they are put in their own
 # output directory (the probe's doc comment uses `-d probes/voxout`).

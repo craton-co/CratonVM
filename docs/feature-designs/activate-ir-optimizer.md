@@ -56,10 +56,18 @@ Defaults are decided at the **read site**, not in `types/src/flag_groups.rs`
 
 ## What is not built yet
 
-- **Guard-surviving scalar replacement is default-off.** The producer exists
-  behind `CRATONVM_SCALAR_DEOPT` (which also needs `CRATONVM_DEOPT_REAL`), and
-  it additionally refuses monitor-bearing graphs — `FrameState` in
-  `jit/src/ir_lower.rs` hard-codes `monitors: Vec::new()`.
+- **Guard-surviving scalar replacement is default-off, and SOAKED default-off
+  on purpose.** The producer exists behind `CRATONVM_SCALAR_DEOPT` (which also
+  needs `CRATONVM_DEOPT_REAL`), and it additionally refuses monitor-bearing
+  graphs — `FrameState` in `jit/src/ir_lower.rs` hard-codes
+  `monitors: Vec::new()`, and `can_deopt_resume` is gated on the graph holding
+  no `Op::MonitorEnter`/`Op::MonitorExit`, so that omission cannot be reached.
+  The 2026-08-27 gauntlet soak
+  (`docs/internal/performance/scalar-deopt-gauntlet-soak-20260827.md`) found the
+  flag green and **inert**: 30 392 allocation-bearing IR compiles across netty
+  and hibernate produced ZERO scalar replacements, so it emitted no descriptor
+  anywhere — including on the probe written to exercise it. Flipping it on that
+  evidence would record a soak that never ran the feature.
 - **Methods needing precise exception-handler frames never reach this tier.**
   The `!precise_exception_frames` clause in `jit/src/lib.rs` excludes them
   because the IR lowerer has no precise-handler-frame equivalent; they are
@@ -111,4 +119,4 @@ that already bit once.
   memory effects and exception edges.
 - **Checksum invariants**: every default flip must preserve bt18 = 68332206 and
   the kafka/keycloak/tomcat gauntlet baselines.
-
+
