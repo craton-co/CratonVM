@@ -18432,8 +18432,9 @@ pub fn register_essential_natives_with_shims(
     // which would skip both the monitor and the cache invalidation and put the
     // defect back with the registration gone.
     //
-    // HANDOFF-20260828-L2-strings.md; the measurement is in
-    // `docs/known-issues/jdk-only/`.
+    // The measurement is the retired `l2-strings-eighteen-defects-five-root-
+    // causes-and-the-writer-half` write-up; its three open residuals are the
+    // `l2-strings-residuals-the-migration-is-unpriced` page.
 
     // --- java.lang.StringUTF16 static helpers ---
     // `<clinit>` queries `isBigEndian()` to pick a byte order for its

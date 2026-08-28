@@ -24,7 +24,7 @@ LinkedList and TreeMap** — 102 value assertions in one deterministic run,
 diffable on stdout, needing no rebuild.
 
 **The StringBuilder/StringBuffer/AbstractStringBuilder cluster (176 rows) is
-deliberately excluded.** `WORKER-3-NOTE-3` already has it OPEN with a diagnosed
+deliberately excluded.** `WORKER-3-NOTE-3` already had it OPEN (**closed 2026-08-28 by lane L2**) with a diagnosed
 mechanism — armed across the three classes, every `append` was discarded and
 `toString()` returned empty with `rc=0`. Probing a family that is already under
 investigation would have re-derived a known answer. Reading the history first is

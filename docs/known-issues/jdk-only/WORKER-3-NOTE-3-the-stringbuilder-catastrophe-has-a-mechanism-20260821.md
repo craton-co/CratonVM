@@ -1,6 +1,25 @@
 # WORKER-3-NOTE-3 — the StringBuilder catastrophe, diagnosed to a mechanism, three of its causes fixed, and the one that is a VM project
 
-**Status: OPEN — MEASURED throughout.** WORKER 3, 2026-08-21, Linux build host,
+**Status: N1 CLOSED 2026-08-28. The rest still OPEN — MEASURED throughout.**
+
+> **N1 — the layout migration — is landed.** `sb_store_units` is the writer half
+> this note named: the payload that is already there decides the layout, so a
+> builder is never converted from one representation to the other and the torn
+> object §3 describes cannot be produced. The residual §3 named — the
+> `ArrayStoreException` from `arraycopy: can not copy byte[] into char[]` — is
+> gone with it, and three further defects nobody had connected to this note fell
+> out at the same time: `chars()`, `codePoints()` and `compareTo` read
+> `value`/`coder` directly and had been answering a LATIN1 truncation of every
+> character above U+00FF, and `writeObject` threw. MEASURED, 747 probe rows,
+> 0 differing lines against HotSpot jdk-25.0.4+7 in both modes. See the retired
+> `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up
+> and the open `l2-strings-residuals-the-migration-is-unpriced` page.
+>
+> **N2, N3, the six refusals of §4 and the §7 refusal of the `java.lang.invoke`
+> block are UNTOUCHED** and are why this page is still here. Read the body for
+> them; read this banner, not the body, for N1's status.
+
+**Original status line: OPEN — MEASURED throughout.** WORKER 3, 2026-08-21, Linux build host,
 clean builds of `22cb4338d` (control) and of this branch. Every arm below was
 run; nothing here is argued from a grep.
 

@@ -1005,8 +1005,47 @@ public class StringBuilderShadowSweep {
             b.append(b);
             return b;
         });
+        // Self-insertion through the `CharSequence` overload is the one place
+        // the JDK's in-place implementation is OBSERVABLE: `insert(int,
+        // CharSequence, int, int)` shifts the tail right and only THEN reads
+        // `s.charAt(...)`, so when `s` is the receiver every read sees the
+        // half-written array. The `setLength` row exists to show what that
+        // makes the answer depend on.
         p("builder insert itself", () -> {
             StringBuilder b = new StringBuilder("abc");
+            b.insert(1, b);
+            return b;
+        });
+        p("builder insert itself at 0", () -> {
+            StringBuilder b = new StringBuilder("abc");
+            b.insert(0, b);
+            return b;
+        });
+        p("builder insert itself at length", () -> {
+            StringBuilder b = new StringBuilder("abc");
+            b.insert(3, b);
+            return b;
+        });
+        p("builder insert itself window", () -> {
+            StringBuilder b = new StringBuilder("abcdef");
+            b.insert(2, b, 1, 3);
+            return b;
+        });
+        p("buffer insert itself", () -> {
+            StringBuffer b = new StringBuffer("abc");
+            b.insert(1, b);
+            return b;
+        });
+        // Does the answer read characters the builder had already discarded?
+        p("builder insert itself over discarded capacity", () -> {
+            StringBuilder b = new StringBuilder("abcdef");
+            b.setLength(2);
+            b.insert(1, b);
+            return b;
+        });
+        p("builder insert itself after a delete", () -> {
+            StringBuilder b = new StringBuilder("abcdef");
+            b.delete(2, 6);
             b.insert(1, b);
             return b;
         });

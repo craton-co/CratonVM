@@ -80,7 +80,8 @@ Same three reasons as the previous record, unchanged: 253 of the 379 rows here
 were never reached; agreement is not the retirement test (`StrictMath` is
 bit-identical and a KEEP); and the registrar's own history has to be read first
 — which is what kept the 176-row StringBuilder cluster out of both batches,
-since `WORKER-3-NOTE-3` already has it open with a diagnosed mechanism.
+since `WORKER-3-NOTE-3` already had it open with a diagnosed mechanism.
+**Closed 2026-08-28 by lane L2**, which took that note's N1 with it.
 
 ## Reproduce
 
