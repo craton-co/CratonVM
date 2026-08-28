@@ -1221,6 +1221,76 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `ByteBuffer.put(int,byte)` / `get(int)` and
+                    // `MessageDigest.update(byte)` — AT THIS DOOR TOO, and this
+                    // is the door that mattered.
+                    //
+                    // All three were bound in `try_compile_inner`'s ladder
+                    // first, and the binds moved NOTHING: `MessageDigest.
+                    // update(byte)` went 216 -> 195 ns and `ByteBuf.writeByte`
+                    // 700 -> 607, against an expected ~16x. The reason is the
+                    // one this file already states two arms up for
+                    // `reachabilityFence`: a hot LOOP body is compiled HERE, by
+                    // the OSR door, which runs its own callee-binding loop
+                    // rather than that ladder — and `testHugeDecompress` is one
+                    // loop, 268 million iterations, calling all three directly.
+                    //
+                    // Address taken directly rather than through the jit-crate
+                    // atomic, for the reason the arms above state: `build_helpers`
+                    // registers those cells only after this construction block.
+                    //
+                    // No `jdk_only` term here, matching every other arm at this
+                    // door — and it is not a hole: each helper asks
+                    // `jit_direct_helper_refused` on its own fast path and
+                    // declines to the generic dispatcher, which is policy-checked.
+                    if invoke_kind == 0
+                        && cratonvm_jit::nio_byte_direct_helpers_enabled()
+                        && target_class == "java/nio/ByteBuffer"
+                        && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
+                            || (mn == "get" && desc == "(I)B"))
+                    {
+                        let is_put = mn == "put";
+                        let entry = if is_put {
+                            crate::jit::helpers::jit_dbb_put_byte_direct as *const () as usize
+                        } else {
+                            crate::jit::helpers::jit_dbb_get_byte_direct as *const () as usize
+                        };
+                        cratonvm_jit::NIO_BYTE_ELEMENT_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: if is_put { 2 } else { 1 },
+                                return_type: if is_put { b'L' } else { b'I' },
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    if invoke_kind == 0
+                        && cratonvm_jit::md_update_direct_helper_enabled()
+                        && target_class == "java/security/MessageDigest"
+                        && mn == "update"
+                        && desc == "(B)V"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_md_update_byte_direct as *const () as usize;
+                        cratonvm_jit::MD_UPDATE_BYTE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     if invoke_kind == 3
                         && cratonvm_jit::census_direct_helpers_enabled()
                         && target_class == "java/lang/ref/Reference"
@@ -8424,6 +8494,47 @@ fn resolve_inline_site_from(
             && cratonvm_jit::ffm_kind_for_descriptor(target_desc).is_some()
         {
             no!("ffm-accessor-keeps-its-own-fast-path");
+        }
+        // THE SAME REFUSAL, THE SAME REASON, FOR EVERY OTHER CALL THAT HAS ITS
+        // OWN THIN DIRECT BIND.
+        //
+        // `try_compile_inner`'s direct-native ladder does not run inside a
+        // spliced body — `try_emit_inline_body`'s invoke arm lowers every call
+        // in one to an ordinary dispatch. The calls below are exactly the
+        // one-line wrappers an inliner takes every time
+        // (`PooledDirectByteBuf._setByte` is `memory.put(idx(index), value)`;
+        // `AbstractByteBuf.ensureAccessible` bottoms out in one `VarHandle`
+        // read), so splicing them converted each site from a ~10 ns helper back
+        // to the ~160 ns generic native funnel.
+        //
+        // MEASURED, on `JdkZlibIntegrationTest#testHugeDecompress`
+        // (`--dump-native-registry`, 369 s wall): **1.07 BILLION** funnel calls,
+        // every one of them a spliced site whose bind never got the chance to
+        // fire —
+        //
+        //     536 870 912  java/security/MessageDigest.update(B)V
+        //     269 768 030  java/lang/invoke/VarHandle.get(...)
+        //     268 435 456  java/nio/DirectByteBuffer.put(IB)...
+        //
+        // — against a `perf` profile that puts the funnel and its receiver
+        // validation at ~45 % of the whole run. The trade is ONE
+        // compiled-to-compiled call per operation for a ~16x funnel, and it is
+        // taken only for the exact triples the ladder actually binds, so every
+        // other call to these classes is inlined as before.
+        if matches!(opcode, 0xb6 | 0xb9)
+            && ((target_class == "java/nio/ByteBuffer"
+                && ((target_name == "put" && target_desc == "(IB)Ljava/nio/ByteBuffer;")
+                    || (target_name == "get" && target_desc == "(I)B")))
+                || (target_class == "java/security/MessageDigest"
+                    && target_name == "update"
+                    && target_desc == "(B)V")
+                || (target_class == "java/lang/invoke/VarHandle"
+                    && (cratonvm_jit::varhandle_read_helper_slot(target_name, target_desc)
+                        .is_some()
+                        || cratonvm_jit::varhandle_write_helper_slot(target_name, target_desc)
+                            .is_some())))
+        {
+            no!("thin-bound-native-keeps-its-own-fast-path");
         }
         // Receiver-included, one slot per parameter regardless of category —
         // the count `JitInvokeInfo::num_jit_args` carries and the count the

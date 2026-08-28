@@ -9986,6 +9986,141 @@ pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
 pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` thin direct-call binds.
+//
+// Census-driven, exactly like `Preconditions.checkIndex` above.
+// `--dump-native-registry` on `BufProbe` (netty's `ByteBuf.writeByte` /
+// `forEachByte` in a loop, the two operations
+// `AbstractIntegrationTest.testHugeDecompress` runs 268 million times each)
+// reports ONE `java/nio/DirectByteBuffer.put(IB)` per `writeByte` and one
+// `get(I)B` per byte read, both `bridge`:
+//
+//     5 242 880  java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;
+//     3 145 728  java/nio/DirectByteBuffer.get(I)B
+//
+// against a measured 700 ns/op for `writeByte` and 349 ns/op for
+// `forEachByte`, where HotSpot is 5.1 ns and 5.9 ns. `perf` puts
+// `safe_native_call_impl` + `try_jit_site_cached_native_dispatch` +
+// the argument marshalling + `is_object_address` at ~30 % of that profile:
+// the native bodies are a bounds check and a one-byte copy, and everything
+// else is the funnel around them.
+//
+// The site's constant-pool class is `java/nio/ByteBuffer` (netty's
+// `PooledDirectByteBuf.memory` is declared as one), so the bind uses
+// `direct_native_helper_for_impl`: the POLICY question has to be asked about
+// `java/nio/DirectByteBuffer`, which is where the native the helper stands in
+// for is registered. The helper declines any receiver whose class the funnel
+// has not already served with the modelled layout -- including every
+// `HeapByteBuffer` -- so a polymorphic site keeps today's behaviour on every
+// receiver the fast path was not proven for.
+pub static NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to the two `ByteBuffer` single-byte helpers.
+pub static NIO_BYTE_ELEMENT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Calls the thin helpers actually SERVED, and calls they DECLINED to the
+/// generic dispatcher.
+///
+/// A site count and a served count answer different questions, and the gap
+/// between them is where a fast path hides: `ByteBuffer.byteElement=2` with
+/// five million funnel invocations still in the census means the bind happened
+/// and the helper said no to every call. Timings cannot tell those apart.
+pub static NIO_BYTE_ELEMENT_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static NIO_BYTE_ELEMENT_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MD_UPDATE_BYTE_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(nio served, nio declined, md served, md declined)`.
+pub fn byte_element_helper_calls() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        NIO_BYTE_ELEMENT_SERVED.load(Relaxed),
+        NIO_BYTE_ELEMENT_DECLINED.load(Relaxed),
+        MD_UPDATE_BYTE_SERVED.load(Relaxed),
+        MD_UPDATE_BYTE_DECLINED.load(Relaxed),
+    )
+}
+
+/// Bound `ByteBuffer` single-byte element sites, for a census that can tell
+/// "the fast path was never installed" from "it was installed and is no
+/// faster" -- the distinction timings alone cannot make.
+pub fn nio_byte_element_sites() -> u64 {
+    NIO_BYTE_ELEMENT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_nio_bytebuffer_byte_direct_fns(put: usize, get: usize) {
+    NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN.store(put, std::sync::atomic::Ordering::Relaxed);
+    NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN.store(get, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `MessageDigest.update(byte)` thin direct-call bind.
+///
+/// The third rung of the same census. `testHugeDecompress` feeds SHA-256 a byte
+/// at a time 536 million times (268 M on the compress side, 268 M more through
+/// `ByteProcessor.process` on the decompress side) at 216 ns/call against
+/// HotSpot's 8.6 ns. `update` is FINAL on `MessageDigest`, so a provider's
+/// subclass cannot override it and the helper has to check the receiver itself
+/// — it serves only the exact class this VM's own `getInstance` builds, and
+/// declines everything else to the funnel, which forwards to `engineUpdate`.
+pub static MD_UPDATE_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sites bound to [`MD_UPDATE_BYTE_DIRECT_FN`].
+pub static MD_UPDATE_BYTE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound `MessageDigest.update(byte)` sites — the same "was it ever installed?"
+/// census [`nio_byte_element_sites`] exists for.
+pub fn md_update_byte_sites() -> u64 {
+    MD_UPDATE_BYTE_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_md_update_byte_direct_fn(addr: usize) {
+    MD_UPDATE_BYTE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0` — send every
+/// `MessageDigest.update(byte)` back through the generic native funnel.
+/// Default ON; the kill switch and B arm, as beside.
+pub fn md_update_direct_helper_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0` — send every `ByteBuffer`
+/// single-byte element access back through the generic native funnel. Default
+/// ON, so a KILL SWITCH and the B arm of a one-binary A/B, for the same reason
+/// `census-direct-helpers` and `long-box-direct-helpers` beside it have one.
+pub fn nio_byte_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
 /// Register the exact-HashMap thin direct-call helpers (called once from the
 /// VM's `build_helpers`).
 pub fn set_hashmap_put_direct_fn(addr: usize) {
@@ -20153,7 +20288,54 @@ fn try_compile_inner(
                             // compiled code was never asking.
                             || (cn == "java/lang/foreign/MemorySegment"
                                 && matches!(mn.as_str(), "getAtIndex" | "setAtIndex")
-                                && ffm_kind_for_descriptor(&desc).is_some());
+                                && ffm_kind_for_descriptor(&desc).is_some())
+                            // The single-BYTE `ByteBuffer` element accessors
+                            // and `MessageDigest.update(byte)`. Bound by their
+                            // own arm in the single-pass scan, for the same
+                            // reason the FFM row above is: they carry a
+                            // dispatch info for the decline edge, so
+                            // `try_resolve_intrinsic` does not name them and
+                            // this predicate has to.
+                            //
+                            // Found the same way, by the same instrument. With
+                            // the bind wired at two doors and the splice
+                            // refusing to swallow the site, `BufProbe` still
+                            // reported `ByteBuffer.byteElement=2` bound sites
+                            // against `served=1636` calls and 5 239 468 funnel
+                            // invocations in the native census: 1 636 is what a
+                            // single-pass compile serves BEFORE
+                            // `PooledDirectByteBuf._setByte` tiers up, and the
+                            // IR tier it tiers up to lowers the site to a plain
+                            // dispatch. A count that small next to a bound-site
+                            // count is the signature of this exact routing.
+                            || (nio_byte_direct_helpers_enabled()
+                                && cn == "java/nio/ByteBuffer"
+                                && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
+                                    || (mn == "get" && desc == "(I)B")))
+                            || (md_update_direct_helper_enabled()
+                                && cn == "java/security/MessageDigest"
+                                && mn == "update"
+                                && desc == "(B)V")
+                            // `VarHandle` read/write modes, bound at BOTH the
+                            // single-pass and OSR doors and lost at this one for
+                            // the same reason as the three rows above.
+                            //
+                            // MEASURED on `JdkZlibIntegrationTest#
+                            // testHugeDecompress` after the other three landed:
+                            // the census still showed **269 768 215**
+                            // `VarHandle.get` bridge invocations — one per
+                            // `ByteBuf.writeByte`, from the `RefCnt` read inside
+                            // `ensureAccessible` — while
+                            // `CRATONVM_DBG=jit-method-stats` reported
+                            // `VarHandle.read=2/0`. Two sites bound at the
+                            // single-pass door, none at OSR, and the tiny hot
+                            // accessor that holds the site tiering up to here.
+                            || (varhandle_read_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_read_helper_slot(&mn, &desc).is_some())
+                            || (varhandle_write_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_write_helper_slot(&mn, &desc).is_some());
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
@@ -23084,6 +23266,94 @@ fn try_compile_inner(
                                 // one 64-bit slot per value, not JVMS
                                 // category-2 pairs.
                                 return_type: b'J',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` — the
+                // per-BYTE element accessors. See
+                // `NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN` for the census that
+                // named them and for why the receiver test lives in the
+                // helper rather than in a `guard_class_id` here: the fast
+                // path serves only a class the FUNNEL has already served
+                // with the modelled layout, which is a fact this compile
+                // cannot know.
+                if direct_jit_callee_calls_enabled
+                    && nio_byte_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/nio/ByteBuffer"
+                    && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
+                        || (method_name == "get" && descriptor == "(I)B"))
+                {
+                    let is_put = method_name == "put";
+                    let entry = direct_native_helper_for_impl(
+                        if is_put {
+                            &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                        } else {
+                            &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                        },
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        "java/nio/DirectByteBuffer",
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        NIO_BYTE_ELEMENT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: if is_put { 2 } else { 1 },
+                                // `put` hands back the receiver, which the
+                                // return-value ladder must mark as an oop;
+                                // `get` returns a Java `byte`, which reaches
+                                // the operand stack sign-extended into an int
+                                // exactly as the registered native's
+                                // `Value::Int` does.
+                                return_type: if is_put { b'L' } else { b'I' },
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `MessageDigest.update(byte)` — see
+                // `MD_UPDATE_BYTE_DIRECT_FN`. `update` is FINAL on
+                // `MessageDigest`, so the site is statically monomorphic in the
+                // only sense that matters here: whatever the receiver's class,
+                // this method is the one that runs. Which receivers the fast
+                // path may SERVE is the helper's question, not this one's.
+                if direct_jit_callee_calls_enabled
+                    && md_update_direct_helper_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/security/MessageDigest"
+                    && method_name == "update"
+                    && descriptor == "(B)V"
+                {
+                    let entry = direct_native_helper(
+                        &MD_UPDATE_BYTE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        MD_UPDATE_BYTE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'V',
                                 guard_class_id: 0,
                             },
                         ));

@@ -14260,15 +14260,29 @@ unsafe fn varhandle_instance_field_read_bits(
     site_ret: u8,
     thread: Option<&mut JvmThread>,
 ) -> Option<i64> {
-    let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
-    let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
-    // The GC-stable key `vh_meta_get` files the handle under. Mirrors
-    // `NativeContextImpl::identity_hash_code`, including the displaced-hash
-    // consultation a thin-locked or inflated header needs.
+    // Both probes and the identity hash go through the per-epoch receiver memo.
+    // This helper serves 269 768 215 calls on
+    // `JdkZlibIntegrationTest#testHugeDecompress` — one per `ByteBuf.writeByte`,
+    // from the `RefCnt` read inside `ensureAccessible` — and it asked
+    // `is_object_address` TWICE and re-derived the handle's identity hash on
+    // every one of them. `ZObjectStarts::contains` + `is_object_address` were
+    // 10.3 % of that profile with every funnel already gone.
+    //
+    // The memo answers exactly what the two probes answered — "this address is
+    // a live object base in this GC epoch" — and its `identity` is computed by
+    // the same `java_identity_hash` arbitration this code used, so a thin-locked
+    // or inflated header still yields the displaced value `vh_meta_get` filed
+    // the handle under.
+    let (vh_class_id, key) = direct_receiver_facts(vm, vh_raw as usize)?;
+    if vh_class_id == 0 {
+        return None;
+    }
+    let (recv_class_id, _) = direct_receiver_facts(vm, recv_raw as usize)?;
+    if recv_class_id == 0 {
+        return None;
+    }
+    let receiver = ObjectRef::from_raw(recv_raw as usize as *mut u8);
     let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
     let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // Reference/primitive agreement between the variable and the call site.
     let site_is_ref = matches!(site_ret, b'L' | b'[');
@@ -15749,6 +15763,395 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
         &LONG_LONG_VALUE_INFO as *const JitInvokeInfo as i64,
         args.as_ptr() as i64,
         1,
+    )
+}
+
+/// A one-entry, per-thread memo of "the raw address `recv` holds a live object
+/// of class `class_id`", valid only inside one GC epoch.
+///
+/// # Why
+///
+/// `ZgcRealHeap::is_object_address` plus `ZObjectStarts::contains` measured
+/// **16 %** of `JdkZlibIntegrationTest#testHugeDecompress` once the funnel was
+/// off its three hot calls -- and the receiver it re-validates is the SAME
+/// object 268 million times running: one `MessageDigest`, one pooled
+/// `ByteBuffer` per megabyte chunk.
+///
+/// # Why the epoch is the whole safety argument
+///
+/// The hazard a memo has to answer is an address whose object died and whose
+/// storage was handed to something else. That cannot happen inside one epoch:
+/// an address occupied by a live object at memo time is not on any free list
+/// until a collection reclaims it, and every collection bumps
+/// `VmHeap::collection_count`. A memo from a previous epoch therefore never
+/// matches, and a moving collection is covered twice over -- the compiled
+/// frame's receiver is rewritten to the new address, which misses on `recv`
+/// as well.
+///
+/// Per-thread, so no lock and no cross-thread visibility question. A miss costs
+/// exactly what every call used to pay.
+#[derive(Clone, Copy)]
+struct DirectReceiverMemo {
+    recv: usize,
+    epoch: u64,
+    class_id: u32,
+    /// The `NativeContext`-compatible identity hash, so a helper keyed by it
+    /// (`MessageDigest.update`) does not re-derive one per call. Never `0` for
+    /// a filled entry: `java_identity_hash` refuses to hand back zero.
+    identity: i32,
+}
+
+/// FOUR entries, and the number is measured rather than chosen.
+///
+/// A ONE-entry memo removed nothing on the workload it was written for:
+/// `testHugeDecompress`'s inner loop alternates `in.writeByte(b)` with
+/// `digest.update(b)`, so consecutive calls arrive with two different receivers
+/// and a single slot thrashes on every one. `is_object_address` +
+/// `ZObjectStarts::contains` stayed at 15 % of the profile across the change.
+/// EIGHT, for the same reason four beat one. `testHugeDecompress`'s inner loop
+/// touches four distinct receivers per byte once the `VarHandle` read is on the
+/// memo too — the digest, the pooled `ByteBuffer`, the `RefCnt` the accessibility
+/// check reads, and the `VarHandle` itself — and the loop's other calls bring
+/// their own. Eight leaves headroom for that without the scan mattering: it is
+/// eight predictable compares against a probe that walks a sorted page index.
+const DIRECT_RECEIVER_MEMO_WAYS: usize = 8;
+
+thread_local! {
+    static DIRECT_RECEIVER_MEMO: std::cell::Cell<[DirectReceiverMemo; DIRECT_RECEIVER_MEMO_WAYS]> =
+        const {
+            std::cell::Cell::new(
+                [DirectReceiverMemo { recv: 0, epoch: 0, class_id: 0, identity: 0 };
+                    DIRECT_RECEIVER_MEMO_WAYS],
+            )
+        };
+    /// Round-robin victim for the memo above.
+    static DIRECT_RECEIVER_MEMO_NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `is_object_address` + `class_id_of` (+ the identity hash) for a thin direct
+/// helper's receiver, memoised per GC epoch. `None` means the address is not a
+/// live object base and the caller must decline.
+///
+/// # Safety
+/// `raw` is a receiver argument from JIT-compiled code; `vm` is live.
+#[inline]
+unsafe fn direct_receiver_facts(vm: &SharedVm, raw: usize) -> Option<(u32, i32)> {
+    let epoch = vm.mem.heap.collection_count();
+    let ways = DIRECT_RECEIVER_MEMO.with(std::cell::Cell::get);
+    for way in ways.iter() {
+        if way.recv == raw && way.epoch == epoch && way.class_id != 0 {
+            return Some((way.class_id, way.identity));
+        }
+    }
+    let object = vm.mem.heap.is_object_address(raw)?;
+    let class_id = vm.mem.heap.class_id_of(object).as_u32();
+    // The SAME key `NativeContextImpl::identity_hash_code` computes: the heap
+    // answer, then the monitor's displaced-hash arbitration. A locked object's
+    // mark word cannot hold a hash, so the heap answer alone is the wrong key
+    // for any side table the natives maintain.
+    let heap = &vm.mem.heap;
+    let identity = vm.threads.monitors.java_identity_hash(
+        object,
+        heap.identity_hash_code(object),
+        || heap.next_identity_hash(),
+    );
+    if class_id != 0 {
+        let slot = DIRECT_RECEIVER_MEMO_NEXT.with(|c| {
+            let i = c.get();
+            c.set((i + 1) % DIRECT_RECEIVER_MEMO_WAYS);
+            i
+        });
+        let mut updated = ways;
+        updated[slot] = DirectReceiverMemo {
+            recv: raw,
+            epoch,
+            class_id,
+            identity,
+        };
+        DIRECT_RECEIVER_MEMO.with(|c| c.set(updated));
+    }
+    Some((class_id, identity))
+}
+
+/// Synthetic call-site info for the `ByteBuffer` single-byte element helpers'
+/// DECLINE edge. `num_jit_args` counts the receiver, the way an instance
+/// site's does.
+static NIO_BYTEBUFFER_PUT_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/nio/ByteBuffer",
+    method_name: "put",
+    descriptor: "(IB)Ljava/nio/ByteBuffer;",
+    num_jit_args: 3,
+    return_type: b'L',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+static NIO_BYTEBUFFER_GET_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/nio/ByteBuffer",
+    method_name: "get",
+    descriptor: "(I)B",
+    num_jit_args: 2,
+    return_type: b'I',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+/// The shared prologue of both `ByteBuffer` single-byte helpers: prove the
+/// receiver is a direct buffer of a class the FUNNEL has already served with
+/// the modelled layout, and return the element's absolute address.
+///
+/// It reads the same three fields `native-io`'s `dbb_elem_addr` reads, through
+/// the same descriptor-aware accessor, in the same order, and refuses on the
+/// same conditions — a negative or out-of-limit index, a read-only carrier for
+/// a write, a non-positive address. That is deliberate duplication of a
+/// SEQUENCE, not of a LAYOUT: the three field indices come from
+/// `elem_fastpath::slots()`, which is what the native itself resolved, so
+/// there is no second copy of the layout to drift.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+unsafe fn dbb_direct_elem_addr(
+    vm: &SharedVm,
+    receiver: i64,
+    index: i64,
+    for_write: bool,
+) -> Option<i64> {
+    let raw = receiver as u64;
+    if (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+        return None;
+    }
+    let (address_slot, limit_slot, read_only_slot) =
+        cratonvm_native_io::direct_buffer::elem_fastpath::slots()?;
+    // The arena-membership probe, for the reason the `Long.longValue` twin
+    // states: nothing on this path has read the receiver's header yet, so it is
+    // the only thing between a fabricated argument and the field reads below.
+    // Memoised per GC epoch -- see `direct_receiver_facts`.
+    let (class_id, _identity) = direct_receiver_facts(vm, raw as usize)?;
+    if !cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served(class_id, for_write) {
+        return None;
+    }
+    // The memo proved this address is a live object base in this epoch, so the
+    // reference is reconstructible without a second probe -- the same step
+    // `jit_hashmap_get_direct` takes after its own exact-receiver screen.
+    let object = ObjectRef::from_raw(raw as usize as *mut u8);
+    // H12-1, as on the `HashMap` helpers: the registered row is `bridge`, so
+    // under a policy latch that went strict AFTER this site was compiled the
+    // real bytecode is authoritative and this helper must not answer. Placed
+    // after the receiver screens so the refusal counter counts calls the fast
+    // path would otherwise have SERVED.
+    if jit_direct_helper_refused(vm) {
+        return None;
+    }
+    let cratonvm_types::Value::Int(limit) = vm.mem.heap.get_field_as(object, limit_slot, b'I')
+    else {
+        return None;
+    };
+    // Cast: the JIT operand stack carries one sign-extended i64 per int.
+    let idx = index as i32;
+    if idx < 0 || idx >= limit {
+        return None;
+    }
+    if for_write
+        && !matches!(
+            vm.mem.heap.get_field_as(object, read_only_slot, b'Z'),
+            cratonvm_types::Value::Int(0)
+        )
+    {
+        return None;
+    }
+    let cratonvm_types::Value::Long(address) = vm.mem.heap.get_field_as(object, address_slot, b'J')
+    else {
+        return None;
+    };
+    if address <= 0 {
+        return None;
+    }
+    address.checked_add(i64::from(idx))
+}
+
+/// Thin direct-call target for JIT `ByteBuffer.put(int,byte)` sites.
+///
+/// See `cratonvm_jit::NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN` for the census. The
+/// fast path writes one byte and returns the receiver, which is what
+/// `put(int,byte)` returns; **every** case it is not certain of — a null or
+/// fabricated receiver, a class the funnel has not served, an out-of-limit
+/// index, a read-only carrier, an address the off-heap store refuses — falls
+/// through to the generic dispatcher, so the exception a caller sees is still
+/// the registered native's.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_dbb_put_byte_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    index: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(at) = dbb_direct_elem_addr(vm, receiver, index, true) {
+        // Cast: only the low 8 bits are the Java `byte`; the operand stack
+        // widened it to int.
+        let byte = value as u8;
+        // Classified by the TAG BIT and not by an arena liveness probe, for the
+        // reason `NativeContextImpl::copy_to_native_memory` states: a tagged
+        // handle whose arena was freed must be DECLINED, never copied as an OS
+        // pointer.
+        let stored = if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(at) {
+            cratonvm_native_builtins::unsafe_arena_copy_in(at, &[byte])
+        } else if at > 0 {
+            // SAFETY: `at` is `address + index` for an index the carrier's own
+            // `limit` admits, and `address` is the block this buffer owns.
+            std::ptr::write(at as *mut u8, byte);
+            true
+        } else {
+            false
+        };
+        if stored {
+            cratonvm_jit::NIO_BYTE_ELEMENT_SERVED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return receiver;
+        }
+    }
+    cratonvm_jit::NIO_BYTE_ELEMENT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, index, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &NIO_BYTEBUFFER_PUT_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
+/// Thin direct-call target for JIT `ByteBuffer.get(int)` sites — the read twin
+/// of [`jit_dbb_put_byte_direct`], with the same decline contract.
+///
+/// The value is returned SIGN-EXTENDED through `i8`, which is what
+/// `dbb_get_abs` produces (`Value::Int(i32::from(byte as i8))`) and what every
+/// `b < 0` caller expects.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_dbb_get_byte_direct(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(at) = dbb_direct_elem_addr(vm, receiver, index, false) {
+        let mut byte = [0u8; 1];
+        let loaded = if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(at) {
+            cratonvm_native_builtins::unsafe_arena_copy_out(at, &mut byte)
+        } else if at > 0 {
+            // SAFETY: as the store twin — inside the carrier's own block.
+            byte[0] = std::ptr::read(at as *const u8);
+            true
+        } else {
+            false
+        };
+        if loaded {
+            cratonvm_jit::NIO_BYTE_ELEMENT_SERVED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return i64::from(byte[0] as i8);
+        }
+    }
+    cratonvm_jit::NIO_BYTE_ELEMENT_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, index];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &NIO_BYTEBUFFER_GET_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
+}
+
+/// Synthetic call-site info for [`jit_md_update_byte_direct`]'s decline edge.
+static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/security/MessageDigest",
+    method_name: "update",
+    descriptor: "(B)V",
+    num_jit_args: 2,
+    return_type: b'V',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+/// Thin direct-call target for JIT `MessageDigest.update(byte)` sites.
+///
+/// See `cratonvm_jit::MD_UPDATE_BYTE_DIRECT_FN` for the census. The fast path
+/// appends one byte to the accumulator the registered native keeps for this
+/// receiver, and it may do so only when BOTH of the native's own conditions
+/// hold: the receiver's class is the exact one `md_receiver_is_ours` accepted,
+/// and the side table already has an entry for it.
+///
+/// The key is computed the way `NativeContextImpl::identity_hash_code`
+/// computes it — heap answer, then `Monitors::java_identity_hash` — and NOT
+/// from the heap alone. A locked object's mark word cannot hold a hash, so the
+/// heap answer for one is `0` and the monitor holds the displaced value; using
+/// the heap answer directly would file a byte under a key the native never
+/// uses. Getting it wrong would MISS rather than corrupt (the entry is looked
+/// up, never created), but a miss on every call is a fast path that does
+/// nothing while looking installed.
+///
+/// # Safety
+/// Called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_md_update_byte_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    'fast: {
+        let raw = receiver as u64;
+        if (raw & 0x7) != 0 || raw >= (1u64 << 48) {
+            break 'fast;
+        }
+        // The arena-membership probe: the only thing between a fabricated
+        // argument and the class-header read below. Memoised per GC epoch --
+        // see `direct_receiver_facts`. This receiver is the SAME digest for
+        // every one of the 268 million bytes a side, so the memo hits on all
+        // but the first (and the entry carries the identity key, which is what
+        // this helper would otherwise re-derive per byte).
+        let Some((class_id, key)) = direct_receiver_facts(vm, raw as usize) else {
+            break 'fast;
+        };
+        if !cratonvm_native_builtins::jca::message_digest::update_fastpath::class_is_ours(class_id)
+        {
+            break 'fast;
+        }
+        if jit_direct_helper_refused(vm) {
+            break 'fast;
+        }
+        // Cast: only the low 8 bits are the Java `byte`; the operand stack
+        // widened it to int.
+        if !cratonvm_native_builtins::jca::message_digest::update_fastpath::append_byte(
+            key, value as u8,
+        ) {
+            break 'fast;
+        }
+        cratonvm_jit::MD_UPDATE_BYTE_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    cratonvm_jit::MD_UPDATE_BYTE_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [receiver, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &MD_UPDATE_BYTE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
     )
 }
 
@@ -22822,6 +23225,13 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         }
         cratonvm_jit::set_preconditions_check_index_direct_fn(
             jit_preconditions_check_index_direct as *const () as usize,
+        );
+        cratonvm_jit::set_nio_bytebuffer_byte_direct_fns(
+            jit_dbb_put_byte_direct as *const () as usize,
+            jit_dbb_get_byte_direct as *const () as usize,
+        );
+        cratonvm_jit::set_md_update_byte_direct_fn(
+            jit_md_update_byte_direct as *const () as usize,
         );
         cratonvm_jit::set_reachability_fence_direct_fn(
             jit_reachability_fence_direct as *const () as usize,
