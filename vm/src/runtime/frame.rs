@@ -3174,7 +3174,7 @@ mod tests {
     /// what makes that safe; doubles now store verbatim through
     /// `CompactValue::double_raw` for the same reason, which is what keeps a NaN
     /// payload alive across `dstore` / `dload` (see
-    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816`).
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828`).
     #[test]
     fn tag_colliding_double_local_round_trips_and_is_never_a_root() {
         use crate::memory::VmHeap;

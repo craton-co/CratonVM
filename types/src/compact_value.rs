@@ -868,7 +868,7 @@ impl CompactValue {
     /// Keeping the check is still right — without it a tagged slot would be
     /// indistinguishable from a double, which is a memory-safety problem rather
     /// than a payload one. What is wrong is calling the loss free. See
-    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816` for the
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828` for the
     /// write-up and the candidate fixes, all of which are changes to this
     /// encoding.
     ///
@@ -939,7 +939,7 @@ impl CompactValue {
     /// the ones an `f2d` of a negative float NaN with mantissa bits 22 and 21
     /// set produces. `Double.doubleToRawLongBits` observes the loss and
     /// HotSpot does not lose it. See
-    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816` for the
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-FIXED-20260828` for the
     /// census: 49 667 / 200 000 widened NaNs flattened before this constructor
     /// existed, 0 after.
     #[inline]
