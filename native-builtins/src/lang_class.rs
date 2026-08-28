@@ -4950,8 +4950,50 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
         let loader_id = ctx.loader_id_of_class(declaring_class_id);
         if (0..=2).contains(&loader_id) {
+            // (a) Already loaded somewhere in the built-in chain? Cheap, and the
+            // common case.
             for builtin in 0..=(loader_id as u32) {
                 if let Some(cid) = ctx.class_id_defined_by_loader_exact(inner, builtin) {
+                    return ctx.get_class_mirror(cid);
+                }
+            }
+            // (b) NOT loaded there yet — and this is the half a lookup cannot
+            // fix. The global fallback below is a by-name probe with no loader
+            // context, so it answers with whichever copy exists; if a
+            // user-defined loader got there first, that is the copy it returns,
+            // and the mirror caches it forever.
+            //
+            // The ORDER is what makes this reachable, and it is not exotic.
+            // MEASURED with `CRATONVM_DBG_DEFINE_FILTER=beans/factory/ObjectProvider`
+            // over the Spring Boot pair that exposed it:
+            //
+            //     insert name=…/ObjectProvider loader=UserDefined(3) id=2095  <- child, FIRST
+            //     insert name=…/ObjectProvider loader=Application    id=2972  <- app, LATER
+            //
+            // The `Method` mirror is built between those two, when the ONLY
+            // definition is the child's. So (a) misses, the fallback collapses
+            // onto `UserDefined(3)`, and `Method.getParameterTypes()` reports a
+            // class the declaring class cannot see. It is order-dependent in
+            // exactly the way that makes it look flaky: resolve the name in the
+            // application namespace first and the same code is correct.
+            //
+            // Initiate through the declaring class's own loader instead —
+            // `class_id_by_name_via_referencing_class` is JVMS §5.4.3
+            // initiating-loader resolution, and its own contract names this
+            // failure ("collapse to whichever loader defined `name` FIRST
+            // process-wide"). It RESOLVES rather than initialises, which is the
+            // right strength here: building a reflective mirror must not run a
+            // parameter type's `<clinit>`.
+            //
+            // Gated on the fallback actually being about to answer wrong, so
+            // the ordinary "not loaded anywhere yet" case keeps its existing
+            // cheap path and no Java loader call is added to it.
+            let foreign_copy_would_win = ctx
+                .class_id_by_name(inner)
+                .is_some_and(|cid| ctx.loader_id_of_class(cid) >= 3);
+            if foreign_copy_would_win {
+                if let Ok(cid) = ctx.class_id_by_name_via_referencing_class(declaring_class_id, inner)
+                {
                     return ctx.get_class_mirror(cid);
                 }
             }

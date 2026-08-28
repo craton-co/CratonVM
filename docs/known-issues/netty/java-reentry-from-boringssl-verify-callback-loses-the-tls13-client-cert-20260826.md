@@ -25,6 +25,31 @@ error:100000c0:SSL routines:OPENSSL_internal:PEER_DID_NOT_RETURN_A_CERTIFICATE
 TLSv1.2 is unaffected. `useTasks=true` is unaffected. **HotSpot is unaffected**:
 it makes the same re-entrant calls and completes the handshake.
 
+### 2026-08-27 addendum: `OpenSslEngineTest`'s full non-passing run is bigger and messier than "12 of 48"
+
+A complete-suite retest (quiet single-shard ZGC host, `dev` rebuilt) let this
+one class run long enough to accumulate **1000+ recorded `@@TESTFAIL` entries**
+before hitting its class-level cap. At that scale it's clearly not just this
+page's defect:
+
+- Many are `mustCallResumeTrustedOnSessionResumption` timing out at its own
+  **60-second method-level `@Timeout`** — consistent with this page (each
+  failing parameterization blocks for the full 60s waiting on a handshake that
+  never completes because the cert was lost), and consuming enough of the
+  class's wall budget on its own to explain why the class doesn't finish.
+- **A separate cluster of bare `java.lang.NullPointerException`s, split
+  roughly evenly between TLSv1.2 and TLSv1.3** (268 vs 266 in one sample) —
+  this does NOT fit this page's mechanism, which is TLSv1.3-specific by
+  construction (BoringSSL's re-entrant verify callback only fires for the
+  TLSv1.3 post-handshake cert flight). These NPEs need their own
+  investigation; not yet attempted. The trace at each site is uninformatively
+  short (JUnit reflection frames only), so the next step is reproducing one in
+  isolation with `CRATONVM_DBG_COERCION=1` rather than reading more of this
+  run's log.
+
+Don't treat every `OpenSslEngineTest` FAIL/HANG as this page's defect without
+checking which of the two shapes above it is.
+
 ## How it was found, and the measurement that pins it
 
 `x509_manager::check_server_trusted_extended` was added on 2026-08-26 to close a
