@@ -1,6 +1,6 @@
 # The completion roadmap says FINAL and is stale: Phase 3 is closed, Phase 1 is five-ninths closed, and strict mode is now *better* than the default
 
-**Status: 13 defects FIXED 2026-08-27, 4 recorded OPEN below.** Measured with five
+**Status: 16 defects FIXED 2026-08-27, 4 recorded OPEN below.** Measured with five
 probes against HotSpot 25.0.3+9, every one run in **both** modes.
 
 ## 1. Why re-adjudicate a document that says FINAL
@@ -135,7 +135,7 @@ synthetic-stub path already uses for exactly this
 was demonstrably present in the source, and `CRATONVM_DBG_STUB_BT` confirmed the
 code path ran. A fix can be present, reached, and inert.
 
-## 5. FIXED — ten more, each in a family whose registrar's claim had drifted
+## 5. FIXED — fifteen more, each in a family whose registrar's claim had drifted
 
 The survey's standing prior is that **every defect so far sat in a family whose
 registrar carried a stated justification that had drifted from its code**, never
@@ -351,6 +351,42 @@ it is now `..._returns_cce_not_silent`, with the measurement in the body. A
 caller catching `ClassCastException` around a field-updater access is catching
 the documented type, and an NPE escaped it.
 
+### 5.12 `newUpdater`'s four refusals all left by the wrong door
+
+```text
+newUpdater(Holder.class, "nope")                 HotSpot RuntimeException  CratonVM IllegalArgumentException
+newUpdater(null, "i")                            HotSpot RuntimeException  CratonVM NullPointerException
+newUpdater(Holder.class, null)                   HotSpot RuntimeException  CratonVM NullPointerException
+ARFU.newUpdater(Holder.class, Integer.class,"i") HotSpot ClassCastException CratonVM IllegalArgumentException
+```
+
+All three factories share one body shape —
+`try { tclass.getDeclaredField(name); .. } catch (Exception ex) { throw new
+RuntimeException(ex); }` — so a null class, a null name and a missing field all
+arrive as a plain `java.lang.RuntimeException`, never as the NPE or IAE that
+caused them.
+
+**Why correct this when IAE and NPE are themselves `RuntimeException`s, so a
+`catch (RuntimeException)` is unaffected?** Because the difference runs the
+other way. Application code that catches `IllegalArgumentException` around a
+`newUpdater` call — a reasonable thing to write — catches *this VM's* refusal and
+does **not** catch HotSpot's, so a recovery path that never runs on the
+reference VM runs here. A wrong exception type is not only a wrong message; it
+is a different set of catch clauses.
+
+The fourth row is a separate door. `AtomicReferenceFieldUpdater` compares the
+field's declared `Class` against the `vclass` argument, and an `int` field can
+never equal a reference `vclass`, so it leaves as `ClassCastException`. The
+existing CCE check was unreachable for exactly this case: it only ran for a
+descriptor `ref_descriptor_to_internal_name` can name, which a primitive
+descriptor is not, so the generic descriptor check upstream answered first.
+
+**A third test asserting this VM's type rather than the JDK's**
+(`..._missing_field_throws_iae`) failed on this change and is renamed with the
+measurement in its body. That is three such tests in one family. The pattern is
+worth naming: a test written from the implementation records what the code does,
+and reads exactly like a test written from the specification.
+
 ## 6. OPEN, and deliberately not fixed here
 
 * **`ConcurrentHashMap.elements()` never terminates**, both modes, no flags —
@@ -368,6 +404,41 @@ the documented type, and an NPE escaped it.
   above this is a missing capability rather than a wrong answer, and it is a
   provider-registration question (`jca/provider_chain.rs`) rather than a
   keystore one.
+
+## 6.5 The three arms, and the two reds that are not this branch's
+
+Run on the merged tree at `646329f81`, release binary, host otherwise idle:
+
+| arm | result |
+| --- | --- |
+| `CRATONVM_ARGS=--jdk-only` | 111 passed, 1 failed — `RJdkEnumerations` |
+| `SUITE=all` | 110 passed, 2 failed — `RJdkEnumerations`, `RBlockingQueue` |
+| `SUITE=core` | **72 passed, 0 failed** |
+
+**`RJdkEnumerations`** is dev's `a0168ed03`, bisected in two builds and recorded
+at `rjdkenumerations-is-red-on-dev-from-the-chm-values-cursor-20260827.md`.
+Reverting that commit alone, with this branch's fixes still in, is clean 3/3.
+
+**`RBlockingQueue` is a KNOWN FLAKE, and I checked rather than assumed.** It is
+new relative to this morning's arms, and the window between contains both this
+branch's 16 fixes and 70 dev commits, so "probably flaky" was not good enough.
+Measured on this binary: **3/3 pass standalone** through the same harness, and
+**pass on a repeat `SUITE=all`** — 4 passes against the 1 failure. A change of
+mine that broke it would not pass 4 of 5.
+
+Then the part that actually settled it: `docs/known-issues/jdk-only/
+HANDOFF-20260812.md` already says, in bold, *"`RBlockingQueue` is a SUSPECTED
+FLAKE, not a regression — do not chase it"*, with the same signature recorded
+two weeks earlier — one failure in a loaded full-suite run, six consecutive
+passes after. It is a heavy concurrency vector, and that page names it as one of
+the vectors on this host that only fail under suite load.
+
+**Reading the existing records before starting the bisect would have saved the
+repeat run.** The instinct to attribute a new red before landing was right; the
+order was wrong. Search the known-issues tree for the vector name FIRST — it
+costs seconds, and this project's convention is that such a page exists.
+
+Nothing in the three arms is attributable to this branch.
 
 ## 7. The prior's score, stated because it is the method
 
