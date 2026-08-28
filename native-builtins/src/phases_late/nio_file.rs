@@ -777,6 +777,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(result))))
                 }
                 None => {
+                    // A path with no name element is a ROOT, and `getFileName()`
+                    // is null there. The EMPTY path is a different thing — it
+                    // has ONE name element, the empty one, and answers a
+                    // non-null empty Path — and this arm cannot tell them apart
+                    // on its own, so it asks `p57_parse_root`: a root is
+                    // `(Some(_), [])`.
+                    //
+                    // The non-null "" used to be returned for BOTH, with the
+                    // comment below arguing for it on the strength of one
+                    // consumer. MEASURED against HotSpot:
+                    //
+                    //   Paths.get("/").getFileName()    null    this VM ""
+                    //   Paths.get("//").getFileName()   null    this VM ""
+                    //   Paths.get("").getFileName()     ""      this VM ""   (agreed)
+                    //
+                    // The empty-path row is why the fix is a root TEST and not
+                    // a blanket null: returning null for both would break the
+                    // row that was already right.
+                    //
+                    // On the consumer named below: a caller that NPEs on a null
+                    // `getFileName()` for "/" would NPE on HotSpot too, so the
+                    // non-null "" was hiding a different defect — whatever hands
+                    // that consumer a root path — rather than fixing one.
+                    let (root, names) = p57_parse_root(&p);
+                    if root.is_some() && names.is_empty() {
+                        return Ok(Some(Value::Object(None)));
+                    }
                     // A path with no name element is a root. The JDK contract is
                     // `getFileName() == null` here, and javac's
                     // `JavacFileManager$ArchiveContainer.preVisitDirectory` relies
@@ -1736,8 +1763,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
                     _ => None,
                 });
+                // `Files.setLastModifiedTime(<missing>)` funnels here (it has
+                // no `Files`-level native), and a missing file must be
+                // `NoSuchFileException`, not the bare `IOException` this
+                // mapping produced. MEASURED against HotSpot.
                 set_file_attribute_times(&path, creation, access, modified)
-                    .map_err(|error| p57_io_error(&error))?;
+                    .map_err(|error| p57_fs_error(ctx, &error, &path))?;
                 Ok(None)
             },
         );
@@ -5163,7 +5194,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match p57_read_to_string(&p) {
+            // `lines` is the third of the three decoding readers and the last
+            // one still answering a bare `IOException` for a missing file and
+            // silently substituting U+FFFD for malformed input. The other two
+            // moved in batch 1; this one is here so all three agree.
+            let read = match p57_read_to_string_strict(&p) {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(len)) => {
+                    return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                        RuntimeError::IOException {
+                            message: "MalformedInputException".into(),
+                        }
+                        .into()
+                    }))
+                }
+                Err(e) => Err(e),
+            };
+            match read {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     use cratonvm_types::ArrayElementType;
@@ -6492,6 +6539,66 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", p57_fc_read);
 
     // --- Files additional methods ---
+    // `Files.probeContentType` has no native and its real bytecode reaches
+    // `sun.nio.fs.DefaultFileTypeDetector.create()`, which calls
+    // `getFileTypeDetector()` on `DefaultFileSystemProvider.instance()`. That
+    // instance is minted by `p57_alloc_provider` as the ABSTRACT
+    // `java/nio/file/spi/FileSystemProvider` itself, which declares no such
+    // method — so the call died with
+    //
+    //   NoSuchMethodError: java.nio.file.spi.FileTypeDetector
+    //                      java.nio.file.spi.FileSystemProvider.getFileTypeDetector()
+    //
+    // and took the whole probe run with it. The FABRICATED ABSTRACT PROVIDER is
+    // the real defect and is recorded separately (it is the same shape as the
+    // `MemorySegment`-as-an-interface row in the roadmap's Phase 1); this
+    // registration closes the entry point rather than the cause.
+    //
+    // The answer is contract-correct rather than a stub: `probeContentType` is
+    // specified to return "the content type, or null if the content type
+    // cannot be determined", and the JDK's own Linux detector is a
+    // `/etc/mime.types` lookup keyed on the file extension. This table is that
+    // lookup for the types a program is likely to ask about, and null for
+    // everything else — which is exactly what an installed JDK answers on a
+    // host with no `mime.types` file.
+    r.register(
+        files,
+        "probeContentType",
+        "(Ljava/nio/file/Path;)Ljava/lang/String;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            let ext = p
+                .rsplit(['/', '\\'])
+                .next()
+                .and_then(|name| name.rsplit_once('.'))
+                .map(|(_, e)| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let mime = match ext.as_str() {
+                "txt" | "text" | "log" | "properties" | "conf" => Some("text/plain"),
+                "html" | "htm" => Some("text/html"),
+                "css" => Some("text/css"),
+                "csv" => Some("text/csv"),
+                "xml" => Some("text/xml"),
+                "js" | "mjs" => Some("text/javascript"),
+                "json" => Some("application/json"),
+                "pdf" => Some("application/pdf"),
+                "zip" => Some("application/zip"),
+                "jar" => Some("application/java-archive"),
+                "gz" => Some("application/gzip"),
+                "class" => Some("application/octet-stream"),
+                "png" => Some("image/png"),
+                "jpg" | "jpeg" => Some("image/jpeg"),
+                "gif" => Some("image/gif"),
+                "svg" => Some("image/svg+xml"),
+                _ => None,
+            };
+            Ok(Some(match mime {
+                Some(m) => Value::Object(Some(ctx.create_string(m))),
+                None => Value::Object(None),
+            }))
+        },
+    );
     // The `obj_arg` in front of each of these is the null check. Every
     // `Files` method opens with `provider(path)`, i.e. `path.getFileSystem()`,
     // so a null path is an NPE and not an answer. MEASURED: `Files.exists(null)`
@@ -20952,22 +21059,46 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
         Ok(result)
     });
+    // THESE TWO RETHROW. `SimpleFileVisitor`'s javadoc is explicit and its
+    // body is one line each:
+    //
+    //   visitFileFailed(T file, IOException exc)      { throw exc; }
+    //   postVisitDirectory(T dir, IOException exc)    { if (exc != null) throw exc;
+    //                                                    return CONTINUE; }
+    //
+    // Answering CONTINUE instead made `SimpleFileVisitor` — the class every
+    // walk that does not care about errors uses, and the one the javadoc
+    // recommends — SWALLOW EVERY I/O FAILURE IN THE TREE. MEASURED:
+    // `Files.walkFileTree(<missing directory>, new SimpleFileVisitor<>(){})`
+    // returned normally on this VM where HotSpot raises `NoSuchFileException`,
+    // and so would an unreadable subdirectory in the middle of a real walk: the
+    // caller sees a completed traversal that silently skipped part of the tree.
+    //
+    // This is the pair the `Files.walkFileTree` start-node repair depends on —
+    // that fix calls `visitFileFailed` exactly as the JDK does, and with these
+    // bodies the callback fired and threw nothing away.
     r.register(
         sfv,
         "visitFileFailed",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        |ctx, _args| {
-            let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
-            Ok(result)
+        |ctx, args| match args.get(1) {
+            Some(Value::Object(Some(exc))) => Err(MethodCallFailed::ExceptionThrown(*exc)),
+            _ => {
+                let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
+                Ok(result)
+            }
         },
     );
     r.register(
         sfv,
         "postVisitDirectory",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        |ctx, _args| {
-            let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
-            Ok(result)
+        |ctx, args| match args.get(1) {
+            Some(Value::Object(Some(exc))) => Err(MethodCallFailed::ExceptionThrown(*exc)),
+            _ => {
+                let result = p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", "CONTINUE", 0)?;
+                Ok(result)
+            }
         },
     );
 

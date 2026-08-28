@@ -948,12 +948,44 @@ pub(crate) fn native_print_double(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(None)
 }
 
+/// `String.valueOf(obj)` for a `print`/`println` argument, preserving the
+/// difference between a NULL REFERENCE and a `toString()` that returns null.
+///
+/// `print(Object)` is `write(String.valueOf(obj))`, and `String.valueOf` is
+/// specified as `obj == null ? "null" : obj.toString()` — it does NOT
+/// substitute for a null RESULT. So the two arguments below are different:
+///
+/// ```text
+///   print((Object) null)                            "null"
+///   print(new Object(){ public String toString(){ return null; } })  NPE
+/// ```
+///
+/// MEASURED: this VM printed "null" for both, because `invoke_to_string`
+/// coerces — correctly, for its other callers (`StringBuilder.append(Object)`
+/// really does substitute the text). The distinction has to be made HERE.
+fn printstream_value_of(
+    ctx: &mut dyn NativeContext,
+    arg: Option<&Value>,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    match arg {
+        Some(Value::Object(Some(obj))) => {
+            match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => Ok(ctx.read_string(s).unwrap_or_default()),
+                Some(Value::Object(None)) => {
+                    Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
+                _ => Ok(invoke_to_string(ctx, *obj)?),
+            }
+        }
+        _ => Ok("null".to_string()),
+    }
+}
+
 pub(crate) fn native_print_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
-    };
+    let text = printstream_value_of(ctx, args.get(1))?;
     ctx.record_printed_line(text.clone());
     stream_write(ctx, args, &text);
     Ok(None)
@@ -996,7 +1028,18 @@ fn native_printstream_init_outputstream(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `PrintStream(OutputStream out)` is `this(false, requireNonNull(out))`,
+    // and the two-argument form the same — so a null sink is an NPE at
+    // CONSTRUCTION. MEASURED: this VM built the stream and stored the null,
+    // which turns every later `print` into a silent no-op that `checkError()`
+    // never reports, because there is no sink to fail.
     let out_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+    if matches!(out_val, Value::Object(None)) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: None,
+        }
+        .into());
+    }
     ctx.set_field(this, 0, out_val.clone());
     ctx.set_field_by_name(this, "out", out_val);
     if let Ok(Some(Value::Object(Some(lock_ref)))) = ctx.new_object("java/lang/Object") {
@@ -1360,6 +1403,16 @@ pub(crate) fn native_printstream_write(
             *slot = b as u8;
         }
     }
+    // `PrintStream.write(byte[], int, int)` is the one overload whose bytes
+    // are NOT encoded — they are already bytes — but it is also the one whose
+    // autoflush is UNCONDITIONAL: its body ends `out.write(buf, off, len);
+    // if (autoFlush) out.flush();` with no newline test. Every `print` and
+    // `println` reaches it through the internal `OutputStreamWriter`, which is
+    // why a `new PrintStream(sink, true)` flushes after a plain `print("a")`
+    // on HotSpot and did not here.
+    if crate::printstream_refuse_if_closed(ctx, args) {
+        return Ok(None);
+    }
     // User/Tee streams route through the real underlying stream; canonical
     // synthetic out/err (out==null) write to the fd directly.
     // LOCK-SCOPE (2026-07-21): see `stream_write`.
@@ -1373,8 +1426,12 @@ pub(crate) fn native_printstream_write(
             if let Some(Value::Object(Some(this))) = args.first().copied() {
                 cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
             }
+        } else if let Some(Value::Object(Some(this))) = args.first().copied() {
+            // See `stream_write`: no sink and no descriptor is `ensureOpen()`.
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
         }
     }
+    crate::printstream_autoflush(ctx, args);
     Ok(None)
 }
 

@@ -2452,7 +2452,10 @@ fn native_fos_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
-    let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, false)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2473,7 +2476,10 @@ fn native_fos_init_string_append(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
-    let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, append)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2498,7 +2504,10 @@ fn native_fos_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
-    let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, false)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2524,7 +2533,10 @@ fn native_fos_init_file_append(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
-    let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, append)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -18103,13 +18115,40 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let src_len = ctx.array_length(src) as i32;
     if off_i < 0 || len_i < 0 || off_i.checked_add(len_i).map_or(true, |e| e > src_len) {
-        return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(if off_i < 0 {
-                off_i
-            } else {
-                off_i.saturating_add(len_i)
-            }),
-        )));
+        // The TYPE depends on which branch of `implWrite` the length picks,
+        // and HotSpot really does answer both:
+        //
+        //   new BufferedOutputStream(sink, 4).write(b /*len 2*/, -1, 1)
+        //       len < buf.length  -> System.arraycopy -> ArrayIndexOutOfBounds
+        //   ... .write(b, 0, 9)   len >= buf.length -> out.write(b, 0, 9)
+        //                          -> Objects.checkFromIndexSize -> IndexOutOfBounds
+        //
+        // MEASURED, all three rows. A single type here is wrong for one of
+        // them whichever one is chosen, so the branch is reproduced rather
+        // than picked.
+        let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+        let _ = (out_slot, count_slot);
+        let buf_len = match ctx.get_field(this, buf_slot) {
+            Value::Object(Some(b)) => ctx.array_length(b) as i32,
+            _ => i32::MAX,
+        };
+        return Err(if len_i >= buf_len {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::ioobe(
+                cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                    i64::from(off_i),
+                    i64::from(len_i),
+                    i64::from(src_len),
+                ),
+            )))
+        } else {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::aioobe_index_only(
+                if off_i < 0 {
+                    off_i
+                } else {
+                    off_i.saturating_add(len_i)
+                },
+            )))
+        });
     }
     let off = off_i as usize;
     let len = len_i as usize;
