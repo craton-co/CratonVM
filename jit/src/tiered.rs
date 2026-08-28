@@ -1454,6 +1454,17 @@ pub fn dump_method_stats_to_stderr() {
          Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr} \
          ByteBuffer.byteElement={nio_byte_sites} MessageDigest.update={md_update_sites}",
     );
+    // Non-virtual `invokevirtual` reclassification, by RULE. Printed together
+    // because they are the same transformation with two different soundness
+    // arguments, and apart because only a per-rule number can say which one a
+    // workload exercised — a combined tally that moves proves neither.
+    let private_pinned = crate::private_invokevirtual_pinned();
+    let final_pinned = crate::final_invokevirtual_pinned();
+    if private_pinned | final_pinned != 0 {
+        eprintln!(
+            "[cratonvm] JIT invokevirtual pinned non-virtual: private={private_pinned}              final={final_pinned}",
+        );
+    }
     let (nio_served, nio_declined, md_served, md_declined) = crate::byte_element_helper_calls();
     if nio_served | nio_declined | md_served | md_declined != 0 {
         eprintln!(

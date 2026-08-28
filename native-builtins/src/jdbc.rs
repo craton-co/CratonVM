@@ -343,49 +343,12 @@ fn sql_datetime_parts(millis: i64) -> (i32, i32, i32, i32, i32, i32) {
     (year, month, day, hour, minute, second)
 }
 
+// `java.sql`'s date/time parts come off the one crate calendar. This module
+// carried its own copy until 2026-08-28; it was the same wrong algorithm as
+// the other three, so a `Timestamp` in a leap year read a day early and one
+// on January 1 of a leap year panicked the native.
 fn from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
-    let abs_day = epoch_day + 719_528;
-    let mut y = ((abs_day * 400) / 146_097) as i32;
-    loop {
-        let year_start = year_start_day(y);
-        if year_start >= abs_day {
-            y -= 1;
-        } else if year_start_day(y + 1) < abs_day {
-            y += 1;
-        } else {
-            break;
-        }
-    }
-
-    let mut remaining = (abs_day - year_start_day(y)) as i32;
-    let mut month = 1;
-    loop {
-        let dim = days_in_month(y, month);
-        if remaining <= dim {
-            break;
-        }
-        remaining -= dim;
-        month += 1;
-    }
-    (y, month, remaining)
-}
-
-fn year_start_day(year: i32) -> i64 {
-    let y = year as i64;
-    365 * y + y / 4 - y / 100 + y / 400
-}
-
-fn days_in_month(year: i32, month: i32) -> i32 {
-    const DAYS: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if month == 2 && is_leap_year(year) {
-        29
-    } else {
-        DAYS[(month - 1) as usize]
-    }
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    crate::civil_date::from_epoch_day(epoch_day)
 }
 
 /// Wire the WP1.8 classpath-walking ServiceLoader natives. Split out

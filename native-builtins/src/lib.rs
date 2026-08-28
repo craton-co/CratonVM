@@ -4166,6 +4166,9 @@ pub mod case_map;
 /// `docs/feature-designs/by-name-field-reads.md`.
 pub(crate) mod field_read;
 pub mod lang_class;
+/// One proleptic-Gregorian calendar for the crate. Four modules had their
+/// own copy of the same wrong one; see the module doc.
+pub mod civil_date;
 pub mod lang_string;
 // WP2.1: java.lang.reflect full coverage — supplements lang_class.rs with
 // new natives (trySetAccessible, canAccess, getEnclosingClass, Parameter
@@ -31623,79 +31626,30 @@ fn alloc_time_synthetic(ctx: &mut dyn NativeContext, class: &str, n: usize) -> O
     }
 }
 
-/// Days in each month for a non-leap year.
-const DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
+// The calendar itself lives in [`crate::civil_date`]; these are the names
+// this module's natives already use. It kept its own copy until 2026-08-28,
+// and that copy was wrong for every day of every leap year.
 fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    crate::civil_date::is_leap_year(year)
 }
 
 fn days_in_month(year: i32, month: i32) -> i32 {
-    if month == 2 && is_leap_year(year) {
-        29
-    } else {
-        DAYS_IN_MONTH[(month - 1) as usize]
-    }
+    crate::civil_date::days_in_month(year, month)
 }
 
 /// Day of year (1-based).
 fn day_of_year(year: i32, month: i32, day: i32) -> i32 {
-    let mut doy = day;
-    for m in 1..month {
-        doy += days_in_month(year, m);
-    }
-    doy
+    crate::civil_date::day_of_year(year, month, day)
 }
 
-/// Convert (year, month, day) to a day count from epoch (2000-01-01 = 0 for internal calculations).
-/// Using a simplified algorithm based on counting days.
+/// Days since 1970-01-01 for a `(year, month, day)`.
 fn to_epoch_day(year: i32, month: i32, day: i32) -> i64 {
-    // Days from year 0 to the given year
-    let y = year as i64;
-    let mut total: i64 = 365 * y + y / 4 - y / 100 + y / 400;
-    // Adjust for months in current year
-    for m in 1..month {
-        total += days_in_month(year, m) as i64;
-    }
-    total += day as i64;
-    // Epoch day: days since 1970-01-01
-    // Days from year 0 to 1970-01-01: computed as to_epoch_day(1970, 1, 1) offset
-    total - 719_528 // days from year 0 to 1970-01-01
+    crate::civil_date::to_epoch_day(year, month, day)
 }
 
 /// Convert epoch day back to (year, month, day).
 fn from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
-    // Shift back to absolute day count
-    let abs_day = epoch_day + 719_528;
-    // Approximate year
-    let mut y = ((abs_day * 400) / 146_097) as i32;
-    // Adjust year
-    loop {
-        let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
-        if year_start >= abs_day {
-            y -= 1;
-        } else {
-            let next_start = 365 * (y + 1) as i64 + (y + 1) as i64 / 4 - (y + 1) as i64 / 100
-                + (y + 1) as i64 / 400;
-            if next_start < abs_day {
-                y += 1;
-            } else {
-                break;
-            }
-        }
-    }
-    let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
-    let mut remaining = (abs_day - year_start) as i32; // 1-based day of year
-    let mut month = 1;
-    loop {
-        let dim = days_in_month(y, month);
-        if remaining <= dim {
-            break;
-        }
-        remaining -= dim;
-        month += 1;
-    }
-    (y, month, remaining)
+    crate::civil_date::from_epoch_day(epoch_day)
 }
 
 /// Zeller-like day-of-week from epoch day (Monday=1 .. Sunday=7, matching Java's DayOfWeek).
