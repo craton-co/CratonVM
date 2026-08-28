@@ -8,7 +8,7 @@
 //! the JNI spec layout. Native code accesses it via `(*env)[index](env, ...)`.
 //!
 //! JNI functions access the VM via thread-local storage. Before calling into
-//! native code, the interpreter sets the TLS context with `set_jni_context()`,
+//! native code, the interpreter installs the TLS context with `replace_jni_context()`,
 //! and clears it on return with `clear_jni_context()`.
 
 #![allow(dead_code)]
@@ -266,27 +266,17 @@ thread_local! {
         std::cell::RefCell::new(DescriptorCache::new());
 }
 
-/// Set the JNI thread-local context before entering native code.
+/// Set the JNI thread-local context from an `Arc<SharedVm>` the caller already
+/// holds — the Invocation API's entry point, where there is no enclosing native
+/// call to preserve.
 ///
-/// Stores an `Arc<SharedVm>` in thread-local storage, keeping the VM alive
-/// via reference counting for the entire duration of the native call.
-/// This eliminates the use-after-free risk of the previous raw-pointer design.
-///
-/// `clear_jni_context()` MUST be called after every native call returns
-/// (including on panic/unwind paths) to release the `Arc` and allow the VM
-/// to be dropped when no longer needed.
-pub fn set_jni_context(shared: &SharedVm) {
-    // Obtain an Arc from the SharedVm's weak self-reference.
-    // This keeps the VM alive via ref-counting for the native call duration.
-    let arc = shared.get_arc();
-    JNI_SHARED_VM.with(|c| {
-        *c.borrow_mut() = Some(arc);
-    });
-    JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
-}
-
-/// Set JNI context directly from an existing `Arc<SharedVm>`.
-/// Preferred when the caller already holds an Arc (avoids weak-reference upgrade).
+/// **There is deliberately no `set_jni_context` beside this any more.** A plain
+/// "install, and clear on the way out" pair is the shape that lost netty's
+/// TLSv1.3 client certificate: a native call NESTS, and the inner call's clear
+/// took the enclosing call's context with it. [`replace_jni_context`] is what a
+/// nesting caller needs, and deleting the non-nesting one — once the fix left it
+/// with no production caller — keeps the next one from reintroducing the bug.
+/// See [`replace_jni_context`] for the measurement.
 pub fn set_jni_context_arc(shared: Arc<SharedVm>) {
     JNI_SHARED_VM.with(|c| {
         *c.borrow_mut() = Some(shared);
@@ -303,6 +293,60 @@ pub fn clear_jni_context() {
     JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
+/// Install the JNI context and hand back what was there, so the caller can put
+/// it back instead of clearing.
+///
+/// # The bug this exists to fix
+///
+/// [`clear_jni_context`] is unconditional, and a native call is not the only
+/// thing that can be on this thread's stack. A JNI native that calls **back**
+/// into Java, whose Java in turn calls **another** JNI native, produces
+///
+/// ```text
+///   install (outer)  ->  Java upcall  ->  install (inner)  ->  clear (inner)
+///                                         ^ outer's context is now gone
+/// ```
+///
+/// and the outer native's *later* upcalls — the ones it makes after the Java
+/// callback returns — find `None` in [`with_jni_context`] and are answered as
+/// if the VM were not attached. They do not fail loudly; `CallObjectMethodV`
+/// and friends return a null `jobject` and the host library reads that as an
+/// ordinary answer.
+///
+/// MEASURED (`probes/OpenSslTls13ReentryBisectProbe.java`, netty +
+/// netty-tcnative BoringSSL, TLSv1.3, `useTasks=false`): with BoringSSL's
+/// verify callback running Java **inside** `SSL_do_handshake`, a single nested
+/// tcnative call from that Java — ANY of them, including
+/// `SSL.getLastErrorNumber()` which touches no `SSL*` at all, and
+/// `SSL.getOptions()` on an unrelated idle `SSL*` — makes BoringSSL's
+/// subsequent CERTIFICATE callback reach no Java. The client's key manager is
+/// never asked for an alias (`keyAsks=0` against `1` on every passing row), so
+/// the client sends no certificate and the server ends the handshake with
+/// `PEER_DID_NOT_RETURN_A_CERTIFICATE`. Java-only, monitor-only, allocation and
+/// `System.gc()` arms all pass, which is what rules out every other hypothesis.
+///
+/// Restoring rather than clearing keeps the outer context alive for exactly as
+/// long as the outer call, and still drops the `Arc` at the outermost return —
+/// the property [`clear_jni_context`]'s contract is about.
+pub fn replace_jni_context(shared: &SharedVm) -> Option<Arc<SharedVm>> {
+    let arc = shared.get_arc();
+    let prev = JNI_SHARED_VM.with(|c| std::mem::replace(&mut *c.borrow_mut(), Some(arc)));
+    JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    prev
+}
+
+/// Put back what [`replace_jni_context`] handed out.
+///
+/// `None` restores the "no context" state, which is what the OUTERMOST native
+/// call's exit must leave behind — so this is a strict generalisation of
+/// [`clear_jni_context`], not a weakening of it.
+pub fn restore_jni_context(prev: Option<Arc<SharedVm>>) {
+    JNI_SHARED_VM.with(|c| {
+        *c.borrow_mut() = prev;
+    });
+    JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
 /// Set the JNI thread-local `JvmThread` pointer before entering native code.
 ///
 /// # Safety
@@ -314,6 +358,28 @@ pub fn clear_jni_context() {
 /// until `clear_jni_thread()` is called.
 pub fn set_jni_thread(thread: *mut JvmThread) {
     JNI_THREAD.with(|c| c.set(thread as *mut ()));
+}
+
+/// [`set_jni_thread`] that hands back the previous pointer, for the same reason
+/// [`replace_jni_context`] exists: a nested native call must not leave the
+/// enclosing one without a thread.
+///
+/// # Safety
+///
+/// Same contract as [`set_jni_thread`].
+pub unsafe fn replace_jni_thread(thread: *mut JvmThread) -> *mut JvmThread {
+    JNI_THREAD.with(|c| c.replace(thread as *mut ())) as *mut JvmThread
+}
+
+/// Put back what [`replace_jni_thread`] handed out. A null `prev` restores the
+/// "no thread" state that [`clear_jni_thread`] leaves.
+///
+/// # Safety
+///
+/// `prev` must be a pointer this thread previously had installed, still valid
+/// for as long as it stays installed.
+pub unsafe fn restore_jni_thread(prev: *mut JvmThread) {
+    JNI_THREAD.with(|c| c.set(prev as *mut ()));
 }
 
 /// Clear the JNI thread pointer on native code return.
@@ -1236,7 +1302,17 @@ where
                 let result = f(arc);
                 let gen_after = JNI_CONTEXT_GENERATION.with(|g| g.get());
                 if gen_before != gen_after {
-                    tracing::warn!("JNI context generation changed during callback ({} -> {}) — possible nested native call", gen_before, gen_after);
+                    // Nesting is legal and handled: `JniContextGuard` saves and
+                    // restores rather than clearing, so a nested native call
+                    // leaves this thread's context exactly as it found it. The
+                    // generation still moves (twice), which is why this is a
+                    // debug note and not a warning — it fires on every correct
+                    // native -> Java -> native chain.
+                    tracing::debug!(
+                        "JNI context generation changed during callback ({} -> {}) — a nested native call, which restore-on-exit handles",
+                        gen_before,
+                        gen_after
+                    );
                 }
                 Some(result)
             }
@@ -1260,8 +1336,36 @@ where
             // thread (thread-local), and we hold exclusive access for the closure duration.
             Some(f(arc, unsafe { &mut *(thread_ptr as *mut JvmThread) }))
         }
-        _ => None,
+        _ => {
+            // A `None` here is answered to the host library as a null `jobject`
+            // or a zero, which it reads as an ordinary answer. That silence is
+            // what made the TLSv1.3 client-certificate defect cost a week: a
+            // nested native call used to CLEAR the enclosing call's context, and
+            // every later up-call the outer native made landed here and was
+            // quietly ignored. See `JniContextGuard::install`.
+            //
+            // A `warn!` is wrong — a genuinely detached host thread reaches this
+            // legitimately and often — so the instrument is a count, reported
+            // with the other JNI figures. Zero is the expected value for any run
+            // whose native calls all originate from Java.
+            JNI_UPCALLS_WITHOUT_CONTEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
     }
+}
+
+/// How many JNI up-calls found no thread context and were answered as if the VM
+/// were detached.
+///
+/// Reported by `CRATONVM_INTRINSIC_STATS=1`. See the `_` arm of
+/// [`with_jni_context`] for what a non-zero count means and why it is a counter
+/// rather than a warning.
+pub static JNI_UPCALLS_WITHOUT_CONTEXT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of JNI up-calls answered with no context since process start.
+pub fn jni_upcalls_without_context() -> u64 {
+    JNI_UPCALLS_WITHOUT_CONTEXT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -8743,6 +8847,67 @@ mod tests {
         assert_eq!(JNI_VERSION_1_8, 0x00010008);
     }
 
+    /// A nested native call must not leave the ENCLOSING one without a JNI
+    /// context.
+    ///
+    /// This is the unit-level statement of
+    /// `fixed-suite-bugs/netty/nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`:
+    /// `set_jni_context` + an unconditional `clear_jni_context` on exit is
+    /// wrong for a call that nests, and the shape nests whenever a native calls
+    /// back into Java. The failure is silent — `with_jni_context` answers
+    /// `None` and every JNI up-call the outer native makes afterwards hands the
+    /// host library a null `jobject` — so a test that only checks the OUTERMOST
+    /// exit (which the old code got right) cannot see it.
+    ///
+    /// Asserted on the thread-locals directly rather than through a real JNI
+    /// dispatch, because reproducing the nesting for real needs a foreign
+    /// library that calls back into Java; that end of it is
+    /// `probes/OpenSslTls13ReentryBisectProbe.java`.
+    #[test]
+    fn nested_native_call_restores_the_enclosing_jni_context() {
+        use crate::config::VmConfig;
+        use crate::vm::Vm;
+
+        let vm = Vm::new(VmConfig::default());
+        // Nothing installed to begin with, which is the state the OUTERMOST
+        // exit must restore.
+        restore_jni_context(None);
+        assert!(
+            with_shared_vm(|_| ()).is_none(),
+            "precondition: no context installed"
+        );
+
+        // Outer native call.
+        let outer_prev = replace_jni_context(&vm.shared);
+        assert!(outer_prev.is_none(), "outer saw a context that was not there");
+        assert!(with_shared_vm(|_| ()).is_some(), "outer install did not take");
+
+        {
+            // Java upcall -> a SECOND native call on the same thread.
+            let inner_prev = replace_jni_context(&vm.shared);
+            assert!(
+                inner_prev.is_some(),
+                "the inner call must SEE the outer context, not a cleared slot"
+            );
+            restore_jni_context(inner_prev);
+        }
+
+        // The whole point: the outer native is still running.
+        assert!(
+            with_shared_vm(|_| ()).is_some(),
+            "the inner call's exit cleared the ENCLOSING native's context — this is \
+             the TLSv1.3 client-certificate defect, and it is silent: the outer \
+             native's next up-call would be answered as if the VM were detached"
+        );
+
+        // Outermost exit still releases, exactly as `clear_jni_context` did.
+        restore_jni_context(outer_prev);
+        assert!(
+            with_shared_vm(|_| ()).is_none(),
+            "the outermost exit must leave no context behind"
+        );
+    }
+
     /// JNI `ThrowNew` must materialise the exact supplied throwable class and
     /// its message, rather than using the historical generic sentinel.  This
     /// is the contract jnr-ffi/posix relies on when it catches a native-load
@@ -8759,7 +8924,7 @@ mod tests {
             .expect("load IllegalArgumentException");
         let message = CString::new("native provider unavailable").unwrap();
 
-        set_jni_context(&vm.shared);
+        let _prev = replace_jni_context(&vm.shared);
         set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
             jni_throw_new(get_jni_env(), class_id_to_jclass(class_id), message.as_ptr(),),

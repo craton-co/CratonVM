@@ -4196,6 +4196,73 @@ impl ClassManager {
             // keys on this exact name.
             self.get_loaded_class_id("java/lang/Process")
                 .or_else(|| self.get_loaded_class_id("java/lang/Object"))
+        } else if matches!(
+            name,
+            "java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl"
+                | "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl"
+                | "java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl"
+        ) {
+            // MEASURED 2026-08-27 (`probes/RustJvmImplReach.java`), compatible
+            // mode against HotSpot 25.0.3+9:
+            //
+            //   HotSpot   ...$AtomicIntegerFieldUpdaterImpl -> AtomicIntegerFieldUpdater
+            //   CratonVM  ...$RustJvmImpl                   -> java.lang.Object
+            //
+            //   u instanceof AtomicIntegerFieldUpdater   HotSpot true, CratonVM FALSE
+            //   u.updateAndGet(box, x -> x + 1)          HotSpot ok,   CratonVM NoSuchMethodError
+            //
+            // `jdk_superclass` ALREADY maps all three of these names to their
+            // abstract base, and its own comment says why: "the cast only
+            // succeeds if the returned object's class chain reaches the
+            // abstract base". **This mint path never asks that table**, so the
+            // mapping was dead code and the premise it states was false. The
+            // sibling `jdk_interfaces(name)` call thirty lines below IS
+            // consulted generally, which is the asymmetry that hid it.
+            //
+            // Consequence, and it is not cosmetic: the base declares
+            // `updateAndGet`, `getAndUpdate`, `accumulateAndGet` and
+            // `getAndAccumulate` as ordinary `public final` bytecode written in
+            // terms of `get`/`compareAndSet` -- both of which ARE registered on
+            // the impl. With no link to the base, all four resolve to nothing
+            // and any caller dies. `probes/AtomicUpdaterSweep.java` runs 87/87
+            // clean under `--jdk-only` (which never mints this class and uses
+            // the real JDK impl) and DIES in compatible mode at the first
+            // `updateAndGet`.
+            //
+            // Named explicitly rather than by consulting `jdk_superclass` here:
+            // that table covers a large slice of the JDK, and routing every
+            // fabricated stub through it would change superclasses, field
+            // layouts, `instanceof` and catch-matching for classes this change
+            // never measured. The general divergence is recorded separately;
+            // this arm fixes the three that were measured, in the same idiom as
+            // the four special cases above it.
+            let base = name
+                .strip_suffix("$RustJvmImpl")
+                .expect("matched arm ends in $RustJvmImpl")
+                .to_string();
+            // LOAD it, do not merely look it up. The first cut of this fix used
+            // `get_loaded_class_id` like the four cases above, and it changed
+            // nothing: at the moment `newUpdater` mints the impl, the abstract
+            // base is NOT yet a loaded class, so the lookup missed and the
+            // `or_else` quietly restored `java/lang/Object` -- the very default
+            // this arm exists to override.
+            //
+            // Why it is not loaded despite `newUpdater` being a static method ON
+            // it: `newUpdater` is a REGISTERED NATIVE, so the invokestatic
+            // resolves through the native registry without the class ever being
+            // loaded from the image. The four cases above happen to name classes
+            // (`java/io/OutputStream`, `java/lang/Process`) that boot long
+            // before any of them is minted, which is why the weaker idiom has
+            // held there and why copying it here was a silent no-op.
+            //
+            // `load_class` is what the sibling synthetic-stub path already uses
+            // for exactly this (`create_synthetic_stub`'s
+            // `Some(self.load_class(parent)?)`). An error falls back to
+            // `java/lang/Object` rather than failing the mint: a fabricated
+            // object with a worse superclass is still better than no object.
+            self.get_loaded_class_id(&base)
+                .or_else(|| self.load_class(&base).ok())
+                .or_else(|| self.get_loaded_class_id("java/lang/Object"))
         } else {
             self.get_loaded_class_id("java/lang/Object")
         };

@@ -2482,7 +2482,18 @@ fn native_inet_get_by_address(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let arr = obj_arg(args, 0)?;
+    // A NULL array is UnknownHostException, not NullPointerException.
+    // `InetAddress.getByAddress(byte[])` delegates to the two-argument form,
+    // whose body is `if (addr != null) { .. }` followed by an unconditional
+    // `throw new UnknownHostException("addr is of illegal length")` -- so null
+    // falls out of the same door as a 5-byte array. MEASURED against HotSpot
+    // 25.0.3+9 (`probes/InetFamilySweep.java`): HotSpot UnknownHostException,
+    // this VM NullPointerException, in BOTH modes. `obj_arg` raises the NPE for
+    // every one of its ~3900 call sites, so the check has to be here.
+    let Some(Value::Object(Some(arr))) = args.first() else {
+        return Err(uhex("addr is of illegal length: null".to_string()));
+    };
+    let arr = *arr;
     let len = ctx.array_length(arr);
     let ip_str = if len == 4 {
         let b = java_byte_array_to_vec(ctx, arr, 0, 4)?;
@@ -7551,13 +7562,25 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(inet_addr_host_name_value(ctx, this)))
         });
+        // NOT `inet_addr_host_name_value`: see `inet_address::canonical_host_name`
+        // for the measured HotSpot split. `getHostName` gives back the name the
+        // mirror was constructed with; `getCanonicalHostName` ignores it and
+        // does its own reverse lookup, falling back to the textual address.
         r.register(
             cls,
             "getCanonicalHostName",
             "()Ljava/lang/String;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(inet_addr_host_name_value(ctx, this)))
+                let text = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
+                let canonical = match text.parse::<IpAddr>() {
+                    Ok(ip) => crate::inet_address::canonical_host_name(&ip),
+                    // No parsable address on the mirror: there is nothing to
+                    // look up, so the constructed name is the only answer left
+                    // and it is still better than an empty string.
+                    Err(_) => return Ok(Some(inet_addr_host_name_value(ctx, this))),
+                };
+                Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
             },
         );
         r.register(cls, "getAddress", "()[B", |ctx, args| {

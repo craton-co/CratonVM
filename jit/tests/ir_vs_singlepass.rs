@@ -6381,12 +6381,26 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
             .unwrap_or_else(|e| panic!("elidable-init method n={n}: {e:?}"));
         assert_eq!(r, n, "the field written is the field read back");
+        // The improvement this assertion's predecessor invited, taken.
+        //
+        // It used to require `i + 1` and say "0 here would be an improvement".
+        // 0 is what `CRATONVM_SCALAR_DEOPT` produces: escape analysis had
+        // always OFFERED this `new` as scalar-replaceable, and that flag is
+        // what lets the offer be acted on — so the allocation is really gone
+        // and `counting_alloc` never runs. Without the flag the offer is
+        // refused at `plan_scalar_replacement`'s descriptor gate and the object
+        // is really allocated, exactly as before.
+        //
+        // Asserted BOTH ways rather than relaxed to "0 or i+1": this count is
+        // the only evidence in the test that the elision happened at all, and
+        // an assertion accepting either answer would pass on a build where the
+        // flag had silently stopped working.
+        let elided = cratonvm_jit::scalar_deopt_enabled() && cratonvm_jit::deopt_real_enabled();
         assert_eq!(
             ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
-            i + 1,
-            "documenting current behaviour, not requiring it: escape analysis \
-             offers this `new` as scalar-replaceable and the emitted body \
-             allocates anyway (see the residual). 0 here would be an improvement"
+            if elided { 0 } else { i + 1 },
+            "with the deopt descriptor available the allocation is elided (0); \
+             without it the offer is refused and the object is really allocated"
         );
     }
     let allocs_after_arm1 = ALLOCS.load(std::sync::atomic::Ordering::SeqCst);

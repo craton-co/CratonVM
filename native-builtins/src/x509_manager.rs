@@ -5238,23 +5238,33 @@ fn classify_extended_tm_peer(
 /// The peer's endpoint identification algorithm, or `None` for "do not
 /// identify" — which is what a null or empty one means in the JDK.
 ///
-/// **This does NOT call `getSSLParameters()` on a netty OpenSSL engine, and
-/// that is the whole point.** These handlers run inside BoringSSL's certificate
-/// callback whenever netty is configured `setUseTasks(false)`, i.e. Java has
-/// re-entered from inside the tcnative `SSL_do_handshake` native.
+/// **This does NOT call `getSSLParameters()` on a netty OpenSSL engine.** That
+/// avoidance is no longer load-bearing and is kept on its own merits — see the
+/// two paragraphs after the measurement.
+///
+/// These handlers run inside BoringSSL's certificate callback whenever netty is
+/// configured `setUseTasks(false)`, i.e. Java has re-entered from inside the
+/// tcnative `SSL_do_handshake` native.
 /// `ReferenceCountedOpenSslEngine.getSSLParameters()` is `synchronized` and
 /// itself re-enters tcnative — `SSL.getOptions(ssl)`, and `SSL.getCiphers(ssl)`
-/// by way of `super.getSSLParameters()` -> `getEnabledCipherSuites()` — on the
-/// very `SSL*` BoringSSL is inside. Doing that loses the client's TLSv1.3
-/// `Certificate` flight: the server ends the handshake with
-/// `PEER_DID_NOT_RETURN_A_CERTIFICATE`.
+/// by way of `super.getSSLParameters()` -> `getEnabledCipherSuites()`. Doing
+/// that used to lose the client's TLSv1.3 `Certificate` flight, and the server
+/// would end the handshake with `PEER_DID_NOT_RETURN_A_CERTIFICATE`.
+///
+/// **The VM defect behind that is FIXED (2026-08-28).** It was never about
+/// tcnative or the `SSL*`: `JniContextGuard::drop` cleared the JNI thread
+/// context unconditionally, so a nested native call tore down the ENCLOSING
+/// call's context and every up-call BoringSSL made afterwards — including the
+/// certificate callback — reached no Java. A nested native call is safe now,
+/// on any library.
 ///
 /// MEASURED, `probes/OpenSslTls13ClientCertProbe.java`, one run per binary:
 /// HotSpot 8/8, CratonVM before the endpoint-identification fix 8/8, CratonVM
 /// with the `getSSLParameters()` call 2 FAIL — and the two are exactly
 /// `TLSv1.3 x useTasks=false`, on BOTH loopback families, so it is not the
-/// transport. Full record:
-/// `known-issues/netty/java-reentry-from-boringssl-verify-callback-loses-the-tls13-client-cert-20260826.md`
+/// transport. Since the VM fix, the same probe's `@@REPRO` rows — a trust
+/// manager that makes the call deliberately — are `rows_failed=0`. Full record:
+/// `fixed-suite-bugs/netty/nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`
 ///
 /// The field read below runs no Java, allocates nothing and enters no native,
 /// so on a netty engine this function costs what it cost before the fix — which

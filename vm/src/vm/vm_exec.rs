@@ -17744,8 +17744,8 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     // for this call; it outlives `_jni_guard` per `set_jni_thread`.
                     let _jni_guard = JniContextGuard::install(self.shared, self.thread as *mut _);
                     let version = sym(crate::native::jni::get_java_vm(), std::ptr::null_mut());
-                    // `_jni_guard` clears the TLS context on scope exit (normal or
-                    // unwind).
+                    // `_jni_guard` restores the previous TLS context on scope exit
+                    // (normal or unwind).
                     //
                     // netty_jni_util returns the requested JNI version on success
                     // and `JNI_ERR` (-1) when any of its `FindClass` /
@@ -28119,12 +28119,17 @@ fn invoke_on_class_shared_inner(
             // can access the VM from within the native library.
             //
             // SECURITY: install the context through an RAII guard rather than a
-            // manual set/clear pair. The guard's `Drop` clears the TLS pointers
+            // manual set/clear pair. The guard's `Drop` RESTORES the TLS pointers
             // on EVERY exit edge — the arity-mismatch early return, the normal
             // return, and (critically) an unwind out of `dispatch_jni_native`.
             // The previous manual-clear pattern skipped the clears on panic,
             // leaving dangling `*mut JvmThread` / `*mut SharedVm` pointers in TLS
             // for a later JNI up-call to dereference (use-after-free).
+            //
+            // It restores rather than clears because this dispatch NESTS: a
+            // native that calls Java that calls another native gets two guards,
+            // and the inner one's exit must not leave the outer native without a
+            // context. See `JniContextGuard::install` for the measurement.
             //
             // Safety: `thread` is the live, exclusively-borrowed `&mut JvmThread`
             // for this dispatch; it outlives the guard (and thus the whole native
@@ -28212,8 +28217,8 @@ fn invoke_on_class_shared_inner(
                 )
             };
 
-            // `_jni_guard` clears the TLS context when it drops at end of scope.
-            // void methods return Value::Object(None) from dispatch_jni_native
+            // `_jni_guard` restores the previous TLS context when it drops at end
+            // of scope. void methods return Value::Object(None) here.
             let ret_char = descriptor
                 .rfind(')')
                 .and_then(|i| descriptor.as_bytes().get(i + 1).copied())
@@ -28665,7 +28670,7 @@ fn jni_pending_exception_after_native(
 /// RAII guard for the JNI thread-local context (`*mut SharedVm` Arc + the
 /// erased `*mut JvmThread` pointer) installed around a native bridge call.
 ///
-/// `set_jni_context` / `set_jni_thread` publish pointers into thread-local
+/// `replace_jni_context` / `replace_jni_thread` publish pointers into thread-local
 /// storage that the native bridge (and any JNI up-call it makes) dereferences;
 /// `jni.rs` documents that the matching `clear_*` MUST run after every native
 /// call returns *including on panic/unwind paths*. The previous code cleared
@@ -28679,10 +28684,51 @@ fn jni_pending_exception_after_native(
 /// mirroring [`SynchronizedMethodGuard`]'s discipline. This is purely a
 /// cleanup guard; it never re-installs context, so a double clear is harmless
 /// (the `clear_*` setters are idempotent no-ops on already-cleared TLS).
-struct JniContextGuard;
+struct JniContextGuard {
+    /// What was installed before this call, put back on `Drop`.
+    ///
+    /// `None`/null at the outermost native call, which makes the restore a
+    /// strict generalisation of the clear it replaces.
+    prev_vm: Option<std::sync::Arc<SharedVm>>,
+    prev_thread: *mut JvmThread,
+}
 
 impl JniContextGuard {
-    /// Install the JNI TLS context and return the guard that will clear it.
+    /// Install the JNI TLS context and return the guard that will put back
+    /// whatever was there before.
+    ///
+    /// # Why SAVE/RESTORE and not set/clear
+    ///
+    /// A JNI native is not the only thing that can be on this stack. A native
+    /// that calls back into Java, whose Java calls another JNI native, nests:
+    ///
+    /// ```text
+    ///   install (outer) -> Java upcall -> install (inner) -> DROP (inner)
+    /// ```
+    ///
+    /// and the inner `Drop` used to CLEAR. The outer native then continued to
+    /// run with no context, and every upcall it made after its Java callback
+    /// returned was answered as though the VM were not attached —
+    /// `with_jni_context` returns `None`, `CallObjectMethodV` hands the host
+    /// library a null `jobject`, and the library reads that as an answer.
+    ///
+    /// MEASURED (`probes/OpenSslTls13ReentryBisectProbe.java`): with netty's
+    /// BoringSSL provider and `useTasks=false`, BoringSSL runs netty's verify
+    /// callback INSIDE `SSL_do_handshake`. One nested tcnative call from that
+    /// Java — any of them, including `SSL.getLastErrorNumber()`, which touches
+    /// no `SSL*` — made BoringSSL's later CERTIFICATE callback reach no Java at
+    /// all: the client's key manager was never asked for an alias (`keyAsks=0`
+    /// against `1` on every passing row), so the client sent no certificate and
+    /// the server ended the handshake with
+    /// `PEER_DID_NOT_RETURN_A_CERTIFICATE`. The monitor-only, Java-only,
+    /// allocation and `System.gc()` arms all passed, which is what rules out
+    /// the lock-ordering, GC-relocation and BoringSSL-state hypotheses the page
+    /// listed. See
+    /// `fixed-suite-bugs/netty/nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`.
+    ///
+    /// The outermost call still drops the `Arc` on exit, because what it saved
+    /// and restores is `None` — the release property `clear_jni_context`'s
+    /// contract is about is preserved exactly.
     ///
     /// # Safety
     ///
@@ -28690,16 +28736,22 @@ impl JniContextGuard {
     /// for the lifetime of the returned guard (i.e. for the whole native
     /// call), exactly as required by [`crate::native::jni::set_jni_thread`].
     unsafe fn install(shared: &SharedVm, thread: *mut JvmThread) -> Self {
-        crate::native::jni::set_jni_context(shared);
-        crate::native::jni::set_jni_thread(thread);
-        JniContextGuard
+        let prev_vm = crate::native::jni::replace_jni_context(shared);
+        let prev_thread = crate::native::jni::replace_jni_thread(thread);
+        JniContextGuard {
+            prev_vm,
+            prev_thread,
+        }
     }
 }
 
 impl Drop for JniContextGuard {
     fn drop(&mut self) {
-        crate::native::jni::clear_jni_context();
-        crate::native::jni::clear_jni_thread();
+        crate::native::jni::restore_jni_context(self.prev_vm.take());
+        // Safety: `prev_thread` is whatever this thread had installed when the
+        // guard was created, and an enclosing guard keeps it valid for at least
+        // as long as this one lives.
+        unsafe { crate::native::jni::restore_jni_thread(self.prev_thread) };
     }
 }
 
@@ -29880,7 +29932,7 @@ mod tests {
         // leak into (or be observed by) other tests sharing the main thread.
         std::thread::spawn(|| {
             let shared = test_shared();
-            // `set_jni_context` (called by the guard) clones an Arc via
+            // `replace_jni_context` (called by the guard) clones an Arc via
             // `SharedVm::get_arc()`, which requires the weak self-reference that
             // only `Vm::new()` installs. `test_shared()` skips `Vm::new`, so set
             // it here exactly as `Vm::new` does before exercising the guard.
