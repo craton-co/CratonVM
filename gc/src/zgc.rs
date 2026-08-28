@@ -9079,16 +9079,33 @@ const ZGC_TLAB_ALIGN: usize = 8;
 /// Small heaps are unaffected: [`ZArenaTlabRegistry::chunk_bytes_for_capacity`]
 /// takes `capacity / 1024` first, so this ceiling only binds above ~512 MiB,
 /// which is exactly where the fragmentation it exists to prevent appears.
-/// `CRATONVM_ZGC_NO_TARGETED_COMPACTION=1` — stop letting an allocation failure
-/// name the window the next collection should empty, restoring the pure
-/// profitability ranking.
+/// `CRATONVM_ZGC_TARGETED_COMPACTION=1` — let an allocation failure name the
+/// window the next collection should empty.
 ///
-/// The bisect lever for targeted compaction, default-ON. Latched: it decides
-/// what a collection does and must not change mid-cycle.
+/// **Default OFF, and the reason is measured rather than cautious.** The
+/// machinery works — `ZRelocationSet::select` admits and prioritises the named
+/// pages, with tests — but on every workload tried it engages ZERO times,
+/// because the windows that fail are in the LARGE-OBJECT end and that end has
+/// no logical pages:
+///
+/// ```text
+/// [zgc-target] recorded window start=1072365328 end=1072627680 width=262352
+///              request=262160 used_low=1068498592 in_low_region=false
+/// ```
+///
+/// `logical_pages` covers `base .. base+used_low_for_compaction()`; that window
+/// begins 3.9 MB above it. `targeted_pages` reads 0 on `TestMVStoreTool`,
+/// `TestKillProcessWhileWriting` and `TestMultiThread`.
+///
+/// So this ships opt-in until the large-object end is relocatable at all —
+/// shipping an unengaged default is how a feature comes to look measured when
+/// it is not. Turn it on to exercise the low-region path or to bisect against
+/// a future high-region compactor. Latched: it decides what a collection does
+/// and must not change mid-cycle.
 fn targeted_compaction_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_TARGETED_COMPACTION").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TARGETED_COMPACTION").is_some()
     })
 }
 

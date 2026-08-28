@@ -1352,6 +1352,66 @@ Still the livelock: `rc=124` at the 1 500 s cap, **18 048** `OutOfMemoryError`
 and 14 arena failures. Same fragmentation family, far past the point where a
 single window would help.
 
+
+## Follow-up 2026-08-28: the large-object end is never compacted
+
+Targeted compaction was built, and the measurement it was built for says the
+target cannot be reached. That is a better answer than the feature would have
+been.
+
+### What was built
+
+`ZRelocationSet::select` ranks pages by garbage ratio and drops anything at or
+above `max_live_occupancy` — the right question for "reclaim the most per byte
+copied", the wrong one for "make one CONTIGUOUS hole of size N", since the pages
+walling such a window are dense by construction. The allocation-failure path now
+records `Arena::frag_profile`'s cheapest window beside the latch that already
+asks for a collection, and the next relocation consumes it as a page-id range;
+pages in it bypass both filters and sort first, because the evacuation budget is
+a prefix rule and a target behind a full budget would be dropped silently.
+
+Two tests, the first carrying its own control (the ranking must REFUSE the
+90 %-live page without a target, then admit and prioritise it with one).
+
+### And it engages zero times
+
+`targeted_pages` reads **0** on `TestMVStoreTool`, `TestKillProcessWhileWriting`
+and `TestMultiThread`. `CRATONVM_DBG_ZGC_TARGET=1` says why in one line:
+
+```
+[zgc-target] recorded window start=1072365328 end=1072627680 width=262352
+             request=262160 used_low=1068498592 capacity=1073741824
+             in_low_region=false
+```
+
+The window begins **3.9 MB above `used_low_for_compaction()`**. `logical_pages`
+builds candidates over `base .. base+used_low` only, so nothing in the
+relocation set can ever cover that range.
+
+**`TestMVStoreTool`'s failing request is 262 160 bytes, which is above
+`ZGC_LARGE_OBJECT_MIN` (65 536), so it is served from the large-object end — and
+that end has no logical pages, no candidates, and `relocate_large_pages` is
+`false` by default besides.** Large-object fragmentation is not something any
+current mechanism can repair. That is the finding, and it supersedes "compaction
+has no targeted mode" as the description of this class's failure.
+
+### Why it ships opt-in
+
+`CRATONVM_ZGC_TARGETED_COMPACTION=1`, default OFF. The machinery is correct and
+tested, and it engaged zero times on every workload measured — shipping that as
+a default is how a feature comes to look measured when it is not. It is kept
+rather than reverted because it is the low-region half of a repair whose other
+half does not exist yet, and because the diagnostic that proved the gap is worth
+more than the code.
+
+### What this asks for next
+
+Making the large-object end relocatable — logical pages over the high region, or
+a compaction pass that understands a bump-down region — is now the blocking
+item, not target selection. Anyone picking it up should start by re-reading the
+`in_low_region=false` line above rather than the frag-profile numbers: those are
+correct and actionable, and there is currently nothing that can act on them.
+
 ## Still open
 
 Ordered by what a next session should pick up first.
@@ -1374,17 +1434,17 @@ Ordered by what a next session should pick up first.
 > attribution alone sent one session down a two-build detour, and this page
 > is where that gets prevented.
 
-* **Compaction has no TARGETED mode, and that is the whole of
-  `TestMVStoreTool`.** §"Follow-up 2026-08-27 (third)": the existing frag
-  profile names **2 888 live bytes in 49 runs** — 34 objects, 1.1 %
-  occupancy — walling off the one 266 KB window that would serve the failing
-  256 KB request, in a run that relocated 1.8 M objects by general policy
-  and left them. `CRATONVM_ZGC_TLAB=0` makes the class PASS, which is the
-  control. The failure path already computes the cheapest window; what it
-  cannot do is hand it to the next collection as a target. That is the
-  feature, and it is the second workload family localised to the TLAB
-  carving (the first was Hibernate's `SmokeTests` /
-  `DefaultCatalogAndSchemaTest`, 2026-08-11).
+* **The LARGE-OBJECT end is never compacted, and that is the whole of
+  `TestMVStoreTool`.** §"Follow-up 2026-08-28". Targeted compaction now
+  exists (`CRATONVM_ZGC_TARGETED_COMPACTION=1`, opt-in) and engages ZERO
+  times, because the window that fails begins 3.9 MB above
+  `used_low_for_compaction()` and `logical_pages` builds candidates over the
+  low region only. The failing request is 262 160 bytes, above
+  `ZGC_LARGE_OBJECT_MIN`, so it is served from an end with no logical pages,
+  no relocation candidates, and `relocate_large_pages: false` besides.
+  The blocking item is making that end relocatable — logical pages over the
+  high region, or a pass that understands a bump-down region. Target
+  selection is solved and waiting on it.
 * **There is no working backstop against a wrong oop map for java locals
   and operand spill.** The band scan's was given up 2026-08-27, and the
   map-completeness oracle CANNOT replace it: re-pointed at
