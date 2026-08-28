@@ -357,6 +357,19 @@ audit the shrink was planned from:
   they are listed because they bake the header size into machine code. The
   codegen picks between them per OBJECT on the `GC_FLAG_COMPACT` header bit, so
   a smaller header must move BOTH or the legacy arm reads the wrong cell.
+- `jit/src/lib.rs::AtomicLongFieldLayout::new` (added 2026-08-28) — the
+  ATOMIC_LONG intrinsic's two `AtomicLong.value` addresses, the 64-bit twin of
+  the `AtomicIntFieldLayout` pair above: compact (`HEADER_SIZE + body_off`) and
+  legacy (`HEADER_SIZE + idx * SLOT_SIZE + FIELD_CELL_PAYLOAD64_OFFSET` — the
+  **64-bit** payload bias, because pointing a REX.W access at the 32-bit one
+  would read four bytes of the cell's tag along with half the value). Emitted
+  as the disp32 of `MOV RCX, [RAX+disp32]` (`48 8B 88`) or
+  `LOCK XADD [RAX+disp32], RCX` (`F0 48 0F C1 88`) — ModRM mod=10, a full
+  signed 32-bit displacement — so no disp8 hazard; listed because they bake
+  the header size into machine code. Same per-OBJECT `GC_FLAG_COMPACT` branch
+  as its 32-bit twin, so a smaller header must move BOTH. The constructor also
+  refuses a compact storage width that is not exactly 8, which is what keeps a
+  narrowed field from being written past.
 - `ir_lower.rs::emit_inline_compact_getfield`, LEGACY branch (added 2026-08-18)
   — `HEADER_SIZE + field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`,
   the uniform 16-byte `Value` cell, emitted in four forms (reference and

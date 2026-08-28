@@ -4866,15 +4866,12 @@ pub(super) fn try_jit_upgrade_with_gate(
         if opcode == 0xb6 {
             let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
             let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
+            let declaring_id = crate::classloading::invokevirtual_private_declaring_class(
                 cp_class_id,
                 method_name,
                 descriptor,
                 store,
             )?;
-            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                return None;
-            }
             return store.get(declaring_id).map(|c| c.name.to_string());
         }
         if opcode != 0xb7 {
@@ -5392,15 +5389,12 @@ pub(super) fn try_jit_upgrade_with_gate(
                 if opcode == 0xb6 {
                     let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
                     let store = cm.class_store();
-                    let (method, declaring_id) = crate::classloading::find_method_recursive(
+                    let declaring_id = crate::classloading::invokevirtual_private_declaring_class(
                         cp_class_id,
                         method_name,
                         descriptor,
                         store,
                     )?;
-                    if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                        return None;
-                    }
                     return store.get(declaring_id).map(|c| c.name.to_string());
                 }
                 if opcode != 0xb7 {
@@ -6831,15 +6825,12 @@ pub(super) fn try_jit_compile_callee_slow(
         if opcode == 0xb6 {
             let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
             let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
+            let declaring_id = crate::classloading::invokevirtual_private_declaring_class(
                 cp_class_id,
                 method_name,
                 descriptor,
                 store,
             )?;
-            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                return None;
-            }
             return store.get(declaring_id).map(|c| c.name.to_string());
         }
         if opcode != 0xb7 {
