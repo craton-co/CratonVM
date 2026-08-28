@@ -5532,8 +5532,117 @@ fn reloc_emit_enabled() -> bool {
                 let (name_ptr, name_len) = (*name_ptr, *name_len);
                 let obj = node.inputs[2];
                 let sp_live_hi = self.spill_high_water;
-                self.emit_safepoint_map(sp_live_hi);
+                // Allocated BEFORE the fast path so that path can store its
+                // result, and AFTER `sp_live_hi` is read so the safepoint map
+                // below still describes exactly the slots it described when
+                // this arm had only one path.
                 let slot = self.alloc_slot(id);
+
+                // ---- inline class-id fast path ----
+                //
+                // The twin of the single-pass backend's `0xc0` arm, and it has
+                // to exist HERE as well: this is the door a HOT method reaches.
+                // The single-pass fast path on its own measured exactly zero
+                // engagement on a four-million-cast probe — `checkcast=
+                // 3,203,236` membership walks with it on against `3,203,316`
+                // with it off — because every body that mattered had tiered up
+                // into the optimizing pipeline, whose `checkcast` lowering is
+                // this one. Same lesson the thin native binds recorded: a bind
+                // at one compile door is not a bind.
+                //
+                // The claim is exactly one fact — an object whose class id
+                // EQUALS the target's is assignable to it — so this can only
+                // turn a slow YES into a fast YES. Subclasses, interfaces,
+                // array covariance, lambda proxies and synthetics all have
+                // DIFFERENT ids and fall through to the helper unchanged, as
+                // does null (which the helper already answers with 0) and a
+                // garbled header, which simply misses.
+                let target_class_id = if name_ptr == 0 {
+                    None
+                } else {
+                    // `Op::CheckCast` carries the interned name as a `usize`
+                    // (the node is `Copy`); the intern table is keyed on that
+                    // same address, so this is the identical row the helper
+                    // call below reaches by pointer.
+                    crate::typecheck_target_for_site(name_ptr as *const u8)
+                }
+                .filter(|&cid| cid != 0 && crate::x64::checkcast_inline_enabled());
+                // The 1-D primitive-array variant — see the twin in the
+                // single-pass arm. It needs no class id, which is the point: a
+                // primitive array's header class id is 0.
+                // SAFETY: an `intern_typecheck_target` pair, leaked for the
+                // life of the process.
+                let prim_array_tag = unsafe {
+                    crate::typecheck_site_name(name_ptr as *const u8, name_len)
+                }
+                .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                .filter(|_| crate::x64::checkcast_inline_enabled());
+                let mut hit_patch: Option<usize> = None;
+                if let Some(tag) = prim_array_tag {
+                    crate::CHECKCAST_INLINE_SITES_PRIM_ARRAY
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
+                    // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag (80 /7 ib).
+                    self.buf.emit(&[
+                        0x80,
+                        0x78,
+                        cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                        tag,
+                    ]);
+                    let miss_slow = self.emit_jcc_rel32(0x85); // JNE → helper
+                    self.store_rax(slot);
+                    hit_patch = Some(self.emit_jmp_rel32());
+                    self.patch_rel32_to_here(null_slow);
+                    self.patch_rel32_to_here(miss_slow);
+                } else if let Some(cid) = target_class_id {
+                    crate::CHECKCAST_INLINE_SITES_IR
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
+                    // ARRAY RECEIVERS MUST NOT REACH THE COMPARE — see the
+                    // twin of this guard in the single-pass `0xc0` arm, and
+                    // `regression-suite` `RJitArrayTypecheck`, which caught
+                    // this fix's first version. An array's header holds its
+                    // COMPONENT class id (or 0, for a primitive array), never
+                    // its own, so `checkcast java/lang/String` on a `String[]`
+                    // would match the baked target and accept a cast that must
+                    // throw. A plain object's KIND_TAGS byte is zero, pinned by
+                    // `const _: () = assert!` in `heap_types.rs` so that JIT
+                    // guards can use exactly this one instruction.
+                    // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 (80 /7 ib).
+                    self.buf.emit(&[
+                        0x80,
+                        0x78,
+                        cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8, // Cast: x86-64 disp8
+                        0x00,
+                    ]);
+                    let kind_slow = self.emit_jcc_rel32(0x85); // JNE → helper
+                    // CMP DWORD [RAX+0], cid. `ObjectHeader.class_id` is a
+                    // plain `u32` at offset 0 by contract — its own doc comment
+                    // says "JIT-emitted type guards are `CMP DWORD [recv+0],
+                    // imm`" and `class_id_remains_at_offset_zero` enforces it —
+                    // and this is byte-for-byte the encoding the guarded-virtual
+                    // inline arm already emits (81 /7 id, ModRM 0x78 = mod01
+                    // disp8 /7 rm=RAX).
+                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                    self.buf.emit(&cid.to_le_bytes());
+                    let miss_slow = self.emit_jcc_rel32(0x85); // JNE → helper
+                    // Hit: the receiver IS the target class, so the cast
+                    // succeeds and its result is the reference already in RAX —
+                    // the same value the helper would have returned. No
+                    // safepoint map, no frame-record republish and no
+                    // sentinel drain, because this path makes no call.
+                    self.store_rax(slot);
+                    hit_patch = Some(self.emit_jmp_rel32());
+                    self.patch_rel32_to_here(null_slow);
+                    self.patch_rel32_to_here(kind_slow);
+                    self.patch_rel32_to_here(miss_slow);
+                }
+
+                self.emit_safepoint_map(sp_live_hi);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
                 self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
@@ -5541,6 +5650,9 @@ fn reloc_emit_enabled() -> bool {
                 self.emit_mov_reg_imm64(RAX, self.checkcast as u64);
                 self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                 self.emit_call_return_check(slot, IrType::Ref);
+                if let Some(p) = hit_patch {
+                    self.patch_rel32_to_here(p);
+                }
             }
             // ── cov-05 increment 1: instanceof ────────────────────────────
             //
