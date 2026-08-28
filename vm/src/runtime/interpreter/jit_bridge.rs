@@ -702,10 +702,36 @@ pub(super) fn compile_osr_artifact(
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.typecheck_ops {
                     let cn = class.constant_pool.get_class_name(cp_idx)?;
-                    let boxed: Box<str> = cn.to_string().into_boxed_str();
-                    let ptr = boxed.as_ptr();
-                    let len = boxed.len();
-                    owned_jit_strings2.push(boxed);
+                    // THE THIRD DOOR, and the last one still handing the
+                    // runtime helper a bare name. The other two — the ordinary
+                    // tiering door in `jit::try_compile_inner` and the eager
+                    // first-call door in `interpreter.rs` — both resolve the
+                    // site's `CONSTANT_Class` through THIS class's own defining
+                    // loader and intern the name under that `ClassId`, so that
+                    // `jit_checkcast` can compare ids instead of re-resolving a
+                    // name against a `(ClassLoaderId, name)`-keyed dictionary,
+                    // and so the JIT can compare them INLINE.
+                    //
+                    // This door did neither: it boxed a per-compilation copy of
+                    // the name, which recorded no id and, being a fresh address
+                    // every compile, could not even share the helper's
+                    // `(ptr, len)` memo with the other two doors' copies of the
+                    // same site.
+                    //
+                    // Measured: `CcProbe2`, a 20-million-iteration loop whose
+                    // body is one `(Node) o` cast, reported
+                    // `checkcast inline sites: single-pass=0 optimizing=0
+                    // refused-no-target-id=2` and 63,989,000 membership walks —
+                    // the inline compare could not fire ANYWHERE in it. A loop
+                    // is exactly what reaches this door, so "the hot case" and
+                    // "the door with no target id" were the same set. Third
+                    // time this shape has been recorded (the thin native binds,
+                    // the `String` call-site intrinsics): a bind at one compile
+                    // door is not a bind.
+                    let target_id = cm_lock
+                        .find_class_by_name_for_class(cn, class_id)
+                        .map(|id| id.as_u32());
+                    let (ptr, len) = cratonvm_jit::intern_typecheck_target(cn, target_id);
                     typecheck_info.push((pc, ptr, len));
                 }
             }

@@ -598,6 +598,70 @@ pub(super) fn inline_site_is_fresh_ctor_first_store(
 /// the GUARDED inline path below (`guarded_inline_getfield_enabled`), which
 /// validates the receiver against the published heap-region bounds before the
 /// raw load and falls back to the checked helper otherwise.
+/// Default-ON inline `checkcast` fast path.
+///
+/// `bytecode_walk`'s `0xc0` arm used to emit an UNCONDITIONAL call to
+/// `jit_checkcast` — `flush_scratch_registers`, `emit_pre_safepoint_spill`, the
+/// CALL, `emit_oop_map_for_safepoint`, a post-invoke exception check — and the
+/// helper then took a heap-membership walk (`ZObjectStarts::contains` →
+/// `is_object_address`) before it could read the header. There was no inline
+/// class-id compare anywhere on the path, even though the guarded-virtual
+/// inline arm has emitted `CMP DWORD [recv+0], class_id` for months.
+///
+/// Measured at **38.2 ns** against HotSpot's **0.28 ns** on a 20M-iteration
+/// cast of an `Object` to `byte[]` (136x). netty's compression cluster pays
+/// 2,001,514 per MiB — `PooledByteBuf<T>` is generic, so `_getByte` casts its
+/// erased `memory` field to `byte[]` on every byte — which
+/// `CRATONVM_DBG=jit-method-stats` reports as
+/// `membership walks by JIT site: checkcast=6,004,543` per 3 MiB.
+///
+/// The fast path is exactly one fact: **an object whose class id EQUALS the
+/// target's is assignable to it**, with no hierarchy walk, no array covariance
+/// and no carve-out involved. Every other answer — a subclass, an interface,
+/// `Object[]`, a lambda proxy, a synthetic — falls through to the helper
+/// unchanged, so this can only turn a slow YES into a fast YES. It cannot turn
+/// a NO into a YES, and a garbled header (a relocated object's forwarding word,
+/// say) simply misses and takes the helper, which revalidates from scratch.
+///
+/// Gated on the same trusted-oop clauses the compact inline `getfield` arm uses
+/// — that arm raw-dereferences the same references at a field offset behind a
+/// bare null test, so reading the header at offset 0 is not a new trust
+/// assumption. The bounds-checked variant `getfield` falls back on is
+/// deliberately NOT reproduced here: ZGC (the default collector) publishes
+/// nothing into `JIT_READ_BOUNDS`, so that arm is unreachable on the default
+/// configuration and would be untested code.
+///
+/// PLAIN OBJECTS ONLY. An array's header does not hold its own class id — a
+/// reference array holds its component's and a primitive array holds 0 — so an
+/// array receiver would match a baked target it is not an instance of. The
+/// guard screens them out in one instruction and they keep the helper, which is
+/// authoritative for arrays via `array_descriptor_of`. `RJitArrayTypecheck` is
+/// the vector that proves it, and it is the vector that caught this fix's first
+/// version reintroducing BUG-JIT-ARRAY-INSTANCEOF-20260726.
+///
+/// That exclusion costs the netty case that motivated the measurement —
+/// `PooledByteBuf<T>`'s `(byte[]) memory` is an array cast, and a primitive
+/// array's header class id is 0, so no class-id compare could ever serve it.
+/// What is left is the far larger population: every `(Foo) obj` on a plain
+/// object, which is what generic collections, `equals` and every erased API
+/// produce.
+///
+/// `CRATONVM_JIT_CHECKCAST_INLINE=0` reverts to the unconditional helper call.
+pub fn checkcast_inline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_CHECKCAST_INLINE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 pub fn inline_getfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
