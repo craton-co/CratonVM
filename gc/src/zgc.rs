@@ -7250,6 +7250,25 @@ impl ZgcRealHeap {
             arena.frag_profile(request).cheapest
         };
         if let Some(w) = window {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_TARGET").is_some() {
+                // Where the window sits RELATIVE TO THE LOW REGION is the whole
+                // question: `logical_pages` only covers `base .. base+used_low`,
+                // so a window in the large-object end above it maps to page ids
+                // no candidate carries, and the target is silently inert.
+                let (used_low, cap) = {
+                    let arena = self.arena.lock();
+                    (arena.used_low_for_compaction(), arena.capacity())
+                };
+                eprintln!(
+                    "[zgc-target] recorded window start={} end={} width={} \
+                     request={request} used_low={used_low} capacity={cap} \
+                     in_low_region={}",
+                    w.start,
+                    w.end,
+                    w.end - w.start,
+                    w.end <= used_low
+                );
+            }
             *self.compaction_target.lock() = Some((w.start, w.end));
         }
     }
@@ -7266,6 +7285,9 @@ impl ZgcRealHeap {
         }
         let lo = start / Self::Z_LOGICAL_PAGE_BYTES;
         let hi = (end - 1) / Self::Z_LOGICAL_PAGE_BYTES;
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_TARGET").is_some() {
+            eprintln!("[zgc-target] consumed window {start}..{end} as pages {lo}..={hi}");
+        }
         // Cast: a logical page index is bounded by capacity / 2 MiB.
         Some((lo as u64, hi as u64))
     }
