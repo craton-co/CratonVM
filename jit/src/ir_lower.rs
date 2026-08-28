@@ -11005,7 +11005,30 @@ mod tests {
     #[test]
     fn ir_lower_loads_incoming_arguments_past_the_entry_abi_registers() {
         let cap = incoming_abi_reg_capacity();
-        for extra in 0..=3 {
+        // `CompiledMethod::try_call` dispatches through one
+        // `extern "C" fn(i64, …)` thunk per arity and has thunks up to
+        // `TRY_CALL_MAX_ARGS`; past that it answers `Err(TooManyArgs)`.
+        // That is a limit of this HARNESS, not of the lowering under test,
+        // and the two ABIs sit on opposite sides of it: Win64 has four
+        // entry registers, so `cap + 3` is 7 and callable, while SysV has
+        // six, so `cap + 3` is 9 and comes back `Err(TooManyArgs(9))` —
+        // which is how this test read RED on Linux and green on Windows
+        // while the prologue it exercises was working on both.
+        //
+        // Clamp to what the harness can call, and assert the clamp still
+        // leaves a stack argument to test: a bound that silently collapsed
+        // to `0..=0` would turn this into a registers-only test that always
+        // passes, which is the failure mode worth guarding.
+        const TRY_CALL_MAX_ARGS: usize = 8;
+        let max_extra = TRY_CALL_MAX_ARGS.saturating_sub(cap).min(3);
+        assert!(
+            max_extra >= 1,
+            "the entry ABI takes {cap} arguments in registers and \
+             `try_call` can pass at most {TRY_CALL_MAX_ARGS}, so this test \
+             can no longer place ANY argument on the caller's stack. Give \
+             `try_call` a wider thunk before trusting this test again."
+        );
+        for extra in 0..=max_extra {
             let slots = cap + extra;
             let last = slots - 1;
             // `iload <last>; ireturn` — `iload` (0x15) takes a one-byte index,

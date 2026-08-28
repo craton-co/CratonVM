@@ -704,6 +704,7 @@ export inherited from a parent shell.
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
 | `staged-arg-shadow` | `CRATONVM_JIT_NO_STAGED_ARG_SHADOW` |
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
+| `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |

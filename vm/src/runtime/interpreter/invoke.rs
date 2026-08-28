@@ -262,9 +262,13 @@ pub(super) fn helpful_npe_opcode_message_parts(
 /// This is the COMPILE-TIME form of that question, answered while the caller
 /// already holds the class-manager read guard. A `true` means the site must be
 /// classified as a direct, non-dispatching bind (`invoke_kind == 1`) rather
-/// than as virtual dispatch. The class name needs no substitution: JVM access
-/// control makes a private method invocable only from the class that declares
-/// it, so the constant pool's owner already IS the declaring class.
+/// than as virtual dispatch.
+///
+/// The rule itself lives in
+/// [`crate::classloading::invokevirtual_private_declaring_class`], beside its
+/// `invokespecial` twin; this is the name-and-loader-resolving wrapper the
+/// interpreter side wants. [`crate::runtime::interpreter::jit_bridge`]'s three
+/// compile doors call the same rule for the declaring class NAME.
 pub(crate) fn invokevirtual_site_targets_private(
     cm: &crate::classloading::ClassManager,
     current_class_id: ClassId,
@@ -275,13 +279,102 @@ pub(crate) fn invokevirtual_site_targets_private(
     let Some(cp_class_id) = cm.find_class_by_name_for_class(target_class, current_class_id) else {
         return false;
     };
+    crate::classloading::invokevirtual_private_declaring_class(
+        cp_class_id,
+        method_name,
+        descriptor,
+        cm.class_store(),
+    )
+    .is_some()
+}
+
+/// Does an `invokevirtual` (0xb6) site resolve to a method **no subclass can
+/// override**? Returns the class that declares it.
+///
+/// A `final` method, or any method of a `final` class, has exactly one possible
+/// target at every site that names it: the verifier guarantees the receiver is
+/// an instance of the constant pool's class, and `final` forbids the override
+/// that would make selection differ from resolution. So the site is statically
+/// bound in the same sense `invokestatic` is — and, unlike class-hierarchy
+/// speculation, it needs NO invalidation dependency, because no class that
+/// could ever be loaded may override it. That is the whole reason this rule is
+/// separate from a guarded monomorphic bind rather than a weaker case of it.
+///
+/// Measured on netty's `ByteBuf` accessor chain, which is what motivated it. A
+/// single `getByte(int)` on a pooled buffer runs
+///
+/// ```text
+/// getByte -> checkIndex -> checkIndex(int,int) -> ensureAccessible
+///                                              -> checkIndex0 -> capacity
+///         -> _getByte -> idx
+/// ```
+///
+/// and `CRATONVM_DBG_JITC=1` reported EVERY link as `ir-direct-call MISSED …
+/// static=false special=false`: nine generic dispatches for one byte, against
+/// the two instructions HotSpot inlines it to. Five of those links —
+/// `checkIndex(int)`, `checkIndex(int,int)`, `checkIndex0`, `ensureAccessible`
+/// and `PooledByteBuf.idx` — are declared `final`, and were being dispatched
+/// virtually only because no door had ever asked.
+///
+/// Deliberately NARROWER than the letter of the rule in two places:
+///
+///  * `native` targets are excluded. A registered native has no compiled body
+///    to bind to, and the three doors already route natives through the
+///    native-shadow and thin-helper machinery; admitting them here would put a
+///    second classification in front of that one for no gain.
+///  * `abstract` and `static` are excluded as impossible-by-construction rather
+///    than trusted not to occur (a `final abstract` method is illegal, and
+///    `invokevirtual` never names a `static` one) — a malformed classfile must
+///    fall back to dispatch, not bind.
+///
+/// Returns the DECLARING class, which the caller must substitute for the
+/// constant pool's class name before any direct bind: the CP entry commonly
+/// names a subclass (`PooledHeapByteBuf.checkIndex`) while the body lives on
+/// the ancestor that declares it (`AbstractByteBuf`), and binding under the
+/// subclass name would key the compiled callee under a method that class does
+/// not declare.
+///
+/// `CRATONVM_JIT_FINAL_DEVIRT=0` turns this off; the counter is
+/// [`cratonvm_jit::FINAL_INVOKEVIRTUAL_PINNED`].
+pub(crate) fn invokevirtual_site_final_owner(
+    cm: &crate::classloading::ClassManager,
+    current_class_id: ClassId,
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<String> {
+    if !crate::runtime::env_cache::jit_final_devirt() {
+        return None;
+    }
+    let cp_class_id = cm.find_class_by_name_for_class(target_class, current_class_id)?;
     let store = cm.class_store();
-    let Some((method, _declaring_id)) =
-        crate::classloading::find_method_recursive(cp_class_id, method_name, descriptor, store)
-    else {
-        return false;
+    let (method, declaring_id) =
+        crate::classloading::find_method_recursive(cp_class_id, method_name, descriptor, store)?;
+    if method.access_flags.intersects(
+        MethodAccessFlags::ABSTRACT
+            | MethodAccessFlags::STATIC
+            | MethodAccessFlags::NATIVE
+            | MethodAccessFlags::PRIVATE,
+    ) {
+        return None;
+    }
+    let method_is_final = method.access_flags.contains(MethodAccessFlags::FINAL);
+    // A `final` CLASS makes every one of its methods unoverridable too. Ask
+    // about the class the constant pool NAMES, not only the one that declares
+    // the method: the receiver must be an instance of the CP class, so if that
+    // is final the receiver's class IS it, and selection cannot reach anywhere
+    // `find_method_recursive` did not just look.
+    let class_is_final = |id| {
+        store
+            .get(id)
+            .is_some_and(|c| c.access_flags.contains(cratonvm_reader::class_access_flags::ClassAccessFlags::FINAL))
     };
-    method.access_flags.contains(MethodAccessFlags::PRIVATE)
+    if !method_is_final && !class_is_final(cp_class_id) && !class_is_final(declaring_id) {
+        return None;
+    }
+    let owner = store.get(declaring_id).map(|c| c.name.to_string())?;
+    cratonvm_jit::FINAL_INVOKEVIRTUAL_PINNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(owner)
 }
 
 /// Resolve a Java 11+ private-method call encoded as `invokevirtual`.

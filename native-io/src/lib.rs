@@ -4309,10 +4309,30 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let buf = match args.get(1) {
-        Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(None),
+    // A NULL buffer is a NullPointerException -- even with len == 0.
+    //
+    // MEASURED against HotSpot 25.0.3+9 in BOTH modes
+    // (`probes/BaosCollectionsShadowSweep.java`):
+    //
+    //   write(null, 0, 1)   HotSpot NullPointerException   CratonVM no-throw
+    //   write(null, 0, 0)   HotSpot NullPointerException   CratonVM no-throw
+    //
+    // The zero-length row is the one worth stating: `Objects.checkFromIndexSize`
+    // runs AFTER `b.length` has already been read, so the JDK never reaches a
+    // "nothing to copy" short-circuit. A caller passing a null buffer with a
+    // computed length of 0 -- the ordinary shape of an empty write -- learns
+    // nothing here and carries the null on.
+    //
+    // Every BOUNDS row already agreed, including `off + len` overflowing to a
+    // negative, so `check_array_bounds` is right; it simply never ran, because
+    // a null buffer returned before it.
+    let Some(Value::Object(Some(buf))) = args.get(1) else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("ByteArrayOutputStream.write: buffer is null".to_string()),
+        }
+        .into());
     };
+    let buf = *buf;
     let off_i = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,

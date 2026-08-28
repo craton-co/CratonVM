@@ -17231,6 +17231,23 @@ pub fn osr_entry_reject_count() -> usize {
 pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Compiled call sites reclassified from `invokevirtual` to a direct,
+/// non-dispatching bind because the resolved method can never be overridden —
+/// it is `final`, or its class is.
+///
+/// Separate from [`PRIVATE_INVOKEVIRTUAL_PINNED`] on purpose. The two rules
+/// reach the same conclusion by different arguments and cover different code,
+/// so one counter for both could not answer the only question worth asking of
+/// either: did THIS rule engage on THIS workload. A shared tally that moves is
+/// indistinguishable from a rule that never fired.
+pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FINAL_INVOKEVIRTUAL_PINNED`].
+pub fn final_invokevirtual_pinned() -> u64 {
+    FINAL_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Snapshot of [`PRIVATE_INVOKEVIRTUAL_PINNED`].
 pub fn private_invokevirtual_pinned() -> u64 {
     PRIVATE_INVOKEVIRTUAL_PINNED.load(std::sync::atomic::Ordering::Relaxed)
@@ -18083,6 +18100,27 @@ const fn invoke_kind_uses_inline_cache(invoke_kind: u8) -> bool {
 fn clear_jit_recursive_cycle_methods_for_test() {
     jit_recursive_cycle_methods().write().clear();
     JIT_COMPILE_STACK.with(|stack| stack.borrow_mut().clear());
+}
+
+/// Serialise the tests that clear [`JIT_RECURSIVE_CYCLE_METHODS`].
+///
+/// That set is process-global and
+/// [`clear_jit_recursive_cycle_methods_for_test`] empties it for the whole
+/// test binary. Two tests clear it and then assert, several compiles later,
+/// on what it contains; run in parallel, either one's clear lands inside the
+/// other's window and the assertion reads a set someone else emptied. It is
+/// a flake, not a defect in the code under test, which is exactly why it is
+/// worth removing rather than retrying: measured at 3 failures in 25 runs of
+/// the jit lib suite under four CPU spinners, and 0 in 25 quiet ones — a
+/// quiet box says nothing here.
+///
+/// Mirrors `cratonvm_types::compact_value::degrade_counter_test_lock`, which
+/// exists for the same reason on the same shape (a process-wide counter two
+/// tests both reset).
+#[cfg(test)]
+fn jit_recursive_cycle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Pack a `multianewarray` site's `(holder_class_id, cp_idx)` into the single
@@ -33641,6 +33679,10 @@ mod tests {
 
     #[test]
     fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
+        // Held for the whole test: the recursive-cycle set this clears and
+        // then asserts on is process-global. See
+        // `jit_recursive_cycle_test_lock`.
+        let _cycle_lock = super::jit_recursive_cycle_test_lock();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -33806,6 +33848,9 @@ mod tests {
     /// of the scan loop, so this asserted 0 before the fix.
     #[test]
     fn statically_bound_direct_callee_call_still_registers_invoke_info() {
+        // The other clearer of the process-global recursive-cycle set;
+        // see `jit_recursive_cycle_test_lock`.
+        let _cycle_lock = super::jit_recursive_cycle_test_lock();
         crate::x64::set_moving_young_override(Some(false));
         use std::sync::Arc;
 
@@ -35232,7 +35277,30 @@ mod layout_constant_inventory {
         // so there is no payload64 arm and no ref/narrow-oop case. Both sites
         // are disp32 in the emitted `LOCK XADD [RAX+disp32], ECX`, so neither
         // shares the disp8 hazard.
-        ("lib.rs", [5, 1, 3, 1, 0, 0, 2, 1]),
+        //
+        // 2026-08-28: `AtomicLongFieldLayout::new` (the ATOMIC_LONG region)
+        // is the 64-bit twin and adds the same pair again, for
+        // `AtomicLong.value`: `HEADER_SIZE` 5 -> 7 (the legacy
+        // header-plus-cell address and the compact header-plus-body one),
+        // `SLOT_SIZE` 3 -> 4 (the legacy cell index), and
+        // `FIELD_CELL_PAYLOAD64_OFFSET` 1 -> 2 (the legacy payload bias).
+        // `FIELD_CELL_PAYLOAD32_OFFSET` does NOT move: `value` is a `long`,
+        // so it biases by the 64-bit payload offset, and pointing it at the
+        // 32-bit one would read four bytes of the cell's TAG along with half
+        // the value -- which is why `AtomicLongFieldLayout::new` also refuses
+        // a compact storage width that is not exactly 8.
+        //
+        // Value-safety at a shrunk header, which is what this inventory
+        // exists to make someone check: both addresses are emitted as the
+        // disp32 of `MOV RCX, [RAX+disp32]` (`48 8B 88`) or
+        // `LOCK XADD [RAX+disp32], RCX` (`F0 48 0F C1 88`) -- ModRM mod=10,
+        // a full signed 32-bit displacement. Neither shares the disp8
+        // backwards-addressing hazard the `ir_lower.rs` array sites have, and
+        // a smaller `HEADER_SIZE` simply makes both numbers smaller. As for
+        // its 32-bit twin, the codegen picks between the two per OBJECT on
+        // the `GC_FLAG_COMPACT` header bit, so a shrink must move BOTH or the
+        // legacy arm reads the wrong cell.
+        ("lib.rs", [7, 1, 4, 1, 0, 0, 2, 2]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8

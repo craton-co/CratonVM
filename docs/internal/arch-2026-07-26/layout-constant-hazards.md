@@ -123,6 +123,8 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 | `jit/src/lib.rs` `AtomicIntFieldLayout::new` (new 2026-08-12) | `(HEADER_SIZE + body_off) as i32` — compact `AtomicInteger.value` **payload** address | disp32 |
 | `jit/src/lib.rs` `AtomicIntFieldLayout::new` (new 2026-08-12) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32 + FIELD_CELL_PAYLOAD32_OFFSET` — legacy `AtomicInteger.value` cell | disp32 |
+| `jit/src/lib.rs` `AtomicLongFieldLayout::new` (new 2026-08-28) | `(HEADER_SIZE + body_off) as i32` — compact `AtomicLong.value` **payload** address | disp32 |
+| `jit/src/lib.rs` `AtomicLongFieldLayout::new` (new 2026-08-28) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32 + FIELD_CELL_PAYLOAD64_OFFSET` — legacy `AtomicLong.value` cell | disp32 |
 | `jit/src/ir_lower.rs` `emit_inline_getstatic` (new 2026-08-03, cov-01) | direct `getstatic`: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` from the class's statics-block base | disp32 |
 | `jit/src/ir_lower.rs` `emit_inline_compact_getfield`, LEGACY branch (new 2026-08-18) | `HEADER_SIZE + field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` — the uniform 16-byte `Value` cell, four emitted forms (ref / `J`\|`D` qword, `F` zero-extending dword, int-category `MOVSXD`) | disp32 |
 
@@ -192,15 +194,20 @@ layout constants this crate could plausibly emit:
 
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `jit/src/lib.rs` | 3 | 1 | 2 | 1 | 0 | 0 | 1 | 1 |
-| `jit/src/ir_lower.rs` | 10 | 4 | 5 | 0 | 0 | 0 | 4 | 2 |
+| `jit/src/lib.rs` | 7 | 1 | 4 | 1 | 0 | 0 | 2 | 2 |
+| `jit/src/ir_lower.rs` | 11 | 4 | 6 | 0 | 0 | 0 | 6 | 4 |
 
 (The `ir_lower.rs` row read `7 | 3 | …` when this section was written, went to
 `8` with the 2026-07-31 guarded inline compact `getfield`, to `10 | 4` with
-COV-02's two GPR array emitters and `arraylength`'s length load, and to
-`… | 5 | … | 4 | 2` with cov-01's `emit_inline_getstatic`. The authority is
-`INVENTORY` in `jit/src/lib.rs`, which is executed; this table is a copy and
-had already drifted by one before COV-02 re-derived it.)
+COV-02's two GPR array emitters and `arraylength`'s length load, to
+`… | 5 | … | 4 | 2` with cov-01's `emit_inline_getstatic`, and to
+`11 | 4 | 6 | … | 6 | 4` with the 2026-08-18 IR inline `getfield` LEGACY arm.
+The `lib.rs` row went `3 → 5` with `AtomicIntFieldLayout` on 2026-08-12 and
+`5 → 7` with `AtomicLongFieldLayout` on 2026-08-28. The authority is
+`INVENTORY` in `jit/src/lib.rs`, which is executed; this table is a copy, it
+had already drifted by one before COV-02 re-derived it, and it had drifted
+again — by four rows' worth — before 2026-08-28 re-derived it from the
+executed table. **Read `INVENTORY`, not this.**)
 
 The zero entries are as load-bearing as the rest: a constant that starts being
 used in a file where it never appeared before also trips the assertion and forces
