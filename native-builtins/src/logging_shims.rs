@@ -1304,18 +1304,56 @@ pub(crate) fn native_printstream_write(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0]=this, args[1]=byte[], args[2]=off, args[3]=len
+    //
+    // THIS BODY CRASHED THE VM. `write(b, 0, -1)` reached `vec![0u8; len]`
+    // with `len = -1 as usize` = 18 446 744 073 709 551 615 and aborted the
+    // process with `capacity overflow` — a Rust panic escaping as
+    // `internal error: native method panic`, which no Java handler can catch
+    // and which killed the probe 72 rows before its end. `write(b, -1, 1)`
+    // did not crash; it read `arr[usize::MAX]`, got zero, and PRINTED A NUL
+    // BYTE where HotSpot throws.
+    //
+    // `PrintStream.write(byte[], int, int)` delegates to the stream
+    // underneath, and every one of those runs `Objects.checkFromIndexSize(
+    // off, len, b.length)` first: a null buffer is an NPE from `b.length`,
+    // and an out-of-range window is the PLAIN `IndexOutOfBoundsException`
+    // (not the array subclass — measured against HotSpot on all three rows).
+    //
+    // This is the one place in this campaign where the refusal is not merely
+    // about a type: `PrintStream` swallows IOExceptions into `checkError()`,
+    // but an NPE and an IndexOutOfBoundsException are ARGUMENT errors and
+    // must escape.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    let arr_len = ctx.array_length(arr) as i32;
+    if off_i < 0 || len_i < 0 || off_i.checked_add(len_i).map_or(true, |e| e > arr_len) {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                i64::from(off_i),
+                i64::from(len_i),
+                i64::from(arr_len),
+            ),
+        )
+        .into());
+    }
+    let off = off_i as usize;
+    let len = len_i as usize;
     let mut buf = vec![0u8; len];
     for (i, slot) in buf.iter_mut().enumerate() {
         if let Value::Int(b) = ctx.get_array_element(arr, off + i) {

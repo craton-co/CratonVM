@@ -834,9 +834,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p1 = p57_read_path(ctx, this);
         match args.get(1) {
-            Some(Value::Object(Some(other))) => {
+            // `UnixPath.equals` is `ob instanceof UnixPath p && compareTo(p)
+            // == 0`; the type test was missing entirely here, so a `String`
+            // with the same text compared EQUAL. See `p57_is_path_object`.
+            Some(Value::Object(Some(other))) if p57_is_path_object(ctx, *other) => {
                 let p2 = p57_read_path(ctx, *other);
-                Ok(Some(Value::Int(if p1 == p2 { 1 } else { 0 })))
+                Ok(Some(Value::Int(i32::from(p1 == p2))))
             }
             _ => Ok(Some(Value::Int(0))),
         }
@@ -1999,6 +2002,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
+            // `Files.getFileStore` has no `Files`-level native, so its real
+            // bytecode calls straight through to HERE — and this copy lacked
+            // the existence check its `Files`-level twin already carried.
+            // MEASURED: `Files.getFileStore(<missing>)` answered a FileStore
+            // where HotSpot raises `NoSuchFileException`. The half-fixed
+            // duplicate pair again: the fix landed on the copy nothing runs.
+            if std::fs::symlink_metadata(&p).is_err() {
+                return Err(p57_no_such_file(ctx, &p)?);
+            }
             Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)?))))
         },
     );
@@ -4728,7 +4740,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files,
         "isDirectory",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_is_directory_impl(ctx, args))))),
+        |ctx, args| {
+            obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(p57_files_is_directory_impl(
+                ctx, args,
+            )))))
+        },
     );
 
     r.register(
@@ -4736,6 +4753,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "isRegularFile",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
         |ctx, args| {
+            obj_arg(args, 0)?;
             Ok(Some(Value::Int(i32::from(p57_files_is_regular_file_impl(
                 ctx, args,
             )))))
@@ -5015,19 +5033,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match p57_read_to_string(&p) {
-                Ok(content) => {
+            match p57_read_to_string_strict(&p) {
+                Ok(Ok(content)) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
+                // Malformed UTF-8 is a decoding REFUSAL, not a substitution —
+                // see `p57_malformed_input`.
+                Ok(Err(len)) => Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                    RuntimeError::IOException {
+                        message: "MalformedInputException".into(),
+                    }
+                    .into()
+                })),
                 // NIO contract: missing file → NoSuchFileException (see
                 // newByteChannel above), not a bare IOException — callers like
                 // FileSystemResource.getContentAsString() catch
                 // NoSuchFileException and translate it to FileNotFoundException.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p)?)
-                }
-                Err(e) => Err(p57_io_error(&e)),
+                Err(e) => Err(p57_fs_error(ctx, &e, &p)),
             }
         },
     );
@@ -5040,15 +5063,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
             // Ignore charset, always UTF-8
-            match p57_read_to_string(&p) {
-                Ok(content) => {
+            match p57_read_to_string_strict(&p) {
+                Ok(Ok(content)) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p)?)
-                }
-                Err(e) => Err(p57_io_error(&e)),
+                Ok(Err(len)) => Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                    RuntimeError::IOException {
+                        message: "MalformedInputException".into(),
+                    }
+                    .into()
+                })),
+                Err(e) => Err(p57_fs_error(ctx, &e, &p)),
             }
         },
     );
@@ -5066,7 +5092,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> cratonvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        match p57_read_to_string(&p) {
+        // `readAllLines` had NO NotFound arm at all, so a missing file was a
+        // bare `IOException` where every sibling raises `NoSuchFileException`.
+        let content = match p57_read_to_string_strict(&p) {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(len)) => {
+                return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                    RuntimeError::IOException {
+                        message: "MalformedInputException".into(),
+                    }
+                    .into()
+                }))
+            }
+            Err(e) => Err(e),
+        };
+        match content {
             Ok(content) => {
                 let lines: Vec<&str> = content.lines().collect();
                 // Resolve real-JDK ArrayList layout: elementData / size slots
@@ -5100,7 +5140,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.unpin_native_roots(list_pin);
                 Ok(Some(Value::Object(Some(list))))
             }
-            Err(e) => Err(p57_io_error(&e)),
+            Err(e) => Err(p57_fs_error(ctx, &e, &p)),
         }
     }
     r.register(
@@ -5257,6 +5297,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Read the options FIRST: the probe re-enters Java, and a moving
             // young GC there would relocate any `ObjectRef` already lifted out
             // of `args` (the native stale-local family).
+            // A null `CopyOption[]` is an NPE (`Set.of(options)` walks it),
+            // not "no options". An absent argument is a different thing and is
+            // left alone.
+            if matches!(args.get(2), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let replace_existing = copy_options_replace_existing(ctx, args.get(2));
             let src = obj_arg(args, 0)?;
             let dst = obj_arg(args, 1)?;
@@ -5316,6 +5362,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 }
             } else if src_is_dir {
+                // REPLACE_EXISTING deletes the target first, and deleting a
+                // NON-EMPTY directory is `DirectoryNotEmptyException`. The
+                // `AlreadyExists => Ok(())` arm below swallowed that case
+                // whole: `Files.copy(dir, someNonEmptyDir, REPLACE_EXISTING)`
+                // returned normally having done nothing, so a caller that
+                // believes it has just replaced a tree carries on over the old
+                // one. MEASURED against HotSpot.
+                if std::fs::symlink_metadata(&dst_path).is_ok_and(|m| m.is_dir())
+                    && std::fs::read_dir(&dst_path).is_ok_and(|mut d| d.next().is_some())
+                {
+                    return Err(match p57_directory_not_empty(ctx, &dst_path) {
+                        Ok(f) => f,
+                        Err(f) => f,
+                    });
+                }
                 match std::fs::create_dir(&dst_path) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -5329,10 +5390,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             match result {
                 Ok(()) => Ok(Some(Value::Object(Some(dst)))),
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
+                // The failing path is the SOURCE for a missing/undreadable
+                // source and the TARGET for a missing parent directory; the
+                // error kind tells them apart only when the source is present.
+                Err(e) => {
+                    let blamed = if std::fs::symlink_metadata(&src_path).is_err() {
+                        src_path.clone()
+                    } else {
+                        dst_path.clone()
+                    };
+                    Err(p57_fs_error(ctx, &e, &blamed))
                 }
-                .into()),
             }
         },
     );
@@ -5407,10 +5475,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             match std::fs::rename(&src_path, &dst_path) {
                 Ok(()) => Ok(Some(Value::Object(Some(dst)))),
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
+                Err(e) => {
+                    let blamed = if std::fs::symlink_metadata(&src_path).is_err() {
+                        src_path.clone()
+                    } else {
+                        dst_path.clone()
+                    };
+                    Err(p57_fs_error(ctx, &e, &blamed))
                 }
-                .into()),
             }
         },
     );
@@ -6274,12 +6346,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     return Err(denied.into())
                 }
                 Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
-                    return Err(if e.kind() == std::io::ErrorKind::NotFound {
-                        RuntimeError::NoSuchFileException { path: p.clone() }.into()
-                    } else {
-                        MethodCallFailed::from(RuntimeError::IOException {
+                    // `Files.newByteChannel(<a directory>, WRITE)` funnels
+                    // here. HotSpot answers `FileSystemException: <path>: Is a
+                    // directory`; a bare `IOException` loses both the type and
+                    // the path.
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            RuntimeError::NoSuchFileException { path: p.clone() }.into()
+                        }
+                        std::io::ErrorKind::IsADirectory => {
+                            p57_filesystem_exception(ctx, &p, None, "Is a directory")?
+                        }
+                        _ => MethodCallFailed::from(RuntimeError::IOException {
                             message: format!("Cannot open {}: {}", p, e),
-                        })
+                        }),
                     })
                 }
             };
@@ -6412,18 +6492,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", p57_fc_read);
 
     // --- Files additional methods ---
+    // The `obj_arg` in front of each of these is the null check. Every
+    // `Files` method opens with `provider(path)`, i.e. `path.getFileSystem()`,
+    // so a null path is an NPE and not an answer. MEASURED: `Files.exists(null)`
+    // answered FALSE and `Files.isDirectory(null)` answered FALSE — the shape
+    // that makes `if (!Files.exists(p))` take the "create it" branch for a
+    // caller whose `p` is null by mistake.
     r.register(
         files,
         "exists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| Ok(Some(Value::Int(i32::from(p57_files_exists_impl(ctx, args))))),
+        |ctx, args| {
+            obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(p57_files_exists_impl(ctx, args)))))
+        },
     );
 
     r.register(
         files,
         "notExists",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z",
-        |ctx, args| Ok(Some(Value::Int(i32::from(!p57_files_exists_impl(ctx, args))))),
+        |ctx, args| {
+            obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(!p57_files_exists_impl(ctx, args)))))
+        },
     );
 
     r.register(
@@ -6607,7 +6699,42 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(bw_class, "write", "(Ljava/lang/String;II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(out) = bw_delegate_out(ctx, this) {
+            // The DELEGATING arm has to enforce `BufferedWriter`'s OWN argument
+            // contract before forwarding, because the writer underneath has a
+            // different one. Forwarding blind, MEASURED against HotSpot:
+            //
+            //   write((String) null, 0, 1)  HotSpot NPE   this VM wrote "n"
+            //   write("ab", -1, 1)          HotSpot SIOOBE   this VM IOOBE
+            //   write("ab", 0, 9)           HotSpot SIOOBE   this VM IOOBE
+            //
+            // The first row is the one that matters: the null was stringified
+            // somewhere down the delegate chain and ONE CHARACTER OF THE WORD
+            // "null" was written to the file. A caller's null slipped into the
+            // output as data.
+            //
+            // The rule is the fd-backed arm's below, and the two must agree:
+            // `s.getChars(off, off + len, ...)` raises the String-specific
+            // subclass, and a negative `len` writes nothing rather than
+            // throwing (`BufferedWriter.write(String,int,int)`'s @implSpec).
             let s = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let text = match &s {
+                Value::Object(Some(o)) => ctx.read_string(*o).unwrap_or_default(),
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            let off_i = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let total = text.encode_utf16().count() as i64;
+            let end = i64::from(off_i) + i64::from(len_i);
+            if len_i > 0 && (off_i < 0 || end > total) {
+                return Err(RuntimeError::StringIndexOutOfBoundsException {
+                    index: off_i,
+                    message: Some(format!("begin {off_i}, end {end}, length {total}")),
+                }
+                .into());
+            }
+            if len_i <= 0 {
+                return Ok(None);
+            }
             let off = args.get(2).cloned().unwrap_or(Value::Int(0));
             let len = args.get(3).cloned().unwrap_or(Value::Int(0));
             ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len])?;
@@ -7118,7 +7245,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, this);
             let o = p57_read_path(ctx, other);
-            Ok(Some(Value::Int(if p.starts_with(&o) { 1 } else { 0 })))
+            Ok(Some(Value::Int(i32::from(p57_starts_with(&p, &o)))))
         },
     );
 
@@ -7127,7 +7254,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let other = obj_arg(args, 1)?;
         let p = p57_read_path(ctx, this);
         let o = ctx.read_string(other).unwrap_or_default();
-        Ok(Some(Value::Int(if p.starts_with(&o) { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(p57_starts_with(&p, &o)))))
     });
 
     r.register(path, "endsWith", "(Ljava/nio/file/Path;)Z", |ctx, args| {
@@ -7135,7 +7262,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let other = obj_arg(args, 1)?;
         let p = p57_read_path(ctx, this);
         let o = p57_read_path(ctx, other);
-        Ok(Some(Value::Int(if p.ends_with(&o) { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(p57_ends_with(&p, &o)))))
     });
 
     r.register(path, "endsWith", "(Ljava/lang/String;)Z", |ctx, args| {
@@ -7143,7 +7270,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let other = obj_arg(args, 1)?;
         let p = p57_read_path(ctx, this);
         let o = ctx.read_string(other).unwrap_or_default();
-        Ok(Some(Value::Int(if p.ends_with(&o) { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(p57_ends_with(&p, &o)))))
     });
 
     r.register(path, "isAbsolute", "()Z", |ctx, args| {
@@ -8444,6 +8571,94 @@ pub(crate) fn p57_parse_root(s: &str) -> (Option<String>, Vec<String>) {
 /// separate from `p57_parse_root` on purpose — [`p57_normalize_path`] and
 /// [`p57_relativize`] must keep seeing zero elements there, since HotSpot's
 /// `Paths.get("").relativize(Paths.get("a"))` is `a`, not `../a`.
+/// `Path.startsWith`, which is a NAME-ELEMENT rule and not a string one.
+///
+/// MEASURED, both spellings wrong in the same way:
+///
+/// ```text
+///   Paths.get("a/bc").startsWith("a/b")   HotSpot false   CratonVM true
+///   Paths.get("a/b/c").startsWith("")     HotSpot false   CratonVM true
+/// ```
+///
+/// `String::starts_with` is a prefix test on TEXT, and a path is not text: it
+/// is a root plus a sequence of names. The first row is the dangerous one —
+/// `startsWith` is how a program asks "is this file inside that directory",
+/// which is the shape of nearly every path-traversal check ever written. A
+/// text prefix answers yes for `/appsecret` under `/app`.
+///
+/// The rule, from `sun.nio.fs.UnixPath`: the roots must be the same, `other`
+/// may not have more name elements, and every one of its names must equal the
+/// name at the same index. The EMPTY path has no names and no root, and is a
+/// prefix of nothing but itself.
+pub(crate) fn p57_starts_with(this: &str, other: &str) -> bool {
+    let (r1, n1) = p57_parse_root(this);
+    let (r2, n2) = p57_parse_root(other);
+    if r1 != r2 {
+        return false;
+    }
+    if r2.is_none() && n2.is_empty() {
+        return r1.is_none() && n1.is_empty();
+    }
+    if n2.len() > n1.len() {
+        return false;
+    }
+    n1[..n2.len()] == n2[..]
+}
+
+/// `Path.endsWith`, the mirror rule — with the asymmetry the JDK actually has.
+///
+/// ```text
+///   Paths.get("ab/c").endsWith("b/c")     HotSpot false   CratonVM true
+///   Paths.get("/a/b").endsWith("a/b")     HotSpot true  (a RELATIVE suffix
+///                                                        matches an absolute
+///                                                        path's tail)
+/// ```
+///
+/// `startsWith` is symmetric in the root — both operands must have the same
+/// one. `endsWith` is not: a relative `other` matches the tail of an absolute
+/// `this`, while an ABSOLUTE `other` must match the whole path including its
+/// root. That asymmetry is the piece a paraphrase drops.
+pub(crate) fn p57_ends_with(this: &str, other: &str) -> bool {
+    let (r1, n1) = p57_parse_root(this);
+    let (r2, n2) = p57_parse_root(other);
+    if r2.is_none() && n2.is_empty() {
+        return r1.is_none() && n1.is_empty();
+    }
+    if n2.len() > n1.len() {
+        return false;
+    }
+    if r2.is_some() && (r1 != r2 || n1.len() != n2.len()) {
+        return false;
+    }
+    n1[n1.len() - n2.len()..] == n2[..]
+}
+
+/// Is `other` a `Path` at all?
+///
+/// `Path.equals(Object)` read the argument's path unconditionally, so
+/// `Paths.get("a/b/c").equals("a/b/c")` — a `String` — answered **true**.
+/// MEASURED against HotSpot, which answers false. An `equals` that admits a
+/// foreign type breaks the contract in both directions at once: it is not
+/// symmetric (`"a/b/c".equals(path)` is false), so a `HashSet` or a `List
+/// .contains` gives different answers depending on which side it holds.
+///
+/// The test is deliberately generous, because a `false` here would be a
+/// REGRESSION for any real JDK `Path` implementation that reaches this native:
+/// this VM's own representation is the synthetic `java/nio/file/Path`, and the
+/// JDK's are all named `*Path` (`sun.nio.fs.UnixPath`, `WindowsPath`,
+/// `jdk.nio.zipfs.ZipPath`). Anything else — a `String` above all — is not one.
+fn p57_is_path_object(ctx: &mut dyn NativeContext, other: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(other);
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some("java/nio/file/Path") => true,
+        Some(name) => {
+            name.rsplit('/').next().is_some_and(|s| s.ends_with("Path"))
+                || ctx.synthetic_implements_declared(cid, "java/nio/file/Path")
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn p57_name_elements(path: &str) -> Vec<String> {
     let (root, names) = p57_parse_root(path);
     if root.is_none() && names.is_empty() {
@@ -9370,9 +9585,18 @@ pub(crate) fn fsp_new_output_stream(
             // Cause C: Spring's `PathResourceTests.getOutputStreamForDirectory`);
             // a missing parent → `NoSuchFileException`. Both are `IOException`
             // subclasses so existing `catch (IOException)` callers are unaffected.
+            // EISDIR is its own row: on Linux, opening a directory for
+            // output fails with "Is a directory", and HotSpot reports that as
+            // a `FileSystemException` carrying the path and the reason.
+            // MEASURED: this VM answered a bare `IOException`, which is the
+            // supertype every other failure also uses, so a caller could not
+            // tell "you named a directory" from "the disk is full".
             return Err(match e.kind() {
                 std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p)?,
                 std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p)?,
+                std::io::ErrorKind::IsADirectory => {
+                    p57_filesystem_exception(ctx, &p, None, "Is a directory")?
+                }
                 _ => RuntimeError::IOException {
                     message: format!("newOutputStream({}): {}", p, e),
                 }
@@ -9493,6 +9717,15 @@ pub(crate) fn p57_files_write_bytes(
     let path_obj = ctx.read_native_pin(path_pin, path_obj);
     ctx.unpin_native_roots(path_pin);
 
+    // `Files.write(path, bytes, READ)` is an `IllegalArgumentException`, and
+    // `fsp_output_stream_option_refusal` is the check that says so — the
+    // sibling `newOutputStream` already ran it and this path did not, so the
+    // same option was refused through one door and accepted through the other.
+    // MEASURED: this VM opened the file for WRITING and truncated it, which is
+    // the opposite of what READ asks for.
+    if let Some(refused) = fsp_output_stream_option_refusal(flags) {
+        return Err(refused);
+    }
     if flags.nofollow {
         if let Some(refused) = p57_nofollow_reject(&p) {
             return Err(refused);
@@ -9513,6 +9746,9 @@ pub(crate) fn p57_files_write_bytes(
             return Err(match e.kind() {
                 std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p)?,
                 std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p)?,
+                std::io::ErrorKind::IsADirectory => {
+                    p57_filesystem_exception(ctx, &p, None, "Is a directory")?
+                }
                 _ => p57_io_error(&e),
             })
         }
@@ -9527,6 +9763,100 @@ pub(crate) fn p57_files_write_bytes(
     match outcome {
         Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
         Err(e) => Err(p57_io_error(&e)),
+    }
+}
+
+/// The `std::io::Error` -> Java exception mapping every `java.nio.file` entry
+/// point owes its caller.
+///
+/// `Files.copy` and `Files.move` both ended in
+///
+/// ```rust,ignore
+/// Err(e) => Err(RuntimeError::IllegalStateException { message: format!("IOException: {e}") })
+/// ```
+///
+/// which is wrong twice over. `IllegalStateException` is **not an
+/// `IOException`**, so `catch (IOException)` — the handler every caller of
+/// these two methods is REQUIRED to write, because both declare `throws
+/// IOException` — does not match it, and the exception unwinds past the code
+/// written to handle it. And the specific subtype is the contract: MEASURED,
+///
+/// ```text
+///   Files.copy(missing, t)      HotSpot NoSuchFileException   CratonVM IllegalStateException
+///   Files.move(s, missingdir/x) HotSpot NoSuchFileException   CratonVM IllegalStateException
+/// ```
+///
+/// The message it built ("IOException: No such file or directory (os error 2)")
+/// shows the intent — it knew which exception it meant and could not spell it.
+pub(crate) fn p57_fs_error(
+    ctx: &mut dyn NativeContext,
+    e: &std::io::Error,
+    file: &str,
+) -> MethodCallFailed {
+    let built = match e.kind() {
+        std::io::ErrorKind::NotFound => p57_no_such_file(ctx, file),
+        std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, file),
+        std::io::ErrorKind::AlreadyExists => return p57_file_already_exists(ctx, file),
+        std::io::ErrorKind::DirectoryNotEmpty => p57_directory_not_empty(ctx, file),
+        std::io::ErrorKind::NotADirectory => p57_not_directory(ctx, file),
+        std::io::ErrorKind::IsADirectory => {
+            p57_filesystem_exception(ctx, file, None, "Is a directory")
+        }
+        _ => return p57_io_error(e),
+    };
+    match built {
+        Ok(f) => f,
+        Err(f) => f,
+    }
+}
+
+/// A `java.nio.charset.MalformedInputException` for a decode that failed.
+///
+/// `Files.readString` / `readAllLines` / `lines` decode with a CharsetDecoder
+/// configured to REPORT, so malformed input raises rather than substituting
+/// U+FFFD. This VM read every file with `String::from_utf8_lossy`, so
+/// `Files.readString(<two bytes of broken UTF-8>)` answered a String
+/// containing replacement characters and the caller could not tell a corrupt
+/// file from a file that genuinely contains them. MEASURED: HotSpot
+/// `MalformedInputException`, this VM no-throw.
+///
+/// The class's only constructor takes the input length, and `getMessage()`
+/// renders it, so it is passed rather than a text. Falls back to the caller's
+/// own error when the class cannot be resolved.
+pub(crate) fn p57_malformed_input(
+    ctx: &mut dyn NativeContext,
+    input_length: i32,
+) -> Option<MethodCallFailed> {
+    let cls = "java/nio/charset/MalformedInputException";
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object(cls) {
+        let _ = ctx.invoke(
+            cls,
+            "<init>",
+            "(I)V",
+            &[Value::Object(Some(exc)), Value::Int(input_length)],
+        );
+        return Some(MethodCallFailed::ExceptionThrown(exc));
+    }
+    None
+}
+
+/// [`p57_read_to_string`] with the JDK's REPORT action instead of REPLACE.
+///
+/// Returns `Err(None)` for an I/O failure the caller must map itself, and
+/// `Err(Some(len))` when the bytes are not valid UTF-8 — `len` being the length
+/// of the offending sequence, which is what `MalformedInputException` carries.
+pub(crate) fn p57_read_to_string_strict(p: &str) -> Result<Result<String, usize>, std::io::Error> {
+    let bytes = match vfs_read(p) {
+        Some(r) => r?,
+        None => std::fs::read(p)?,
+    };
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Ok(s)),
+        Err(e) => {
+            // `error_len()` is `None` for an unexpected end of input, which the
+            // JDK reports with length 1.
+            Ok(Err(e.utf8_error().error_len().unwrap_or(1)))
+        }
     }
 }
 
@@ -15268,6 +15598,98 @@ fn win_file_identity(path: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
+/// [`file_alloc`] in code units.
+///
+/// `getParentFile` used to build its answer with `file_alloc`, i.e. through a
+/// `String`, which lost a surrogate-bearing path (G78-1 §4). It now has no
+/// reason to: the parent is computed in units and stays in units.
+pub(crate) fn file_alloc_units(
+    ctx: &mut dyn NativeContext,
+    path: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh File (native stale-local family).
+    let obj_pin = ctx.pin_native_root(obj);
+    let s = ctx.create_string_from_units(path);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field(obj, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(obj_pin);
+    Ok(obj)
+}
+
+/// `new File(URI)`'s six refusals, in the constructor's own order.
+///
+/// ```text
+/// if (!uri.isAbsolute())          throw new IllegalArgumentException("URI is not absolute");
+/// if (uri.isOpaque())             throw new IllegalArgumentException("URI is not hierarchical");
+/// if (scheme == null || !scheme.equalsIgnoreCase("file"))
+///                                 throw new IllegalArgumentException("URI scheme is not \"file\"");
+/// if (uri.getAuthority() != null) throw new IllegalArgumentException("URI has an authority component");
+/// if (uri.getFragment() != null)  throw new IllegalArgumentException("URI has a fragment component");
+/// if (uri.getQuery() != null)     throw new IllegalArgumentException("URI has a query component");
+/// ```
+///
+/// MEASURED before the fix (`probes/L4FileSweep.java`): `new File(new
+/// URI("foo/bar"))`, `new File(new URI("http://x/y"))` and `new File((URI)
+/// null)` all constructed a `File` rather than refusing. The first two are the
+/// dangerous pair -- a relative or non-`file` URI produced a `File` whose path
+/// is a fragment of somebody else's namespace, and the caller learns that only
+/// when `exists()` answers false somewhere else entirely.
+///
+/// The scan works on the URI's raw TEXT rather than on `getScheme()` /
+/// `getAuthority()`, because the constructor already has to cope with the
+/// synthetic 7-slot URIs whose accessors may not be wired -- and a check that
+/// cannot be grounded must not invent a refusal. An unreadable text answers
+/// `None`, which is the pre-existing behaviour exactly.
+///
+/// The separator tests use [`u_is_sep`] rather than `/` alone, so the mangled
+/// `file:\C:\...` spelling this constructor is documented to receive on
+/// Windows keeps working instead of being newly rejected as opaque.
+fn file_uri_reject(raw: &[u16]) -> Option<&'static str> {
+    if raw.is_empty() {
+        return None;
+    }
+    let colon = u16::from(b':');
+    let hash = u16::from(b'#');
+    let quest = u16::from(b'?');
+    // A scheme is the text before the first `:`, and only if no separator,
+    // query or fragment delimiter comes first -- otherwise the URI is relative.
+    let stop = raw
+        .iter()
+        .position(|&c| u_is_sep(c) || c == quest || c == hash);
+    let scheme_end = match (raw.iter().position(|&c| c == colon), stop) {
+        (Some(i), Some(j)) if i > j => return Some("URI is not absolute"),
+        (Some(0), _) | (None, _) => return Some("URI is not absolute"),
+        (Some(i), _) => i,
+    };
+    let scheme = String::from_utf16_lossy(&raw[..scheme_end]);
+    if !scheme.eq_ignore_ascii_case("file") {
+        return Some("URI scheme is not \"file\"");
+    }
+    let rest = &raw[scheme_end + 1..];
+    // Opaque: the scheme-specific part does not begin with a separator.
+    if !rest.first().is_some_and(|&c| u_is_sep(c)) {
+        return Some("URI is not hierarchical");
+    }
+    if rest.len() >= 2 && u_is_sep(rest[1]) {
+        let after = &rest[2..];
+        let alen = after.iter().position(|&c| u_is_sep(c)).unwrap_or(after.len());
+        // An EMPTY authority (`file:///x`) is `getAuthority() == null`, which
+        // is the ordinary spelling and must not be refused.
+        if alen > 0 {
+            return Some("URI has an authority component");
+        }
+    }
+    if rest.contains(&hash) {
+        return Some("URI has a fragment component");
+    }
+    if rest.contains(&quest) {
+        return Some("URI has a query component");
+    }
+    None
+}
+
 /// Allocate a new File synthetic with the given path.
 pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
@@ -15298,8 +15720,18 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // UNITS (G70-1 N1): the normalised path is written straight back into
         // a Java field, so this is a round trip, not an inspection.
+        //
+        // `File(String)` opens `if (pathname == null) throw new
+        // NullPointerException();`. Reading a null argument as the empty path
+        // instead built `new File("")` -- an object that answers `exists()`
+        // false, `getName()` "" and `getAbsolutePath()` the working directory,
+        // so the caller's mistake surfaces arbitrarily far from where it was
+        // made. MEASURED: HotSpot NPE, this VM no-throw.
         let path = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+            Some(Value::Object(None)) => {
+                return Err(RuntimeError::NullPointerException { message: None }.into())
+            }
             _ => Vec::new(),
         };
         let normalised = file_normalise_path_units(&path);
@@ -15320,12 +15752,24 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // A null PARENT and an empty parent are different, and this body
+            // treated them alike. The JDK's two branches are
+            //   parent == null  ->  path = fs.normalize(child)
+            //   parent == ""    ->  path = fs.resolve(fs.getDefaultParent(), ..)
+            // so `new File((String) null, "c")` is "c" while `new File("", "c")`
+            // is "/c". MEASURED: this VM answered "/c" to both, i.e. it moved a
+            // relative path to the filesystem ROOT.
             let parent = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
-                _ => Vec::new(),
+                Some(Value::Object(Some(s))) => Some(ctx.read_string_units(*s).unwrap_or_default()),
+                Some(Value::Object(None)) => None,
+                _ => Some(Vec::new()),
             };
+            // `if (child == null) throw new NullPointerException();`
             let child = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => Vec::new(),
             };
             // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
@@ -15336,7 +15780,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             // Java: strip leading/trailing separators from the child, a trailing one
             // from the parent, join with a separator, then normalise (slash
             // conversion + collapse). Empty child → just the normalised parent.
-            let path = file_join_parent_child_units(&parent, &child);
+            let path = match &parent {
+                Some(p) => file_join_parent_child_units(p, &child),
+                None => file_normalise_path_units(&child),
+            };
             // Pin across the create_string below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
@@ -15355,15 +15802,25 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         "(Ljava/io/File;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Same two branches as the (String, String) form above: a null
+            // parent normalises the child, it does not resolve it against the
+            // default parent.
             let parent_path = match args.get(1) {
-                Some(Value::Object(Some(p))) => file_read_path_units(ctx, *p),
-                _ => Vec::new(),
+                Some(Value::Object(Some(p))) => Some(file_read_path_units(ctx, *p)),
+                Some(Value::Object(None)) => None,
+                _ => Some(Vec::new()),
             };
             let child = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => Vec::new(),
             };
-            let path = file_join_parent_child_units(&parent_path, &child);
+            let path = match &parent_path {
+                Some(p) => file_join_parent_child_units(p, &child),
+                None => file_normalise_path_units(&child),
+            };
             // Pin across the create_string below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
@@ -15391,16 +15848,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let uri = match args.get(1) {
             Some(Value::Object(Some(u))) => *u,
-            _ => {
-                // Pin across the create_string below — a moving young GC there
-                // would relocate `this` (native stale-local family).
-                let this_pin = ctx.pin_native_root(this);
-                let s = ctx.create_string("");
-                let this = ctx.read_native_pin(this_pin, this);
-                ctx.set_field(this, 0, Value::Object(Some(s)));
-                ctx.unpin_native_roots(this_pin);
-                return Ok(None);
-            }
+            // `File(URI)` opens with `uri.isAbsolute()`, so a null URI is an
+            // NPE from the receiver. Minting an empty-path File instead handed
+            // the caller an object that silently denotes the working directory.
+            _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
         };
         // Prefer the parsed `path` component — with the slot-collision guard:
         // synthetic 7-slot URIs (URL.toURI) answer the by-name "path" read
@@ -15433,6 +15884,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // G75-1 N1, so by this point the ONLY remaining loss was this
         // constructor's own read of the answer.
         let raw_u = crate::net_phase_e::uri_raw_units(ctx, uri);
+        if let Some(why) = file_uri_reject(&raw_u) {
+            return Err(RuntimeError::IllegalArgumentException { message: why.into() }.into());
+        }
         let mut path_u = match ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[]) {
             Ok(Some(Value::Object(Some(s)))) => ctx
                 .read_string_units(s)
@@ -15540,21 +15994,26 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
     r.register(file, "getParentFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // `file_alloc` takes a `&str`; the parent of a surrogate-bearing path
-        // therefore still round-trips lossily HERE. That is recorded rather than
-        // papered over — see G78-1 §4. `getParent()` above, which is the string
-        // answer and by far the commoner call, is exact.
-        let path = file_read_path(ctx, this);
-        match std::path::Path::new(&path).parent() {
-            Some(p) => {
-                let pstr = p.to_string_lossy().into_owned();
-                if pstr.is_empty() {
-                    Ok(Some(Value::Object(None)))
-                } else {
-                    Ok(Some(Value::Object(Some(file_alloc(ctx, &pstr)?))))
-                }
-            }
-            None => Ok(Some(Value::Object(None))),
+        // The JDK's body is `String p = this.getParent(); if (p == null) return
+        // null; return new File(p, this.prefixLength);` — so the two methods
+        // cannot disagree. This one used `std::path::Path::parent`, whose
+        // COMPONENTS normalise `.` away, and so they did:
+        //
+        //   new File("a/./b").getParent()      "a/."     getParentFile()  "a"
+        //   new File("/.").getParent()         "/"       getParentFile()  null
+        //
+        // Both MEASURED against HotSpot. The second shape is the one that
+        // bites: `new File(".").getAbsoluteFile().getParentFile()` is the
+        // ordinary way to name the working directory, and it answered the
+        // directory ABOVE it.
+        //
+        // Going through `file_parent_units` also removes the G78-1 §4 loss —
+        // the parent of a surrogate-bearing path no longer round-trips through
+        // a lossy `String`.
+        let path = file_read_path_units(ctx, this);
+        match file_parent_units(&path) {
+            Some(pu) if !pu.is_empty() => Ok(Some(Value::Object(Some(file_alloc_units(ctx, &pu)?)))),
+            _ => Ok(Some(Value::Object(None))),
         }
     });
     r.register(
@@ -15793,9 +16252,12 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "renameTo", "(Ljava/io/File;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let src = file_read_path(ctx, this);
+        // `renameTo(null)` is an NPE in the JDK (`dest.getPath()`), not a
+        // false. A false is indistinguishable from "the rename was refused by
+        // the filesystem", which is the answer callers retry or log.
         let dst = match args.get(1) {
             Some(Value::Object(Some(f))) => file_read_path(ctx, *f),
-            _ => return Ok(Some(Value::Int(0))),
+            _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
         };
         let ok = std::fs::rename(&src, &dst).is_ok();
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
@@ -15807,6 +16269,14 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
+        // `if (time < 0) throw new IllegalArgumentException("Negative time");`
+        // — the JDK's first line, and the only argument check the method has.
+        if millis < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Negative time".into(),
+            }
+            .into());
+        }
         Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
             1
         } else {
@@ -16186,9 +16656,12 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
     r.register(file, "compareTo", "(Ljava/io/File;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // `compareTo(null)` reaches `pathname.getPath()` and is an NPE.
+        // Answering 0 said "these two files are the same", which is the one
+        // answer a sort or a TreeSet acts on destructively.
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
+            _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
         };
         let p1 = file_path_key_units(&file_read_path_units(ctx, this));
         let p2 = file_path_key_units(&file_read_path_units(ctx, other));
@@ -17480,6 +17953,14 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
         |ctx, args| {
+            // `readAttributes(path, null)` is an NPE. It used to fall through
+            // to the BASIC view, which is the one answer that cannot be
+            // distinguished from a correct call — a caller whose `type`
+            // reference is null by mistake got a plausible attributes object
+            // back. MEASURED against HotSpot.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             #[cfg(windows)]
             {
                 // Only a PRESENT `Class` argument states a requested type. A
@@ -18521,6 +19002,10 @@ pub(crate) fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Valu
 }
 
 pub(crate) fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A null path is an NPE, not a `NoSuchFileException` for the empty path —
+    // the two mean different things to a caller that catches the latter to
+    // mean "the file is not there yet".
+    obj_arg(args, 0)?;
     let path_str = extract_path_string(ctx, args.first());
     if let Some(bytes) = vfs_read(&path_str) {
         return match bytes {
@@ -20613,6 +21098,43 @@ pub(crate) fn p98_walk_file_tree(
     // -- once it returns.
     let visitor_pin = p98_pin(ctx, visitor);
     let path_pin = p98_pin(ctx, path_obj);
+    // A START NODE THAT IS NOT THERE. `Files.walkFileTree` reads the start
+    // node's attributes first, and when that fails it calls
+    // `visitor.visitFileFailed(start, ioe)` — which `SimpleFileVisitor`
+    // implements by RETHROWING. MEASURED: HotSpot `NoSuchFileException`, this
+    // VM returned the start path having visited nothing, so a caller walking a
+    // directory that does not exist saw a successful empty walk.
+    //
+    // The callback is made rather than the exception thrown directly, because
+    // a visitor is entitled to override `visitFileFailed` and continue — which
+    // is the whole reason the JDK routes it through the visitor.
+    let root_missing = match vfs_classify(&root_str) {
+        Some(kind) => matches!(kind, JarFsKind::Absent),
+        None => std::fs::symlink_metadata(&root_str).is_err(),
+    };
+    if root_missing {
+        let exc = match p57_no_such_file(ctx, &root_str) {
+            Ok(MethodCallFailed::ExceptionThrown(e)) => e,
+            Ok(other) | Err(other) => {
+                ctx.unpin_native_roots(visitor_pin.0);
+                return Err(other);
+            }
+        };
+        let visitor_now = p98_read_pin(ctx, visitor_pin);
+        let path_now = p98_read_pin(ctx, path_pin);
+        let outcome = p98_invoke_file_visitor(
+            ctx,
+            visitor_now,
+            "visitFileFailed",
+            "(Ljava/nio/file/Path;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
+            "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
+            path_now,
+            Value::Object(Some(exc)),
+        );
+        ctx.unpin_native_roots(visitor_pin.0);
+        outcome?;
+        return Ok(Some(path_val));
+    }
     // JDK 25's ArchiveContainer indexer only records package directories.
     // Serve that exact, already-indexed jar walk without an interpreter
     // callback for every directory; all other visitors use the generic path.
