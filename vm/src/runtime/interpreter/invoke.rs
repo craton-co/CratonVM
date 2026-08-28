@@ -262,9 +262,13 @@ pub(super) fn helpful_npe_opcode_message_parts(
 /// This is the COMPILE-TIME form of that question, answered while the caller
 /// already holds the class-manager read guard. A `true` means the site must be
 /// classified as a direct, non-dispatching bind (`invoke_kind == 1`) rather
-/// than as virtual dispatch. The class name needs no substitution: JVM access
-/// control makes a private method invocable only from the class that declares
-/// it, so the constant pool's owner already IS the declaring class.
+/// than as virtual dispatch.
+///
+/// The rule itself lives in
+/// [`crate::classloading::invokevirtual_private_declaring_class`], beside its
+/// `invokespecial` twin; this is the name-and-loader-resolving wrapper the
+/// interpreter side wants. [`crate::runtime::interpreter::jit_bridge`]'s three
+/// compile doors call the same rule for the declaring class NAME.
 pub(crate) fn invokevirtual_site_targets_private(
     cm: &crate::classloading::ClassManager,
     current_class_id: ClassId,
@@ -275,13 +279,13 @@ pub(crate) fn invokevirtual_site_targets_private(
     let Some(cp_class_id) = cm.find_class_by_name_for_class(target_class, current_class_id) else {
         return false;
     };
-    let store = cm.class_store();
-    let Some((method, _declaring_id)) =
-        crate::classloading::find_method_recursive(cp_class_id, method_name, descriptor, store)
-    else {
-        return false;
-    };
-    method.access_flags.contains(MethodAccessFlags::PRIVATE)
+    crate::classloading::invokevirtual_private_declaring_class(
+        cp_class_id,
+        method_name,
+        descriptor,
+        cm.class_store(),
+    )
+    .is_some()
 }
 
 /// Resolve a Java 11+ private-method call encoded as `invokevirtual`.

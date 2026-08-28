@@ -15670,15 +15670,31 @@ fn dup_x2_without_a_provable_form_bails_under_its_own_name() {
     assert_eq!(site, "singlepass-codegen/dup_x2-unprovable-form");
 }
 
-/// The catch-all is no longer anonymous. `wide` (0xC4) is unlowered in this
-/// walk; `jit_scan` also rejects it, so in production it never gets this far,
-/// but `compile` does not re-run the scan — which is exactly what lets this
-/// test drive the walk onto the catch-all and pin the reason string it now
+/// The catch-all is no longer anonymous. `frem` (0x72) has no arm in this
+/// walk — `jit_scan` admits it on purpose so the optimizing IR backend can
+/// see the method, which is why it is on
+/// [`SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM`] — so driving the single-pass
+/// walk onto it lands on the catch-all and pins the reason string it now
 /// records. Before, every opcode that landed here reported the bare
 /// `singlepass-codegen` site, naming nothing.
+///
+/// The exemplar used to be `wide` (0xC4), which stopped being unlowered on
+/// 2026-08-28 and turned this test red for a reason that had nothing to do
+/// with what it asserts. So the exemplar is now checked before it is used:
+/// a hard-coded opcode in a test about UNLOWERED opcodes is a fact with a
+/// shelf life, and the failure should say which fact expired.
 #[test]
 fn the_unlowered_opcode_catch_all_names_itself() {
-    let code = [0xc4, 0x15, 0x00, 0x01, 0xac]; // wide iload 1; ireturn
+    const EXEMPLAR: u8 = 0x72; // frem
+    assert!(
+        !single_pass_dispatch_arms().contains(&EXEMPLAR),
+        "0x{EXEMPLAR:02x} is lowered now, so it can no longer drive the walk \
+         onto its catch-all. Pick another opcode with no dispatch arm — \
+         `SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM` lists the deliberate ones."
+    );
+    // fconst_0; fconst_0; frem; freturn — the two operands keep the walk's
+    // stack model honest right up to the opcode under test.
+    let code = [0x0b, 0x0b, EXEMPLAR, 0xae];
     let _ = crate::take_jit_bail_site();
     assert!(compile_probe_method(&code, 0, 2).is_none());
     let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
@@ -15826,13 +15842,18 @@ fn the_dispatch_arm_parser_reads_the_real_match() {
         (0x1bu8, "iload_1, inside a `..=` range arm"),
         (0xc2u8, "monitorenter, inside an alternation arm"),
         (0xacu8, "ireturn"),
+        // 2026-08-28: `wide` moved from the negative list below to this
+        // one when the prefix was lowered (netty's `FastLz.compress` is
+        // 1617 bytes carrying three `iinc_w`, and a scan refusal is
+        // permanent for the whole method at every compile door). A spot
+        // check either way is what makes the move visible.
+        (0xc4u8, "wide, the prefix arm"),
     ] {
         assert!(arms.contains(&op), "dispatch arm for 0x{op:02x} ({what})");
     }
     // And it must not invent coverage for opcodes nobody lowers here.
     for (op, what) in [
         (0xa8u8, "jsr — unlowered in both walkers"),
-        (0xc4u8, "wide — unlowered in both walkers"),
         (0x72u8, "frem — deliberately IR-only"),
     ] {
         assert!(
