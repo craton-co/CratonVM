@@ -446,7 +446,9 @@ from the earlier screen, closest to L1, and it blocks no workload.
 
 ## 9. Gates and the three arms
 
-Run on the merged tree, release binary, same host. **No red is new.**
+Run on the MERGED tree — `origin/dev` had moved eight commits while this lane
+was measuring, and the whole set was re-run after the merge rather than the
+quick subset. Release binary, same host. **No red is new.**
 
 ```text
 cargo test -p cratonvm-types                                   PASS
@@ -456,8 +458,13 @@ cargo test -p cratonvm-native-builtins --lib      4177 passed, 0 failed
 cargo test -p cratonvm-vm --lib                   2637 passed, 2 failed   <- see below
 SUITE=core                bash regression-suite/run.sh          72 / 72
 SUITE=all                 bash regression-suite/run.sh         111 / 112
-CRATONVM_ARGS=--jdk-only  bash regression-suite/run.sh         110 / 112
+CRATONVM_ARGS=--jdk-only  bash regression-suite/run.sh         111 / 112
 ```
+
+All fifteen definition-of-done arm runs were re-taken on the merged tree too,
+with the same verdicts and the same two compatible-mode probe differences (R2
+and R3 below); a merge of two independently-verified halves is not a verified
+whole.
 
 **The two `cratonvm-vm --lib` failures are red on pristine `origin/dev` and are
 in a file this branch does not touch.**
@@ -498,9 +505,10 @@ java.lang.AssertionError: ConcurrentHashMap.elements(): hasMoreElements() never 
   at RJdkEnumerations.drain(RJdkEnumerations.java:113)
 ```
 
-`RBlockingQueue` failed in the `--jdk-only` arm only and **passes standalone on
-the same binary** — the documented load flake of `HANDOFF-20260812.md`, checked
-rather than assumed.
+`RBlockingQueue` failed once in the pre-merge `--jdk-only` arm, **passes
+standalone on the same binary**, and did not fail again in the merged tree's
+three arms — the documented load flake of `HANDOFF-20260812.md`, checked rather
+than assumed.
 
 
 ## Reproduce
