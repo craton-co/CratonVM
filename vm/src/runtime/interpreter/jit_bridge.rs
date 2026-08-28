@@ -4872,10 +4872,24 @@ pub(super) fn try_jit_upgrade_with_gate(
                 descriptor,
                 store,
             )?;
-            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                return None;
+                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return store.get(declaring_id).map(|c| c.name.to_string());
             }
-            return store.get(declaring_id).map(|c| c.name.to_string());
+            // Not private, but possibly unoverridable anyway — a `final`
+            // method, or any method of a `final` class, has exactly one
+            // possible target at this site for the same reason a private one
+            // does. Same conclusion (statically bound; substitute the
+            // DECLARING class, which for this rule is often not the class the
+            // constant pool names), reached by a different argument. The rule
+            // lives in `invoke::invokevirtual_site_final_owner` so these three
+            // per-door copies cannot drift apart on it.
+            return super::invoke::invokevirtual_site_final_owner(
+                &cm,
+                class_id,
+                target_class,
+                method_name,
+                descriptor,
+            );
         }
         if opcode != 0xb7 {
             return None;
@@ -5398,10 +5412,24 @@ pub(super) fn try_jit_upgrade_with_gate(
                         descriptor,
                         store,
                     )?;
-                    if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                        return None;
+                                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                        return store.get(declaring_id).map(|c| c.name.to_string());
                     }
-                    return store.get(declaring_id).map(|c| c.name.to_string());
+                    // Not private, but possibly unoverridable anyway — a `final`
+                    // method, or any method of a `final` class, has exactly one
+                    // possible target at this site for the same reason a private one
+                    // does. Same conclusion (statically bound; substitute the
+                    // DECLARING class, which for this rule is often not the class the
+                    // constant pool names), reached by a different argument. The rule
+                    // lives in `invoke::invokevirtual_site_final_owner` so these three
+                    // per-door copies cannot drift apart on it.
+                    return super::invoke::invokevirtual_site_final_owner(
+                        &cm,
+                        callee_cid,
+                        target_class,
+                        method_name,
+                        descriptor,
+                    );
                 }
                 if opcode != 0xb7 {
                     return None;
@@ -6837,10 +6865,24 @@ pub(super) fn try_jit_compile_callee_slow(
                 descriptor,
                 store,
             )?;
-            if !method.access_flags.contains(MethodAccessFlags::PRIVATE) {
-                return None;
+                        if method.access_flags.contains(MethodAccessFlags::PRIVATE) {
+                return store.get(declaring_id).map(|c| c.name.to_string());
             }
-            return store.get(declaring_id).map(|c| c.name.to_string());
+            // Not private, but possibly unoverridable anyway — a `final`
+            // method, or any method of a `final` class, has exactly one
+            // possible target at this site for the same reason a private one
+            // does. Same conclusion (statically bound; substitute the
+            // DECLARING class, which for this rule is often not the class the
+            // constant pool names), reached by a different argument. The rule
+            // lives in `invoke::invokevirtual_site_final_owner` so these three
+            // per-door copies cannot drift apart on it.
+            return super::invoke::invokevirtual_site_final_owner(
+                &cm,
+                cid,
+                target_class,
+                method_name,
+                descriptor,
+            );
         }
         if opcode != 0xb7 {
             return None;
