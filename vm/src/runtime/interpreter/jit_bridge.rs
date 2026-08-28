@@ -4131,13 +4131,23 @@ pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
 /// Does the resolved field's own descriptor agree with the one the constant
 /// pool's `NameAndType` spells for this site?
 ///
-/// # Why this has to be asked at all
+/// # Why this was asked at all
 ///
-/// JVMS §5.4.3.2 resolves a field by **name and descriptor**. This VM's field
-/// resolution — `MemberResolver::locate_field`, `ClassFile::find_own_field` and
-/// `find_field_recursive` underneath it — matches on the **name alone** and
-/// returns the first field of that name it meets walking the class, its
-/// superinterfaces and its superclass chain.
+/// **The premise below is now historical.** When this guard was written, this
+/// VM's field resolution — `MemberResolver::locate_field`,
+/// `ClassFile::find_own_field` and `find_field_recursive` underneath it —
+/// matched on the **name alone** and returned the first field of that name it
+/// met walking the class, its superinterfaces and its superclass chain, while
+/// JVMS §5.4.3.2 resolves by name **and** descriptor.
+///
+/// Resolution applies the full key since 2026-08-27, and raises
+/// `NoSuchFieldError` when the pair is absent since 2026-08-28
+/// (`CRATONVM_FIELD_RESOLUTION_NAME_ONLY=1` restores the old answer). So a
+/// disagreement can no longer arise from the resolver, and this guard should
+/// count zero forever. It is kept as the tripwire for that: a non-zero here
+/// now means the descriptor key was NOT applied on some path — the lenient
+/// lever is armed, or a caller reached `locate_field` with `descriptor: None`
+/// where it should have passed one.
 ///
 /// For the interpreter that is almost always harmless: it reads and writes a
 /// dynamically-tagged 16-byte cell, so landing on a same-named field of another
@@ -4155,10 +4165,9 @@ pub static JIT_FIELD_TAG_DISAGREEMENTS: std::sync::atomic::AtomicU64 =
 /// (`known-issues/tomcat/punned-sqlchar-rawdata-cell-writer-localized-…`).
 ///
 /// Refusing the site is the conservative answer: the method falls back to a
-/// tier that reads the cell's own tag, so the disagreement costs compilation
-/// rather than correctness. Fixing the resolver to match on the descriptor too
-/// is the larger change this guard makes safe to defer — and the counter says
-/// whether it is ever needed.
+/// tier that reads the cell's own tag, so a disagreement costs compilation
+/// rather than correctness. That was worth keeping after the resolver was
+/// fixed, because it is cheap and it fails in the safe direction.
 ///
 /// A `desc_byte` of 0 means the resolver had no descriptor to report (an empty
 /// descriptor string); that is a missing observation, not a disagreement, so it
