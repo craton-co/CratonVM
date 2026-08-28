@@ -430,6 +430,64 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 local_slot_ops.push((pc, true, code[pc + 1] as u16));
                 pc += 3;
             }
+            // wide (JVMS §6.5) — the prefix that widens the FOLLOWING opcode's
+            // local index to two bytes, and `wide iinc`'s constant to two more.
+            //
+            // Refused here until 2026-08-28, and a refusal in this scan is
+            // PERMANENT for the whole method at EVERY compile door: the `None`
+            // arms call `mark_jit_bail_listed`, and the OSR door consults the
+            // same list. netty's `FastLz.compress` is 1617 bytes whose entire
+            // job is one loop, so OSR is its only route to compiled code —
+            // and it carries three `iinc_w` instructions, of which
+            // `iinc_w 18, -255` is simply an increment too big for a signed
+            // byte. That one prefix left 256 MiB of compression running in the
+            // interpreter at **138x HotSpot** (`FastLz` encode, 1 MiB:
+            // 5115 ms against 37 ms), with no diagnostic beyond a silent
+            // `OSR-recompile reason=no-cached-artifact` repeating forever.
+            //
+            // Every downstream consumer was already built for this and says so
+            // in its own comment: `bytecode_len_at` and regalloc's `bc_len`
+            // twin size it 4/6 "as defense-in-depth ... if any is ever
+            // accepted", `find_reference_locals` reads its `aload`/`astore`
+            // forms, `classify_local_kinds` has tests for all three shapes, and
+            // `oop_dataflow_transfer` transfers it. Only this scan and the
+            // codegen's own walk were missing, and they are changed together.
+            0xC4 => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
+                let wop = code[pc + 1];
+                // `wide iinc` is SIX bytes (prefix, opcode, 2-byte index,
+                // 2-byte signed constant); every other widened form is four.
+                let width = if wop == 0x84 { 6 } else { 4 };
+                if pc + width > code_len {
+                    return None;
+                }
+                let idx = u16::from_be_bytes([code[pc + 2], code[pc + 3]]);
+                match wop {
+                    // iload, lload, fload, dload, aload
+                    0x15..=0x19 => local_slot_ops.push((pc, false, idx)),
+                    // istore, lstore, fstore, dstore, astore
+                    0x36..=0x3a => local_slot_ops.push((pc, true, idx)),
+                    // iinc — reads then writes the same slot, in that order,
+                    // exactly as the narrow arm above records it.
+                    0x84 => {
+                        local_slot_ops.push((pc, false, idx));
+                        local_slot_ops.push((pc, true, idx));
+                    }
+                    // `wide ret` (0xa9) and anything else. `ret` is half of the
+                    // obsolete `jsr`/`ret` pair this scan does not accept in its
+                    // narrow form either, so refuse the method rather than
+                    // widen the set this walk claims to model.
+                    _ => {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                            eprintln!("[cratonvm-jitc] scan-bail wide op=0x{wop:02x} pc={pc}");
+                        }
+                        return None;
+                    }
+                }
+                pc += width;
+            }
             // i2l, i2f, i2d, l2i, l2f, l2d, f2i, f2l, f2d, d2i, d2l, d2f, i2b, i2c, i2s
             0x85..=0x93 => {
                 pc += 1;
