@@ -15,7 +15,8 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| L1, L3, L6, L7 | unclaimed | your own worktree | your own branch |
+| **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
+| L3, L6, L7 | unclaimed | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
 Everything else is unclaimed.
@@ -187,6 +188,34 @@ planning:
 
 * `the-definition-of-done-screen-run-for-the-first-time-20260828.md`
 * `phase-2-worklist-mined-28-defects-in-four-families-20260828.md`
+
+### What L1 found that changes another lane's reasoning
+
+* **A shadow can be unretirable by construction.** The JDK implements the whole
+  byte/short/char/boolean atomic family in bytecode, by masking the 32-bit word
+  at `offset & ~3`. That is meaningless when `objectFieldOffset` returns a SLOT
+  INDEX, so on CratonVM `compareAndSetByte` answered `false` with the right
+  witness and `getAndSetByte` / `getAndBitwiseOrByte` **never returned**. Any
+  retirement pass reasoning from "the real method has Code" will nominate the
+  natives that stand in front of that bytecode; the answer is no. If your family
+  has a JDK bytecode body that does OFFSET ARITHMETIC, check it before you
+  retire its native.
+* **The retirement surface IS the JDK's argument-validation layer.** Nineteen of
+  L1's 24 defects are a null check, a bounds check, a size rule or a refusal
+  type that lives in a bytecode wrapper and nowhere else, and the `0`-suffixed
+  twin the wrapper calls is already registered here — pointing at the SAME Rust
+  function. That is why the check has one home.
+* **Two spellings of one class need not share one contract.**
+  `sun.misc.Unsafe.objectFieldOffset` refuses a record component;
+  `jdk.internal.misc.Unsafe.objectFieldOffset` answers an offset. One native
+  serves both, so the receiver is the discriminator. A first pass that applied
+  the refusal to both replaced one wrong answer with another.
+* **The oracle can be the thing that crashes.**
+  `sun.misc.Unsafe.allocateInstance(null)` SIGSEGVs HotSpot 25.0.4+7, and the
+  crash summary goes to STDOUT, so it both truncates the sweep and pollutes the
+  transcript. Null and out-of-bounds arguments belong in a probe that runs one
+  call per process behind a `timeout`, where "the VM died", "the VM never
+  returned" and "the VM threw" stay three different transcripts.
 
 ### OPEN, owned, do not duplicate
 
