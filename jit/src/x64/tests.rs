@@ -15532,6 +15532,136 @@ fn dup2_x2_without_a_provable_form_bails_under_its_own_name() {
     assert_eq!(site, "singlepass-codegen/dup2_x2-unprovable-form");
 }
 
+// ---------------------------------------------------------------------------
+// dup_x2 (0x5B) and dup2_x1 (0x5D) — the forms the second-entry width oracle
+// admitted on 2026-08-27.
+//
+// Before it, `dup_x2` was lowered ONLY when the next opcode was a category-1
+// array store (the `++z[i]` peephole) and `dup2_x1` ONLY when its top was
+// category-2. Everything else reached `self.fail(...)` and stayed interpreted
+// for the life of the process — including javac's POST-increment
+// `arr[n[0]++] = v`, which is what kept `HibfixComposeProbe2.chain`
+// `ineligible-by-policy` with `dup_x2-unprovable-form(pc=15,op=0x5b)`.
+//
+// Each case RUNS the compiled body and checks a value a wrong-depth insert
+// cannot produce: `.expect(...)` alone would pass against a shuffle that
+// compiles and computes nonsense. Local numbering follows this harness's
+// convention — every parameter, `long` included, is ONE local slot.
+// ---------------------------------------------------------------------------
+
+/// `dup_x2` FORM-1 — `[c, b, a] -> [a, c, b, a]`, all three category-1, and
+/// NOT followed by an array store.
+///
+/// This is the case the old peephole could not prove. The body computes
+/// `a + b + 2c`, so a copy inserted two deep instead of three (i.e. FORM-2's
+/// depth) gives a different sum.
+#[test]
+fn dup_x2_form1_admitted_without_the_array_store_peephole() {
+    // 0: iload_0  [a]
+    // 1: iload_1  [a, b]
+    // 2: iload_2  [a, b, c]
+    // 3: dup_x2   [c, a, b, c]
+    // 4: iadd     [c, a, b+c]
+    // 5: iadd     [c, a+b+c]
+    // 6: iadd     [a+b+2c]
+    // 7: ireturn
+    let code = [0x1a, 0x1b, 0x1c, 0x5b, 0x60, 0x60, 0x60, 0xac];
+    let compiled = compile_probe_method(&code, 3, 3)
+        .expect("FORM-1 dup_x2 must JIT-compile without the astore peephole");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[1, 2, 3]).expect("test JIT call") };
+    assert_eq!(r, 1 + 2 + 2 * 3, "a + b + 2c for a=1 b=2 c=3");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[-5, 7, 11]).expect("test JIT call") };
+    assert_eq!(r, -5 + 7 + 2 * 11, "a + b + 2c for a=-5 b=7 c=11");
+}
+
+/// `dup_x2` FORM-2 — `[w, a] -> [a, w, a]`, where `w` is a category-2
+/// long/double and therefore ONE entry in this backend's model.
+///
+/// The whole point of the second-entry oracle: the top is category-1 in both
+/// forms, so only the width of the entry BELOW it decides whether the copy
+/// goes two entries deep or three. Inserting at FORM-1's depth here would
+/// index past the bottom of a two-entry stack.
+#[test]
+fn dup_x2_form2_category_2_below_the_top() {
+    // 0: lload_0  [w]
+    // 1: iload_1  [w, i]
+    // 2: dup_x2   [i, w, i]
+    // 3: pop      [i, w]
+    // 4: l2i      [i, (int)w]
+    // 5: iadd     [i + (int)w]
+    // 6: ireturn
+    let code = [0x1e, 0x1b, 0x5b, 0x57, 0x88, 0x60, 0xac];
+    let compiled = compile_probe_method(&code, 2, 2)
+        .expect("FORM-2 dup_x2 must JIT-compile");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") };
+    assert_eq!(r, 13, "i + (int)w for w=10 i=3");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[-4, 9]).expect("test JIT call") };
+    assert_eq!(r, 5, "i + (int)w for w=-4 i=9");
+}
+
+/// `dup2_x1` FORM-1 — `[c, b, a] -> [b, a, c, b, a]`, all three category-1.
+///
+/// TWO entries are duplicated here, not one, so this is the form the old
+/// top-width-only peephole could never prove: `dup2_top_cat2` answering
+/// `false` says the top is category-1 and says nothing about how deep the pair
+/// must be inserted. The body computes `a + 2b + 2c`.
+#[test]
+fn dup2_x1_form1_all_category_1() {
+    // 0: iload_0  [a]
+    // 1: iload_1  [a, b]
+    // 2: iload_2  [a, b, c]
+    // 3: dup2_x1  [b, c, a, b, c]
+    // 4: iadd     [b, c, a, b+c]
+    // 5: iadd     [b, c, a+b+c]
+    // 6: iadd     [b, a+b+2c]
+    // 7: iadd     [a+2b+2c]
+    // 8: ireturn
+    let code = [0x1a, 0x1b, 0x1c, 0x5d, 0x60, 0x60, 0x60, 0x60, 0xac];
+    let compiled = compile_probe_method(&code, 3, 3)
+        .expect("FORM-1 dup2_x1 must JIT-compile");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[1, 2, 3]).expect("test JIT call") };
+    assert_eq!(r, 1 + 2 * 2 + 2 * 3, "a + 2b + 2c for a=1 b=2 c=3");
+}
+
+/// `dup2_x1` FORM-2 — `[b, w] -> [w, b, w]`, a category-2 top over one
+/// category-1. The shape the peephole alone already proved; kept so a future
+/// change to the oracle cannot silently drop it. Computes `2w + (long)b`.
+#[test]
+fn dup2_x1_form2_category_2_top() {
+    // 0: iload_1  [b]
+    // 1: lload_0  [b, w]
+    // 2: dup2_x1  [w, b, w]
+    // 3: lstore_2 [w, b]
+    // 4: i2l      [w, (long)b]
+    // 5: ladd     [w + (long)b]
+    // 6: lload_2  [w + b, w]
+    // 7: ladd     [2w + b]
+    // 8: lreturn
+    let code = [0x1b, 0x1e, 0x5d, 0x41, 0x85, 0x61, 0x20, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 2, 3)
+        .expect("FORM-2 dup2_x1 must JIT-compile");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") };
+    assert_eq!(r, 2 * 10 + 3, "2w + b for w=10 b=3");
+}
+
+/// The conservative half of the contract, for `dup_x2`: with no operands at
+/// all under the dup, neither the width analysis nor the peephole can answer,
+/// and the method stays interpreted under its OWN name.
+#[test]
+fn dup_x2_without_a_provable_form_bails_under_its_own_name() {
+    let code = [0x5b, 0xac]; // dup_x2; ireturn
+    let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+    assert!(compile_probe_method(&code, 0, 1).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(site, "singlepass-codegen/dup_x2-unprovable-form");
+}
+
 /// The catch-all is no longer anonymous. `wide` (0xC4) is unlowered in this
 /// walk; `jit_scan` also rejects it, so in production it never gets this far,
 /// but `compile` does not re-run the scan — which is exactly what lets this

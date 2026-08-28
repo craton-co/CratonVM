@@ -1997,10 +1997,8 @@ pub fn execute(
             // consulted for `<init>`/`<clinit>`).
             let _ = policy;
             let static_skip_reason: Option<()> = None;
-            // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
-            // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
-            // under deep recursion and must run in the interpreter pending a
-            // proper regalloc fix.
+            // RFJP.1 (RETIRED, lever-only) — see `is_fjp_subclass_blocklisted`.
+            // Inert unless `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`.
             let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str, Some(class_id));
             // S111r15 - refuse to JIT a method directly backed by a Rust native at
             // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`

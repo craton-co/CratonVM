@@ -1211,21 +1211,28 @@ pub fn jit_lambda_capture_adapter() -> bool {
     })
 }
 
-/// `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=0` — stop forcing the interpreter for
-/// every method on a `ForkJoinTask` subclass (RFJP.1).
+/// `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1` — put back the RFJP.1 workaround that
+/// forced the interpreter for every method on a `ForkJoinTask` subclass.
 ///
-/// Default ON, and it is a CORRECTNESS workaround, not a tuning knob: with it
-/// off a deeply-recursive `RecursiveTask.compute()` miscompiles. It exists so
-/// the ceiling can be priced before anyone narrows the blocklist, because the
-/// blocklist's stated scope is wrong — `CompletableFuture$UniCompose` and
-/// `$UniRelay` DO extend `ForkJoinTask`, and they are the composition hot path.
+/// **Default OFF since 2026-08-27**, i.e. those methods compile. The workaround
+/// guarded a `RecursiveTask<Long>.compute()` that returned 0 past recursion
+/// depth ~10; that miscompile was root-caused to `Long.valueOf` boxing and
+/// fixed in Session 108 (commit 6f605451d, "RFJP.1 closed as side-effect"),
+/// and the blocklist was simply never taken back out. Its cost was not small:
+/// `CompletableFuture$UniCompose` and `$UniRelay` extend `Completion`, which
+/// extends `ForkJoinTask`, so the whole completion machinery ran interpreted.
+///
+/// This flag stays as a ROLLBACK LEVER, not because the defect is expected
+/// back. See
+/// `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
+/// for the evidence that retired it.
 #[inline]
 pub fn jit_fjp_subclass_blocklist() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => true,
+            Err(_) => false,
         }
     })
 }

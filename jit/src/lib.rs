@@ -10289,7 +10289,8 @@ pub fn varhandle_read_direct_helpers_enabled() -> bool {
 // of `HibfixVarHandleProbe` counts 698 000 `VarHandle.set` invocations for
 // 500 000 probe writes: every one is a full dispatch.
 //
-// See `docs/known-issues/perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`.
+// See `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
+// (retired to the internal tree 2026-08-27, FIXED).
 //
 // A write is the EASIER half of what the read bind refused, not the harder one.
 // The read table excludes `L`/`[` because a reference RETURN has to be

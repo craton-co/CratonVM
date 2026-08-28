@@ -4794,8 +4794,10 @@ pub(super) fn try_jit_upgrade_with_gate(
     // the callee and return (entry_ptr, needs_context). Used for cross-method direct calls.
     let callee_compiler =
         |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
-            // RFJP.1 — never JIT a callee on a class transitively extending
-            // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
+            // RFJP.1 (RETIRED, lever-only) — refuse a callee on a class
+            // transitively extending `java/util/concurrent/ForkJoinTask`.
+            // Inert unless `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`; matches
+            // `try_jit_compile_callee`.
             if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
                 cratonvm_jit::note_direct_callee_bind_refusal(
                     cratonvm_jit::DirectBindRefusal::FjpBlocklist,
@@ -5677,44 +5679,54 @@ pub(super) fn try_jit_upgrade_with_gate(
     })
 }
 
-/// RFJP.1 — JIT correctness workaround for `RecursiveTask<Long>.compute()`.
+/// RFJP.1 — the RETIRED JIT correctness workaround for
+/// `RecursiveTask<Long>.compute()`, now OFF by default.
 ///
-/// Methods defined on a class transitively extending
-/// `java/util/concurrent/ForkJoinTask` miscompile under deep recursion: the
-/// JIT'd `compute()` body returns 0 once the recursion depth is ~10+, because
-/// a long local on the operand stack of the caller is held in a register that
-/// the recursive callee clobbers. The proper fix lives in regalloc / spill
-/// handling around `invokevirtual`; until that lands, we force the interpreter
-/// for any method on an FJP-subclass class. This is narrow enough to leave
-/// FjpSum (single-task) and CompletableFuture paths JIT-eligible because they
-/// don't extend `ForkJoinTask` directly in the hot path.
+/// # What it was
 ///
-/// Returns `true` if the named class transitively extends
-/// `java/util/concurrent/ForkJoinTask` and therefore must not be JIT-compiled
-/// pending the regalloc fix.
+/// Methods on a class transitively extending `java/util/concurrent/ForkJoinTask`
+/// were force-interpreted, because a JIT'd `compute()` returned 0 once the
+/// recursion depth reached ~10+. That was root-caused not to regalloc but to a
+/// `Long.valueOf` boxing miscompile, and fixed in Session 108
+/// (commit 6f605451d, "RFJP.1 closed as side-effect"). The blocklist was never
+/// taken back out.
+///
+/// # Why leaving it in was expensive
+///
+/// Its own comment claimed it was "narrow enough to leave ... CompletableFuture
+/// paths JIT-eligible because they don't extend `ForkJoinTask` directly in the
+/// hot path". That claim was FALSE: `CompletableFuture$UniCompose` and
+/// `$UniRelay` extend `Completion`, which extends `ForkJoinTask`, and they ARE
+/// the composition hot path — 199 476 and 119 668 invocations on
+/// `HibfixComposeProbe2`, every one of them refused here. The whole completion
+/// machinery ran interpreted, at 1.57x on that probe.
+///
+/// # What retired it (2026-08-27)
+///
+/// `probes/FjpStress.java` sums a `long[200000]` to depth 17 through all three
+/// FJP bases the blocklist names — `RecursiveTask<Long>` (the boxed-return
+/// shape RFJP.1 was recorded against), `RecursiveAction` and
+/// `CountedCompleter` — 20 rounds each, at C1 and at C2, with
+/// `compute()` WITNESSED compiled (`CRATONVM_DBG=jit-method-stats` moves
+/// `FjpDeepSum$SumTask.compute` from `3 145 652 invocations compile-failed` to
+/// compiled with `hot_but_stuck_in_interpreter=0`). Plus `FjpProbe` at depth 10
+/// and `FjpDeepSum` at depth 17. See
+/// `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
+///
+/// Returns `true` only when `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1` puts the
+/// workaround back AND the named class transitively extends
+/// `java/util/concurrent/ForkJoinTask`.
 pub fn is_fjp_subclass_blocklisted(
     shared: &SharedVm,
     class_name: &str,
     requesting_class_id: Option<ClassId>,
 ) -> bool {
-    // MEASUREMENT LEVER ONLY — `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=0`.
+    // ROLLBACK LEVER — `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`, default OFF.
     //
-    // RFJP.1 is a CORRECTNESS workaround (a `RecursiveTask.compute()` that
-    // returns 0 past recursion depth ~10), so running with it off is expected
-    // to MISCOMPILE and must never ship that way.
-    //
-    // It exists because the comment above claims this blocklist "leave[s] ...
-    // CompletableFuture paths JIT-eligible because they don't extend
-    // ForkJoinTask directly in the hot path", and that claim is FALSE:
-    // `CompletableFuture$UniCompose` and `$UniRelay` extend `Completion`, which
-    // extends `ForkJoinTask`, and they are exactly the hot path — 99 444 and
-    // 59 636 invocations on `HibfixComposeProbe2`, both refused here. So the
-    // whole `CompletableFuture` completion machinery runs interpreted, which is
-    // the 442-872x that probe measures.
-    //
-    // Before narrowing the blocklist (to `compute()`, or to methods that can
-    // actually recurse), price the ceiling with this switch. If lifting it is
-    // worth ~0 the narrowing is not worth its correctness risk.
+    // Everything below this line is dead on the shipped configuration. It is
+    // kept, rather than deleted, so a regression that the FjpStress/FjpProbe/
+    // FjpDeepSum evidence did not cover can be bisected against the old
+    // behaviour in one environment variable instead of one revert.
     if !crate::runtime::env_cache::jit_fjp_subclass_blocklist() {
         return false;
     }
@@ -6216,11 +6228,11 @@ pub(super) fn try_jit_compile_callee_slow(
     // `eager-callee-chain`: a top-level compile starts with a fresh transitive
     // callee-compile budget; a nested one inherits the outer compile's.
     eager_callee_chain_enter_top_level();
-    // RFJP.1 — never JIT a method whose declaring class transitively extends
-    // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
-    // miscompiles under deep recursion (returns 0 from depth ~10), and the
-    // proper regalloc fix is out of scope here. Returning `None` here forces
-    // the interpreter for both direct and dispatcher-cached callee paths.
+    // RFJP.1 (RETIRED, lever-only) — refuse a method whose declaring class
+    // transitively extends `java/util/concurrent/ForkJoinTask`. Inert unless
+    // `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`. This is the exit that reported
+    // `reason=vm-fjp-subclass-blocklisted` for both `CompletableFuture$
+    // UniCompose.tryFire` and `$UniRelay.tryFire`.
     if is_fjp_subclass_blocklisted(shared, class_name, None) {
         cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-fjp-subclass-blocklisted");
         return None;
