@@ -22174,10 +22174,51 @@ fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
 }
 
 fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let list = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(None),
+    // A NULL list is a NullPointerException, not a silent no-op. MEASURED in
+    // BOTH modes (`probes/BaosCollectionsShadowSweep.java`): HotSpot NPE, this
+    // VM returned normally, so `Collections.sort(maybeNull)` looked like it had
+    // sorted something.
+    let Some(Value::Object(Some(list))) = args.first() else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Collections.sort: list is null".to_string()),
+        }
+        .into());
     };
+    let list = *list;
+    // An IMMUTABLE list must refuse. MEASURED in COMPATIBLE mode only --
+    // `--jdk-only` already threw UnsupportedOperationException, because it runs
+    // the real bytecode:
+    //
+    //   Collections.sort(List.of("b", "a"))
+    //     HotSpot     UnsupportedOperationException
+    //     --jdk-only  same
+    //     compatible  no-throw
+    //
+    // and "no-throw" here does not mean it declined: `al_state` reads the
+    // backing array of an `ImmutableCollections.ListN` just as happily as an
+    // ArrayList's, so the native SORTED AN IMMUTABLE LIST IN PLACE. Every
+    // holder of that list -- and `List.of` is shared, interned and handed
+    // around precisely because it cannot change -- observed its contents
+    // reorder underneath it.
+    //
+    // The receiver's class name is `cratonvm/internal/Unmodifiable*`, NOT
+    // `java/util/ImmutableCollections$*`: this VM funnels every unmodifiable
+    // view through seven synthetic classes and FAKES `getClass()` to report the
+    // JDK name (`getclass_immutable_marker` in native-builtins). So a guard
+    // written against the name the probe prints -- which is what I tried first
+    // -- can never fire. Screening on the real receiver class also catches
+    // `Collections.unmodifiableList(..)`, which must refuse for the same reason.
+    //
+    // Delegating to the receiver's own `sort` runs the real refusal body; that
+    // is the same route the non-ArrayList branch below already takes.
+    if object_class_name(ctx, list).starts_with("cratonvm/internal/Unmodifiable") {
+        return ctx.invoke_virtual(
+            list,
+            "sort",
+            "(Ljava/util/Comparator;)V",
+            &[Value::Object(None)],
+        );
+    }
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
@@ -22213,8 +22254,22 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     for i in 0..len {
         items.push(ctx.get_array_element(data, i));
     }
-    // Verify Comparable on every non-null element (JDK throws CCE otherwise).
+    // Verify Comparable on every non-null element (JDK throws CCE otherwise),
+    // and REFUSE a null one.
+    //
+    // MEASURED in both modes: `Collections.sort(list with a null)` returned
+    // normally here where HotSpot throws NullPointerException. The JDK's NPE
+    // comes out of the comparison itself -- `compareTo` is invoked ON the null
+    // -- so it can only happen when the element is actually compared, which for
+    // `len >= 2` it always is. `len <= 1` has already returned above, so this
+    // loop is exactly the region where a null must throw.
     for v in &items {
+        if matches!(v, Value::Object(None)) {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Collections.sort: null element".to_string()),
+            }
+            .into());
+        }
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
                 let cname = object_class_name(ctx, *obj);

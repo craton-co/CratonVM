@@ -1,9 +1,10 @@
-# Working Phase 2 from the report's `outcome` field: 23 defects in the first three families
+# Working Phase 2 from the report's `outcome` field: 28 defects in the first four families
 
-**Status: 22 FIXED, 1 recorded OPEN, 2026-08-28.** `java.util.Arrays` 10,
-`java.util.HashMap` 4, `java.lang.Class`/`Module` 9 (8 fixed). All identical in
-both modes, so none is a `--jdk-only` defect — they are ordinary correctness bugs
-that the strict-mode instrument found.
+**Status: 27 FIXED, 1 recorded OPEN, 2026-08-28.** `java.util.Arrays` 10,
+`java.util.HashMap` 4, `java.lang.Class`/`Module` 9 (8 fixed),
+`java.io.ByteArrayOutputStream`/`java.util.Collections` 5. All but one identical
+in both modes, so almost none is a `--jdk-only` defect — they are ordinary
+correctness bugs that the strict-mode instrument found.
 
 ## 1. The families were not chosen by hand
 
@@ -178,14 +179,76 @@ findable by name, `[I` and `[[I` findable, the slash form rejected, a null
 loader scoping to bootstrap); `cast` including its null and primitive rules; and
 the whole public-vs-declared split for fields, methods and constructors.
 
+## 4.55 Fourth family: `ByteArrayOutputStream` and `Collections` — 5
+
+62 rows against the 6 BAOS and 4 `Collections` triples the report named.
+
+**One is not a missing exception at all.**
+
+```text
+Collections.sort(List.of("b", "a"))
+  HotSpot     UnsupportedOperationException
+  --jdk-only  same
+  compatible  no-throw — and the list came back [a, b]
+```
+
+`al_state` reads the backing array of an immutable list just as happily as an
+`ArrayList`'s, so the native **sorted an immutable list in place**. `List.of` is
+shared and passed around precisely because it cannot change; every holder of
+that list would have observed its contents reorder underneath them. Strict mode
+was already correct, because it runs the real bytecode and refuses — the fourth
+place in this survey where the DEFAULT is wrong and `--jdk-only` right.
+
+**Four are nulls**: `BAOS.write(null, 0, 1)`, `BAOS.write(null, 0, 0)`,
+`Collections.sort(null)`, and sorting a list containing a null element.
+
+The zero-length write is the one worth stating. `Objects.checkFromIndexSize`
+runs AFTER `b.length` has been read, so the JDK never reaches a "nothing to
+copy" short-circuit; a caller passing a null buffer with a computed length of 0
+— the ordinary shape of an empty write — learned nothing and carried the null
+on.
+
+**Every BOUNDS row already passed**, including `off + len` overflowing to a
+negative int, which is the case a check written as `off + len > b.length` gets
+wrong while looking right. `check_array_bounds` is correct; it simply never ran,
+because the null buffer returned before it.
+
+### The guard I wrote first could never have fired
+
+Worth recording, because it is the second inert fix of the day and a different
+cause from the first.
+
+I screened on `java/util/ImmutableCollections`, because that is what the probe
+prints for `List.of(..).getClass().getName()`. **That name is faked.** This VM
+funnels every unmodifiable view through seven `cratonvm/internal/Unmodifiable*`
+synthetic classes and has `getclass_immutable_marker` report the JDK name to
+callers. A guard written against the name the probe shows can never match the
+receiver's real class.
+
+Both inert fixes today had the same signature — source reads correctly, build
+clean, behaviour unchanged — and different causes:
+
+| | cause | what finds it |
+| --- | --- | --- |
+| `Arrays.fill` | edited a registrar that does not own the slot | `--dump-native-registry`, `owns_slot`, one line |
+| `Collections.sort` | matched an identity the VM deliberately misreports | only re-running the probe |
+
+The second cannot be caught by reading, because the VM is lying to the reader on
+purpose. **Re-measure; never re-read.**
+
+The corrected guard is also strictly better than the one I intended: screening
+the real receiver class catches `Collections.unmodifiableList(..)` too, which
+must refuse `sort` for the same reason and which the `ImmutableCollections`
+check would have missed.
+
 ## 4.6 The pattern, now strong enough to state
 
-Three families, 448 probed rows, 23 defects — **and every one of them is on a
+Four families, 510 probed rows, 28 defects — **and every one of them is on a
 contract edge.** Not one is a wrong answer to an ordinary call, in any of the
-three.
+four.
 
 That is worth stating as a finding rather than an impression, because it has two
-consequences. It predicts where the remaining ~300 triples will yield. And it
+consequences. It predicts where the remaining ~295 triples will yield. And it
 means **a probe that exercises only the happy path will report a family clean
 when it is not** — which is how a shim's middle stays correct while its
 perimeter rots unnoticed.
