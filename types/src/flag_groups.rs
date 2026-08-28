@@ -514,6 +514,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "remap-residue", on_key: Some("CRATONVM_DBG_REMAP_RESIDUE"), off_key: None, off_word: None },
     // Declared 2026-08-23. `jit-rootscan` reports the moving-young coverage
     // verdict as an aggregate `map_coverage=N` counter, which names neither the
     // METHOD nor WHICH of `fully_oop_covered`'s four terms said no. `oopcov`

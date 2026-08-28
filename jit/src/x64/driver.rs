@@ -2492,7 +2492,7 @@ pub fn compile_with_param_slots(
         eprintln!(
             "[oopcov] uncovered method={} frameslot={} shadow={} \
              shadow_missing_pcs={shadow_missing:?} \
-             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={}) ",
+             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={} inline_scope={}) ",
             compiler.method_key,
             cm.fully_oop_covered,
             cm.fully_shadow_covered,
@@ -2503,6 +2503,7 @@ pub fn compile_with_param_slots(
             scauses[4],
             scauses[5],
             scauses[6],
+            scauses[7],
         );
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
