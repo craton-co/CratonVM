@@ -456,7 +456,7 @@ unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64)
     if obj_ptr == 0 {
         return 0;
     }
-    let field_index = (field_index as u64 & !cratonvm_jit_api::GETFIELD_FLAG_BITS) as i64;
+    let field_index = cratonvm_jit_api::getfield_index_of(field_index);
     let base = obj_ptr as *const u8; // Cast: address arithmetic
     let num_slots = read_num_slots(base);
     if field_index < 0 || field_index as u64 >= num_slots as u64 {

@@ -3262,7 +3262,36 @@ extern "C" fn jni_get_field_id(
                 .classes
                 .link_resolver
                 .resolve_or_compute(class_id, name_str, sig_str, || {
-                    let result = find_field_recursive(class_id, name_str, &cm.class_store);
+                    // Round 9 fixed the cache KEY to include the signature; the
+                    // resolution underneath it still discarded the signature and
+                    // matched on the name alone, so two `GetFieldID` calls with
+                    // different signatures got two cache entries holding the
+                    // same (possibly wrong) field. JVMS §5.4.3.2 — and the
+                    // comment above — say the key is `(name, descriptor)`; use
+                    // it. An empty `sig_str` is the documented NULL-signature
+                    // case and keeps the name-only search.
+                    //
+                    // Falls back to name-only, counted, when no field of that
+                    // exact pair exists, for the reason `locate_field` does.
+                    let result = if sig_str.is_empty() {
+                        find_field_recursive(class_id, name_str, &cm.class_store)
+                    } else {
+                        cratonvm_classloading::find_field_recursive_by_descriptor(
+                            class_id,
+                            name_str,
+                            sig_str,
+                            &cm.class_store,
+                        )
+                        .or_else(|| {
+                            let name_only =
+                                find_field_recursive(class_id, name_str, &cm.class_store);
+                            if name_only.is_some() {
+                                crate::runtime::resolve::FIELD_RESOLUTION_DESCRIPTOR_FALLBACKS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            name_only
+                        })
+                    };
                     let resolved = match result {
                         Some((field_index, field, declaring)) => ResolvedMember::Field {
                             declaring_class_id: declaring,

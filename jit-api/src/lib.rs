@@ -780,6 +780,79 @@ pub const fn getfield_index_arg(
     arg
 }
 
+/// Recover the slot index from [`getfield_index_arg`]'s result — the DECODER
+/// twin of that encoder.
+///
+/// One encoder means a new flag reaches every emitter by construction. It does
+/// nothing at all for the other side, and the other side is where the flags are
+/// dangerous: a decoder that misses one indexes an object with a bit set at 61
+/// or 62, which is not a bounds-check failure, it is `idx * SLOT_SIZE`
+/// overflowing.
+///
+/// That is not hypothetical twice over. `jit/src/x64/tests.rs`'s `stub_getfield`
+/// checked `field_index as u32` against the slot count and then indexed with
+/// `field_index as usize`: the u32 truncation dropped the flag, the bounds
+/// check passed, and the index walked off the object — "which aborted the whole
+/// test binary the first time a reference load carried a flag" (2026-08-23).
+/// `jit/tests/ir_vs_singlepass.rs`'s twin stub was not updated with it and did
+/// the same thing four days later, aborting the process inside an
+/// `extern "C"` fn — where a panic cannot unwind, so it took every test after
+/// it in the file with it.
+///
+/// Both of those are decode sites that had to *know* to strip. This is the one
+/// place that knows, so a third flag added to [`GETFIELD_FLAG_BITS`] reaches
+/// them without anyone remembering.
+#[must_use]
+pub const fn getfield_index_of(arg: i64) -> i64 {
+    (arg as u64 & !GETFIELD_FLAG_BITS) as i64
+}
+
+
+#[cfg(test)]
+mod getfield_arg_tests {
+    use super::*;
+
+    /// [`getfield_index_of`] inverts [`getfield_index_arg`] for every flag
+    /// combination, and the flag mask covers exactly the two flags.
+    ///
+    /// The pair exists because a DECODE site that misses a flag does not fail a
+    /// bounds check — it overflows `idx * SLOT_SIZE`. Two test doubles have
+    /// already done exactly that; see [`getfield_index_of`].
+    #[test]
+    fn the_index_argument_round_trips_through_every_flag_combination() {
+        for slot in [0u32, 1, 7, u16::MAX as u32] {
+            for is_ref in [false, true] {
+                for proven in [false, true] {
+                    let arg = getfield_index_arg(slot, is_ref, proven);
+                    assert_eq!(
+                        getfield_index_of(arg as i64),
+                        i64::from(slot),
+                        "slot {slot} (is_ref={is_ref}, proven={proven})"
+                    );
+                    assert_eq!(
+                        arg & GETFIELD_EXPECT_REFERENCE != 0,
+                        is_ref,
+                        "the reference flag must ride only on the reference path"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A real slot cannot reach either flag bit, which is the property that
+    /// lets them share the argument at all.
+    #[test]
+    fn a_class_file_slot_index_cannot_reach_the_flag_bits() {
+        // A class-file field table is `u16`-sized.
+        let widest = getfield_index_arg(u16::MAX as u32, false, false);
+        assert_eq!(widest & GETFIELD_FLAG_BITS, 0);
+        assert_eq!(
+            GETFIELD_FLAG_BITS,
+            GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE,
+            "a third flag must join the mask, or every decoder silently keeps it"
+        );
+    }
+}
 
 /// Function pointer table for JIT runtime callbacks.
 ///

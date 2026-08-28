@@ -61,7 +61,8 @@ pub mod verify_insn;
 pub mod vtype;
 
 pub use class::{
-    class_origin_epoch, find_field_recursive, find_method_recursive, invokespecial_selection_start,
+    class_origin_epoch, find_field_recursive, find_field_recursive_by_descriptor,
+    find_method_recursive, invokespecial_selection_start,
     ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
     RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE,
     RECORD_OBJ_TO_STRING,
