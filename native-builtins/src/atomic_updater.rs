@@ -379,9 +379,7 @@ fn build_updater(
             field = %field_name,
             "T19.H5: newUpdater field not found"
         );
-        MethodCallFailed::from(RuntimeError::IllegalArgumentException {
-            message: format!("no such field: {field_name}"),
-        })
+        new_updater_refusal(ctx, &format!("java.lang.NoSuchFieldException: {field_name}"))
     })?;
 
     // Reject static / final.  ACC_STATIC = 0x0008, ACC_FINAL = 0x0010.
@@ -397,8 +395,47 @@ fn build_updater(
         }
         .into());
     }
+    // ACC_VOLATILE = 0x0040. MEASURED (`probes/AtomicUpdaterSweep.java`,
+    // compatible mode): `newUpdater(Holder.class, "plainInt")` on a NON-volatile
+    // field answered `no-throw` where HotSpot throws IllegalArgumentException.
+    //
+    // This is the one validation whose absence is silently unsafe rather than
+    // merely wrong-typed: the whole contract of a field updater is that the
+    // field is volatile, and an updater handed a plain field gives every caller
+    // ordinary non-atomic reads and writes while looking exactly like an atomic
+    // one. `static` and `final` were already rejected two checks above; volatile
+    // was the third of the JDK's three and it was missing.
+    if (meta.access_flags & 0x0040) == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("field {field_name} must be volatile"),
+        }
+        .into());
+    }
 
     // Variant-specific descriptor check.
+    // The REFERENCE variant on a non-reference field is a ClassCastException.
+    //
+    // The JDK's `AtomicReferenceFieldUpdater` compares the field's declared
+    // Class against the `vclass` argument and throws CCE on mismatch; an `int`
+    // field can never equal a reference `vclass`, so it leaves by that door and
+    // not by the descriptor check below. MEASURED (`AtomicUpdaterSweep`):
+    // `AtomicReferenceFieldUpdater.newUpdater(Holder.class, Integer.class, "i")`
+    // is HotSpot ClassCastException, this VM IllegalArgumentException.
+    //
+    // Checked here rather than in the `vclass` block further down because that
+    // block is only reached for a descriptor `ref_descriptor_to_internal_name`
+    // can name -- which a primitive descriptor is not, so it was unreachable
+    // for exactly this case.
+    if vclass_mirror.is_some() && !descriptor_is_reference(&meta.descriptor) {
+        return Err(RuntimeError::ClassCastException {
+            message: format!(
+                "field {field_name} is declared {} and cannot be a reference updater's field",
+                meta.descriptor
+            ),
+        }
+        .into());
+    }
+
     let tag = expected(&meta.descriptor).ok_or_else(|| {
         tracing::warn!(
             field = %field_name,
@@ -481,10 +518,48 @@ fn build_updater(
 // newUpdater natives
 // ---------------------------------------------------------------------------
 
+/// The JDK's `newUpdater` refusals are wrapped in a plain `RuntimeException`.
+///
+/// All three factories have the same body shape:
+///
+/// ```java
+/// try { field = tclass.getDeclaredField(fieldName); ... }
+/// catch (Exception ex) { throw new RuntimeException(ex); }
+/// ```
+///
+/// so a null `tclass`, a null field name and a missing field all leave as
+/// `java.lang.RuntimeException` — not as the NPE or IAE that caused them.
+/// MEASURED against HotSpot 25.0.3+9 (`probes/AtomicUpdaterSweep.java`):
+///
+/// ```text
+/// newUpdater(Holder.class, "nope")   HotSpot RuntimeException  CratonVM IllegalArgumentException
+/// newUpdater(null, "i")             HotSpot RuntimeException  CratonVM NullPointerException
+/// newUpdater(Holder.class, null)    HotSpot RuntimeException  CratonVM NullPointerException
+/// ```
+///
+/// Why it is worth correcting even though IAE and NPE are themselves
+/// `RuntimeException`s, so a `catch (RuntimeException)` is unaffected: the
+/// difference runs the OTHER way. Application code that catches
+/// `IllegalArgumentException` around a `newUpdater` call — a reasonable thing to
+/// write — catches this VM's refusal and does NOT catch HotSpot's, so a
+/// recovery path that never runs on the reference VM runs here.
+fn new_updater_refusal(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    crate::phases_early::throw_jca_exc(ctx, "java/lang/RuntimeException", msg)
+}
+
 fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let tclass = arg_obj_or_npe(args, 0, "tclass")?;
-    let vclass = arg_obj_or_npe(args, 1, "vclass")?;
-    let name_obj = arg_obj_or_npe(args, 2, "fieldName")?;
+    // `new_updater_refusal`, not `arg_obj_or_npe`: see that helper for the
+    // measured shape. The JDK reaches these through `getDeclaredField` inside
+    // a `catch (Exception) -> RuntimeException`, so the NPE never escapes.
+    let Some(tclass) = arg_obj(args, 0) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+    };
+    let Some(vclass) = arg_obj(args, 1) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: vclass"));
+    };
+    let Some(name_obj) = arg_obj(args, 2) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+    };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     tracing::info!(
         field = %name,
@@ -507,8 +582,13 @@ fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let tclass = arg_obj_or_npe(args, 0, "tclass")?;
-    let name_obj = arg_obj_or_npe(args, 1, "fieldName")?;
+    // See `new_updater_refusal`.
+    let Some(tclass) = arg_obj(args, 0) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+    };
+    let Some(name_obj) = arg_obj(args, 1) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+    };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     build_updater(
         ctx,
@@ -521,8 +601,13 @@ fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_alfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let tclass = arg_obj_or_npe(args, 0, "tclass")?;
-    let name_obj = arg_obj_or_npe(args, 1, "fieldName")?;
+    // See `new_updater_refusal`.
+    let Some(tclass) = arg_obj(args, 0) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+    };
+    let Some(name_obj) = arg_obj(args, 1) else {
+        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+    };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     build_updater(
         ctx,
@@ -570,8 +655,63 @@ fn describe_value(ctx: &dyn NativeContext, value: Value) -> String {
     }
 }
 
-fn require_target(args: &[Value], idx: usize) -> Result<ObjectRef, MethodCallFailed> {
-    arg_obj_or_npe(args, idx, "target")
+/// The target object, checked against the updater's `tclass`.
+///
+/// The JDK's accessors open with `if (!tclass.isInstance(obj)) throw new
+/// ClassCastException()` — an `isInstance` that is FALSE for null, so a null
+/// target leaves by the same door as a wrong-typed one. Both rows were wrong
+/// here (`probes/AtomicUpdaterSweep.java`, compatible mode):
+///
+/// ```text
+/// u.get(null)                       HotSpot ClassCastException  CratonVM NPE
+/// rawUpdater.get(new Object())      HotSpot ClassCastException  CratonVM no-throw
+/// ```
+///
+/// The second is the dangerous one. An `AtomicIntegerFieldUpdater<Holder>` cast
+/// to a raw type and applied to some other class read and wrote **slot N of an
+/// unrelated object** — whatever happens to live at the offset `Holder.i`
+/// occupies. Generics are erased, so the cast that makes this reachable is one
+/// an application can perform by accident, and the JDK's runtime check is the
+/// only thing standing between it and a silent cross-object write.
+///
+/// `tclass_id` comes from the updater's own `FU_SLOT_TCLASS_ID`; a slot that
+/// does not hold a class id (an updater minted before this field was populated,
+/// or a foreign receiver) skips the check rather than inventing a failure.
+fn require_target(
+    ctx: &dyn NativeContext,
+    updater: ObjectRef,
+    args: &[Value],
+    idx: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let Some(target) = (match args.get(idx) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }) else {
+        // Null target: `isInstance(null)` is false, so this is a
+        // ClassCastException, not the NullPointerException `arg_obj_or_npe`
+        // would raise.
+        return Err(RuntimeError::ClassCastException {
+            message: "the target object is not an instance of the updater's class".to_string(),
+        }
+        .into());
+    };
+    if let Value::Int(tclass_raw) = ctx.get_field(updater, FU_SLOT_TCLASS_ID) {
+        if tclass_raw >= 0 {
+            let tclass = cratonvm_types::ClassId::new(tclass_raw as u32);
+            let actual = ctx.class_id_of_object(target);
+            if actual != tclass && !ctx.is_subclass(actual, tclass) {
+                return Err(RuntimeError::ClassCastException {
+                    message: format!(
+                        "{} is not an instance of {}",
+                        ctx.class_name_of_id(actual).unwrap_or_default(),
+                        ctx.class_name_of_id(tclass).unwrap_or_default()
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(target)
 }
 
 fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usize, ObjectRef)> {
@@ -639,7 +779,7 @@ fn arfu_update_with_operator(
 
 fn native_arfu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let value = ctx.get_field_volatile(target, slot);
     if atomic_updater_diag_enabled() {
@@ -658,7 +798,7 @@ fn native_arfu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_arfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let new_val = arg_value(args, 2);
     let slot = impl_slot(ctx, this).unwrap_or(0);
     if atomic_updater_diag_enabled() {
@@ -685,7 +825,7 @@ fn native_arfu_lazy_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn native_arfu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let expected = arg_value(args, 2);
     let new_val = arg_value(args, 3);
     let slot = impl_slot(ctx, this).unwrap_or(0);
@@ -695,7 +835,7 @@ fn native_arfu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn native_arfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let new_val = arg_value(args, 2);
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // Linearizable getAndSet: read+CAS until the swap commits. The CAS
@@ -724,7 +864,7 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // operator via invoke_virtual on the Java Function to compute a new
     // value, then CAS until success.
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let op = arg_obj_or_npe(args, 2, "op")?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // The UnaryOperator is arbitrary Java code and cannot run inside the
@@ -738,7 +878,7 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let op = arg_obj_or_npe(args, 2, "op")?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // Unbounded recompute-and-CAS-retry (see native_arfu_get_and_update):
@@ -753,7 +893,7 @@ fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn native_aifu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let v = match ctx.get_field_volatile(target, slot) {
         Value::Int(i) => i,
@@ -765,7 +905,7 @@ fn native_aifu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_aifu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let val = match arg_value(args, 2) {
         Value::Int(v) => v,
         Value::Long(v) => v as i32,
@@ -778,7 +918,7 @@ fn native_aifu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_aifu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let expected = match arg_value(args, 2) {
         Value::Int(v) => v,
         _ => 0,
@@ -794,7 +934,7 @@ fn native_aifu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn native_aifu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let new_val = match arg_value(args, 2) {
         Value::Int(v) => v,
         _ => 0,
@@ -817,7 +957,7 @@ fn native_aifu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_aifu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let delta = match arg_value(args, 2) {
         Value::Int(v) => v,
         _ => 0,
@@ -840,7 +980,7 @@ fn native_aifu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Replaces a bounded CAS loop that returned 0 (no update applied)
     // under contention — a lost update.
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let prev = ctx.atomic_fetch_add_int(target, slot, 1)?;
     Ok(Some(Value::Int(prev.wrapping_add(1))))
@@ -849,7 +989,7 @@ fn native_aifu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn native_aifu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // decrementAndGet(target) ≡ getAndAdd(target, -1) - 1.
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let prev = ctx.atomic_fetch_add_int(target, slot, -1)?;
     Ok(Some(Value::Int(prev.wrapping_sub(1))))
@@ -867,7 +1007,7 @@ fn native_aifu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // update) after 1024 contended retries — a lost update under contention.
 fn native_aifu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // getAndIncrement returns the OLD value — exactly the previous value
     // reported by a fetch-add of +1.
@@ -877,7 +1017,7 @@ fn native_aifu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_aifu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // getAndDecrement returns the OLD value (previous value of fetch-add -1).
     let prev = ctx.atomic_fetch_add_int(target, slot, -1)?;
@@ -886,7 +1026,7 @@ fn native_aifu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_aifu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let delta = match arg_value(args, 2) {
         Value::Int(v) => v,
         _ => 0,
@@ -904,7 +1044,7 @@ fn native_aifu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_alfu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let v = match ctx.get_field_volatile(target, slot) {
         Value::Long(l) => l,
@@ -916,7 +1056,7 @@ fn native_alfu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_alfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let val = match arg_value(args, 2) {
         Value::Long(v) => v,
         Value::Int(v) => v as i64,
@@ -929,7 +1069,7 @@ fn native_alfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_alfu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let expected = match arg_value(args, 2) {
         Value::Long(v) => v,
         _ => 0,
@@ -945,7 +1085,7 @@ fn native_alfu_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn native_alfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let new_val = match arg_value(args, 2) {
         Value::Long(v) => v,
         _ => 0,
@@ -968,7 +1108,7 @@ fn native_alfu_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let delta = match arg_value(args, 2) {
         Value::Long(v) => v,
         _ => 0,
@@ -988,7 +1128,7 @@ fn native_alfu_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // a fabricated 0 (applying no update) on contended loop exhaustion.
 fn native_alfu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // getAndIncrement returns the OLD value (previous value of fetch-add +1).
     let prev = ctx.atomic_fetch_add_long(target, slot, 1)?;
@@ -997,7 +1137,7 @@ fn native_alfu_get_and_increment(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_alfu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     // getAndDecrement returns the OLD value (previous value of fetch-add -1).
     let prev = ctx.atomic_fetch_add_long(target, slot, -1)?;
@@ -1006,7 +1146,7 @@ fn native_alfu_get_and_decrement(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let delta = match arg_value(args, 2) {
         Value::Long(v) => v,
         _ => 0,
@@ -1029,7 +1169,7 @@ fn native_alfu_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_alfu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // incrementAndGet(target) ≡ getAndAdd(target, 1) + 1.
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let prev = ctx.atomic_fetch_add_long(target, slot, 1)?;
     Ok(Some(Value::Long(prev.wrapping_add(1))))
@@ -1038,7 +1178,7 @@ fn native_alfu_increment_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn native_alfu_decrement_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // decrementAndGet(target) ≡ getAndAdd(target, -1) - 1.
     let this = arg_obj_or_npe(args, 0, "updater")?;
-    let target = require_target(args, 1)?;
+    let target = require_target(ctx, this, args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
     let prev = ctx.atomic_fetch_add_long(target, slot, -1)?;
     Ok(Some(Value::Long(prev.wrapping_sub(1))))
@@ -1154,24 +1294,6 @@ fn register_arfu(r: &mut NativeMethodRegistry) {
     // Also register accessors on the abstract base class so virtual
     // dispatch from generic code that doesn't see the impl class still
     // finds an implementation.
-    r.register(
-        CLS_REF_FIELD_UPDATER,
-        "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_arfu_get,
-    );
-    r.register(
-        CLS_REF_FIELD_UPDATER,
-        "set",
-        "(Ljava/lang/Object;Ljava/lang/Object;)V",
-        native_arfu_set,
-    );
-    r.register(
-        CLS_REF_FIELD_UPDATER,
-        "compareAndSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
-        native_arfu_compare_and_set,
-    );
 }
 
 fn register_aifu(r: &mut NativeMethodRegistry) {
@@ -1236,7 +1358,7 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
         native_aifu_decrement_and_get,
     );
     // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
-    for cls in [CLS_INT_FIELD_UPDATER_IMPL, CLS_INT_FIELD_UPDATER] {
+    for cls in [CLS_INT_FIELD_UPDATER_IMPL] {
         r.register(
             cls,
             "getAndIncrement",
@@ -1256,51 +1378,46 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
             native_aifu_add_and_get,
         );
     }
-    // Also on the abstract base for virtual dispatch.
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "get",
-        "(Ljava/lang/Object;)I",
-        native_aifu_get,
-    );
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "compareAndSet",
-        "(Ljava/lang/Object;II)Z",
-        native_aifu_compare_and_set,
-    );
+    // NOT on the abstract base. This block used to carry
+    // "Also on the abstract base for virtual dispatch." -- and dispatch does not
+    // need it, while a user subclass is actively harmed by it.
+    //
+    // `AtomicIntegerFieldUpdater` is a PUBLIC ABSTRACT class with a protected
+    // constructor: an application may extend it and supply its own
+    // `get`/`set`/`compareAndSet`. A native registered on the BASE runs in front
+    // of that subclass's inherited bodies, so the JDK's own base-class
+    // `getAndIncrement` -- specified in terms of `get` and `compareAndSet`, and
+    // therefore required to dispatch back INTO the subclass -- never did.
+    //
+    // MEASURED in compatible mode (`probes/AtomicUpdaterSweep.java`), a counting
+    // subclass whose own bodies record every entry:
+    //
+    //   [subclass] getAndIncrement result             HotSpot 100   CratonVM 10
+    //   [subclass] getAndIncrement entered subclass   HotSpot true  CratonVM FALSE
+    //   [subclass] getAndIncrement counters           gets=1 cas=1  gets=0 cas=0
+    //   [subclass] holder untouched                   HotSpot 10    CratonVM 56
+    //
+    // The last row is the damaging one: the native read and wrote the caller's
+    // HOLDER object through its own slot layout, while the subclass's state --
+    // the only state the subclass believes it has -- sat untouched.
+    //
+    // Why removing them is safe rather than merely better: dispatch probes the
+    // registry from the RECEIVER'S OWN class first, and every updater this
+    // module hands out is one of the three `$RustJvmImpl` classes, which carry
+    // their own full registrations. So these base rows were already DEAD for our
+    // own objects and fired only for receivers we should never have intercepted.
+    // Since `$RustJvmImpl` now has its real abstract base as superclass, our
+    // impls also inherit the base's real bytecode for everything not registered
+    // -- which is what made `updateAndGet` and its three siblings work at all.
+    //
+    // `--jdk-only` was ALREADY clean here (87/87) because strict mode drops
+    // these bridges and runs the JDK's own bytecode. This change makes the
+    // default mode agree with strict, rather than the other way round.
+    //
+    // `newUpdater` STAYS on the base: it is a static factory, has no receiver,
+    // and is the entry point the whole module exists to serve.
     // Also register accessors on the abstract base AtomicIntegerFieldUpdater
     // so generic-typed callers dispatch correctly without the impl class in scope.
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "set",
-        "(Ljava/lang/Object;I)V",
-        native_aifu_set,
-    );
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "lazySet",
-        "(Ljava/lang/Object;I)V",
-        native_aifu_set,
-    );
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "get",
-        "(Ljava/lang/Object;)I",
-        native_aifu_get,
-    );
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "compareAndSet",
-        "(Ljava/lang/Object;II)Z",
-        native_aifu_compare_and_set,
-    );
-    r.register(
-        CLS_INT_FIELD_UPDATER,
-        "getAndSet",
-        "(Ljava/lang/Object;I)I",
-        native_aifu_get_and_set,
-    );
 }
 
 fn register_alfu(r: &mut NativeMethodRegistry) {
@@ -1356,7 +1473,7 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
     // decrementAndGet on both impl + base. (incrementAndGet/decrementAndGet
     // were previously missing — kotlinx.coroutines' CoroutineScheduler calls
     // incrementAndGet(Object)J, which ABENDed the VM with NoSuchMethodError.)
-    for cls in [CLS_LONG_FIELD_UPDATER_IMPL, CLS_LONG_FIELD_UPDATER] {
+    for cls in [CLS_LONG_FIELD_UPDATER_IMPL] {
         r.register(
             cls,
             "getAndIncrement",
@@ -1388,12 +1505,6 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
             native_alfu_decrement_and_get,
         );
     }
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "compareAndSet",
-        "(Ljava/lang/Object;JJ)Z",
-        native_alfu_compare_and_set,
-    );
     // Also register accessors on the abstract base class so virtual
     // dispatch from generic code that holds an AtomicLongFieldUpdater
     // reference (e.g. ActiveMQ's LongSequenceGenerator.setLastSequenceId)
@@ -1401,36 +1512,6 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
     // without these, every AtomicLongFieldUpdater.set/get call from a
     // user library throws AbstractMethodError before the Impl class is
     // ever consulted.
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "set",
-        "(Ljava/lang/Object;J)V",
-        native_alfu_set,
-    );
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "lazySet",
-        "(Ljava/lang/Object;J)V",
-        native_alfu_set,
-    );
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "get",
-        "(Ljava/lang/Object;)J",
-        native_alfu_get,
-    );
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "getAndSet",
-        "(Ljava/lang/Object;J)J",
-        native_alfu_get_and_set,
-    );
-    r.register(
-        CLS_LONG_FIELD_UPDATER,
-        "getAndAdd",
-        "(Ljava/lang/Object;J)J",
-        native_alfu_get_and_add,
-    );
 }
 
 // ===========================================================================
@@ -2155,12 +2236,26 @@ mod tests {
                 "newUpdater",
                 "(Ljava/lang/Class;Ljava/lang/String;)Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;",
             ),
-            // The silent half — base-class accessors on real JDK class names.
-            (CLS_REF_FIELD_UPDATER, "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-            (CLS_INT_FIELD_UPDATER, "getAndIncrement", "(Ljava/lang/Object;)I"),
-            (CLS_INT_FIELD_UPDATER, "addAndGet", "(Ljava/lang/Object;I)I"),
-            (CLS_LONG_FIELD_UPDATER, "incrementAndGet", "(Ljava/lang/Object;)J"),
-            (CLS_LONG_FIELD_UPDATER, "getAndAdd", "(Ljava/lang/Object;J)J"),
+            // The silent half — the accessors, which is where a `newUpdater`-only
+            // test would be green on a broken tree.
+            //
+            // These used to be the ABSTRACT BASE classes. They are the impl
+            // classes since 2026-08-27: registering an accessor on
+            // `AtomicIntegerFieldUpdater` itself shadowed the inherited defaults
+            // of any application subclass of that public abstract class, and the
+            // rows were dead for this module's own objects anyway (dispatch
+            // probes the receiver's own class first). See the note above
+            // `register_aifu`'s impl block for the measurement.
+            //
+            // This list has to name registrations that really exist, because the
+            // compatible arm below is a MUTATION CONTROL: if the triple is wrong
+            // the strict assertion above passes vacuously. When the base rows
+            // were removed, this control is what failed and said so.
+            (CLS_REF_FIELD_UPDATER_IMPL, "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            (CLS_INT_FIELD_UPDATER_IMPL, "getAndIncrement", "(Ljava/lang/Object;)I"),
+            (CLS_INT_FIELD_UPDATER_IMPL, "addAndGet", "(Ljava/lang/Object;I)I"),
+            (CLS_LONG_FIELD_UPDATER_IMPL, "incrementAndGet", "(Ljava/lang/Object;)J"),
+            (CLS_LONG_FIELD_UPDATER_IMPL, "getAndAdd", "(Ljava/lang/Object;J)J"),
         ] {
             assert!(
                 strict.find(cls, name, desc).is_none(),
@@ -2223,7 +2318,7 @@ mod tests {
     }
 
     #[test]
-    fn t19_h5_arfu_new_updater_missing_field_throws_iae() {
+    fn t19_h5_arfu_new_updater_missing_field_throws_runtime_exception() {
         let mut um = UpdaterMock::new();
         let (tmirror, _) = make_class_mirror_um(&mut um, "Target");
         let (vmirror, _) = make_class_mirror_um(&mut um, "java/lang/Object");
@@ -2237,14 +2332,23 @@ mod tests {
             ],
         )
         .unwrap_err();
-        match err {
-            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                RuntimeError::IllegalArgumentException { message },
-            )) => {
-                assert!(message.contains("no such field"), "{message}");
-            }
-            other => panic!("expected IllegalArgumentException, got {other:?}"),
-        }
+        // A THROWN java.lang.RuntimeException, not an IllegalArgumentException.
+        //
+        // CHANGED 2026-08-27, and the old assertion was this VM's behaviour
+        // rather than the JDK's. All three `newUpdater` factories wrap their
+        // reflection in `catch (Exception ex) { throw new RuntimeException(ex); }`,
+        // so a missing field arrives as a plain `RuntimeException`.
+        // MEASURED (`probes/AtomicUpdaterSweep.java`): HotSpot
+        // `java.lang.RuntimeException`, this VM `IllegalArgumentException`.
+        //
+        // The mock raises it through `new_object_initialized`, so it lands as
+        // `ExceptionThrown` rather than an `InternalError` variant -- which is
+        // itself the signal that the refusal now goes out as a real Java
+        // throwable of a named class instead of a Rust-side enum arm.
+        assert!(
+            matches!(err, MethodCallFailed::ExceptionThrown(_)),
+            "a missing field must be a thrown java.lang.RuntimeException, got {err:?}"
+        );
     }
 
     #[test]
@@ -2276,7 +2380,10 @@ mod tests {
         let (tmirror, tcid) = make_class_mirror_um(&mut um, "Target");
         let (vmirror_wrong, _) = make_class_mirror_um(&mut um, "java/lang/Integer");
         // declared as `String` but vclass is `Integer` — type mismatch.
-        um.add_field(tcid, "f", "Ljava/lang/String;", 0, 0, false);
+        // ACC_VOLATILE: this test is about the vclass MISMATCH, and a
+        // non-volatile fixture would now fail one check earlier for an
+        // unrelated reason.
+        um.add_field(tcid, "f", "Ljava/lang/String;", 0x0040, 0, false);
         let name = um.create_string("f");
         let err = native_arfu_new_updater(
             &mut um,
@@ -2302,7 +2409,8 @@ mod tests {
         let mut um = UpdaterMock::new();
         let (tmirror, tcid) = make_class_mirror_um(&mut um, "Target");
         let (vmirror, _) = make_class_mirror_um(&mut um, "java/lang/Integer");
-        um.add_field(tcid, "f", "Ljava/lang/Object;", 0, 0, false);
+        // ACC_VOLATILE — see the sibling test above.
+        um.add_field(tcid, "f", "Ljava/lang/Object;", 0x0040, 0, false);
         let name = um.create_string("f");
         let res = native_arfu_new_updater(
             &mut um,
@@ -2394,7 +2502,12 @@ mod tests {
     fn t19_h5_aifu_new_updater_long_field_rejected() {
         let mut um = UpdaterMock::new();
         let (tmirror, tcid) = make_class_mirror_um(&mut um, "Target");
-        um.add_field(tcid, "v", "J", 0, 0, false);
+        // ACC_VOLATILE, and this one MATTERS: the assertion below only checks
+        // for `IllegalArgumentException`, and "field must be volatile" is also
+        // an IAE. With a non-volatile fixture this test went green for a
+        // reason that has nothing to do with the long/int descriptor split it
+        // is named for.
+        um.add_field(tcid, "v", "J", 0x0040, 0, false);
         let name = um.create_string("v");
         let err = native_aifu_new_updater(
             &mut um,
@@ -2643,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn t19_h5_null_target_returns_npe_not_silent() {
+    fn t19_h5_null_target_returns_cce_not_silent() {
         let mut um = UpdaterMock::new();
         let (tmirror, tcid) = make_class_mirror_um(&mut um, "Target");
         let (vmirror, _) = make_class_mirror_um(&mut um, "java/lang/Object");
@@ -2663,18 +2776,36 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        // Pass null as target — must NPE.
+        // Pass null as target — must throw, and specifically a
+        // ClassCastException.
+        //
+        // CHANGED 2026-08-27, from NullPointerException. This test's NAME is
+        // still exactly right — the point is that a null target is not silently
+        // absorbed — but the TYPE it asserted was this VM's, not the JDK's.
+        //
+        // MEASURED against HotSpot 25.0.3+9 (`probes/AtomicUpdaterSweep.java`):
+        //
+        //   u.get(null)   HotSpot ClassCastException   CratonVM (then) NPE
+        //
+        // The JDK's accessors open with `if (!tclass.isInstance(obj)) throw new
+        // ClassCastException()`, and `isInstance` is FALSE for null — so a null
+        // target leaves by the same door as a wrong-typed one, and never
+        // reaches a dereference. A caller catching CCE around a field-updater
+        // access is catching the documented type; NPE escaped it.
         let err = native_arfu_get(
             &mut um,
             &[Value::Object(Some(updater)), Value::Object(None)],
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                RuntimeError::NullPointerException { .. }
-            ))
-        ));
+        assert!(
+            matches!(
+                err,
+                MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                    RuntimeError::ClassCastException { .. }
+                ))
+            ),
+            "null target must be a ClassCastException like the JDK's, got {err:?}"
+        );
     }
 
     #[test]
