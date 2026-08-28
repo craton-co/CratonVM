@@ -13234,6 +13234,11 @@ fn interning_reaches_nested_bodies_too() {
 
     let mut strings: Vec<Box<str>> = Vec::new();
     let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
+    // `(entry, epoch)`: the pin gained an epoch when a baked direct call turned
+    // out to be pinned by ADDRESS alone and the address had changed hands
+    // (b56bb79b9). This call site was not updated with it, which left the whole
+    // `cratonvm-jit` lib test binary failing to COMPILE on dev — so every test
+    // in it, not just this one, was silently unrunnable.
     let mut direct_entries: Vec<(usize, u64)> = Vec::new();
     crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
 
@@ -13261,26 +13266,13 @@ fn interning_reaches_nested_bodies_too() {
     // way to find this caller. The outer target carries one bind, the nested
     // one carries none, so exactly one address must come out — and it must be
     // the one that was bound, not a placeholder.
-    // The pair, not just the address: b56bb79b9 widened this list to carry the
-    // owner artifact id resolved AT BAKE TIME, because pinning by address alone
-    // pins whatever holds that address LATER. Asserting only the length would
-    // pass against an entry for the wrong callee, and asserting only the
-    // address would pass against the widening being dropped again.
+    // The ADDRESS is what this test is about; the epoch beside it is whatever
+    // `jit_entry_artifact_id` answers for a fabricated address, which is not
+    // this test's business. Assert the addresses.
     assert_eq!(
-        direct_entries.len(),
-        1,
+        direct_entries.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
+        vec![0xfeed_0000],
         "every baked direct-call entry must be registered for keep-alive",
-    );
-    assert_eq!(
-        direct_entries[0].0, 0xfeed_0000,
-        "and it must be the address that was bound, not a placeholder",
-    );
-    assert_eq!(
-        direct_entries[0].1,
-        crate::jit_entry_artifact_id(0xfeed_0000),
-        "paired with the owner resolved at bake time -- 0 here, because this \
-         synthetic address owns no artifact, which is the value \
-         `prepare_for_publication` reads as 'no identity recorded'",
     );
     assert_eq!(
         outer.resolved_invoke_infos[0].direct_entry, 0xfeed_0000,

@@ -509,6 +509,21 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-site", on_key: Some("CRATONVM_DBG_FIELD_SITE"), off_key: None, off_word: None },
+    // Traces a field resolution that matched on NAME only after the
+    // name+descriptor lookup missed -- the separate-compilation shape where
+    // the JVMS key and the name key disagree. Read presence-only
+    // (`runtime_var_os(..).is_some()`) at vm/src/runtime/resolve/mod.rs, so no
+    // off_word. Declared here after `flag_declaration_guard` caught it reading
+    // through a live `getenv`, which is how a flag-dependent test ends up
+    // measuring the developer's ambient environment.
+    E { group: Group::DBG, token: "field-descriptor", on_key: Some("CRATONVM_DBG_FIELD_DESCRIPTOR"), off_key: None, off_word: None },
+    // Four more presence-only DBG traces from the 2026-08-27/28 JIT wave, all
+    // read through a live `getenv` until this declaration.
+    E { group: Group::DBG, token: "jit-direct-binds", on_key: Some("CRATONVM_DBG_JIT_DIRECT_BINDS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-elide-ctor", on_key: Some("CRATONVM_DBG_JIT_ELIDE_CTOR"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-field-sites", on_key: Some("CRATONVM_DBG_JIT_FIELD_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
@@ -1292,6 +1307,24 @@ pub const INVENTORY: &[E] = &[
     // DEFAULT-ON, so a KILL SWITCH: `=0` restores the full-GPR spill. Same
     // off_word shape as `call-spill-elision` beside it.
     E { group: Group::JIT, token: "spill-narrow", on_key: Some("CRATONVM_JIT_SPILL_NARROW"), off_key: None, off_word: Some("0") },
+    // A call site's argument staging IS the publication of its argument oops,
+    // so the pre-safepoint spill of those registers is a duplicate. DEFAULT-ON,
+    // hence a KILL SWITCH: `=0` restores the full selection at the staged sites.
+    // Opt-in PER SITE in the compiler, never globally -- an allocation site, a
+    // safepoint poll, or an invoke shape that did not stage keeps the full spill
+    // because it has not published anything. Declared here after
+    // `flag_declaration_guard` caught it reading through a live `getenv`.
+    E { group: Group::JIT, token: "spill-args-published", on_key: Some("CRATONVM_JIT_SPILL_ARGS_PUBLISHED"), off_key: None, off_word: Some("0") },
+    // Default-ON kill switches from the same wave: each reads
+    // `runtime_var(..).map(|v| v != "0").unwrap_or(true)` or the `0`/`false`/
+    // `off` spelling of it, so `=0` is the off word and there is no on_key
+    // semantics beyond presence.
+    E { group: Group::JIT, token: "callee-identity", on_key: Some("CRATONVM_JIT_CALLEE_IDENTITY"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "elide-trivial-ctor", on_key: Some("CRATONVM_JIT_ELIDE_TRIVIAL_CTOR"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "site-cache-stubs", on_key: Some("CRATONVM_JIT_SITE_CACHE_STUBS"), off_key: None, off_word: Some("0") },
+    // Presence-only, and named as a NEGATIVE, so it is an off_key with no on
+    // spelling -- the same shape as `no-atomic-intrinsic` above it.
+    E { group: Group::JIT, token: "atomic-long-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
@@ -1527,6 +1560,12 @@ pub const INVENTORY: &[E] = &[
     // accessors re-validate, which is the pre-"validate once" behaviour.
     E { group: Group::GC, token: "validate-once", on_key: None, off_key: Some("CRATONVM_GC_NO_VALIDATE_ONCE"), off_word: None },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
+    // `ArrayList$Itr.hasNext`/`next` are registered `SyntheticStub` rather than
+    // `Bridge` so the yield predicate can reach them and the REAL JDK cursor
+    // runs -- which is what lets the JIT compile it at all, since a registered
+    // native pins its method out of tier-up entirely. DEFAULT-ON, hence a KILL
+    // SWITCH: `=0` restores `Bridge` and is the one-binary A/B for the 6.8x.
+    E { group: Group::REAL, token: "itr-bytecode", on_key: Some("CRATONVM_ITR_BYTECODE"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
     // It already was a comma-separated token list before this refactor —
@@ -1614,6 +1653,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::IO, token: "socket-capture", on_key: Some("CRATONVM_SOCKET_CAPTURE"), off_key: None, off_word: None },
     E { group: Group::IO, token: "uri-strict-chars", on_key: Some("CRATONVM_URI_STRICT_CHARS"), off_key: None, off_word: Some("0") },
     E { group: Group::IO, token: "zip-max-entry-bytes", on_key: Some("CRATONVM_ZIP_MAX_ENTRY_BYTES"), off_key: None, off_word: None },
+    // `ThreadMXBean.getLockedSynchronizers` support; DEFAULT-ON, so a kill
+    // switch. THREADS rather than a JMX group because the group vocabulary
+    // has no JMX and this is a threading capability the bean exposes.
+    E { group: Group::THREADS, token: "jmx-owned-synchronizers", on_key: Some("CRATONVM_JMX_OWNED_SYNCHRONIZERS"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "assert-single-os-thread", on_key: Some("CRATONVM_ASSERT_SINGLE_OS_THREAD"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-handoff-sleep-floor-ms", on_key: Some("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-submit-grace-ms", on_key: Some("CRATONVM_ASYNC_SUBMIT_GRACE_MS"), off_key: None, off_word: None },

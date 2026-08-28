@@ -2966,6 +2966,32 @@ pub(crate) fn native_runtime_get_runtime(
         // rather than reporting that it is missing.
         Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/Runtime", 8)?,
     };
+    // `Runtime.getRuntime()` MUST answer the same object every time -- the real
+    // class is `private static final Runtime currentRuntime = new Runtime()`
+    // and `getRuntime()` is a bare `getstatic`. Allocating a fresh object per
+    // call made `Runtime.getRuntime() == Runtime.getRuntime()` FALSE (MEASURED
+    // against HotSpot 25.0.3+9, `probes/TailFamilySweep.java`, both modes).
+    //
+    // That is not a cosmetic identity: `addShutdownHook` and
+    // `removeShutdownHook` are instance methods, so a hook registered on one
+    // instance is invisible to every later caller's instance, and any code that
+    // caches the Runtime and compares it later disagrees with itself.
+    //
+    // Reading and writing the REAL `currentRuntime` static rather than a
+    // Rust-side cache means the object this hands back is the same one the
+    // JDK's own bytecode sees, and it is rooted by the class rather than needing
+    // a global root of ours.
+    if let Some(idx) = ctx.static_field_index_by_name(class_id, "currentRuntime") {
+        if let Value::Object(Some(existing)) = ctx.get_static_field(class_id, idx) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        let obj = ctx.alloc_object(class_id, 0);
+        ctx.set_static_field(class_id, idx, Value::Object(Some(obj)));
+        return Ok(Some(Value::Object(Some(obj))));
+    }
+    // No such static (a synthetic-JDK image): fall back to the previous
+    // behaviour rather than inventing a side table for a shape that has no
+    // `currentRuntime` to be consistent with.
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -3728,16 +3754,32 @@ pub(crate) fn native_runtime_exec_string(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = Runtime instance, args[1] = command string
+    // NULL is an NPE and EMPTY is an IllegalArgumentException -- two different
+    // doors, and this VM had them swapped and missing respectively.
+    //
+    // MEASURED in COMPATIBLE mode against HotSpot 25.0.3+9
+    // (`probes/Phase1Sweep.java`, the P1-I lane). Strict mode already agreed on
+    // both rows, because it drops these `SyntheticStub`s and runs the JDK's own
+    // `exec` -- so this is a defect the strict work exposed in the DEFAULT mode:
+    //
+    //   Runtime.exec("")     HotSpot IllegalArgumentException  CratonVM ArrayIndexOutOfBounds
+    //   Runtime.exec(null)   HotSpot NullPointerException      CratonVM IllegalArgumentException
+    //
+    // The JDK's `exec(String, String[], File)` opens with
+    // `if (command.isEmpty()) throw new IllegalArgumentException("Empty
+    // command")`, so a null receiver NPEs on `isEmpty()` one instruction before
+    // the emptiness test can run. That ordering is the whole of the behaviour.
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "Runtime.exec: null command".to_string(),
-            }
-            .into())
-        }
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+    if parts.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Empty command".to_string(),
+        }
+        .into());
+    }
     runtime_spawn_process(ctx, &parts, None, None)
 }
 
@@ -3756,16 +3798,32 @@ pub(crate) fn native_runtime_exec_string_env(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // NULL is an NPE and EMPTY is an IllegalArgumentException -- two different
+    // doors, and this VM had them swapped and missing respectively.
+    //
+    // MEASURED in COMPATIBLE mode against HotSpot 25.0.3+9
+    // (`probes/Phase1Sweep.java`, the P1-I lane). Strict mode already agreed on
+    // both rows, because it drops these `SyntheticStub`s and runs the JDK's own
+    // `exec` -- so this is a defect the strict work exposed in the DEFAULT mode:
+    //
+    //   Runtime.exec("")     HotSpot IllegalArgumentException  CratonVM ArrayIndexOutOfBounds
+    //   Runtime.exec(null)   HotSpot NullPointerException      CratonVM IllegalArgumentException
+    //
+    // The JDK's `exec(String, String[], File)` opens with
+    // `if (command.isEmpty()) throw new IllegalArgumentException("Empty
+    // command")`, so a null receiver NPEs on `isEmpty()` one instruction before
+    // the emptiness test can run. That ordering is the whole of the behaviour.
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "Runtime.exec: null command".to_string(),
-            }
-            .into())
-        }
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+    if parts.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Empty command".to_string(),
+        }
+        .into());
+    }
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let env = if matches!(env_val, Value::Object(None)) {
         None
@@ -3796,16 +3854,32 @@ pub(crate) fn native_runtime_exec_string_env_dir(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // NULL is an NPE and EMPTY is an IllegalArgumentException -- two different
+    // doors, and this VM had them swapped and missing respectively.
+    //
+    // MEASURED in COMPATIBLE mode against HotSpot 25.0.3+9
+    // (`probes/Phase1Sweep.java`, the P1-I lane). Strict mode already agreed on
+    // both rows, because it drops these `SyntheticStub`s and runs the JDK's own
+    // `exec` -- so this is a defect the strict work exposed in the DEFAULT mode:
+    //
+    //   Runtime.exec("")     HotSpot IllegalArgumentException  CratonVM ArrayIndexOutOfBounds
+    //   Runtime.exec(null)   HotSpot NullPointerException      CratonVM IllegalArgumentException
+    //
+    // The JDK's `exec(String, String[], File)` opens with
+    // `if (command.isEmpty()) throw new IllegalArgumentException("Empty
+    // command")`, so a null receiver NPEs on `isEmpty()` one instruction before
+    // the emptiness test can run. That ordering is the whole of the behaviour.
     let cmd_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "Runtime.exec: null command".to_string(),
-            }
-            .into())
-        }
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
     };
     let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+    if parts.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Empty command".to_string(),
+        }
+        .into());
+    }
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let env = if matches!(env_val, Value::Object(None)) {
         None
