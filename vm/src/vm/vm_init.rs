@@ -3084,11 +3084,33 @@ impl SharedVm {
             // native via `register_collections_natives`; this branch
             // covers the real-JDK path which never calls that bulk
             // registration.
+            /// The `ArrayStoreException` `System.arraycopy` raises, named after
+            /// the offending element's class exactly as HotSpot names it.
+            fn array_store_failure(
+                ctx: &dyn cratonvm_native_api::NativeContext,
+                value: cratonvm_types::ObjectRef,
+            ) -> cratonvm_types::error::MethodCallFailed {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(value))
+                    .unwrap_or_default()
+                    .replace('/', ".");
+                cratonvm_types::error::RuntimeError::ArrayStoreException { message: cname }.into()
+            }
+
             fn real_jdk_to_array_typed(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
                 args: &[cratonvm_types::Value],
             ) -> cratonvm_types::error::MethodCallResult {
                 use cratonvm_types::Value;
+                // `Collection.toArray(T[])` reads `a.length` before anything
+                // else, so a null template is an NPE whatever the receiver
+                // holds. MEASURED: no-throw (probes/ArrayListShadowSweep 135).
+                if matches!(args.get(1), Some(Value::Object(None))) {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into());
+                }
                 let this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
@@ -3204,6 +3226,20 @@ impl SharedVm {
                                 ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
+                            // The JDK copies with `System.arraycopy`, which
+                            // performs the aastore store check — so
+                            // `List<String>.toArray(new Integer[4])` is an
+                            // `ArrayStoreException`, not an `Integer[]` full of
+                            // `String`s. Same rule as the opcode by
+                            // construction: `aastore_element_assignable` IS the
+                            // interpreter's predicate, and it fails OPEN
+                            // (`None`) wherever it cannot answer, so this can
+                            // only ever ADD a refusal HotSpot also makes.
+                            if let cratonvm_types::Value::Object(Some(vo)) = v {
+                                if ctx.aastore_element_assignable(cur_target, vo) == Some(false) {
+                                    return Err(array_store_failure(ctx, vo));
+                                }
+                            }
                             ctx.set_array_element(cur_target, i, v);
                         }
                         let target = ctx.read_native_pin(target_pin, target);
@@ -3241,7 +3277,18 @@ impl SharedVm {
                     let d_len = ctx.array_length(d);
                     let copy = size.min(d_len);
                     for i in 0..copy {
-                        ctx.set_array_element(target, i, ctx.get_array_element(d, i));
+                        let v = ctx.get_array_element(d, i);
+                        // See the iterator path above: `System.arraycopy`'s
+                        // store check.
+                        if let cratonvm_types::Value::Object(Some(vo)) = v {
+                            if ctx.aastore_element_assignable(target, vo) == Some(false) {
+                                if let Some((h, _)) = d_pin {
+                                    ctx.unpin_native_roots(h);
+                                }
+                                return Err(array_store_failure(ctx, vo));
+                            }
+                        }
+                        ctx.set_array_element(target, i, v);
                     }
                     ctx.unpin_native_roots(h);
                 }
