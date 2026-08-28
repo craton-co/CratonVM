@@ -1,81 +1,127 @@
-# 11 `codec.compression.*IntegrationTest` classes HANG at the 180s cap — one shared, already-diagnosed throughput wall, partially fixed
+# `codec.compression.*IntegrationTest` — the shared `testHugeDecompress` wall, 2.5-4x closed 2026-08-28, 4 of 11 classes still over
 
 ## Status
-**Known throughput characteristic, partially fixed, expected to still HANG at
-the harness's 180s cap.** Pulled back from
-`docs/internal/fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
-(full investigation and fix history) — this page is the public-facing summary.
-Reproduces every run this session, including the 2026-08-27 quiet single-shard
-ZGC rerun.
 
-## The 11 classes
+**OPEN, but a different page than it was.** The shared per-byte native wall that
+made all eleven classes HANG identically is fixed. Seven of the eleven now
+COMPLETE, in 125-191 s where they used to run past the suite's 180 s cap; four
+still do not, and their residual is a different one. No class is green yet: the
+test method itself carries netty's own 120 s JUnit timeout, and only the fastest
+`JdkZlibIntegrationTest` runs land under it.
 
-`JdkZlibIntegrationTest`, `SnappyIntegrationTest`, `SnappyJumboSizeIntegrationTest`,
-`JZlibIntegrationTest`, `BrotliIntegrationTest`, `Bzip2IntegrationTest`,
-`FastLzIntegrationTest`, `LengthAwareLzfIntegrationTest`, `LzfIntegrationTest`,
-`Lz4FrameIntegrationTest`, `ZstdIntegrationTest` — all `process-died rc=124
-timeout=180s`.
+Supersedes the "one shared, already-diagnosed throughput wall" framing. The
+page's own retirement condition — *"no new investigation needed unless the
+failure signature changes"* — has been met: the signature changed.
 
-## Root cause
+## What the eleven share
 
-All eleven inherit one shared base-class test method, `testHugeDecompress`,
-which builds a **256 MiB** buffer **one byte at a time** before compression
-even starts:
+All eleven inherit `AbstractIntegrationTest.testHugeDecompress`, which builds a
+256 MiB buffer one byte at a time:
 
 ```java
-int chunkSize = 1024 * 1024, numberOfChunks = 256;
-for (int i = 0; i <= numberOfChunks; i++) {
-    ByteBuf in = compressChannel.alloc().buffer(chunkSize);
-    for (int j = 0; j < chunkSize; j++) {
-        in.writeByte(...);       // <- 268,435,456 times
-        digest.update(byteValue); // <- 268,435,456 times
-    }
+in.writeByte(byteValue);      // 268,435,456 times
+digest.update(byteValue);     // 268,435,456 times, and again on the decompress side
 ```
 
-Not a hang in the "stuck" sense — the process is CPU-bound the whole time,
-confirmed via `/proc/<pid>/status` showing `R` (running) state and climbing
-`utime` on the original Linux investigation. It's a plain per-iteration
-throughput wall on `ByteBuf.writeByte` and `MessageDigest.update(byte)`, times
-536 million calls total (compress + decompress sides).
+## What was actually costing the time
 
-## What's already been fixed here
+A `--dump-native-registry` census of `JdkZlibIntegrationTest` — which the
+earlier investigation never took — named it exactly. **1.07 billion generic
+native dispatches**, three call sites:
 
-`AbstractByteBuf.writeByte` was paying two `VarHandle.get` calls at ~2µs each
-through `ensureAccessible()` -> `RefCnt.isLiveNonVolatile` — a
-signature-polymorphic call site the JIT's per-call-site native cache had
-permanently refused to resolve (see
-`varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`). Fixing that:
+```
+536 870 912  java/security/MessageDigest.update(B)V
+269 768 030  java/lang/invoke/VarHandle.get(...)        <- ensureAccessible -> RefCnt
+268 435 456  java/nio/DirectByteBuffer.put(IB)...       <- PooledDirectByteBuf._setByte
+```
 
-| | before | after |
-|---|---:|---:|
-| `ByteBuf.writeByte` (microbenchmark) | 2440–2578 ns | **368–654 ns** |
-| `JdkZlibIntegrationTest#testHugeDecompress`, solo, uncapped | 1063 s | **455–528 s** |
+`perf` put the funnel plus its receiver validation at ~45 % of the run. The
+previous page attributed the residual to "the native-dispatch floor
+(~170 ns/call)" and judged closing it unjustified. The floor was real; what was
+missing is that all three calls had, or could have, a thin direct bind that skips
+it — and that four separate mechanisms were each independently preventing those
+binds from reaching these sites.
 
-A 2–4x class-level win. **Still nowhere near the suite's 180s cap.**
+## The fix
 
-## What's left, and why it isn't worth chasing further right now
+`perf(jit): thin direct binds for the three per-BYTE natives`, on
+`fix/netty-longlong-npe-and-compression-wall-20260827`. Two new thin helpers
+(`ByteBuffer.put(int,byte)` / `get(int)`, `MessageDigest.update(byte)`), the
+existing `VarHandle` read bind routed to where it was needed, and a per-GC-epoch
+receiver memo. Per operation, against HotSpot on the same host:
 
-The residual is `MessageDigest.update(byte)` — 268M single-byte SHA-256 updates
-per side, at the native-dispatch floor (~170ns/call) — plus the codec work
-itself. That floor isn't specific to this cluster; it's the same per-call
-native-dispatch cost this session's testing keeps running into elsewhere (the
-`HashedWheelTimerTest` page and the KFusion FFM-segment page are two other
-instances of the same underlying floor, each priced independently). Restructuring
-the dispatch path to close it has been judged, separately, not justified by a
-lever too small to measure once it lands.
+| | before | after | HotSpot |
+|---|---:|---:|---:|
+| `MessageDigest.update(byte)` | 216 ns | **25 ns** | 8.6 ns |
+| `ByteBuf.writeByte` | 700 ns | **297 ns** | 5.1 ns |
+| `ByteBuf.forEachByte` | 349 ns | **122 ns** | 5.9 ns |
 
-`MessageDigest.update(byte[], off, len)` (the bulk-copy overload, which is what
-the actual codec bodies use, not the single-byte one `testHugeDecompress` hits)
-was also fixed on the way: it was reading the array one element at a time
-through the collector's generic accessor; now bulk-copies (1519ns -> 315ns for
-a 64-byte update).
+Same-binary A/B on `JdkZlibIntegrationTest`, B arm
+`CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS=0 CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0`:
+
+```
+A  119 s  ok=11 failed=0        B  176 s  ok=10 failed=1
+A   85 s  ok=11 failed=0        B  172 s  ok=10 failed=1
+```
+
+## Where the eleven stand now
+
+Solo, uncapped, killed at 300 s, one run each on a quiet host:
+
+| class | wall | |
+|---|---:|---|
+| `JdkZlibIntegrationTest` | 85 / 119 / 125 s | PASSES on the faster runs |
+| `ZstdIntegrationTest` | 148 s | completes |
+| `BrotliIntegrationTest` | 151 s | completes |
+| `Lz4FrameIntegrationTest` | 157 s | completes |
+| `JZlibIntegrationTest` | 179 s | completes |
+| `LengthAwareLzfIntegrationTest` | 181 s | completes |
+| `LzfIntegrationTest` | 191 s | completes |
+| `SnappyIntegrationTest` | 500 s | still over |
+| `SnappyJumboSizeIntegrationTest` | > 300 s | still over |
+| `Bzip2IntegrationTest` | > 300 s | still over |
+| `FastLzIntegrationTest` | > 300 s | still over |
+
+Against 455-528 s for `JdkZlibIntegrationTest` before, and 369 s for it on
+2026-08-28 `dev` immediately before this work.
+
+## The two residuals, which are NOT the same residual
+
+**1. `testHugeDecompress` is on netty's own 120 s boundary.** The harness cap is
+180 s, but the test method carries `@Timeout`-equivalent JUnit configuration of
+120 s, so a class can complete inside the harness and still report
+`ok=10 failed=1` with `TimeoutException: testHugeDecompress() timed out after
+120 seconds`. `JdkZlibIntegrationTest` straddles it: 85 s and 119 s runs pass,
+125 s and 143 s runs do not. Run-to-run spread on this workload is ±25 %, so
+this needs roughly another 1.3x of headroom to be reliable, not a new mechanism.
+
+What is left in its profile after the binds is diffuse: 41 % in JIT-compiled
+code and the rest spread across field access through the collector
+(`get_field_as` / `coerce_field_value_for_slot` / `read_value_cell_checked`),
+`jit_checkcast`, `jit_invoke_virtual_mic`, and the accumulator's per-byte
+`Mutex` + hash. No single item is above 8 %.
+
+**2. Snappy / Bzip2 / FastLz are a different wall.** `SnappyIntegrationTest`
+runs 500 s for 15 tests, and its census has NO concentrated funnel left — the
+largest native is 175 M `VarHandle.get`, and its profile's top entry is 3.8 %.
+Its cost is the platform's general per-operation overhead against netty's
+pure-Java codec loops, which is the subject of `the snappy wall is VM runtime,
+not compiled code` and not of this page. Attributing these three to the shared
+`testHugeDecompress` wall was correct while the wall dominated everything; it is
+not correct now.
 
 ## Not a bug to keep re-discovering
 
-If any of these 11 classes shows up as HANG in a future run, this is why — no
-new investigation needed unless the failure signature changes (e.g. a real
-FAIL instead of a timeout-HANG, or a wall time that's gotten *worse* rather
-than the expected "still over 180s, better than before").
+If one of the seven shows up as FAIL with `TimeoutException:
+testHugeDecompress() timed out after 120 seconds`, this is why, and the number
+to watch is the CLASS wall time: above ~200 s means something regressed, because
+these now sit at 125-191 s. A HANG at the 180 s cap from one of the seven IS new
+and worth investigating.
+
+`CRATONVM_DBG=jit-method-stats` prints the bound-site and served/declined counts
+for the three helpers. `ByteBuffer.byteElement=0` or a served count far below the
+call count is the shape of a bind that stopped reaching these sites — which
+happened four times while this was being written, once per compile door.
 
 ## Repro
 
@@ -83,9 +129,12 @@ than the expected "still over 180s, better than before").
 cd apps/netty-suite-runner
 cratonvm.exe --java-home <jdk25> --Xmx 1500m -XX:+UseZGC @common.args -Dcraton.batch=1 \
   CratonRunner io.netty.handler.codec.compression.JdkZlibIntegrationTest
-# any of the 11 reproduces the same wall
 ```
 
 ## Related
-- Full investigation: `docs/internal/fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
-- `docs/internal/fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
+
+* Full investigation and fix history of the earlier rounds:
+  `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
+* `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
+* The per-call native-dispatch floor, priced independently elsewhere:
+  the `HashedWheelTimerTest` page and the KFusion FFM-segment page.
