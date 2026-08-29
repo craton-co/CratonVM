@@ -112,3 +112,74 @@ mod tests {
         }
     }
 }
+
+/// A native is about to hand back an instance of a class `new` could not have
+/// produced. Report it ONCE per class, naming the native that asked.
+///
+/// Returns whether this call was the one that reported.
+///
+/// # Why this lives here rather than at the funnel that calls it
+///
+/// It was written inline in `native-builtins`' fabrication funnel, and it cost
+/// that crate its 429th raw lock construction. `lock_discipline_ratchet` holds
+/// `native-builtins` to a baseline for a reason it states plainly: that crate
+/// RE-ENTERS the VM — a native callback calls back into Java, which takes the
+/// heap and the L10 class-manager locks — so a new global lock there with no
+/// `LockLevel` is a deadlock the order checker cannot see. A diagnostic census
+/// has no business being the thing that raises that ceiling, and the predicate
+/// it needs (`ACC_INTERFACE` / `ACC_ABSTRACT`) is already here.
+///
+/// # The shape is `layout_alias::observe`'s, deliberately
+///
+/// A plain `parking_lot::Mutex`, which is this crate's convention
+/// (`capability.rs`, `fd_table.rs`); the ordered wrappers are the other crate's
+/// ratchet and do not apply here. The guard lives for exactly one `insert` and
+/// is dropped before the `tracing::warn!` — the subscriber re-enters the VM, so
+/// warning under the guard would be the inversion this move exists to avoid.
+///
+/// # Why a `warn!` and not a `--jdk-only` report row
+///
+/// A new `JdkOnlyViolation` variant is a wire-format change: `kind()` is the
+/// documented `"kind"` field of every report row, `difftest`'s census tallies by
+/// exactly that string, and `jfr`'s `jdk_only` holds a CLOSED label vocabulary
+/// with its own schema version. That is the right eventual home and it is four
+/// crates and a schema bump; a half-added kind — recorded but not tallied, or
+/// tallied but not labelled — is worse than none.
+///
+/// # Why it is not behind a flag
+///
+/// `layout_alias` is, and that is exactly why the definition-of-done screen
+/// could not see this species: the screen reads the REPORT, not a debug flag
+/// that is off in almost every run. MEASURED 2026-08-29
+/// (`probes/AbstractReceiverSweep`): seven `java.lang.foreign` sites answer an
+/// interface under `--jdk-only`, and one — `Arena.ofConfined()` — does so in
+/// compatible mode too, on runs whose report said `compatibility_classes: 0`.
+/// The predicate counts classes MINTED; this species is an allocation against a
+/// class that is perfectly real. Deduped by class name, so a segment-heavy
+/// workload pays one line per carrier rather than thousands.
+///
+/// `#[track_caller]` all the way up the funnel, so the location reported is the
+/// NATIVE that asked for the shape, not this line and not the forwarder.
+#[track_caller]
+pub fn observe_uninstantiable_receiver(class_name: &str, flags: u16) -> bool {
+    if flags & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
+        return false;
+    }
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut guard = seen.lock();
+        if !guard.insert(class_name.to_string()) {
+            return false;
+        }
+    }
+    let site = core::panic::Location::caller();
+    tracing::warn!(
+        class = %class_name,
+        requester = %format!("{}:{}", site.file(), site.line()),
+        kind = if flags & ACC_INTERFACE != 0 { "interface" } else { "abstract" },
+        "a native allocated an instance of a class `new` could not produce (JVMS 6.5);          the definition-of-done screen's compatibility_classes counts classes MINTED and          cannot see this. Reported once per class."
+    );
+    true
+}
