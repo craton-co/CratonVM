@@ -808,7 +808,10 @@ pub(crate) fn vh_memory_segment_set(ctx: &dyn NativeContext, vh: ObjectRef, args
 /// Auto-box a primitive Value into its wrapper object for signature-polymorphic
 /// VarHandle returns. When the call-site expects Ljava/lang/Object;, primitives
 /// must be wrapped (e.g. Int(42) → Integer object with field 0 = Int(42)).
-pub(crate) fn vh_auto_box(ctx: &mut dyn NativeContext, val: Value) -> Result<Value, MethodCallFailed> {
+pub(crate) fn vh_auto_box(
+    ctx: &mut dyn NativeContext,
+    val: Value,
+) -> Result<Value, MethodCallFailed> {
     match val {
         Value::Int(_) => {
             let wrapper = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
@@ -1631,8 +1634,11 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                 .map(|d| crate::lang_class::descriptor_to_class_mirror(ctx, d));
             let pin = arr_mirror.map(|m| ctx.pin_native_root(m));
             let comp_pin = comp_mirror.map(|m| ctx.pin_native_root(m));
-            let vh_obj =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS)?;
+            let vh_obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/invoke/VarHandle",
+                VH_META_NUM_FIELDS,
+            )?;
             ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Object(None));
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(0));
             // Mark this VarHandle as array-element kind so the get/set/cas
@@ -1673,8 +1679,11 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let coord0 = crate::lang_class::descriptor_to_class_mirror(ctx, "[B");
             let vt_pin = ctx.pin_native_root(var_type);
             let c0_pin = ctx.pin_native_root(coord0);
-            let vh_obj =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS)?;
+            let vh_obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/invoke/VarHandle",
+                VH_META_NUM_FIELDS,
+            )?;
             ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Int(elem as i32));
             ctx.set_field(
                 vh_obj,
@@ -1729,7 +1738,8 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             // receiver's FIRST field regardless of which field was asked for.
             // `mirror_class_id` is the reverse-map lookup that actually names
             // the represented class.
-            let holder_class = holder_mirror.and_then(|m| crate::lang_class::mirror_class_id(ctx, m));
+            let holder_class =
+                holder_mirror.and_then(|m| crate::lang_class::mirror_class_id(ctx, m));
             // A mirror we could not resolve keeps the historical fallback
             // (ClassId 0, index 0) rather than raising: we do not know that the
             // field is absent, only that we cannot see the class. The handle it
@@ -1737,9 +1747,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             // reporting the caller's requested type as fact.
             let class_id = holder_class.unwrap_or_else(|| ClassId::new(0));
             let resolved = holder_class.and_then(|c| vh_find_instance_field(ctx, c, &field_name));
-            if resolved.is_none()
-                && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c))
-            {
+            if resolved.is_none() && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c)) {
                 // The JDK raises NoSuchFieldException here. Handing back a
                 // handle aimed at field 0 is the fabricated-success shape: the
                 // caller gets a working-looking VarHandle onto the wrong
@@ -1757,8 +1765,8 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             // freshly resolved mirror is not guaranteed to be.
             let declared =
                 holder_class.and_then(|c| vh_instance_field_descriptor(ctx, c, &field_name));
-            let requested = type_mirror
-                .map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
+            let requested =
+                type_mirror.map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
             let var_type = match (&declared, &requested, type_mirror) {
                 (Some(d), Some(rq), Some(m)) if d == rq => Some(m),
                 (Some(d), _, _) => Some(crate::lang_class::descriptor_to_class_mirror(ctx, d)),
@@ -1766,8 +1774,11 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             };
             let vt_pin = var_type.map(|m| ctx.pin_native_root(m));
             let hm_pin = holder_mirror.map(|m| ctx.pin_native_root(m));
-            let vh_obj =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS)?;
+            let vh_obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/invoke/VarHandle",
+                VH_META_NUM_FIELDS,
+            )?;
             ctx.set_field(
                 vh_obj,
                 VH_CLASS_OR_TARGET,
@@ -1823,9 +1834,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let resolved = holder_class.and_then(|c| vh_find_static_field(ctx, c, &field_name));
-            if resolved.is_none()
-                && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c))
-            {
+            if resolved.is_none() && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c)) {
                 return Err(RuntimeError::NoSuchFieldException {
                     field_name: field_name.clone(),
                 }
@@ -1833,16 +1842,19 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             }
             let field_idx = resolved.as_ref().map(|(i, _)| *i as i32).unwrap_or(0);
             let declared = resolved.map(|(_, d)| d);
-            let requested = type_mirror
-                .map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
+            let requested =
+                type_mirror.map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
             let var_type = match (&declared, &requested, type_mirror) {
                 (Some(d), Some(rq), Some(m)) if d == rq => Some(m),
                 (Some(d), _, _) => Some(crate::lang_class::descriptor_to_class_mirror(ctx, d)),
                 _ => None,
             };
             let vt_pin = var_type.map(|m| ctx.pin_native_root(m));
-            let vh_obj =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS)?;
+            let vh_obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/invoke/VarHandle",
+                VH_META_NUM_FIELDS,
+            )?;
             ctx.set_field(
                 vh_obj,
                 VH_CLASS_OR_TARGET,
@@ -2231,10 +2243,10 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
             // through this synthetic-carrier registration. Prefer the real
             // ClassFrameInfo.flags bit when present; otherwise use the
             // persistent permission copied onto our synthetic carrier.
-            let retains_class_ref =
-                crate::lang_stackwalker::class_frame_retains_class_ref(ctx, this).unwrap_or_else(
-                    || matches!(ctx.get_field(this, 7), Value::Int(value) if value != 0),
-                );
+            let retains_class_ref = crate::lang_stackwalker::class_frame_retains_class_ref(
+                ctx, this,
+            )
+            .unwrap_or_else(|| matches!(ctx.get_field(this, 7), Value::Int(value) if value != 0));
             if !retains_class_ref {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
@@ -2632,7 +2644,9 @@ pub(crate) fn populate_stack_frame(
     // known, so a repeated frame does not re-run `.replace('/', '.')` and
     // allocate a fresh Rust `String` on top of the Java one.
     let dotted: std::sync::Arc<str> = match decl_cid {
-        Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &entry.class_name),
+        Some(cid) => {
+            crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &entry.class_name)
+        }
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
     };
     let mut cls_str = ctx.create_string(&dotted);
@@ -2912,7 +2926,10 @@ pub(crate) fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -
 }
 
 /// Helper: build a `HashSet<String>` Java object from a Vec of Rust strings.
-pub(crate) fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn build_string_set(
+    ctx: &mut dyn NativeContext,
+    items: Vec<String>,
+) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     let len = items.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
@@ -3616,6 +3633,37 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
                 } else {
                     None
                 };
+
+            // A modular jar reached through `-cp` is an UNNAMED-module citizen:
+            // a real JVM ignores its `module-info` outright, and `getModule()`
+            // answers the loader's unnamed module. This VM's registry scans the
+            // application class path for `module-info.class` and registers what
+            // it finds (so readability checks pass for e.g. `org.jboss.logging`),
+            // which made this accessor report `ch.qos.logback.classic` for a
+            // class-path class.
+            //
+            // MEASURED 2026-08-28, `probes/L7ModuleProbe`, both modes:
+            //
+            //   ch.qos.logback.classic.spi.LogbackServiceProvider
+            //     HotSpot   isNamed=false  name=null
+            //     CratonVM  isNamed=true   name=ch.qos.logback.classic
+            //
+            // It is not a labelling nicety. `ServiceLoader`'s classpath lookup
+            // iterator does `if (clazz.getModule().isNamed()) continue;` — a
+            // SILENT skip, no error and no report row — so every classpath SPI
+            // provider disappeared. Under `--jdk-only`, where the ServiceLoader
+            // synthetic stubs are refused and the real bytecode runs, that made
+            // SLF4J bind `NOPLoggerFactory` and every Spring Boot application
+            // die in `LogbackLoggingSystem.beforeInitialize`.
+            //
+            // Same rule, same predicate, as `populate_boot_layer_modules` and
+            // `ModuleRegistry::providers_for_service`; this is its fourth door.
+            // A `--module-path` module is re-registered `automatic = false` by
+            // `vm_init` immediately after `ClassManager::new`, so it is NOT
+            // class-path-only and is unaffected — which is what
+            // `regression-suite/src/RJdkModule.java` pins.
+            let module_name = module_name.filter(|n| !ctx.module_is_class_path_only(n));
+
             if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
                 return Ok(Some(Value::Object(Some(cached))));
             }

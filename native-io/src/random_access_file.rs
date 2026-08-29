@@ -631,7 +631,13 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
     }
     registry.register_with_kind(raf, "seek0", "(J)V", native_seek0, NativeKind::Bridge);
     registry.register_with_kind(raf, "length0", "()J", native_length0, NativeKind::Bridge);
-    registry.register_with_kind(raf, "setLength0", "(J)V", native_setLength0, NativeKind::Bridge);
+    registry.register_with_kind(
+        raf,
+        "setLength0",
+        "(J)V",
+        native_setLength0,
+        NativeKind::Bridge,
+    );
     // Not ACC_NATIVE — not declared by JDK 25's RandomAccessFile at all.
     // Left on the ambient category deliberately; see the marker above.
     registry.set_category(__prev_cat);
@@ -643,10 +649,13 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::fd_table::FileDescriptorTable;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::{Read, Write};
 
     /// The crux of the TC0622 fix: a file opened via `open_random_access`

@@ -215,7 +215,10 @@ mod tests {
     //! Full intrinsic-on vs intrinsic-off differential testing is owned by the
     //! TESTS agent in `vm/tests/intrinsic_diff.rs`.
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     use super::*;
     use cratonvm_native_api::NativeCallback;

@@ -612,10 +612,8 @@ fn parse_signed_data(
                 // malformed signature encoding.  Absence of evidence is not
                 // evidence of trust: refuse, with a message that does not
                 // claim a verdict we did not reach.
-                return Err(
-                    "SignerInfo signature could not be verified \
-                     (unsupported or unusable algorithm/key) — refusing",
-                );
+                return Err("SignerInfo signature could not be verified \
+                     (unsupported or unusable algorithm/key) — refusing");
             }
         }
     }
@@ -5321,8 +5319,8 @@ mod tests {
 
         let mut ts = TrustStore::empty();
         assert!(ts.add_anchor_der(root_der.clone()));
-        let vs = verify_signer_block(&block, sf, &ts)
-            .expect("the legitimate signer must still verify");
+        let vs =
+            verify_signer_block(&block, sf, &ts).expect("the legitimate signer must still verify");
 
         assert_eq!(
             vs.chain,
@@ -5477,9 +5475,16 @@ mod tests {
         );
 
         // Tamper at either link and it breaks.
-        assert!(!digest_matches(declared[0].alg, b"swapped bytes", &declared[0].expected));
+        assert!(!digest_matches(
+            declared[0].alg,
+            b"swapped bytes",
+            &declared[0].expected
+        ));
         let tampered = manifest.replace("pkg/Real.class", "pkg/Evil.class");
-        assert!(!verify_sf_binds_manifest(sf.as_bytes(), tampered.as_bytes()));
+        assert!(!verify_sf_binds_manifest(
+            sf.as_bytes(),
+            tampered.as_bytes()
+        ));
 
         // TRUST BOUNDARY: everything above used no key and no certificate.
         // A `.SF` anyone can write produces the same `true`, so integrity is

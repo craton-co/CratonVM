@@ -1381,8 +1381,13 @@ fn module_builder_set_or_empty(
     }
 }
 
-pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?)
+pub(crate) fn module_descriptor_empty_set(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(
+        ctx,
+        &[],
+    )?)
 }
 
 fn module_descriptor_set_field(
@@ -2097,12 +2102,16 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 let name_pin = ctx.pin_native_root(name);
                 first_pin = Some(first_pin.map_or(name_pin, |pin: usize| pin.min(name_pin)));
 
-                let mref =
-                    try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
+                let mref = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "jdk/internal/module/ModuleReferenceImpl",
+                    8,
+                )?;
                 let mref_pin = ctx.pin_native_root(mref);
                 first_pin = Some(first_pin.map_or(mref_pin, |pin: usize| pin.min(mref_pin)));
 
-                let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+                let md =
+                    try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
                 let name = ctx.read_native_pin(name_pin, name);
                 ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
                 let mref = ctx.read_native_pin(mref_pin, mref);
@@ -2152,12 +2161,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             // `--jdk-only` while HotSpot 25 passes.
             let name_text = ctx.read_string(name).unwrap_or_default();
             if !is_system_module_name(&*ctx, &name_text) {
-                return ctx.invoke(
-                    "java/util/Optional",
-                    "empty",
-                    "()Ljava/util/Optional;",
-                    &[],
-                );
+                return ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]);
             }
             // A ModuleReferenceImpl whose `descriptor.name` carries the module
             // name and whose `readerSupplier` is left null — `open()` below
@@ -2396,7 +2400,10 @@ fn native_attrs_name_text(ctx: &dyn NativeContext, name_obj: ObjectRef) -> Optio
     }
 }
 
-fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn native_attrs_make_name(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(name);
@@ -2406,7 +2413,10 @@ fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> Result<Obj
     Ok(obj)
 }
 
-fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn native_attrs_key_for_value(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.read_string(key) {
         Some(name) => native_attrs_make_name(ctx, &name),
         None => Ok(key),
@@ -3810,7 +3820,11 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if let Some(cid) = generated_cid {
         if let Some(Value::Object(Some(loader_obj))) = args.first() {
             if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(
+                    ctx.vm_identity(),
+                    cid.as_u32(),
+                    *loader_obj,
+                );
             }
         }
     }
@@ -3883,7 +3897,11 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // loaders are recorded; built-in/null loaders keep the fallback.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                    crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
+                    crate::classloader::register_defining_loader(
+                        ctx.vm_identity(),
+                        cid.as_u32(),
+                        *loader_obj,
+                    );
                 }
             }
             let mirror = ctx.get_class_mirror(cid);
@@ -4382,7 +4400,10 @@ fn throw_proxy_failure(ctx: &mut dyn NativeContext, stage: &str) -> MethodCallFa
 #[cfg(test)]
 mod proxy_strict_gate_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     /// increment 3 (§3): STRICT proxy mode is opt-in and OFF by default, so the
     /// silent-degrade safety net remains the default behaviour until the soak
     /// flips it. (The throw path itself requires a live VM and is exercised by
@@ -5105,9 +5126,12 @@ fn native_proxy_instance_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 #[cfg(test)]
 mod module_can_read_essential_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// `register_p59_module` (phases_late.rs) also registers this triple, but
     /// that function is only reachable via the `synthetic-jdk`-feature-gated

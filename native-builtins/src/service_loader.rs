@@ -375,7 +375,12 @@ pub fn impl_jars_load_class(
     internal_name: &str,
 ) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     let mut visited = std::collections::HashSet::new();
-    Ok(impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)?)
+    Ok(impl_jars_load_class_inner(
+        ctx,
+        defining_loader,
+        internal_name,
+        &mut visited,
+    )?)
 }
 
 fn impl_jars_load_class_inner(
@@ -472,7 +477,11 @@ fn impl_jars_load_class_inner(
                 if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts)
                 {
                     if let Some(loader) = defining_loader {
-                        crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
+                        crate::classloader::register_defining_loader(
+                            ctx.vm_identity(),
+                            cid.as_u32(),
+                            loader,
+                        );
                     }
                     return Ok(Some(ctx.get_class_mirror(cid)));
                 }
@@ -578,7 +587,11 @@ fn load_provider_class_from_loader_jars(
             // same EmbeddedImplClassLoader.
             let loader_id = crate::classloader::get_or_assign_loader_id(ctx, loader);
             if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts) {
-                crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
+                crate::classloader::register_defining_loader(
+                    ctx.vm_identity(),
+                    cid.as_u32(),
+                    loader,
+                );
                 preload_embedded_dependencies(ctx, loader, &class_bytes);
                 return Some(ctx.get_class_mirror(cid));
             }
@@ -906,7 +919,8 @@ fn discover_providers(
     };
     let loader_is_jboss_module = loader_ref_opt
         .map(|r| {
-            ctx.class_name_arc_of_id(ctx.class_id_of_object(r)).as_deref()
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(r))
+                .as_deref()
                 == Some("org/jboss/modules/ModuleClassLoader")
         })
         .unwrap_or(false);
@@ -1480,7 +1494,10 @@ fn provider_not_found_error(
     service_name: &str,
     provider: &str,
 ) -> Option<MethodCallFailed> {
-    service_configuration_error(ctx, &format!("{service_name}: Provider {provider} not found"))
+    service_configuration_error(
+        ctx,
+        &format!("{service_name}: Provider {provider} not found"),
+    )
 }
 
 /// `ServiceLoader.fail(service, msg)`: a cause-less `ServiceConfigurationError`.
@@ -3522,7 +3539,10 @@ fn drain_real_spliterator(
     // The third of the three `StreamCollector` mints. Ask the policy first for
     // the same reason as the other two: an infallible fabrication anywhere
     // makes the refusal everywhere else depend on which path ran first.
-    if ctx.try_ensure_synthetic_class(STREAM_COLLECTOR_CLASS, 2).is_err() {
+    if ctx
+        .try_ensure_synthetic_class(STREAM_COLLECTOR_CLASS, 2)
+        .is_err()
+    {
         return cratonvm_native_collections::drain_spliterator_via_real_iterator(
             ctx,
             spliterator,
@@ -3775,10 +3795,13 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn file_url_path_preserves_windows_drive_letter() {
@@ -3928,7 +3951,11 @@ mod tests {
         ctx.set_field_by_name(loader, "ucp", Value::Object(Some(ucp)));
         let urls = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(urls, 0, Value::Object(Some(url)));
-        ctx.set_field(ucp, crate::classloader::UCP_STASHED_URLS, Value::Object(Some(urls)));
+        ctx.set_field(
+            ucp,
+            crate::classloader::UCP_STASHED_URLS,
+            Value::Object(Some(urls)),
+        );
         loader
     }
 
@@ -3987,7 +4014,11 @@ mod tests {
             crate::classloader::loader_owns_complete_resource_view(&ctx, loader),
             "fixture must present a URLClassLoader-family loader with recorded URLs"
         );
-        let sl = service_loader_for(&mut ctx, "org/slf4j/spi/SLF4JServiceProvider", Value::Object(Some(loader)));
+        let sl = service_loader_for(
+            &mut ctx,
+            "org/slf4j/spi/SLF4JServiceProvider",
+            Value::Object(Some(loader)),
+        );
         // `discover_providers` reads the named `loader` field, then legacy slot 1.
         assert!(
             matches!(ctx.get_field_by_name(sl, "loader"), Value::Object(Some(_)))

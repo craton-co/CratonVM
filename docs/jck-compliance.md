@@ -5,9 +5,9 @@
 > outcomes onto JCK sections — **not** a claim of OCTLA-signed
 > conformance. Only an Oracle-endorsed run of the actual JCK bundle
 > can produce that claim; see `docs/legal.md` for how to obtain the
-> bundle and `.github/_disabled-workflows/jck.yml` (currently
-> disabled — see RELEASING.md §2) for the harness that drives
-> it once `JCK_HOME` is configured.
+> bundle and `.github/workflows/jck.yml` (manual `workflow_dispatch`
+> only — see RELEASING.md §2) for the harness that drives it once
+> `JCK_HOME` is configured.
 >
 > Until then, each section tracks two numbers:
 >

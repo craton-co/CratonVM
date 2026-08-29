@@ -517,10 +517,10 @@ explicit `.rn` rounding modifier — `add.rn.f32`, `sub.rn.f32`,
   kept as a double, still emits `sqrt.rn.f64`. See
   `float_sqrt_triple_at`.
 
-The contraction hazard was latent from the day the lowerer was written
-and only surfaced on 2026-08-21, because none of the earlier fixtures
-contained a mul-then-add pair to contract — a kernel needs an `a*b + c`
-chain before the two spellings can diverge at all. The regression test
+The contraction hazard needs an `a*b + c` chain to surface at all — a kernel
+with no mul-then-add pair to contract never exercises it, which is why it can
+stay latent across fixtures that happen not to contain one. The regression
+test
 `float_arithmetic_always_carries_an_explicit_rounding_mode` asserts on
 the rendered PTX text, so it runs everywhere and does not need a CUDA
 toolkit.

@@ -159,10 +159,7 @@ fn to_array_typed_on_an_unmodelled_receiver_uses_its_real_iterator() {
 
     assert_eq!(
         contents,
-        vec![
-            Value::Object(Some(elems[0])),
-            Value::Object(Some(elems[1])),
-        ],
+        vec![Value::Object(Some(elems[0])), Value::Object(Some(elems[1])),],
         "AbstractCollection.toArray(T[]) must honour the Collection contract \
          for a receiver whose layout no heuristic models"
     );
@@ -313,10 +310,7 @@ fn a_readable_receiver_is_answered_from_its_layout_without_virtual_calls() {
 
     assert_eq!(
         contents,
-        vec![
-            Value::Object(Some(elems[0])),
-            Value::Object(Some(elems[1])),
-        ]
+        vec![Value::Object(Some(elems[0])), Value::Object(Some(elems[1])),]
     );
     let called = methods_called(&ctx);
     assert!(
@@ -359,10 +353,7 @@ fn for_each_on_an_unmodelled_receiver_visits_every_element() {
 
     assert_eq!(
         visited,
-        vec![
-            Value::Object(Some(elems[0])),
-            Value::Object(Some(elems[1])),
-        ],
+        vec![Value::Object(Some(elems[0])), Value::Object(Some(elems[1])),],
         "Collection.forEach must visit the elements of a receiver whose layout \
          no heuristic models"
     );

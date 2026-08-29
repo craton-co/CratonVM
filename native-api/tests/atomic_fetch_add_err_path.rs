@@ -36,11 +36,11 @@ mod mock {
     use std::sync::OnceLock;
 
     use cratonvm_native_api::ffi::UpcallEntry;
-use cratonvm_native_api::{
+    use cratonvm_native_api::NativeHeapAccess;
+    use cratonvm_native_api::{
         AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeContext,
         StackTraceEntry,
-};
-use cratonvm_native_api::NativeHeapAccess;
+    };
     use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
     use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
@@ -93,7 +93,6 @@ use cratonvm_native_api::NativeHeapAccess;
     }
 
     impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
-
         fn load_class(&mut self, _n: &str) -> MethodCallResult {
             Ok(None)
         }
@@ -231,7 +230,6 @@ use cratonvm_native_api::NativeHeapAccess;
     }
 
     impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
-
         fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
             Ok(None)
         }
@@ -253,7 +251,6 @@ use cratonvm_native_api::NativeHeapAccess;
     }
 
     impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
-
         fn new_object(&mut self, _c: &str) -> MethodCallResult {
             Ok(Some(Value::Object(Some(self.fresh_object_ref()))))
         }
@@ -375,8 +372,6 @@ use cratonvm_native_api::NativeHeapAccess;
     }
 
     impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
-
-
         fn thread_id(&self) -> u64 {
             1
         }
@@ -428,7 +423,6 @@ use cratonvm_native_api::NativeHeapAccess;
     }
 
     impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
-
         fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
             Vec::new()
         }
@@ -437,13 +431,9 @@ use cratonvm_native_api::NativeHeapAccess;
         }
     }
 
-    impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
-
-    }
+    impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {}
 
     impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
-
-
         fn record_printed_value(&mut self, _v: Value) {}
         fn record_printed_line(&mut self, _t: String) {}
         fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
@@ -492,20 +482,17 @@ use cratonvm_native_api::NativeHeapAccess;
         }
     }
 
-
-
-        // GPU offload (`gpu_dispatch_method`, `gpu_future_*`,
-        // `gpu_array_download_if_dirty`, `gpu_resolve_lambda_target`,
-        // `gpu_release_array_cache`, `gpu_clear_input_cache`) inherits the
-        // trait's `None` / no-op defaults — no override needed for the
-        // mock's narrow CAS-loop brief.
-
+    // GPU offload (`gpu_dispatch_method`, `gpu_future_*`,
+    // `gpu_array_download_if_dirty`, `gpu_resolve_lambda_target`,
+    // `gpu_release_array_cache`, `gpu_clear_input_cache`) inherits the
+    // trait's `None` / no-op defaults — no override needed for the
+    // mock's narrow CAS-loop brief.
 }
 
 use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::NativeHeapAccess;
 use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 use cratonvm_types::{ClassId, Value};
-use cratonvm_native_api::NativeHeapAccess;
 
 use mock::MockNativeContext;
 

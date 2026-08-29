@@ -663,7 +663,8 @@ impl ZRelocateStats {
             .fetch_add(c.objects_adopted, Ordering::Relaxed);
         self.objects_abandoned
             .fetch_add(c.objects_abandoned, Ordering::Relaxed);
-        self.bytes_copied.fetch_add(c.bytes_copied, Ordering::Relaxed);
+        self.bytes_copied
+            .fetch_add(c.bytes_copied, Ordering::Relaxed);
         self.bytes_abandoned
             .fetch_add(c.bytes_abandoned, Ordering::Relaxed);
     }
@@ -1597,7 +1598,15 @@ impl ZRelocate {
                 heap_base
             }
         };
-        Self::build(ctx, allocator, registry, config, to_encoding_base, heap_base, heap_end)
+        Self::build(
+            ctx,
+            allocator,
+            registry,
+            config,
+            to_encoding_base,
+            heap_base,
+            heap_end,
+        )
     }
 
     /// Build a relocator, **refusing** an encoding base that cannot express this
@@ -1679,8 +1688,7 @@ impl ZRelocate {
         heap_base: u64,
         heap_end: u64,
     ) -> Self {
-        let record =
-            ZRelocationRecord::new(config.record_pointer_map, config.pointer_map_reserve);
+        let record = ZRelocationRecord::new(config.record_pointer_map, config.pointer_map_reserve);
         tracing::debug!(
             target: "zgc",
             heap_base = heap_base,
@@ -2228,13 +2236,13 @@ impl ZRelocate {
             Some(a) => a,
             None => return Ok(None),
         };
-        let to_offset =
-            self.offset_of_address(to_absolute)
-                .ok_or(ZRelocateError::NotInHeap {
-                    value: to_absolute,
-                    heap_base: self.heap_base,
-                    heap_end: self.heap_end,
-                })?;
+        let to_offset = self
+            .offset_of_address(to_absolute)
+            .ok_or(ZRelocateError::NotInHeap {
+                value: to_absolute,
+                heap_base: self.heap_base,
+                heap_end: self.heap_end,
+            })?;
         // Belt and braces: `offset_of_address` already bounded this by
         // `heap_end`, but a reservation is not required to be smaller than
         // 2^42, and the barrier's field is.
@@ -2294,9 +2302,7 @@ impl ZRelocate {
         let table = self
             .registry
             .get(page.id())
-            .ok_or(ZRelocateError::NoForwardingTable {
-                page_id: page.id(),
-            })?;
+            .ok_or(ZRelocateError::NoForwardingTable { page_id: page.id() })?;
 
         let (start, end) = page.walk_bounds();
         let cap = (page.size() / ZRELOCATE_MIN_OBJECT_BYTES).saturating_add(1);
@@ -2348,8 +2354,7 @@ impl ZRelocate {
             outcome.objects_seen += 1;
 
             if self.ctx.is_live(addr as u64) {
-                let r =
-                    self.relocate_object(page, &table, addr as u64, work.gen_hint, local)?;
+                let r = self.relocate_object(page, &table, addr as u64, work.gen_hint, local)?;
                 if r.fresh {
                     outcome.objects_relocated += 1;
                     outcome.bytes_copied += r.bytes;
@@ -2907,7 +2912,10 @@ mod tests {
             if self.starve.load(Ordering::Relaxed) {
                 return None;
             }
-            self.allocator.alloc_object(bytes, align).ok().map(|a| a as u64)
+            self.allocator
+                .alloc_object(bytes, align)
+                .ok()
+                .map(|a| a as u64)
         }
 
         fn on_relocated(&self, from: u64, to: u64) {
@@ -2931,9 +2939,8 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let allocator = Arc::new(
-            ZPageAllocator::new(test_page_config()).expect("test geometry must validate"),
-        );
+        let allocator =
+            Arc::new(ZPageAllocator::new(test_page_config()).expect("test geometry must validate"));
         let ctx = Arc::new(TestCtx::new(Arc::clone(&allocator)));
         let registry = Arc::new(ZForwardingRegistry::new());
         // Explicit binding rather than an `as` cast: the unsizing coercion
@@ -2965,18 +2972,16 @@ mod tests {
     /// never the allocator's *shared* page — which is what guarantees that
     /// to-space allocations (which go through `alloc_object`) land in a
     /// different page and can never alias the source.
-    fn make_from_page(
-        f: &Fixture,
-        count: usize,
-        size: usize,
-    ) -> (Arc<ZPageReal>, Vec<usize>) {
+    fn make_from_page(f: &Fixture, count: usize, size: usize) -> (Arc<ZPageReal>, Vec<usize>) {
         let page = f
             .allocator
             .alloc_page(ZPageSizeClass::Small, 0)
             .expect("small page");
         let mut addrs = Vec::with_capacity(count);
         for i in 0..count {
-            let a = page.alloc(size, 8).expect("from-page must hold the objects");
+            let a = page
+                .alloc(size, 8)
+                .expect("from-page must hold the objects");
             write_test_object(a, size, i as u8);
             addrs.push(a);
         }
@@ -2984,8 +2989,10 @@ mod tests {
         page.set_state(ZPageState::Relocatable);
         assert!(page.try_transition(ZPageState::Relocatable, ZPageState::InRelocationSet));
 
-        f.registry
-            .install(page.id(), Arc::new(ZForwardingTable::for_page(page.id(), count.max(1))));
+        f.registry.install(
+            page.id(),
+            Arc::new(ZForwardingTable::for_page(page.id(), count.max(1))),
+        );
         f.remap.begin_cycle();
         assert!(f.remap.select_page(page.id(), count));
         (page, addrs)
@@ -3107,7 +3114,10 @@ mod tests {
 
         // (e) The pointer map has the move, once.
         assert_eq!(f.relocate.record().len(), 1);
-        assert_eq!(f.relocate.record().get(from as usize), Some(winner as usize));
+        assert_eq!(
+            f.relocate.record().get(from as usize),
+            Some(winner as usize)
+        );
     }
 
     // -- 3. byte identity for a range of sizes ------------------------------
@@ -3331,7 +3341,10 @@ mod tests {
         // The healthy page still finished — one bad header must not abandon the
         // rest of the relocation set.
         assert_eq!(result.pages_completed, 1);
-        assert_eq!(f.remap.state_of(good.id()), Some(ZPageRemapState::Relocated));
+        assert_eq!(
+            f.remap.state_of(good.id()),
+            Some(ZPageRemapState::Relocated)
+        );
 
         // The failed page is NOT marked relocated and therefore can never be
         // recycled by ZR-1's rule — which is the correct outcome for a page
@@ -3382,7 +3395,10 @@ mod tests {
         assert_eq!(result.aborted_walk_page_ids, vec![page.id()]);
         assert_eq!(result.pages_completed, 0);
         assert_eq!(result.outstanding_at_exit, 0);
-        assert_ne!(f.remap.state_of(page.id()), Some(ZPageRemapState::Relocated));
+        assert_ne!(
+            f.remap.state_of(page.id()),
+            Some(ZPageRemapState::Relocated)
+        );
     }
 
     // -- 7. the pointer map records every move -----------------------------
@@ -3427,8 +3443,7 @@ mod tests {
 
     #[test]
     fn a_disabled_record_accumulates_nothing() {
-        let allocator =
-            Arc::new(ZPageAllocator::new(test_page_config()).expect("test geometry"));
+        let allocator = Arc::new(ZPageAllocator::new(test_page_config()).expect("test geometry"));
         let ctx = Arc::new(TestCtx::new(Arc::clone(&allocator)));
         let registry = Arc::new(ZForwardingRegistry::new());
         // `ctx.clone()` (method form), NOT `Arc::clone(&ctx)`: the associated-fn
@@ -3590,9 +3605,8 @@ mod tests {
                 "{bad:#x} must not pass the barrier's own domain predicate"
             );
 
-            let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                f.relocate.forward_offset(bad)
-            }));
+            let caught =
+                std::panic::catch_unwind(AssertUnwindSafe(|| f.relocate.forward_offset(bad)));
             match caught {
                 // Debug builds: the `debug_assert!` in `check_offset_domain`
                 // turns it into a test failure at the boundary.
@@ -3645,21 +3659,15 @@ mod tests {
 
         // (c) The default — the allocator base — works at either placement,
         //     because the encoded value is bounded by the heap SIZE.
+        assert!(ZRelocate::check_encoding_base(LINUX_BASE, LINUX_BASE, LINUX_BASE + HEAP).is_ok());
         assert!(
-            ZRelocate::check_encoding_base(LINUX_BASE, LINUX_BASE, LINUX_BASE + HEAP).is_ok()
+            ZRelocate::check_encoding_base(WINDOWS_BASE, WINDOWS_BASE, WINDOWS_BASE + HEAP).is_ok()
         );
-        assert!(ZRelocate::check_encoding_base(
-            WINDOWS_BASE,
-            WINDOWS_BASE,
-            WINDOWS_BASE + HEAP
-        )
-        .is_ok());
 
         // (d) A base above the heap base cannot express the bottom of the heap
         //     at all — every destination there fails `checked_sub`.
         assert!(
-            ZRelocate::check_encoding_base(LINUX_BASE + 8, LINUX_BASE, LINUX_BASE + HEAP)
-                .is_err()
+            ZRelocate::check_encoding_base(LINUX_BASE + 8, LINUX_BASE, LINUX_BASE + HEAP).is_err()
         );
 
         // (e) The boundary: a heap ending exactly at ZFWD_MAX_PAYLOAD encodes
@@ -3827,7 +3835,10 @@ mod tests {
         assert!(result.is_clean(), "{result:?}");
         assert_eq!(result.pages_completed, PAGES);
         assert_eq!(result.counts.objects_relocated, PAGES * COUNT);
-        assert_eq!(result.counts.objects_abandoned, 0, "no two workers share a page");
+        assert_eq!(
+            result.counts.objects_abandoned, 0,
+            "no two workers share a page"
+        );
         assert_eq!(result.outstanding_at_exit, 0);
         assert_eq!(f.relocate.record().len(), PAGES * COUNT);
 
@@ -3836,7 +3847,10 @@ mod tests {
                 .relocate
                 .forward_lookup(*from)
                 .expect("every object must be forwarded");
-            assert!(!page.contains(to as usize), "to-space must not be from-space");
+            assert!(
+                !page.contains(to as usize),
+                "to-space must not be from-space"
+            );
             assert_eq!(f.relocate.record().get(*from as usize), Some(to as usize));
         }
     }

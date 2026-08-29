@@ -85,8 +85,8 @@ impl VerifiedCode {
         };
         // Already validated by `decode`, which rejects any out-of-range or
         // mid-instruction target, so the error arm is unreachable here.
-        let mut out = instruction_targets(&decoded.instruction, pc, self.code.len())
-            .unwrap_or_default();
+        let mut out =
+            instruction_targets(&decoded.instruction, pc, self.code.len()).unwrap_or_default();
         if falls_through(&decoded.instruction) && (decoded.next_pc as usize) < self.code.len() {
             out.push(decoded.next_pc as usize);
         }
@@ -222,11 +222,12 @@ pub fn verified_code(code: &[u8]) -> Result<Arc<VerifiedCode>, ClassReaderError>
 }
 
 fn checked_target(source: usize, offset: i64, code_len: usize) -> Result<usize, ClassReaderError> {
-    let target = (source as i64).checked_add(offset).ok_or_else(|| {
-        ClassReaderError::InvalidClassData {
-            message: format!("branch target at offset {source} overflowed"),
-        }
-    })?;
+    let target =
+        (source as i64)
+            .checked_add(offset)
+            .ok_or_else(|| ClassReaderError::InvalidClassData {
+                message: format!("branch target at offset {source} overflowed"),
+            })?;
     if target < 0 || target >= code_len as i64 {
         return Err(ClassReaderError::InvalidClassData {
             message: format!(
@@ -245,24 +246,10 @@ fn instruction_targets(
 ) -> Result<Vec<usize>, ClassReaderError> {
     use Instruction::*;
     let offsets: Vec<i64> = match instruction {
-        Ifeq(offset)
-        | Ifne(offset)
-        | Iflt(offset)
-        | Ifge(offset)
-        | Ifgt(offset)
-        | Ifle(offset)
-        | IfIcmpeq(offset)
-        | IfIcmpne(offset)
-        | IfIcmplt(offset)
-        | IfIcmpge(offset)
-        | IfIcmpgt(offset)
-        | IfIcmple(offset)
-        | IfAcmpeq(offset)
-        | IfAcmpne(offset)
-        | Ifnull(offset)
-        | Ifnonnull(offset)
-        | Goto(offset)
-        | Jsr(offset) => vec![*offset as i64],
+        Ifeq(offset) | Ifne(offset) | Iflt(offset) | Ifge(offset) | Ifgt(offset) | Ifle(offset)
+        | IfIcmpeq(offset) | IfIcmpne(offset) | IfIcmplt(offset) | IfIcmpge(offset)
+        | IfIcmpgt(offset) | IfIcmple(offset) | IfAcmpeq(offset) | IfAcmpne(offset)
+        | Ifnull(offset) | Ifnonnull(offset) | Goto(offset) | Jsr(offset) => vec![*offset as i64],
         GotoW(offset) | JsrW(offset) => vec![*offset as i64],
         Tableswitch(ts) => std::iter::once(ts.default as i64)
             .chain(ts.offsets.iter().map(|offset| *offset as i64))

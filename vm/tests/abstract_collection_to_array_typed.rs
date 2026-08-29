@@ -147,7 +147,9 @@ fn run_probe(extra_env: &[(&str, &str)]) -> (String, String) {
                 if start.elapsed() > TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("[abstract_collection_to_array_typed] {PROBE} timed out after {TIMEOUT:?}");
+                    panic!(
+                        "[abstract_collection_to_array_typed] {PROBE} timed out after {TIMEOUT:?}"
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }

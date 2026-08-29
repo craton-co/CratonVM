@@ -65,7 +65,9 @@ fn arrays_helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,

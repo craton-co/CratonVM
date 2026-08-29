@@ -59,7 +59,7 @@ use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
 use crate::jboss_msc::{alloc_java_service_name, global_container, Mode, ServiceName};
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ===========================================================================
 // JNDI-name types + allowlist
@@ -526,7 +526,11 @@ const BIND_INFO_NUM_SLOTS: usize = 4;
 /// correctly. The detail message is written through `detailMessage` by name
 /// (real-JDK `Throwable` layout) with a slot-1 fallback for the
 /// synthetic-stub layout.
-fn throw_naming(ctx: &mut dyn NativeContext, exc_class: &str, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn throw_naming(
+    ctx: &mut dyn NativeContext,
+    exc_class: &str,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     // `NamingException` and subclasses extend `Throwable` (message, cause,
     // and JNDI-specific `resolvedName` / `remainingName` / `rootException`
     // / `resolvedObj`). Reserve a generous slot count; the real class load
@@ -539,19 +543,39 @@ fn throw_naming(ctx: &mut dyn NativeContext, exc_class: &str, msg: &str) -> Resu
     Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
-fn throw_name_not_found(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
-    Ok(throw_naming(ctx, "javax/naming/NameNotFoundException", msg)?)
+fn throw_name_not_found(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(
+        ctx,
+        "javax/naming/NameNotFoundException",
+        msg,
+    )?)
 }
 
-fn throw_no_initial_context(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
-    Ok(throw_naming(ctx, "javax/naming/NoInitialContextException", msg)?)
+fn throw_no_initial_context(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(throw_naming(
+        ctx,
+        "javax/naming/NoInitialContextException",
+        msg,
+    )?)
 }
 
-fn throw_naming_exception(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn throw_naming_exception(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     Ok(throw_naming(ctx, "javax/naming/NamingException", msg)?)
 }
 
-fn throw_invalid_name(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn throw_invalid_name(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     Ok(throw_naming(ctx, "javax/naming/InvalidNameException", msg)?)
 }
 
@@ -559,7 +583,10 @@ fn throw_invalid_name(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCa
 /// (`lookup_value`, `bind_value`, …) onto the matching catchable
 /// `javax.naming.*` exception, keying off the message prefix the helper
 /// produced.
-fn flat_store_error(ctx: &mut dyn NativeContext, msg: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn flat_store_error(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     if msg.starts_with("InvalidNameException") {
         throw_invalid_name(ctx, msg)
     } else if msg.starts_with("NameNotFoundException") {
@@ -742,10 +769,12 @@ fn environment_with_property(
                 Value::Object(Some(object)) => Some(object),
                 _ => None,
             })
-            .or_else(|| match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
-                Ok(Some(Value::Object(Some(object)))) => Some(object),
-                _ => None,
-            }),
+            .or_else(
+                || match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
+                    Ok(Some(Value::Object(Some(object)))) => Some(object),
+                    _ => None,
+                },
+            ),
         _ => match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
             Ok(Some(Value::Object(Some(object)))) => Some(object),
             _ => None,
@@ -927,7 +956,12 @@ fn configured_initial_context(
         _ => match incoming {
             Value::Object(Some(env)) => {
                 let key = ctx.create_string("java.naming.factory.initial");
-                match ctx.invoke_virtual(env, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[Value::Object(Some(key))])? {
+                match ctx.invoke_virtual(
+                    env,
+                    "get",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[Value::Object(Some(key))],
+                )? {
                     Some(Value::Object(Some(value))) => ctx.read_string(value),
                     _ => None,
                 }
@@ -935,7 +969,9 @@ fn configured_initial_context(
             _ => None,
         },
     };
-    let Some(factory) = factory.filter(|value| !value.trim().is_empty()) else { return Ok(None); };
+    let Some(factory) = factory.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
     // The native InitialContext constructor does not execute the JDK body that
     // copies system JNDI properties into `myProps`. Give NamingManager the
     // equivalent explicit environment so it can instantiate the configured
@@ -1392,7 +1428,8 @@ fn native_context_create_subcontext(
         return Err(flat_store_error(ctx, &msg)?);
     }
     // Return a fresh synthetic Context so the caller can chain bind().
-    let sub = try_alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS)?;
+    let sub =
+        try_alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS)?;
     Ok(Some(Value::Object(Some(sub))))
 }
 
@@ -1715,9 +1752,12 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, MutexGuard};
 

@@ -1139,8 +1139,14 @@ mod with_cell_ab {
         }
 
         let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
-        println!("with_cell   borrow (new): {new_ns:?}  min={:.2} ns", min(&new_ns));
-        println!("with_cell Arc::clone (old): {old_ns:?}  min={:.2} ns", min(&old_ns));
+        println!(
+            "with_cell   borrow (new): {new_ns:?}  min={:.2} ns",
+            min(&new_ns)
+        );
+        println!(
+            "with_cell Arc::clone (old): {old_ns:?}  min={:.2} ns",
+            min(&old_ns)
+        );
         println!(
             "minima separate by {:.2} ns/call; the native funnel performs TWO \
              transitions per call",
@@ -1191,7 +1197,10 @@ mod tests {
     #[test]
     fn self_edges_are_legal_for_every_state() {
         for state in ThreadExecState::ALL {
-            assert!(is_legal(state, state), "{state} -> {state} must be accepted");
+            assert!(
+                is_legal(state, state),
+                "{state} -> {state} must be accepted"
+            );
         }
     }
 
@@ -1288,7 +1297,10 @@ mod tests {
             S::CompiledUninterruptible.relocation_rule(),
             RelocationRule::Forbidden
         );
-        assert_eq!(S::NativeRunning.relocation_rule(), RelocationRule::Forbidden);
+        assert_eq!(
+            S::NativeRunning.relocation_rule(),
+            RelocationRule::Forbidden
+        );
         assert_eq!(
             S::Terminated.relocation_rule(),
             RelocationRule::PermittedNoRefsHeld
@@ -1322,9 +1334,7 @@ mod tests {
             );
             assert_eq!(current_state(), ThreadExecState::NativeBlocked);
 
-            assert!(
-                try_record_transition(ThreadExecState::JavaRunning, "test::unblock").is_ok()
-            );
+            assert!(try_record_transition(ThreadExecState::JavaRunning, "test::unblock").is_ok());
             assert!(try_record_transition(ThreadExecState::Terminated, "test::die").is_ok());
             assert_eq!(current_state(), ThreadExecState::Terminated);
         })
@@ -1496,10 +1506,8 @@ mod tests {
         let worker = std::thread::spawn(move || {
             bind_current_thread(1002);
             let _ = try_record_transition(ThreadExecState::JavaRunning, "test::reloc-seed");
-            let _ = try_record_transition(
-                ThreadExecState::CompiledUninterruptible,
-                "test::reloc-jit",
-            );
+            let _ =
+                try_record_transition(ThreadExecState::CompiledUninterruptible, "test::reloc-jit");
             ready_tx.send(()).expect("handshake send");
             release_rx.recv().expect("handshake recv");
             let _ = try_record_transition(ThreadExecState::JavaRunning, "test::reloc-leave");

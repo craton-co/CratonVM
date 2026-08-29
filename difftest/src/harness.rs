@@ -53,7 +53,10 @@ impl ModeOutcome {
             // it. A compatible run's census records what a strict run would
             // have rejected — a measurement, not a finding against this run.
             jdk_only_violation: self.mode.is_jdk_only()
-                && self.census.as_ref().is_some_and(StrictCensus::has_violations),
+                && self
+                    .census
+                    .as_ref()
+                    .is_some_and(StrictCensus::has_violations),
         }
     }
 }
@@ -148,9 +151,7 @@ impl ProgramResult {
 
     /// True when at least one of `profile`'s modes disagreed with HotSpot.
     pub fn diverged_in(&self, profile: &str) -> bool {
-        self.modes_in(profile)
-            .iter()
-            .any(|m| !m.verdict.agrees())
+        self.modes_in(profile).iter().any(|m| !m.verdict.agrees())
     }
 
     /// The triage label computed from `profile`'s modes alone, so a strict
@@ -1435,7 +1436,11 @@ mod tests {
 
         let ledger = summary.to_ledger("h".into(), "t".into(), "25".into());
         assert_eq!(ledger.entries.len(), 2);
-        let profiles: Vec<&str> = ledger.entries.iter().map(|e| e.jdk_profile.as_str()).collect();
+        let profiles: Vec<&str> = ledger
+            .entries
+            .iter()
+            .map(|e| e.jdk_profile.as_str())
+            .collect();
         assert_eq!(profiles, vec![PROFILE_COMPATIBLE, PROFILE_JDK_ONLY]);
         // Ids stay unique across rows of the same class.
         assert_ne!(ledger.entries[0].id, ledger.entries[1].id);
@@ -1466,7 +1471,9 @@ mod tests {
         assert_eq!(strict.cratonvm.stdout, "42");
         // The compatible row is brand new and did not inherit the strict row's
         // triage.
-        let compat = merged.find("X", PROFILE_COMPATIBLE).expect("compatible row");
+        let compat = merged
+            .find("X", PROFILE_COMPATIBLE)
+            .expect("compatible row");
         assert_eq!(compat.status, LedgerStatus::New);
         assert_eq!(compat.first_seen, "cap");
         assert!(compat.linked_doc.is_none());
@@ -1513,7 +1520,10 @@ mod tests {
     #[test]
     fn a_violation_that_changed_behaviour_gates_as_the_divergence_it_is() {
         let mut outcome = diverging_outcome(Mode::JdkOnlyJit);
-        outcome.census = Some(census_with(PROFILE_JDK_ONLY, "compatibility-class-requested"));
+        outcome.census = Some(census_with(
+            PROFILE_JDK_ONLY,
+            "compatibility-class-requested",
+        ));
         let summary = summary_of(vec![program_with("X", vec![outcome])]);
         let report = gate(&summary, &Ledger::new("h".into(), "t".into(), "25".into()));
         // It gates once, as a new divergence — not twice.
@@ -1527,9 +1537,16 @@ mod tests {
         // `real-compatible-*` records what a strict run *would* have refused.
         // It must be reported, but it must not classify the run as violating.
         let mut outcome = agreeing_outcome(Mode::RealCompatibleJit);
-        outcome.census = Some(census_with(PROFILE_COMPATIBLE, "compatibility-class-requested"));
+        outcome.census = Some(census_with(
+            PROFILE_COMPATIBLE,
+            "compatibility-class-requested",
+        ));
         let r = program_with("X", vec![outcome]);
-        assert_eq!(r.classification(), None, "a would-be refusal is not a finding");
+        assert_eq!(
+            r.classification(),
+            None,
+            "a would-be refusal is not a finding"
+        );
 
         let report = gate(
             &summary_of(vec![r]),
@@ -1611,7 +1628,10 @@ mod tests {
             Some(Classification::JdkOnlyViolation)
         );
         let rendered = render_summary(&summary_of(vec![r]));
-        assert!(rendered.contains("jdk-only violation(s) recorded"), "{rendered}");
+        assert!(
+            rendered.contains("jdk-only violation(s) recorded"),
+            "{rendered}"
+        );
     }
 
     // -- census-free modes are untouched -------------------------------------
@@ -1642,7 +1662,10 @@ mod tests {
             &summary_of(vec![r]),
             &ledger_with("X", LedgerStatus::Known, "42"),
         );
-        assert_eq!(report.path_splits, vec!["X: nojit≠ir-jit[stdout]".to_string()]);
+        assert_eq!(
+            report.path_splits,
+            vec!["X: nojit≠ir-jit[stdout]".to_string()]
+        );
         assert_eq!(report.exit_code(), 0, "a path split must not move the gate");
         assert!(report.is_clean());
         assert!(render_gate(&report).contains("reported, not gated"));
@@ -1698,7 +1721,11 @@ mod tests {
     fn legacy_modes_carry_no_census_and_no_violation() {
         let r = diverging_program("X");
         for m in &r.modes {
-            assert!(m.census.is_none(), "{} must not collect a census", m.mode.label());
+            assert!(
+                m.census.is_none(),
+                "{} must not collect a census",
+                m.mode.label()
+            );
         }
         assert_eq!(r.profiles(), vec![PROFILE_COMPATIBLE]);
         assert_eq!(r.classification(), Some(Classification::Universal));

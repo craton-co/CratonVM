@@ -130,7 +130,12 @@ fn run_fixture() {
         return;
     };
 
-    let warm = vm.invoke("cratonvm/LambdaJitTierUp", "warmCapturingChecksum", "()I", &[]);
+    let warm = vm.invoke(
+        "cratonvm/LambdaJitTierUp",
+        "warmCapturingChecksum",
+        "()I",
+        &[],
+    );
     assert_eq!(
         warm.ok().flatten(),
         Some(Value::Int(expected_warm_capturing())),
@@ -139,7 +144,12 @@ fn run_fixture() {
          number here rather than a crash"
     );
 
-    let shapes = vm.invoke("cratonvm/LambdaJitTierUp", "captureShapesChecksum", "()I", &[]);
+    let shapes = vm.invoke(
+        "cratonvm/LambdaJitTierUp",
+        "captureShapesChecksum",
+        "()I",
+        &[],
+    );
     assert_eq!(
         shapes.ok().flatten(),
         Some(Value::Int(expected_capture_shapes())),
@@ -147,7 +157,12 @@ fn run_fixture() {
          in `expected_capture_shapes` for which failure each arm names"
     );
 
-    let multi = vm.invoke("cratonvm/LambdaJitTierUp", "multiCaptureChecksum", "()I", &[]);
+    let multi = vm.invoke(
+        "cratonvm/LambdaJitTierUp",
+        "multiCaptureChecksum",
+        "()I",
+        &[],
+    );
     assert_eq!(
         multi.ok().flatten(),
         Some(Value::Int(expected_multi_capture())),

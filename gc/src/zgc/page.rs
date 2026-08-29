@@ -792,12 +792,10 @@ impl ZPageReal {
             if new_top > self.size {
                 return None;
             }
-            match self.top.compare_exchange_weak(
-                cur,
-                new_top,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .top
+                .compare_exchange_weak(cur, new_top, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Some(aligned),
                 Err(actual) => cur = actual,
             }
@@ -1504,7 +1502,11 @@ impl ZPageAllocator {
             return None;
         }
         let n = self.granule_count;
-        let start = if state.scan_hint >= n { 0 } else { state.scan_hint };
+        let start = if state.scan_hint >= n {
+            0
+        } else {
+            state.scan_hint
+        };
 
         // Two passes so the wrap-around is explicit and no run is counted
         // across the seam (a run must be contiguous in index space).
@@ -1802,11 +1804,11 @@ mod tests {
     fn test_config() -> ZPageConfig {
         ZPageConfig {
             granule_size: 4096,
-            small_page_size: 8192,               // 2 granules
-            medium_page_size: 65536,             // 16 granules
-            small_object_limit: 8192 / 8,        // 1 KiB
-            medium_object_limit: 65536 / 8,      // 8 KiB
-            max_capacity: 4096 * 64,             // 256 KiB
+            small_page_size: 8192,          // 2 granules
+            medium_page_size: 65536,        // 16 granules
+            small_object_limit: 8192 / 8,   // 1 KiB
+            medium_object_limit: 65536 / 8, // 8 KiB
+            max_capacity: 4096 * 64,        // 256 KiB
         }
     }
 
@@ -1844,9 +1846,15 @@ mod tests {
         // its tier, limit + 1 is the first object of the next one.
         assert_eq!(c.class_for(1), ZPageSizeClass::Small);
         assert_eq!(c.class_for(c.small_object_limit), ZPageSizeClass::Small);
-        assert_eq!(c.class_for(c.small_object_limit + 1), ZPageSizeClass::Medium);
+        assert_eq!(
+            c.class_for(c.small_object_limit + 1),
+            ZPageSizeClass::Medium
+        );
         assert_eq!(c.class_for(c.medium_object_limit), ZPageSizeClass::Medium);
-        assert_eq!(c.class_for(c.medium_object_limit + 1), ZPageSizeClass::Large);
+        assert_eq!(
+            c.class_for(c.medium_object_limit + 1),
+            ZPageSizeClass::Large
+        );
         assert_eq!(c.class_for(usize::MAX / 2), ZPageSizeClass::Large);
 
         // Large page sizes round up to a whole granule.
@@ -1885,7 +1893,10 @@ mod tests {
         let mut last = page.base();
         let mut count = 0usize;
         while let Some(addr) = page.alloc(chunk, 8) {
-            assert!(page.contains(addr), "handed out an address outside the page");
+            assert!(
+                page.contains(addr),
+                "handed out an address outside the page"
+            );
             assert_eq!(addr % 8, 0, "allocations must stay on the object grid");
             if count > 0 {
                 assert_eq!(addr - last, chunk, "bump allocation must be dense");
@@ -2021,7 +2032,11 @@ mod tests {
         assert_eq!(again.base(), base);
         assert_eq!(again.state(), ZPageState::Allocating);
         assert_eq!(alloc.stats().cached, 0);
-        assert_eq!(alloc.stats().small_pages, 1, "recycling must not double-count");
+        assert_eq!(
+            alloc.stats().small_pages,
+            1,
+            "recycling must not double-count"
+        );
     }
 
     #[test]
@@ -2183,7 +2198,10 @@ mod tests {
         assert_eq!(empty.used, 0);
         assert_eq!(empty.free, 262144);
         assert_eq!(empty.free_granules, 64);
-        assert_eq!(empty.small_pages + empty.medium_pages + empty.large_pages, 0);
+        assert_eq!(
+            empty.small_pages + empty.medium_pages + empty.large_pages,
+            0
+        );
 
         let small = alloc.alloc_page(ZPageSizeClass::Small, 0).unwrap();
         assert!(small.alloc(1024, 8).is_some());

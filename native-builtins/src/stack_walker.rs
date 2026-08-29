@@ -69,7 +69,8 @@ fn alloc_walker(
     estimate_depth: i32,
     retain_class_ref: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let walker = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT)?;
+    let walker =
+        try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT)?;
     // Real-JDK field declaration order is:
     //   continuation, contScope, options, extendedOption, estimateDepth, retainClassRef
     // Our synthetic-mode hard-coded indices (FIELD_OPTIONS=0,
@@ -126,7 +127,10 @@ pub(crate) fn native_get_instance_default(
 /// Helper: allocate a real `java.util.HashSet` and add each provided option
 /// reference to it. Used by every `getInstance(...)` variant so the stored
 /// option set is queryable via standard `Set.contains` without NPE.
-fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_options_set(
+    ctx: &mut dyn NativeContext,
+    opts: &[ObjectRef],
+) -> Result<ObjectRef, MethodCallFailed> {
     let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0)?;
     let _ = ctx.invoke(
         "java/util/HashSet",
@@ -567,10 +571,13 @@ pub(crate) fn native_check_stack_walk_modes(
 
 #[cfg(test)]
 mod check_modes_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn validate_accepts_default() {
@@ -618,10 +625,13 @@ mod check_modes_tests {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn get_instance_default_returns_non_null_walker() {
@@ -760,10 +770,9 @@ mod tests {
         // name→slot table that puts `name` and `ordinal` wherever it likes,
         // and the assertions below would be measuring the mock rather than
         // the native.
-        for (slot_index, (name, descriptor)) in
-            [("name", "Ljava/lang/String;"), ("ordinal", "I")]
-                .into_iter()
-                .enumerate()
+        for (slot_index, (name, descriptor)) in [("name", "Ljava/lang/String;"), ("ordinal", "I")]
+            .into_iter()
+            .enumerate()
         {
             fields.push(FieldMetadata {
                 name: name.to_string(),
@@ -872,7 +881,8 @@ mod tests {
     #[test]
     fn get_instance_one_option_sets_retain_flag() {
         let mut ctx = MockNativeContext::new();
-        let option = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1).unwrap();
+        let option =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1).unwrap();
         let args = [Value::Object(Some(option))];
         let result = native_get_instance_one_option(&mut ctx, &args)
             .unwrap()

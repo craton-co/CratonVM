@@ -6,7 +6,10 @@
 mod common;
 
 #[allow(unused_imports)]
-use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+use cratonvm_native_api::{
+    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+};
 
 use common::{
     boxed_int, build_registry, call, new_arraylist, new_concurrent_hashmap, new_hashmap,
@@ -42,16 +45,12 @@ fn generic_snapshot_iterator_roots_array_and_shell_across_allocation() {
     ctx.set_array_element(snapshot, 1, e2);
 
     ctx.set_relocate_pins_on_alloc(true);
-    let iterator = match cratonvm_native_collections::make_iterator_from_array(
-        &mut ctx,
-        snapshot,
-        2,
-    )
-    .unwrap()
-    {
-        Some(Value::Object(Some(iterator))) => iterator,
-        other => panic!("expected snapshot iterator, got {other:?}"),
-    };
+    let iterator =
+        match cratonvm_native_collections::make_iterator_from_array(&mut ctx, snapshot, 2).unwrap()
+        {
+            Some(Value::Object(Some(iterator))) => iterator,
+            other => panic!("expected snapshot iterator, got {other:?}"),
+        };
     ctx.set_relocate_pins_on_alloc(false);
 
     let forwarded_snapshot = match ctx.get_field(iterator, 0) {
@@ -301,7 +300,8 @@ fn unmodifiable_wrapper_roots_backing_and_wrapper_across_allocation() {
     ctx.set_relocate_pins_on_alloc(false);
 
     assert_eq!(
-        ctx.class_name_arc_of_id(ctx.class_id_of_object(wrapper)).as_deref(),
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(wrapper))
+            .as_deref(),
         Some(UNMOD_COLLECTION)
     );
     let forwarded_backing = match ctx.get_field(wrapper, 0) {

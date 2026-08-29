@@ -19,7 +19,7 @@ use cratonvm_types::ArrayElementType;
 use cratonvm_types::ObjectRef;
 use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Calendar math helpers
@@ -1328,7 +1328,10 @@ fn real_hashtable_enumerator_pinned(
     // synthetic-JDK shape, and the caller has a landing for it. Discard the
     // failure rather than surfacing it at the application's `keys()` call site,
     // which is the mistake the fabricated carrier made in the other direction.
-    if ctx.ensure_class_initialized(HASHTABLE_ENUMERATOR_CLASS).is_err() {
+    if ctx
+        .ensure_class_initialized(HASHTABLE_ENUMERATOR_CLASS)
+        .is_err()
+    {
         return Ok((None, ctx.read_native_pin(pin, this)));
     }
     if ctx.is_class_synthetic_stub(HASHTABLE_ENUMERATOR_CLASS)
@@ -2319,10 +2322,13 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn call_native(
         registry: &NativeMethodRegistry,
@@ -3233,7 +3239,8 @@ mod tests {
     fn test_sbis_read_sequential() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("AB");
 
         call_native(
@@ -3283,7 +3290,8 @@ mod tests {
     fn test_sbis_available_and_reset() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("XYZ");
 
         call_native(
@@ -3354,7 +3362,8 @@ mod tests {
     fn test_sbis_bulk_read() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("Hello");
         let buf = ctx.new_array(ArrayElementType::Byte, 5);
 
@@ -3400,7 +3409,8 @@ mod tests {
         data: &str,
     ) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
         // We use a StringBufferInputStream as the underlying stream.
-        let sbis = try_alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let sbis =
+            try_alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string(data);
         call_native(
             reg,
@@ -3430,7 +3440,8 @@ mod tests {
     fn test_lnis_get_set_line_number() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
 
         call_native(
@@ -3505,7 +3516,8 @@ mod tests {
     fn test_lnis_set_line_number_roundtrip() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
         call_native(
             &reg,
@@ -3542,7 +3554,8 @@ mod tests {
         // Manually set line number and saved line number fields, then call reset.
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
         call_native(
             &reg,

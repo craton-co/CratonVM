@@ -74,9 +74,9 @@ use cratonvm_types::{ObjectRef, Value};
 // `parking_lot::RwLock` — removes poison handling (which the file already
 // drained with `unwrap_or_else(into_inner)`) and matches the doc comment that
 // already claimed parking-lot semantics.
+use cratonvm_types::error::MethodCallFailed;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use cratonvm_types::error::MethodCallFailed;
 
 // ---------------------------------------------------------------------------
 // OS entropy helpers
@@ -510,14 +510,10 @@ pub(crate) fn native_random_next_bytes(
         // normally, which `RJdkIntrinsics2 --only=random` check 41 reports as
         // "got none". Message measured on OpenJDK 25.0.3+9.
         Some(Value::Object(None)) => {
-            return Err(
-                cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some(
-                        "Cannot read the array length because \"bytes\" is null".to_string(),
-                    ),
-                }
-                .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Cannot read the array length because \"bytes\" is null".to_string()),
+            }
+            .into());
         }
         // A missing or non-reference argument is an arity/marshalling bug, not
         // a Java null — keep the defensive return rather than reporting an NPE
@@ -650,7 +646,10 @@ fn rnd_gaussian_pair(next: &mut dyn FnMut(u32) -> i32) -> Option<(f64, f64)> {
 /// instance this module hands out. `regression-suite/src/RJdkSecurity.java:136`
 /// asserts `sr.getProvider() != null` and failed in BOTH `--real-jdk` and
 /// `--jdk-only`. Attach the owning `Provider` here as well.
-fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
+fn secure_random_record_algorithm(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), MethodCallFailed> {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(());
     };
@@ -692,8 +691,9 @@ fn secure_random_static_provider(algo: &str) -> Option<&'static str> {
         // `NativePRNG` family is registered by SUN on Unix only; accepting it
         // on every host is strictly closer to HotSpot than refusing a name
         // that is valid on the platform half the corpus runs on.
-        "DRBG" | "SHA1PRNG" | "NATIVEPRNG" | "NATIVEPRNGBLOCKING"
-        | "NATIVEPRNGNONBLOCKING" => Some("SUN"),
+        "DRBG" | "SHA1PRNG" | "NATIVEPRNG" | "NATIVEPRNGBLOCKING" | "NATIVEPRNGNONBLOCKING" => {
+            Some("SUN")
+        }
         // SunMSCAPI — Windows only.
         "WINDOWSPRNG" => Some("SunMSCAPI"),
         // Our own name, stamped by the constructors and `getInstanceStrong()`.
@@ -1302,12 +1302,10 @@ pub(crate) fn native_secure_random_next_bytes(
         // (`SecureRandom.java:774`), so the message is genuinely null here and
         // `message: None` is the faithful answer, not a shortcut.
         Some(Value::Object(None)) => {
-            return Err(
-                cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: None,
-                }
-                .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into());
         }
         _ => return Ok(None),
     };
@@ -1581,7 +1579,10 @@ pub(crate) fn native_secure_random_generate_seed(
 /// The String is created and pinned *before* the object allocation so a moving
 /// GC during `alloc_concurrent_synthetic` cannot leave us writing through a
 /// stale reference.
-fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn make_secure_random(
+    ctx: &mut dyn NativeContext,
+    algorithm: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let algo_str = ctx.create_string(algorithm);
     let pin = ctx.pin_native_root(algo_str);
     let sr = crate::try_alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4)?;
@@ -1612,12 +1613,10 @@ pub(crate) fn native_secure_random_get_instance(
     let algo = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         Some(Value::Object(None)) | None => {
-            return Err(
-                cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some("null algorithm name".to_string()),
-                }
-                .into(),
-            );
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("null algorithm name".to_string()),
+            }
+            .into());
         }
         _ => String::new(),
     };
@@ -1664,12 +1663,10 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
     // delegates to is the whole fix: that body is reached only AFTER both
     // provider checks have already had their chance to throw.
     if matches!(args.first(), Some(Value::Object(None)) | None) {
-        return Err(
-            cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("null algorithm name".to_string()),
-            }
-            .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("null algorithm name".to_string()),
+        }
+        .into());
     }
     // The provider argument is otherwise discarded (every algorithm here is
     // served by the OS CSPRNG regardless), but real JDK does resolve the named
@@ -1839,9 +1836,12 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// JDK reference values for `new Random(42).nextLong()` followed by
     /// `nextLong()` again.  These were produced by running `OpenJDK

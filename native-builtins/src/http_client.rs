@@ -47,7 +47,7 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // We read HPACK static-table indices and the RFC 7541 Huffman decoder from
 // `http2.rs` so we can speak HTTP/2 against servers that prefer it after ALPN.
@@ -1448,7 +1448,8 @@ fn do_send(
     }?;
     // If a BodyHandler was supplied, deliver the body via apply(ResponseInfo).
     if let Some(Value::Object(Some(handler))) = body_handler {
-        let info = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$ResponseInfo", 3)?;
+        let info =
+            try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$ResponseInfo", 3)?;
         ctx.set_field(info, 0, ctx.get_field(resp_obj, HRS_STATUS));
         ctx.set_field(info, 1, ctx.get_field(resp_obj, HRS_HEADERS_ARR));
         ctx.set_field(info, 2, ctx.get_field(resp_obj, HRS_VERSION));
@@ -1687,7 +1688,10 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
             // `alloc_response` writes an `Int` there. The descriptor says
             // `HttpClient$Version`, so this returned a primitive where the
             // caller's bytecode `areturn`s / `checkcast`s a reference.
-            let stored = ctx.get_field(this, HRS_VERSION).as_int().unwrap_or(HTTP_VERSION_2);
+            let stored = ctx
+                .get_field(this, HRS_VERSION)
+                .as_int()
+                .unwrap_or(HTTP_VERSION_2);
             Ok(Some(http_version_mirror(ctx, stored)))
         },
     );
@@ -2125,9 +2129,12 @@ pub fn register_http_client_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod http_client_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn test_register_http_client_impl_init() {

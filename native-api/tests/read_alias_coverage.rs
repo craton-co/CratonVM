@@ -274,7 +274,8 @@ fn there_is_exactly_one_read_side_detector() {
     {
         for file in rust_sources(&root.join(crate_dir).join("src")) {
             let src = strip_comments(&fs::read_to_string(&file).unwrap_or_default());
-            if src.contains("direction = \"wrong-field\"") || src.contains("direction = \"absent-slot\"")
+            if src.contains("direction = \"wrong-field\"")
+                || src.contains("direction = \"absent-slot\"")
             {
                 owners.push(
                     file.strip_prefix(&root)
@@ -483,7 +484,7 @@ fn the_calibration_site_is_still_observed_before_its_own_read() {
         .map(|(idx, _)| idx)
         .unwrap_or_else(|| {
             panic!(
-            "`bb_resolve_heap_array` no longer observes the read-side alias.\n\
+                "`bb_resolve_heap_array` no longer observes the read-side alias.\n\
              That call is the instrument's calibration point: slot 0 of a real \
              java.nio.DirectByteBuffer is `java.nio.Buffer.mark`, not the backing \
              array `hb` (which is 6). The read is IN BOUNDS, so nothing else in this \
@@ -493,8 +494,8 @@ fn the_calibration_site_is_still_observed_before_its_own_read() {
              It is observation-only and costs one OnceLock load when the flag is off; \
              if it is in the way, move it, do not drop it.\n\
              See W7-69-read-side-alias-instrument.md."
-        )
-    });
+            )
+        });
     let final_read = body
         .rfind("get_field(this, BB_FIELD_ARRAY)")
         .expect("`bb_resolve_heap_array` no longer reads BB_FIELD_ARRAY — re-check this gate");
@@ -590,7 +591,10 @@ fn the_gate_matchers_accept_paths_without_going_blind() {
         find_enabled_gate("if some_other::enabled() {").is_none(),
         "a different predicate is not this gate"
     );
-    assert!(find_enabled_gate("").is_none(), "an empty window has no gate");
+    assert!(
+        find_enabled_gate("").is_none(),
+        "an empty window has no gate"
+    );
 
     // --- published_slot_map_idents: accepts both spellings ---
     let found = published_slot_map_idents(
@@ -787,9 +791,11 @@ fn the_post_main_sweep_runs_after_the_workload() {
     let src = strip_comments(&read("vm-cli/src/main.rs"));
     let body = fn_body(&src, "run")
         .expect("vm-cli/src/main.rs no longer defines `fn run()` — the launcher moved");
-    let sweep = body.find("vm.sweep_declared_slot_maps(").unwrap_or_else(|| {
-        panic!(
-            "`vm-cli`'s `run()` no longer sweeps the declared slot maps after `main` \
+    let sweep = body
+        .find("vm.sweep_declared_slot_maps(")
+        .unwrap_or_else(|| {
+            panic!(
+                "`vm-cli`'s `run()` no longer sweeps the declared slot maps after `main` \
              returns.\n\
              That call is the read-side census's primary trigger. Without it the seven \
              published `SlotMap`s are swept only on the `System.exit` paths, and a \
@@ -799,8 +805,8 @@ fn the_post_main_sweep_runs_after_the_workload() {
              and costs one OnceLock load and a branch once per process when the flag is \
              off. If it is in the way, move it, do not drop it.\n\
              See W7-90-slot-map-sweep-caller.md."
-        )
-    });
+            )
+        });
     let main_invoke = body
         .rfind("\"main\",")
         .expect("`run()` no longer invokes a method literally named `main` — re-check this gate");
@@ -918,19 +924,27 @@ fn the_surefire_exit_paths_sweep_before_they_terminate() {
             "native_surefire_forkedbooter_acknowledged_exit",
             "\"ForkedBooter.acknowledgedExit\"",
         ),
-        ("native_surefire_forkedbooter_exit1", "\"ForkedBooter.exit1\""),
-        ("native_surefire_forkedbooter_exit_code", "\"ForkedBooter.exit\""),
+        (
+            "native_surefire_forkedbooter_exit1",
+            "\"ForkedBooter.exit1\"",
+        ),
+        (
+            "native_surefire_forkedbooter_exit_code",
+            "\"ForkedBooter.exit\"",
+        ),
     ] {
-        let b = fn_body(&src, body)
-            .unwrap_or_else(|| panic!("{body} not found in test_frameworks.rs"));
-        let sweep = b.find("sweep_declared_slot_maps_before_exit(").unwrap_or_else(|| {
-            panic!(
-                "{body} terminates the process with std::process::exit and never \
+        let b =
+            fn_body(&src, body).unwrap_or_else(|| panic!("{body} not found in test_frameworks.rs"));
+        let sweep = b
+            .find("sweep_declared_slot_maps_before_exit(")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{body} terminates the process with std::process::exit and never \
                  sweeps. A Surefire fork skips the launcher trigger AND the three \
                  lang_system natives, so the declared slot-map sweep prints nothing \
                  on exactly the fixtures W7-90 section 2.2 was written for."
-            )
-        });
+                )
+            });
         assert!(
             b[sweep..].contains(label),
             "{body}'s sweep call must carry its own trigger label {label:?}; three \
@@ -981,7 +995,9 @@ fn census() {
                     // that is a slot map asserting itself, as opposed to an index
                     // resolved by name at run time.
                     let args = &src[idx + accessor.len()..];
-                    let Some(comma) = args.find(',') else { continue };
+                    let Some(comma) = args.find(',') else {
+                        continue;
+                    };
                     let second: String = args[comma + 1..]
                         .trim_start()
                         .chars()
@@ -1011,7 +1027,10 @@ fn census() {
     for (name, t, o) in &per_crate {
         println!("  {name:28} constant-slot {t:6}   observed {o:4}");
     }
-    println!("  {:28} constant-slot {total:6}   observed {observed:4}", "TOTAL");
+    println!(
+        "  {:28} constant-slot {total:6}   observed {observed:4}",
+        "TOTAL"
+    );
     println!(
         "  the gap is the honest remainder: reads whose expected field name exists only \
          in a `const F_x: usize = k` identifier and a comment. See \

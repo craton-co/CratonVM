@@ -636,7 +636,8 @@ fn real_fjp_path() {
     // cause; a swallowed failure would silently report a half-built
     // container as a successful CDI deployment.
     assert!(
-        run.stdout.contains("r:invokeAllFailure=IllegalStateException"),
+        run.stdout
+            .contains("r:invokeAllFailure=IllegalStateException"),
         "a throwing callable did not surface as ExecutionException(cause) \
          from Future.get().\nstdout:\n{}",
         run.stdout,

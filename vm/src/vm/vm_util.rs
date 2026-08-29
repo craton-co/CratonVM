@@ -30,13 +30,13 @@
 //! escalation gate is still honoured where present, but it is now a no-op for
 //! the swallow path because swallowing no longer happens by default.
 
-use std::sync::Arc;
 use crate::classloading::{find_field_recursive, Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::ObjectRef;
+use std::sync::Arc;
 
 use super::SharedVm;
 
@@ -51,10 +51,12 @@ use super::SharedVm;
 fn lenient_clinit() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT") {
-        Ok(v) => v == "1",
-        Err(_) => false,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT") {
+            Ok(v) => v == "1",
+            Err(_) => false,
+        },
+    )
 }
 
 /// Whether a swallowed `<clinit>` failure for `class_name` has a *documented,
@@ -385,12 +387,20 @@ fn clinit_order_trace(shared: &SharedVm, thread: &JvmThread, class_id: ClassId, 
             .map(|f| format!("{}.{}@{}", f.class_name(), f.method_name(), f.last_instr_pc))
             .collect();
         let from = format!("depth={} [{}]", thread.frames.len(), top.join(" <- "));
-        eprintln!("[clinit-order] {:width$}> {name}   from {from}", "", width = d * 2);
+        eprintln!(
+            "[clinit-order] {:width$}> {name}   from {from}",
+            "",
+            width = d * 2
+        );
         DEPTH.with(|x| x.set(d + 1));
     } else {
         let nd = d.saturating_sub(1);
         DEPTH.with(|x| x.set(nd));
-        eprintln!("[clinit-order] {:width$}< {name} {phase}", "", width = nd * 2);
+        eprintln!(
+            "[clinit-order] {:width$}< {name} {phase}",
+            "",
+            width = nd * 2
+        );
     }
 }
 
@@ -698,7 +708,12 @@ pub fn ensure_class_initialized_shared(
                     }
                     clinit_order_trace(shared, thread, class_id, "claim");
                     let r = initialize_class_shared(shared, thread, class_id);
-                    clinit_order_trace(shared, thread, class_id, if r.is_ok() { "done" } else { "FAIL" });
+                    clinit_order_trace(
+                        shared,
+                        thread,
+                        class_id,
+                        if r.is_ok() { "done" } else { "FAIL" },
+                    );
                     return r;
                 }
                 // Another thread claimed it вЂ” loop back to wait
@@ -1852,8 +1867,7 @@ fn initialize_class_shared(
                         let exc_class_id = shared.mem.heap.class_id_of(*exc_ref);
                         let is_error = {
                             let cm = shared.classes.class_manager.read();
-                            let error_id =
-                                cm.find_bootstrap_class_by_name("java/lang/Error");
+                            let error_id = cm.find_bootstrap_class_by_name("java/lang/Error");
                             match error_id {
                                 Some(eid) => cm.is_subclass_of(exc_class_id, eid),
                                 None => false,
@@ -1987,30 +2001,31 @@ fn initialize_class_shared(
                                     // so real slot 0 is `backtrace` and the message
                                     // lives at slot 1. Reading slot 0 as the message
                                     // against real bytes is a silent wrong-field read.
-                                    let field_idx_of = |obj: crate::types::ObjectRef,
-                                                        want: &'static str|
-                                     -> Option<usize> {
-                                        let mut walk = Some(shared.mem.heap.class_id_of(obj));
-                                        while let Some(k) = walk {
-                                            if let Some(cls) = cm.get_class(k) {
-                                                let mut inst = 0usize;
-                                                for f in &cls.fields {
-                                                    if !f.is_static() {
-                                                        if &*f.name == want {
-                                                            return Some(
-                                                                cls.first_field_index + inst,
-                                                            );
+                                    let field_idx_of =
+                                        |obj: crate::types::ObjectRef,
+                                         want: &'static str|
+                                         -> Option<usize> {
+                                            let mut walk = Some(shared.mem.heap.class_id_of(obj));
+                                            while let Some(k) = walk {
+                                                if let Some(cls) = cm.get_class(k) {
+                                                    let mut inst = 0usize;
+                                                    for f in &cls.fields {
+                                                        if !f.is_static() {
+                                                            if &*f.name == want {
+                                                                return Some(
+                                                                    cls.first_field_index + inst,
+                                                                );
+                                                            }
+                                                            inst += 1;
                                                         }
-                                                        inst += 1;
                                                     }
+                                                    walk = cls.superclass;
+                                                } else {
+                                                    break;
                                                 }
-                                                walk = cls.superclass;
-                                            } else {
-                                                break;
                                             }
-                                        }
-                                        None
-                                    };
+                                            None
+                                        };
                                     let mut cur = *exc_ref;
                                     for depth in 0..4 {
                                         let Some(ci) = field_idx_of(cur, "cause") else {
@@ -5084,13 +5099,19 @@ mod post_clinit_fixup_typing_tests {
         // `UnsafeConstants.BIG_ENDIAN` (Z) all share this arm.
         for d in ["I", "S", "B", "C", "Z"] {
             assert!(
-                matches!(coerce_static_to_descriptor(d, Value::Int(4)), Some(Value::Int(4))),
+                matches!(
+                    coerce_static_to_descriptor(d, Value::Int(4)),
+                    Some(Value::Int(4))
+                ),
                 "descriptor {d}"
             );
             // A long-typed literal narrows rather than being refused: the call
             // sites are integer constants, not user input.
             assert!(
-                matches!(coerce_static_to_descriptor(d, Value::Long(4)), Some(Value::Int(4))),
+                matches!(
+                    coerce_static_to_descriptor(d, Value::Long(4)),
+                    Some(Value::Int(4))
+                ),
                 "descriptor {d}"
             );
         }
@@ -5124,9 +5145,16 @@ mod post_clinit_fixup_typing_tests {
     fn wide_static_slots_default_to_their_descriptor_width_not_int_zero() {
         let descriptors = ["J", "I", "D", "F", "Ljava/lang/Object;", "[B", "Z"];
         let slots = typed_default_static_slots(&descriptors, descriptors.len());
-        assert!(matches!(slots[0], Value::Long(0)), "J must be Long, got {:?}", slots[0]);
+        assert!(
+            matches!(slots[0], Value::Long(0)),
+            "J must be Long, got {:?}",
+            slots[0]
+        );
         assert!(matches!(slots[1], Value::Int(0)));
-        assert!(matches!(slots[2], Value::Double(d) if d == 0.0), "D must be Double");
+        assert!(
+            matches!(slots[2], Value::Double(d) if d == 0.0),
+            "D must be Double"
+        );
         assert!(matches!(slots[3], Value::Float(f) if f == 0.0));
         assert!(matches!(slots[4], Value::Object(None)));
         assert!(matches!(slots[5], Value::Object(None)));

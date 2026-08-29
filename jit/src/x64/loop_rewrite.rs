@@ -577,7 +577,10 @@ pub(super) fn plan_bytecode_loop_xform(
 /// through the one replication function. That is the point: replicating some
 /// tables and not others compiles fine and silently produces a loop copy
 /// missing a field resolution or an inline cache.
-pub(super) fn replicate_pc3<A: Clone, B: Clone>(x: &LoopXform, t: Vec<(usize, A, B)>) -> Vec<(usize, A, B)> {
+pub(super) fn replicate_pc3<A: Clone, B: Clone>(
+    x: &LoopXform,
+    t: Vec<(usize, A, B)>,
+) -> Vec<(usize, A, B)> {
     let packed: Vec<(usize, (A, B))> = t.into_iter().map(|(pc, a, b)| (pc, (a, b))).collect();
     x.replicate_pc_keyed(&packed)
         .into_iter()
@@ -823,31 +826,29 @@ pub(super) fn rewritten_deopt_points_are_publishable(
         // pcs — see point 4 of the doc comment for why the other two shapes are
         // an ordinary compile's and not this rewrite's.
         match first_at.get(&(p.bci, p.reason)) {
-            Some(&j) if emitter_pcs[j] != pc => {
-                match deopt_point_difference(&points[j], p) {
-                    Some(PointDifference::Fatal(how)) => {
-                        return Err(format!(
-                            "two copies of bci {} published disagreeing {:?} points \
+            Some(&j) if emitter_pcs[j] != pc => match deopt_point_difference(&points[j], p) {
+                Some(PointDifference::Fatal(how)) => {
+                    return Err(format!(
+                        "two copies of bci {} published disagreeing {:?} points \
                              (output pcs {} and {pc}): {how}; a bci-keyed consumer \
                              takes that field on trust and would pick one arbitrarily",
-                            p.bci, p.reason, emitter_pcs[j]
-                        ));
-                    }
-                    Some(PointDifference::Divergent(how)) => {
-                        crate::metrics::record_loop_xform_event("loop_xform_deopt_frames_diverge");
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
-                            eprintln!(
-                                "[JIT_GEN] loop-rewrite copies of bci {} diverge at \
+                        p.bci, p.reason, emitter_pcs[j]
+                    ));
+                }
+                Some(PointDifference::Divergent(how)) => {
+                    crate::metrics::record_loop_xform_event("loop_xform_deopt_frames_diverge");
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                        eprintln!(
+                            "[JIT_GEN] loop-rewrite copies of bci {} diverge at \
                                  output pcs {} and {pc}: {how} — the OSR entry \
                                  contract re-validates this, so it is reported, not \
                                  refused",
-                                p.bci, emitter_pcs[j]
-                            );
-                        }
+                            p.bci, emitter_pcs[j]
+                        );
                     }
-                    None => {}
                 }
-            }
+                None => {}
+            },
             Some(_) => {}
             None => {
                 first_at.insert((p.bci, p.reason), i);

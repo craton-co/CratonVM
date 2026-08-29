@@ -488,12 +488,7 @@ fn windows_host_locale() -> Option<HostLocale> {
     extern "system" {
         fn GetUserDefaultLocaleName(lp_locale_name: *mut u16, cch_locale_name: i32) -> i32;
         fn GetUserDefaultUILanguage() -> u16;
-        fn LCIDToLocaleName(
-            locale: u32,
-            lp_name: *mut u16,
-            cch_name: i32,
-            dw_flags: u32,
-        ) -> i32;
+        fn LCIDToLocaleName(locale: u32, lp_name: *mut u16, cch_name: i32, dw_flags: u32) -> i32;
     }
 
     /// Trim the trailing NUL the Win32 `*LocaleName` calls include in their
@@ -573,7 +568,6 @@ fn fill_i18n_props(
         sys_props.insert(format!("{base}.format"), format.to_string());
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // SharedVm — thread-safe shared state
@@ -3183,8 +3177,12 @@ impl SharedVm {
                         };
                         let target_pin = ctx.pin_native_root(target);
                         let cur_this = ctx.read_native_pin(pin_base, this);
-                        let it_v =
-                            ctx.invoke_virtual(cur_this, "iterator", "()Ljava/util/Iterator;", &[])?;
+                        let it_v = ctx.invoke_virtual(
+                            cur_this,
+                            "iterator",
+                            "()Ljava/util/Iterator;",
+                            &[],
+                        )?;
                         let it = match it_v {
                             Some(Value::Object(Some(o))) => o,
                             _ => {
@@ -4577,7 +4575,11 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // With one VM registered (the normal case) this is the same single
     // invalidation the pre-registry code performed.
     for shared in live_hook_vms() {
-        shared.classes.resolution_cache.write().invalidate_class(cid);
+        shared
+            .classes
+            .resolution_cache
+            .write()
+            .invalidate_class(cid);
         // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
         // was missing from the redefine-invalidation cascade. Without
         // this, any cached `(class, name, descriptor)` triple resolved
@@ -5366,8 +5368,7 @@ impl SharedVm {
                     let declaring = cm
                         .get_loaded_class_id(&row.class)
                         .and_then(|id| cm.get_class(id));
-                    let method =
-                        declaring.and_then(|c| c.find_method(&row.name, &row.descriptor));
+                    let method = declaring.and_then(|c| c.find_method(&row.name, &row.descriptor));
                     out.push_str("      \"real_declaring_method\": {");
                     out.push_str(&format!(
                         "\"loaded\": {}, \"declared\": {}, \"acc_native\": {}, \"has_code\": {}",
@@ -6260,7 +6261,10 @@ impl SharedVm {
             }
         }
         if let Some(path) = report {
-            if self.dump_jdk_only_report_json_with(path, verbose, cm).is_ok() {
+            if self
+                .dump_jdk_only_report_json_with(path, verbose, cm)
+                .is_ok()
+            {
                 wrote = true;
             }
         }
@@ -6988,8 +6992,12 @@ pub(crate) fn fold_origin_buckets(rows: &[ClassOriginEntry]) -> OriginBuckets {
         match row.origin.as_str() {
             "boot-image" => buckets.boot_image += 1,
             "application-class-path" | "user-defined" => buckets.application += 1,
-            "vm-array" | "hidden-class" | "generated-lambda" | "generated-proxy"
-            | "reflection-accessor" | "vm-internal" => buckets.generated += 1,
+            "vm-array"
+            | "hidden-class"
+            | "generated-lambda"
+            | "generated-proxy"
+            | "reflection-accessor"
+            | "vm-internal" => buckets.generated += 1,
             "compatibility-stub" => buckets.compatibility += 1,
             // An unknown tag means the origin vocabulary grew. Count it as
             // generated rather than dropping it: an unclassified class must
@@ -7037,7 +7045,10 @@ pub(crate) fn render_class_origins_json(rows: &mut [ClassOriginEntry], verbose: 
             "      \"name\": {},\n",
             json_string(&row.name, verbose)
         ));
-        out.push_str(&format!("      \"origin\": {},\n", json_escape(&row.origin)));
+        out.push_str(&format!(
+            "      \"origin\": {},\n",
+            json_escape(&row.origin)
+        ));
         out.push_str(&format!(
             "      \"reason\": {},\n",
             json_opt_string(row.reason.as_deref(), verbose)
@@ -10575,7 +10586,10 @@ mod tests {
         let text = render_class_origins_json(&mut rows, false);
 
         // Sorted by (name, loader_id, origin).
-        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
         assert!(at("\"[I\"") < at("\"com/example/Main\""));
         assert!(at("\"com/example/Main\"") < at("\"java/lang/String\""));
         assert!(at("\"java/lang/String\"") < at("\"org/jboss/logging/Logger\""));
@@ -10608,7 +10622,10 @@ mod tests {
     /// Compatible mode must stay byte-for-byte HotSpot's value (§10).
     #[test]
     fn vm_info_mode_list_spells_the_policy_once() {
-        assert_eq!(vm_info_mode_list(CompatibilityMode::Compatible), "mixed mode");
+        assert_eq!(
+            vm_info_mode_list(CompatibilityMode::Compatible),
+            "mixed mode"
+        );
         assert_eq!(
             vm_info_mode_list(CompatibilityMode::JdkOnly),
             "mixed mode, jdk-only"
@@ -11048,7 +11065,8 @@ mod tests {
             .classes
             .class_manager
             .write()
-            .try_ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            .try_ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let object_id = shared
             .classes
             .class_manager
@@ -15001,7 +15019,10 @@ mod tests {
         let aqs = cm
             .get_class(aqs_id)
             .expect("class should exist in class store");
-        assert!(!aqs.origin.is_compatibility_stub(), "AQS should be real bytecode");
+        assert!(
+            !aqs.origin.is_compatibility_stub(),
+            "AQS should be real bytecode"
+        );
 
         // AQS should have key methods
         let method_names: Vec<&str> = aqs.methods.iter().map(|m| m.name.as_ref()).collect();
@@ -15395,7 +15416,10 @@ mod tests {
         let sem = cm
             .get_class(sem_id)
             .expect("class should exist in class store");
-        assert!(!sem.origin.is_compatibility_stub(), "Semaphore should be real bytecode");
+        assert!(
+            !sem.origin.is_compatibility_stub(),
+            "Semaphore should be real bytecode"
+        );
 
         let method_names: Vec<&str> = sem.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -15575,7 +15599,10 @@ mod tests {
         let sl = cm
             .get_class(sl_id)
             .expect("class should exist in class store");
-        assert!(!sl.origin.is_compatibility_stub(), "StampedLock should be real bytecode");
+        assert!(
+            !sl.origin.is_compatibility_stub(),
+            "StampedLock should be real bytecode"
+        );
 
         let method_names: Vec<&str> = sl.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -15609,7 +15636,10 @@ mod tests {
         let ph = cm
             .get_class(ph_id)
             .expect("class should exist in class store");
-        assert!(!ph.origin.is_compatibility_stub(), "Phaser should be real bytecode");
+        assert!(
+            !ph.origin.is_compatibility_stub(),
+            "Phaser should be real bytecode"
+        );
 
         let method_names: Vec<&str> = ph.methods.iter().map(|m| m.name.as_ref()).collect();
         assert!(
@@ -17087,9 +17117,8 @@ mod tests {
     /// test in this binary.
     #[test]
     fn xverify_all_reaches_the_class_manager_and_only_that_vm() {
-        let strict = SharedVm::new(
-            VmConfig::default().with_xverify_mode(crate::config::XverifyMode::All),
-        );
+        let strict =
+            SharedVm::new(VmConfig::default().with_xverify_mode(crate::config::XverifyMode::All));
         let lenient = SharedVm::new(VmConfig::default());
         assert!(
             strict
@@ -17259,8 +17288,10 @@ mod tests {
         let vm = SharedVm::new(VmConfig::default());
         let raw = vm.vm_identity;
         release_vm_native_state(raw);
-        assert!(cratonvm_native_api::capabilities_for(cratonvm_native_api::VmId::from_raw(raw))
-            .is_none());
+        assert!(
+            cratonvm_native_api::capabilities_for(cratonvm_native_api::VmId::from_raw(raw))
+                .is_none()
+        );
         // Second call: no entry left, no panic, and the `SharedVm` drop below
         // makes it a third.
         release_vm_native_state(raw);

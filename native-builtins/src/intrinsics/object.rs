@@ -71,7 +71,10 @@ mod tests {
     //! agent in `vm/tests/intrinsic_diff.rs` — it cannot run from a unit
     //! test in this leaf crate.
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     use super::{intrinsic_object_get_class, intrinsic_object_hash_code};
     use cratonvm_native_api::NativeCallback;

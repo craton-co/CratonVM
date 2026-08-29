@@ -375,7 +375,10 @@ pub fn reconcile_class_mirrors(
                     }
                 };
                 render(
-                    &shared.mem.heap.retention_paths(addr, &is_real_root, 200_000, 8),
+                    &shared
+                        .mem
+                        .heap
+                        .retention_paths(addr, &is_real_root, 200_000, 8),
                     &format!("mirror={addr:#x}"),
                 );
                 // The mirror has no heap referrer; it is marked because
@@ -391,7 +394,10 @@ pub fn reconcile_class_mirrors(
                         is_marked(laddr)
                     );
                     render(
-                        &shared.mem.heap.retention_paths(laddr, &is_real_root, 200_000, 8),
+                        &shared
+                            .mem
+                            .heap
+                            .retention_paths(laddr, &is_real_root, 200_000, 8),
                         &format!("loader={laddr:#x}"),
                     );
                 } else {
@@ -437,7 +443,9 @@ pub fn reconcile_class_mirrors(
                 // but it is the one thing neither check above can rule out.
                 let mut all_overlay_elems: Vec<crate::types::ObjectRef> = Vec::new();
                 cratonvm_gc::external_roots::scan_external_roots(&mut all_overlay_elems);
-                let mirror_in_overlay = all_overlay_elems.iter().any(|r| r.as_ptr() as usize == addr);
+                let mirror_in_overlay = all_overlay_elems
+                    .iter()
+                    .any(|r| r.as_ptr() as usize == addr);
                 eprintln!(
                     "[MIRRORWHY] {name} mirror_is_overlay_element={mirror_in_overlay} \
                      total_overlay_elements={}",
@@ -448,11 +456,10 @@ pub fn reconcile_class_mirrors(
                     class_id.as_u32(),
                 ) {
                     let laddr = loader.as_ptr() as usize;
-                    let loader_in_overlay =
-                        all_overlay_elems.iter().any(|r| r.as_ptr() as usize == laddr);
-                    eprintln!(
-                        "[MIRRORWHY] {name} loader_is_overlay_element={loader_in_overlay}"
-                    );
+                    let loader_in_overlay = all_overlay_elems
+                        .iter()
+                        .any(|r| r.as_ptr() as usize == laddr);
+                    eprintln!("[MIRRORWHY] {name} loader_is_overlay_element={loader_in_overlay}");
                 }
                 for &(iaddr, icid) in live_instances.iter().take(4) {
                     let iname = cm
@@ -460,7 +467,10 @@ pub fn reconcile_class_mirrors(
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("cid{icid}"));
                     render(
-                        &shared.mem.heap.retention_paths(iaddr, &is_real_root, 200_000, 4),
+                        &shared
+                            .mem
+                            .heap
+                            .retention_paths(iaddr, &is_real_root, 200_000, 4),
                         &format!("instance {iname}@{iaddr:#x}"),
                     );
                 }
@@ -485,9 +495,10 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_
     let class_mirrors = shared.classes.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
-        if let Some(loader) =
-            cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32())
-        {
+        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+            shared.vm_identity,
+            class_id.as_u32(),
+        ) {
             let old_mirror_addr = mirror_ref.as_ptr() as usize;
             let mirror_addr = pointer_map
                 .get(&old_mirror_addr)
@@ -949,7 +960,8 @@ pub fn update_all_roots(
     // registers. This is what makes the moving collector correct under JIT.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         let _rewritten = thread.shadow_stack.remap(pointer_map);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0 {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0
+        {
             eprintln!(
                 "[SHADOW] remap: depth={} rewritten={}",
                 thread.shadow_stack.depth(),
@@ -1236,7 +1248,6 @@ pub fn update_all_roots(
     // The historical notes below document the individual registered sources.
     crate::memory::native_roots::remap_all_roots(shared, pointer_map);
 
-
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
     //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
     //     does not read a stale pointer after a moving collection (root scan in
@@ -1418,7 +1429,6 @@ pub fn update_all_roots(
         .thread_registry
         .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
-
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs
     //     step 10b; without the remap the registry serves stale mirrors
@@ -1590,7 +1600,8 @@ pub fn verify_heap_object_fields(
 ) {
     use crate::types::Value;
     use cratonvm_types::{
-        ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE,
+        ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE,
+        REF_ELEMENT_SIZE,
     };
 
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
@@ -1673,11 +1684,14 @@ pub fn verify_heap_object_fields(
                     }
                 }
             }
-        } else if hdr.kind() == ObjectKind::Array && hdr.element_type() == ArrayElementType::Reference {
+        } else if hdr.kind() == ObjectKind::Array
+            && hdr.element_type() == ArrayElementType::Reference
+        {
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length() as usize;
             for i in 0..len {
-                let s_ptr = unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
+                let s_ptr =
+                    unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(
@@ -1796,7 +1810,10 @@ fn verify_no_stale_refs(
     // for a zeroed header (class_id=0 && identity_hash_code=0 && num_slots=0).
     // Such a slot is the in-memory signature of the heavy-trees bug: a
     // pointer at an address inside the just-reset young-from semispace.
-    let heavy = cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1");
+    let heavy = cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // Build the set of "stale destination addresses" — addresses that appear
     // as VALUES in pointer_map but ALSO as KEYS. These are intermediate
@@ -1877,7 +1894,14 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, li, frame.pc, addr, h.kind(), h.gc_flags(),
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            h.kind(),
+                            h.gc_flags(),
                         );
                     }
                 }
@@ -1933,7 +1957,14 @@ fn verify_no_stale_refs(
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, si, frame.pc, addr, h.kind(), h.gc_flags(),
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            h.kind(),
+                            h.gc_flags(),
                         );
                     }
                 }
@@ -2001,7 +2032,10 @@ mod tests {
         let mut cache: std::collections::HashMap<&'static str, ObjectRef> =
             std::collections::HashMap::new();
         cache.insert("Api.alpha()Ljava/lang/String;", moved);
-        cache.insert("Api.bravo(Ljava/lang/String;)Ljava/lang/String;", also_moved);
+        cache.insert(
+            "Api.bravo(Ljava/lang/String;)Ljava/lang/String;",
+            also_moved,
+        );
         cache.insert("Api.charlie(II)I", pinned);
 
         let pointer_map = cratonvm_types::PointerMap::from_iter([
@@ -2087,7 +2121,10 @@ mod tests {
         let pointer_map = cratonvm_types::PointerMap::from_iter([(0x1000usize, 0x8000usize)]);
 
         assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 0);
-        assert_eq!(thread.jit_pending_exception.unwrap().as_ptr() as usize, 0x5000);
+        assert_eq!(
+            thread.jit_pending_exception.unwrap().as_ptr() as usize,
+            0x5000
+        );
         assert!(thread.java_thread_obj.is_none());
         assert!(thread.pending_async_exception.is_none());
     }

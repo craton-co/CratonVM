@@ -298,7 +298,9 @@ fn slots(ctx: &mut dyn NativeContext) -> Option<&'static Slots> {
         let gcal_class = ctx.class_id_by_name("java/util/GregorianCalendar")?;
         let date_class = ctx.class_id_by_name("java/util/Date")?;
         let dfs_class = ctx.class_id_by_name("java/text/DateFormatSymbols")?;
-        let f = |cid: cratonvm_types::ClassId, name: &str| ctx.resolve_field_index_by_class_id(cid, name);
+        let f = |cid: cratonvm_types::ClassId, name: &str| {
+            ctx.resolve_field_index_by_class_id(cid, name)
+        };
         let timezone_class = ctx.class_id_by_name("java/util/TimeZone");
         Some(Slots {
             sdf_class,
@@ -346,7 +348,20 @@ const PATTERN_CHARS: &str = "GyMdkHmsSEDFwWahKzZYuXL";
 fn letter_supported(c: char) -> bool {
     matches!(
         c,
-        'G' | 'y' | 'M' | 'd' | 'k' | 'H' | 'm' | 's' | 'S' | 'E' | 'D' | 'a' | 'h' | 'K' | 'Z'
+        'G' | 'y'
+            | 'M'
+            | 'd'
+            | 'k'
+            | 'H'
+            | 'm'
+            | 's'
+            | 'S'
+            | 'E'
+            | 'D'
+            | 'a'
+            | 'h'
+            | 'K'
+            | 'Z'
             | 'X'
     )
 }
@@ -451,8 +466,8 @@ fn day_of_year(y: i64, m: u32, d: u32) -> u32 {
 /// Broken-down local time, in the same field terms `Calendar` uses.
 struct Fields {
     year: i64,
-    month0: u32,   // 0-based, as Calendar.MONTH
-    day: u32,      // DAY_OF_MONTH
+    month0: u32,      // 0-based, as Calendar.MONTH
+    day: u32,         // DAY_OF_MONTH
     day_of_week: u32, // 1 = SUNDAY, as Calendar.DAY_OF_WEEK
     day_of_year: u32,
     hour_of_day: u32,
@@ -548,11 +563,7 @@ fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, want: &str) -> bool {
 }
 
 /// Read a `String[]` element as a Rust `String`.
-fn string_array_elem(
-    ctx: &mut dyn NativeContext,
-    arr: ObjectRef,
-    index: usize,
-) -> Option<String> {
+fn string_array_elem(ctx: &mut dyn NativeContext, arr: ObjectRef, index: usize) -> Option<String> {
     if index >= ctx.array_length(arr) {
         return None;
     }
@@ -569,12 +580,7 @@ fn string_array_elem(
 /// Render `pieces` for the given instant. `None` means "something in here is
 /// outside the supported subset after all" — run the bytecode.
 #[allow(clippy::too_many_arguments)]
-fn render(
-    pieces: &[Piece],
-    inputs: &Inputs,
-    syms: &Symbols,
-    out: &mut String,
-) -> Option<()> {
+fn render(pieces: &[Piece], inputs: &Inputs, syms: &Symbols, out: &mut String) -> Option<()> {
     let f = &inputs.fields;
     out.clear();
     for piece in pieces {
@@ -607,7 +613,11 @@ fn render(
                     'D' => zero_padding_number(out, f.day_of_year as i64, count, usize::MAX),
                     // 'k' — 1..24. GregorianCalendar's getMaximum(HOUR_OF_DAY) is 23.
                     'k' => {
-                        let v = if f.hour_of_day == 0 { 24 } else { f.hour_of_day };
+                        let v = if f.hour_of_day == 0 {
+                            24
+                        } else {
+                            f.hour_of_day
+                        };
                         zero_padding_number(out, v as i64, count, usize::MAX);
                     }
                     'H' => zero_padding_number(out, f.hour_of_day as i64, count, usize::MAX),
@@ -623,7 +633,11 @@ fn render(
                     's' => zero_padding_number(out, f.second as i64, count, usize::MAX),
                     'S' => zero_padding_number(out, f.millis as i64, count, usize::MAX),
                     'E' => {
-                        let table = if count >= 4 { &syms.weekdays } else { &syms.short_weekdays };
+                        let table = if count >= 4 {
+                            &syms.weekdays
+                        } else {
+                            &syms.short_weekdays
+                        };
                         out.push_str(table.get(f.day_of_week as usize)?);
                     }
                     'a' => {
@@ -704,16 +718,17 @@ fn format_via_bytecode(
         }
     };
     let sb_pin = ctx.pin_native_root(sb);
-    let fp = match ctx.new_object_initialized("java/text/FieldPosition", "(I)V", &[Value::Int(0)])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            ctx.unpin_native_roots(this_pin);
-            return Err(RuntimeError::NullPointerException {
-                message: Some("FieldPosition <init> produced no object".to_string()),
+    let fp =
+        match ctx.new_object_initialized("java/text/FieldPosition", "(I)V", &[Value::Int(0)])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("FieldPosition <init> produced no object".to_string()),
+                }
+                .into());
             }
-            .into());
-        }
-    };
+        };
     let this_now = ctx.read_native_pin(this_pin, this);
     let date_now = match (date, date_pin) {
         (Some(d), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, d))),
@@ -766,7 +781,12 @@ fn gather(
         Some(z) if z == '0' as i32 => {}
         _ => return None,
     }
-    if ctx.get_field(this, sl.sdf_force_standalone).as_int().unwrap_or(1) != 0 {
+    if ctx
+        .get_field(this, sl.sdf_force_standalone)
+        .as_int()
+        .unwrap_or(1)
+        != 0
+    {
         return None;
     }
 
@@ -821,8 +841,8 @@ fn gather(
     // DECLARES `getOffset(J)I` with code, so `invoke_or_native`'s
     // `has_own_bytecode` gate skips the superclass climb and
     // `java/util/TimeZone`'s surviving tzdb native does not capture it either.
-    let vm_implemented = Some(zone_class) == sl.zoneinfo_class
-        || Some(zone_class) == sl.timezone_class;
+    let vm_implemented =
+        Some(zone_class) == sl.zoneinfo_class || Some(zone_class) == sl.timezone_class;
     let offset_ms = if vm_implemented {
         let (rules, id) = zone_rules_cached(ctx, sl, zone)?;
         match rules {
@@ -899,7 +919,10 @@ fn zone_rules_cached(
     ctx: &mut dyn NativeContext,
     sl: &Slots,
     zone: ObjectRef,
-) -> Option<(Option<std::sync::Arc<crate::tzdb::ZoneRulesData>>, std::sync::Arc<str>)> {
+) -> Option<(
+    Option<std::sync::Arc<crate::tzdb::ZoneRulesData>>,
+    std::sync::Arc<str>,
+)> {
     let id_obj = obj_slot(ctx, zone, sl.tz_id)?;
     let id_identity = ctx.identity_hash_code(id_obj);
     let zone_identity = ctx.identity_hash_code(zone);
@@ -1158,17 +1181,35 @@ mod tests {
         assert_eq!(
             p,
             vec![
-                Piece::Field { letter: 'd', count: 2 },
+                Piece::Field {
+                    letter: 'd',
+                    count: 2
+                },
                 Piece::Literal("-".into()),
-                Piece::Field { letter: 'M', count: 3 },
+                Piece::Field {
+                    letter: 'M',
+                    count: 3
+                },
                 Piece::Literal("-".into()),
-                Piece::Field { letter: 'y', count: 4 },
+                Piece::Field {
+                    letter: 'y',
+                    count: 4
+                },
                 Piece::Literal(" ".into()),
-                Piece::Field { letter: 'H', count: 2 },
+                Piece::Field {
+                    letter: 'H',
+                    count: 2
+                },
                 Piece::Literal(":".into()),
-                Piece::Field { letter: 'm', count: 2 },
+                Piece::Field {
+                    letter: 'm',
+                    count: 2
+                },
                 Piece::Literal(":".into()),
-                Piece::Field { letter: 's', count: 2 },
+                Piece::Field {
+                    letter: 's',
+                    count: 2
+                },
             ]
         );
     }
@@ -1179,9 +1220,15 @@ mod tests {
             compile_pattern("'at' HH''mm").unwrap(),
             vec![
                 Piece::Literal("at ".into()),
-                Piece::Field { letter: 'H', count: 2 },
+                Piece::Field {
+                    letter: 'H',
+                    count: 2
+                },
                 Piece::Literal("'".into()),
-                Piece::Field { letter: 'm', count: 2 },
+                Piece::Field {
+                    letter: 'm',
+                    count: 2
+                },
             ]
         );
         // An unterminated quote is an IllegalArgumentException in the JDK — we

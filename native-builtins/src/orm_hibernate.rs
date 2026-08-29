@@ -884,13 +884,15 @@ fn native_hibernate_navigable_path_get_parent(
 }
 
 fn hibernate_navigable_path_is_entity_identifier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
         == Some(HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH)
 }
 
 fn hibernate_navigable_path_is_path(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     matches!(
-        ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref(),
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+            .as_deref(),
         Some(
             HIBERNATE_NAVIGABLE_PATH
                 | HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH
@@ -913,7 +915,12 @@ fn hibernate_pinned_objects_equal(
             let result = (|| {
                 let a = ctx.read_native_pin(base, a);
                 let b = ctx.read_native_pin(b_pin, b);
-                match ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])? {
+                match ctx.invoke_virtual(
+                    a,
+                    "equals",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(b))],
+                )? {
                     Some(Value::Int(v)) => Ok(v != 0),
                     _ => Ok(false),
                 }
@@ -960,7 +967,9 @@ fn native_hibernate_navigable_path_equals(
     }
 
     let other_is_path = hibernate_navigable_path_is_path(ctx, other);
-    let other_is_role = ctx.class_name_arc_of_id(ctx.class_id_of_object(other)).as_deref()
+    let other_is_role = ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(other))
+        .as_deref()
         == Some(HIBERNATE_NAVIGABLE_ROLE);
     if !other_is_path && !other_is_role {
         return Ok(Some(Value::Int(0)));
@@ -972,7 +981,8 @@ fn native_hibernate_navigable_path_equals(
         let this = ctx.read_native_pin(this_pin, this);
         let other = ctx.read_native_pin(other_pin, other);
         let this_entity = hibernate_navigable_path_is_entity_identifier(ctx, this);
-        let other_entity = other_is_path && hibernate_navigable_path_is_entity_identifier(ctx, other);
+        let other_entity =
+            other_is_path && hibernate_navigable_path_is_entity_identifier(ctx, other);
 
         let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
         let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
@@ -987,11 +997,7 @@ fn native_hibernate_navigable_path_equals(
                 let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
                 let other_identifier =
                     hibernate_navigable_path_field_object(ctx, other, "identifierAttributeName");
-                hibernate_pinned_objects_equal(
-                    ctx,
-                    this_local,
-                    other_identifier,
-                )?
+                hibernate_pinned_objects_equal(ctx, this_local, other_identifier)?
             }
         } else if this_entity {
             let this = ctx.read_native_pin(this_pin, this);
@@ -999,11 +1005,7 @@ fn native_hibernate_navigable_path_equals(
             let this_identifier =
                 hibernate_navigable_path_field_object(ctx, this, "identifierAttributeName");
             let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
-            hibernate_pinned_objects_equal(
-                ctx,
-                this_identifier,
-                other_local,
-            )?
+            hibernate_pinned_objects_equal(ctx, this_identifier, other_local)?
         } else {
             false
         };
@@ -1016,11 +1018,7 @@ fn native_hibernate_navigable_path_equals(
         if other_is_path {
             let this_alias = hibernate_navigable_path_field_object(ctx, this, "alias");
             let other_alias = hibernate_navigable_path_field_object(ctx, other, "alias");
-            let aliases_equal = hibernate_pinned_objects_equal(
-                ctx,
-                this_alias,
-                other_alias,
-            )?;
+            let aliases_equal = hibernate_pinned_objects_equal(ctx, this_alias, other_alias)?;
             if !aliases_equal {
                 return Ok(Some(Value::Int(0)));
             }
@@ -1028,19 +1026,11 @@ fn native_hibernate_navigable_path_equals(
             let other = ctx.read_native_pin(other_pin, other);
             let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
             let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
-            hibernate_pinned_objects_equal(
-                ctx,
-                this_parent,
-                other_parent,
-            )
+            hibernate_pinned_objects_equal(ctx, this_parent, other_parent)
         } else {
             let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
             let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
-            hibernate_pinned_objects_equal(
-                ctx,
-                this_parent,
-                other_parent,
-            )
+            hibernate_pinned_objects_equal(ctx, this_parent, other_parent)
         }
         .map(|equal| Some(Value::Int(equal as i32)))
     })();
@@ -1594,27 +1584,35 @@ pub(crate) fn native_hibernate_uuid_v7_generate(
                 let previous_millis = previous_seconds * 1000 + previous_nanos / 1_000_000;
                 let now_sub_millis = (now_nanos % 1_000_000) * 4096 / 1_000_000;
                 let random_sequence = sr_os_random_u64() & MAX_RANDOM_SEQUENCE;
-                let (next_seconds, next_nanos, next_sequence, next_sub_millis) =
-                    if previous_millis < now_millis
-                        || (previous_millis == now_millis && previous_sub_millis < now_sub_millis)
-                    {
-                        (now_seconds, now_nanos, random_sequence, now_sub_millis)
-                    } else if previous_sequence >= random_sequence {
-                        let adjusted = previous_nanos + 245;
-                        let (seconds, nanos) = if adjusted >= 1_000_000_000 {
-                            (previous_seconds + 1, adjusted - 1_000_000_000)
-                        } else {
-                            (previous_seconds, adjusted)
-                        };
-                        (seconds, nanos, random_sequence, (nanos % 1_000_000) * 4096 / 1_000_000)
+                let (next_seconds, next_nanos, next_sequence, next_sub_millis) = if previous_millis
+                    < now_millis
+                    || (previous_millis == now_millis && previous_sub_millis < now_sub_millis)
+                {
+                    (now_seconds, now_nanos, random_sequence, now_sub_millis)
+                } else if previous_sequence >= random_sequence {
+                    let adjusted = previous_nanos + 245;
+                    let (seconds, nanos) = if adjusted >= 1_000_000_000 {
+                        (previous_seconds + 1, adjusted - 1_000_000_000)
                     } else {
-                        (previous_seconds, previous_nanos, random_sequence, previous_sub_millis)
+                        (previous_seconds, adjusted)
                     };
+                    (
+                        seconds,
+                        nanos,
+                        random_sequence,
+                        (nanos % 1_000_000) * 4096 / 1_000_000,
+                    )
+                } else {
+                    (
+                        previous_seconds,
+                        previous_nanos,
+                        random_sequence,
+                        previous_sub_millis,
+                    )
+                };
                 let instant_class = ctx.ensure_class_initialized("java/time/Instant")?;
-                let next_instant = ctx.alloc_object(
-                    instant_class,
-                    ctx.class_num_total_fields(instant_class),
-                );
+                let next_instant =
+                    ctx.alloc_object(instant_class, ctx.class_num_total_fields(instant_class));
                 let next_instant_pin = ctx.pin_native_root(next_instant);
                 let next_instant = ctx.read_native_pin(next_instant_pin, next_instant);
                 ctx.set_field_by_name(next_instant, "seconds", Value::Long(next_seconds));

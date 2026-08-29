@@ -578,11 +578,7 @@ impl LazyAttribute {
     /// This is the zero-copy constructor: callers that already hold the
     /// class file as an `Arc<[u8]>` clone the Arc (refcount bump, no
     /// memcpy) and hand it in alongside the body's `start..end` range.
-    pub fn new_raw_in(
-        name: Arc<str>,
-        source: impl Into<SharedBytes>,
-        range: Range<usize>,
-    ) -> Self {
+    pub fn new_raw_in(name: Arc<str>, source: impl Into<SharedBytes>, range: Range<usize>) -> Self {
         let source = source.into();
         debug_assert!(
             range.end <= source.len(),
@@ -925,8 +921,11 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
             let _ = buf.read_bytes(code_length)?;
             let exception_table_length = buf.read_u16()? as usize;
             const ET_ENTRY_SIZE: usize = EXCEPTION_TABLE_ENTRY_SIZE;
-            let et_span =
-                checked_span("Code exception_table", exception_table_length, ET_ENTRY_SIZE)?;
+            let et_span = checked_span(
+                "Code exception_table",
+                exception_table_length,
+                ET_ENTRY_SIZE,
+            )?;
             let et_bytes = buf.read_bytes(et_span)?;
             // JVMS §4.7.3 program-counter ranges. This walk has no constant
             // pool, so `catch_type` is checked later in `decode_code_body`;
@@ -955,8 +954,7 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
                 // declared `Code` body. The lazy decoder still performs
                 // the full constant-pool-keyed dispatch at first access.
                 let _name_index = buf.read_u16()?;
-                let nested_len =
-                    wire_len_to_usize("nested attribute_length", buf.read_u32()?)?;
+                let nested_len = wire_len_to_usize("nested attribute_length", buf.read_u32()?)?;
                 if nested_len > buf.remaining() {
                     return Err(ClassReaderError::InvalidClassData {
                         message: format!(
@@ -1282,8 +1280,7 @@ fn decode_attribute_body(
             // is still what proves the bytes are there.
             let num_exceptions = buf.read_u16()? as usize;
             let span = checked_span("Exceptions", num_exceptions, EXCEPTIONS_ENTRY_SIZE)?;
-            let capacity =
-                bounded_capacity(num_exceptions, EXCEPTIONS_ENTRY_SIZE, buf.remaining());
+            let capacity = bounded_capacity(num_exceptions, EXCEPTIONS_ENTRY_SIZE, buf.remaining());
             let bytes = buf.read_bytes(span)?;
             let mut exception_indices = Vec::with_capacity(capacity);
             for chunk in bytes.chunks_exact(2) {
@@ -1837,7 +1834,11 @@ fn decode_code_body(
     // version does one bounds check for the whole table.
     let exception_table_length = buf.read_u16()? as usize;
     const ET_ENTRY_SIZE: usize = EXCEPTION_TABLE_ENTRY_SIZE; // four u16 fields
-    let et_span = checked_span("Code exception_table", exception_table_length, ET_ENTRY_SIZE)?;
+    let et_span = checked_span(
+        "Code exception_table",
+        exception_table_length,
+        ET_ENTRY_SIZE,
+    )?;
     let et_capacity = bounded_capacity(exception_table_length, ET_ENTRY_SIZE, buf.remaining());
     let et_bytes = buf.read_bytes(et_span)?;
     let mut exception_table = Vec::with_capacity(et_capacity);

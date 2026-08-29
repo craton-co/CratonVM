@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 #[allow(dead_code)]
 pub(super) const RAX: u8 = 0;
 #[allow(dead_code)]
@@ -51,8 +50,8 @@ pub(super) const R15: u8 = 15;
 /// table and the numbers cannot drift apart.
 #[allow(dead_code)]
 pub(super) const GPR64_NAMES: [&str; 16] = [
-    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
-    "r13", "r14", "r15",
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
 ];
 
 /// XMM register mnemonics, indexed by encoding number.

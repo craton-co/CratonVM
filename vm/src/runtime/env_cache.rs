@@ -2485,11 +2485,24 @@ mod tests {
     #[test]
     fn enforce_shadow_scope_parses_the_three_spellings() {
         assert_eq!(parse_enforce_shadow_scope(None), EnforceShadowScope::Off);
-        assert_eq!(parse_enforce_shadow_scope(Some("")), EnforceShadowScope::Off);
-        assert_eq!(parse_enforce_shadow_scope(Some("  ")), EnforceShadowScope::Off);
-        assert_eq!(parse_enforce_shadow_scope(Some("0")), EnforceShadowScope::Off);
+        assert_eq!(
+            parse_enforce_shadow_scope(Some("")),
+            EnforceShadowScope::Off
+        );
+        assert_eq!(
+            parse_enforce_shadow_scope(Some("  ")),
+            EnforceShadowScope::Off
+        );
+        assert_eq!(
+            parse_enforce_shadow_scope(Some("0")),
+            EnforceShadowScope::Off
+        );
         for on in ["1", "all", "ALL", "true", "Yes", "on"] {
-            assert_eq!(parse_enforce_shadow_scope(Some(on)), EnforceShadowScope::All, "{on}");
+            assert_eq!(
+                parse_enforce_shadow_scope(Some(on)),
+                EnforceShadowScope::All,
+                "{on}"
+            );
         }
         assert_eq!(
             parse_enforce_shadow_scope(Some("javax/management/")),
@@ -2529,7 +2542,10 @@ mod tests {
         assert!(!jmx.is_off());
         assert!(jmx.covers("javax/management/MBeanServer"));
         assert!(jmx.covers("javax/management/openmbean/CompositeDataSupport"));
-        assert!(!jmx.covers("java/lang/String"), "the JMX dial must not reach java.lang");
+        assert!(
+            !jmx.covers("java/lang/String"),
+            "the JMX dial must not reach java.lang"
+        );
         assert!(!jmx.covers("java/util/logging/LogManager"));
 
         let two = parse_enforce_shadow_scope(Some("java/util/logging/,javax/management/"));

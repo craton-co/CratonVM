@@ -121,34 +121,86 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     // precisely so nobody can change that), so answering by identity is the
     // specified behaviour rather than a guess. `toString` returns the `name`
     // field and `compareTo` the ordinal difference — both read real state.
-    ("java/lang/Enum", "toString", "reads the real `name` field; matches JDK"),
-    ("java/lang/Enum", "equals", "JDK `Enum.equals` is final identity"),
-    ("java/lang/Enum", "hashCode", "JDK `Enum.hashCode` is final identity"),
-    ("java/lang/Enum", "compareTo", "ordinal difference, reads real state"),
+    (
+        "java/lang/Enum",
+        "toString",
+        "reads the real `name` field; matches JDK",
+    ),
+    (
+        "java/lang/Enum",
+        "equals",
+        "JDK `Enum.equals` is final identity",
+    ),
+    (
+        "java/lang/Enum",
+        "hashCode",
+        "JDK `Enum.hashCode` is final identity",
+    ),
+    (
+        "java/lang/Enum",
+        "compareTo",
+        "ordinal difference, reads real state",
+    ),
     // `Record` is abstract and its `equals`/`hashCode`/`toString` are the
     // component-wise implementations the JVM is REQUIRED to synthesise
     // (JLS 8.10.3) — there is no bytecode on `java.lang.Record` to shadow,
     // the real JDK leaves them abstract.
-    ("java/lang/Record", "equals", "component-wise; Record's own are abstract"),
-    ("java/lang/Record", "hashCode", "component-wise; Record's own are abstract"),
-    ("java/lang/Record", "toString", "component-wise; Record's own are abstract"),
+    (
+        "java/lang/Record",
+        "equals",
+        "component-wise; Record's own are abstract",
+    ),
+    (
+        "java/lang/Record",
+        "hashCode",
+        "component-wise; Record's own are abstract",
+    ),
+    (
+        "java/lang/Record",
+        "toString",
+        "component-wise; Record's own are abstract",
+    ),
     // `ByteBuffer` is abstract; these read the receiver's actual storage
     // (heap array or native window) via `s2_bb_read_window`, so they answer
     // for a `DirectByteBuffer` receiver as correctly as for a heap one.
     // `hashCode` iterates backward over `[position, limit)` to match
     // `Buffer.hashCode` exactly.
-    ("java/nio/ByteBuffer", "equals", "content-compare over the real storage"),
-    ("java/nio/ByteBuffer", "hashCode", "backward content hash, matches JDK"),
-    ("java/nio/ByteBuffer", "compareTo", "content compare over the real storage"),
-    ("java/nio/ByteBuffer", "toString", "renders the RECEIVER's class name"),
+    (
+        "java/nio/ByteBuffer",
+        "equals",
+        "content-compare over the real storage",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "hashCode",
+        "backward content hash, matches JDK",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "compareTo",
+        "content compare over the real storage",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "toString",
+        "renders the RECEIVER's class name",
+    ),
     // `CharBuffer` is abstract; `toString` renders the remaining chars from the
     // receiver's own backing store.
-    ("java/nio/CharBuffer", "toString", "remaining chars from real storage"),
+    (
+        "java/nio/CharBuffer",
+        "toString",
+        "remaining chars from real storage",
+    ),
     // `AbstractMap.toString` renders `{size=N}` where N comes from a VIRTUAL
     // `size()` call on the receiver. It is not the JDK's `{k=v, …}` rendering
     // and is recorded as a residual in the audit doc — but it reads real state
     // and `vm/src/vm.rs` has a test pinned to it, so it is not changed here.
-    ("java/util/AbstractMap", "toString", "residual: `{size=N}`, see audit doc"),
+    (
+        "java/util/AbstractMap",
+        "toString",
+        "residual: `{size=N}`, see audit doc",
+    ),
     // `AbstractPreferences.toString` is now the JDK's own definition —
     // `(isUserNode() ? "User" : "System") + " Preference Node: " +
     // absolutePath()` — composed through VIRTUAL calls, so a subclass that
@@ -280,7 +332,9 @@ fn abstract_map_refuses_equals_and_hash_code_but_keeps_its_state_readers() {
     let am = "java/util/AbstractMap";
 
     assert!(
-        registry.find(am, "equals", "(Ljava/lang/Object;)Z").is_none(),
+        registry
+            .find(am, "equals", "(Ljava/lang/Object;)Z")
+            .is_none(),
         "AbstractMap.equals must NOT be shimmed: the real implementation is entry-wise, \
          and an identity answer is inherited by every Map that does not override equals"
     );
@@ -343,7 +397,9 @@ fn abstract_preferences_to_string_composes_from_virtual_accessors() {
 fn object_supplies_the_identity_fallback_the_refusals_depend_on() {
     let registry = production_registry();
     assert!(
-        registry.find("java/lang/Object", "hashCode", "()I").is_some(),
+        registry
+            .find("java/lang/Object", "hashCode", "()I")
+            .is_some(),
         "the AbstractMap refusal falls through to Object.hashCode — it must be registered"
     );
     assert!(

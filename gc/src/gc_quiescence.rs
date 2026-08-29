@@ -200,7 +200,11 @@ fn moving_young_state_set(v: u8) {
 /// Idempotent; a *changed* value is a bug (the codegen gate is a `OnceLock`)
 /// and is reported loudly rather than silently accepted.
 pub fn publish_moving_young_enabled(on: bool) {
-    let next = if on { MOVING_YOUNG_ON } else { MOVING_YOUNG_OFF };
+    let next = if on {
+        MOVING_YOUNG_ON
+    } else {
+        MOVING_YOUNG_OFF
+    };
     let prev = moving_young_state_get();
     if prev != MOVING_YOUNG_UNPUBLISHED && prev != next {
         tracing::warn!(
@@ -983,9 +987,8 @@ pub fn record_moving_young_coverage_fallback() -> usize {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_FALLBACK_REASONS").is_some() {
         let mask = incomplete_reason_mask_get();
         let first = moving_young_incomplete_reason();
-        let innermost_pair =
-            (1usize << incomplete_reason::FOREIGN_INNERMOST_RBP)
-                | (1usize << incomplete_reason::UNBOUNDED_FRAME_BAND);
+        let innermost_pair = (1usize << incomplete_reason::FOREIGN_INNERMOST_RBP)
+            | (1usize << incomplete_reason::UNBOUNDED_FRAME_BAND);
         let attributable_innermost = mask != 0
             && mask & (1usize << incomplete_reason::FOREIGN_INNERMOST_RBP) != 0
             && mask & !innermost_pair == 0;
@@ -1001,7 +1004,11 @@ pub fn record_moving_young_coverage_fallback() -> usize {
         eprintln!(
             "[moving-young-reasons] #{n} first={} sole={} attributable-innermost-rbp={} all={}",
             incomplete_reason::label(first),
-            if mask == (1usize << first) { "yes" } else { "no" },
+            if mask == (1usize << first) {
+                "yes"
+            } else {
+                "no"
+            },
             if attributable_innermost { "yes" } else { "no" },
             all,
         );
@@ -1838,7 +1845,6 @@ pub fn native_rvas() -> Vec<usize> {
     NATIVE_RVA_HOOK.get().map(|f| f()).unwrap_or_default()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2172,8 +2178,7 @@ type VacatedLedger = (
     rustc_hash::FxHashSet<usize>,
 );
 
-static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> =
-    parking_lot::RwLock::new(None);
+static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> = parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
 pub fn vacated_frames_enabled() -> bool {

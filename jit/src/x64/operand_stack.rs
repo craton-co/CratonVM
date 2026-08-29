@@ -462,12 +462,7 @@ impl Compiler {
                 }
             }
         }
-        Some(
-            kinds
-                .iter()
-                .map(|k| k.is_category_2())
-                .collect(),
-        )
+        Some(kinds.iter().map(|k| k.is_category_2()).collect())
     }
 
     /// Peek at the top of the simulated stack.
@@ -640,7 +635,6 @@ impl Compiler {
     // instruction form. They are still inherent methods on this `Compiler`;
     // the ones called from outside that file are declared `pub(super)` there.
 
-
     /// Return the callee-saved register for local `idx`, if register-mapped.
     pub(super) fn reg_for_local(&self, idx: usize) -> Option<u8> {
         self.local_assignments.get(idx).copied().flatten()
@@ -804,7 +798,6 @@ impl Compiler {
             }
         }
     }
-
 
     /// Emit a load from a StackSlot into a specific GPR register.
     pub(super) fn load_slot_to_reg(&mut self, dst: u8, slot: StackSlot) {

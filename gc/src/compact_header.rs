@@ -961,8 +961,7 @@ const COMPACT_SLOT_SIZE: usize = 16;
 /// twice below until the 2026-08-06 header shrink took the legacy header from
 /// 32 to 24 and made it 16 — a literal that feeds `savings_report()` and four
 /// assertions, so it drifts silently. Derived now.
-const LEGACY_MINUS_COMPACT_HEADER: usize =
-    cratonvm_types::HEADER_SIZE - CompactHeader::SIZE;
+const LEGACY_MINUS_COMPACT_HEADER: usize = cratonvm_types::HEADER_SIZE - CompactHeader::SIZE;
 
 impl CompactAllocator {
     /// Create a new compact allocator with the given capacity in bytes.

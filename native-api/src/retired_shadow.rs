@@ -1253,7 +1253,12 @@ mod tests {
     #[test]
     fn the_stateless_table_is_sorted_and_unique() {
         for w in RETIRED_SHADOW_STATELESS_TRIPLES.windows(2) {
-            assert!(w[0] < w[1], "out of order or duplicated: {:?} then {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -1263,7 +1268,10 @@ mod tests {
     #[test]
     fn every_stateless_entry_is_reachable() {
         for (c, m, d) in RETIRED_SHADOW_STATELESS_TRIPLES {
-            assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
         }
     }
 
@@ -1349,20 +1357,36 @@ mod tests {
     /// not retire anything the tables do not name.
     #[test]
     fn a_prefix_alone_retires_nothing() {
-        assert!(!triple_is_retired_shadow("java/text/SimpleDateFormat", "format",
-                                          "(Ljava/util/Date;)Ljava/lang/String;"));
-        assert!(!triple_is_retired_shadow("java/lang/module/ModuleDescriptor",
-                                          "notAMethod", "()V"));
+        assert!(!triple_is_retired_shadow(
+            "java/text/SimpleDateFormat",
+            "format",
+            "(Ljava/util/Date;)Ljava/lang/String;"
+        ));
+        assert!(!triple_is_retired_shadow(
+            "java/lang/module/ModuleDescriptor",
+            "notAMethod",
+            "()V"
+        ));
         // HELD by the arm, and the prefix list does not admit it — belt and
         // braces, because a widening of that list must not silently re-retire
         // what RClassUnloadSweep rejected.
-        assert!(!triple_is_retired_shadow("java/lang/ref/Reference", "clear", "()V"));
+        assert!(!triple_is_retired_shadow(
+            "java/lang/ref/Reference",
+            "clear",
+            "()V"
+        ));
         // `sun/nio/fs/` IS in the prefix list as of 2026-08-20, so this arm now
         // has to earn its answer from the table rather than from the prefix.
-        assert!(!triple_is_retired_shadow("sun/nio/fs/WindowsFileAttributes",
-                                          "notAMethod", "()V"));
-        assert!(!triple_is_retired_shadow("sun/nio/fs/WindowsPath", "toString",
-                                          "()Ljava/lang/String;"));
+        assert!(!triple_is_retired_shadow(
+            "sun/nio/fs/WindowsFileAttributes",
+            "notAMethod",
+            "()V"
+        ));
+        assert!(!triple_is_retired_shadow(
+            "sun/nio/fs/WindowsPath",
+            "toString",
+            "()Ljava/lang/String;"
+        ));
     }
 
     /// `java/lang/ref/` stays whole, and this is the record of WHY — the
@@ -1384,7 +1408,10 @@ mod tests {
     fn the_reference_subsystem_stays_whole() {
         for (m, d) in [
             ("<init>", "(Ljava/lang/Object;)V"),
-            ("<init>", "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V"),
+            (
+                "<init>",
+                "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
+            ),
             ("get", "()Ljava/lang/Object;"),
             ("clear", "()V"),
             ("enqueue", "()Z"),
@@ -1411,7 +1438,11 @@ mod tests {
             ("remove", "()Ljava/lang/ref/Reference;"),
             ("remove", "(J)Ljava/lang/ref/Reference;"),
         ] {
-            assert!(!triple_is_retired_shadow("java/lang/ref/ReferenceQueue", m, d));
+            assert!(!triple_is_retired_shadow(
+                "java/lang/ref/ReferenceQueue",
+                m,
+                d
+            ));
         }
     }
 
@@ -1484,7 +1515,12 @@ mod tests {
     #[test]
     fn the_table_is_sorted_and_unique() {
         for w in RETIRED_SHADOW_TRIPLES.windows(2) {
-            assert!(w[0] < w[1], "out of order or duplicated: {:?} then {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -1493,7 +1529,10 @@ mod tests {
     #[test]
     fn every_entry_is_reachable_through_the_predicate() {
         for (c, m, d) in RETIRED_SHADOW_TRIPLES {
-            assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
         }
     }
 
@@ -1510,7 +1549,10 @@ mod tests {
             "(Ljava/util/logging/Level;Ljava/lang/Throwable;Ljava/util/function/Supplier;)V",
             "(Ljava/util/logging/LogRecord;)V",
         ] {
-            assert!(triple_is_retired_shadow("java/util/logging/Logger", "log", d), "{d}");
+            assert!(
+                triple_is_retired_shadow("java/util/logging/Logger", "log", d),
+                "{d}"
+            );
         }
         // HELD BACK: `log(Level, Supplier, Throwable)` is not a JDK 25
         // signature at all — the real overload takes the Throwable SECOND —
@@ -1523,17 +1565,31 @@ mod tests {
             "(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V"
         ));
         assert!(triple_is_retired_shadow(
-            "java/util/logging/Logger", "fine", "(Ljava/lang/String;)V"));
+            "java/util/logging/Logger",
+            "fine",
+            "(Ljava/lang/String;)V"
+        ));
     }
 
     /// Nothing outside the retired subsystem is touched.
     #[test]
     fn other_subsystems_are_untouched() {
-        assert!(!triple_is_retired_shadow("java/lang/String", "length", "()I"));
-        assert!(!triple_is_retired_shadow("javax/management/MBeanServer", "getDomains",
-                                          "()[Ljava/lang/String;"));
+        assert!(!triple_is_retired_shadow(
+            "java/lang/String",
+            "length",
+            "()I"
+        ));
+        assert!(!triple_is_retired_shadow(
+            "javax/management/MBeanServer",
+            "getDomains",
+            "()[Ljava/lang/String;"
+        ));
         // A logging class that is not in the table answers false too.
-        assert!(!triple_is_retired_shadow("java/util/logging/Logger", "notARealMethod", "()V"));
+        assert!(!triple_is_retired_shadow(
+            "java/util/logging/Logger",
+            "notARealMethod",
+            "()V"
+        ));
     }
 
     /// A vacuity floor. An empty table would make every test above pass and
@@ -1560,8 +1616,16 @@ mod tests {
             ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
             ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
             ("java/util/ArrayList", "clear", "()V"),
-            ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
-            ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
+            (
+                "java/util/Arrays$ArrayList",
+                "iterator",
+                "()Ljava/util/Iterator;",
+            ),
+            (
+                "java/util/Collections",
+                "synchronizedMap",
+                "(Ljava/util/Map;)Ljava/util/Map;",
+            ),
         ] {
             assert!(triple_is_retired_shadow(c, m, d), "not retired: {c}.{m}{d}");
         }
@@ -1585,14 +1649,29 @@ mod tests {
     fn the_held_collection_families_are_not_retired() {
         for (c, m, d) in [
             // needs-VM-support: state is not real.
-            ("java/util/TreeMap", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            (
+                "java/util/TreeMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
             ("java/util/ArrayDeque", "addLast", "(Ljava/lang/Object;)V"),
-            ("java/util/concurrent/ConcurrentHashMap", "put",
-             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
-            ("java/util/Hashtable", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/util/Hashtable",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             ("java/util/LinkedHashSet", "add", "(Ljava/lang/Object;)Z"),
-            ("java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            (
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             ("java/util/HashSet", "iterator", "()Ljava/util/Iterator;"),
             ("java/util/LinkedList", "add", "(Ljava/lang/Object;)Z"),
             // `size`, `get`, `contains`, `isEmpty`, `iterator` and both
@@ -1602,9 +1681,16 @@ mod tests {
             // through `al_itr_slots`, and no per-triple trial has been run on it.
             ("java/util/ArrayList$Itr", "next", "()Ljava/lang/Object;"),
             // Load-bearing FOR the retirements above.
-            ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;"),
+            (
+                "java/util/Arrays",
+                "copyOf",
+                "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+            ),
         ] {
-            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "wrongly retired: {c}.{m}{d}"
+            );
         }
     }
 

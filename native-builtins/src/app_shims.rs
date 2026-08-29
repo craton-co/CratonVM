@@ -482,10 +482,13 @@ pub fn register_jboss_wildfly_xnio_shims(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeKind;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Internal-name prefixes that belong to the JDK, not to any
     /// application. A family registering into one of these cannot be
@@ -541,7 +544,11 @@ mod tests {
             .dump_registrations()
             .into_iter()
             .map(|(class, method, descriptor, _)| {
-                (class.to_string(), method.to_string(), descriptor.to_string())
+                (
+                    class.to_string(),
+                    method.to_string(),
+                    descriptor.to_string(),
+                )
             })
             .collect()
     }
@@ -621,7 +628,11 @@ mod tests {
             .dump_registrations()
             .into_iter()
             .map(|(class, method, descriptor, _)| {
-                (class.to_string(), method.to_string(), descriptor.to_string())
+                (
+                    class.to_string(),
+                    method.to_string(),
+                    descriptor.to_string(),
+                )
             })
             .collect();
 
@@ -654,7 +665,10 @@ mod tests {
                 }
             }
         }
-        assert!(leaks.is_empty(), "application pack classes leaked into core: {leaks:?}");
+        assert!(
+            leaks.is_empty(),
+            "application pack classes leaked into core: {leaks:?}"
+        );
     }
 
     /// `NativeKind` is ambient (`current_category` persists across

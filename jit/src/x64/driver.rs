@@ -254,11 +254,7 @@ pub(super) fn gc_inert_selfrec_candidate(
     while pc < code_len {
         let op = code[pc];
         let allowed = match op {
-            0x00..=0x11
-            | 0x15..=0x2d
-            | 0x36..=0x4e
-            | 0x57..=0x6b
-            | 0x74..=0x98 => true,
+            0x00..=0x11 | 0x15..=0x2d | 0x36..=0x4e | 0x57..=0x6b | 0x74..=0x98 => true,
             // Conditional branches and forward goto only. A backward edge
             // would need cooperative polling and is therefore not GC-inert.
             0x99..=0xa7 | 0xc6 | 0xc7 => {
@@ -322,8 +318,7 @@ pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
 /// A nested body gets its own locals and its own operand stack on top of the
 /// body that splices it, so the reserves add.
 pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
-    let (_, param_span) =
-        crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
     site.nested_sites
         .iter()
         .map(|n| spliced_stack_reserve(&n.site))
@@ -678,19 +673,51 @@ pub fn compile_with_param_slots(
     // (`jit/src/lib.rs::try_compile`) owns and outlives these slots, and
     // minting fresh ones per copy would need code outside this crate's file.
     let (
-        multianewarray_info, field_info, typecheck_info, static_field_info,
-        new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
-        invoke_info, direct_calls, mic_slots, pic_slots,
-        ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
-        loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        new_info,
+        new_deferred_info,
+        anewarray_info,
+        anewarray_deferred_info,
+        invoke_info,
+        direct_calls,
+        mic_slots,
+        pic_slots,
+        ldc_info,
+        ldc_string_info,
+        ldc_class_info,
+        ldc2w_info,
+        branch_hints,
+        loop_unroll_hints,
+        non_escaping_new,
+        inline_sites,
+        compact_field_info,
         indy_info,
     ) = match &loop_xform {
         None => (
-            multianewarray_info, field_info, typecheck_info, static_field_info,
-            new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
-            invoke_info, direct_calls, mic_slots, pic_slots,
-            ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
-            loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
+            multianewarray_info,
+            field_info,
+            typecheck_info,
+            static_field_info,
+            new_info,
+            new_deferred_info,
+            anewarray_info,
+            anewarray_deferred_info,
+            invoke_info,
+            direct_calls,
+            mic_slots,
+            pic_slots,
+            ldc_info,
+            ldc_string_info,
+            ldc_class_info,
+            ldc2w_info,
+            branch_hints,
+            loop_unroll_hints,
+            non_escaping_new,
+            inline_sites,
+            compact_field_info,
             indy_info,
         ),
         Some(x) => (
@@ -1168,63 +1195,62 @@ pub fn compile_with_param_slots(
     // vector is the emitter's proof that duplicating machine code is sound,
     // and "the bytecode was already duplicated" must be visible AT the vector
     // rather than two functions away.
-    let unroll_loops: Vec<(usize, usize, usize)> = if loop_xform.is_some()
-        || !native_unroller_enabled()
-    {
-        Vec::new()
-    } else {
-        loops
-            .iter()
-            .filter_map(|&(header, back_edge)| {
-                // Only unroll loops with goto back-edge (not conditional)
-                if back_edge >= code_len || code[back_edge] != 0xa7 {
-                    return None;
-                }
-                let body_size = back_edge - header;
-                if body_size < 5 {
-                    return None;
-                }
-
-                // PGO path: use profiled trip count if available for this back-edge
-                if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
-                    // `saturating_sub`: the old `pgo_factor - 1` underflowed on
-                    // a 0 hint. A 0/1 factor now means "no extra copies", which
-                    // `plan_native_unroll` refuses as `TooManyCopies`.
-                    let extra_copies = pgo_factor.saturating_sub(1);
-                    // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
-                    if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
-                        return plan_native_unroll(
-                            code,
-                            code_len,
-                            header,
-                            back_edge,
-                            extra_copies,
-                            &exception_ranges,
-                            &bypassable_headers,
-                        );
+    let unroll_loops: Vec<(usize, usize, usize)> =
+        if loop_xform.is_some() || !native_unroller_enabled() {
+            Vec::new()
+        } else {
+            loops
+                .iter()
+                .filter_map(|&(header, back_edge)| {
+                    // Only unroll loops with goto back-edge (not conditional)
+                    if back_edge >= code_len || code[back_edge] != 0xa7 {
+                        return None;
                     }
-                }
+                    let body_size = back_edge - header;
+                    if body_size < 5 {
+                        return None;
+                    }
 
-                // Static heuristic fallback
-                let extra_copies = if body_size <= 20 {
-                    3 // 4x unroll
-                } else if body_size <= 50 {
-                    1 // 2x unroll (covers FP-heavy loops like N-Body advance)
-                } else {
-                    return None;
-                };
-                plan_native_unroll(
-                    code,
-                    code_len,
-                    header,
-                    back_edge,
-                    extra_copies,
-                    &exception_ranges,
-                    &bypassable_headers,
-                )
-            })
-            .collect()
-    };
+                    // PGO path: use profiled trip count if available for this back-edge
+                    if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
+                        // `saturating_sub`: the old `pgo_factor - 1` underflowed on
+                        // a 0 hint. A 0/1 factor now means "no extra copies", which
+                        // `plan_native_unroll` refuses as `TooManyCopies`.
+                        let extra_copies = pgo_factor.saturating_sub(1);
+                        // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
+                        if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
+                            return plan_native_unroll(
+                                code,
+                                code_len,
+                                header,
+                                back_edge,
+                                extra_copies,
+                                &exception_ranges,
+                                &bypassable_headers,
+                            );
+                        }
+                    }
+
+                    // Static heuristic fallback
+                    let extra_copies = if body_size <= 20 {
+                        3 // 4x unroll
+                    } else if body_size <= 50 {
+                        1 // 2x unroll (covers FP-heavy loops like N-Body advance)
+                    } else {
+                        return None;
+                    };
+                    plan_native_unroll(
+                        code,
+                        code_len,
+                        header,
+                        back_edge,
+                        extra_copies,
+                        &exception_ranges,
+                        &bypassable_headers,
+                    )
+                })
+                .collect()
+        };
     if !unroll_loops.is_empty()
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
     {
@@ -1397,14 +1423,13 @@ pub fn compile_with_param_slots(
     let num_hoists = hoist_info.len();
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
-    let non_escaping_for_sr =
-        if precise_exception_frames
-            || cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some()
-        {
-            &empty_non_escaping
-        } else {
-            &non_escaping_new
-        };
+    let non_escaping_for_sr = if precise_exception_frames
+        || cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some()
+    {
+        &empty_non_escaping
+    } else {
+        &non_escaping_new
+    };
     let sr_plan = plan_scalar_replacement(
         code,
         code_len,
@@ -1923,12 +1948,8 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     if crate::deopt_real_enabled() || precise_exception_frames {
         compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
         // Resolve the `Ambiguous` votes per bci where control flow allows it.
-        compiler.local_kinds_refined = refine_ambiguous_local_kinds(
-            code,
-            code_len,
-            &compiler.local_kinds,
-            &exception_ranges,
-        );
+        compiler.local_kinds_refined =
+            refine_ambiguous_local_kinds(code, code_len, &compiler.local_kinds, &exception_ranges);
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
@@ -2485,11 +2506,8 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // The SHADOW aggregate, and a different question from the four terms above
     // — see `CompiledMethod::fully_shadow_covered`. `cm.oop_maps` was assigned
     // above, so this is the complete set this compilation pushed.
-    cm.fully_shadow_covered = !cm.oop_maps.is_empty()
-        && cm
-            .oop_maps
-            .iter()
-            .all(|m| m.moving_young_coverage_complete);
+    cm.fully_shadow_covered =
+        !cm.oop_maps.is_empty() && cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
     // `CRATONVM_DBG_OOPCOV=1` — WHICH of the four terms said no, per method.
     //
     // `moving_young_osr_method_needs_fallback` reports the aggregate as one

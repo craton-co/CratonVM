@@ -210,7 +210,6 @@ use std::hash::{Hash, Hasher};
 
 type CachedInvokeTarget = GenericCachedInvokeTarget<cratonvm_jit::RetainedCode>;
 
-
 /// Per-shard entry cap, so the total across all shards is [`shared_cache_cap`].
 ///
 /// Rounds **up** (`ceil`), which means the true global bound is at most

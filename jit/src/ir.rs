@@ -2167,7 +2167,11 @@ impl Graph {
     /// exclusions (snapshot slots do not count).
     pub fn use_count(&self, id: NodeId) -> u32 {
         if self.use_lists_current() {
-            return self.uses.users.get(id as usize).map_or(0, |u| u.len() as u32);
+            return self
+                .uses
+                .users
+                .get(id as usize)
+                .map_or(0, |u| u.len() as u32);
         }
         if id == NO_NODE {
             return 0;
@@ -3072,7 +3076,7 @@ impl Op {
             // the only defensible one for a node whose callee is a class
             // initialiser.
             Op::ConstString { .. } | Op::ConstClass { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
-            Op::LoadStatic { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
+            Op::LoadStatic { .. } => (2, MemAccess::Opaque),                          // [ctrl, mem]
             // cov-05: same Opaque classification as the three above, for the
             // same reason — the helper it calls can allocate a Class mirror.
             Op::InstanceOf { .. } => (3, MemAccess::Opaque), // [ctrl, mem, obj]
@@ -3495,11 +3499,7 @@ impl Graph {
                 base,
                 offset: fold(offset),
             },
-            AliasClass::ArrayElem {
-                array,
-                index,
-                elem,
-            } => AliasClass::ArrayElem {
+            AliasClass::ArrayElem { array, index, elem } => AliasClass::ArrayElem {
                 array,
                 index: fold(index),
                 elem,
@@ -3650,9 +3650,16 @@ impl Graph {
                 !kinds_disjoint && !i.provably_distinct(j) && self.refs_may_alias(x, y)
             }
             (C::ArrayLength { array: x }, C::ArrayLength { array: y }) => self.refs_may_alias(x, y),
-            (C::Static { class_id: c, field: i }, C::Static { class_id: d, field: j }) => {
-                c == d && i == j
-            }
+            (
+                C::Static {
+                    class_id: c,
+                    field: i,
+                },
+                C::Static {
+                    class_id: d,
+                    field: j,
+                },
+            ) => c == d && i == j,
             (C::Monitor { obj: x }, C::Monitor { obj: y }) => self.refs_may_alias(x, y),
             // Different storage kinds — see the premises in the doc above.
             _ => false,
@@ -4623,8 +4630,12 @@ impl IrBuilder {
         if !self.splice.is_empty() {
             self.splice_guard_seen = true;
         }
-        self.graph
-            .add(Op::Guard { bci: pc }, IrType::Void, vec![ctrl, cond], Some(pc));
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, cond],
+            Some(pc),
+        );
     }
 
     /// FP value tier (inc 30): a `float` constant, stored as its raw 32-bit
@@ -4885,9 +4896,7 @@ impl IrBuilder {
                         // `a ? x : y` shape merges on the stack, not in a
                         // local) — see `phi_data_type`.
                         let phi_ty = self.phi_data_type(&phi_inputs);
-                        let phi = self
-                            .graph
-                            .add(Op::Phi, phi_ty, phi_inputs, Some(target_pc));
+                        let phi = self.graph.add(Op::Phi, phi_ty, phi_inputs, Some(target_pc));
                         self.stack[slot_idx] = phi;
                     }
                 }
@@ -6178,9 +6187,12 @@ impl IrBuilder {
                     } else {
                         Op::MonitorExit
                     };
-                    let mon =
-                        self.graph
-                            .add(op, IrType::Memory, vec![self.ctrl, self.mem, obj], Some(pc));
+                    let mon = self.graph.add(
+                        op,
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, obj],
+                        Some(pc),
+                    );
                     self.mem = mon;
                     pc += 1;
                 }
@@ -6354,7 +6366,8 @@ impl IrBuilder {
                             Some(next) => pc = next,
                             None => return ir_build_bail(line!(), pc),
                         }
-                    } else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                    } else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc)
+                    {
                         let mut args = Vec::with_capacity(num_args);
                         for _ in 0..num_args {
                             args.push(self.pop());
@@ -6894,9 +6907,7 @@ impl IrBuilder {
                         };
                         self.push(c);
                         pc += width;
-                    } else if let Some(&(holder_class_id, cp_idx)) =
-                        self.ldc_string_info.get(&pc)
-                    {
+                    } else if let Some(&(holder_class_id, cp_idx)) = self.ldc_string_info.get(&pc) {
                         let s = self.graph.add(
                             Op::ConstString {
                                 holder_class_id,
@@ -8163,7 +8174,9 @@ mod tests {
     #[test]
     fn test_ir_getfield_and_putfield_admit_the_same_field_tags() {
         for &(long_gate, fp_gate) in &[(false, false), (true, false), (false, true), (true, true)] {
-            for tag in [b'I', b'Z', b'B', b'C', b'S', b'L', b'[', b'J', b'F', b'D', b'V'] {
+            for tag in [
+                b'I', b'Z', b'B', b'C', b'S', b'L', b'[', b'J', b'F', b'D', b'V',
+            ] {
                 // aload_0; getfield #2; return — the read side only needs to
                 // build; leaving the value on the abstract stack at the return
                 // is fine for a straight-line translation.
@@ -8245,8 +8258,7 @@ mod tests {
             // helper, and an `Int`-typed producer would mean the slot was never
             // written as one.
             assert_eq!(
-                graph.nodes[store.inputs[4] as usize].ty,
-                ty,
+                graph.nodes[store.inputs[4] as usize].ty, ty,
                 "{} store value operand type",
                 tag as char
             );
@@ -8431,7 +8443,10 @@ mod tests {
         scan.invoke_ops = (0..IR_MAX_INVOKES + 1)
             .map(|i| (i, i as u16, 0xb8))
             .collect();
-        assert!(!ir_compatible(&scan), "one invoke past the budget is rejected");
+        assert!(
+            !ir_compatible(&scan),
+            "one invoke past the budget is rejected"
+        );
         scan.invoke_ops.clear();
         // A virtual site is admitted on the same budget as a static one — the
         // inline-cache lowering removed the reason to treat it differently.
@@ -8999,7 +9014,9 @@ mod tests {
         assert_eq!(b.graph.nodes[phi as usize].ty, IrType::Ref);
 
         // Memory φs are bookkeeping tokens and are never retyped as values.
-        let mem_phi = b.graph.add(Op::Phi, IrType::Memory, vec![region, back], None);
+        let mem_phi = b
+            .graph
+            .add(Op::Phi, IrType::Memory, vec![region, back], None);
         b.retype_phi(mem_phi);
         assert_eq!(b.graph.nodes[mem_phi as usize].ty, IrType::Memory);
     }
@@ -9323,7 +9340,10 @@ mod tests {
             locals: vec![a, NO_NODE],
             stack: vec![a, b],
         });
-        assert!(g.use_lists_valid(), "push_safepoint keeps the lists current");
+        assert!(
+            g.use_lists_valid(),
+            "push_safepoint keeps the lists current"
+        );
         assert_eq!(g.verify_use_lists(), Ok(()));
         assert_eq!(g.safepoint_users_of(a).len(), 2);
         assert_eq!(
@@ -9634,7 +9654,10 @@ mod tests {
     #[test]
     fn inline_scope_rejects_a_foreign_parent() {
         let mut t = InlineScopeTable::new();
-        assert_eq!(t.push_scope("A.a:()V", 1, None, Some(InlineScopeId(7))), None);
+        assert_eq!(
+            t.push_scope("A.a:()V", 1, None, Some(InlineScopeId(7))),
+            None
+        );
         assert!(t.is_empty());
         // …and an unknown handle reads back as nothing, never as scope 0.
         assert_eq!(t.scope(InlineScopeId(0)), None);
@@ -9757,7 +9780,12 @@ mod tests {
         let (ctrl, mem) = start_preamble(&mut g);
         let obj = ref_param(&mut g, 0);
         let enter = g.add(Op::MonitorEnter, IrType::Memory, vec![ctrl, mem, obj], None);
-        let exit = g.add(Op::MonitorExit, IrType::Memory, vec![ctrl, enter, obj], None);
+        let exit = g.add(
+            Op::MonitorExit,
+            IrType::Memory,
+            vec![ctrl, enter, obj],
+            None,
+        );
 
         assert_eq!(g.memory_effect(enter), MemEffect::monitor_enter(obj));
         assert_eq!(g.memory_effect(exit), MemEffect::monitor_exit(obj));
@@ -9863,8 +9891,14 @@ mod tests {
         // allocations and provably different objects.
         let a = value(&mut g, IrType::Ref);
         let b = value(&mut g, IrType::Ref);
-        assert!(!g.refs_may_alias(a, b), "two fresh allocations are distinct");
-        assert!(!g.may_alias(AliasClass::Monitor { obj: a }, AliasClass::Monitor { obj: b }));
+        assert!(
+            !g.refs_may_alias(a, b),
+            "two fresh allocations are distinct"
+        );
+        assert!(!g.may_alias(
+            AliasClass::Monitor { obj: a },
+            AliasClass::Monitor { obj: b }
+        ));
 
         let enter_a = g.add(Op::MonitorEnter, IrType::Memory, vec![ctrl, mem, a], None);
         let enter_b = g.add(

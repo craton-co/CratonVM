@@ -46,7 +46,6 @@ use super::*;
 
 use crate::runtime::resolve::MemberResolver;
 
-
 /// B5: convert a malformed-constant-pool `ClassFormatError` (produced by
 /// `execute_ldc`/`execute_ldc2w` on a bad CP index or wrong-type entry) into a
 /// catchable Java `java/lang/ClassFormatError`. The verifier normally prevents
@@ -79,7 +78,6 @@ pub(super) fn convert_ldc_class_format_error(
     }
     err
 }
-
 
 /// Canonical instance for a surrogate-bearing string **literal**.
 ///
@@ -221,9 +219,7 @@ pub(super) fn execute_ldc(
                 thread.frames[frame_idx].stack.push(cached)?;
                 return Ok(());
             }
-            None => {
-                super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_MISS)
-            }
+            None => super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_MISS),
         }
     }
 
@@ -400,7 +396,12 @@ pub(super) fn execute_ldc(
             // The pool already guarantees identity; recording it only removes
             // the work of getting back here — the lock, the `get_utf8`, the
             // owned `String` this arm allocated, and the pool's content hash.
-            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
+            record_cp_constant_if_enabled(
+                shared,
+                frame_class_id,
+                index,
+                Value::Object(Some(obj_ref)),
+            );
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -411,7 +412,12 @@ pub(super) fn execute_ldc(
             if remap_trace_on() {
                 push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
             }
-            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(obj_ref)));
+            record_cp_constant_if_enabled(
+                shared,
+                frame_class_id,
+                index,
+                Value::Object(Some(obj_ref)),
+            );
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -442,7 +448,12 @@ pub(super) fn execute_ldc(
             // recorded through this same store on the same key for the same
             // reason. A failed resolution is deliberately NOT recorded: the
             // error must be re-raised on each attempt.
-            record_cp_constant_if_enabled(shared, frame_class_id, index, Value::Object(Some(mirror)));
+            record_cp_constant_if_enabled(
+                shared,
+                frame_class_id,
+                index,
+                Value::Object(Some(mirror)),
+            );
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mirror)))?;
@@ -702,7 +713,10 @@ fn class_mirror_for_field_descriptor(
     frame_class_id: ClassId,
     descriptor: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(inner) = descriptor.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+    if let Some(inner) = descriptor
+        .strip_prefix('L')
+        .and_then(|s| s.strip_suffix(';'))
+    {
         let class_id = resolve_class_loader_aware(shared, thread, frame_class_id, inner)
             .map_err(|e| convert_class_not_found(shared, thread, inner, e))?;
         return Ok(get_or_create_class_mirror(shared, class_id));
@@ -712,7 +726,9 @@ fn class_mirror_for_field_descriptor(
             .map_err(|e| convert_class_not_found(shared, thread, descriptor, e))?;
         return Ok(get_or_create_class_mirror(shared, class_id));
     }
-    Ok(crate::vm::get_or_create_primitive_mirror(shared, descriptor))
+    Ok(crate::vm::get_or_create_primitive_mirror(
+        shared, descriptor,
+    ))
 }
 
 /// JVMS §5.4.3.5 resolution of a `CONSTANT_MethodHandle` reached from `ldc` /
@@ -951,16 +967,15 @@ pub(super) fn resolve_condy_constant(
                 .into())
             }
         };
-        let (name, descriptor) =
-            class
-                .constant_pool
-                .get_name_and_type(nat_index)
-                .ok_or_else(|| {
-                    VmError::Linkage(LinkageError::ClassFormatError {
-                        class_name: class.name.to_string(),
-                        message: format!("ldc: invalid condy name_and_type at #{nat_index}"),
-                    })
-                })?;
+        let (name, descriptor) = class
+            .constant_pool
+            .get_name_and_type(nat_index)
+            .ok_or_else(|| {
+                VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: class.name.to_string(),
+                    message: format!("ldc: invalid condy name_and_type at #{nat_index}"),
+                })
+            })?;
         let bsm = class
             .bootstrap_methods
             .get(bsm_index as usize) // Widening: index conversion
@@ -1313,7 +1328,10 @@ pub(super) fn is_global_resolution_namespace(name: &str) -> bool {
 /// `WebappClassLoader`, and WildFly's module loaders are never
 /// `GroovyClassLoader` instances, so their resolution order is completely
 /// unaffected by this check.
-pub(super) fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectRef) -> bool {
+pub(super) fn is_groovy_class_loader(
+    shared: &SharedVm,
+    loader_obj: cratonvm_types::ObjectRef,
+) -> bool {
     let cm = shared.classes.class_manager.read();
     let loader_class_id = shared.mem.heap.class_id_of(loader_obj);
     match cm.get_loaded_class_id("groovy/lang/GroovyClassLoader") {
@@ -1381,8 +1399,10 @@ pub(super) fn should_use_loader_initiated_resolution(
     if crate::runtime::env_cache::loader_aware_resolution() {
         return true;
     }
-    match cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
-    {
+    match cratonvm_native_builtins::classloader::defining_loader_for(
+        shared.vm_identity,
+        referencing_class_id.as_u32(),
+    ) {
         Some(loader_obj) => {
             is_groovy_class_loader(shared, loader_obj)
                 || is_compile_with_forked_class_loader(shared, loader_obj)
@@ -1563,9 +1583,10 @@ pub(super) fn is_isolated_url_loader_definition(
     referencing_class_id: ClassId,
 ) -> bool {
     use cratonvm_native_api::NativeContext as _;
-    let Some(loader) =
-        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
-    else {
+    let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+        shared.vm_identity,
+        referencing_class_id.as_u32(),
+    ) else {
         return false;
     };
     let ctx = crate::vm::NativeContextImpl { shared, thread };
@@ -1710,8 +1731,11 @@ pub(crate) fn resolve_class_loader_aware(
     // for initiating-resolution map probes merely because another loader was
     // registered elsewhere in the process.
     let has_registered_defining_loader =
-        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32())
-            .is_some();
+        cratonvm_native_builtins::classloader::defining_loader_for(
+            shared.vm_identity,
+            referencing_class_id.as_u32(),
+        )
+        .is_some();
     let has_loader_namespace = direct_user_loader || has_registered_defining_loader;
     let isolated_url_definition = if has_registered_defining_loader {
         is_isolated_url_loader_definition(shared, thread, referencing_class_id)
@@ -1830,7 +1854,9 @@ pub(crate) fn resolve_class_loader_aware(
             // the side table `should_use_loader_initiated_resolution` already
             // consulted directly instead of silently downgrading to "not a
             // user loader" on a disagreement.
-            _ => cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32(),
+            _ => cratonvm_native_builtins::classloader::defining_loader_for(
+                shared.vm_identity,
+                referencing_class_id.as_u32(),
             )
             .map(|loader_obj| {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
@@ -1978,7 +2004,8 @@ pub(crate) fn resolve_class_loader_aware(
                 if drive_defining_loader_load(shared, thread, referencing_class_id, component)
                     .is_some()
                 {
-                    if let Ok(id) = shared.load_class_concurrent_for(name, requesting_frame(thread)) {
+                    if let Ok(id) = shared.load_class_concurrent_for(name, requesting_frame(thread))
+                    {
                         return Ok(id);
                     }
                 }
@@ -2027,8 +2054,10 @@ pub(crate) fn drive_defining_loader_load(
     let dbg_trace = crate::runtime::env_cache::dbg_loader_trace()
         && (name.contains("EnvironmentPostProcessorsFactory")
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
-    let loader_obj_opt =
-        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, referencing_class_id.as_u32());
+    let loader_obj_opt = cratonvm_native_builtins::classloader::defining_loader_for(
+        shared.vm_identity,
+        referencing_class_id.as_u32(),
+    );
     if dbg_trace {
         eprintln!(
             "[LOADER-TRACE] drive_defining_loader_load name={name} referencing_class_id={referencing_class_id:?} defining_loader_for={:?}",

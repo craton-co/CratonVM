@@ -470,7 +470,7 @@ tree where other lanes are landing changes while you write.
 
 * `vm/tests/rbigdec1_arithmetic.rs` — *"so the gate is now live in CI."* It is
   not, three times over: the test opens with `None => return` (a silent skip);
-  the fixture `probes/BdProbe.java` is **untracked** (`?? probes/BdProbe.java`),
+  the fixture `apps/probes/BdProbe.java` is **untracked** (`?? apps/probes/BdProbe.java`),
   so a fresh clone does not have it, and the alternative path
   `apps/bigdecimal_probe/BdProbe.java` does not exist; and `require_fixture` only
   panics under `CRATONVM_REQUIRE_E2E`, which no workflow sets. The adjacent
@@ -485,7 +485,7 @@ tree where other lanes are landing changes while you write.
   reason is not, and the next person to "simplify" them back to the value-shape
   test will be doing it on a false premise.
 * ~~**Two un-recorded §5 residuals**~~ — **BOTH RESOLVED. Row re-run and
-  corrected 2026-08-12 by the lane that owns
+  corrected by the lane that owns
   `known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md`; kept here because
   what it demonstrates is this section's own rule.** The row read: *"`lang_invoke.rs::lk_write_allowed_modes`
   still does a bare `ctx.set_field(obj, 1, Value::Int(modes))` on its error
@@ -504,15 +504,15 @@ tree where other lanes are landing changes while you write.
   two halves of one bullet can rot independently — run every row, and re-read the
   function rather than the citation.** (The source-only audit that wrote this row
   was honest about being source-only. The `lk_write_allowed_modes` half was
-  already repaired when it was written — W7-13 dates that rewrite to 2026-08-07 —
-  and the `lk_previous_lookup_class` half was repaired at some point after,
+  already repaired when it was written, and the `lk_previous_lookup_class`
+  half was repaired at some point after,
   carrying a doc comment that recites the old defect as the thing it replaced. No
   commit is cited for the second because this lane ran no `git` command; the
   evidence is the code.)
 * `regression-suite/jdk-only-coverage.txt` and `regression-suite/README.md`
   state that `run.sh` *"prints a SKIP line with the reason"* for unscheduled
   `--jdk-only` vectors. `run.sh` has no such code.
-* `probes/BdProbe.java`, `regression-suite/src/RJdkPhaser.java` and
+* `apps/probes/BdProbe.java`, `regression-suite/src/RJdkPhaser.java` and
   `regression-suite/src/RJdkFieldModule.java` are **untracked** while `run.sh`
   schedules the latter two. A fresh clone schedules classes whose sources do not
   exist. `apps/` is `.gitignore`d with fixtures force-added, which is how this

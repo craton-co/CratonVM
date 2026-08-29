@@ -106,7 +106,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry, NativeThreadBlock
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -1545,9 +1545,12 @@ pub fn register_xnio_io_thread_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::sync::atomic::AtomicI32;
     use std::sync::{Arc, Barrier};
 

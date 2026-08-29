@@ -1699,7 +1699,10 @@ mod tests {
             ("invoke_virtual_mic", offset_of!(H, invoke_virtual_mic)),
             ("lambda_int_to_double", offset_of!(H, lambda_int_to_double)),
             ("write_barrier", offset_of!(H, write_barrier)),
-            ("satb_pre_write_barrier", offset_of!(H, satb_pre_write_barrier)),
+            (
+                "satb_pre_write_barrier",
+                offset_of!(H, satb_pre_write_barrier),
+            ),
             ("uncommon_trap", offset_of!(H, uncommon_trap)),
             ("math_fma_double", offset_of!(H, math_fma_double)),
             ("math_fma_float", offset_of!(H, math_fma_float)),
@@ -1711,7 +1714,10 @@ mod tests {
                 "tlab_end_offset_in_thread",
                 offset_of!(H, tlab_end_offset_in_thread),
             ),
-            ("class_id_offset_in_obj", offset_of!(H, class_id_offset_in_obj)),
+            (
+                "class_id_offset_in_obj",
+                offset_of!(H, class_id_offset_in_obj),
+            ),
             ("get_current_thread", offset_of!(H, get_current_thread)),
             ("tlab_post_init", offset_of!(H, tlab_post_init)),
             ("frame_record", offset_of!(H, frame_record)),
@@ -1724,9 +1730,15 @@ mod tests {
             ("dispatch_threw", offset_of!(H, dispatch_threw)),
             ("jit_frem", offset_of!(H, jit_frem)),
             ("jit_drem", offset_of!(H, jit_drem)),
-            ("self_call_stack_guard", offset_of!(H, self_call_stack_guard)),
+            (
+                "self_call_stack_guard",
+                offset_of!(H, self_call_stack_guard),
+            ),
             ("region_bounds_addr", offset_of!(H, region_bounds_addr)),
-            ("native_stack_floor_fn", offset_of!(H, native_stack_floor_fn)),
+            (
+                "native_stack_floor_fn",
+                offset_of!(H, native_stack_floor_fn),
+            ),
             ("ldc_string", offset_of!(H, ldc_string)),
             ("safepoint_flag_addr", offset_of!(H, safepoint_flag_addr)),
             ("safepoint_slow_path", offset_of!(H, safepoint_slow_path)),
@@ -1888,7 +1900,12 @@ mod tests {
             "safepoint_slow_path",
             "native_stack_floor_fn",
         ] {
-            assert_eq!(by_name(nullary).arity, 0, "`{}` takes no arguments", nullary);
+            assert_eq!(
+                by_name(nullary).arity,
+                0,
+                "`{}` takes no arguments",
+                nullary
+            );
         }
 
         // The mechanical accessor-naming rule, including the field that
@@ -2060,7 +2077,10 @@ mod tests {
             h.validate_with(JIT_HELPERS_ABI_VERSION),
             Err(HelperAbiError::MissingRequired("newarray")),
         );
-        assert_eq!(h.validate_abi(), Err(HelperAbiError::MissingRequired("newarray")));
+        assert_eq!(
+            h.validate_abi(),
+            Err(HelperAbiError::MissingRequired("newarray"))
+        );
         // The message must name the field.
         let msg = HelperAbiError::MissingRequired("newarray").to_string();
         assert!(msg.contains("newarray"), "unhelpful message: {}", msg);

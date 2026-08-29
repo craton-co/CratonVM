@@ -43,7 +43,10 @@ pub(crate) fn p67_layout_object(
     Ok(obj)
 }
 
-pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p67_optional(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match value {
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
@@ -107,7 +110,10 @@ pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
     }
 }
 
-pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p67_class_mirror(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     match class_name {
         "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
             Ok(ctx.primitive_class_mirror(class_name))
@@ -555,7 +561,10 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
 /// `java.nio.ByteOrder` resolves `name` to slot 0 and gets the String;
 /// a shape where the resolved index is out of range is skipped rather than
 /// written out of bounds.
-pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p67_byte_order_object(
+    ctx: &mut dyn NativeContext,
+    little_endian: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
     let cid = ctx.class_id_of_object(obj);
@@ -770,7 +779,10 @@ pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Result<Value, M
 /// `ArenaImpl.session`) — and that field holds one of OUR sessions, because the
 /// `createConfined`/`createShared` factories are force-dispatched here. A
 /// synthetic receiver has no such field; there, a fresh session is all there is.
-pub(crate) fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_receiver_session(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+) -> Result<Value, MethodCallFailed> {
     // A real-JDK receiver carries it in a named field.
     for name in ["scope", "session"] {
         if let Value::Object(Some(session)) = ctx.get_field_by_name(receiver, name) {
@@ -845,7 +857,10 @@ fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<Object
 /// lifetime. `confined` records the calling thread as the session owner, which
 /// is what lets an off-thread access raise `WrongThreadException`; a shared or
 /// automatic arena leaves the owner null.
-fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRef, MethodCallFailed> {
+fn p67_new_arena(
+    ctx: &mut dyn NativeContext,
+    confined: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
     // The session allocation below can move the fresh arena (native stale-local
     // family).
@@ -874,7 +889,11 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRe
 /// `p67_segment_byte_size`, `p67_segment_address`, and `panama_libffi
 /// ::segment_address`) — a 3-field segment takes the same branches a 2-field
 /// one did.
-fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> Result<ObjectRef, MethodCallFailed> {
+fn p67_arena_segment(
+    ctx: &mut dyn NativeContext,
+    arena: ObjectRef,
+    size: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let arena_pin = ctx.pin_native_root(arena);
     let segment = crate::panama::alloc_segment_carrier(ctx, 3)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
@@ -1758,17 +1777,18 @@ pub(crate) fn p67_layout_path_walk(
                     }
                     None => {
                         return Err(RuntimeError::IllegalArgumentException {
-                            message: format!("cannot resolve layout path element: no member named `{name}`"),
+                            message: format!(
+                                "cannot resolve layout path element: no member named `{name}`"
+                            ),
                         }
                         .into());
                     }
                 }
             }
             P67PathElement::GroupByIndex(idx) => {
-                let found =
-                    p67_group_member_offset(ctx, current, |member_index, _| {
-                        member_index as i64 == idx
-                    });
+                let found = p67_group_member_offset(ctx, current, |member_index, _| {
+                    member_index as i64 == idx
+                });
                 match found {
                     Some((member_offset, member)) => {
                         offset = offset.saturating_add(member_offset);
@@ -1776,7 +1796,9 @@ pub(crate) fn p67_layout_path_walk(
                     }
                     None => {
                         return Err(RuntimeError::IllegalArgumentException {
-                            message: format!("cannot resolve layout path element: no member at index {idx}"),
+                            message: format!(
+                                "cannot resolve layout path element: no member at index {idx}"
+                            ),
                         }
                         .into());
                     }
@@ -1835,7 +1857,10 @@ pub(crate) fn p67_layout_byte_offset(
     Ok(Some(Value::Long(target.offset)))
 }
 
-pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_var_handle_for_layout(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+) -> Result<Value, MethodCallFailed> {
     p67_var_handle_for_path(ctx, layout, 0, &[])
 }
 
@@ -1919,11 +1944,15 @@ pub(crate) fn p67_carrier_descriptor_byte(carrier: &str, width: i32) -> u8 {
     }
 }
 
-pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_var_handle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Value, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout),
         _ => {
-            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
+            let vh =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
             ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
             ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
             ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
@@ -3833,7 +3862,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()J",
         p67_layout_byte_alignment,
     );
-    r.register(seq_layout, "name", "()Ljava/util/Optional;", p67_layout_name);
+    r.register(
+        seq_layout,
+        "name",
+        "()Ljava/util/Optional;",
+        p67_layout_name,
+    );
     r.register(
         seq_layout,
         "withName",
@@ -4089,7 +4123,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         // through `segment_address`/`segment_byte_size`, which accept BOTH
         // segment models, and raises `IndexOutOfBoundsException` where the JDK
         // does rather than `IllegalStateException`.
-        r.register(ms, "getUtf8String", "(J)Ljava/lang/String;", p67_segment_get_string);
+        r.register(
+            ms,
+            "getUtf8String",
+            "(J)Ljava/lang/String;",
+            p67_segment_get_string,
+        );
     }
 
     r.register(
@@ -4234,7 +4273,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(ArrayElementType::Reference, 0),
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
@@ -4368,8 +4408,7 @@ mod g19_scope_tests {
     /// `panama::pe_segment_slice` mint: eight slots, `[1]=byteSize`, and
     /// `[2]` = the segment's own session.
     fn stamped_segment(ctx: &mut dyn NativeContext, session: Value, byte_size: i64) -> ObjectRef {
-        let seg =
-            crate::panama::alloc_segment_carrier(ctx, 8).unwrap();
+        let seg = crate::panama::alloc_segment_carrier(ctx, 8).unwrap();
         ctx.set_field(seg, 0, Value::Long(0));
         ctx.set_field(seg, 1, Value::Long(byte_size));
         ctx.set_field(seg, P67_SEGMENT_ARENA, session);
@@ -4608,7 +4647,12 @@ fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
     // deliberately NOT registered: this implementation decodes UTF-8, and
     // answering a caller that asked for another charset with UTF-8 bytes would
     // be a wrong value where the AbstractMethodError is at least a refusal.
-    r.register(ms, "getString", "(J)Ljava/lang/String;", p67_segment_get_string);
+    r.register(
+        ms,
+        "getString",
+        "(J)Ljava/lang/String;",
+        p67_segment_get_string,
+    );
     // `MemorySegment` does not override `equals` in the JDK — segment equality
     // IS reference identity. The constant `false` this used to return broke
     // even reflexivity (`seg.equals(seg)` was false), so a segment could not be

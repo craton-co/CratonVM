@@ -321,7 +321,9 @@ fn native_mockito_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -
         return Ok(Some(Value::Int(0)));
     };
     let this_referent = ctx.get_field_by_name(*this, "referent");
-    let is_latent = ctx.class_name_arc_of_id(ctx.class_id_of_object(*other)).as_deref()
+    let is_latent = ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(*other))
+        .as_deref()
         == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey");
     let other_key = if is_latent {
         ctx.get_field_by_name(*other, "key")
@@ -330,8 +332,7 @@ fn native_mockito_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     Ok(Some(Value::Int(
         (matches!((this_referent, other_key),
-            (Value::Object(a), Value::Object(b)) if a == b))
-            as i32,
+            (Value::Object(a), Value::Object(b)) if a == b)) as i32,
     )))
 }
 
@@ -349,7 +350,8 @@ fn native_mockito_latent_key_equals(
         return Ok(Some(Value::Int(0)));
     };
     let this_key = ctx.get_field_by_name(*this, "key");
-    let other_key = if ctx.class_name_arc_of_id(ctx.class_id_of_object(*other))
+    let other_key = if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(*other))
         .as_deref()
         == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey")
     {
@@ -359,8 +361,7 @@ fn native_mockito_latent_key_equals(
     };
     Ok(Some(Value::Int(
         (matches!((this_key, other_key),
-            (Value::Object(a), Value::Object(b)) if a == b))
-            as i32,
+            (Value::Object(a), Value::Object(b)) if a == b)) as i32,
     )))
 }
 
@@ -1188,7 +1189,10 @@ mod tests {
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::{FieldMetadata, NativeMethodRegistry};
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     // -----------------------------------------------------------------------

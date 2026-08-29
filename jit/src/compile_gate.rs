@@ -212,12 +212,8 @@ impl CompileDoor {
     pub const fn direct_call_ladder(self) -> &'static str {
         match self {
             CompileDoor::MethodEntry => "jit/src/lib.rs::try_compile_inner",
-            CompileDoor::EagerFirstCall => {
-                "vm/src/runtime/interpreter.rs::direct_calls_early"
-            }
-            CompileDoor::Osr => {
-                "vm/src/runtime/interpreter/jit_bridge.rs::direct_calls2"
-            }
+            CompileDoor::EagerFirstCall => "vm/src/runtime/interpreter.rs::direct_calls_early",
+            CompileDoor::Osr => "vm/src/runtime/interpreter/jit_bridge.rs::direct_calls2",
         }
     }
 }
@@ -316,24 +312,13 @@ impl std::fmt::Display for CompileRefusal {
     }
 }
 
-static ADMISSIONS: [AtomicU64; 3] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static REFUSALS: [AtomicU64; 3] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static ADMISSIONS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static REFUSALS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static UNGATED_BACKEND_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// Direct-call rows that reached the backend under an admission whose door
 /// never declared a [`DirectCallPolicy`]. See [`undeclared_direct_bind_rows`].
-static UNDECLARED_DIRECT_BIND_ROWS: [AtomicU64; 3] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static UNDECLARED_DIRECT_BIND_ROWS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 thread_local! {
     /// Depth of open admissions on this thread. A count rather than a flag
@@ -602,8 +587,7 @@ pub fn note_direct_binds(admission: &CompileAdmission, n: usize) {
         return;
     }
     if admission.direct_call_policy().is_none() {
-        UNDECLARED_DIRECT_BIND_ROWS[admission.door.index()]
-            .fetch_add(n as u64, Ordering::Relaxed);
+        UNDECLARED_DIRECT_BIND_ROWS[admission.door.index()].fetch_add(n as u64, Ordering::Relaxed);
     }
 }
 
@@ -712,10 +696,10 @@ mod tests {
     #[test]
     fn admissions_nest() {
         let _guard = COUNTER_LOCK.lock();
-        let outer = admit(&unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry)
-            .expect("admits");
-        let inner = admit(&unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry)
-            .expect("admits");
+        let outer =
+            admit(&unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry).expect("admits");
+        let inner =
+            admit(&unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry).expect("admits");
         drop(inner);
         assert!(
             admission_is_open(),

@@ -208,7 +208,10 @@ fn aio_closed_err() -> std::io::Error {
 /// and enforces it itself. Without this a wakeup fix would have removed one
 /// hang and introduced another on every timed read.
 fn aio_deadline(timeout: std::io::Result<Option<Duration>>) -> Option<std::time::Instant> {
-    timeout.ok().flatten().map(|t| std::time::Instant::now() + t)
+    timeout
+        .ok()
+        .flatten()
+        .map(|t| std::time::Instant::now() + t)
 }
 
 /// The poll slice for this pass: `AIO_CLOSE_POLL_MS`, clamped to the time left
@@ -1578,9 +1581,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                                 ) {
                                     break Err(aio_closed_err());
                                 }
-                                std::thread::sleep(Duration::from_millis(
-                                    AIO_CLOSE_POLL_MS as u64,
-                                ));
+                                std::thread::sleep(Duration::from_millis(AIO_CLOSE_POLL_MS as u64));
                             }
                             // EINTR on a parked accept is a transient
                             // interruption, not a failed accept -- see
@@ -1960,7 +1961,11 @@ fn flush_pending_root_releases(ctx: &mut dyn NativeContext) {
                     Value::Int(v) if v >= 0 => v,
                     _ => 0,
                 };
-                ctx.set_field_by_name(bb, "position", Value::Int(position.saturating_add(r.advance)));
+                ctx.set_field_by_name(
+                    bb,
+                    "position",
+                    Value::Int(position.saturating_add(r.advance)),
+                );
             }
         }
         ctx.remove_global_root(r.gref);
@@ -2032,10 +2037,7 @@ const ACG_IMPLS: &[&str] = &[
 /// Its two abstract parents, mirror targets for the same reason as
 /// [`ASC_ABSTRACT_IMPL`]: `shutdown`/`isShutdown`/`awaitTermination` are
 /// declared there, with `Code`.
-const ACG_ABSTRACT_IMPLS: &[&str] = &[
-    "sun/nio/ch/Port",
-    "sun/nio/ch/AsynchronousChannelGroupImpl",
-];
+const ACG_ABSTRACT_IMPLS: &[&str] = &["sun/nio/ch/Port", "sun/nio/ch/AsynchronousChannelGroupImpl"];
 
 /// Where this module's private slot map (`F_OPEN`..`F_REMOTE`) starts on `o`.
 ///
@@ -2832,12 +2834,11 @@ static AIO_QUEUE_N: AtomicUsize = AtomicUsize::new(0);
 static AIO_DELIVER_NS: AtomicUsize = AtomicUsize::new(0);
 static AIO_DELIVER_N: AtomicUsize = AtomicUsize::new(0);
 
-fn aio_latency_record(
-    total: &AtomicUsize,
-    count: &AtomicUsize,
-    d: std::time::Duration,
-) {
-    total.fetch_add(d.as_nanos().min(usize::MAX as u128) as usize, Ordering::Relaxed);
+fn aio_latency_record(total: &AtomicUsize, count: &AtomicUsize, d: std::time::Duration) {
+    total.fetch_add(
+        d.as_nanos().min(usize::MAX as u128) as usize,
+        Ordering::Relaxed,
+    );
     let n = count.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 500 == 0 {
         aio_latency_report();
@@ -3642,7 +3643,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
         aio_get_option,
     );
-    r.register(asc, "supportedOptions", "()Ljava/util/Set;", aio_supported_options);
+    r.register(
+        asc,
+        "supportedOptions",
+        "()Ljava/util/Set;",
+        aio_supported_options,
+    );
     r.register(
         asc,
         "getRemoteAddress",
@@ -3723,7 +3729,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
         aio_get_option,
     );
-    r.register(assc, "supportedOptions", "()Ljava/util/Set;", aio_supported_options);
+    r.register(
+        assc,
+        "supportedOptions",
+        "()Ljava/util/Set;",
+        aio_supported_options,
+    );
     r.register(
         assc,
         "bind",
@@ -3845,10 +3856,13 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// No private slot in this module may be indexed RAW — every access goes
     /// through `aio_get`/`aio_set`/`aio_has`, which add `aio_base`.
@@ -3916,10 +3930,7 @@ mod tests {
 
         push_handler_completion(Completion {
             roots,
-            outcome: Ok(CompletionKind::WriteCount {
-                n: 7,
-                buffer_gref,
-            }),
+            outcome: Ok(CompletionKind::WriteCount { n: 7, buffer_gref }),
         });
         drain_completions(&mut ctx);
 
