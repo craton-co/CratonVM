@@ -2637,6 +2637,31 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     if let Ok(v6) = host.parse::<Ipv6Addr>() {
         return Ok(IpAddr::V6(v6));
     }
+    // A SCOPED IPv6 literal — `fe80::1%14`, `fe80::1%eth0`,
+    // `fe80::1%{04C70698-…}` on Windows, where our interface names are the
+    // adapter GUIDs. `Ipv6Addr::from_str` rejects the suffix, so without this
+    // the whole text fell through to DNS and came back
+    // `UnknownHostException` — including for text this VM had just PRODUCED
+    // itself: `Inet6Address.getHostAddress()` renders `%<interface name>`, and
+    // anything that puts an address on the wire as text and parses it back
+    // (netty's SOCKS4 proxy handler, every `URI`-shaped config) round-trips
+    // through exactly this call.
+    //
+    // HotSpot's rule, which this follows: a numeric scope is taken as-is, and
+    // a NAMED scope has to name an interface that exists — an unknown name is
+    // an unknown host, not scope 0. Scanning the interfaces costs a syscall,
+    // and only a literal carrying a `%` ever reaches it.
+    if let Some((bare, scope)) = host.split_once('%') {
+        if !scope.is_empty() {
+            if let Ok(v6) = bare.parse::<Ipv6Addr>() {
+                let numeric = scope.bytes().all(|b| b.is_ascii_digit());
+                if numeric || re8_scan_host_ifaces().iter().any(|i| i.name == scope) {
+                    return Ok(IpAddr::V6(v6));
+                }
+                return Err(uhex(host.to_string()));
+            }
+        }
+    }
     let lookup = format!("{host}:0");
     let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str())
         .map_err(|e| uhex(format!("{host}: {e}")))?;
@@ -18139,6 +18164,32 @@ struct Re8HostIface {
     /// Hardware address; empty for loopback and other address-less interfaces.
     mac: Vec<u8>,
     addrs: Vec<IpAddr>,
+    /// The IPv6 scope each entry of `addrs` carries, same length and order
+    /// (0 for IPv4, and for an IPv6 address that has no scope).
+    ///
+    /// This column exists because the two platforms genuinely disagree, and a
+    /// single rule gets one of them wrong. On Linux the JDK's enumeration
+    /// reads `/proc/net/if_inet6` and stores the interface INDEX as the scope
+    /// of every row, so `lo`'s address really is `0:0:0:0:0:0:0:1%lo` with
+    /// `getScopeId() == 1` even though `getifaddrs` reports
+    /// `sin6_scope_id == 0` for it. On Windows the JDK reads
+    /// `sin6_scope_id` from `GetAdaptersAddresses`, which is the interface
+    /// index for a link-local address and **0 for the loopback and for global
+    /// addresses** — measured against HotSpot 25 on this host, where
+    /// `loopback_0`'s address is a bare `0:0:0:0:0:0:0:1` with
+    /// `getScopeId() == 0` and `getScopedInterface() == null`, and only the
+    /// `fe80:` rows are scoped.
+    ///
+    /// Scoping everything, which is what this did, is right on Linux and
+    /// wrong on Windows in a way that leaves the address text unable to
+    /// round-trip: `getHostAddress()` answered
+    /// `0:0:0:0:0:0:0:1%{3C307829-…}` and `InetAddress.getByName` of that
+    /// threw `UnknownHostException`. netty's `Socks4ProxyHandler` puts
+    /// `getHostAddress()` of the destination on the wire and the proxy server
+    /// feeds the text straight back to `getByName`, so every proxy-chain hop
+    /// over the IPv6 loopback failed — 8 of `ProxyHandlerTest`'s 47
+    /// parameterisations, against 47/47 on HotSpot.
+    addr_scopes: Vec<u32>,
 }
 
 // `IFF_*` bits. The low bits are identical on Linux and the BSDs; only
@@ -18271,6 +18322,7 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
                     mtu: None,
                     mac: Vec::new(),
                     addrs: Vec::new(),
+                    addr_scopes: Vec::new(),
                 });
                 out.len() - 1
             }
@@ -18316,6 +18368,16 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
         iface.mac = re8_sys_attr(&iface.name, "address")
             .map(|t| re8_parse_mac(&t))
             .unwrap_or_default();
+        // Unchanged behaviour, now written down as data: the JDK's Linux pass
+        // scopes every IPv6 row to the interface index (see `addr_scopes`).
+        // `.max(1)` keeps a scope even when `if_nametoindex` could not answer,
+        // which is what the unconditional suffix used to do.
+        let scope = (iface.index.max(1)) as u32;
+        iface.addr_scopes = iface
+            .addrs
+            .iter()
+            .map(|ip| if ip.is_ipv6() { scope } else { 0 })
+            .collect();
     }
     out
 }
@@ -18371,22 +18433,35 @@ struct Re8WinUnicastAddress {
 /// `&IP_ADAPTER_UNICAST_ADDRESS` borrowed from the OS-owned list. The whole
 /// Windows arm of this function is `#[cfg(windows)]`, so a Linux-only build
 /// never type-checked it.
-unsafe fn re8_win_ip(address: &Re8WinSocketAddress) -> Option<IpAddr> {
+unsafe fn re8_win_ip(address: &Re8WinSocketAddress) -> Option<(IpAddr, u32)> {
     if address.address.is_null() || address.length < 2 {
         return None;
     }
     let family = u16::from_ne_bytes([*address.address, *address.address.add(1)]);
     match family {
-        2 if address.length >= 8 => Some(IpAddr::V4(Ipv4Addr::new(
-            *address.address.add(4),
-            *address.address.add(5),
-            *address.address.add(6),
-            *address.address.add(7),
-        ))),
+        2 if address.length >= 8 => Some((
+            IpAddr::V4(Ipv4Addr::new(
+                *address.address.add(4),
+                *address.address.add(5),
+                *address.address.add(6),
+                *address.address.add(7),
+            )),
+            0,
+        )),
         23 if address.length >= 24 => {
             let mut octets = [0u8; 16];
             std::ptr::copy_nonoverlapping(address.address.add(8), octets.as_mut_ptr(), 16);
-            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+            // `sockaddr_in6` is family(2) port(2) flowinfo(4) addr(16)
+            // scope_id(4); a short `SOCKET_ADDRESS` that stops before the
+            // scope word is read as unscoped rather than as garbage.
+            let scope = if address.length >= 28 {
+                let mut raw = [0u8; 4];
+                std::ptr::copy_nonoverlapping(address.address.add(24), raw.as_mut_ptr(), 4);
+                u32::from_ne_bytes(raw)
+            } else {
+                0
+            };
+            Some((IpAddr::V6(Ipv6Addr::from(octets)), scope))
         }
         _ => None,
     }
@@ -18465,12 +18540,14 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
                     Vec::new()
                 };
                 let mut addrs = Vec::new();
+                let mut addr_scopes = Vec::new();
                 let mut unicast = adapter.first_unicast_address;
                 while !unicast.is_null() {
                     let entry = unsafe { &*unicast };
-                    if let Some(ip) = unsafe { re8_win_ip(&entry.address) } {
+                    if let Some((ip, scope)) = unsafe { re8_win_ip(&entry.address) } {
                         if !addrs.contains(&ip) {
                             addrs.push(ip);
+                            addr_scopes.push(scope);
                         }
                     }
                     unicast = entry.next;
@@ -18482,6 +18559,7 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
                     mtu: (adapter.mtu != 0).then_some(adapter.mtu.min(i32::MAX as u32) as i32),
                     mac,
                     addrs,
+                    addr_scopes,
                 });
             }
             current = adapter.next;
@@ -18534,6 +18612,7 @@ fn re8_host_iface_by_name(name: &str) -> Option<Re8HostIface> {
                 .map(|t| re8_parse_mac(&t))
                 .unwrap_or_default(),
             addrs: Vec::new(),
+            addr_scopes: Vec::new(),
         });
     }
     re8_scan_host_ifaces()
@@ -18632,19 +18711,15 @@ fn re8_make_interface(
         // still answers the numeric text, because that is its no-name
         // fallback.
         let label = NO_HOST_NAME;
-        // EVERY IPv6 address reached through an interface is scoped to that
-        // interface, not just the link-local ones. Measured against HotSpot
-        // JDK 25 on this host: `lo`'s address is `0:0:0:0:0:0:0:1%lo` with
-        // `getScopeId() == 1`, even though `getifaddrs` reports
-        // `sin6_scope_id == 0` for it. The JDK's Linux enumeration reads
-        // `/proc/net/if_inet6` and stores the interface INDEX as the scope for
-        // every row, then `createNetworkInterface` attaches the interface as
-        // `scope_ifname` whenever that scope is non-zero — so the suffix is
-        // the interface NAME and the id is its index. Deriving the suffix from
-        // `sin6_scope_id` instead would leave `::1%lo` unscoped.
+        // An IPv6 address gets the `%<interface>` suffix exactly when its
+        // scope says so — which on Linux is every row and on Windows only the
+        // link-local ones. `addr_scopes` carries the platform's answer and its
+        // doc comment carries the measurement behind it; a single rule here
+        // was right on one platform and unable to round-trip on the other.
+        let scope = host.addr_scopes.get(i).copied().unwrap_or(0);
         let text = match ip {
-            IpAddr::V6(_) => format!("{ip}%{}", host.name),
-            IpAddr::V4(_) => ip.to_string(),
+            IpAddr::V6(_) if scope != 0 => format!("{ip}%{}", host.name),
+            _ => ip.to_string(),
         };
         // Allocates several objects, so re-read the array through its pin
         // before storing into it (native stale-local family).
@@ -18692,9 +18767,24 @@ fn re8_make_interface(
     let addrs_now = ctx.read_native_pin(base_pin, addrs);
     let iface_now = ctx.read_native_pin(iface_pin, iface0);
     for i in 0..ctx.array_length(addrs_now) {
+        // Only a SCOPED address carries the interface. An unscoped one that
+        // did got a `%<interface>` suffix out of `getHostAddress()` (the
+        // renderer prefers `scope_ifname` over the numeric id) even though
+        // nothing else about it was scoped — which is the bug this column
+        // fixes, so the two must agree.
+        let scope = host.addr_scopes.get(i as usize).copied().unwrap_or(0);
+        if scope == 0 {
+            continue;
+        }
         if let Value::Object(Some(a)) = ctx.get_array_element(addrs_now, i) {
             if let Value::Object(Some(h6)) = ctx.get_field_by_name(a, "holder6") {
                 ctx.set_field_by_name(h6, "scope_ifname", Value::Object(Some(iface_now)));
+                // HotSpot answers the interface index from `getScopeId()` for
+                // a scoped address; ours answered 0 for every one of them,
+                // because nothing ever wrote the numeric half. The renderer
+                // still prefers `scope_ifname`, so the text is unchanged.
+                ctx.set_field_by_name(h6, "scope_id", Value::Int(scope as i32));
+                ctx.set_field_by_name(h6, "scope_id_set", Value::Int(1));
             }
         }
     }
