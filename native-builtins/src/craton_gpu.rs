@@ -1200,8 +1200,7 @@ fn builtin_submit_method(
     let timed = dispatch_timing::enabled();
     let handle = submit_method_dispatch(ctx, args)?;
     let mark = std::time::Instant::now();
-    let wrapper =
-        instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
+    let wrapper = instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
     if timed {
         dispatch_timing::add(7, mark.elapsed().as_nanos() as u64);
     }
@@ -1255,19 +1254,25 @@ fn submit_method_dispatch_on(
     let class_name = match arg_object(args, 1).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            return Ok(record_failed_future_with_message("submitMethod: className was null"));
+            return Ok(record_failed_future_with_message(
+                "submitMethod: className was null",
+            ));
         }
     };
     let method_name = match arg_object(args, 2).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            return Ok(record_failed_future_with_message("submitMethod: methodName was null"));
+            return Ok(record_failed_future_with_message(
+                "submitMethod: methodName was null",
+            ));
         }
     };
     let descriptor = match arg_object(args, 3).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            return Ok(record_failed_future_with_message("submitMethod: descriptor was null"));
+            return Ok(record_failed_future_with_message(
+                "submitMethod: descriptor was null",
+            ));
         }
     };
 
@@ -1283,7 +1288,9 @@ fn submit_method_dispatch_on(
     let java_args_obj = match arg_object(args, 4) {
         Some(o) => o,
         None => {
-            return Ok(record_failed_future_with_message("submitMethod: args array was null"));
+            return Ok(record_failed_future_with_message(
+                "submitMethod: args array was null",
+            ));
         }
     };
     let n = ctx.array_length(java_args_obj);
@@ -2051,10 +2058,13 @@ fn builtin_release_array(
 
 #[cfg(all(test, feature = "gpu-offload"))]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     // Brings `.get_field(...)` (and friends) into scope for direct calls
     // on a concrete `MockNativeContext` in the scalar-boxing tests below
     // (elsewhere in this file `ctx` only ever appears as `&mut dyn

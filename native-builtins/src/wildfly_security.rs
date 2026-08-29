@@ -78,7 +78,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ===========================================================================
 // Principal — interned, immutable name; value-equality on name only.
@@ -1761,7 +1761,12 @@ pub fn register_jdk_security_natives(r: &mut NativeMethodRegistry) {
     // `JaasCredentialsValidator` uses the 2-arg (String, CallbackHandler)
     // form; see fixed-suite-bugs/h2-suite-bugs/
     // bug-h2-jaas-logincontext-two-arg-ctor-gap.md.
-    r.register(lc, "<init>", "(Ljava/lang/String;)V", native_login_context_init_name_only);
+    r.register(
+        lc,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_login_context_init_name_only,
+    );
     r.register(
         lc,
         "<init>",
@@ -1828,10 +1833,13 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
     use std::sync::Mutex;
 

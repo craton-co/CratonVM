@@ -15,7 +15,6 @@
 
 use super::*;
 
-
 /// Information about a vectorizable int-array sum reduction loop.
 /// Pattern: for (i = start; i < bound; i++) sum += arr[i]
 #[derive(Debug)]
@@ -328,10 +327,10 @@ pub(super) fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
 /// Extract local index from an istore instruction at pc.
 pub(super) fn extract_istore_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
-        0x3b => Some(0), // istore_0
-        0x3c => Some(1), // istore_1
-        0x3d => Some(2), // istore_2
-        0x3e => Some(3), // istore_3
+        0x3b => Some(0),                               // istore_0
+        0x3c => Some(1),                               // istore_1
+        0x3d => Some(2),                               // istore_2
+        0x3e => Some(3),                               // istore_3
         0x36 => code.get(pc + 1).map(|&b| b as usize), // istore
         _ => None,
     }
@@ -2256,7 +2255,11 @@ pub mod vector_gate {
         /// `for i: c[i] = a[i] + b[i]` over three freshly-allocated `int[]`.
         fn independent_int_loop() -> (Graph, Case) {
             let mut g = empty_graph();
-            let (a, b, c) = (fresh_array(&mut g), fresh_array(&mut g), fresh_array(&mut g));
+            let (a, b, c) = (
+                fresh_array(&mut g),
+                fresh_array(&mut g),
+                fresh_array(&mut g),
+            );
             let body = vec![
                 read(&mut g, a, 0, MemKind::Int),
                 read(&mut g, b, 0, MemKind::Int),
@@ -2292,7 +2295,11 @@ pub mod vector_gate {
         /// reassociation and no NaN-ordering question.
         fn fp_elementwise_loop() -> (Graph, Case) {
             let mut g = empty_graph();
-            let (a, b, c) = (fresh_array(&mut g), fresh_array(&mut g), fresh_array(&mut g));
+            let (a, b, c) = (
+                fresh_array(&mut g),
+                fresh_array(&mut g),
+                fresh_array(&mut g),
+            );
             let body = vec![
                 read(&mut g, a, 0, MemKind::Double),
                 read(&mut g, b, 0, MemKind::Double),
@@ -2499,7 +2506,11 @@ pub mod vector_gate {
             case.base_alignment = 16;
             let elem = elem_bytes(MemKind::Int) as i64;
             let pad = (16 - (HEADER_SIZE as i64 % 16)) % 16;
-            assert_eq!(pad % elem, 0, "header padding must land on an element boundary");
+            assert_eq!(
+                pad % elem,
+                0,
+                "header padding must land on an element boundary"
+            );
             case.counted = counted_loop((pad / elem) as i32, 1024);
             (g, case)
         }
@@ -2620,7 +2631,11 @@ pub mod vector_gate {
                 ("fp max reduction", fp_max_reduction_loop, false),
                 ("carried distance 1", carried_distance_one_loop, false),
                 ("carried distance 4", carried_distance_four_loop, true),
-                ("forward anti-dependence", forward_anti_dependence_loop, true),
+                (
+                    "forward anti-dependence",
+                    forward_anti_dependence_loop,
+                    true,
+                ),
                 (
                     "backward anti-dependence",
                     backward_anti_dependence_loop,
@@ -3135,7 +3150,10 @@ pub mod vector_gate {
             // all, because MOVDQU is correct.
             let (g, case) = distinct_allocation_loop();
             let verdict = case.run(&g);
-            assert_eq!(verdict.plan().expect("admitted").alignment, Alignment::Unknown);
+            assert_eq!(
+                verdict.plan().expect("admitted").alignment,
+                Alignment::Unknown
+            );
         }
 
         #[test]
@@ -3202,10 +3220,10 @@ pub mod vector_gate {
             case.counted = counted_loop(0, 2);
             let verdict = case.run(&g);
             assert!(
-                verdict.refusals().iter().any(|r| matches!(
-                    r,
-                    VecRefusal::TripCountTooSmall { min_trips: 2, .. }
-                )),
+                verdict
+                    .refusals()
+                    .iter()
+                    .any(|r| matches!(r, VecRefusal::TripCountTooSmall { min_trips: 2, .. })),
                 "a loop known to run twice cannot enter a four-lane body: {:?}",
                 verdict.refusals()
             );

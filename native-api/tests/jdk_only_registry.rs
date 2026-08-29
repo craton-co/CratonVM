@@ -270,9 +270,30 @@ fn strict_registry_census_contains_zero_synthetic_stub_entries() {
     // A representative mix: two keepers and two fakes, interleaved so a
     // "refuse the tail after the first stub" bug would be visible.
     register_as(&mut reg, NativeKind::Bridge, "a/A", "one", "()V", cb_one);
-    register_as(&mut reg, NativeKind::SyntheticStub, "a/A", "two", "()V", cb_one);
-    register_as(&mut reg, NativeKind::Intrinsic, "a/A", "three", "()I", cb_two);
-    register_as(&mut reg, NativeKind::SyntheticStub, "b/B", "four", "()V", cb_two);
+    register_as(
+        &mut reg,
+        NativeKind::SyntheticStub,
+        "a/A",
+        "two",
+        "()V",
+        cb_one,
+    );
+    register_as(
+        &mut reg,
+        NativeKind::Intrinsic,
+        "a/A",
+        "three",
+        "()I",
+        cb_two,
+    );
+    register_as(
+        &mut reg,
+        NativeKind::SyntheticStub,
+        "b/B",
+        "four",
+        "()V",
+        cb_two,
+    );
 
     let census = reg.census();
     let stubs: Vec<_> = census
@@ -369,7 +390,9 @@ fn census_records_the_registration_site() {
          registry.rs; got {site:?}"
     );
     assert!(
-        site.rsplit(':').next().is_some_and(|l| l.parse::<u32>().is_ok()),
+        site.rsplit(':')
+            .next()
+            .is_some_and(|l| l.parse::<u32>().is_ok()),
         "registered_by is 'file:line'; got {site:?}"
     );
 }
@@ -417,8 +440,16 @@ fn strict_census_is_deterministic() {
     populate(&mut b);
 
     assert_eq!(census_shape(&a), census_shape(&b));
-    let refused_a: Vec<_> = a.refused_registrations().iter().map(|v| v.summary()).collect();
-    let refused_b: Vec<_> = b.refused_registrations().iter().map(|v| v.summary()).collect();
+    let refused_a: Vec<_> = a
+        .refused_registrations()
+        .iter()
+        .map(|v| v.summary())
+        .collect();
+    let refused_b: Vec<_> = b
+        .refused_registrations()
+        .iter()
+        .map(|v| v.summary())
+        .collect();
     assert_eq!(
         refused_a, refused_b,
         "the refusal list is part of the strict-mode artifact and must be \
@@ -433,9 +464,30 @@ fn strict_census_is_deterministic() {
 #[test]
 fn invocations_of_kind_counts_dispatches() {
     let mut reg = NativeMethodRegistry::new();
-    register_as(&mut reg, NativeKind::Bridge, "i/I", "bridged", "()V", cb_one);
-    register_as(&mut reg, NativeKind::Intrinsic, "i/I", "fast", "()I", cb_two);
-    register_as(&mut reg, NativeKind::SyntheticStub, "i/I", "fake", "()V", cb_one);
+    register_as(
+        &mut reg,
+        NativeKind::Bridge,
+        "i/I",
+        "bridged",
+        "()V",
+        cb_one,
+    );
+    register_as(
+        &mut reg,
+        NativeKind::Intrinsic,
+        "i/I",
+        "fast",
+        "()I",
+        cb_two,
+    );
+    register_as(
+        &mut reg,
+        NativeKind::SyntheticStub,
+        "i/I",
+        "fake",
+        "()V",
+        cb_one,
+    );
 
     for kind in [
         NativeKind::Bridge,
@@ -495,7 +547,14 @@ fn invocation_counters_survive_re_registration_on_the_winning_slot() {
     // pins the documented behaviour so a future refactor to per-registration
     // counters is a deliberate, visible change rather than silent drift.
     let mut reg = NativeMethodRegistry::new();
-    register_as(&mut reg, NativeKind::SyntheticStub, "r/R", "m", "()V", cb_one);
+    register_as(
+        &mut reg,
+        NativeKind::SyntheticStub,
+        "r/R",
+        "m",
+        "()V",
+        cb_one,
+    );
     let id = reg.resolve_id("r/R", "m", "()V").expect("resolvable");
     reg.record_invocation(id);
     register_as(&mut reg, NativeKind::Bridge, "r/R", "m", "()V", cb_two);

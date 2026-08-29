@@ -445,8 +445,8 @@ mod sys {
     }
 }
 
-use sys::AF_UNIX;
 pub use sys::RawSock;
+use sys::AF_UNIX;
 
 /// True when this build/platform can create AF_UNIX stream sockets at all.
 /// Mirrors `sun.nio.ch.UnixDomainSockets.isSupported()`.

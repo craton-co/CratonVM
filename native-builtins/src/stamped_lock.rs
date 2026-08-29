@@ -926,9 +926,12 @@ pub fn rw_is_write_locked(parent_addr: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Each test allocates a unique synthetic "object address" so the
@@ -1047,7 +1050,10 @@ mod tests {
         );
         // WBIT is inside SBITS, so setting it makes the stamp name a
         // different lock state — the JDK rejects it and so must we.
-        assert!(!stamped_unlock_read(a, r | WBIT), "SBITS mismatch must be rejected");
+        assert!(
+            !stamped_unlock_read(a, r | WBIT),
+            "SBITS mismatch must be rejected"
+        );
         assert_eq!(stamped_get_read_lock_count(a), 1);
         assert!(stamped_unlock_read(a, r));
         assert!(!stamped_unlock_read(a, r), "no hold left to release");
@@ -1216,7 +1222,10 @@ mod tests {
         stamped_init(a);
         let opt = stamped_try_optimistic_read(a);
         let rd = stamped_read_lock(a);
-        assert_ne!(opt, rd, "an optimistic stamp must not look like a read stamp");
+        assert_ne!(
+            opt, rd,
+            "an optimistic stamp must not look like a read stamp"
+        );
         // Converting the OPTIMISTIC stamp must not steal the reader's hold.
         assert!(stamped_try_convert_to_optimistic(a, opt) != 0);
         assert_eq!(stamped_get_read_lock_count(a), 1);

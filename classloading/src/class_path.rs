@@ -642,7 +642,10 @@ fn same_classpath_source(a: &ClassPathEntry, b: &ClassPathEntry) -> bool {
         (ClassPathEntry::Directory(x), ClassPathEntry::Directory(y)) => x == y,
         (ClassPathEntry::JarFile { path: x, .. }, ClassPathEntry::JarFile { path: y, .. })
         | (ClassPathEntry::JmodFile { path: x, .. }, ClassPathEntry::JmodFile { path: y, .. })
-        | (ClassPathEntry::JImageFile { path: x, .. }, ClassPathEntry::JImageFile { path: y, .. }) => x == y,
+        | (
+            ClassPathEntry::JImageFile { path: x, .. },
+            ClassPathEntry::JImageFile { path: y, .. },
+        ) => x == y,
         (
             ClassPathEntry::NestedDirectory {
                 parent_jar: xj,
@@ -2807,7 +2810,6 @@ impl ClassPath {
         })
     }
 
-
     /// Is `relative_path` present under the `Directory` entry `dir`, according
     /// to [`ClassPath::dir_index`]?
     ///
@@ -2829,7 +2831,9 @@ impl ClassPath {
         }
         let built = Self::build_dir_index(dir);
         let answer = built.as_ref().map(|set| set.contains(relative_path));
-        self.dir_index.lock().insert(dir.to_path_buf(), built.clone());
+        self.dir_index
+            .lock()
+            .insert(dir.to_path_buf(), built.clone());
         answer
     }
 
@@ -2940,11 +2944,7 @@ impl ClassPath {
             .or_else(|| self.find_class_source_path_pass(class_name, false))
     }
 
-    fn find_class_source_path_pass(
-        &self,
-        class_name: &str,
-        use_dir_index: bool,
-    ) -> Option<String> {
+    fn find_class_source_path_pass(&self, class_name: &str, use_dir_index: bool) -> Option<String> {
         let relative_path = format!("{}.class", class_name);
         for entry in &self.entries {
             match entry {
@@ -4444,12 +4444,7 @@ impl ClassPath {
                 let slash_entry = if direct_entry.is_none() && !name.ends_with('/') {
                     let alt = format!("{name}/");
                     if *multi_release {
-                        Self::multi_release_entry_name(
-                            archive,
-                            versions_cache,
-                            entry_index,
-                            &alt,
-                        )
+                        Self::multi_release_entry_name(archive, versions_cache, entry_index, &alt)
                     } else {
                         entry_index.contains(&alt).then_some(alt)
                     }
@@ -4462,7 +4457,11 @@ impl ClassPath {
                         "[GRES-DBG]   jar {} mr={} -> {}",
                         path.display(),
                         multi_release,
-                        if selected_entry.is_some() { "HIT" } else { "miss" }
+                        if selected_entry.is_some() {
+                            "HIT"
+                        } else {
+                            "miss"
+                        }
                     );
                 }
                 // Bind the entry name by pattern rather than testing a
@@ -4493,8 +4492,7 @@ impl ClassPath {
                 }
                 if simple_resource_glob(name).is_some() {
                     let p = Self::nested_jar_url_path(parent_jar);
-                    for candidate in
-                        Self::matching_resource_entry_names(entries_cache.keys(), name)
+                    for candidate in Self::matching_resource_entry_names(entries_cache.keys(), name)
                     {
                         urls.push(format!("jar:file:{p}!/{prefix}{candidate}"));
                     }
@@ -4517,9 +4515,7 @@ impl ClassPath {
                 }
                 if simple_resource_glob(name).is_some() {
                     let p = Self::nested_jar_url_path(parent_jar);
-                    for candidate in
-                        Self::matching_resource_entry_names(entry_index.iter(), name)
-                    {
+                    for candidate in Self::matching_resource_entry_names(entry_index.iter(), name) {
                         urls.push(format!("jar:nested:{p}/!{nested_path}!/{candidate}"));
                     }
                     return urls;
@@ -4573,21 +4569,18 @@ impl ClassPath {
                 if !archive_safe {
                     return urls;
                 }
-                let attempts: Vec<String> =
-                    if let Some(class_name) = name.strip_suffix(".class") {
-                        if let Some(module) = class_to_module.get(class_name) {
-                            vec![format!("/{module}/{class_name}.class")]
-                        } else {
-                            Vec::new()
-                        }
+                let attempts: Vec<String> = if let Some(class_name) = name.strip_suffix(".class") {
+                    if let Some(module) = class_to_module.get(class_name) {
+                        vec![format!("/{module}/{class_name}.class")]
                     } else {
-                        match resource_to_modules.get(name) {
-                            Some(modules) => {
-                                modules.iter().map(|m| format!("/{m}/{name}")).collect()
-                            }
-                            None => Vec::new(),
-                        }
-                    };
+                        Vec::new()
+                    }
+                } else {
+                    match resource_to_modules.get(name) {
+                        Some(modules) => modules.iter().map(|m| format!("/{m}/{name}")).collect(),
+                        None => Vec::new(),
+                    }
+                };
                 if simple_resource_glob(name).is_some() {
                     for candidate in
                         Self::matching_resource_entry_names(resource_to_modules.keys(), name)
@@ -4652,8 +4645,7 @@ impl ClassPath {
         }
         let dbg = dbg_getresources();
         for (index, entry) in self.entries.iter().enumerate().skip(from) {
-            let urls =
-                self.resource_urls_for_entry(entry, name, archive_safe, directory_safe, dbg);
+            let urls = self.resource_urls_for_entry(entry, name, archive_safe, directory_safe, dbg);
             if let Some(url) = urls.into_iter().next() {
                 return Some((url, index + 1));
             }
@@ -4693,7 +4685,13 @@ impl ClassPath {
         }
         let mut urls = Vec::new();
         for entry in &self.entries {
-            urls.extend(self.resource_urls_for_entry(entry, name, archive_safe, directory_safe, dbg));
+            urls.extend(self.resource_urls_for_entry(
+                entry,
+                name,
+                archive_safe,
+                directory_safe,
+                dbg,
+            ));
         }
         if dbg {
             eprintln!(

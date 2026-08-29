@@ -53,7 +53,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ===========================================================================
 // ServiceName — hierarchical, immutable, interned-segment dotted name.
@@ -1240,7 +1240,9 @@ fn native_service_name_of_string(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => String::new(),
     };
     let sn = ServiceName::parse(&s);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)?))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &sn,
+    )?))))
 }
 
 fn native_service_name_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1256,7 +1258,9 @@ fn native_service_name_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
     let sn = ServiceName::of(read_service_name_segments_array(ctx, arr)?);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)?))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &sn,
+    )?))))
 }
 
 fn native_service_name_of_parent_varargs(
@@ -1279,7 +1283,9 @@ fn native_service_name_of_parent_varargs(
         }
     };
     let sn = append_service_name_segments(base, read_service_name_segments_array(ctx, arr)?);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)?))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &sn,
+    )?))))
 }
 
 fn native_service_name_append_varargs(
@@ -1300,7 +1306,9 @@ fn native_service_name_append_varargs(
         }
     };
     let sn = append_service_name_segments(base, read_service_name_segments_array(ctx, arr)?);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)?))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &sn,
+    )?))))
 }
 
 fn native_service_name_append_service_name(
@@ -1315,7 +1323,9 @@ fn native_service_name_append_service_name(
         .ok_or_else(|| illegal_service_name_arg("ServiceName.append: unreadable suffix"))?;
     let suffix_segments: Vec<String> = suffix.segments.iter().map(|s| s.to_string()).collect();
     let sn = append_service_name_segments(base, suffix_segments);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)?))))
+    Ok(Some(Value::Object(Some(alloc_java_service_name(
+        ctx, &sn,
+    )?))))
 }
 
 fn native_service_name_get_canonical(
@@ -1397,8 +1407,11 @@ fn native_service_container_add_service(
     // call below (either branch can invoke real Java code and trigger a
     // moving GC) — pin both and re-read before their next use.
     let sn_pin = ctx.pin_native_root(sn_obj);
-    let ctrl_obj =
-        try_alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS)?;
+    let ctrl_obj = try_alloc_concurrent_synthetic(
+        ctx,
+        "org/jboss/msc/service/ServiceController",
+        SC_NUM_SLOTS,
+    )?;
     let sn_obj = ctx.read_native_pin(sn_pin, sn_obj);
     let ctrl_pin = ctx.pin_native_root(ctrl_obj);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_obj)));
@@ -3225,8 +3238,12 @@ fn wire_provides_injectors(
 }
 
 /// Allocate a synthetic `StartContext` carrying `controller_id`, and root it.
-fn build_start_context(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
-    let sctx = try_alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/StartContext", CTX_NUM_SLOTS)?;
+fn build_start_context(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let sctx =
+        try_alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/StartContext", CTX_NUM_SLOTS)?;
     ctx.set_field(sctx, CTX_FIELD_CONTROLLER_ID, Value::Long(id as i64));
     {
         let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
@@ -3525,8 +3542,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // primary name instead so getName()/diagnostics stay meaningful.
     // Allocated BEFORE the mirror: a GC triggered by this allocation would
     // otherwise stale the raw `ctrl_obj` local (it is only rooted later).
-    let sn_for_mirror = match sn_pin.map(|(pin, original)| ctx.read_native_pin(pin, original))
-    {
+    let sn_for_mirror = match sn_pin.map(|(pin, original)| ctx.read_native_pin(pin, original)) {
         Some(sn) => sn,
         None => alloc_java_service_name(ctx, &name)?,
     };
@@ -3535,8 +3551,11 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // its pin just above, or freshly allocated in the anonymous branch) before
     // the NAME-slot store; re-read it after the alloc.
     let sn_mirror_pin = ctx.pin_native_root(sn_for_mirror);
-    let ctrl_obj =
-        try_alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS)?;
+    let ctrl_obj = try_alloc_concurrent_synthetic(
+        ctx,
+        "org/jboss/msc/service/ServiceController",
+        SC_NUM_SLOTS,
+    )?;
     let sn_for_mirror = ctx.read_native_pin(sn_mirror_pin, sn_for_mirror);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
@@ -4487,7 +4506,9 @@ fn native_construct_message_logger(
             // generic Object here fails the caller's typed checkcast.
             match ctx.new_object(&impl_name) {
                 Ok(Some(Value::Object(Some(o))))
-                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                    if ctx
+                        .class_name_arc_of_id(ctx.class_id_of_object(o))
+                        .as_deref()
                         == Some(impl_name.as_str()) =>
                 {
                     Value::Object(Some(o))
@@ -4504,9 +4525,12 @@ fn native_construct_message_logger(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn service_controller_get_service_uses_msc_1_5_descriptor() {

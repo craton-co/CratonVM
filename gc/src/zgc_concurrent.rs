@@ -857,10 +857,7 @@ impl ZgcConcurrentMarkController {
     /// lock-free `is_terminated_hint` deliberately is not used, because it can
     /// lag and a stale "terminated" would take the safepoint while workers are
     /// still tracing.
-    fn await_fixed_point(
-        params: &ZgcConcurrentMarkParams,
-        state: &ZgcConcurrentMarkState,
-    ) -> bool {
+    fn await_fixed_point(params: &ZgcConcurrentMarkParams, state: &ZgcConcurrentMarkState) -> bool {
         let terminator = params.coordinator.shared().terminator();
         loop {
             if terminator.is_terminated() {
@@ -1413,8 +1410,14 @@ mod tests {
         pool.end_cycle();
 
         assert!(outcome.mark_set_complete, "{outcome:?}");
-        assert_eq!(outcome.resurrected, 1, "only 60 was dead; 2 was already live");
-        assert_eq!(outcome.redrains, 1, "the resurrection must force a re-drain");
+        assert_eq!(
+            outcome.resurrected, 1,
+            "only 60 was dead; 2 was already live"
+        );
+        assert_eq!(
+            outcome.redrains, 1,
+            "the resurrection must force a re-drain"
+        );
         assert_eq!(
             outcome.passes, 2,
             "one strong pass, then one more to trace the resurrection"
@@ -1546,8 +1549,8 @@ mod tests {
         let entered = Arc::new(AtomicUsize::new(0));
         let hook_release = Arc::clone(&release);
         let hook_entered = Arc::clone(&entered);
-        let ctx = Arc::new(TestMarkContext::new(g).with_visit_hook(Box::new(
-            move |addr: u64| {
+        let ctx = Arc::new(
+            TestMarkContext::new(g).with_visit_hook(Box::new(move |addr: u64| {
                 if addr != 1 {
                     return;
                 }
@@ -1561,8 +1564,8 @@ mod tests {
                     spins += 1;
                     std::thread::yield_now();
                 }
-            },
-        )));
+            })),
+        );
 
         let pool = Arc::new(ZMarkCoordinator::new(ctx.clone(), 2));
         pool.begin_cycle();
@@ -1627,8 +1630,10 @@ mod tests {
     fn the_no_mutator_safepoint_drives_a_cycle() {
         let (ctx, pool) = open_cycle(graph(&[(1, &[2]), (2, &[3]), (3, &[])]), &[1], 1);
         let safepoint: Arc<dyn ZgcMarkSafepoint> = Arc::new(ZgcNoMutatorSafepoint);
-        let controller =
-            ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(Arc::clone(&pool), safepoint));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
 
         let outcome = controller.join_cycle().expect("driver joined");
         pool.end_cycle();
@@ -1654,7 +1659,10 @@ mod tests {
         let outcome = controller.join_cycle().expect("driver joined");
         pool.end_cycle();
 
-        assert_eq!(state.passes_performed.load(Ordering::Relaxed), outcome.passes as u64);
+        assert_eq!(
+            state.passes_performed.load(Ordering::Relaxed),
+            outcome.passes as u64
+        );
         assert_eq!(
             state.restarts_performed.load(Ordering::Relaxed),
             outcome.restarts as u64

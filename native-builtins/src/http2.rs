@@ -10,14 +10,14 @@
 //! Implements Java HTTP Client API (java.net.http) introduced in Java 11,
 //! with HTTP/2 (RFC 7540) and HPACK header compression (RFC 7541) stubs.
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
 
+use cratonvm_types::error::MethodCallFailed;
 use std::io::Write;
 use std::net::TcpStream;
-use cratonvm_types::error::MethodCallFailed;
 
 // ---------------------------------------------------------------------------
 // HTTP/2 frame types per RFC 7540
@@ -590,7 +590,9 @@ const WS_INPUT_CLOSED: usize = 3;
 /// (`protected HttpClient() {}`), so declining to write anything is exactly
 /// the faithful behaviour.
 fn is_synthetic_shape(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
-    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+        == Some(class_name)
 }
 
 /// Is this `java/net/http/HttpHeaders` receiver one THIS file minted?
@@ -700,7 +702,10 @@ fn alloc_http_request_builder(ctx: &mut dyn NativeContext) -> Result<ObjectRef, 
     Ok(obj)
 }
 
-fn alloc_http_response(ctx: &mut dyn NativeContext, status: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_http_response(
+    ctx: &mut dyn NativeContext,
+    status: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 7)?;
     init_http_response_fields(ctx, obj, status);
     Ok(obj)
@@ -1032,7 +1037,10 @@ fn decode_chunked(input: &str) -> String {
     result
 }
 
-fn alloc_body_publisher(ctx: &mut dyn NativeContext, len: i64) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_body_publisher(
+    ctx: &mut dyn NativeContext,
+    len: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 2)?;
     init_body_publisher_fields(ctx, obj, len);
     Ok(obj)
@@ -1043,7 +1051,10 @@ fn init_body_publisher_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, len: 
     ctx.set_field(obj, 1, Value::Int(0)); // type idx
 }
 
-fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_body_handler(
+    ctx: &mut dyn NativeContext,
+    kind: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
     ctx.set_field(obj, 0, Value::Int(kind));
     Ok(obj)
@@ -1060,66 +1071,69 @@ fn http2_send_async(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-            let req = match args.get(1) {
-                Some(Value::Object(Some(r))) => *r,
-                _ => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let method_idx = match ctx.get_field(req, REQ_METHOD) {
-                Value::Int(n) => n,
-                _ => METHOD_GET,
-            };
-            let method_str = method_idx_to_name(method_idx);
-            let uri_obj = match ctx.get_field(req, REQ_URI) {
-                Value::Object(Some(u)) => u,
-                _ => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
-                Some(parts) => parts,
-                None => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let use_tls = uri_wants_tls(ctx, uri_obj, port);
-            // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
-            ensure_no_dropped_payload(ctx, req)?;
-            // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
-            validate_no_crlf("method", method_str)?;
-            validate_no_crlf("request-target", &path)?;
-            validate_no_crlf("Host header", &host)?;
-            let result = if use_tls {
-                https_request(&host, port, method_str, &path)
-            } else {
-                http11_request(&host, port, method_str, &path)
-            };
-            let resp = match result {
-                Ok((status, body)) => {
-                    let r = alloc_http_response(ctx, status)?;
-                    let body_str = ctx.create_string(&body);
-                    ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
-                    r
-                }
-                Err(_) => alloc_http_response(ctx, 0)?,
-            };
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+    let req = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let resp = alloc_http_response(ctx, 0)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(resp)));
-            ctx.set_field(cf, 1, Value::Int(1)); // completed
-            Ok(Some(Value::Object(Some(cf))))
+            ctx.set_field(cf, 1, Value::Int(1));
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let method_idx = match ctx.get_field(req, REQ_METHOD) {
+        Value::Int(n) => n,
+        _ => METHOD_GET,
+    };
+    let method_str = method_idx_to_name(method_idx);
+    let uri_obj = match ctx.get_field(req, REQ_URI) {
+        Value::Object(Some(u)) => u,
+        _ => {
+            let resp = alloc_http_response(ctx, 0)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            ctx.set_field(cf, 0, Value::Object(Some(resp)));
+            ctx.set_field(cf, 1, Value::Int(1));
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
+        Some(parts) => parts,
+        None => {
+            let resp = alloc_http_response(ctx, 0)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            ctx.set_field(cf, 0, Value::Object(Some(resp)));
+            ctx.set_field(cf, 1, Value::Int(1));
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let use_tls = uri_wants_tls(ctx, uri_obj, port);
+    // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
+    ensure_no_dropped_payload(ctx, req)?;
+    // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
+    validate_no_crlf("method", method_str)?;
+    validate_no_crlf("request-target", &path)?;
+    validate_no_crlf("Host header", &host)?;
+    let result = if use_tls {
+        https_request(&host, port, method_str, &path)
+    } else {
+        http11_request(&host, port, method_str, &path)
+    };
+    let resp = match result {
+        Ok((status, body)) => {
+            let r = alloc_http_response(ctx, status)?;
+            let body_str = ctx.create_string(&body);
+            ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
+            r
+        }
+        Err(_) => alloc_http_response(ctx, 0)?,
+    };
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+    ctx.set_field(cf, 0, Value::Object(Some(resp)));
+    ctx.set_field(cf, 1, Value::Int(1)); // completed
+    Ok(Some(Value::Object(Some(cf))))
 }
 
 /// `HttpClient.Version` for an ordinal, as a real enum object.
@@ -1127,7 +1141,10 @@ fn http2_send_async(
 /// Shares `p57_alloc_enum` with the `phases_late::net_channels` registrar that
 /// owns the `HTTP_1_1` / `HTTP_2` statics, so an object from either side has the
 /// same (name, ordinal) shape and the two compare equal.
-fn version_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::error::MethodCallResult {
+fn version_enum(
+    ctx: &mut dyn NativeContext,
+    ordinal: i32,
+) -> cratonvm_types::error::MethodCallResult {
     let name = if ordinal == HTTP_VERSION_1_1 {
         "HTTP_1_1"
     } else {
@@ -1137,7 +1154,10 @@ fn version_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::er
 }
 
 /// `HttpClient.Redirect` for an ordinal. See [`version_enum`].
-fn redirect_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::error::MethodCallResult {
+fn redirect_enum(
+    ctx: &mut dyn NativeContext,
+    ordinal: i32,
+) -> cratonvm_types::error::MethodCallResult {
     let name = match ordinal {
         REDIRECT_ALWAYS => "ALWAYS",
         REDIRECT_NORMAL => "NORMAL",
@@ -2961,7 +2981,8 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Z)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2975,7 +2996,8 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;Z)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2989,7 +3011,8 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -3003,7 +3026,8 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -3020,7 +3044,8 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
             // Mark both directions closed
             ctx.set_field(this, WS_STATE, Value::Int(WS_CLOSING));
             ctx.set_field(this, WS_OUTPUT_CLOSED, Value::Int(1));
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -3133,10 +3158,13 @@ pub(crate) fn register_http2_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod http2_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // --- Registration tests ------------------------------------------------
 
@@ -4040,7 +4068,13 @@ mod http2_tests {
 
     #[test]
     fn e2_connect_timeout_absent_is_null_and_present_is_a_duration() {
-        let cb = || find_cb("java/net/http/HttpClient", "connectTimeout", "()Ljava/util/Optional;");
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpClient",
+                "connectTimeout",
+                "()Ljava/util/Optional;",
+            )
+        };
 
         // Absent: this is the row that used to report isPresent() == true.
         let mut ctx = crate::test_utils::MockNativeContext::new();
@@ -4072,7 +4106,13 @@ mod http2_tests {
 
     #[test]
     fn e2_request_timeout_absent_is_null_and_present_is_a_duration() {
-        let cb = || find_cb("java/net/http/HttpRequest", "timeout", "()Ljava/util/Optional;");
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpRequest",
+                "timeout",
+                "()Ljava/util/Optional;",
+            )
+        };
 
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
@@ -4097,11 +4137,13 @@ mod http2_tests {
 
     #[test]
     fn e2_body_publisher_moves_the_publisher_into_slot_zero() {
-        let cb = || find_cb(
-            "java/net/http/HttpRequest",
-            "bodyPublisher",
-            "()Ljava/util/Optional;",
-        );
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpRequest",
+                "bodyPublisher",
+                "()Ljava/util/Optional;",
+            )
+        };
 
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
@@ -4144,7 +4186,11 @@ mod http2_tests {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
             ctx.set_field(this, REQ_VERSION, stored);
-            let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+            let cb = find_cb(
+                "java/net/http/HttpRequest",
+                "version",
+                "()Ljava/util/Optional;",
+            );
             let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(this))]);
             assert_not_a_flag("version", &slot0);
             if expect_present {
@@ -4190,7 +4236,13 @@ mod http2_tests {
 
     #[test]
     fn e2_ssl_session_moves_the_session_into_slot_zero() {
-        let cb = || find_cb("java/net/http/HttpResponse", "sslSession", "()Ljava/util/Optional;");
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpResponse",
+                "sslSession",
+                "()Ljava/util/Optional;",
+            )
+        };
 
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let this = alloc_of(&mut ctx, "java/net/http/HttpResponse", 7);
@@ -4212,11 +4264,13 @@ mod http2_tests {
 
     #[test]
     fn e2_first_value_moves_the_string_into_slot_zero() {
-        let cb = || find_cb(
-            "java/net/http/HttpHeaders",
-            "firstValue",
-            "(Ljava/lang/String;)Ljava/util/Optional;",
-        );
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpHeaders",
+                "firstValue",
+                "(Ljava/lang/String;)Ljava/util/Optional;",
+            )
+        };
 
         // Present: the header string used to sit at slot 1.
         let mut ctx = crate::test_utils::MockNativeContext::new();
@@ -4262,11 +4316,13 @@ mod http2_tests {
     /// fix here would BREAK a working accessor.
     #[test]
     fn e2_optional_long_keeps_the_primitive_flag_payload_layout() {
-        let cb = || find_cb(
-            "java/net/http/HttpHeaders",
-            "firstValueAsLong",
-            "(Ljava/lang/String;)Ljava/util/OptionalLong;",
-        );
+        let cb = || {
+            find_cb(
+                "java/net/http/HttpHeaders",
+                "firstValueAsLong",
+                "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+            )
+        };
 
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let this = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
@@ -4530,12 +4586,11 @@ mod http2_tests {
             );
 
             let build = find_cb(CLS_CLIENT_BUILDER, "build", "()Ljava/net/http/HttpClient;");
-            let client = match build(&mut ctx, &[Value::Object(Some(bld))])
-                .expect("build must not fail")
-            {
-                Some(Value::Object(Some(c))) => c,
-                other => panic!("build() must return an HttpClient, got {other:?}"),
-            };
+            let client =
+                match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
+                    Some(Value::Object(Some(c))) => c,
+                    other => panic!("build() must return an HttpClient, got {other:?}"),
+                };
             assert_eq!(ctx.get_field(client, CLIENT_REDIRECT), Value::Int(ordinal));
             assert_eq!(
                 ctx.get_field(client, CLIENT_HAS_COOKIE),
@@ -4725,13 +4780,21 @@ mod http2_tests {
         let v = alloc_enum_const(&mut ctx, "java/net/http/HttpClient$Version", "HTTP_2", 1);
         let set = find_cb(CLS_REQUEST_BUILDER, "version", DESC_REQUEST_VERSION);
         call_setter(set, &mut ctx, bld, Value::Object(Some(v)));
-        let build = find_cb(CLS_REQUEST_BUILDER, "build", "()Ljava/net/http/HttpRequest;");
+        let build = find_cb(
+            CLS_REQUEST_BUILDER,
+            "build",
+            "()Ljava/net/http/HttpRequest;",
+        );
         let req = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
             Some(Value::Object(Some(r))) => r,
             other => panic!("build() must return an HttpRequest, got {other:?}"),
         };
 
-        let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+        let cb = find_cb(
+            "java/net/http/HttpRequest",
+            "version",
+            "()Ljava/util/Optional;",
+        );
         let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(req))]);
         assert_not_a_flag("version.present", &slot0);
         match slot0 {
@@ -4753,7 +4816,11 @@ mod http2_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let req = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
         init_http_request_fields(&mut ctx, req);
-        let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+        let cb = find_cb(
+            "java/net/http/HttpRequest",
+            "version",
+            "()Ljava/util/Optional;",
+        );
         let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(req))]);
         assert_eq!(slot0, Value::Object(None));
     }
@@ -4776,11 +4843,11 @@ mod http2_tests {
         );
         call_setter(set, &mut ctx, bld, Value::Object(Some(d)));
         let build = find_cb(CLS_CLIENT_BUILDER, "build", "()Ljava/net/http/HttpClient;");
-        let client = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail")
-        {
-            Some(Value::Object(Some(c))) => c,
-            other => panic!("build() must return an HttpClient, got {other:?}"),
-        };
+        let client =
+            match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
+                Some(Value::Object(Some(c))) => c,
+                other => panic!("build() must return an HttpClient, got {other:?}"),
+            };
         let cb = find_cb(
             "java/net/http/HttpClient",
             "connectTimeout",
@@ -4810,18 +4877,22 @@ mod http2_tests {
             "ofString",
             "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         );
-        let bp = match bp_cb(&mut ctx, &[Value::Object(Some(body))]).expect("ofString must not fail")
-        {
-            Some(Value::Object(Some(o))) => o,
-            other => panic!("expected a BodyPublisher, got {other:?}"),
-        };
+        let bp =
+            match bp_cb(&mut ctx, &[Value::Object(Some(body))]).expect("ofString must not fail") {
+                Some(Value::Object(Some(o))) => o,
+                other => panic!("expected a BodyPublisher, got {other:?}"),
+            };
         let post = find_cb(
             CLS_REQUEST_BUILDER,
             "POST",
             "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
         );
         call_setter(post, &mut ctx, bld, Value::Object(Some(bp)));
-        let build = find_cb(CLS_REQUEST_BUILDER, "build", "()Ljava/net/http/HttpRequest;");
+        let build = find_cb(
+            CLS_REQUEST_BUILDER,
+            "build",
+            "()Ljava/net/http/HttpRequest;",
+        );
         let req = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
             Some(Value::Object(Some(r))) => r,
             other => panic!("build() must return an HttpRequest, got {other:?}"),

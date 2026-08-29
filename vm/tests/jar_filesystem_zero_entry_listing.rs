@@ -117,11 +117,11 @@ fn compile_probe(java_home: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     let source = dir.join(format!("{CLASS_NAME}.java"));
     std::fs::write(&source, SOURCE).expect("write probe source");
-    let out = match Command::new(
-        java_home
-            .join("bin")
-            .join(if cfg!(windows) { "javac.exe" } else { "javac" }),
-    )
+    let out = match Command::new(java_home.join("bin").join(if cfg!(windows) {
+        "javac.exe"
+    } else {
+        "javac"
+    }))
     .arg("--release")
     .arg("21")
     .arg("-d")

@@ -29,9 +29,7 @@
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
 use cratonvm_jit_api::JitRuntimeHelpers;
-use cratonvm_types::{
-    ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
-};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -92,7 +90,9 @@ fn helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,
@@ -783,7 +783,6 @@ fn charseq_char_at_null_receiver_deopts() {
     assert_one_deopt_after(before, "null-receiver CharSequence.charAt");
 }
 
-
 // --- COMPACT-laid-out receivers (BUG-STRING-CODER-COMPACT-20260726) --------
 //
 // Every test above forges a LEGACY instance (uniform 16-byte `Value` cells,
@@ -869,8 +868,7 @@ fn make_compact_string(value_ptr: i64, coder: u8, hash: i32, hash_is_zero: bool)
 /// receiver-class-id guard pointed at [`COMPACT_STRING_CLASS_ID`].
 fn compile_unary_compact(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
     let layout = compact_string_layout();
-    let entry =
-        try_resolve_string_intrinsic("java/lang/String", name, descriptor, Some(layout))?.0;
+    let entry = try_resolve_string_intrinsic("java/lang/String", name, descriptor, Some(layout))?.0;
     let code: Vec<u8> = vec![0x2a, 0xb6, 0x00, 0x01, 0xac, 0, 0];
     let compiled = compile(
         &code,
@@ -914,11 +912,23 @@ fn compact_string_layout_offsets_are_exact_payload_addresses() {
     let l = compact_string_layout();
     // COMPACT: `HEADER_SIZE + body_offset`, nothing added.
     assert_eq!(l.value_compact_offset, HEADER_SIZE as i32, "value compact");
-    assert_eq!(l.coder_compact_offset, (HEADER_SIZE + 8) as i32, "coder compact");
-    assert_eq!(l.hash_compact_offset, (HEADER_SIZE + 12) as i32, "hash compact");
+    assert_eq!(
+        l.coder_compact_offset,
+        (HEADER_SIZE + 8) as i32,
+        "coder compact"
+    );
+    assert_eq!(
+        l.hash_compact_offset,
+        (HEADER_SIZE + 12) as i32,
+        "hash compact"
+    );
     assert!(l.coder_compact_is_byte, "coder is a natural-width byte");
     // LEGACY: uniform 16-byte cells, payload inside each.
-    assert_eq!(l.value_legacy_offset, (HEADER_SIZE + 8) as i32, "value legacy");
+    assert_eq!(
+        l.value_legacy_offset,
+        (HEADER_SIZE + 8) as i32,
+        "value legacy"
+    );
     assert_eq!(
         l.coder_legacy_offset,
         (HEADER_SIZE + SLOT_SIZE + 4) as i32,
@@ -956,7 +966,11 @@ fn compact_string_length_ignores_cached_hash() {
     assert_eq!(coder, 1);
     let arr = make_byte_array(&bytes);
     let strobj = make_compact_string(arr.ptr(), coder as u8, -1_924_094_359, false);
-    assert_eq!(f(strobj.ptr()) as i32, 3, "UTF-16 length under a cached hash");
+    assert_eq!(
+        f(strobj.ptr()) as i32,
+        3,
+        "UTF-16 length under a cached hash"
+    );
 }
 
 #[test]
@@ -1038,7 +1052,11 @@ fn compact_string_char_at_decodes_through_its_own_coder() {
         // Non-zero cached hash: the coder read must not pick it up.
         let strobj = make_compact_string(arr.ptr(), coder as u8, ref_hash(s), false);
         for i in 0..s.encode_utf16().count() {
-            assert_eq!(f(strobj.ptr(), i as i64) as i32, ref_char_at(s, i), "charAt({s:?},{i})");
+            assert_eq!(
+                f(strobj.ptr(), i as i64) as i32,
+                ref_char_at(s, i),
+                "charAt({s:?},{i})"
+            );
         }
     }
 }

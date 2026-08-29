@@ -306,10 +306,13 @@ pub(crate) fn register_missing_deprecated_shims(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // ── T8.5.1 — Round-trip: every deprecated API is registered ──────────
 
@@ -376,9 +379,9 @@ mod tests {
         // allowed to shrink.
         for expected in &[
             "T8.1.1", "T8.1.2", "T8.1.3", "T8.1.4", "T8.1.6", "T8.1.7", "T8.1.8", "T8.1.9",
-            "T8.1.10", "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6",
-            "T8.2.10", "T8.2.11", "T8.2.13", "T8.2.14", "T8.3.1", "T8.3.2", "T8.4.1", "T8.4.2",
-            "T8.4.3", "T8.4.4",
+            "T8.1.10", "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6", "T8.2.10",
+            "T8.2.11", "T8.2.13", "T8.2.14", "T8.3.1", "T8.3.2", "T8.4.1", "T8.4.2", "T8.4.3",
+            "T8.4.4",
         ] {
             assert!(
                 sections.contains(expected),

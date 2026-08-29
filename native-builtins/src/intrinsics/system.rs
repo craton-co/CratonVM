@@ -36,10 +36,13 @@ pub fn intrinsic_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeCallback;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// The intrinsic handler must be usable exactly where a `NativeCallback`
     /// is expected — the contract requires `CachedInvokeTarget::Intrinsic` to

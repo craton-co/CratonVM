@@ -1078,7 +1078,9 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // but reads 0x4 here was corrupted *by collect_garbage itself*
             // (between entry and exit) — isolating GC-vs-mutator definitively.
             if crate::runtime::ec_watch::enabled() {
-                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect(shared.vm_identity) {
+                for (holder, idx, expected, now) in
+                    crate::runtime::ec_watch::detect(shared.vm_identity)
+                {
                     eprintln!(
                         "[ecwatch-GCEXIT] holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x} (corrupted DURING collect_garbage)"
                     );
@@ -2653,7 +2655,9 @@ pub(super) fn process_references_after_gc(
         // reclaimed-and-reused slot from the Reference that used to be there.
         if !is_reference_shaped(obj_ref) {
             if straystack_enabled() {
-                eprintln!("[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)");
+                eprintln!(
+                    "[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)"
+                );
             }
             continue;
         }
@@ -2999,7 +3003,9 @@ pub(super) fn process_references_after_gc(
                 }
                 continue;
             }
-            if let Some(&want_class) = referent_class_stamps.get(&ref_obj_old).filter(|_| screen_on)
+            if let Some(&want_class) = referent_class_stamps
+                .get(&ref_obj_old)
+                .filter(|_| screen_on)
             {
                 let have_class = shared.mem.heap.class_id_of(rt).as_u32();
                 if want_class != 0 && have_class != want_class {
@@ -3906,16 +3912,13 @@ static TLAB_LEGACY_CLASSES: [(
     std::sync::atomic::AtomicU32,
     std::sync::atomic::AtomicU64,
     std::sync::OnceLock<String>,
-); 16] = [
-    const {
-        (
-            std::sync::atomic::AtomicU32::new(u32::MAX),
-            std::sync::atomic::AtomicU64::new(0),
-            std::sync::OnceLock::new(),
-        )
-    };
-    16
-];
+); 16] = [const {
+    (
+        std::sync::atomic::AtomicU32::new(u32::MAX),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::OnceLock::new(),
+    )
+}; 16];
 
 /// `(description, class id, count)` for every class this path allocated legacy.
 pub fn tlab_legacy_object_classes() -> Vec<(String, u32, u64)> {
@@ -3928,7 +3931,9 @@ pub fn tlab_legacy_object_classes() -> Vec<(String, u32, u64)> {
                 return None;
             }
             Some((
-                name.get().cloned().unwrap_or_else(|| "<unnamed>".to_string()),
+                name.get()
+                    .cloned()
+                    .unwrap_or_else(|| "<unnamed>".to_string()),
                 cid,
                 count.load(Ordering::Relaxed),
             ))
@@ -4418,7 +4423,11 @@ static ROOTSNAP_MISS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// `walk_objects`-derived `walked_bases` in `old_gen_gc`. Over-retention for
 /// one cycle is the whole cost; a dropped root is a use-after-free.
 #[inline]
-pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
+pub(super) fn scan_frame_roots(
+    frame: &Frame,
+    out: &mut Vec<ObjectRef>,
+    heap: &crate::memory::VmHeap,
+) {
     frame.scan_local_objects(out, heap);
     let before = out.len();
     frame.stack.scan_object_refs(out, heap);
@@ -5801,21 +5810,22 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// mark roots.
 pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let stw_taken = shared
-        .mem
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            let (n, blocked, tids, blocked_tids) = shared
-                .threads
-                .thread_registry
-                .alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let stw_taken =
+        shared
+            .mem
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                let (n, blocked, tids, blocked_tids) = shared
+                    .threads
+                    .thread_registry
+                    .alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if !stw_taken {
         // Another STW is in progress. Nothing has been done, so there is
         // nothing to unwind: the next allocation re-tests the threshold and
@@ -5843,10 +5853,7 @@ pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThrea
             .chain(xt_roots.into_iter())
             .collect();
 
-        let opened = shared
-            .mem
-            .heap
-            .zgc_start_concurrent_mark(&stw, &all_roots);
+        let opened = shared.mem.heap.zgc_start_concurrent_mark(&stw, &all_roots);
 
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
         // world — same race rationale as `maybe_gc`'s epilogue.
@@ -6052,10 +6059,11 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         // every other mutator and `taken` is still held. The remark drain and
         // cleanup that follow are STW phases; the token is their witness.
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-        let completed = shared
-            .mem
-            .heap
-            .g1_final_remark_and_cleanup(&stw, &all_roots, Some(&mut process));
+        let completed =
+            shared
+                .mem
+                .heap
+                .g1_final_remark_and_cleanup(&stw, &all_roots, Some(&mut process));
         tracing::debug!(
             "[G1] Final remark: {} roots, cycle_completed={}",
             all_roots.len(),
@@ -6112,12 +6120,11 @@ pub(super) fn g1_remark_process_references(
     // root as unverified.
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked, None);
     let no_moves = cratonvm_types::PointerMap::default();
-    let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
-            shared.vm_identity,
-            is_marked,
-            &no_moves,
-        );
+    let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+        shared.vm_identity,
+        is_marked,
+        &no_moves,
+    );
     let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(
@@ -6505,8 +6512,7 @@ pub(super) fn dm_dbg_enabled() -> bool {
 /// `run_cleaner_actions` entries that got past the exclusion switches.
 static DM_CLEANER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ...of those, the ones that bailed because a JIT borrow was live.
-static DM_CLEANER_JIT_BLOCKED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static DM_CLEANER_JIT_BLOCKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ...the ones that reached the drain and found nothing queued.
 static DM_CLEANER_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Cleaner actions actually run.

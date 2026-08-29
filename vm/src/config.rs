@@ -719,7 +719,7 @@ pub enum CdsMode {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
-            max_heap_size: 256 * 1024 * 1024,    // 256 MB
+            max_heap_size: 256 * 1024 * 1024, // 256 MB
             max_direct_memory_size: None,
             initial_heap_size: 16 * 1024 * 1024, // 16 MB
             // Default raised from 1024 to 8192 (root-cause fix for
@@ -1528,7 +1528,8 @@ pub fn require_synthetic_jdk() -> Result<(), String> {
     if SYNTHETIC_JDK_COMPILED_IN {
         return Ok(());
     }
-    Err("synthetic-JDK mode was selected but this binary was built without the \
+    Err(
+        "synthetic-JDK mode was selected but this binary was built without the \
          `synthetic-jdk` Cargo feature, so none of the ~5,200 synthetic stubs are \
          compiled in.\n\
          \n\
@@ -1540,7 +1541,8 @@ pub fn require_synthetic_jdk() -> Result<(), String> {
          Fix by one of:\n  \
          * rebuild with `cargo build -p cratonvm-cli --features synthetic-jdk`; or\n  \
          * drop --synthetic-jdk and run the default real-JDK mode."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Resolve the JAVA_HOME path from an explicit value, the environment, or
@@ -2299,9 +2301,7 @@ mod tests {
             return;
         }
         std::fs::copy(&me, &alias).expect("copy self as java.exe");
-        let resolved = resolve_java_executable().map(|p| {
-            std::fs::canonicalize(&p).unwrap_or(p)
-        });
+        let resolved = resolve_java_executable().map(|p| std::fs::canonicalize(&p).unwrap_or(p));
         let _ = std::fs::remove_file(&alias);
 
         let resolved = resolved.expect("sibling alias resolves");
@@ -2476,10 +2476,9 @@ mod tests {
     ///   which is process-wide and races concurrent tests, hence
     ///   [`env_lock`].
     fn with_scratch_java_home<R>(root: Option<&str>, f: impl FnOnce() -> R) -> R {
-        cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_JAVA_HOME", root)],
-            || with_env("JAVA_HOME", None, f),
-        )
+        cratonvm_types::flags::with_thread_overrides(&[("CRATONVM_JAVA_HOME", root)], || {
+            with_env("JAVA_HOME", None, f)
+        })
     }
 
     /// Set an **undeclared** environment variable for the duration of `f`.
@@ -2717,7 +2716,8 @@ mod tests {
         assert!(policy.real_jdk, "strict mode runs on a real JDK image");
         assert!(policy.is_jdk_only());
         assert_eq!(policy, ExecutionPolicy::jdk_only());
-        cfg.validate_compatibility().expect("jdk-only + real-jdk is valid");
+        cfg.validate_compatibility()
+            .expect("jdk-only + real-jdk is valid");
     }
 
     /// `--jdk-only --synthetic-jdk` is a configuration error, and the error
@@ -2773,9 +2773,7 @@ mod tests {
                 .expect("compatible mode is valid with either class library");
         }
         // The legacy boolean setter is equivalent and equally inert.
-        assert!(!VmConfig::default()
-            .with_synthetic_jdk(true)
-            .is_jdk_only());
+        assert!(!VmConfig::default().with_synthetic_jdk(true).is_jdk_only());
         assert!(!VmConfig::for_launcher()
             .with_synthetic_jdk(false)
             .is_jdk_only());

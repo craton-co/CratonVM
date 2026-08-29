@@ -448,8 +448,7 @@ pub fn ambiguous_process_vm_resolutions() -> u64 {
     AMBIGUOUS_RESOLUTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-static AMBIGUOUS_RESOLUTIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AMBIGUOUS_RESOLUTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`process_vm`], but `None` when the answer is ambiguous.
 ///
@@ -789,7 +788,10 @@ pub fn host_thread_enter_native() -> bool {
     // this OS thread is in no registry entry at all, so it is absent from
     // `alive_count` and occupies no `expected` slot — the counter-only path
     // below is then exactly right.
-    let tid = shared.threads.thread_registry.thread_id_for_current_os_tid();
+    let tid = shared
+        .threads
+        .thread_registry
+        .thread_id_for_current_os_tid();
     if let Some(tid) = tid {
         // Raise the identity flag BEFORE the counter, matching every other
         // blocking-region entry (`deposit_root_snapshot` then
@@ -803,7 +805,10 @@ pub fn host_thread_enter_native() -> bool {
         // HOST code holds no live Java roots. (Its `java.lang.Thread` mirror
         // is not affected — that is a strong root of every alive registry
         // entry, `memory/roots.rs` step 10b.)
-        shared.threads.thread_registry.mark_native_thread_blocked(tid);
+        shared
+            .threads
+            .thread_registry
+            .mark_native_thread_blocked(tid);
     }
     let pre_stw = shared.mem.gc_barrier.mark_blocked_region_enter();
     if pre_stw {
@@ -816,7 +821,10 @@ pub fn host_thread_enter_native() -> bool {
         // The fallback id is unchanged from the pre-fix behaviour: for an
         // unregistered caller it only answers "am I the initiator", and such a
         // thread never is.
-        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid.unwrap_or(ThreadId(0)));
+        let _ = shared
+            .mem
+            .gc_barrier
+            .arrive_and_wait_auto(tid.unwrap_or(ThreadId(0)));
     }
     true
 }
@@ -846,7 +854,10 @@ pub fn host_thread_leave_native() -> bool {
         Some(s) => s,
         None => return false,
     };
-    let tid = shared.threads.thread_registry.thread_id_for_current_os_tid();
+    let tid = shared
+        .threads
+        .thread_registry
+        .thread_id_for_current_os_tid();
     shared.mem.gc_barrier.mark_blocked_region_leave();
     if let Some(tid) = tid {
         if let Some(gc_block_state) = shared.threads.thread_registry.gc_block_state_of(tid) {
@@ -865,7 +876,10 @@ pub fn host_thread_leave_native() -> bool {
         // that a caller broke the "no live Java roots while parked" contract.
         // Its own `store(false)` is a no-op here: the barrier already cleared
         // the flag above.
-        shared.threads.thread_registry.mark_native_thread_unblocked(tid);
+        shared
+            .threads
+            .thread_registry
+            .mark_native_thread_unblocked(tid);
     }
     true
 }
@@ -4610,13 +4624,9 @@ extern "C" fn jni_define_class(
         if let Some(n) = class_name.as_deref() {
             let _ = shared.jit.jit_cache.write().invalidate_for_class(n);
             let _ = shared.invalidate_jit_for_class(n);
-            let _ = shared
-                .jit
-                .compilation_broker
-                .lock()
-                .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
-                    n.to_string(),
-                ));
+            let _ = shared.jit.compilation_broker.lock().invalidate(
+                &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(n.to_string()),
+            );
         }
         Some(class_id_to_jclass(cid))
     })
@@ -5274,7 +5284,6 @@ extern "C" fn jni_varargs_unsupported() -> usize {
     );
     0
 }
-
 
 // ---------------------------------------------------------------------------
 // Bare-varargs Call<Type>Method(...) trampolines
@@ -8588,7 +8597,10 @@ mod tests {
             "idle foreign thread must be excluded from the STW expected-set"
         );
         shared.mem.gc_barrier.wait_for_all(); // returns immediately — no deadlock
-        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
 
         // Teardown mirrors detach: mark dead, leave the region, reclaim.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
@@ -8724,7 +8736,10 @@ mod tests {
             "in-native thread must be excluded from the STW expected-set"
         );
         shared.mem.gc_barrier.wait_for_all();
-        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
 
         assert!(host_thread_leave_native());
         // Same re-check as the twin below: a republish mid-body sends the
@@ -8807,9 +8822,12 @@ mod tests {
         );
 
         // Same call shape as `runtime/interpreter.rs`'s GC initiator.
-        let requested = shared.mem.gc_barrier.request_stw_counted_with_live_blocked(init, || {
-            (alive as u32, blocked as u32, blocked_tids)
-        });
+        let requested = shared
+            .mem
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(init, || {
+                (alive as u32, blocked as u32, blocked_tids)
+            });
         assert!(requested);
         assert_eq!(
             shared.mem.gc_barrier.pending_count(),
@@ -8818,7 +8836,10 @@ mod tests {
              never arrive to fill",
         );
         shared.mem.gc_barrier.wait_for_all(); // returns immediately — no hang
-        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
 
         assert!(host_thread_leave_native());
         // Re-checked, not assumed: the cell can be republished at any point in
@@ -8839,7 +8860,10 @@ mod tests {
             .threads
             .thread_registry
             .alive_count_blocked_and_os_tids();
-        assert_eq!(blocked_after, 0, "the census must see the thread running again");
+        assert_eq!(
+            blocked_after, 0,
+            "the census must see the thread running again"
+        );
     }
 
     #[test]
@@ -8879,8 +8903,14 @@ mod tests {
 
         // Outer native call.
         let outer_prev = replace_jni_context(&vm.shared);
-        assert!(outer_prev.is_none(), "outer saw a context that was not there");
-        assert!(with_shared_vm(|_| ()).is_some(), "outer install did not take");
+        assert!(
+            outer_prev.is_none(),
+            "outer saw a context that was not there"
+        );
+        assert!(
+            with_shared_vm(|_| ()).is_some(),
+            "outer install did not take"
+        );
 
         {
             // Java upcall -> a SECOND native call on the same thread.
@@ -8927,7 +8957,11 @@ mod tests {
         let _prev = replace_jni_context(&vm.shared);
         set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
-            jni_throw_new(get_jni_env(), class_id_to_jclass(class_id), message.as_ptr(),),
+            jni_throw_new(
+                get_jni_env(),
+                class_id_to_jclass(class_id),
+                message.as_ptr(),
+            ),
             JNI_OK
         );
 
@@ -9321,7 +9355,13 @@ mod tests {
             JniNativeMethodTable::default(),
         );
 
-        register_jni_native_in(&vm_a, "com/example/Iso", "m", "()J", a as *const () as usize);
+        register_jni_native_in(
+            &vm_a,
+            "com/example/Iso",
+            "m",
+            "()J",
+            a as *const () as usize,
+        );
 
         // VM B has not bound it, and must not inherit VM A's binding.
         assert!(
@@ -9330,7 +9370,13 @@ mod tests {
         );
 
         // And once B binds its own, the two answer differently for one triple.
-        register_jni_native_in(&vm_b, "com/example/Iso", "m", "()J", b as *const () as usize);
+        register_jni_native_in(
+            &vm_b,
+            "com/example/Iso",
+            "m",
+            "()J",
+            b as *const () as usize,
+        );
         assert_eq!(
             find_jni_native_in(&vm_a, "com/example/Iso", "m", "()J"),
             Some(a as *const () as usize)
@@ -9372,10 +9418,7 @@ mod tests {
             "Java_com_example_Foo_1Bar_do_1it"
         );
         // Doubly nested.
-        assert_eq!(
-            jni_short_name("a/B$C$D", "m"),
-            "Java_a_B_00024C_00024D_m"
-        );
+        assert_eq!(jni_short_name("a/B$C$D", "m"), "Java_a_B_00024C_00024D_m");
         // Long form: the parameter block carries `;` → `_2` and `[` → `_3`,
         // and a nested parameter type takes the `$` escape too.
         assert_eq!(
@@ -9395,8 +9438,20 @@ mod tests {
             2
         }
         let table = JniNativeMethodTable::default();
-        register_jni_native_in(&table, "com/example/Baz", "quux", "()I", v1 as *const () as usize);
-        register_jni_native_in(&table, "com/example/Baz", "quux", "()I", v2 as *const () as usize);
+        register_jni_native_in(
+            &table,
+            "com/example/Baz",
+            "quux",
+            "()I",
+            v1 as *const () as usize,
+        );
+        register_jni_native_in(
+            &table,
+            "com/example/Baz",
+            "quux",
+            "()I",
+            v2 as *const () as usize,
+        );
         assert_eq!(
             find_jni_native_in(&table, "com/example/Baz", "quux", "()I"),
             Some(v2 as *const () as usize)
@@ -10227,8 +10282,7 @@ mod tests {
         );
         let func_ptr = unsafe { *(*env).add(233) };
         assert_eq!(
-            func_ptr,
-            jni_get_module as *const () as usize,
+            func_ptr, jni_get_module as *const () as usize,
             "slot 233 must dispatch to GetModule"
         );
     }
@@ -10535,8 +10589,7 @@ mod tests {
                  'no such class' for it"
             );
             assert_eq!(
-                handle as u32,
-                raw,
+                handle as u32, raw,
                 "the tag must vanish under the `clazz as u32` decode every \
                  jclass consumer uses"
             );
@@ -10710,7 +10763,15 @@ mod tests {
 
         // For every string, what the region path now writes must be exactly
         // what GetStringUTFLength told the caller to expect.
-        for s in ["", "ascii", nul, "\u{00e9}", "\u{20ac}", emoji, "mix\u{0}é€😀"] {
+        for s in [
+            "",
+            "ascii",
+            nul,
+            "\u{00e9}",
+            "\u{20ac}",
+            emoji,
+            "mix\u{0}é€😀",
+        ] {
             assert_eq!(
                 to_modified_utf8(s).len(),
                 modified_utf8_len(s),
@@ -10719,11 +10780,9 @@ mod tests {
         }
 
         // Source witness: the entry point must use the shared encoder.
-        let src = std::fs::read_to_string(format!(
-            "{}/src/native/jni.rs",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .expect("read jni.rs");
+        let src =
+            std::fs::read_to_string(format!("{}/src/native/jni.rs", env!("CARGO_MANIFEST_DIR")))
+                .expect("read jni.rs");
         let start = src
             .find("extern \"C\" fn jni_get_string_utf_region(")
             .expect("jni_get_string_utf_region must still exist");
@@ -11261,5 +11320,4 @@ mod tests {
             assert_eq!(cur.next(false), 901);
         }
     }
-
 }

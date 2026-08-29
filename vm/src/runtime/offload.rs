@@ -1135,7 +1135,7 @@ mod tests {
             event: None,
             status: parking_lot::Mutex::new(SubmissionStatus::Failed {
                 message: "test: dispatch-time failure".to_string(),
-                    kind: GpuErrorKind::Unknown,
+                kind: GpuErrorKind::Unknown,
             }),
             finalize: parking_lot::Mutex::new(None),
             device_done: std::sync::atomic::AtomicBool::new(false),
@@ -1587,10 +1587,7 @@ pub enum SubmissionStatus {
     /// `kind` — recorded here, at the point of failure, rather than
     /// reconstructed on the Java side by matching substrings against
     /// the driver's wording.
-    Failed {
-        message: String,
-        kind: GpuErrorKind,
-    },
+    Failed { message: String, kind: GpuErrorKind },
 }
 
 /// Async kernel submission handle.
@@ -1789,11 +1786,7 @@ impl OffloadCache {
     ) -> Vec<std::sync::Arc<cuda_bridge::Event>> {
         {
             let held = self.chunk_events.read();
-            if held.len() >= want
-                && held
-                    .iter()
-                    .all(|e| std::sync::Arc::strong_count(e) == 1)
-            {
+            if held.len() >= want && held.iter().all(|e| std::sync::Arc::strong_count(e) == 1) {
                 return held[..want].to_vec();
             }
         }
@@ -1840,8 +1833,10 @@ impl OffloadCache {
             match Stream::new(ctx) {
                 Ok(s) => made.push(std::sync::Arc::new(s)),
                 Err(e) => {
-                    tracing::debug!("gpu offload: chunk stream pool unavailable ({e}); \
-                                     falling back to the whole-array writeback");
+                    tracing::debug!(
+                        "gpu offload: chunk stream pool unavailable ({e}); \
+                                     falling back to the whole-array writeback"
+                    );
                     return Vec::new();
                 }
             }
@@ -2077,7 +2072,14 @@ impl OffloadCache {
                     // Cast: `work` is a JVM array length, so it fits usize.
                     let events = self.chunk_event_pool(ctx, chunk_count_wanted());
                     match launch_chunked(
-                        self, &events, ctx, &kernel, &args, work as usize, &pool, plain,
+                        self,
+                        &events,
+                        ctx,
+                        &kernel,
+                        &args,
+                        work as usize,
+                        &pool,
+                        plain,
                     ) {
                         Ok(wb) => {
                             // Give the submission a completion event that
@@ -2119,7 +2121,7 @@ impl OffloadCache {
                             // writeback and returning stale Java state.
                             return make(SubmissionStatus::Failed {
                                 message: format!("chunked dispatch failed: {msg}"),
-                    kind: GpuErrorKind::Launch,
+                                kind: GpuErrorKind::Launch,
                             });
                         }
                     }
@@ -2165,7 +2167,7 @@ impl OffloadCache {
         if let Err(e) = stream.record_event(&event) {
             return make(SubmissionStatus::Failed {
                 message: format!("Stream::record_event: {e}"),
-                    kind: kind_of_device_error(&e),
+                kind: kind_of_device_error(&e),
             });
         }
 
@@ -2803,7 +2805,8 @@ pub fn dispatch_method_from_native_on_stream(
             return record_failed_submission(
                 None,
                 GpuErrorKind::Compile,
-                format!("submitMethod: load class failed for {class_name}: {e:?}"),);
+                format!("submitMethod: load class failed for {class_name}: {e:?}"),
+            );
         }
         let cm = shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
@@ -2811,10 +2814,11 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: class not loaded after load_class_concurrent: {class_name}"
-                    ),);
+                    ),
+                );
             }
         };
         let class = match cm.get_class(class_id) {
@@ -2822,8 +2826,9 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
-                    format!("submitMethod: class id missing in manager: {class_name}"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: class id missing in manager: {class_name}"),
+                );
             }
         };
         let mi = match class
@@ -2835,10 +2840,11 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method not found: {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         };
         let is_static_local = class.methods[mi as usize].is_static();
@@ -2871,25 +2877,27 @@ pub fn dispatch_method_from_native_on_stream(
                     else {
                         return record_failed_submission(
                             None,
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} is not a FieldReference \
                                  entry in {class_name}'s constant pool — analyzer / class \
                                  mismatch",
                                 names.len(),
-                            ),);
+                            ),
+                        );
                     };
                     let Some((nm, _desc)) =
                         class.constant_pool.get_name_and_type(*name_and_type_index)
                     else {
                         return record_failed_submission(
                             None,
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} has no resolvable \
                                  NameAndType",
                                 names.len(),
-                            ),);
+                            ),
+                        );
                     };
                     names.push(nm.to_string());
                 }
@@ -2914,10 +2922,11 @@ pub fn dispatch_method_from_native_on_stream(
             LookupOutcome::Blacklisted => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method blacklisted: {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         }
     };
@@ -2974,11 +2983,12 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Launch,
+                    GpuErrorKind::Launch,
                     format!(
                         "submitMethod: unknown or released stream handle {h} \
                          ({class_name}.{method_name}{descriptor})",
-                    ),);
+                    ),
+                );
             }
         },
         None => match CudaStream::new(ctx) {
@@ -3056,20 +3066,22 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static receiver is not an object reference: {other:?}",
-                    ),);
+                    ),
+                );
             }
             None => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static method called with no arguments \
                          (expected receiver as arg 0): {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         };
 
@@ -3100,11 +3112,12 @@ pub fn dispatch_method_from_native_on_stream(
                         drop(token);
                         return record_failed_submission(
                             Some(stream.clone()),
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field `{field_name}` not found on receiver's \
                                  class hierarchy (receiver class_id={receiver_class_id:?})",
-                            ),);
+                            ),
+                        );
                     }
                 }
             };
@@ -3124,22 +3137,24 @@ pub fn dispatch_method_from_native_on_stream(
                     drop(token);
                     return record_failed_submission(
                         Some(stream.clone()),
-                GpuErrorKind::Compile,
+                        GpuErrorKind::Compile,
                         format!(
                             "submitMethod: this_field `{field_name}` (pthis_{i}) is not an \
                              object reference: {other:?}",
-                        ),);
+                        ),
+                    );
                 }
             };
             let Some(etype) = shared.mem.heap.array_element_type(field_obj) else {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: this_field `{field_name}` (pthis_{i}) does not point at a \
                          primitive array",
-                    ),);
+                    ),
+                );
             };
             // Phase 10 #2 — `pthis_*` (receiver-field) params are not
             // represented in `KernelSignature::param_kinds` (the
@@ -3212,10 +3227,10 @@ pub fn dispatch_method_from_native_on_stream(
                         Err(msg) => {
                             drop(token);
                             return record_failed_submission(
-                        Some(stream.clone()),
-                        kind_of_device_message(&msg),
-                        msg,
-                    );
+                                Some(stream.clone()),
+                                kind_of_device_message(&msg),
+                                msg,
+                            );
                         }
                     }
                     continue;
@@ -3243,10 +3258,10 @@ pub fn dispatch_method_from_native_on_stream(
                         Err(msg) => {
                             drop(token);
                             return record_failed_submission(
-                        Some(stream.clone()),
-                        kind_of_device_message(&msg),
-                        msg,
-                    );
+                                Some(stream.clone()),
+                                kind_of_device_message(&msg),
+                                msg,
+                            );
                         }
                     }
                     continue;
@@ -3274,15 +3289,17 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
-                    format!("submitMethod: arg #{i} is null"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} is null"),
+                );
             }
             _ => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
-                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),
+                );
             }
         }
     }
@@ -3388,7 +3405,8 @@ pub fn dispatch_method_from_native_on_stream(
             return record_failed_submission(
                 Some(stream.clone()),
                 GpuErrorKind::Compile,
-                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),);
+                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),
+            );
         }
     };
     {
@@ -3625,11 +3643,7 @@ pub fn finalize_submission(
             .iter()
             .filter(is_chunk)
             .chain(writebacks.iter().filter(is_flag))
-            .chain(
-                writebacks
-                    .iter()
-                    .filter(|wb| !is_chunk(wb) && !is_flag(wb)),
-            )
+            .chain(writebacks.iter().filter(|wb| !is_chunk(wb) && !is_flag(wb)))
         {
             match wb.writeback(shared, &local_token) {
                 Ok(Some(result)) => scalar_result = Some(result),
@@ -3802,7 +3816,7 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
                 if matches!(&*status, SubmissionStatus::Running) {
                     *status = SubmissionStatus::Failed {
                         message: format!("event.query: {e}"),
-                    kind: kind_of_device_error(&e),
+                        kind: kind_of_device_error(&e),
                     };
                 }
             }
@@ -3861,11 +3875,7 @@ const AWAIT_SPINS: u32 = 64;
 /// A zero or negative `timeout_nanos` is a pure poll: the status is
 /// checked once and the answer returned without sleeping.
 #[cfg(feature = "gpu-offload")]
-pub fn await_submission(
-    shared: &crate::vm::SharedVm,
-    handle: u64,
-    timeout_nanos: u64,
-) -> i32 {
+pub fn await_submission(shared: &crate::vm::SharedVm, handle: u64, timeout_nanos: u64) -> i32 {
     use cratonvm_native_api::registry::{GPU_AWAIT_COMPLETED, GPU_AWAIT_TIMED_OUT};
 
     let deadline = std::time::Instant::now()
@@ -3880,9 +3890,7 @@ pub fn await_submission(
             // An unknown handle is terminal in the only sense that
             // matters here: no further waiting can change the answer.
             None => return GPU_AWAIT_COMPLETED,
-            Some(PollOutcome::Completed) | Some(PollOutcome::Failed) => {
-                return GPU_AWAIT_COMPLETED
-            }
+            Some(PollOutcome::Completed) | Some(PollOutcome::Failed) => return GPU_AWAIT_COMPLETED,
             Some(PollOutcome::Running) => {}
         }
 
@@ -4570,7 +4578,6 @@ pub(crate) mod input_cache {
     }
 }
 
-
 /// One chunk of a chunked writeback: where it lives in the array, and the
 /// event that fires when its device->staging copy has landed.
 #[cfg(feature = "gpu-offload")]
@@ -4612,7 +4619,6 @@ pub enum ChunkedStage {
         host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>,
     },
 }
-
 
 /// How many streams a chunked dispatch rotates its launches over, and how
 /// many chunks it splits the iteration space into.
@@ -4765,7 +4771,6 @@ fn take_chunkable_writeback(
     Some(writebacks.remove(idx))
 }
 
-
 /// Issue a chunked, overlapped dispatch.
 ///
 /// Splits `[0, work)` into `chunk_count_wanted()` chunks and, for each, launches
@@ -4885,8 +4890,7 @@ fn launch_chunked(
         let done = match events.get(chunks.len()) {
             Some(e) => std::sync::Arc::clone(e),
             None => std::sync::Arc::new(
-                cuda_bridge::Event::new(ctx)
-                    .map_err(|e| format!("chunk event (lo={lo}): {e}"))?,
+                cuda_bridge::Event::new(ctx).map_err(|e| format!("chunk event (lo={lo}): {e}"))?,
             ),
         };
         stream
@@ -4898,7 +4902,6 @@ fn launch_chunked(
 
     Ok(MarshalWriteback::Chunked { obj, stage, chunks })
 }
-
 
 /// Define an `OffloadCache` accessor for a reusable page-locked staging
 /// slab of one element type.
@@ -5109,7 +5112,8 @@ impl MarshalWriteback {
                             // DMA that owned `[lo, lo+len)` in staging is
                             // complete and the range is ours to read. No
                             // other chunk covers it.
-                            let src = unsafe { &$host.as_mut_slice()[chunk.lo..chunk.lo + chunk.len] };
+                            let src =
+                                unsafe { &$host.as_mut_slice()[chunk.lo..chunk.lo + chunk.len] };
                             $write(*obj, &shared.mem.heap, src, chunk.lo, token).map_err(|e| {
                                 format!("chunked {} write (lo={}): {e}", $what, chunk.lo)
                             })?;
@@ -5248,9 +5252,7 @@ impl MarshalWriteback {
         match self {
             // A chunked writeback covers the whole array; its length is
             // the sum of the chunks, which by construction tile it.
-            Self::Chunked { chunks, .. } => {
-                Some(chunks.iter().map(|c| c.len).sum())
-            }
+            Self::Chunked { chunks, .. } => Some(chunks.iter().map(|c| c.len).sum()),
             Self::I32 { len, .. }
             | Self::I64 { len, .. }
             | Self::F32 { len, .. }

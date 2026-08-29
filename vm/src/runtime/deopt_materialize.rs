@@ -41,10 +41,10 @@ use cratonvm_types::ClassId;
 
 use crate::error::{MethodCallFailed, VmError};
 use crate::runtime::interpreter::{alloc_object_shared, maybe_gc_forced_pub};
-use cratonvm_gc::heap::ArrayElementType;
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
+use cratonvm_gc::heap::ArrayElementType;
 
 /// RAII temporary GC-root scope for virtual-object materialization.
 ///
@@ -478,7 +478,8 @@ mod tests {
     /// A scalar-replaced object placeholder: id `id`, class `class_id`,
     /// `num_fields` default-`Undefined` fields.
     fn vobj(id: usize, class_id: u32, num_fields: usize) -> FrameValue {
-        FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id,
             class_id,
             num_fields,
@@ -583,7 +584,8 @@ mod tests {
         let real_addr = real.as_ptr() as usize as u64;
 
         // One virtual object (id 0, class 5, 3 fields): [Int(42), Object(real), Undefined].
-        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 0,
             class_id: 5,
             num_fields: 3,
@@ -628,13 +630,15 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // A (id 0).field0 -> B ;  B (id 1).field0 -> A
-        let a = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let a = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 0,
             class_id: 1,
             num_fields: 1,
             field_values: vec![FrameValue::VirtualObjectRef(1)],
         });
-        let b = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let b = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 1,
             class_id: 1,
             num_fields: 1,

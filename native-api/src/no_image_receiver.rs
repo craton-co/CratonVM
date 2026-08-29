@@ -454,7 +454,9 @@ pub fn receiver_declared_by_no_supported_image(class_name: &str) -> bool {
     // `cratonvm/`, and almost no registration does, so the common case is one
     // byte compare plus one binary search.
     if class_name.starts_with("cratonvm/") {
-        return VM_MINTED_STAND_IN_RECEIVERS.binary_search(&class_name).is_ok();
+        return VM_MINTED_STAND_IN_RECEIVERS
+            .binary_search(&class_name)
+            .is_ok();
     }
     if VM_SERVICE_RECEIVERS.binary_search(&class_name).is_ok() {
         return false;
@@ -565,7 +567,10 @@ mod tests {
         }
         // Same shape for the proxy machinery, which is excluded as a VM
         // service rather than as a blocked stand-in.
-        for name in ["java/lang/reflect/Proxy$Dispatch", "java/lang/reflect/Proxy$Instance"] {
+        for name in [
+            "java/lang/reflect/Proxy$Dispatch",
+            "java/lang/reflect/Proxy$Instance",
+        ] {
             assert!(NO_IMAGE_JDK_RECEIVERS.contains(&name), "{name}");
             assert!(VM_SERVICE_RECEIVERS.contains(&name), "{name}");
             assert!(!receiver_declared_by_no_supported_image(name), "{name}");

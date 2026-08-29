@@ -435,7 +435,8 @@ pub fn diff_against_model(
             None => SlotVerdict::ModelOverruns,
             Some(_) if is_vm_internal_model_field(&mf.name) => SlotVerdict::VmInternal,
             Some(rf) => {
-                if is_reference_descriptor(&mf.descriptor) != is_reference_descriptor(&rf.descriptor)
+                if is_reference_descriptor(&mf.descriptor)
+                    != is_reference_descriptor(&rf.descriptor)
                 {
                     SlotVerdict::TypeMismatch
                 } else if !is_anonymous_model_field(&mf.name) && mf.name != rf.name {
@@ -622,7 +623,10 @@ mod tests {
             &mut store,
             "java/io/Writer",
             None,
-            vec![field("writeBuffer", "[C"), field("lock", "Ljava/lang/Object;")],
+            vec![
+                field("writeBuffer", "[C"),
+                field("lock", "Ljava/lang/Object;"),
+            ],
         );
         // What `java/io/BufferedWriter`'s model says today.
         let model = vec![
@@ -672,7 +676,12 @@ mod tests {
     #[test]
     fn model_slots_past_the_real_layout_are_pad_not_disagreements() {
         let mut store = ClassStore::new();
-        let cid = add_real(&mut store, "java/util/Fake", None, vec![field("map", "Ljava/util/Map;")]);
+        let cid = add_real(
+            &mut store,
+            "java/util/Fake",
+            None,
+            vec![field("map", "Ljava/util/Map;")],
+        );
         let diff = diff_against_model(&store, cid, &anon(3)).expect("diff");
         assert_eq!(diff.slot(0).unwrap().verdict, SlotVerdict::Agrees);
         assert_eq!(diff.slot(1).unwrap().verdict, SlotVerdict::ModelOverruns);
@@ -710,7 +719,10 @@ mod tests {
         let diff = diff_against_model(&store, cid, &anon(6)).expect("diff");
         assert_eq!(diff.slot(0).unwrap().real_name.as_deref(), Some("table"));
         assert_eq!(diff.slot(1).unwrap().real_name.as_deref(), Some("count"));
-        assert_eq!(diff.slot(3).unwrap().real_name.as_deref(), Some("loadFactor"));
+        assert_eq!(
+            diff.slot(3).unwrap().real_name.as_deref(),
+            Some("loadFactor")
+        );
         assert_eq!(diff.slot(4).unwrap().real_name.as_deref(), Some("defaults"));
         // 1, 2 and 3 are primitives under an anonymous reference model.
         assert_eq!(diff.slot(1).unwrap().verdict, SlotVerdict::TypeMismatch);
@@ -739,7 +751,10 @@ mod tests {
         );
         let diff = diff_against_model(&store, cid, &anon(2)).expect("diff");
         assert_eq!(diff.slot(0).unwrap().real_name.as_deref(), Some("key"));
-        assert_eq!(diff.slot(1).unwrap().real_name.as_deref(), Some("algorithm"));
+        assert_eq!(
+            diff.slot(1).unwrap().real_name.as_deref(),
+            Some("algorithm")
+        );
         assert_eq!(diff.disagreement_count(), 0);
     }
 
@@ -816,7 +831,10 @@ mod tests {
         }
         // Slot 3 is the measured one: `PROPS_FIELD_DEFAULTS` in
         // `native-collections`, `float loadFactor` in the image.
-        assert_eq!(diff.slot(3).unwrap().real_name.as_deref(), Some("loadFactor"));
+        assert_eq!(
+            diff.slot(3).unwrap().real_name.as_deref(),
+            Some("loadFactor")
+        );
         assert!(diff.disagreement_count() >= 4);
         // And the rendering has to actually name it, or the census is useless.
         let rendered = diff.render();
@@ -965,7 +983,10 @@ mod production_model_order_tests {
             // below — a row here can only state one of the two.
             //
             // Declaration order, NOT the CodeSource(URL, Certificate[]) ctor.
-            ("java/security/CodeSource", &["location", "signers", "certs"]),
+            (
+                "java/security/CodeSource",
+                &["location", "signers", "certs"],
+            ),
             // Fixed earlier the same day; pinned here so the whole family is
             // covered by one test rather than three.
             (
@@ -1087,7 +1108,9 @@ mod production_model_order_tests {
             let got = instance_names(class);
             let got: Vec<&str> = got.iter().map(String::as_str).collect();
             if got != *want {
-                wrong.push(format!("  {class}\n    model: {got:?}\n    real:  {want:?}"));
+                wrong.push(format!(
+                    "  {class}\n    model: {got:?}\n    real:  {want:?}"
+                ));
             }
         }
         assert!(
@@ -1141,7 +1164,9 @@ mod production_model_order_tests {
             let got = instance_names(class);
             let got: Vec<&str> = got.iter().map(String::as_str).collect();
             if got != *want {
-                wrong.push(format!("  {class}\n    model: {got:?}\n    want:  {want:?}"));
+                wrong.push(format!(
+                    "  {class}\n    model: {got:?}\n    want:  {want:?}"
+                ));
             }
         }
         assert!(

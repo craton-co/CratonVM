@@ -340,7 +340,9 @@ mod tests {
         // arrives from a method the `Read`/`Write` wrappers never see.
         let mut socket = Flaky::new(0);
         socket.flushes_pending = 3;
-        EintrIo::new(&mut socket).flush().expect("EINTR must not escape");
+        EintrIo::new(&mut socket)
+            .flush()
+            .expect("EINTR must not escape");
         assert_eq!(socket.flushes_pending, 0);
     }
 

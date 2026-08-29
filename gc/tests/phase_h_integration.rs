@@ -447,7 +447,7 @@ fn rh8_selection_is_deterministic_under_ties() {
         for region in regions.iter_mut().take(10) {
             region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = 0.5; // all tied
-            // Marking data required for mixed-CSet eligibility (G1CORE-7).
+                                        // Marking data required for mixed-CSet eligibility (G1CORE-7).
             region.live_bytes = 100;
         }
     });

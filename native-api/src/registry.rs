@@ -6578,7 +6578,11 @@ impl NativeMethodRegistry {
     /// Run `f` with `current_category` set to `kind`, restoring the previous
     /// category afterwards. This is how a whole `register_*` function tags all
     /// of its registrations without touching individual `register()` calls.
-    pub fn with_category(&mut self, kind: impl Into<Option<NativeKind>>, f: impl FnOnce(&mut Self)) {
+    pub fn with_category(
+        &mut self,
+        kind: impl Into<Option<NativeKind>>,
+        f: impl FnOnce(&mut Self),
+    ) {
         let prev = self.current_category;
         self.current_category = kind.into();
         f(self);
@@ -6902,7 +6906,9 @@ impl NativeMethodRegistry {
         // Compatible mode pays exactly one field load plus a discriminant
         // compare here, and the `allowed_in` call is short-circuited away.
         if self.compatibility_mode == CompatibilityMode::JdkOnly
-            && !self.effective_category().allowed_in(CompatibilityMode::JdkOnly)
+            && !self
+                .effective_category()
+                .allowed_in(CompatibilityMode::JdkOnly)
         {
             // Reuse the existing `CRATONVM_DBG_DROPPED_STUBS` switch (added
             // 2026-07-14 for the mis-tagged-category bisection) with a distinct
@@ -7885,7 +7891,8 @@ impl NativeMethodRegistry {
         // inherited? Only `register_with_kind` sets the flag, and only for the
         // duration of its own inner call.
         self.kind_stated.push(self.next_kind_stated);
-        self.category_chosen_log.push(self.current_category.is_some());
+        self.category_chosen_log
+            .push(self.current_category.is_some());
         // Provenance, index-parallel with the two pushes above. `overwrote` is
         // read HERE — before the `match prior_slot` arm below rewrites
         // `slot.kind` in place — because that is the last moment the displaced
@@ -9123,8 +9130,17 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
 
         // Someone adjudicated this as a Bridge.
-        r.register_with_kind("java/util/Demo", "m", desc, dummy_native, NativeKind::Bridge);
-        assert_eq!(r.kind_of("java/util/Demo", "m", desc), Some(NativeKind::Bridge));
+        r.register_with_kind(
+            "java/util/Demo",
+            "m",
+            desc,
+            dummy_native,
+            NativeKind::Bridge,
+        );
+        assert_eq!(
+            r.kind_of("java/util/Demo", "m", desc),
+            Some(NativeKind::Bridge)
+        );
 
         // A later phase re-registers to win the callback, saying nothing about
         // the kind. The callback must change; the adjudicated kind must not.
@@ -9134,7 +9150,9 @@ mod tests {
             Some(NativeKind::Bridge),
             "an ambient SyntheticStub default must not overwrite a stated Bridge"
         );
-        let id = r.resolve_id("java/util/Demo", "m", desc).expect("registered");
+        let id = r
+            .resolve_id("java/util/Demo", "m", desc)
+            .expect("registered");
         let cb = r.callback_of(id).expect("callback");
         let mut ctx = MockNativeContext::new();
         assert_eq!(
@@ -10802,7 +10820,9 @@ mod tests {
         let mut registry = NativeMethodRegistry::new();
         let mut set = CapabilitySet::new(VmId::from_raw(0xCA9A_0002), CapabilityMode::Enforce);
         // Grant registration of the HashMap native only.
-        set.grant(Capability::NativeRegister(Scope::name("java/util/HashMap.*")));
+        set.grant(Capability::NativeRegister(Scope::name(
+            "java/util/HashMap.*",
+        )));
         registry.set_capabilities(std::sync::Arc::new(set));
 
         let generation_before = registry.generation();

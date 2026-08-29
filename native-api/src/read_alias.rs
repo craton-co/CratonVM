@@ -688,7 +688,11 @@ mod tests {
                         (10, "nativeByteOrder"),
                     ],
                 ),
-                ("java/nio/MappedByteBuffer", 2, vec![(11, "fd"), (12, "isSync")]),
+                (
+                    "java/nio/MappedByteBuffer",
+                    2,
+                    vec![(11, "fd"), (12, "isSync")],
+                ),
                 (
                     "java/nio/DirectByteBuffer",
                     3,
@@ -832,7 +836,10 @@ mod tests {
         let oracle = ChainOracle {
             classes: vec![("java/nio/DirectByteBuffer", usize::MAX, vec![])],
         };
-        assert_eq!(field_name_at(&oracle, ClassId::new(0), 0), SlotAnswer::Unknown);
+        assert_eq!(
+            field_name_at(&oracle, ClassId::new(0), 0),
+            SlotAnswer::Unknown
+        );
         assert_eq!(classify_read("hb", &SlotAnswer::Unknown), None);
     }
 
@@ -840,7 +847,12 @@ mod tests {
     #[test]
     fn agreement_is_not_a_finding() {
         let (oracle, dbb) = direct_byte_buffer_chain();
-        for (slot, name) in [(1, "position"), (2, "limit"), (3, "capacity"), (13, "cleaner")] {
+        for (slot, name) in [
+            (1, "position"),
+            (2, "limit"),
+            (3, "capacity"),
+            (13, "cleaner"),
+        ] {
             assert_eq!(
                 classify_read(name, &field_name_at(&oracle, dbb, slot)),
                 None,

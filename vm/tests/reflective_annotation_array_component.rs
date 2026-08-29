@@ -274,7 +274,10 @@ const EXPECTED: &[(&str, &str)] = &[
     ("ctorDeclared", "[Ljava.lang.annotation.Annotation;"),
     ("paramDeclared", "[Ljava.lang.annotation.Annotation;"),
     ("classByType", "[LAnnotationArrayComponentProbe$Tag;"),
-    ("classDeclaredByType", "[LAnnotationArrayComponentProbe$Tag;"),
+    (
+        "classDeclaredByType",
+        "[LAnnotationArrayComponentProbe$Tag;",
+    ),
     ("methodByType", "[LAnnotationArrayComponentProbe$Tag;"),
 ];
 

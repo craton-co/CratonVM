@@ -56,12 +56,10 @@ fn test_vm() -> Vm {
 /// everywhere and still live at that point.
 #[must_use]
 fn force_deterministic_jit_warmup() -> cratonvm_types::flags::FlagOverride {
-    cratonvm_types::flags::override_process(cratonvm_types::flags::VmFlags::from_env_with_edits(
-        &[
-            ("CRATONVM_JIT_THRESHOLD", Some("2")),
-            ("CRATONVM_BG_COMPILE", Some("0")),
-        ],
-    ))
+    cratonvm_types::flags::override_process(cratonvm_types::flags::VmFlags::from_env_with_edits(&[
+        ("CRATONVM_JIT_THRESHOLD", Some("2")),
+        ("CRATONVM_BG_COMPILE", Some("0")),
+    ]))
 }
 
 #[test]

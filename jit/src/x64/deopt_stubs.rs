@@ -48,7 +48,6 @@ fn osr_ambiguous_dead_enabled() -> bool {
 }
 
 impl Compiler {
-
     /// deopt-osr Step 1: record a precise deopt-exit snapshot (the interpreter
     /// frame state — locals + operand stack as `FrameValue`s — reconstructable
     /// from live machine state) at an eligible guard whose loop-header/canonical
@@ -130,8 +129,11 @@ impl Compiler {
     pub(super) fn analyze_stack_kinds(&mut self, code: &[u8], code_len: usize) {
         use super::stack_kinds::{analyze, StackKindInputs};
 
-        let field_types: FxHashMap<usize, u8> =
-            self.field_info.iter().map(|&(pc, _, tag)| (pc, tag)).collect();
+        let field_types: FxHashMap<usize, u8> = self
+            .field_info
+            .iter()
+            .map(|&(pc, _, tag)| (pc, tag))
+            .collect();
         let static_types: FxHashMap<usize, u8> = self
             .static_field_info
             .iter()
@@ -204,7 +206,11 @@ impl Compiler {
         }
     }
 
-    pub(super) fn snapshot_pre_intrinsic_call(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
+    pub(super) fn snapshot_pre_intrinsic_call(
+        &mut self,
+        bci: usize,
+        reason: crate::deopt::DeoptReason,
+    ) {
         if self.deopt_box_ptr_by_bci.contains_key(&bci) {
             return;
         }
@@ -502,7 +508,12 @@ impl Compiler {
             // `Unsupported`, which made every deopt point's frame unresumable
             // and cost the whole METHOD its OSR entry at every back edge. See
             // `regalloc::live_locals_per_pc_all` for the measurement.
-            if self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
+            if self
+                .local_liveness_covered
+                .get(bci)
+                .copied()
+                .unwrap_or(false)
+            {
                 let live_here = self.local_liveness_word(bci, i);
                 if live_here & (1u64 << (i % 64)) == 0 {
                     // `CRATONVM_DBG_EXCFRAME=1` reports every local DROPPED
@@ -704,7 +715,10 @@ impl Compiler {
                         self.local_kinds_refined.cfg_is_exact,
                         reg,
                         xmm,
-                        self.local_liveness_covered.get(bci).copied().unwrap_or(false),
+                        self.local_liveness_covered
+                            .get(bci)
+                            .copied()
+                            .unwrap_or(false),
                         self.method_key,
                     );
                 }
@@ -806,15 +820,13 @@ impl Compiler {
         // Either disagreement discards the whole vector for this bci and leaves
         // the pre-existing encoding in place.
         let raw_kinds = self.stack_kinds.get(bci);
-        let stack_kinds = raw_kinds
-            .filter(|kinds| kinds.len() == n)
-            .filter(|kinds| {
-                kinds.iter().enumerate().all(|(i, k)| {
-                    let analysis_says_ref = *k == super::stack_kinds::StackKind::Ref;
-                    let unknown = *k == super::stack_kinds::StackKind::Unknown;
-                    unknown || self.stack_oop_marks[i] == analysis_says_ref
-                })
-            });
+        let stack_kinds = raw_kinds.filter(|kinds| kinds.len() == n).filter(|kinds| {
+            kinds.iter().enumerate().all(|(i, k)| {
+                let analysis_says_ref = *k == super::stack_kinds::StackKind::Ref;
+                let unknown = *k == super::stack_kinds::StackKind::Unknown;
+                unknown || self.stack_oop_marks[i] == analysis_says_ref
+            })
+        });
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
             // Which of the three outcomes happened is the whole diagnosis when
             // a snapshot stays `Unsupported`: no answer at this bci (the
@@ -932,9 +944,7 @@ impl Compiler {
                     Some(b'D') => FrameValue::XmmDouble(*n),
                     Some(b'F') => FrameValue::XmmFloat(*n),
                     _ => match stack_kinds.and_then(|kinds| kinds.get(i)) {
-                        Some(super::stack_kinds::StackKind::Double) => {
-                            FrameValue::XmmDouble(*n)
-                        }
+                        Some(super::stack_kinds::StackKind::Double) => FrameValue::XmmDouble(*n),
                         Some(super::stack_kinds::StackKind::Float) => FrameValue::XmmFloat(*n),
                         // An `Int`/`Long`/`Ref` kind claiming an XMM home is a
                         // contradiction, not a value to encode — the same
@@ -1488,8 +1498,12 @@ impl Compiler {
     ) {
         if self.local_handler_propagate_survives_a_call(throw_bci) {
             if let Some(site_idx) = self.local_handler_site_for(throw_bci) {
-                self.local_handler_stubs
-                    .push((patch_offset, site_idx, throw_bci, precise_exc_stub));
+                self.local_handler_stubs.push((
+                    patch_offset,
+                    site_idx,
+                    throw_bci,
+                    precise_exc_stub,
+                ));
                 return;
             }
         }
@@ -1552,9 +1566,9 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        // An allocation failure stashes a real `OutOfMemoryError` object, so a
-        // `catch (OutOfMemoryError)` / `finally` guarding this bci is as
-        // enterable in compiled code as a callee's throw.
+                                                  // An allocation failure stashes a real `OutOfMemoryError` object, so a
+                                                  // `catch (OutOfMemoryError)` / `finally` guarding this bci is as
+                                                  // enterable in compiled code as a callee's throw.
         self.record_exception_check_edge(patch_offset, throw_bci, precise_exc_stub);
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
@@ -1642,9 +1656,7 @@ impl Compiler {
                 declaring_class_id: self.local_handler_class_id,
                 // Cast: a bci fits u32 by classfile limits.
                 throw_bci: throw_bci as u32,
-                cache: std::sync::atomic::AtomicU64::new(
-                    crate::JitLocalHandlerSite::CACHE_EMPTY,
-                ),
+                cache: std::sync::atomic::AtomicU64::new(crate::JitLocalHandlerSite::CACHE_EMPTY),
             }));
         self.local_handler_site_by_bci.insert(throw_bci, idx);
         Some(idx)
@@ -1813,7 +1825,7 @@ impl Compiler {
                     // the pending exception. 48 B8 <imm64>
                     self.buf.emit(&[0x48, 0xB8]);
                     self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-                    // Standard method epilogue: restore callee-saved regs and return.
+                                                                     // Standard method epilogue: restore callee-saved regs and return.
                     self.emit_epilogue();
                     off
                 }
@@ -2193,7 +2205,10 @@ mod spill_region_contract {
             // …and the reservation predicate really does answer `true` for that
             // property alone, with `deopt_real` OFF. This is the assertion the
             // bug failed: `has_indy_sites` was not a term in it at all.
-            let (pef, indy) = (property == "precise_exception_frames", property == "has_indy_sites");
+            let (pef, indy) = (
+                property == "precise_exception_frames",
+                property == "has_indy_sites",
+            );
             assert!(
                 reserved(false, pef, indy),
                 "reason {reason}: {property} does not reserve the spill region"
@@ -2216,10 +2231,16 @@ mod spill_region_contract {
     #[test]
     fn the_contract_is_stated_in_both_directions() {
         assert!(reserved(false, false, true), "an indy method must reserve");
-        assert!(reserved(false, true, false), "a precise-frame method must reserve");
+        assert!(
+            reserved(false, true, false),
+            "a precise-frame method must reserve"
+        );
         for reason in SPILLS_WITHOUT_DEOPT_REAL {
             assert!(covered_by(reason).is_some(), "reason {reason} uncovered");
         }
-        assert!(covered_by(2).is_none(), "reason 2 spills only under deopt_real");
+        assert!(
+            covered_by(2).is_none(),
+            "reason 2 spills only under deopt_real"
+        );
     }
 }

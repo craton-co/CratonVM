@@ -371,7 +371,10 @@ pub(crate) fn xml_unescape(s: &str) -> String {
 }
 
 /// Build a DOM tree of synthetic objects from a parsed XML tree
-pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn xml_build_dom(
+    ctx: &mut dyn NativeContext,
+    node: &XmlNode,
+) -> Result<ObjectRef, MethodCallFailed> {
     match node {
         XmlNode::Element {
             tag,
@@ -473,7 +476,10 @@ pub(crate) fn xml_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) 
 }
 
 /// Parse XML string and build DOM document
-pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn xml_parse_to_document(
+    ctx: &mut dyn NativeContext,
+    xml_text: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Slot 2 carries the DTD-declared ID attributes — see `DOC_ID_ATTRS`.
     let mut doc = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 3)?;
     // Pin across the DOM build below — a moving young GC there would relocate
@@ -596,7 +602,11 @@ fn dom_find_by_id(
 }
 
 /// Walk a DOM tree for SAX callbacks
-pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) -> Result<(), MethodCallFailed> {
+pub(crate) fn sax_walk(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+    node: &XmlNode,
+) -> Result<(), MethodCallFailed> {
     // Pin across the string/attr allocs and SAX callbacks below — a moving
     // young GC there would relocate `handler` (native stale-local family).
     let handler_pin = ctx.pin_native_root(handler);
@@ -1088,7 +1098,10 @@ fn xslt_output_property(
 /// `DOMSource` and `StreamSource` cover essentially every identity-transform
 /// caller; anything else (notably `SAXSource`) returns `None` so `transform`
 /// can report it rather than emit an empty result.
-fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Result<Option<String>, MethodCallFailed> {
+fn xslt_source_text(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Result<Option<String>, MethodCallFailed> {
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(source))
         .unwrap_or_default();
@@ -2318,7 +2331,8 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/transform/TransformerFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/transform/TransformerFactory", 0)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "javax/xml/transform/TransformerFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3103,7 +3117,9 @@ pub(crate) fn reflection_deserialize_from_json(
     json: &str,
     class_id: ClassId,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    Ok(reflection_deserialize_from_json_depth(ctx, json, class_id, 0)?)
+    Ok(reflection_deserialize_from_json_depth(
+        ctx, json, class_id, 0,
+    )?)
 }
 
 pub(crate) fn reflection_deserialize_from_json_depth(
@@ -4017,7 +4033,10 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 }
 
 /// Allocate a JsonNode synthetic object with the given type.
-pub(crate) fn alloc_json_node(ctx: &mut dyn NativeContext, node_type: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn alloc_json_node(
+    ctx: &mut dyn NativeContext,
+    node_type: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let node = try_alloc_concurrent_synthetic(ctx, "com/fasterxml/jackson/databind/JsonNode", 8)?;
     ctx.set_field(node, 0, Value::Int(node_type));
     ctx.set_field(node, 2, Value::Long(0));
@@ -4028,7 +4047,10 @@ pub(crate) fn alloc_json_node(ctx: &mut dyn NativeContext, node_type: i32) -> Re
 }
 
 /// Build a JsonNode tree from a raw JSON string.
-pub(crate) fn build_json_tree_node(ctx: &mut dyn NativeContext, json: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn build_json_tree_node(
+    ctx: &mut dyn NativeContext,
+    json: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     Ok(build_json_tree_node_depth(ctx, json, 0)?)
 }
 

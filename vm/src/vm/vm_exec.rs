@@ -208,10 +208,8 @@ fn reject_missing_implementation(
 /// distinguishable from "it runs and never admits a native". Without this a
 /// zero census reads as "the exception list is dead" when it may only mean the
 /// probe never got there.
-static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record a `--jdk-only` refusal of the §8 interface substitution.
 ///
@@ -243,8 +241,8 @@ pub fn record_interface_substitution_refusal(
 
 /// JDK-ONLY-WAVE2 §8 census: which of the five hard-coded interface
 /// substitutions in `interpreter.rs` actually fires, and for what.
-fn canonical_census() -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>
-{
+fn canonical_census(
+) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>> {
     static C: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>,
     > = std::sync::OnceLock::new();
@@ -308,7 +306,8 @@ pub fn record_check_override_strict_refusal(class_name: &str, method_name: &str,
 /// per-family deletion exercise, not something the fast path pays for.
 #[allow(clippy::type_complexity)]
 fn check_override_census(
-) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>> {
+) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>>
+{
     static C: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>>,
     > = std::sync::OnceLock::new();
@@ -541,9 +540,9 @@ static DIAL_DOOR_YIELDED: [std::sync::atomic::AtomicU64; 14] = [
 /// too expensive for the hot path, which is why the totals above are separate
 /// and always available on an armed run.
 #[allow(clippy::type_complexity)]
-fn dial_door_detail(
-) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(&'static str, String, String, String), (u64, u64)>>
-{
+fn dial_door_detail() -> &'static parking_lot::Mutex<
+    std::collections::BTreeMap<(&'static str, String, String, String), (u64, u64)>,
+> {
     static C: std::sync::OnceLock<
         parking_lot::Mutex<
             std::collections::BTreeMap<(&'static str, String, String, String), (u64, u64)>,
@@ -723,8 +722,7 @@ static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
 /// owns the spelling and both sides cannot drift. See
 /// [`cratonvm_types::error::NATIVE_SHADOW_RAN_TAG`], which records what the split
 /// spelling cost the first time somebody read the report without it.
-pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str =
-    cratonvm_types::error::NATIVE_SHADOW_RAN_TAG;
+pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str = cratonvm_types::error::NATIVE_SHADOW_RAN_TAG;
 
 /// Maximum number of distinct structured observations retained, by default.
 ///
@@ -1096,8 +1094,8 @@ fn offer_native_shadow_observation(
     // triples rather than of dispatch events: a repeat of a triple already
     // offered — retained or dropped — returns here and increments nothing.
     let digest = jdk_only_shadow_digest(class, method, descriptor, kind_tag);
-    let slot =
-        &JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
+    let slot = &JDK_ONLY_NATIVE_SHADOW_FILTER
+        [(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
     if slot.load(Ordering::Relaxed) == digest {
         return;
     }
@@ -1273,12 +1271,7 @@ pub fn resolve_dispatch<'a>(
         // `Compatible` mode this is one not-taken branch and nothing else.
         if strict {
             if let Some((_, kind)) = native {
-                record_native_shadows_bytecode(
-                    &class.name,
-                    &method.name,
-                    &method.descriptor,
-                    kind,
-                );
+                record_native_shadows_bytecode(&class.name, &method.name, &method.descriptor, kind);
             }
         }
         return DispatchDecision::Bytecode(method);
@@ -2479,7 +2472,8 @@ pub fn unbox_poly_return_checked(
     // boxed primitive (the same closed eight-class table the invokeExact rule
     // uses) reaching a NON-`Object` reference return — i.e. exactly the values
     // that are already a silent wrong answer today.
-    if let Some(actual) = varhandle_reference_return_mismatch(shared, value, descriptor, method_name)
+    if let Some(actual) =
+        varhandle_reference_return_mismatch(shared, value, descriptor, method_name)
     {
         let message = format!(
             "VarHandle access site {descriptor} requires a reference of its declared return \
@@ -3707,7 +3701,8 @@ fn native_diag_post_call(
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         if n % youngscan_stride() == 0 {
-            if let Some((addr, cid, fld, payload, nbr)) = shared.mem.heap.dbg_first_young_small_ref()
+            if let Some((addr, cid, fld, payload, nbr)) =
+                shared.mem.heap.dbg_first_young_small_ref()
             {
                 if !youngscan_mark_found() {
                     let native = native_callee_name(callback);
@@ -4854,7 +4849,10 @@ thread_local! {
 #[inline]
 fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
     // Widening: u32 -> usize (value preserved).
-    ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
+    ((class_id as usize)
+        .wrapping_mul(31)
+        .wrapping_add(slot_index))
+        & 63
 }
 
 /// Stamp for a DEFINITIVE thread-local entry: one resolved against a real,
@@ -4914,9 +4912,7 @@ fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
 /// so a silently-never-taken fast path looks exactly like a working one.
 fn hw_atomic_dbg() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HW_ATOMIC").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HW_ATOMIC").is_some())
 }
 
 static HW_ATOMIC_SEEN: [std::sync::atomic::AtomicBool; 3] = [
@@ -5005,7 +5001,9 @@ fn hw_atomic_addr(
     let class_id = shared.mem.heap.class_id_of(obj);
     // The slot must really be of the requested type. This doubles as the bounds
     // proof: the descriptor only resolves for a declared field of this class.
-    if !kind.matches_descriptor(resolve_field_descriptor_byte_cached(shared, class_id, index)?) {
+    if !kind.matches_descriptor(resolve_field_descriptor_byte_cached(
+        shared, class_id, index,
+    )?) {
         return None;
     }
     let header = shared.mem.heap.get_header(obj);
@@ -5016,8 +5014,7 @@ fn hw_atomic_addr(
         // A compact body offset IS the payload address; there is no tag word,
         // so there is nothing to guard. Refuse any width this atomic cannot
         // address (a narrow reference, say) rather than tearing it.
-        let (body_off, storage) =
-            cratonvm_types::compact_field_storage(class_id.as_u32(), index)?;
+        let (body_off, storage) = cratonvm_types::compact_field_storage(class_id.as_u32(), index)?;
         if storage.size_runtime() as usize != kind.width() {
             return None;
         }
@@ -5136,7 +5133,7 @@ fn resolve_field_descriptor_byte_cached(
             && entry.1 == class_id.as_u32()
             && entry.2 == slot_index
             && live(entry.4))
-            .then_some((entry.3, entry.4))
+        .then_some((entry.3, entry.4))
     });
     if let Some((byte, stamp)) = ring_hit {
         FIELD_DESCRIPTOR_LAST
@@ -5560,9 +5557,8 @@ fn first_model_slot_report(class_id: ClassId, index: usize, is_read: bool) -> bo
     }) {
         return true;
     }
-    static SEEN: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashSet<(u32, u32, bool)>>,
-    > = std::sync::OnceLock::new();
+    static SEEN: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashSet<(u32, u32, bool)>>> =
+        std::sync::OnceLock::new();
     SEEN.get_or_init(Default::default)
         .lock()
         .insert((class_id.as_u32(), index as u32, is_read))
@@ -5612,7 +5608,8 @@ fn overlay_check_access(
     // census, so the per-access line's whole job is to NAME the native, and one
     // occurrence does that. Without this, `java/lang/String` slot 1 alone —
     // model says reference, image says `byte coder` — buries the run.
-    if n == 1 && reasons[0] == OverlayReason::ModelSlot
+    if n == 1
+        && reasons[0] == OverlayReason::ModelSlot
         && !first_model_slot_report(class_id, index, is_read)
     {
         return;
@@ -5984,7 +5981,12 @@ impl NativeContextImpl<'_> {
 /// (the write side), including its `_fN` opaque-bootstrap-metadata fallback,
 /// so the two cannot disagree about which slot holds the message.
 pub(crate) fn describe_throwable(shared: &SharedVm, exc: ObjectRef) -> String {
-    if shared.mem.heap.is_object_address(exc.as_ptr() as usize).is_none() {
+    if shared
+        .mem
+        .heap
+        .is_object_address(exc.as_ptr() as usize)
+        .is_none()
+    {
         return format!("<not a live object: {:p}>", exc.as_ptr());
     }
     let class_id = shared.mem.heap.class_id_of(exc);
@@ -6743,8 +6745,8 @@ impl<'a> NativeContextImpl<'a> {
         // has PARKED — see `env_cache::noflag_deposit_skips_jit_scan` for the
         // measurement, the argument, and the two holes in the argument that
         // keep it off by default.
-        let skip_jit_scan = !raise_blocked_flag
-            && crate::runtime::env_cache::noflag_deposit_skips_jit_scan();
+        let skip_jit_scan =
+            !raise_blocked_flag && crate::runtime::env_cache::noflag_deposit_skips_jit_scan();
         if !moving_young_precise_only && !skip_jit_scan {
             let jit_scan_start = snapshot.len();
             crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
@@ -7852,14 +7854,9 @@ impl<'a> NativeContextImpl<'a> {
         // bump above: that pairing has its own ordering comment and the two
         // epochs answer different questions — global "was the cache flushed"
         // versus per-class "was THIS class replaced".
-        let _ = self
-            .shared
-            .jit
-            .compilation_broker
-            .lock()
-            .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
-                name.to_string(),
-            ));
+        let _ = self.shared.jit.compilation_broker.lock().invalidate(
+            &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
+        );
         Ok(())
     }
 }
@@ -8247,9 +8244,7 @@ unsafe fn string_unit_at(data: *const u8, storage: u8, index: usize) -> u16 {
     // little-endian bytes (`StringUTF16.isBigEndian() == false`, and `char[]`
     // elements are stored as native-endian `u16` on the little-endian targets
     // this VM builds for).
-    unsafe {
-        u16::from_le_bytes([*data.add(index * 2), *data.add(index * 2 + 1)])
-    }
+    unsafe { u16::from_le_bytes([*data.add(index * 2), *data.add(index * 2 + 1)]) }
 }
 
 /// Return the raw Java String hash directly from the receiver's character
@@ -9251,14 +9246,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                     .unwrap_or_default();
                 // Same one pass, for the same reason: `create_method_object`
                 // used to re-find this method by name+descriptor to read it.
-                let signature: Option<String> = m.attributes.iter().find_map(|a| {
-                    match a.as_decoded() {
+                let signature: Option<String> =
+                    m.attributes.iter().find_map(|a| match a.as_decoded() {
                         Some(cratonvm_reader::attribute::Attribute::Signature(sig)) => {
                             Some(sig.to_string())
                         }
                         _ => None,
-                    }
-                });
+                    });
                 MethodMetadata {
                     name: m.name.to_string(),
                     descriptor: m.descriptor.to_string(),
@@ -10175,14 +10169,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, so a queued compilation of the previous body is stale.
-                let _ = self
-                    .shared
-                    .jit
-                    .compilation_broker
-                    .lock()
-                    .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
-                        name.to_string(),
-                    ));
+                let _ = self.shared.jit.compilation_broker.lock().invalidate(
+                    &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
+                );
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -10259,14 +10248,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, so a queued compilation of the previous body is stale.
-                let _ = self
-                    .shared
-                    .jit
-                    .compilation_broker
-                    .lock()
-                    .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
-                        name.to_string(),
-                    ));
+                let _ = self.shared.jit.compilation_broker.lock().invalidate(
+                    &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
+                );
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -10403,14 +10387,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         let cha_evicted = self.shared.invalidate_jit_for_class(name);
         // A define over an already-loaded name replaces that class's
         // bytecode, so a queued compilation of the previous body is stale.
-        let _ = self
-            .shared
-            .jit
-            .compilation_broker
-            .lock()
-            .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
-                name.to_string(),
-            ));
+        let _ = self.shared.jit.compilation_broker.lock().invalidate(
+            &cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(name.to_string()),
+        );
         if cha_evicted > 0 {
             tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
         }
@@ -10504,7 +10483,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-                let mut fwd_buf: Vec<Value> = Vec::new();
+        let mut fwd_buf: Vec<Value> = Vec::new();
         let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_shared(
             self.shared,
@@ -10524,7 +10503,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-                let mut fwd_buf: Vec<Value> = Vec::new();
+        let mut fwd_buf: Vec<Value> = Vec::new();
         let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_by_class_id_shared(
             self.shared,
@@ -10547,7 +10526,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
-                let mut fwd_buf: Vec<Value> = Vec::new();
+        let mut fwd_buf: Vec<Value> = Vec::new();
         let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared(
             self.shared,
@@ -12122,7 +12101,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             // the only ones that do not advance that generation, are the
             // marker install/replace phases, and `native_chm_get_string_chain`
             // refuses to memoize a marker node.
-            return Some((segment_id, generation, self.shared.mem.heap.get_field(entry_node, 2)));
+            return Some((
+                segment_id,
+                generation,
+                self.shared.mem.heap.get_field(entry_node, 2),
+            ));
         }
         None
     }
@@ -13311,11 +13294,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         locale: Option<ObjectRef>,
         upper: bool,
     ) -> Option<ObjectRef> {
-        let entry = self
-            .thread
-            .string_case_cache
-            .iter_mut()
-            .find(|entry| entry.source == source && entry.locale == locale && entry.upper == upper)?;
+        let entry = self.thread.string_case_cache.iter_mut().find(|entry| {
+            entry.source == source && entry.locale == locale && entry.upper == upper
+        })?;
         let result = if entry.next {
             entry.second
         } else {
@@ -13512,7 +13493,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     .rev()
                     .take(4)
                     .map(|f| {
-                        format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor())
+                        format!(
+                            "{}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
                     })
                     .collect();
                 let site = if frames.is_empty() {
@@ -13751,7 +13737,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .iter()
                 .rev()
                 .take(4)
-                .map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor()))
+                .map(|f| {
+                    format!(
+                        "{}.{}{}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor()
+                    )
+                })
                 .collect();
             let site = if frames.is_empty() {
                 "<no java frame>".to_string()
@@ -15508,9 +15501,11 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // its physical class name.
         let lock_class_name = if contended.is_none() {
             waiting.and_then(|object| {
-                (self.class_name_arc_of_id(self.class_id_of_object(object)).as_deref()
+                (self
+                    .class_name_arc_of_id(self.class_id_of_object(object))
+                    .as_deref()
                     == Some("java/util/concurrent/CountDownLatch"))
-                    .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
+                .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
             })
         } else {
             None
@@ -17179,12 +17174,10 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     name: name.to_string(),
                     definitions,
                 },
-                NameResolution::Absent | NameResolution::Unique(_) => {
-                    ClassIdentityError::Refused {
-                        name: name.to_string(),
-                        reason: err.to_string(),
-                    }
-                }
+                NameResolution::Absent | NameResolution::Unique(_) => ClassIdentityError::Refused {
+                    name: name.to_string(),
+                    reason: err.to_string(),
+                },
             }),
         }
     }
@@ -19291,12 +19284,10 @@ pub fn invoke_or_native(
                         // native wins. See `populate_virtual_invoke_cache` for
                         // the full LinkedHashMap-overlay rationale.
                         if parent.find_method(method_name, descriptor).is_some() {
-                            if let Some((callback, native_kind)) =
-                                shared.natives.native_methods.find_with_kind(
-                                    &parent.name,
-                                    method_name,
-                                    descriptor,
-                                )
+                            if let Some((callback, native_kind)) = shared
+                                .natives
+                                .native_methods
+                                .find_with_kind(&parent.name, method_name, descriptor)
                             {
                                 // The `cm` read guard is HELD across this whole
                                 // walk, which is why the dial's bytecode probe
@@ -19337,12 +19328,10 @@ pub fn invoke_or_native(
                             }
                             break;
                         }
-                        if let Some((callback, native_kind)) =
-                            shared.natives.native_methods.find_with_kind(
-                                &parent.name,
-                                method_name,
-                                descriptor,
-                            )
+                        if let Some((callback, native_kind)) = shared
+                            .natives
+                            .native_methods
+                            .find_with_kind(&parent.name, method_name, descriptor)
                         {
                             if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
                                 eprintln!(
@@ -22939,9 +22928,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             }
             _ => String::new(),
         };
-        eprintln!(
-            "[ANN-PROXY-MISS] type={type_desc} member={method_name} elements={n} -> null"
-        );
+        eprintln!("[ANN-PROXY-MISS] type={type_desc} member={method_name} elements={n} -> null");
     }
     Ok(Some(Value::Object(None)))
 }
@@ -26646,11 +26633,9 @@ fn invoke_on_class_shared_inner(
                         record_check_override_strict_refusal(class_name, method_name, descriptor);
                     }
                     if check_override_census_on() {
-                        CHECK_OVERRIDE_REACHED
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        CHECK_OVERRIDE_REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if check_override {
-                            CHECK_OVERRIDE_TRUE
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            CHECK_OVERRIDE_TRUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     if check_override
@@ -27252,9 +27237,11 @@ fn invoke_on_class_shared_inner(
                         // `Object`, but its header carries the COMPONENT class
                         // id — walking that chain would run the component
                         // class's own body with the array as `this`.
-                        let recv_is_array = shared.mem.heap.kind_of(recv)
-                            == cratonvm_types::ObjectKind::Array;
-                        if !recv_is_array && !recv_name.is_empty() && recv_name != "java/lang/Object"
+                        let recv_is_array =
+                            shared.mem.heap.kind_of(recv) == cratonvm_types::ObjectKind::Array;
+                        if !recv_is_array
+                            && !recv_name.is_empty()
+                            && recv_name != "java/lang/Object"
                         {
                             // Native registered on the receiver's class
                             // (or any superclass on the chain).
@@ -28031,9 +28018,7 @@ fn invoke_on_class_shared_inner(
         let (class_name, native_shadows_bytecode) = {
             let cm = shared.classes.class_manager.read();
             let declaring = cm.get_class(declaring_class_id);
-            let class_name = declaring
-                .map(|c| c.name.to_string())
-                .unwrap_or_default();
+            let class_name = declaring.map(|c| c.name.to_string()).unwrap_or_default();
             let shadows = strict
                 && declaring
                     .and_then(|c| c.find_method(method_name, descriptor))
@@ -28046,31 +28031,32 @@ fn invoke_on_class_shared_inner(
         // the `NativeKind` that decides §1.3 / §1.4. `compat_native_wins` is
         // `true` — the unconditional "the registered native runs here" this
         // site has always encoded — so `Compatible` is bit-for-bit unchanged.
-        let registry_native = match shared.natives.native_methods.find_with_kind(
-            &class_name,
-            method_name,
-            descriptor,
-        ) {
-            Some((callback, native_kind)) => match resolve_native_dispatch_wave1(
-                DispatchDoor::ClassSharedNative,
-                policy,
-                &class_name,
-                method_name,
-                descriptor,
-                Some((callback, native_kind)),
-                true,
-                native_shadows_bytecode,
-            ) {
-                Some(DispatchDecision::Reject(violation)) => {
-                    return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
-                }
-                Some(decision) => decision.native_callback(),
-                // JdkOnly, §7 step 3: this "native" is a bridge standing in
-                // front of concrete bytecode, and the bytecode wins.
+        let registry_native =
+            match shared
+                .natives
+                .native_methods
+                .find_with_kind(&class_name, method_name, descriptor)
+            {
+                Some((callback, native_kind)) => match resolve_native_dispatch_wave1(
+                    DispatchDoor::ClassSharedNative,
+                    policy,
+                    &class_name,
+                    method_name,
+                    descriptor,
+                    Some((callback, native_kind)),
+                    true,
+                    native_shadows_bytecode,
+                ) {
+                    Some(DispatchDecision::Reject(violation)) => {
+                        return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
+                    }
+                    Some(decision) => decision.native_callback(),
+                    // JdkOnly, §7 step 3: this "native" is a bridge standing in
+                    // front of concrete bytecode, and the bytecode wins.
+                    None => None,
+                },
                 None => None,
-            },
-            None => None,
-        };
+            };
         (class_name, native_shadows_bytecode, registry_native)
     } else {
         (String::new(), false, None)
@@ -28950,8 +28936,10 @@ mod native_funnel_profile {
                 thread: &mut thread,
             };
             black_box(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| noop_native(&mut ctx, &[])))
-                    .map_err(|_| ()),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    noop_native(&mut ctx, &[])
+                }))
+                .map_err(|_| ()),
             )
             .ok();
         });
@@ -29008,13 +28996,16 @@ mod native_funnel_profile {
         rung("component: take_jni_pending_exception()", || {
             black_box(crate::native::jni::take_jni_pending_exception());
         });
-        rung("component: the two INLINE_NATIVE_ARGS scratch arrays", || {
-            const N: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
-            let mut forwarded = [Value::Object(None); N];
-            let mut roots = [None::<usize>; N];
-            black_box(&mut forwarded);
-            black_box(&mut roots);
-        });
+        rung(
+            "component: the two INLINE_NATIVE_ARGS scratch arrays",
+            || {
+                const N: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
+                let mut forwarded = [Value::Object(None); N];
+                let mut roots = [None::<usize>; N];
+                black_box(&mut forwarded);
+                black_box(&mut roots);
+            },
+        );
     }
 }
 
@@ -29141,7 +29132,10 @@ mod native_diag_tests {
     /// print nothing on a healthy run.
     #[test]
     fn pre_call_acts_only_on_the_bits_it_is_given() {
-        fn probe(_ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+        fn probe(
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _a: &[Value],
+        ) -> MethodCallResult {
             Ok(None)
         }
         let cb: NativeCallback = probe;
@@ -29151,7 +29145,10 @@ mod native_diag_tests {
         let st = native_diag_pre_call(0, &mut thread, cb);
         assert!(st.ring_idx.is_none(), "mask 0 must not enter the ring");
         assert!(!st.straystack_pushed, "mask 0 must not push straystack");
-        assert!(st.vm_state_name.is_none(), "mask 0 must not name the callee");
+        assert!(
+            st.vm_state_name.is_none(),
+            "mask 0 must not name the callee"
+        );
 
         // RING alone: a token, and nothing else.
         //
@@ -29353,7 +29350,11 @@ mod tests {
         let shared = test_shared();
         let a = crate::vm::create_java_string_uninterned(&shared, "k0");
         let b = crate::vm::create_java_string_uninterned(&shared, "k0");
-        assert_ne!(a.as_ptr(), b.as_ptr(), "the probe needs two distinct objects");
+        assert_ne!(
+            a.as_ptr(),
+            b.as_ptr(),
+            "the probe needs two distinct objects"
+        );
         assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
         // "k0" == 'k' * 31 + '0' == 3365, the value String.hashCode() returns.
         assert_eq!(compact_java_string_hash(&shared, a), Some(3365));
@@ -29376,9 +29377,9 @@ mod tests {
         let c = crate::vm::create_java_string_uninterned(&shared, "kπ1");
         assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
         assert_eq!(compact_java_strings_equal(&shared, a, c), Some(false));
-        let expected = "kπ0"
-            .encode_utf16()
-            .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+        let expected = "kπ0".encode_utf16().fold(0i32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(unit as i32)
+        });
         assert_eq!(compact_java_string_hash(&shared, a), Some(expected));
     }
 
@@ -31227,13 +31228,17 @@ mod tests {
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
             let mut cm = shared.classes.class_manager_write();
-            cm.try_ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
+            cm.try_ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         // Sanity: that class is a stub.
         {
             let cm = shared.classes.class_manager.read();
             let cls = cm.get_class(cid).expect("stub registered");
-            assert!(cls.origin.is_compatibility_stub(), "expected a synthetic stub");
+            assert!(
+                cls.origin.is_compatibility_stub(),
+                "expected a synthetic stub"
+            );
         }
         // Resolution must return None so the caller falls back to raw read.
         assert_eq!(resolve_field_descriptor_byte_cached(&shared, cid, 0), None);
@@ -31874,11 +31879,8 @@ mod tests {
     };
 
     /// A native that `classify_native` maps to a capability…
-    const SENSITIVE: (&str, &str, &str) = (
-        "java/lang/ProcessBuilder",
-        "start",
-        "()Ljava/lang/Process;",
-    );
+    const SENSITIVE: (&str, &str, &str) =
+        ("java/lang/ProcessBuilder", "start", "()Ljava/lang/Process;");
     /// …and one it does not, which is the answer for ~3,100 of the ~3,100.
     const BENIGN: (&str, &str, &str) = ("java/lang/Object", "hashCode", "()I");
 
@@ -31888,10 +31890,7 @@ mod tests {
     /// The same `Arc` in both, so there is one audit log.
     fn vm_in_mode(mode: CapabilityMode) -> (SharedVm, Arc<CapabilitySet>) {
         let mut shared = SharedVm::new(VmConfig::default());
-        let caps = Arc::new(CapabilitySet::new(
-            VmId::from_raw(shared.vm_identity),
-            mode,
-        ));
+        let caps = Arc::new(CapabilitySet::new(VmId::from_raw(shared.vm_identity), mode));
         shared
             .natives
             .native_methods
@@ -32048,10 +32047,8 @@ mod tests {
     #[test]
     fn enforce_admits_a_dispatch_covered_by_an_unscoped_grant() {
         let mut shared = SharedVm::new(VmConfig::default());
-        let mut set = CapabilitySet::new(
-            VmId::from_raw(shared.vm_identity),
-            CapabilityMode::Enforce,
-        );
+        let mut set =
+            CapabilitySet::new(VmId::from_raw(shared.vm_identity), CapabilityMode::Enforce);
         set.grant(Capability::parse_grant("process-spawn:*").unwrap());
         let caps = Arc::new(set);
         shared
@@ -32063,10 +32060,8 @@ mod tests {
         assert!(gate(&shared, SENSITIVE).is_ok());
         // A *scoped* grant does not admit it: the gate's request is
         // `Scope::Any`, and fail-closed means a narrow grant refuses it.
-        let mut narrow = CapabilitySet::new(
-            VmId::from_raw(shared.vm_identity),
-            CapabilityMode::Enforce,
-        );
+        let mut narrow =
+            CapabilitySet::new(VmId::from_raw(shared.vm_identity), CapabilityMode::Enforce);
         narrow.grant(Capability::parse_grant("process-spawn:/bin/sh").unwrap());
         let narrow = Arc::new(narrow);
         shared
@@ -32659,7 +32654,6 @@ mod real_protected_stub_single_predicate_witness {
     }
 }
 
-
 /// The field compare-and-swap, as a free function over `&SharedVm`.
 ///
 /// Extracted from `VmExec::compare_and_swap_field` so the JIT funnel's
@@ -32713,8 +32707,7 @@ pub(crate) fn compare_and_swap_field_shared(
             }
         }
         (Value::Object(exp), Value::Object(new)) => {
-            if let Some(addr) = hw_atomic_addr(shared, fwd, index, HwAtomicKind::Reference)
-            {
+            if let Some(addr) = hw_atomic_addr(shared, fwd, index, HwAtomicKind::Reference) {
                 // The payload word of a reference cell IS the raw pointer,
                 // zero for a JVM null, and `values_equal_for_cas` compares
                 // references by exactly that pointer — so a bit-level CAS

@@ -1137,7 +1137,6 @@ impl Arm64Backend {
         r
     }
 
-
     /// Run the shared operand-stack kind analysis over `bytecode`.
     ///
     /// See the `stack_kinds` field for why empty metadata is sufficient on
@@ -1201,7 +1200,6 @@ impl Arm64Backend {
         // `cats[0]` is the top, `cats[1]` the entry below it, ...
         Some(cats)
     }
-
 
     /// The shared `dup2_x1` / `dup2_x2` shuffle:
     /// `[under.., group..] -> [group.., under.., group..]`, counted in
@@ -2685,8 +2683,7 @@ impl Arm64Backend {
                     if cats[0] {
                         let val = self.pop_operand();
                         let dup = self.alloc_scratch();
-                        self.buffer
-                            .emit(Arm64Instruction::Mov { rd: dup, rm: val });
+                        self.buffer.emit(Arm64Instruction::Mov { rd: dup, rm: val });
                         self.push_operand(val);
                         self.push_operand(dup);
                     } else {
@@ -4773,7 +4770,11 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
             } => {
                 // Scaled unsigned form: imm12 scaled by the access size, so the
                 // reachable byte range is 8*4095 for D and 4*4095 for S.
-                let (scale, max_scaled) = if *is_double { (8i32, 32760i32) } else { (4, 16380) };
+                let (scale, max_scaled) = if *is_double {
+                    (8i32, 32760i32)
+                } else {
+                    (4, 16380)
+                };
                 if *offset >= 0 && *offset % scale == 0 && *offset <= max_scaled {
                     if *is_double {
                         emitter.ldr_fp_d(fp(*vt), r(*rn), *offset as u16);
@@ -4801,7 +4802,11 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 offset,
                 is_double,
             } => {
-                let (scale, max_scaled) = if *is_double { (8i32, 32760i32) } else { (4, 16380) };
+                let (scale, max_scaled) = if *is_double {
+                    (8i32, 32760i32)
+                } else {
+                    (4, 16380)
+                };
                 if *offset >= 0 && *offset % scale == 0 && *offset <= max_scaled {
                     if *is_double {
                         emitter.str_fp_d(fp(*vt), r(*rn), *offset as u16);
@@ -5437,7 +5442,10 @@ mod tests {
     fn backend_int_div_bails_with_constant_operands() {
         // iconst_1, iconst_2, idiv, ireturn
         let result = make_backend_with_method(0, 0, &[0x04, 0x05, 0x6c, 0xac]);
-        assert!(!result.success, "idiv must bail, constant operands included");
+        assert!(
+            !result.success,
+            "idiv must bail, constant operands included"
+        );
         let has_div = result
             .instructions
             .iter()
@@ -5931,7 +5939,13 @@ mod tests {
 
         // Small immediate (fits 12 bits): one ADD-immediate instruction.
         let mut e_small = Aarch64Emitter::new();
-        assert!(emit_addsub_imm_safe(&mut e_small, Reg::X9, Reg::X9, 5, false));
+        assert!(emit_addsub_imm_safe(
+            &mut e_small,
+            Reg::X9,
+            Reg::X9,
+            5,
+            false
+        ));
         assert_eq!(
             e_small.code().len(),
             4,
@@ -6245,7 +6259,11 @@ mod tests {
         let bytes = emit_machine_code(&result).expect("must encode");
         let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         // LDR D0, [X1, #16] — scaled unsigned form has bit 24 set, imm12 = 2.
-        assert_eq!((w >> 24) & 1, 1, "positive aligned offset uses the scaled form");
+        assert_eq!(
+            (w >> 24) & 1,
+            1,
+            "positive aligned offset uses the scaled form"
+        );
         assert_eq!((w >> 10) & 0xFFF, 2, "imm12 must be 16/8 == 2");
     }
 
@@ -6272,7 +6290,11 @@ mod tests {
         let n = bytes.len();
         let access = u32::from_le_bytes([bytes[n - 8], bytes[n - 7], bytes[n - 6], bytes[n - 5]]);
         assert_eq!((access >> 5) & 0x1F, 16, "access base must be IP0 (X16)");
-        assert_eq!((access >> 12) & 0x1FF, 0, "materialized access uses offset 0");
+        assert_eq!(
+            (access >> 12) & 0x1FF,
+            0,
+            "materialized access uses offset 0"
+        );
     }
 
     // ===================================================================
@@ -6332,7 +6354,10 @@ mod tests {
     fn p95_irem_bails_with_constant_operands() {
         // iconst_5, iconst_2, irem, ireturn
         let result = make_backend_with_method(0, 0, &[0x08, 0x05, 0x70, 0xac]);
-        assert!(!result.success, "irem must bail, constant operands included");
+        assert!(
+            !result.success,
+            "irem must bail, constant operands included"
+        );
         let has_msub = result
             .instructions
             .iter()
@@ -7000,7 +7025,10 @@ mod tests {
         // Sign-extend imm26 and confirm it points backwards, at a real
         // instruction inside the buffer.
         let signed = ((imm26 << 6) as i32) >> 6;
-        assert_eq!(signed, -2, "B at word 2 targeting word 0 is a -2 displacement");
+        assert_eq!(
+            signed, -2,
+            "B at word 2 targeting word 0 is a -2 displacement"
+        );
         let target = (b_index as i64 + signed as i64) * 4;
         assert_eq!(target, 0, "back-edge target must be the bound label");
         assert!(
@@ -7226,7 +7254,10 @@ mod tests {
             // it was, silently. Without these two cases the rest of this test
             // passes against the pre-fix backend for the wrong reason (an
             // accidental underflow), which is no test at all.
-            ("dup of a float over two ints", vec![0x03u8, 0x04, 0x0b, 0x59]),
+            (
+                "dup of a float over two ints",
+                vec![0x03u8, 0x04, 0x0b, 0x59],
+            ),
             ("pop of a float over two ints", vec![0x03, 0x04, 0x0b, 0x57]),
             ("dup of a double", vec![0x0e, 0x59]),
             ("dup2 of a double", vec![0x0e, 0x5c]),
@@ -7249,9 +7280,7 @@ mod tests {
     fn pop2_over_a_long_discards_one_entry_not_two() {
         // iconst_0, lconst_0, pop2 -> the int must survive.
         let mut backend = Arm64Backend::new();
-        assert!(backend
-            .compile_method(4, 0, 8, &[0x03, 0x09, 0x58])
-            .success);
+        assert!(backend.compile_method(4, 0, 8, &[0x03, 0x09, 0x58]).success);
         assert_eq!(
             backend.operand_stack.len(),
             1,
@@ -7265,10 +7294,12 @@ mod tests {
     #[test]
     fn dup2_over_a_long_duplicates_one_entry_not_two() {
         let mut backend = Arm64Backend::new();
-        assert!(backend
-            .compile_method(4, 0, 8, &[0x03, 0x09, 0x5c])
-            .success);
-        assert_eq!(backend.operand_stack.len(), 3, "[int, long] -> [int, long, long]");
+        assert!(backend.compile_method(4, 0, 8, &[0x03, 0x09, 0x5c]).success);
+        assert_eq!(
+            backend.operand_stack.len(),
+            3,
+            "[int, long] -> [int, long, long]"
+        );
     }
 
     /// When the width analysis cannot type the operands, the method is
@@ -7279,5 +7310,4 @@ mod tests {
         let mut backend = Arm64Backend::new();
         assert!(!backend.compile_method(4, 0, 8, &[0x5e]).success);
     }
-
 }

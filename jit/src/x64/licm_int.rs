@@ -256,7 +256,11 @@ pub(super) fn decode_int_store(code: &[u8], pc: usize, code_len: usize) -> Optio
 
 /// Decode a small int constant push (`iconst_m1..5` / `bipush` / `sipush`) →
 /// (value, next pc).
-pub(super) fn decode_int_const_push(code: &[u8], pc: usize, code_len: usize) -> Option<(i32, usize)> {
+pub(super) fn decode_int_const_push(
+    code: &[u8],
+    pc: usize,
+    code_len: usize,
+) -> Option<(i32, usize)> {
     match *code.get(pc)? {
         // Widening: u8 -> wider int (bytecode operand byte, value fits)
         0x02..=0x08 => Some((code[pc] as i32 - 3, pc + 1)),
@@ -281,7 +285,12 @@ pub(super) struct AffineStep {
 /// Match a single `iload_k ; [push c1 ; imul] ; [push c2 ; (iadd|isub)] ;
 /// istore_k` step on local `k` at `pc`. At least one of the multiply/add must
 /// be present (so a bare `iload_k; istore_k` copy is not "folded").
-pub(super) fn match_affine_step(code: &[u8], pc: usize, code_len: usize, k: usize) -> Option<AffineStep> {
+pub(super) fn match_affine_step(
+    code: &[u8],
+    pc: usize,
+    code_len: usize,
+    k: usize,
+) -> Option<AffineStep> {
     let (lk, mut p) = decode_int_load(code, pc, code_len)?;
     if lk != k {
         return None;
@@ -452,7 +461,11 @@ pub(super) fn find_arith_loop_hoists(
 /// Find loop-invariant FP loads (dload/fload of locals not modified in the loop).
 /// These can be hoisted to a frame slot before the loop, avoiding redundant
 /// loads on every iteration when the local is not XMM-allocated.
-pub(super) fn find_fp_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]) -> Vec<FpLoopHoist> {
+pub(super) fn find_fp_loop_hoists(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> Vec<FpLoopHoist> {
     if loops.is_empty() {
         return Vec::new();
     }

@@ -123,11 +123,7 @@ pub fn alloc_concrete(
 ///     fields. A later `base_for_class` on that receiver would answer `nfields`
 ///     and disagree with the 0 the allocator used; the width check sends it
 ///     back to 0, which is the base that was actually used.
-pub fn concrete_base(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    nfields: usize,
-) -> usize {
+pub fn concrete_base(ctx: &mut dyn NativeContext, this: ObjectRef, nfields: usize) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, nfields)
 }
 

@@ -11,10 +11,10 @@
 use cratonvm_native_api::registry::NativeContext;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
+use cratonvm_types::error::MethodCallFailed;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use cratonvm_types::error::MethodCallFailed;
 
 thread_local! {
     /// The `GenericDeclaration` (Class / Method / Constructor mirror) that owns
@@ -291,11 +291,14 @@ fn resolve_class_id_in_generic_scope(
     if let Some(declaring_class) = declaring_class {
         let loader_id = ctx.loader_id_of_class(declaring_class);
         let loader =
-            crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class.as_u32()).or_else(|| {
-                (loader_id >= 3)
-                    .then(|| crate::classloader::loader_object_for_namespace_id(loader_id as u32))
-                    .flatten()
-            });
+            crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class.as_u32())
+                .or_else(|| {
+                    (loader_id >= 3)
+                        .then(|| {
+                            crate::classloader::loader_object_for_namespace_id(loader_id as u32)
+                        })
+                        .flatten()
+                });
         if let Some(loader) = loader {
             if let Some(mirror) =
                 crate::classloader::find_loaded_class_for_loader(ctx, loader, name)
@@ -429,7 +432,10 @@ fn component_array_name(sig: &TypeSig) -> Option<String> {
 }
 
 /// Convert a TypeSig into a java.lang.reflect.Type runtime object.
-pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Value, MethodCallFailed> {
+pub fn type_sig_to_java(
+    ctx: &mut dyn NativeContext,
+    sig: &TypeSig,
+) -> Result<Value, MethodCallFailed> {
     match sig {
         TypeSig::Base(ch) => {
             // Primitive types -> Class mirror for the primitive.
@@ -765,7 +771,8 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value,
             // Object is the conservative non-null representation when the
             // referenced class cannot be resolved.
             if matches!(value, Ok(Value::Object(None))) {
-                Ok(ctx.class_id_by_name("java/lang/Object")
+                Ok(ctx
+                    .class_id_by_name("java/lang/Object")
                     .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
                     .unwrap_or(value?))
             } else {
@@ -951,7 +958,10 @@ pub fn type_param_to_java(
 /// identically to HotSpot. Non-parameterized / type-variable / array / primitive
 /// shapes fall back to [`type_sig_to_java`] (a raw `Class<?>` mirror renders
 /// fine; a synthetic `TypeVariable` is resolved via the generic-decl scope).
-pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Value, MethodCallFailed> {
+pub(crate) fn typesig_to_real_type(
+    ctx: &mut dyn NativeContext,
+    sig: &TypeSig,
+) -> Result<Value, MethodCallFailed> {
     match sig {
         TypeSig::Class {
             name,
@@ -1044,7 +1054,10 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
 }
 
 /// Build the REAL `Type` for a single `TypeArg` (used by [`typesig_to_real_type`]).
-fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value, MethodCallFailed> {
+fn typearg_to_real_type(
+    ctx: &mut dyn NativeContext,
+    arg: &TypeArg,
+) -> Result<Value, MethodCallFailed> {
     match arg {
         TypeArg::Exact(sig) => {
             let value = typesig_to_real_type(ctx, sig);
