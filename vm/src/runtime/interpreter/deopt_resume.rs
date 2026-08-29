@@ -1798,6 +1798,69 @@ pub(crate) fn dbg_deopt_sink(
     );
 }
 
+/// May the interpreter re-run this method from entry instead of resuming
+/// precisely at `resume_bci`?
+///
+/// `true` means the abandoned compiled attempt cannot have committed anything
+/// observable, so a re-run from bci 0 is the same execution — the locals are
+/// rebuilt from the same arguments and nothing outside the frame was written.
+///
+/// # Why a PREFIX, and not the whole body
+///
+/// The rule used to be "the whole method commits no side effect", and that is
+/// the right rule for a method the compiler ran end to end. It is the wrong
+/// rule for an abandoned attempt: what a replay could DUPLICATE is only what
+/// the attempt already committed, and the attempt stopped at `resume_bci`.
+/// Every deopt point this VM emits carries `ResumeSemantics::REEXECUTE` (only
+/// `PendingException` differs, and those frames go to a different stash), so
+/// the bytecode AT `resume_bci` had not completed and the bytecodes after it
+/// never ran. Only `code[..resume_bci]` can have committed anything.
+///
+/// The narrower rule cost a real answer: netty's
+/// `UnpooledHeapByteBuf._getUnsignedMedium` is `getfield array; invokestatic
+/// getUnsignedMedium`, and once `CRATONVM_JIT_IR_INLINE` splices that callee
+/// in, an out-of-bounds read deopts at the invoke. The whole body "commits a
+/// side effect" — it contains a call — so the replay was refused and a
+/// three-byte bounds check raised `InternalError` instead of
+/// `IndexOutOfBoundsException`. Nothing before the invoke commits anything, and
+/// the call itself never completed, so the replay was always safe. See
+/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+///
+/// # The second half
+///
+/// A spliced artifact's attempt also ran part of a RELOCATED callee body, which
+/// the caller's bytecode does not describe. `spliced_bodies_pure` is the
+/// artifact's own answer for that half (`CompiledMethod::
+/// spliced_bodies_side_effect_free`), computed at compile time with this same
+/// predicate over each spliced region. It is vacuously `true` for an artifact
+/// that spliced nothing.
+///
+/// Conservative in both directions it can be: an out-of-range `resume_bci`
+/// (including the `u32::MAX` identity-less re-run sentinel) falls back to
+/// asking the question of the whole body, which is the historical rule.
+pub(crate) fn replay_from_entry_is_observably_equivalent(
+    code: &[u8],
+    spliced_bodies_pure: bool,
+    resume_bci: u32,
+) -> bool {
+    // The historical rule first: a body that commits nothing anywhere needs no
+    // reasoning about where the attempt stopped, and answers `true` even for
+    // the `u32::MAX` sentinel.
+    if !cratonvm_jit::bytecode_commits_side_effect(code, code.len()) {
+        return true;
+    }
+    if !spliced_bodies_pure {
+        return false;
+    }
+    let Ok(prefix) = usize::try_from(resume_bci) else {
+        return false;
+    };
+    if prefix > code.len() {
+        return false;
+    }
+    !cratonvm_jit::bytecode_commits_side_effect(code, prefix)
+}
+
 pub(crate) fn deopt_frame_matches_method(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
     class_name: &str,
@@ -3431,5 +3494,97 @@ mod deopt_step3_tests {
             !why.contains("inlined caller chain"),
             "the chain is not what is wrong here: {why}"
         );
+    }
+    // ── replay_from_entry_is_observably_equivalent ──────────────────────
+
+    /// netty's `UnpooledHeapByteBuf._getUnsignedMedium`, byte for byte:
+    /// `aload_0; getfield #57; iload_1; invokestatic #262; ireturn`.
+    ///
+    /// Nine bytes, one of which is a call — so the OLD rule ("the body commits
+    /// no side effect") refused every replay, and an out-of-bounds read through
+    /// the spliced callee raised `InternalError` instead of
+    /// `IndexOutOfBoundsException`. The deopt resumes at the invoke, bci 5, and
+    /// nothing before bci 5 commits anything.
+    const GET_UNSIGNED_MEDIUM: [u8; 9] = [
+        0x2a, // 0: aload_0
+        0xb4, 0x00, 0x39, // 1: getfield
+        0x1b, // 4: iload_1
+        0xb8, 0x01, 0x06, // 5: invokestatic  <- the spliced site, the resume bci
+        0xac, // 8: ireturn
+    ];
+
+    #[test]
+    fn a_replay_is_allowed_when_nothing_before_the_resume_point_commits() {
+        // The whole body contains a call, so the historical rule refuses.
+        assert!(cratonvm_jit::bytecode_commits_side_effect(
+            &GET_UNSIGNED_MEDIUM,
+            GET_UNSIGNED_MEDIUM.len()
+        ));
+        // But the abandoned attempt stopped AT the call, and the prefix is
+        // three pure loads.
+        assert!(replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            5
+        ));
+    }
+
+    /// The same body, with a spliced callee that could have written something.
+    /// The prefix says nothing about the relocated bytecode, so the artifact's
+    /// own answer has to veto.
+    #[test]
+    fn an_impure_spliced_body_vetoes_the_prefix_rule() {
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            false,
+            5
+        ));
+    }
+
+    /// A resume point PAST a side effect is still refused: the attempt already
+    /// committed it, and a re-run from entry would do it twice.
+    #[test]
+    fn a_resume_point_after_a_store_still_refuses() {
+        // 0: aload_0  1: iload_1  2: putfield  5: aload_0  6: iload_1
+        // 7: invokestatic  10: ireturn
+        let code = [
+            0x2a, 0x1b, 0xb5, 0x00, 0x01, 0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac,
+        ];
+        assert!(
+            !replay_from_entry_is_observably_equivalent(&code, true, 7),
+            "the putfield at bci 2 is before the resume point and would be \
+             duplicated"
+        );
+        // Resuming at the putfield itself is fine — it had not run.
+        assert!(replay_from_entry_is_observably_equivalent(&code, true, 2));
+    }
+
+    /// A body that commits nothing anywhere keeps the historical answer,
+    /// including for the identity-less `u32::MAX` re-run sentinel that a null
+    /// deopt point stashes.
+    #[test]
+    fn a_pure_body_replays_at_any_resume_point_including_the_sentinel() {
+        let pure = [0x2a, 0x1b, 0xac]; // aload_0; iload_1; ireturn
+        assert!(replay_from_entry_is_observably_equivalent(&pure, true, 0));
+        assert!(replay_from_entry_is_observably_equivalent(&pure, true, u32::MAX));
+        assert!(replay_from_entry_is_observably_equivalent(&pure, false, u32::MAX));
+        // ...and an impure body with that sentinel is refused, because there is
+        // no resume point to reason about.
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            u32::MAX
+        ));
+    }
+
+    /// A resume bci past the end of the body is nonsense; refuse rather than
+    /// answer from a truncated walk.
+    #[test]
+    fn an_out_of_range_resume_bci_refuses() {
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            36
+        ));
     }
 }

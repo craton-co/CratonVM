@@ -4000,9 +4000,10 @@ pub fn execute(
                                             shared,
                                             &rframe_for_despec,
                                         );
-                                    } else if !cratonvm_jit::bytecode_commits_side_effect(
+                                    } else if replay_from_entry_is_observably_equivalent(
                                         &code_attr.code,
-                                        code_attr.code.len(),
+                                        compiled.spliced_bodies_side_effect_free,
+                                        rframe_for_despec.bci,
                                     ) {
                                         // The refusal below is about DUPLICATED
                                         // SIDE EFFECTS, and this method has none
@@ -4074,12 +4075,28 @@ pub fn execute(
                                     } else {
                                         "unknown"
                                     };
+                                    // `deopt_reason` DEFAULTS to `UnreachedCode` when no
+                                    // point carries this bci, so printing it bare names a
+                                    // reason nothing ever requested — which is how the
+                                    // spliced-bci defect read as an `UnreachedCode` trap
+                                    // for a day. Say which of the two this is.
+                                    let reason_is_real = compiled
+                                        .deopt_points
+                                        .iter()
+                                        .any(|dp| dp.bci == rframe_for_despec.bci);
+                                    let reason_note = if reason_is_real {
+                                        "reason"
+                                    } else {
+                                        "NO deopt point carries this bci, so the reason \
+                                         below is this sink's default rather than a \
+                                         request — reason"
+                                    };
                                     return Err(MethodCallFailed::InternalError(
                                         VmError::Internal {
                                             message: format!(
                                                 "precise deoptimization unavailable for \
                                                  {}.{}{} at bci {} ({}, stashed key {:?}, \
-                                                 inline callers {}, reason {:?}); \
+                                                 inline callers {}, {} {:?}); \
                                                  refusing side-effecting replay",
                                                 class_name_str,
                                                 method_name,
@@ -4088,6 +4105,7 @@ pub fn execute(
                                                 why,
                                                 rframe_for_despec.method_key,
                                                 rframe_for_despec.caller_frames.len(),
+                                                reason_note,
                                                 deopt_reason,
                                             ),
                                         },
