@@ -1526,13 +1526,13 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
         native_unsafe_define_class,
     );
 
-    // Legacy `defineAnonymousClass` — JDK 8 surface, ByteBuddy still emits.
-    r.register(
-        u2,
-        "defineAnonymousClass",
-        "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
-        native_unsafe_define_anonymous_class,
-    );
+    // `defineAnonymousClass` RETIRED 2026-08-29. Its comment justified it as
+    // "JDK 8 surface, ByteBuddy still emits" -- and that premise is not true of
+    // any image this VM supports: the method is ABSENT from 17, 21 and 25, so a
+    // caller emitting it, from bytecode or reflectively, fails resolution
+    // against the real class no matter what is registered here. A guard scoped
+    // by a stated premise is only as good as the premise. Evidence for the
+    // whole retirement is on the `monitorEnter` note in `unsafe_natives_ext.rs`.
     r.set_category(__prev_cat);
 }
 
@@ -1935,13 +1935,12 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
         native_unsafe_weak_cas_object,
     );
 
-    // 2. park with blocker (Object, long).
-    registry.register(
-        u2,
-        "park",
-        "(Ljava/lang/Object;J)V",
-        native_unsafe_park_with_blocker,
-    );
+    // 2. park with blocker (Object, long) RETIRED 2026-08-29: absent from every
+    // supported image. `park(ZJ)V` -- the overload the JDK does declare -- stays
+    // registered and takes 781 invocations across 16 corpus vectors in strict
+    // mode, which is what makes this row's zero mean something.
+    // `native_unsafe_park_with_blocker` itself is retained: a unit test below
+    // calls it directly.
 
     // 3. invokeCleaner.
     registry.register(
@@ -2155,18 +2154,10 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     // 10. Volatile Object/Reference getter already registered in lib.rs,
     // but the Plain-suffixed aliases for VarHandle.PlainSet/PlainGet are
     // not. Map them to the same underlying impls.
-    registry.register(
-        u2,
-        "getReferencePlain",
-        "(Ljava/lang/Object;J)Ljava/lang/Object;",
-        crate::native_unsafe_get_object,
-    );
-    registry.register(
-        u2,
-        "putReferencePlain",
-        "(Ljava/lang/Object;JLjava/lang/Object;)V",
-        crate::native_unsafe_put_object,
-    );
+    // `getReferencePlain` / `putReferencePlain` RETIRED 2026-08-29: absent from
+    // every supported image. They aliased `native_unsafe_{get,put}_object`, so
+    // even the bodies were duplicates of registrations that remain live under
+    // the names the JDK does declare.
 
     // 11. getAndAddByte / getAndAddShort — uncommon but present in JDK 25
     // for VarHandle arithmetic on sub-int widths. Implement via strong CAS
