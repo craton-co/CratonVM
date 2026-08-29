@@ -352,6 +352,25 @@ fn native_unsafe_invoke_cleaner(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
         _ => return Ok(None),
     };
+    // MEASURED, HotSpot 25.0.4+7: a slice or duplicate of a direct buffer is an
+    // `IllegalArgumentException` ("duplicate or slice"), and a non-direct
+    // buffer is too. Freeing through a view would release memory the ORIGINAL
+    // buffer still owns, so the refusal is the whole point of the method's
+    // contract. CratonVM accepted every one of them.
+    //
+    // The JDK's own test is `!(directBuffer instanceof DirectBuffer) ||
+    // ((DirectBuffer) directBuffer).attachment() != null` -- a view keeps a
+    // reference to what it was cut from in `attachment`, and only a root
+    // direct buffer has it null.
+    if matches!(
+        ctx.get_field_by_name(buf, "att"),
+        Value::Object(Some(_))
+    ) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "invokeCleaner: duplicate or slice".into(),
+        }
+        .into());
+    }
     let addr = buf.as_ptr() as usize;
     // Idempotency: first call does work, repeats are no-ops.
     // We don't eagerly call arena.free here because the Java-side
@@ -710,14 +729,36 @@ fn native_unsafe_allocate_memory_consolidated(
         Some(Value::Int(s)) => *s as i64,
         _ => 0,
     };
-    if size < 0 {
+    // The JDK's `allocateMemory(long)` bytecode is four steps, and this native
+    // replaces all four. MEASURED against HotSpot 25.0.4+7 with
+    // `probes/AllocBoundary.java`, which is what fixes the boundary rather
+    // than a guess about it:
+    //
+    //   bytes < 0                    IllegalArgumentException
+    //   align8(bytes) overflows      IllegalArgumentException   (MAX and MAX-1)
+    //   bytes == 0                   returns 0
+    //   2^62-1, 2^40, ...            OutOfMemoryError
+    //
+    // The overflow rule is not a separate check in the JDK: `alignToHeapWordSize`
+    // rounds up to a multiple of 8 FIRST, and for anything above
+    // `Long.MAX_VALUE - 7` that wraps negative, so the negative test catches it.
+    // Reproducing it as an explicit bound keeps the two cases legible.
+    if size < 0 || size > i64::MAX - 7 {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("allocateMemory: negative size {size}"),
+            message: format!("allocateMemory: bad size {size}"),
         }
         .into());
     }
-    let addr = crate::unsafe_arena_allocate(size as usize);
-    Ok(Some(Value::Long(addr)))
+    if size == 0 {
+        return Ok(Some(Value::Long(0)));
+    }
+    match crate::unsafe_arena_try_allocate(size as usize) {
+        Some(addr) => Ok(Some(Value::Long(addr))),
+        None => Err(RuntimeError::OutOfMemoryError {
+            message: format!("Unable to allocate {size} bytes"),
+        }
+        .into()),
+    }
 }
 
 /// SECURITY FIX (V5): reallocateMemory(long,long) routed to the arena store.
@@ -736,21 +777,37 @@ fn native_unsafe_reallocate_memory_consolidated(
         Some(Value::Int(s)) => *s as i64,
         _ => 0,
     };
-    if new_size < 0 {
+    // Same four steps as `allocateMemory`, plus the JDK's zero rule:
+    //   `reallocateMemory(address, 0)` FREES the block and returns 0.
+    // MEASURED, HotSpot 25.0.4+7 (`UnsafeShadowSweep`, off-heap section).
+    if new_size < 0 || new_size > i64::MAX - 7 {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("reallocateMemory: negative size {new_size}"),
+            message: format!("reallocateMemory: bad size {new_size}"),
         }
         .into());
     }
+    if new_size == 0 {
+        if old_addr != 0 {
+            crate::unsafe_arena_free(old_addr);
+        }
+        invalidate_arena_cache();
+        return Ok(Some(Value::Long(0)));
+    }
     let addr = if old_addr == 0 {
-        crate::unsafe_arena_allocate(new_size as usize)
+        crate::unsafe_arena_try_allocate(new_size as usize)
     } else {
-        crate::unsafe_arena_reallocate(old_addr, new_size as usize)
+        crate::unsafe_arena_try_reallocate(old_addr, new_size as usize)
     };
     // The arena may have moved/resized under this address — drop the
     // per-thread window so a stale range can't mask a later access.
     invalidate_arena_cache();
-    Ok(Some(Value::Long(addr)))
+    match addr {
+        Some(a) => Ok(Some(Value::Long(a))),
+        None => Err(RuntimeError::OutOfMemoryError {
+            message: format!("Unable to allocate {new_size} bytes"),
+        }
+        .into()),
+    }
 }
 
 /// SECURITY FIX (V5): setMemory(Object,long,long,byte). The off-heap form
@@ -770,11 +827,23 @@ fn native_unsafe_set_memory_consolidated(
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    let bytes = match args.get(3) {
-        Some(Value::Long(v)) => *v as usize,
-        Some(Value::Int(v)) => *v as usize,
+    // A NEGATIVE length is an IllegalArgumentException, not a size-cap
+    // violation. MEASURED, HotSpot 25.0.4+7: `setMemory(addr, -1, 0)` throws
+    // IAE from the JDK's own `checkSize`. Casting straight to `usize` turned
+    // -1 into 2^64-1, which tripped the 256 MiB cap below and reported the
+    // wrong contract: `IllegalStateException`.
+    let signed_bytes = match args.get(3) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
+    if signed_bytes < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.setMemory: negative length {signed_bytes}"),
+        }
+        .into());
+    }
+    let bytes = signed_bytes as usize;
     let value = match args.get(4) {
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
@@ -903,6 +972,21 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
     let src_null = matches!(args.get(1), Some(Value::Object(None)) | None);
     let dst_null = matches!(args.get(3), Some(Value::Object(None)) | None);
 
+    // A NEGATIVE length is an IllegalArgumentException on EVERY arm, so the
+    // check has to come before the dispatch, not after it. It was below the
+    // heap-heap delegation, and the heap-heap arm therefore kept reporting the
+    // 256 MiB size cap's `IllegalStateException` -- the guard was in the
+    // function the caller never reached. MEASURED, HotSpot 25.0.4+7:
+    // `copyMemory(byte[], base, byte[], base, -1)` -> IllegalArgumentException.
+    if matches!(args.get(5), Some(Value::Long(b)) if *b < 0)
+        || matches!(args.get(5), Some(Value::Int(b)) if *b < 0)
+    {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Unsafe.copyMemory: negative length".to_string(),
+        }
+        .into());
+    }
+
     // Heap↔heap: keep lib.rs's bounds-checked array/field copy.
     if !src_null && !dst_null {
         return crate::native_unsafe_copy_memory(ctx, args);
@@ -918,11 +1002,20 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
         Some(Value::Int(a)) => *a as i64,
         _ => 0,
     };
-    let bytes = match args.get(5) {
-        Some(Value::Long(b)) => *b as usize,
-        Some(Value::Int(b)) => *b as usize,
+    // See `native_unsafe_set_memory_consolidated`: a negative length is an
+    // IllegalArgumentException and the 256 MiB cap is a different contract.
+    let signed_bytes = match args.get(5) {
+        Some(Value::Long(b)) => *b,
+        Some(Value::Int(b)) => *b as i64,
         _ => 0,
     };
+    if signed_bytes < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.copyMemory: negative length {signed_bytes}"),
+        }
+        .into());
+    }
+    let bytes = signed_bytes as usize;
     if bytes == 0 {
         return Ok(None);
     }
@@ -1456,15 +1549,40 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
 
 fn native_unsafe_get_load_average(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [this, double[] dest, int nelems]
+    // The JDK's wrapper is
+    //   if (nelems < 0 || nelems > 3 || nelems > loadavg.length)
+    //       throw new ArrayIndexOutOfBoundsException();
+    // and a null array fails on `.length` first. MEASURED, HotSpot 25.0.4+7:
+    // `getLoadAverage(null, 1)` -> NullPointerException,
+    // `getLoadAverage(new double[1], 3)` -> ArrayIndexOutOfBoundsException.
+    // CratonVM answered 0 and silently CLAMPED. The clamp meant no memory was
+    // ever written out of bounds -- so this is a contract defect, not a safety
+    // one -- but a caller that sizes its array from the return value is told
+    // that three samples exist in a one-element array.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Unsafe.getLoadAverage: null array".to_string()),
+            }
+            .into())
+        }
     };
-    let nelems = match args.get(2) {
-        Some(Value::Int(n)) => (*n as usize).min(3),
+    let requested = match args.get(2) {
+        Some(Value::Int(n)) => *n,
         _ => 0,
     };
     let arr_len = ctx.array_length(arr);
+    if requested < 0 || requested > 3 || (requested as usize) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: requested,
+            message: Some(format!(
+                "Unsafe.getLoadAverage: nelems {requested} out of range for an array of {arr_len}"
+            )),
+        }
+        .into());
+    }
+    let nelems = requested as usize;
     let write_count = nelems.min(arr_len);
 
     #[cfg(unix)]
@@ -1528,10 +1646,28 @@ pub(crate) fn native_unsafe_static_field_base(
     args: &[Value],
 ) -> MethodCallResult {
     // args: [this, Field]
+    // MEASURED, HotSpot 25.0.4+7: a null Field is a `NullPointerException` and
+    // an INSTANCE field is an `IllegalArgumentException`. CratonVM answered
+    // `null` for the first and the declaring class's mirror for the second --
+    // and a mirror is a usable addressing base, so the caller's next
+    // `putInt(base, offset, v)` wrote into the static area at an offset that
+    // was resolved in the INSTANCE space.
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Unsafe.staticFieldBase: null Field".to_string()),
+            }
+            .into())
+        }
     };
+    let (is_static, _cid, _slot, _desc) = crate::lang_class::read_field_meta(ctx, field_obj);
+    if !is_static {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "not a static field".to_string(),
+        }
+        .into());
+    }
     if let Some((class_id, _name)) = crate::lang_class::field_class_and_name(ctx, field_obj) {
         let mirror = ctx.get_class_mirror(class_id);
         return Ok(Some(Value::Object(Some(mirror))));

@@ -76,6 +76,17 @@ pub(crate) fn native_unsafe_ensure_class_initialized(
         }
         _ => None,
     });
+    // MEASURED, HotSpot 25.0.4+7: `ensureClassInitialized(null)` is a
+    // `NullPointerException`; CratonVM returned quietly. The mirror is found
+    // by SCANNING the arguments (it is not at a fixed index on every call
+    // path), so the null case can only be recognised by asking whether
+    // argument 1 was explicitly null after the scan came up empty.
+    if class_mirror.is_none() && matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.ensureClassInitialized: null class".to_string()),
+        }
+        .into());
+    }
     let Some(class_mirror) = class_mirror else {
         return Ok(None);
     };
@@ -466,6 +477,20 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(u, "getUnsafe", "()Lsun/misc/Unsafe;", |ctx, _args| {
         let class_name = "sun/misc/Unsafe";
+        // `getUnsafe()` is `@CallerSensitive`: the JDK hands the singleton only
+        // to a caller on the boot/platform class path and throws
+        // `SecurityException` otherwise. MEASURED, HotSpot 25.0.4+7: an
+        // application-loader caller gets `SecurityException`; CratonVM handed
+        // over `theUnsafe`. That is the difference between "reflection on
+        // `theUnsafe` is the documented back door" and "there is no door to
+        // close" -- and the reason every real-world snippet reaches for the
+        // field rather than this method.
+        if !unsafe_caller_is_boot_path(ctx) {
+            return Err(RuntimeError::SecurityException {
+                message: "Unsafe".to_string(),
+            }
+            .into());
+        }
         ctx.ensure_class_initialized(class_name)?;
         let class_id = match ctx.class_id_by_name(class_name) {
             Some(id) => id,
@@ -685,25 +710,25 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u,
         "getFloat",
         "(Ljava/lang/Object;J)F",
-        native_unsafe_get_float,
+        native_unsafe_get_float_mb,
     );
     r.register(
         u,
         "putFloat",
         "(Ljava/lang/Object;JF)V",
-        native_unsafe_put_float,
+        native_unsafe_put_float_mb,
     );
     r.register(
         u,
         "getDouble",
         "(Ljava/lang/Object;J)D",
-        native_unsafe_get_double,
+        native_unsafe_get_double_mb,
     );
     r.register(
         u,
         "putDouble",
         "(Ljava/lang/Object;JD)V",
-        native_unsafe_put_double,
+        native_unsafe_put_double_mb,
     );
     r.register(
         u,
@@ -895,6 +920,73 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "compareAndSetReference",
         "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
         native_unsafe_cas_object,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    // THE SUB-WORD ATOMICS. These four are not a convenience: without them the
+    // byte/short/char/boolean atomic family is BROKEN, and two of its members
+    // do not return at all.
+    //
+    // The JDK implements `compareAndSetByte` in bytecode by masking the 32-bit
+    // word that contains the byte:
+    //
+    //     long wordOffset = offset & ~3;
+    //     int  shift      = (int)(offset & 3) << 3;
+    //     ... getIntVolatile(o, wordOffset) ... weakCompareAndSetInt(...)
+    //
+    // That arithmetic is only meaningful when `offset` is a BYTE offset into an
+    // object. CratonVM's `objectFieldOffset` returns a SLOT INDEX, so
+    // `offset & ~3` names a DIFFERENT FIELD, the masked compare never matches,
+    // and every caller built on it either lies or spins. MEASURED against
+    // HotSpot 25.0.4+7 with `probes/UnsafeSubwordProbe.java`, one call per
+    // process behind a timeout:
+    //
+    //     compareAndSetByte(right witness)   HotSpot true    CratonVM FALSE
+    //     compareAndExchangeByte             HotSpot 10      CratonVM 0
+    //     getAndSetByte                      HotSpot 10      CratonVM NEVER RETURNED
+    //     getAndAddByte (a registered native) HotSpot 10     CratonVM 10   <- the control
+    //
+    // The control is what identifies the mechanism: `getAndAddByte` is
+    // registered here and is correct, and its neighbours differ only in going
+    // through the JDK's word-masking bytecode instead.
+    //
+    // Registering the CAS layer is sufficient for the whole family, because
+    // everything above it delegates rather than re-deriving the offset:
+    // `weakCompareAndSetByte*` -> `compareAndSetByte`; `compareAndSetBoolean`
+    // -> `compareAndSetByte`; `compareAndSetChar` -> `compareAndSetShort`;
+    // `getAndSet*` and `getAndBitwise*` -> `weakCompareAndSet*`. Those
+    // delegations are VERIFIED by the probe, not assumed -- it asks char,
+    // boolean, weak, getAndSet and getAndBitwise at every width.
+    //
+    // The bodies are the int ones unchanged: a byte field's slot holds
+    // `Value::Int`, and the caller widens `B` to `Int` at the call boundary, so
+    // the comparison is already width-correct. What was missing was a
+    // registration, not an implementation.
+    r.register_with_kind(
+        u2,
+        "compareAndSetByte",
+        "(Ljava/lang/Object;JBB)Z",
+        native_unsafe_cas_int,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        u2,
+        "compareAndSetShort",
+        "(Ljava/lang/Object;JSS)Z",
+        native_unsafe_cas_int,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        u2,
+        "compareAndExchangeByte",
+        "(Ljava/lang/Object;JBB)B",
+        native_unsafe_compare_and_exchange_int,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        u2,
+        "compareAndExchangeShort",
+        "(Ljava/lang/Object;JSS)S",
+        native_unsafe_compare_and_exchange_int,
         cratonvm_native_api::NativeKind::Bridge,
     );
     r.register_with_kind(
@@ -1999,10 +2091,111 @@ pub fn gc_update_unsafe_side_store_refs(pointer_map: &cratonvm_types::PointerMap
     }
 }
 
+/// Throw a real `java.lang.InstantiationException`.
+///
+/// There is no `RuntimeError` variant for it; `Constructor.newInstance`'s
+/// abstract/interface refusal in `lang_class.rs` builds the class and throws
+/// the object, and this is the same shape. The TYPE is what callers catch --
+/// an `IllegalStateException` in its place is missed by every
+/// `catch (InstantiationException)` in the world.
+fn unsafe_instantiation_exception(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/lang/InstantiationException", "()V", &[])
+    {
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+    Err(RuntimeError::IllegalStateException {
+        message: "InstantiationException: no instances of this type exist".to_string(),
+    }
+    .into())
+}
+
+/// True when the frame that called this native is on the boot path.
+///
+/// `sun.misc.Unsafe.getUnsafe()` is `@CallerSensitive`. This resolves the
+/// caller the same way the reflection gate does -- innermost Java frame,
+/// trusted loader -- but WITHOUT reaching into `lang_class.rs`, which another
+/// lane has open. `frame_class_ids()` is innermost-first.
+///
+/// It fails OPEN when no Java frame resolves: that means VM bootstrap, and the
+/// reflection gate takes the same position for the same reason.
+fn unsafe_caller_is_boot_path(ctx: &mut dyn NativeContext) -> bool {
+    const LOADER_ID_BOOTSTRAP: i32 = 0;
+    const LOADER_ID_PLATFORM: i32 = 1;
+    for cid in ctx.frame_class_ids() {
+        let name = match ctx.class_name_of_id(cid) {
+            Some(n) => n,
+            None => continue,
+        };
+        // The two Unsafe classes are not the caller -- `sun.misc.Unsafe`'s own
+        // bytecode reaches the internal one on some paths.
+        if name == "sun/misc/Unsafe" || name == "jdk/internal/misc/Unsafe" {
+            continue;
+        }
+        let loader = ctx.loader_id_of_class(cid);
+        return loader == LOADER_ID_BOOTSTRAP || loader == LOADER_ID_PLATFORM;
+    }
+    true
+}
+
+/// True when the `Unsafe` receiver is the `sun.misc` spelling.
+///
+/// `sun.misc.Unsafe` and `jdk.internal.misc.Unsafe` share every native in this
+/// file but NOT every contract: the deprecated class does argument checks in
+/// its own bytecode that the internal one does not. Argument 0 is the receiver
+/// on every one of these instance methods, so its class is the discriminator.
+fn unsafe_receiver_is_sun_misc(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    match args.first() {
+        Some(Value::Object(Some(o))) => {
+            let cid = ctx.class_id_of_object(*o);
+            ctx.class_name_of_id(cid).as_deref() == Some("sun/misc/Unsafe")
+        }
+        _ => false,
+    }
+}
+
+/// True if `class_id` is (or descends from) `java.lang.Record`.
+///
+/// `objectFieldOffset` refuses a record's component field, and this is how the
+/// declaring class is recognised without a dedicated `is_record` accessor: a
+/// record class always has `java/lang/Record` on its superclass chain, and
+/// nothing else does.
+fn declaring_class_is_record(ctx: &mut dyn NativeContext, class_id: cratonvm_types::ClassId) -> bool {
+    let mut cur = ctx.superclass_of(class_id);
+    let mut hops = 0;
+    while let Some(c) = cur {
+        if ctx.class_name_of_id(c).as_deref() == Some("java/lang/Record") {
+            return true;
+        }
+        hops += 1;
+        if hops > 64 {
+            return false;
+        }
+        cur = ctx.superclass_of(c);
+    }
+    false
+}
+
 pub(crate) fn native_unsafe_object_field_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A NULL `Field` has no offset, and the JDK refuses rather than answering
+    // one. MEASURED, HotSpot 25.0.4+7: `NullPointerException`; CratonVM
+    // returned `0` in both modes, which is slot 0 of whatever receiver the
+    // caller passes next -- a silent read or WRITE of an unrelated field.
+    //
+    // The check is missing here because it lives in the JDK's `Unsafe`
+    // BYTECODE, and this native replaces that bytecode. That is the shape of
+    // every defect this lane found: the retirement surface IS the JDK's
+    // argument-validation layer, so a shadow that reproduces only the happy
+    // path deletes the validation with it.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.objectFieldOffset: null Field".to_string()),
+        }
+        .into());
+    }
     // args[0] = Unsafe this, args[1] = Field object.
     // Use read_field_meta so the slot index is read from the CratonVM
     // extra-metadata slot (the JDK `slot` field has different semantics
@@ -2045,6 +2238,44 @@ pub(crate) fn native_unsafe_object_field_offset(
                 message: "not an instance field".to_string(),
             }
             .into());
+        }
+
+        // A RECORD's component field and a HIDDEN class's field have no offset
+        // a caller may address, and `sun.misc.Unsafe` refuses both so that a
+        // deserializer cannot write one.
+        //
+        // THE TWO SPELLINGS DO NOT SHARE THIS CONTRACT. Measured, HotSpot
+        // 25.0.4+7:
+        //
+        //   sun.misc.Unsafe.objectFieldOffset(record component)  -> UOE
+        //   jdk.internal.misc.Unsafe.objectFieldOffset(the same) -> an offset
+        //
+        // so the shared native has to ask which door it came through, and the
+        // receiver is the only thing that says. Applying the refusal to both
+        // spellings replaced one wrong answer with another.
+        if unsafe_receiver_is_sun_misc(ctx, args) {
+            if let Some((class_id, _)) = crate::lang_class::field_class_and_name(ctx, *field_obj) {
+                if declaring_class_is_record(ctx, class_id) {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: "can't get field offset on a record class".to_string(),
+                    }
+                    .into());
+                }
+                // A hidden class is registered under `<this_class>/0x<n>` --
+                // the class store's own naming convention, documented at
+                // `lang_class.rs`'s `split_hidden_suffix`, and the same thing
+                // `RJdkHidden.java` keys its assertion on.
+                if ctx
+                    .class_name_of_id(class_id)
+                    .map(|n| n.contains("/0x"))
+                    .unwrap_or(false)
+                {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: "can't get field offset on a hidden class".to_string(),
+                    }
+                    .into());
+                }
+            }
         }
 
         // T19.H1: if `read_field_meta` returned 0 but the Field actually
@@ -2106,13 +2337,32 @@ pub(crate) fn native_unsafe_static_field_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let Some(Value::Object(Some(field_obj))) = args.get(1) else {
-        return Ok(Some(Value::Long(0)));
+    // Null and instance-field refusals, both MEASURED against HotSpot
+    // 25.0.4+7 and both missing here: a null answered `0` and an INSTANCE
+    // field was quietly forwarded to `objectFieldOffset`, so a caller that
+    // asked the wrong accessor got a plausible offset in the wrong address
+    // space. This is the exact mirror of the `objectFieldOffset(static)`
+    // defect fixed on 2026-08-26 -- that fix closed one polarity of a
+    // two-sided confusion and left the other open.
+    let Some(field_arg) = args.get(1) else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.staticFieldOffset: null Field".to_string()),
+        }
+        .into());
+    };
+    let Value::Object(Some(field_obj)) = field_arg else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.staticFieldOffset: null Field".to_string()),
+        }
+        .into());
     };
     let (is_static, meta_class_id, meta_slot, _desc) =
         crate::lang_class::read_field_meta(ctx, *field_obj);
     if !is_static {
-        return native_unsafe_object_field_offset(ctx, args);
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "not a static field".to_string(),
+        }
+        .into());
     }
 
     let (class_id, field_name) = crate::lang_class::field_class_and_name(ctx, *field_obj)
@@ -2136,8 +2386,21 @@ pub(crate) fn native_unsafe_static_field_offset(
 /// HotSpot layout and keeps JCTools happy.
 pub(crate) fn native_unsafe_array_base_offset(
     _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    // MEASURED, HotSpot 25.0.4+7: `arrayBaseOffset(null)` is a
+    // `NullPointerException`. CratonVM answered 16 -- a plausible base for a
+    // class that was never named. Note the asymmetry this closes: the
+    // `jdk.internal.misc` spelling ALREADY threw, because that registration
+    // shadows nothing on this image and the JDK's own bytecode ran instead.
+    // Three of four sibling doors were wrong and the fourth was right for a
+    // reason that had nothing to do with the check.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.arrayBaseOffset: null class".to_string()),
+        }
+        .into());
+    }
     Ok(Some(Value::Int(16)))
 }
 
@@ -2159,6 +2422,14 @@ pub(crate) fn native_unsafe_array_index_scale(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = Unsafe this, args[1] = Class mirror of the array type.
+    // MEASURED, HotSpot 25.0.4+7: a null class is a `NullPointerException`,
+    // not the catch-all scale of 1. See `native_unsafe_array_base_offset`.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.arrayIndexScale: null class".to_string()),
+        }
+        .into());
+    }
     let scale = match args.get(1) {
         Some(Value::Object(Some(mirror))) => {
             let name = crate::lang_class::mirror_class_name(ctx, *mirror).unwrap_or_default();
@@ -3271,6 +3542,49 @@ fn native_unsafe_allocate_instance(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = Unsafe this, args[1] = Class mirror
+    // A null class. HotSpot 25.0.4+7 SIGSEGVs in `Unsafe_AllocateInstance`
+    // rather than refusing (measured -- it is why the null-argument rows of
+    // this lane run one call per process), so again the oracle has no answer
+    // and the choice is ours. CratonVM returned a null REFERENCE, which moves
+    // the failure to the caller's next dereference and names nothing.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.allocateInstance: null class".to_string()),
+        }
+        .into());
+    }
+    // MEASURED, HotSpot 25.0.4+7: an interface, an abstract class, a primitive
+    // class, `void` and an array class are each an `InstantiationException`.
+    // CratonVM allocated something for all five. An "instance" of an interface
+    // is the fabricated-receiver shape this whole campaign exists to remove --
+    // it is handed back with the interface's own name and fails arbitrarily far
+    // away, which is exactly what Phase 1 was about.
+    if let Some(Value::Object(Some(class_obj))) = args.get(1) {
+        if let Some(name) = crate::lang_class::mirror_class_name(ctx, *class_obj) {
+            let is_primitive = matches!(
+                name.as_str(),
+                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+                    | "void"
+            );
+            if is_primitive || name.starts_with('[') {
+                return unsafe_instantiation_exception(ctx);
+            }
+        }
+        if let Some(cid) = ctx
+            .class_id_from_mirror(*class_obj)
+            .or_else(|| match ctx.get_field(*class_obj, 0) {
+                Value::Int(c) if c >= 0 => Some(cratonvm_types::ClassId::new(c as u32)),
+                _ => None,
+            })
+        {
+            let ACC_INTERFACE = cratonvm_types::access_flags::ACC_INTERFACE;
+            let ACC_ABSTRACT = cratonvm_types::access_flags::ACC_ABSTRACT;
+            let flags = ctx.class_access_flags(cid);
+            if flags & (ACC_INTERFACE | ACC_ABSTRACT) != 0 {
+                return unsafe_instantiation_exception(ctx);
+            }
+        }
+    }
     // Read class name from mirror, allocate without calling <init>
     if let Some(Value::Object(Some(class_obj))) = args.get(1) {
         let cid_opt =
@@ -3467,6 +3781,91 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     unreachable!()
+}
+
+/// `Unsafe.getFloat(Object, long)` with the NULL-BASE arm routed off-heap.
+///
+/// A null base means an absolute address, and `getFloat(long)` is literally
+/// `getFloat(null, address)` in the JDK -- so a write through one spelling has
+/// to be visible through the other. It was not: the null-base arm of
+/// `native_unsafe_get_float` reads a private static-field side map keyed by the
+/// address, which round-trips perfectly WITHIN that door and shares no storage
+/// with the arena the 1-arg form uses. MEASURED, HotSpot 25.0.4+7:
+///
+///   putFloat(null, addr, 1.5f) then getFloat(addr)   HotSpot 1.5   CratonVM 0.0
+///   putFloat(addr, 2.5f) then getFloat(null, addr)   HotSpot 2.5   CratonVM 0.0
+///
+/// int, long, byte, short and char already have `_mb` handlers that route a
+/// null base through `copy_from_native_memory`; float and double were the two
+/// widths that never got one. That is the same population as
+/// `a-null-base-unsafe-access-means-off-heap-not-a-static-field` (2026-08-24) --
+/// which fixed the ONE-ARG forms and left the two-arg null-base forms behind.
+pub(crate) fn native_unsafe_get_float_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let addr = unsafe_raw_addr(args, 2);
+        let mut b = [0u8; 4];
+        if ctx.copy_from_native_memory(addr, &mut b) {
+            return Ok(Some(Value::Float(f32::from_le_bytes(b))));
+        }
+    }
+    native_unsafe_get_float(ctx, args)
+}
+
+/// Write half of [`native_unsafe_get_float_mb`].
+pub(crate) fn native_unsafe_put_float_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let addr = unsafe_raw_addr(args, 2);
+        let bits = match args.get(3) {
+            Some(Value::Float(f)) => f.to_bits(),
+            Some(Value::Int(i)) => *i as u32,
+            _ => 0,
+        };
+        if ctx.copy_to_native_memory(addr, &bits.to_le_bytes()) {
+            return Ok(None);
+        }
+    }
+    native_unsafe_put_float(ctx, args)
+}
+
+/// `Unsafe.getDouble(Object, long)` with the null-base arm routed off-heap.
+/// See [`native_unsafe_get_float_mb`].
+pub(crate) fn native_unsafe_get_double_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let addr = unsafe_raw_addr(args, 2);
+        let mut b = [0u8; 8];
+        if ctx.copy_from_native_memory(addr, &mut b) {
+            return Ok(Some(Value::Double(f64::from_le_bytes(b))));
+        }
+    }
+    native_unsafe_get_double(ctx, args)
+}
+
+/// Write half of [`native_unsafe_get_double_mb`].
+pub(crate) fn native_unsafe_put_double_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let addr = unsafe_raw_addr(args, 2);
+        let bits = match args.get(3) {
+            Some(Value::Double(d)) => d.to_bits(),
+            Some(Value::Long(l)) => *l as u64,
+            _ => 0,
+        };
+        if ctx.copy_to_native_memory(addr, &bits.to_le_bytes()) {
+            return Ok(None);
+        }
+    }
+    native_unsafe_put_double(ctx, args)
 }
 
 pub(crate) fn native_unsafe_get_float(
@@ -4356,25 +4755,58 @@ mod unsafe_arena {
             }
         }
 
-        pub(super) fn allocate(&self, size: usize) -> i64 {
+        /// `None` when the backing buffer could not be allocated.
+        ///
+        /// `vec![0u8; size]` is INFALLIBLE: on failure Rust runs the
+        /// allocation-error hook, which aborts the process. That is what
+        /// `Unsafe.allocateMemory(Long.MAX_VALUE)` did -- SIGABRT with
+        /// `memory allocation of 9223372036854775807 bytes failed`, taking the
+        /// whole VM down where HotSpot throws. A Java caller must never be
+        /// able to abort the runtime by passing a large number to a method
+        /// whose contract is "returns 0 / throws OutOfMemoryError".
+        pub(super) fn try_allocate(&self, size: usize) -> Option<i64> {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.try_reserve_exact(size).ok()?;
+            bytes.resize(size, 0u8);
             let addr = {
                 let mut c = self.next_addr.lock();
                 let a = *c;
                 *c = c.saturating_add(((size.max(1) + 15) & !15) as i64);
                 a
             };
-            self.inner.write().insert(
-                addr,
-                Arena {
-                    bytes: vec![0u8; size],
-                },
-            );
-            addr
+            self.inner.write().insert(addr, Arena { bytes });
+            Some(addr)
+        }
+
+        pub(super) fn allocate(&self, size: usize) -> i64 {
+            self.try_allocate(size).unwrap_or(0)
         }
 
         #[cfg(test)]
         pub(super) fn block_is_translated(&self, addr: i64) -> bool {
             self.translated.lock().contains_key(&addr)
+        }
+
+        /// `None` when the resize could not be allocated -- see
+        /// [`Self::try_allocate`]. The block is left UNTOUCHED on failure,
+        /// which is what `realloc(3)` guarantees and what the JDK's
+        /// `reallocateMemory` contract relies on when it throws.
+        pub(super) fn try_reallocate(&self, addr: i64, new_size: usize) -> Option<i64> {
+            let mut inner = self.inner.write();
+            let cur_len = inner.get(&addr).map(|a| a.bytes.len()).unwrap_or(0);
+            if new_size > cur_len {
+                match inner.get_mut(&addr) {
+                    Some(a) => a.bytes.try_reserve_exact(new_size - cur_len).ok()?,
+                    None => {
+                        // No existing block: allocating a fresh one, so probe
+                        // the request before `reallocate` commits to it.
+                        let mut probe: Vec<u8> = Vec::new();
+                        probe.try_reserve_exact(new_size).ok()?;
+                    }
+                }
+            }
+            drop(inner);
+            Some(self.reallocate(addr, new_size))
         }
 
         pub(super) fn reallocate(&self, addr: i64, new_size: usize) -> i64 {
@@ -4683,6 +5115,19 @@ pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
     unsafe_arena::store().allocate(size)
 }
 
+/// Fallible `allocateMemory` backing: `None` means "the allocation failed",
+/// which the native maps to `OutOfMemoryError`. See
+/// `unsafe_arena::ArenaStore::try_allocate`.
+pub(crate) fn unsafe_arena_try_allocate(size: usize) -> Option<i64> {
+    unsafe_arena::store().try_allocate(size)
+}
+
+/// Fallible `reallocateMemory` backing. See
+/// `unsafe_arena::ArenaStore::try_reallocate`.
+pub(crate) fn unsafe_arena_try_reallocate(addr: i64, new_size: usize) -> Option<i64> {
+    unsafe_arena::store().try_reallocate(addr, new_size)
+}
+
 /// True if `addr` is a live `Unsafe.allocateMemory` arena handle (as opposed
 /// to a real OS pointer). NIO native I/O (e.g. `sun/nio/ch/Net.read0/write0`,
 /// which live in the `native-io` crate) uses this — via the `NativeContext`
@@ -4870,6 +5315,15 @@ pub(crate) fn native_unsafe_get_and_add_int_shim(
 fn native_unsafe_throw_exception(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match args.get(1) {
         Some(Value::Object(Some(exc))) => Err(MethodCallFailed::ExceptionThrown(*exc)),
+        // A null throwable cannot be thrown. HotSpot 25.0.4+7 does not refuse
+        // it either -- it SIGSEGVs inside `Unsafe_ThrowException` -- so this is
+        // not "match the oracle"; the oracle has no answer here. Returning
+        // quietly is the one option that is certainly wrong: the caller wrote
+        // `throwException(x)` expecting control not to reach the next line.
+        Some(Value::Object(None)) => Err(RuntimeError::NullPointerException {
+            message: Some("Unsafe.throwException: null throwable".to_string()),
+        }
+        .into()),
         _ => Ok(None),
     }
 }

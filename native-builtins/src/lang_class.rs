@@ -3086,12 +3086,31 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
-        // L16 -- the ELEMENT, not the descriptor. This arm answers before the
-        // two loader arms below, both of which already apply `for_name_cnfe_name`,
-        // so without it the rule this function documents in three places stops
-        // holding at the door that now runs first. `regression-suite`'s
-        // `RExceptions` and `RJdkFailure` both assert it:
-        //   Class.forName("[Lp.X;")  HotSpot CNFE msg="p.X" cause=null
+        // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
+        //
+        // MEASURED on JDK 25, and asserted by two vectors that were already in
+        // the tree before this arm existed:
+        //
+        //   Class.forName("[Lp.X;")   ->  CNFE msg="p.X"   cause=null
+        //   Class.forName("[[Lp.X;")  ->  CNFE msg="p.X"   cause=null
+        //
+        // `regression-suite/src/RExceptions.java:382` and
+        // `RJdkFailure.java:168` both check exactly this, and both turned red
+        // when this arm was added with `&dotted_name` -- the descriptor -- as
+        // the message. HotSpot resolves the descriptor down to the element
+        // class and reports the resolution that actually failed, which is the
+        // name a caller can act on: `[Lp.X;` is not a name anything can be
+        // asked for again.
+        //
+        // Through `for_name_cnfe_name`, which is exactly this rule and is what
+        // the two loader arms further down already call. Two lanes fixed this
+        // on the same day and the other one re-derived the extraction inline;
+        // a third copy of a rule that already has a named home is how the
+        // multi-dimension case (`[[Lp.X;`) ends up handled in two places and
+        // then in one. The helper delegates to
+        // `cratonvm_classloading::array_descriptor_element_class`, which strips
+        // every dimension and returns `None` -- so the caller's own name
+        // survives -- for `[I` and for malformed spellings.
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",

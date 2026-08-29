@@ -126,6 +126,43 @@ pub fn native_unsafe_copy_swap_memory(
         return Ok(None);
     }
 
+    // A null base is an OFF-HEAP address, and returning quietly meant an
+    // endian-converting copy between two `allocateMemory` blocks wrote nothing
+    // at all. MEASURED, HotSpot 25.0.4+7: elemSize 2 over [1..8] gives
+    // [2,1,4,3,6,5,8,7]; CratonVM left the destination as eight zeros -- a
+    // silent no-op, which is the failure mode that reads as success.
+    //
+    // `bytes` here is a real byte count, so the arena's own bounds-checked
+    // copy_out/copy_in are the right primitives; anything the arena does not
+    // recognise is refused rather than dereferenced.
+    if src_obj.is_none() && dest_obj.is_none() {
+        let mut buf = vec![0u8; bytes];
+        if !crate::unsafe_arena_copy_out(src_offset as i64, &mut buf) {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copySwapMemory: source 0x{:x} is not in any live arena",
+                    src_offset
+                ),
+            }
+            .into());
+        }
+        if elem_size >= 2 {
+            for chunk in buf.chunks_mut(elem_size) {
+                chunk.reverse();
+            }
+        }
+        if !crate::unsafe_arena_copy_in(dest_offset as i64, &buf) {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copySwapMemory: destination 0x{:x} is not in any live arena",
+                    dest_offset
+                ),
+            }
+            .into());
+        }
+        return Ok(None);
+    }
+
     let src = match src_obj {
         Some(s) => s,
         None => return Ok(None),
@@ -606,27 +643,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: copySwapMemory with None src is a no-op
+    // Test 8: copySwapMemory with a NULL base and an address the arena does not
+    // know is REFUSED -- it used to be a silent no-op, and this test pinned
+    // that.
+    //
+    // A null base means an OFF-HEAP address. Returning `Ok(None)` meant an
+    // endian-converting copy between two `allocateMemory` blocks wrote nothing
+    // at all, and the destination was already zero, so the failure read as
+    // success. MEASURED against HotSpot 25.0.4+7 (`probes/UnsafeShadowSweep`,
+    // off-heap section): elemSize 2 over [1..8] gives [2,1,4,3,6,5,8,7];
+    // CratonVM produced eight zeros.
+    //
+    // This assertion is the one that has to change with the fix. It was
+    // written from the implementation rather than from the contract -- the
+    // name said "is a noop", which is a description of the code, not of what
+    // `Unsafe.copySwapMemory` promises. Address 0 is in no live arena, so the
+    // contract-correct outcome is the same IllegalArgumentException the
+    // arena's other accessors already produce for an unknown address.
     // -----------------------------------------------------------------------
     #[test]
-    fn t12_copy_swap_memory_no_src_is_noop() {
+    fn t12_copy_swap_memory_null_base_unknown_address_is_refused() {
         let mut ctx = MockNativeContext::new();
 
-        // Call with None src — should return Ok(None) without panic
         let result = native_unsafe_copy_swap_memory(
             &mut ctx,
             &[
                 dummy_this(),
-                Value::Object(None), // no src
-                Value::Long(0),
-                Value::Object(None), // no dst
+                Value::Object(None), // off-heap source
+                Value::Long(0),      // ... at an address no arena owns
+                Value::Object(None), // off-heap destination
                 Value::Long(0),
                 Value::Long(16),
                 Value::Long(4),
             ],
-        )
-        .unwrap();
-        assert_eq!(result, None);
+        );
+        match result {
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException { .. },
+                ),
+            )) => {}
+            other => panic!(
+                "expected IllegalArgumentException for an off-heap copySwapMemory at an                  address no arena owns, got {other:?}"
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------
