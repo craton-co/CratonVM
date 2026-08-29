@@ -2180,6 +2180,21 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer at a sane chunk size to bound memory), so loop until `n`
     // bytes have been skipped or EOF is reached. Return the actual
     // number of bytes skipped, matching `java.io.FileInputStream.skip`.
+    // NOT REPAIRED HERE, AND THE REGISTRY SAYS WHY. HotSpot's `skip` past end
+    // of file answers the requested count (its `skip0` is one `lseek`), and
+    // this body answers 0. A seek was added here and MEASURED INERT: under
+    // `--jdk-only` the `skip(J)J` triple is not registered at all, and in the
+    // default mode it is registered with `invocations: 0`. So is `skip0(J)J`,
+    // in both. What actually answers is `java.io.InputStream.skip`'s
+    // read-and-discard default — the invocation counts prove it
+    // (`readBytes` +4 for two skips over a 2-byte file, `skip0` +0).
+    //
+    // That is a RESOLUTION finding, not a body one: `FileInputStream.skip`
+    // resolves to its superclass's method, so no change to either native here
+    // can move the answer. Recorded as a nomination rather than fixed with an
+    // edit that cannot fire. The answer is contract-legal in the meantime —
+    // `InputStream.skip` is specified to "skip over some smaller number of
+    // bytes, possibly zero".
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;
@@ -2452,7 +2467,10 @@ fn native_fos_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
-    let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, false)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2473,7 +2491,10 @@ fn native_fos_init_string_append(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
-    let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, append)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2498,7 +2519,10 @@ fn native_fos_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
-    let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, false)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2524,7 +2548,10 @@ fn native_fos_init_file_append(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let path = validated_path(&path)?;
     reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
-    let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
+    let fd = ctx
+        .fd_table()
+        .open_write(&path, append)
+        .map_err(|e| file_not_found_because(&path, &e))?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -2559,9 +2586,18 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null buffer is an NPE (`b.length` in `Objects.checkFromIndexSize`),
+    // not a silent no-op: a write that vanishes is the worst possible answer
+    // for an output stream, because the caller goes on to close the file and
+    // believe it holds the bytes.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let off = match args.get(2) {
         Some(Value::Int(o)) => *o,
@@ -2572,17 +2608,22 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     // JDK contract: reject negative off/len and a range past the array end
-    // with IndexOutOfBoundsException before allocating the buffer — a
-    // negative `len` cast to usize would otherwise abort the process in
-    // `vec![0u8; len]`. Mirrors the bounds check in `pipe.rs`.
+    // before allocating the buffer — a negative `len` cast to usize would
+    // otherwise abort the process in `vec![0u8; len]`.
+    //
+    // The TYPE is the plain superclass. `FileOutputStream.write(byte[], int,
+    // int)` reaches `Objects.checkFromIndexSize`, whose default formatter
+    // builds `IndexOutOfBoundsException`; `ArrayIndexOutOfBoundsException` is
+    // a SUBCLASS, so `catch (ArrayIndexOutOfBoundsException)` used to match
+    // here where HotSpot's does not. MEASURED, all three rows.
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(if off < 0 {
-                off
-            } else {
-                off.saturating_add(len)
-            }),
+            RuntimeError::ioobe(cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                i64::from(off),
+                i64::from(len),
+                i64::from(arr_len),
+            )),
         )));
     }
     // Zero-length transfers answer before the closed check — see
@@ -2615,9 +2656,15 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `write(null)` is `write(b, 0, b.length)` — an NPE on the length read.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let len = ctx.array_length(arr);
     // `write(new byte[0])` on a closed stream is `void` on HotSpot — see
@@ -3630,14 +3677,58 @@ fn input_stream_has_bais_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool
     }
 }
 
+/// A `java.io.UTFDataFormatException` carrying the JDK's own wording.
+///
+/// `DataOutputStream.writeUTF` refuses a string whose MODIFIED-UTF-8 encoding
+/// exceeds 65535 bytes, and the type is the contract: `UTFDataFormatException
+/// extends IOException`, and a caller that catches it knows the record is
+/// unrepresentable rather than that the stream broke. MEASURED: this VM raised
+/// a plain `IOException`, which is indistinguishable from a disk error.
+///
+/// Built through the real class (`new_object` + its `(String)` constructor) the
+/// same way `Files.move` builds `FileAlreadyExistsException`, so the thrown
+/// object carries the genuine `ClassId`. If the class cannot be resolved the
+/// caller falls back to the `IOException` it raised before — a missing class is
+/// not a reason to lose the refusal.
+fn utf_data_format_exception(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+) -> Option<cratonvm_types::error::MethodCallFailed> {
+    let cls = "java/io/UTFDataFormatException";
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object(cls) {
+        let exc_pin = ctx.pin_native_root(exc);
+        let msg = ctx.create_string(message);
+        let exc = ctx.read_native_pin(exc_pin, exc);
+        let _ = ctx.invoke(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc)), Value::Object(Some(msg))],
+        );
+        let exc = ctx.read_native_pin(exc_pin, exc);
+        ctx.unpin_native_roots(exc_pin);
+        return Some(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+    }
+    None
+}
+
 fn native_bais_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `new ByteArrayInputStream(null)` reaches `buf.length` and is an NPE.
+    // Returning quietly left a stream whose `buf` field is null and whose
+    // `count` is whatever the object was born with — every later `read()`
+    // answered -1, so the caller saw an EMPTY stream rather than its own bug.
     let data = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let len = ctx.array_length(data) as i32;
     ctx.set_field(this, BAIS_FIELD_DATA, Value::Object(Some(data)));
@@ -3652,9 +3743,15 @@ fn native_bais_init_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Same NPE as the one-argument form above.
     let data = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let offset = match args.get(2) {
         Some(Value::Int(v)) => *v,
@@ -3802,9 +3899,18 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // `InputStream.read(byte[], int, int)` runs `Objects.checkFromIndexSize(
+    // off, len, b.length)`, so a null buffer is an NPE from `b.length` — it is
+    // reached BEFORE any bounds test and before the EOF short-circuit.
+    // Answering -1 told the caller the stream had ended.
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(Some(Value::Int(-1))),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     if let Some(result) = maybe_socket_input_stream_read(
         ctx,
@@ -14296,9 +14402,16 @@ fn native_dis_read_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `readFully(null)` is `readFully(b, 0, b.length)` — an NPE. Returning
+    // quietly reported a SUCCESSFUL full read of a record that was never read.
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let len = ctx.array_length(buf) as i32;
     dis_read_fully_impl(ctx, this, buf, 0, len as usize)
@@ -14311,7 +14424,12 @@ fn native_dis_read_fully_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let off = match args.get(2) {
         Some(Value::Int(v)) => *v as usize,
@@ -14628,9 +14746,18 @@ fn dos_write_one(
     this: ObjectRef,
     b: i32,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // `new DataOutputStream(null).writeInt(1)` is an NPE on `out.write(..)`:
+    // `FilterOutputStream` stores whatever it is handed and fails on use.
+    // Returning `this` counted the bytes as written into nothing, and
+    // `size()` then reported a length no stream holds.
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
-        _ => return Ok(this),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let this_pin = ctx.pin_native_root(this);
     let r = ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)]);
@@ -14835,12 +14962,24 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `writeUTF(null)` reaches `str.length()` and is an NPE. Encoding the
+    // empty string instead wrote a well-formed two-byte zero-length record, so
+    // the reader could not tell a bug from a genuinely empty string.
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => String::new(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let bytes = encode_modified_utf8(&s);
     if bytes.len() > 65535 {
+        let message = format!("encoded string too long: {} bytes", bytes.len());
+        if let Some(exc) = utf_data_format_exception(ctx, &message) {
+            return Err(exc);
+        }
         return Err(cratonvm_types::error::RuntimeError::IOException {
             message: format!(
                 "writeUTF: encoded string too long ({} bytes, max 65535)",
@@ -17847,6 +17986,19 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 8192,
     };
+    // `if (size <= 0) throw new IllegalArgumentException("Buffer size <= 0");`
+    // is the constructor's first line. MEASURED: `--jdk-only` already refused
+    // (it drops this SyntheticStub and runs the real bytecode) while the
+    // DEFAULT mode accepted 0 and -1 — the sixth place in this campaign where
+    // strict mode is right and the default is not. A zero-size buffer here was
+    // silently rounded up to one byte, so the caller got a "buffered" stream
+    // that flushes on every single byte.
+    if size <= 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Buffer size <= 0".into(),
+        }
+        .into());
+    }
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
     if out_slot < ctx.object_num_fields(this) {
@@ -17952,18 +18104,69 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // MEASURED: `write(null, 0, 1)` was a silent no-op and `write(b, -1, 1)`
+    // wrote nothing and returned normally, where HotSpot raises NPE and
+    // ArrayIndexOutOfBoundsException. The buffered case reaches
+    // `System.arraycopy`, which is where both come from — and which is why the
+    // type here is the ARRAY subclass while `FileOutputStream`'s is the plain
+    // superclass. The two really do differ; they were both wrong here in
+    // different directions.
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    let src_len = ctx.array_length(src) as i32;
+    if off_i < 0 || len_i < 0 || off_i.checked_add(len_i).map_or(true, |e| e > src_len) {
+        // The TYPE depends on which branch of `implWrite` the length picks,
+        // and HotSpot really does answer both:
+        //
+        //   new BufferedOutputStream(sink, 4).write(b /*len 2*/, -1, 1)
+        //       len < buf.length  -> System.arraycopy -> ArrayIndexOutOfBounds
+        //   ... .write(b, 0, 9)   len >= buf.length -> out.write(b, 0, 9)
+        //                          -> Objects.checkFromIndexSize -> IndexOutOfBounds
+        //
+        // MEASURED, all three rows. A single type here is wrong for one of
+        // them whichever one is chosen, so the branch is reproduced rather
+        // than picked.
+        let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+        let _ = (out_slot, count_slot);
+        let buf_len = match ctx.get_field(this, buf_slot) {
+            Value::Object(Some(b)) => ctx.array_length(b) as i32,
+            _ => i32::MAX,
+        };
+        return Err(if len_i >= buf_len {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::ioobe(
+                cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                    i64::from(off_i),
+                    i64::from(len_i),
+                    i64::from(src_len),
+                ),
+            )))
+        } else {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::aioobe_index_only(
+                if off_i < 0 {
+                    off_i
+                } else {
+                    off_i.saturating_add(len_i)
+                },
+            )))
+        });
+    }
+    let off = off_i as usize;
+    let len = len_i as usize;
     // Mirror the real BufferedOutputStream.implWrite(byte[], off, len)
     // (JDK: `if (len >= maxBufSize) { flushBuffer(); out.write(b, off, len); }`)
     // instead of looping per byte through write(int). The per-byte loop broke
