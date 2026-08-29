@@ -1577,6 +1577,24 @@ impl Arena {
         }
     }
 
+    /// Bytes the LOW bump may still take without eating the large-object
+    /// reserve — i.e. the headroom [`Self::alloc`]'s ordinary bump path has
+    /// before the last-resort arm at the bottom of that function starts
+    /// spending the reserve to avoid an `OutOfMemoryError`.
+    ///
+    /// Published because the TLAB refill needs it to make a decision the free
+    /// list alone cannot inform. "Is there a recycled chunk worth taking?" has
+    /// a different answer depending on what the ALTERNATIVE is: with headroom,
+    /// the alternative is a clean full-size bump and a short chunk is mere
+    /// churn; without it, the alternative is eating the reserve, and a short
+    /// chunk is then strictly better than the large-object end losing the space
+    /// it was promised. See `zgc::recycled_chunk_size`.
+    pub fn low_bump_headroom(&self) -> usize {
+        self.high_cursor
+            .saturating_sub(self.remaining_high_reserve())
+            .saturating_sub(self.cursor)
+    }
+
     /// Bytes of [`Self::high_reserve`] the large-object end has not claimed
     /// yet — i.e. how much of the shared middle is spoken for.
     ///

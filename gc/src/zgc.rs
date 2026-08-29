@@ -9511,15 +9511,57 @@ const ZGC_LARGE_OBJECT_MIN: usize = ZGC_TLAB_MAX_CHUNK / 8;
 /// through the heap's public API: it takes ~4,000 threads and a full 2 GB arena
 /// to reproduce the shape, and the shape is one comparison.
 ///
-/// The floor is `want / 8`, which is `ZTlabConfig::max_tlab_alloc` — the bound
-/// that decides what a TLAB will serve at all. A chunk at the floor therefore
+/// The PREFERRED floor is `want / 8`, which is `ZTlabConfig::max_tlab_alloc` —
+/// the bound that decides what a TLAB will serve at all. A chunk at that floor
 /// still holds at least eight of the largest object it can ever be asked for.
-/// Below that a buffer is churning rather than buffering.
+/// Below it a buffer is churning rather than buffering.
+///
+/// # …and a STARVED floor of `want / 64`, because the alternative changes
+///
+/// "Is a short chunk worth taking?" has two answers and they depend on what
+/// happens if it is refused. With bump headroom left, the refusal costs one
+/// clean full-size bump and the short chunk is pure churn. With none, the
+/// refusal walks straight down `Arena::alloc` — free list, un-reserved bump,
+/// merge — to the arm that **eats the large-object reserve rather than fail**.
+/// The chunk is taken either way; the only question is whether it comes out of
+/// recycled space or out of the space the large-object end was promised.
+///
+/// MEASURED on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`, 2026-08-29,
+/// at the failing 262 160-byte request:
+///
+/// ```text
+/// used=1073540152 capacity=1073741824 free_list_bytes=757199136
+/// largest_free_block=102128 high_cursor=1069219280 high_bytes=102128
+/// high_reserve_unclaimed=129695184
+/// span_hist=8:72610 16:28157 32:12819 … 1K:45234 2K:15565 8K:65060 32K:53 64K:1
+/// ```
+///
+/// 757 MB free and the largest LOW block under 64 KiB — one notch below a
+/// `want / 8` floor of exactly 64 KiB, with 65 060 spans of 8–16 KiB sitting
+/// unusable beneath it. Every refill in the process therefore bumped, the
+/// cursor reached capacity, the 128 MiB reserve was spent on TLAB churn, and a
+/// 262 160-byte request that the reserve existed to serve had nowhere to go.
+///
+/// `need` is still the hard bound in both regimes — a chunk that cannot serve
+/// the request that forced the refill is not a chunk — so the starved floor
+/// cannot produce a refill that immediately fails.
 #[inline]
-fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Option<usize> {
+fn recycled_chunk_size(
+    want: usize,
+    need: usize,
+    largest_low_free: usize,
+    bump_headroom: usize,
+) -> Option<usize> {
     let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
-    let floor = (want / 8).max(need);
-    (size >= floor && size < want).then_some(size)
+    if size >= want || size < need {
+        return None;
+    }
+    if size >= (want / 8).max(need) {
+        return Some(size);
+    }
+    // Below the preferred floor: worth it only when a full chunk can no longer
+    // be bumped without spending the large-object reserve.
+    (bump_headroom < want && size >= (want / 64).max(need)).then_some(size)
 }
 
 /// Share of the arena that TLAB chunks may hold in RESERVATION at one time.
@@ -10924,7 +10966,8 @@ impl ZgcRealHeap {
             // and the honest answer is a full-size chunk (or the failure that
             // follows it).
             let largest = arena.largest_low_free_block();
-            let sized = recycled_chunk_size(want, need, largest)
+            let headroom = arena.low_bump_headroom();
+            let sized = recycled_chunk_size(want, need, largest, headroom)
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // `alloc(want)` covers both the "the free list has a full-size
             // block" case and the bump.
@@ -14050,7 +14093,7 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         const NODE: usize = 96;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - NODE),
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4),
             Some(CHUNK - NODE),
             "a chunk short by one AQS node must still be recycled",
         );
@@ -14062,19 +14105,19 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4), None);
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4), None);
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 8),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4),
             Some(CHUNK / 8),
             "the floor itself is acceptable",
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4), None);
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -14086,6 +14129,7 @@ pub(crate) mod tests {
     fn a_recycled_chunk_is_never_shorter_than_the_request_that_forced_it() {
         const CHUNK: usize = 512 * 1024;
         for need in [8usize, 1024, CHUNK / 8, CHUNK / 8 + 8, CHUNK / 2] {
+            for headroom in [0usize, CHUNK - 8, CHUNK, CHUNK * 4] {
             for largest in [
                 0usize,
                 4096,
@@ -14095,7 +14139,7 @@ pub(crate) mod tests {
                 CHUNK,
                 CHUNK * 2,
             ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest) {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom) {
                     assert!(
                         size >= need,
                         "need={need} largest={largest} produced a {size}-byte chunk",
@@ -14104,7 +14148,45 @@ pub(crate) mod tests {
                     assert_eq!(size % ZGC_TLAB_ALIGN, 0, "chunks stay on the object grid");
                 }
             }
+            }
         }
+    }
+
+    /// **The starved floor, and the exact numbers that produced it.**
+    ///
+    /// With bump headroom, a 32 KiB block against a 512 KiB chunk is churn and
+    /// is refused -- that is the preferred `want / 8` floor, unchanged. Without
+    /// it, refusing does not buy a full chunk: it walks `Arena::alloc` down to
+    /// the arm that eats the large-object reserve. So the same block is taken.
+    ///
+    /// `TestMVStoreTool` at `--Xmx 1g` reached its failing 262 160-byte request
+    /// with `largest_free_block=102128`, 757 MB free and
+    /// `high_reserve_unclaimed=129695184`: every refill bumped, past a floor of
+    /// exactly 64 KiB, over 65 060 spans of 8-16 KiB.
+    #[test]
+    fn a_starved_bump_takes_a_chunk_the_preferred_floor_refuses() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16; // 32 KiB -- below `want / 8`, above `want / 64`
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4),
+            None,
+            "with headroom the alternative is a clean full-size bump, so a              short chunk is pure churn",
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8),
+            Some(short),
+            "without it the alternative is spending the large-object reserve,              and the chunk is taken either way -- the only question is out of              WHICH space",
+        );
+        // The starved floor is a floor, not an abolition: dust is still refused
+        // however starved the bump is.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0),
+            None,
+            "below `want / 64` a buffer is churning rather than buffering, and              that does not change with the alternative",
+        );
+        // ...and `need` still bounds it in the starved regime, or the refill
+        // would install a chunk its own allocation cannot use.
+        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0), None);
     }
 
     // ------------------------------------------------------------------
