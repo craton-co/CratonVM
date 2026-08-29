@@ -3920,7 +3920,7 @@ pub fn publish_peer_jit_coverage_for_stw() {
     // names the term without any new bookkeeping. Only taken when the debug
     // flag is on — it is two array reads either side of a proof that already
     // walks the stack.
-    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_fallback_reason_counts);
+    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -3929,10 +3929,10 @@ pub fn publish_peer_jit_coverage_for_stw() {
         cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
     }
     if let Some(before) = before {
-        let after = cratonvm_gc::gc_quiescence::moving_young_fallback_reason_counts();
+        let added = cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask() & !before;
         let mut why = String::new();
-        for (i, (a, b)) in after.iter().zip(before.iter()).enumerate() {
-            if a > b {
+        for i in 0..cratonvm_gc::gc_quiescence::incomplete_reason::COUNT {
+            if added & (1usize << i) != 0 {
                 if !why.is_empty() {
                     why.push(',');
                 }
@@ -3940,7 +3940,11 @@ pub fn publish_peer_jit_coverage_for_stw() {
             }
         }
         if why.is_empty() {
-            why.push_str("none");
+            // Distinguishable from a reason literally labelled "none": this
+            // says the proof added no obligation to the mask at all, which for
+            // a `proven=false` deposit means the reason was ALREADY recorded
+            // this cycle (by this thread's earlier proof, or by a peer).
+            why.push_str("<no-new-reason>");
         }
         eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth} why={why}");
     }
