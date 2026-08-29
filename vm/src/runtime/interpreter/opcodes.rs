@@ -4531,7 +4531,32 @@ pub(super) fn op_getstatic(
                 .push(Value::Object(Some(stream)))?;
             // Skip the normal getstatic path — we've already pushed.
         } else if fname == "in" {
-            let stdin = ensure_system_stdin_object(shared, thread)?;
+            // Honor `System.setIn`, exactly as the `out`/`err` arm above honors
+            // `setOut`/`setErr`: read the STATIC FIELD first and fall back to
+            // the canonical stdin only when it is absent.
+            //
+            // This arm used to go straight to `ensure_system_stdin_object`, so
+            // the field write that `System.setIn` performs was never read back
+            // and `setIn` could not be observed AT ALL -- the field held the
+            // caller's stream and every `getstatic System.in` answered the
+            // original. A test harness feeding stdin through `System.setIn` --
+            // which is the ordinary way to do it -- silently read the real
+            // process stdin instead. MEASURED by
+            // `apps/probes/SystemRuntimeObjectSweep.java`: `System.in ==
+            // replacement` was false while reflection on the field said true.
+            //
+            // The asymmetry is the point: two arms of one `if`/`else if` chain,
+            // for three fields with identical semantics, and only one of them
+            // consulted the field.
+            let overridden =
+                match get_static_shared(shared, field.declaring_class_id, field.field_index) {
+                    Value::Object(Some(s)) => Some(s),
+                    _ => None,
+                };
+            let stdin = match overridden {
+                Some(s) => s,
+                None => ensure_system_stdin_object(shared, thread)?,
+            };
             if remap_trace_on() {
                 push_prov_record(stdin.as_ptr() as usize, "getstatic-stream");
             }
