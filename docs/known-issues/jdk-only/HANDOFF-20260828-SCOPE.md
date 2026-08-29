@@ -14,12 +14,22 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 | --- | --- | --- | --- |
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
-| **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
+| **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 | L1, L6, L7 | unclaimed | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
 L3, L4 and L5 are finished. L1, L6 and L7 are unclaimed.
+
+**RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
+you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
+running the four `java.io` probes that were already in the tree found
+`probes/FilePathSweep.java` at **94 differing lines** and the largest single
+cause in that lane — a path predicate whose own comment claimed it was
+platform-independent and was not. A new probe asks the questions its author
+thought of, and L4's author was on a Linux host and did not think of
+backslashes. Cheap to do, and it is the only step that can catch what your
+fixes broke as well as what they missed.
 
 **Two things L3 found that the next lane should read before starting.**
 `x::m` and `() -> x.m()` are DIFFERENT DISPATCH DOORS on this VM — a bound
@@ -30,6 +40,11 @@ registration can fire: if the class INHERITS the method as an interface default,
 dispatch resolves to the interface and the class-name row is dead. The dump says
 so in the same row — `real_declaring_method.has_code: false` next to
 `invocations: 0`.
+
+**And re-run the ARMS after you merge, not only before.** L3's merge of L4 and
+L5 turned `RExceptions` and `RJdkFailure` red — a `ClassNotFoundException`
+message, nothing either lane's own gates could see. Two green lanes combine into
+a red tree; the arms on the MERGED tree are the only thing that says so.
 
 Two items L5 first recorded as OPEN were later FIXED, and both had been deferred
 for reasons that one lookup would have refuted — `Module.canUse` (the VM's own

@@ -98,10 +98,18 @@ public class L4FileSweep {
 
     /** The path-string surface. A pure function of the string -- no disk. */
     static void naming() {
+        // The BACKSLASH rows are here because a Linux-shaped probe forgets
+        // them, and the first version of this file did. `\\` is a path
+        // separator on Windows and an ORDINARY FILENAME CHARACTER on Unix, so
+        // every one of these asks a different question on each host and both
+        // are the oracle's. They found 46 differing rows on Linux.
         String[] paths = {
             "", ".", "..", "/", "//", "///", "a", "a/b", "a/b/c", "/a", "/a/b",
             "a/", "a//b", "a/./b", "a/../b", "/a/", "trailing/", "  spaced  ",
             "dot.ext", ".hidden", "a.b.c.d", "/..", "/.", "x/y/../../z",
+            "\\", "\\\\", "\\x", "a\\b", "trailing\\", "..\\..\\up",
+            "relative\\win\\path", "C:", "C:/", "C:\\", "C:\\x\\y",
+            "\\\\server\\share", "\\\\server\\share\\f", "//server/share",
         };
         for (String s : paths) {
             File f = new File(s);
@@ -113,6 +121,11 @@ public class L4FileSweep {
             p("toString[" + s + "]", f.toString());
             p("hash-eq-self[" + s + "]", f.hashCode() == new File(s).hashCode());
             p("equals-self[" + s + "]", f.equals(new File(s)));
+            // `toURI` belongs in the naming block rather than with the disk
+            // rows: it is a pure function of the path string plus the working
+            // directory, and it is where `slashify` — which is a no-op on Unix
+            // and a rewrite on Windows — becomes visible.
+            p("toURI[" + s + "]", f.toURI());
         }
         // getParent AT A ROOT is null, and so is the parent of a bare name.
         p("parent of root", new File("/").getParent());
@@ -178,6 +191,20 @@ public class L4FileSweep {
         t("File(non-file URI)", () -> new File(new URI("http://x/y")));
         t("File((URI)null)", () -> new File((URI) null));
         p("toPath round trip", plain.toPath().toFile().getPath().equals(plain.getPath()));
+        // `toURI()` renders through `java.net.URI`'s multi-argument
+        // constructor, whose `quote` escapes a character BELOW U+0080 only when
+        // the mask rejects it and appends everything above it unchanged — only
+        // `toASCIIString()` encodes the rest. So a space is `%20` and an
+        // e-acute is itself. Both halves are asked, because a shim that
+        // percent-encodes everything gets the first row right and the second
+        // wrong, which is what this VM did.
+        p("uri escapes a space", new File(BASE, "a b.txt").toURI().toString().endsWith("a%20b.txt"));
+        p("uri escapes a hash", new File(BASE, "a#b.txt").toURI().toString().endsWith("a%23b.txt"));
+        p("uri keeps non-ascii", new File(BASE, "\u00e9\u4e2d.txt").toURI().toString());
+        p("uri toASCIIString encodes non-ascii",
+          new File(BASE, "\u00e9\u4e2d.txt").toURI().toASCIIString().endsWith("%C3%A9%E4%B8%AD.txt"));
+        p("uri round trip non-ascii",
+          new File(new File(BASE, "\u00e9\u4e2d.txt").toURI()).getName());
     }
 
     // ------------------------------------------------------------ existence
