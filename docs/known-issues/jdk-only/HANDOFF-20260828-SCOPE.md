@@ -536,30 +536,46 @@ Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
   was not. And a failure rate that climbs with load is a race in someone's code,
   not noise to be re-run away — here, ours.
 
-### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+### A gate was red on `dev` for ~5 hours on 2026-08-29 — CLOSED, kept for the technique
 
-`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
-`origin/dev` as of `a5c67dcda`:
+`cargo test -p cratonvm-native-builtins --lib` was 4176 passed, **1 failed**
+between `5a6348d28` and `b5a784fee`:
+`properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot`,
+naming `native_properties_clone` and `native_properties_replace_all`. Both the
+guard and the two functions it names landed in the SAME commit. Fixed by the
+owning lane, which took the exit this row argued for — reading the ORDERED
+snapshot — rather than adding the pair to `ALLOWED`.
+
+**The reusable part is how ownership was settled: without a build.** The test is
+a source witness over ONE file (`include_str!("properties_sidetable.rs")`), so
+its verdict is a pure function of that file's bytes, and
+`git diff origin/dev -- <that file>` came back empty. That is a proof, not an
+inference, and it costs a second. Reach for it before rebuilding a pristine
+`dev` — and note it only works because the witness reads a fixed path; a witness
+that scans a directory has to be re-run.
+
+**Both halves of the list matter.** This section lists known-red VECTORS, and a
+lane that runs the gates first had nothing to check a gate red against.
+
+**And a second one is OPEN as of `ff92ca9a4` (2026-08-29 evening).** Same test,
+different row:
 
 ```
-properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
-  these functions read the UNORDERED side-table snapshot:
-  ["native_properties_clone", "native_properties_replace_all"]
+cargo test -p cratonvm-native-builtins --test registrar_drift   (also with --features management)
+  the_drift_baseline_has_no_stale_rows
+  STALE BASELINE — 1 recorded drift pair(s) no longer drift.
+    register_phase54_atomics
+      java/util/concurrent/atomic/AtomicReference.compareAndSet(Ljava/lang/Object;Ljava/lang/Object;)Z
 ```
 
-**It is not your merge, and you can prove that without building anything.** The
-test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
-— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
-native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
-touched it, which makes the red identical to pristine `dev`'s.
-
-It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
-new guard it is: the guard and the two functions it names landed in the same
-commit. Left for that lane rather than silenced here, because the guard's two
-exits are not equivalent and picking between them is a behavioural call, not a
-gate-quieting one — `Properties.clone()` hands its key order to Java through
-`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
-that order, so "add it to ALLOWED" would be the wrong exit for both.
+It arrived with `7c90ec930` ("de-register the now-slower `AtomicReference
+.compareAndSet` stub"), which collapsed the pair and did not regenerate the
+baseline — the failure text says to do both in one commit. `registrar_drift.rs`,
+`phases_early.rs` and `vm/src/jit/helpers.rs` are byte-identical to `origin/dev`
+on any branch that has not touched them, which is how to tell it from yours.
+Left for that lane: the fix is to move the triple to `FIXED_NOT_DRIFTING` with
+`--dump-native-registry` evidence, which is a claim about their change, not
+about the gate.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.

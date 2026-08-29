@@ -917,12 +917,72 @@ pub(crate) fn p67_receiver_session(
 /// session we modelled, so a segment (whose slot 1 is a `Long` address) and any
 /// other 2+-slot object answer `None`.
 fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<ObjectRef> {
-    if ctx.object_num_fields(arena) <= P67_ARENA_SESSION {
+    let slots = p67_arena_slots(ctx, arena);
+    if ctx.object_num_fields(arena) <= slots.session {
         return None;
     }
-    match ctx.get_field(arena, P67_ARENA_SESSION) {
+    match ctx.get_field(arena, slots.session) {
         Value::Object(Some(session)) if p67_session_modelled(ctx, session) => Some(session),
         _ => None,
+    }
+}
+
+/// The class an `Arena` carrier is minted as: the REAL JDK implementation.
+///
+/// It used to be the `java.lang.foreign.Arena` INTERFACE, which made
+/// `Arena.ofConfined().getClass()` answer `java.lang.foreign.Arena` where
+/// HotSpot answers `jdk.internal.foreign.ArenaImpl` -- an object whose class
+/// `isInterface()` is true and whose `getSuperclass()` is null, which the Java
+/// object model does not contain.
+pub(crate) const P67_ARENA_IMPL: &str = "jdk/internal/foreign/ArenaImpl";
+
+/// Enough slots for the real class's two fields plus the two flags this VM
+/// keeps that the JDK has no field for. `try_alloc_concurrent_synthetic` takes
+/// the LARGER of this and the loaded class's own field count, so the request is
+/// a floor, not a claim about the layout.
+const P67_ARENA_IMPL_SLOTS: usize = 4;
+
+/// Where an `Arena`'s fields live, resolved from the receiver's class.
+///
+/// `ArenaImpl` is a real JDK class with two instance fields (`session`,
+/// `shouldReserveMemory`); the interface carrier this file used to mint had
+/// none, so its slot numbers were free to choose. Resolving by NAME is the
+/// pattern [`p67_session_slots`] already uses for `MemorySessionImpl`, and it
+/// is what lets these accessors keep serving a carrier minted before this
+/// change -- by another registrar, or by a build that could not load the impl.
+pub(crate) struct P67ArenaSlots {
+    pub(crate) session: usize,
+    pub(crate) open: usize,
+    pub(crate) closeable: usize,
+}
+
+impl P67ArenaSlots {
+    /// The historical interface carrier. Still reachable: `refused_class` hands
+    /// back a synthetic stand-in when the impl class will not load.
+    const SYNTHETIC: Self = Self {
+        session: P67_ARENA_SESSION,
+        open: P67_ARENA_OPEN,
+        closeable: P67_ARENA_CLOSEABLE,
+    };
+}
+
+pub(crate) fn p67_arena_slots(ctx: &dyn NativeContext, arena: ObjectRef) -> P67ArenaSlots {
+    let class_id = ctx.class_id_of_object(arena);
+    match ctx.resolve_field_index_by_class_id(class_id, "session") {
+        // `open` and `closeable` have no JDK field to live in -- the JDK keeps
+        // that state in the session, and expresses closeability by WHICH
+        // session subclass it builds. They are APPENDED past the real layout
+        // rather than aliased onto `shouldReserveMemory`, so nothing this VM
+        // writes can be read back by real JDK bytecode as a field it declared.
+        Some(session) => {
+            let base = ctx.class_num_total_fields(class_id);
+            P67ArenaSlots {
+                session,
+                open: base,
+                closeable: base + 1,
+            }
+        }
+        None => P67ArenaSlots::SYNTHETIC,
     }
 }
 
@@ -944,20 +1004,20 @@ fn p67_new_arena_kind(
     confined: bool,
     closeable: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
+    let arena = try_alloc_concurrent_synthetic(ctx, P67_ARENA_IMPL, P67_ARENA_IMPL_SLOTS)?;
     // The session allocation below can move the fresh arena (native stale-local
     // family).
     let arena_pin = ctx.pin_native_root(arena);
     let session_value = p67_memory_session(ctx)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
-    ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
-    ctx.set_field(arena, P67_ARENA_SESSION, session_value);
-    ctx.set_field(
-        arena,
-        P67_ARENA_CLOSEABLE,
-        Value::Int(i32::from(closeable)),
-    );
+    // Resolved AFTER the allocation, from the object that actually came back:
+    // if the impl class would not load, this is the synthetic carrier and its
+    // slots are the historical ones.
+    let slots = p67_arena_slots(ctx, arena);
+    ctx.set_field(arena, slots.open, Value::Int(1));
+    ctx.set_field(arena, slots.session, session_value);
+    ctx.set_field(arena, slots.closeable, Value::Int(i32::from(closeable)));
     if confined {
         if let Value::Object(Some(session)) = session_value {
             let owner = ctx.current_thread_object();
@@ -2853,38 +2913,63 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
         crate::panama::pe_arena_allocate_from_string,
     );
-    r.register(arena, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // A non-closeable arena refuses BEFORE anything is torn down --
-        // `global()` and `ofAuto()`. See `P67_ARENA_CLOSEABLE` for the
-        // measurement; the message is HotSpot's, transcribed.
-        if ctx.object_num_fields(this) > P67_ARENA_CLOSEABLE
-            && matches!(ctx.get_field(this, P67_ARENA_CLOSEABLE), Value::Int(0))
-        {
-            return Err(RuntimeError::UnsupportedOperationException {
-                message: "Attempted to close a non-closeable session".into(),
-            }
-            .into());
-        }
-        // Close the arena's session FIRST: a second `close()` must surface the
-        // session's IllegalStateException rather than silently re-clearing the
-        // flag, and the cleanups have to run while the arena is still open.
-        if let Some(session) = p67_arena_session(ctx, this) {
-            p67_session_just_close(ctx, session)?;
-            p67_session_run_close_actions(ctx, session)?;
-        }
-        ctx.set_field(this, P67_ARENA_OPEN, Value::Int(0));
-        Ok(None)
-    });
+    // The impl class as well: `allocateFrom(String)` is the shape
+    // `RJdkForeign.downcall` uses, and it is the one that crashed.
     r.register(
-        arena,
-        "scope",
-        "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)?))
-        },
+        "jdk/internal/foreign/ArenaImpl",
+        "allocateFrom",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate_from_string,
     );
+    // BOTH names, and for the reason `register_p67_segment_surface` states a
+    // few hundred lines down: native dispatch is keyed on the RECEIVER'S CLASS,
+    // and an arena is now stamped `ArenaImpl`. `close()` and `scope()` are real
+    // methods on that class, so a registration left only on the interface would
+    // lose the dispatch to JDK bytecode reading this VM's field values.
+    // Spelled out rather than `[arena, P67_ARENA_IMPL]`: `registrar_drift`
+    // resolves the class from the CALL TEXT, and a variable or a const reads to
+    // it as no registration at all -- which turned a live drift pair into a
+    // "stale baseline" failure. `panama.rs`'s allocator loop spells its classes
+    // out for the same reason.
+    for arena_cls in [
+        "java/lang/foreign/Arena",
+        "jdk/internal/foreign/ArenaImpl",
+    ] {
+        r.register(arena_cls, "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // A non-closeable arena refuses BEFORE anything is torn down --
+            // `global()` and `ofAuto()`. See `P67_ARENA_CLOSEABLE` for the
+            // measurement; the message is HotSpot's, transcribed.
+            let slots = p67_arena_slots(ctx, this);
+            if ctx.object_num_fields(this) > slots.closeable
+                && matches!(ctx.get_field(this, slots.closeable), Value::Int(0))
+            {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: "Attempted to close a non-closeable session".into(),
+                }
+                .into());
+            }
+            // Close the arena's session FIRST: a second `close()` must surface
+            // the session's IllegalStateException rather than silently
+            // re-clearing the flag, and the cleanups have to run while the
+            // arena is still open.
+            if let Some(session) = p67_arena_session(ctx, this) {
+                p67_session_just_close(ctx, session)?;
+                p67_session_run_close_actions(ctx, session)?;
+            }
+            ctx.set_field(this, slots.open, Value::Int(0));
+            Ok(None)
+        });
+        r.register(
+            arena_cls,
+            "scope",
+            "()Ljava/lang/foreign/MemorySegment$Scope;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(p67_receiver_session(ctx, this)?))
+            },
+        );
+    }
     let session = "jdk/internal/foreign/MemorySessionImpl";
     r.register(
         session,
@@ -4248,9 +4333,16 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     );
     // Arena.allocate(long) is an interface default method in the real JDK.
     // Route it directly so it cannot construct a JDK segment whose layout
-    // differs from the native MemorySegment bridge.
+    // differs from the native MemorySegment bridge. On the impl class as well,
+    // for the receiver-class reason above -- `allocate(JJ)` is already on both.
     r.register(
         "java/lang/foreign/Arena",
+        "allocate",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "jdk/internal/foreign/ArenaImpl",
         "allocate",
         "(J)Ljava/lang/foreign/MemorySegment;",
         crate::panama::pe_arena_allocate,

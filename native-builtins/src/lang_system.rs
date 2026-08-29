@@ -2941,6 +2941,44 @@ fn load_library_or_throw(
     from_class: Option<ObjectRef>,
     scoping: LoaderScoping,
 ) -> MethodCallResult {
+    // The two PRE-CHECKS `Runtime.load0`/`loadLibrary0` run before they look
+    // for anything, and which decide the message a caller sees:
+    //
+    //   System.load("relative.so")
+    //     HotSpot  UnsatisfiedLinkError: Expecting an absolute path of the
+    //              library: relative.so
+    //     was      UnsatisfiedLinkError: no relative.so in java.library.path
+    //   System.loadLibrary("a/b")
+    //     HotSpot  UnsatisfiedLinkError: Directory separator should not appear
+    //              in library name: a/b
+    //     was      UnsatisfiedLinkError: no a/b in java.library.path
+    //
+    // Both were reported as a missing library, which sends a reader looking for
+    // a file rather than at the spelling of the argument. `LibrarySpelling` was
+    // already the right distinction -- it just was not asked this question.
+    // MEASURED by `apps/probes/SystemRuntimeObjectSweep.java`.
+    match spelling {
+        LibrarySpelling::AbsolutePath => {
+            if !std::path::Path::new(requested).is_absolute() {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/UnsatisfiedLinkError",
+                    &format!("Expecting an absolute path of the library: {requested}"),
+                ));
+            }
+        }
+        LibrarySpelling::BareName => {
+            if requested.contains(std::path::MAIN_SEPARATOR) {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/UnsatisfiedLinkError",
+                    &format!(
+                        "Directory separator should not appear in library name: {requested}"
+                    ),
+                ));
+            }
+        }
+    }
     let target = match spelling {
         LibrarySpelling::BareName => platform_lib_name(requested),
         LibrarySpelling::AbsolutePath => requested.to_string(),
@@ -3941,7 +3979,22 @@ pub(crate) fn native_system_getenv(
 ) -> MethodCallResult {
     let key_ref = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        // `System.getenv(null)` reaches `ProcessEnvironment.getenv`, which
+        // encodes the name before it looks anything up, so the JDK's answer is
+        // that method's own helpful NPE rather than a null. Answering null made
+        // a caller's bug look like an unset variable, which is the same failure
+        // `System.getProperty(null)` was fixed for. The text is a site-specific
+        // literal: both halves are fixed by `ProcessEnvironment`'s source.
+        // MEASURED by `apps/probes/SystemRuntimeObjectSweep.java`.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"String.getBytes(java.nio.charset.Charset)\" because \"str\" is null"
+                        .to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let key_str = ctx.read_string(key_ref).unwrap_or_default();
     match cratonvm_types::flags::runtime_var(&key_str) {
