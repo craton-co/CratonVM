@@ -397,7 +397,7 @@ directly is not the same as calling the method.**
 
 ## 6. The residuals, each with its measurement
 
-### 6.1 The snapshot-iterator families are not fail-fast — 5 rows
+### 6.1 The snapshot-iterator families are not fail-fast — 5 rows, OPEN
 
 ```text
 TreeSet      for (x : s) s.add(..)      HotSpot CME   CratonVM no-throw
@@ -407,15 +407,59 @@ PriorityQueue for (x : q) q.add(..)     HotSpot CME   CratonVM no-throw
 TreeMap.keySet()  (--jdk-only ONLY)     HotSpot CME   CratonVM no-throw
 ```
 
-STRUCTURAL, not an omission. These four families hand out a SNAPSHOT iterator,
-and under `--jdk-only` that iterator is the real `java.util.Arrays$ArrayItr` —
-whose `next()` is real bytecode. A comodification check has nowhere to run.
-Implementing it only in compatible mode, where the fabricated iterator's `next()`
-IS a native, would make the two modes disagree, which is a worse state than a
-recorded gap: this campaign's whole premise is that the two modes converge.
+**The 2026-08-29 re-diagnosis, which is the useful part of this section.** The
+first reading said the check "has nowhere to run" because the iterator is the
+real `Arrays$ArrayItr` and its `next()` is real bytecode. That is true of three
+of the five and it is not the cause. `apps/probes/FailFastShapeProbe` printed
+the iterator CLASS each family hands out, and the answer lines up exactly with
+the fail-fast column:
 
-Closing it needs the iterator itself to change, which is the same change
-`W7-1 family 1` made for `TreeMap`'s views and is a lane of its own.
+| family | HotSpot's iterator | CratonVM's | fail-fast? |
+| --- | --- | --- | --- |
+| `TreeSet` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
+| `ArrayDeque` | `ArrayDeque$DeqIterator` | `Arrays$ArrayItr` | no |
+| `PriorityQueue` | `PriorityQueue$Itr` | `ArrayList$Itr` | no |
+| `TreeMap.keySet()` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
+| `TreeMap.values()` | `TreeMap$ValueIterator` | **`TreeMap$ValueIterator`** | **yes** |
+| `TreeMap.entrySet()` | `TreeMap$EntryIterator` | **`TreeMap$EntryIterator`** | **yes** |
+| `HashMap.values()` | `HashMap$ValueIterator` | **`HashMap$ValueIterator`** | **yes** |
+| `ArrayList` | `ArrayList$Itr` | **`ArrayList$Itr`** | **yes** |
+
+Every family that hands out its REAL iterator class is fail-fast, and every
+family that does not is not. That is one defect wearing two faces, and it means
+these five rows are not a missing check — they are **four iterator-class
+identity differences the twelve probes never asked about**, which the fail-fast
+rows are the behavioural shadow of.
+
+`native_ts_iterator`'s own comment has known the class since the L7 wave: *"No
+JDK declares `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
+behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class — and
+then hand back the snapshot through a real iterator anyway."* The refusal is
+right; the fallback is what costs the class and the check.
+
+**The fix this points at, for whoever takes it.** The mechanism already exists
+and already serves the four working rows: `VALUES_ITR_CARRIERS` maps a view
+carrier to its real iterator class, and `alloc_arraylist_iterator_as` mints that
+class with the three snapshot fields past its declared ones, refusing rather
+than fabricating when the class is not real. Pointing `TreeSet` at
+`java/util/TreeMap$KeyIterator` through that same helper gets the right class
+for two of the four rows at once — `TreeMap.keySet()` is TreeSet-carried on this
+VM, so it is one producer, not two, which is the
+`two-producers-of-one-carrier-class-is-a-failure-family` trap this would
+otherwise walk into.
+
+That gets identity. Fail-fast additionally needs a GENERATION the third door can
+read: `al_view_generation` answers `None` for a source with no `modCount`, which
+is every one of these four. Either the natives maintain the real `modCount`
+field their family declares, or each family gets a generation of its own. The
+`modCount` route is the one that also makes real JDK bytecode agree, which is
+the campaign's direction.
+
+Not attempted here. `native_ts_iterator` is among the most pin-dense functions
+in the crate — its own comments record two Family-1 stale-`ObjectRef` defects
+paid for in `RTreeRangeGc` — and replacing a working, GC-audited snapshot path
+is a change that wants its own build-and-arm cycle rather than a corner of
+someone else's. It is the same lane as §6.3.
 
 ### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
 
