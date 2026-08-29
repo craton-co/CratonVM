@@ -644,6 +644,82 @@ python3 probes/dod-summary.py /data/dod-out
 python3 probes/dod-report.py /data/dod-out/rep-tcssl-strict.json
 ```
 
+## RE-VERIFIED 2026-08-29 on a dev 77 commits later — the predicate holds, and the fabrication surface SHRANK
+
+Everything above was measured on 2026-08-28. `dev` moved **77 commits** in the
+day that followed, and several of them changed exactly the machinery this
+predicate rests on: the FFM carriers, the `Properties` side-table, and an
+`AtomicReference` de-registration. A claim this central should not sit
+unverified across that, so the same five arms were re-run on a release binary
+built from the merged tree (`22:04:17`, timestamp checked — a SIGKILLed
+fat-LTO link leaves the previous binary in place and the arms would have
+reported on the wrong commit).
+
+```text
+arm       compat_cls  syn_stub  fab_req  native-won  result
+sbsimple           0         0        2         566  DOD RESULT OK
+tcssl              0         0        5         848  DOD RESULT OK
+tcnetssl           0         0        5         731  DOD RESULT FAILURES  (the same 20/21)
+jdbc               0         0        2         358  DOD RESULT OK checks=92
+h2jdbc             0         0        3         516  DOD RESULT OK
+```
+
+**The predicate holds on every arm**, and the five results are identical to the
+original run arm for arm — including `tcnetssl`'s single
+`testClientInitiatedRenegotiation[JSSE]` failure, which is neither better nor
+worse than §3 recorded. No regression.
+
+### The comparison is total against total, which had to be checked first
+
+Both censuses report `partial: none`, `truncated: false`, `dropped: 0`,
+`saturated: false` on all ten reports. That check comes before the numbers
+rather than after: a shrinking count is exactly what a silently capped sink
+looks like, and a bounded sink is this instrument's known failure mode.
+
+### Three of the nine fabrication requests are GONE
+
+Per arm, distinct classes requested: `5 8 7 3 5` on 2026-08-28, `2 5 5 2 3`
+today. Every arm dropped, and the three classes that disappeared are one family:
+
+```text
+java/util/ArrayDeque$Itr    native-collections/src/lib.rs:44681   sbsimple, tcssl
+java/util/HashMap$KeyItr    native-collections/src/lib.rs:58700   all five
+java/util/TreeSet$Itr       native-collections/src/lib.rs:53586   sbsimple, tcssl, tcnetssl, h2jdbc
+```
+
+All three are `native-collections` iterator stand-ins, and all three were closed
+by the **L3 `java.util` collections lane** (609 owning rows, 69 defects) — not
+by anything in this lane. The table in §7 is therefore DATED, not wrong: a
+request set is a property of the tree on the day you measure it, and this one
+improved while nobody was looking at it from here.
+
+The six that remain, with today's line numbers:
+
+| class | requester | arms (strict) |
+| --- | --- | --- |
+| `cratonvm/internal/BufferPool` | `shared_secrets_bridge.rs:2920` | tcssl |
+| `cratonvm/internal/SystemLogger` | `lib.rs:28891` | tcssl, tcnetssl, h2jdbc |
+| `cratonvm/internal/foreign/MemorySegmentImpl` | `panama.rs:192` | tcnetssl |
+| `cratonvm/stream/LazyOp` | `native-collections/src/lib.rs:26755` | all five |
+| `java/util/Enumeration$Impl` | `classloader.rs:5449` and `:5477` | all five, two call sites |
+| `java/util/IteratorEnumeration` | `keystore.rs:3104` | tcssl, tcnetssl |
+
+Three of the six still do not match `cratonvm/internal/`, so §7's point about the
+roadmap's prefix clause survives the shrink.
+
+`MemorySegmentImpl` appearing under STRICT is not a contradiction of
+`compatibility_classes: 0`: the request is RECORDED and the fabrication REFUSED,
+which is the whole shape `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`
+§4 describes from the other side — strict refuses and lands on the interface,
+compatible instantiates the stand-in.
+
+### Reproduce
+
+```bash
+DOD_CVM=<release binary>  DOD_CLASSES=<javac -d probes/out probes/Dod*.java>  DOD_OUT=/data/dod-out-reverify  bash probes/dod-arms.sh strict
+python3 probes/dod-summary.py /data/dod-out-reverify
+```
+
 ## Where the probes are
 
 **In the tree, at `probes/`, committed normally.**
