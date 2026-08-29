@@ -451,7 +451,7 @@ was measuring, and the whole set was re-run after the merge rather than the
 quick subset. Release binary, same host. **No red is new.**
 
 ```text
-cargo test -p cratonvm-types                                   PASS
+cargo test -p cratonvm-types                       589 passed, 0 failed  (see the flake note)
 cargo test -p cratonvm-native-builtins  (the seven ratchets)   PASS
   ... --features management (three of them)                    PASS
 cargo test -p cratonvm-native-builtins --lib      4177 passed, 0 failed
@@ -464,7 +464,15 @@ CRATONVM_ARGS=--jdk-only  bash regression-suite/run.sh         111 / 112
 All fifteen definition-of-done arm runs were re-taken on the merged tree too,
 with the same verdicts and the same two compatible-mode probe differences (R2
 and R3 below); a merge of two independently-verified halves is not a verified
-whole.
+whole. That is not a formality here — the second merge arrived with a red of its
+own, and §10 is it.
+
+`cratonvm-types` failed once, on
+`arraylist_view::tests::a_fallback_mint_revokes_the_yield_permanently`, during a
+window with seven other sessions' regression suites running on the same host.
+It **passes alone and passes in a full clean re-run** — the dial it asserts on
+is a process-global latch, so the failure is test interleaving under load, not a
+verdict. Checked rather than assumed, and recorded rather than quietly re-run.
 
 **The two `cratonvm-vm --lib` failures are red on pristine `origin/dev` and are
 in a file this branch does not touch.**
@@ -509,6 +517,45 @@ java.lang.AssertionError: ConcurrentHashMap.elements(): hasMoreElements() never 
 standalone on the same binary**, and did not fail again in the merged tree's
 three arms — the documented load flake of `HANDOFF-20260812.md`, checked rather
 than assumed.
+
+
+## 10. The second merge brought a red of its own, in a file this lane does not own
+
+`origin/dev` moved again between the first merge and the push, and the eleven
+new commits took `RExceptions` (core) and `RJdkFailure` (strict and all) red.
+Both report the same thing:
+
+```text
+java.lang.AssertionError: an array CNFE must name the element, not the
+descriptor: [Lcom.cratonvm.absent.NoSuchClass20260731;
+```
+
+The cause is a new early arm in `native_class_for_name`
+(`native-builtins/src/lang_class.rs`) that resolves an array DESCRIPTOR without
+consulting a loader. The arm is right to exist — `Class.forName("[I")` must
+work while `ClassLoader.loadClass("[I")` must throw, and handling the descriptor
+before the delegation is what lets the two doors keep different contracts. Its
+miss path threw `ClassNotFoundException(dotted_name)`, the whole descriptor,
+where HotSpot names the element:
+
+```text
+Class.forName("[Lp.X;")    HotSpot  CNFE msg="p.X"     cause=null
+                           here     CNFE msg="[Lp.X;"
+```
+
+**Both other CNFE arms of that same function already call
+`for_name_cnfe_name`**, which is exactly this rule and a no-op for every
+non-array name. The new arm returns before either can run, so an invariant the
+file documents in three places stopped holding at the door that now answers
+first. Fixed by calling it there too — one argument.
+
+Cleared here rather than left, because this is the opposite case from the
+`invoke.rs` allowlist above: nothing is being relaxed, the correct value is
+already computed by a helper used twice in the same function, and the assertion
+that failed states the contract in its own message. Verified as dev's before
+touching, by the rule the scope brief gives: the arm arrives in
+`git diff <first-merge>..HEAD -- native-builtins/src/lang_class.rs`, and this
+branch's own diff does not list that file.
 
 
 ## Reproduce

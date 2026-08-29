@@ -3086,11 +3086,17 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
+        // L16 -- the ELEMENT, not the descriptor. This arm answers before the
+        // two loader arms below, both of which already apply `for_name_cnfe_name`,
+        // so without it the rule this function documents in three places stops
+        // holding at the door that now runs first. `regression-suite`'s
+        // `RExceptions` and `RJdkFailure` both assert it:
+        //   Class.forName("[Lp.X;")  HotSpot CNFE msg="p.X" cause=null
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &dotted_name,
+            &for_name_cnfe_name(&dotted_name),
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }
