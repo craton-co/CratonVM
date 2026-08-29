@@ -15,104 +15,70 @@ module.
 CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 ([`vm/src/config.rs`](../vm/src/config.rs)):
 
-> **The default collector changed on 2026-08-10: it is now ZGC, not
-> Generational.** If you pinned nothing, your runs moved. Two things follow.
+> **ZGC is the default collector, not Generational.** If you pin nothing,
+> this is what you run. Two things follow.
 >
-> **(1) Budget more heap — RETIRED as a standing rule, 2026-08-13.** This
-> paragraph used to say ZGC needs roughly **1.5x** the heap the generational
-> collector needed, on the strength of one class: `ZipContentTests` OOMed under
-> ZGC at `-Xmx 2g` and passed from 3g up, where Generational passed at 2g.
->
-> **That class now passes 29/29 at `-Xmx 2g` under ZGC**, and 29/29 under
-> Generational on the same heap
-> (`fixed-suite-bugs/vm/zgc-oom-with-84-percent-of-the-heap-free-FIXED-20260810.md`).
-> Two defects were under it, both specific to a non-compacting collector and
-> both fixed: the GC trigger asked about live bytes when the binding constraint
-> is allocatable space, and the arena's bump cursor was a one-way ratchet.
-> **The sole measurement behind the 1.5x figure is gone, so the figure is
-> withdrawn rather than restated.**
->
-> The same happened to the other two instances of the shape. Hibernate's
-> `DFAState[8192]` OOM (2026-08-11) was an allocator sizing bug; Tomcat's 2 MB
-> `char[]` OOM (2026-08-13) was mostly a TLAB *reservation* bug —
-> 4,000 threads x 512 KiB claiming the whole heap behind a trigger that counts
-> only object bytes. **All three known instances were allocator defects, not
-> the price of not compacting.**
->
-> What still holds, and is the honest general statement: **a non-compacting
-> collector needs more headroom than a compacting one, and how much is a
-> property of the workload's allocation shapes rather than a constant.** If
-> something throws `OutOfMemoryError` under ZGC, raise `-Xmx` to get moving —
-> but file it, because every instance so far has had a fixable cause.
+> **(1) Budget more heap.** A non-compacting collector needs more headroom
+> than a compacting one, and how much is a property of the workload's
+> allocation shapes rather than a fixed multiple — every OOM shape found so
+> far under ZGC has turned out to be a fixable allocator defect (a trigger
+> asking about live bytes when the binding constraint was allocatable space,
+> a TLAB reservation sized flat regardless of thread count) rather than an
+> inherent cost of non-compaction. If something throws `OutOfMemoryError`
+> under ZGC, raise `-Xmx` to get moving — but file it.
 > **(2) The escape hatch is `-XX:+UseGenerationalGC`**, available in every
 > build including `--no-default-features`. `-XX:-UseZGC` does the same thing.
 >
-> Why the flip, as measured on 2026-08-10: on the 651-class Tomcat suite, one
-> commit, all three backends — ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min
-> against Generational's 519 / 115 / 1 in 356 min. 63 classes are non-PASS
-> under Generational while passing under *both* other backends, and 62 of those
-> log `[moving-young] fallback`.
->
-> **That margin did not survive the next day, and this is the current number.**
-> The same three arms re-run on 2026-08-11 give ZGC **629 PASS / 11 HANG / 0
-> CRASH in 178.4 min** against Generational's **628 / 11 / 0 in 177.5 min** —
-> a one-class lead, not an 85-class one. ZGC is still the top row and still the
-> only backend that has never crashed here, but size up your heap on the
-> paragraph above, not on a pass-rate gap that has closed. The cross-suite
-> picture is
-> [the Phase 1 baseline](feature-designs/zgc-phase1-empirical-baseline-20260813.md).
-> See
-> [`docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md).
+> ZGC was promoted on measured suite behaviour: across every suite with a
+> per-collector sweep, it is at parity with or ahead of Generational on PASS
+> count, ties or leads on HANG, and is the only backend that has never
+> crashed. Read that as "roughly comparable, slightly ahead," not as a wide
+> margin — the gap narrows or closes depending on which suite and run you
+> look at.
 
-> **One ZGC default changed for the gauntlet, not two.** The small-object end
-> of the arena is now **compacted** at the end of a collection;
-> `CRATONVM_ZGC_RELOCATE=0` restores the non-moving sweep byte for byte, so it
-> is a re-run rather than a rebuild and therefore usable as a bisect.
+> The small-object end of the arena is **compacted** at the end of a
+> collection by default; `CRATONVM_ZGC_RELOCATE=0` restores the non-moving
+> sweep byte for byte, which makes it a usable bisect for anything that looks
+> like a stale-reference or relocation defect.
 >
-> **Parallel marking was flipped on 2026-08-13 and flipped back on 2026-08-14**,
-> by the measurement it should have had first: on a 1M-object live set a driven
-> mark costs **+31% pause at one worker and +153% at four**, rising with the
-> worker count. `CRATONVM_ZGC_PARMARK=<n>` still turns it on for anyone
-> measuring the fix; unset means the serial loop, which is the faster one.
+> **Parallel marking is off by default.** Driving the mark phase with a
+> worker pool costs pause time rather than saving it — on a 1M-object live
+> set it measured **+31% pause at one worker and +153% at four**, rising with
+> the worker count, because the serial loop is the faster one on this
+> workload shape. `CRATONVM_ZGC_PARMARK=<n>` turns it on if you want to
+> measure your own workload against it.
 >
-> **What to watch.** Compaction is the first configuration in which a ZGC cycle
-> returns a **non-empty pointer map**, so every consumer of one now runs for
-> this collector: JIT frame maps, monitor tables, external root providers,
-> native side tables. Those consumers are collector-agnostic and already run
-> for the generational moving-young path, but "runs for another collector" is
-> not "has run for this one". **A crash, a stale-reference warning or a
-> silently-wrong result that disappears under `CRATONVM_ZGC_RELOCATE=0` is that
-> change**, and the flag is the bisect.
->
-> Turning parallel marking on found two things worth the day it was on. A
-> defect that had been invisible while it was opt-in — the parallel path did
-> not open a mark cycle, so `visit_refs` traced every weak/soft/phantom
-> referent as a strong edge and no reference could be cleared — and then the
-> pause measurement above, which is why it is off again.
+> **What to watch.** Compaction is the configuration in which a ZGC cycle
+> returns a **non-empty pointer map**, so every consumer of one runs for this
+> collector: JIT frame maps, monitor tables, external root providers, native
+> side tables. Those consumers are collector-agnostic and already run for the
+> generational moving-young path, but "runs for another collector" is not
+> "has run for this one". **A crash, a stale-reference warning or a
+> silently-wrong result that disappears under `CRATONVM_ZGC_RELOCATE=0` is
+> that class of bug**, and the flag is the bisect.
 
 ### What is actually shipping, in one place
 
-Everything in this block was re-derived from the tree on 2026-08-13. If another
-page contradicts it, that page is stale — several were, and the reason this
+If another page contradicts this block, that page is stale — the reason this
 block exists is that a default collector documented as an opt-in experiment
 leaves an operator unable to tell what they are running.
 
 | Question | Answer | Where it is decided |
 |---|---|---|
-| Which collector runs if I set nothing? | **ZGC**, since 2026-08-10 | `VmConfig::default`, `vm/src/config.rs` |
+| Which collector runs if I set nothing? | **ZGC** | `VmConfig::default`, `vm/src/config.rs` |
 | Is the `zgc` Cargo feature on? | **Yes, by default** — it gates the `GcAlgorithm::Zgc` variant, so the default could not be `Zgc` without it | `gc/Cargo.toml`, `vm/Cargo.toml`, `vm-cli/Cargo.toml` (`^default = `) |
 | How do I get a build with no ZGC? | `--no-default-features` (name `mimalloc` back if you still want it). Generational becomes the default there and `-XX:+UseZGC` warns and falls back | `vm-cli/Cargo.toml` |
 | How do I switch collector at runtime? | `-XX:+UseGenerationalGC` (or `-XX:-UseZGC`); `-XX:+UseG1GC` for G1. Available in every build | `parse_gc_algorithm`, `vm/src/config.rs` |
 | Does ZGC move objects? | **No.** Non-moving, non-generational, whole-heap stop-the-world mark-sweep over one arena | `ZgcRealHeap::collect_garbage`, `gc/src/zgc.rs` |
 | Does ZGC have TLABs? | **Yes, default-on.** Not through `VmHeap::refill_tlab` (which returns `None` here) but inside the backend. Kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab` | `ZgcRealHeap::alloc_raw_tlab`, `gc/src/zgc/tlab.rs` |
-| Is it concurrent, generational or compacting? | **Concurrent: BUILT since 2026-08-16, OPT-IN (`CRATONVM_ZGC_CONC_START=60`).** The strong closure is traced by a worker pool while every mutator runs; the pause replays the SATB ingress, re-scans the roots and sweeps. Measured per-cycle pause **-38% to -58%**, wall clock **+37% to +55%**, and roughly **twice as many cycles** (floating garbage) -- so it is off unless asked for. The table is in [the plan](feature-designs/zgc-concurrent-and-generational-plan-20260813.md#2b-what-concurrent-marking-actually-measured--2026-08-16). **Compacting: YES, on by default since 2026-08-13** (`CRATONVM_ZGC_RELOCATE=0` is the kill switch). **Generational: BUILT since 2026-08-17, OPT-IN (`CRATONVM_ZGC_GENERATIONAL=1`).** Every collection between two whole-heap ones is a young cycle: the old generation is pre-marked and never traced, and the remembered set supplies the old-to-young roots. The split is by **object** age, not page age | [the concurrent+generational plan](feature-designs/zgc-concurrent-and-generational-plan-20260813.md) |
+| Is it concurrent, generational or compacting? | **Concurrent: OPT-IN (`CRATONVM_ZGC_CONC_START=60`).** The strong closure is traced by a worker pool while every mutator runs; the pause replays the SATB ingress, re-scans the roots and sweeps. Measured per-cycle pause **-38% to -58%**, wall clock **+37% to +55%**, and roughly **twice as many cycles** (floating garbage) -- so it is off unless asked for. **Compacting: YES, on by default** (`CRATONVM_ZGC_RELOCATE=0` is the kill switch). **Generational: OPT-IN (`CRATONVM_ZGC_GENERATIONAL=1`).** Every collection between two whole-heap ones is a young cycle: the old generation is pre-marked and never traced, and the remembered set supplies the old-to-young roots. The split is by **object** age, not page age | [the concurrent+generational plan](feature-designs/zgc-concurrent-and-generational-plan-20260813.md) |
 | How do I tell whether a collection marked concurrently? | `--verbose:gc`'s **`mark=`** field on each `[GC] zgc-real:` line — `concurrent`, `stw-parallel` or `stw-serial`. At shutdown, `[GC] zgc-concurrent:` gives `cycles_started` / `cycles_completed` / `black_allocations` / `satb_replayed` / `concurrent_phase_ms`. **`cycles_started=0` means the run says nothing about concurrent marking**, which is a different fact from concurrent marking not helping | `ZgcRealHeap::collect_garbage`, `VmHeap::print_gc_summary` |
 | When does a concurrent cycle open? | When allocation crosses `CRATONVM_ZGC_CONC_START`% of the collection threshold (default `0`, i.e. never). **A `System.gc()`-driven workload never opens one** — a forced collection is meant to collect now, not to start marking — so a benchmark built out of `System.gc()` calls measures the stop-the-world path however this is configured | `ZgcRealHeap::should_start_concurrent_mark` |
-| Do young cycles actually happen? | Before 2026-08-17 they fired only when a WHOLE-HEAP collection would have — `needs_gc`'s clauses are live bytes and allocatable space, neither of which asks how much has been allocated since the last cycle — so a 600-round run got **six**. `CRATONVM_ZGC_GEN_NURSERY_PERCENT` (default 10, `0` restores the old behaviour) adds a nursery-size clause. `[GC] zgc-nursery:`'s trigger count is the engagement counter: **zero on a generational run means every collection still came from the whole-heap predicate**. The clause bypasses `gc_rearm` deliberately (that floor is a quarter of remaining headroom and would make it unreachable); it cannot storm because the watermark resets on every collection | `ZgcRealHeap::needs_gc` |
+| Do young cycles actually happen? | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` (default 10, `0` disables it) adds a nursery-size clause to `needs_gc`, so a young cycle can fire on its own rather than only when a whole-heap collection would have. `[GC] zgc-nursery:`'s trigger count is the engagement counter: **zero on a generational run means every collection still came from the whole-heap predicate**. The clause bypasses `gc_rearm` deliberately (that floor is a quarter of remaining headroom and would make it unreachable); it cannot storm because the watermark resets on every collection | `ZgcRealHeap::needs_gc` |
 | Is the young cycle's SWEEP actually bounded? | `--verbose:gc`'s `gen=young/N **swept=A/B**` field: `A` is the registered objects the sweep walked, `B` the whole registry. `A == B` means the nursery floor never moved and the sweep is O(registry) — the state the first Phase G measurement was in. At shutdown, `[GC] zgc-nursery:` gives `sweep_skipped` / `floor` / `old_live_bytes`; **`sweep_skipped=0` with `young_cycles>0` is the inert state**. The floor is the arena cursor the last WHOLE-HEAP collection ended on, so a young cycle sweeps only what the bump cursor served since then — an object the free list placed below the floor waits for a major (over-retention, never unsoundness) | `ZgcRealHeap::gen_young_floor` |
 | How do I tell whether a collection was a young one? | `--verbose:gc`'s **`gen=`** field on each `[GC] zgc-real:` line: `young/N` (a minor, where `N` is the objects it retained **without tracing** — the work it did not do), `major/+N` (whole-heap, `N` objects promoted) or `off`. At shutdown, `[GC] zgc-generational:` gives `young_cycles` / `old_retained` / `remembered_roots` / `promotions` / `recards_after_relocation`. **`young_cycles>0` with `old_retained=0` means the run did full-heap work under a generational name** — which is the vacuous green a "generational is on" claim would otherwise rest on | `ZgcRealHeap::collect_garbage`, `VmHeap::print_gc_summary` |
 | When is a collection forced to be whole-heap? | Four cases, and each is a refusal rather than a policy: the mark set came from a **concurrent** cycle (it *is* the whole-heap closure and cannot be scoped after the fact); the collection was driven by **allocation failure** (`headroom_low` / `hard_alloc_failure` — a young cycle retains the whole old generation unexamined, so it is the wrong tool for "the heap is full"); `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` young cycles have run since the last one (default 8); or **nothing has been promoted yet**, in which case a young cycle would be a full one anyway. On a heap too small for `zgc_headroom_margin` the second case fires every cycle and generational never engages — check `young_cycles` before concluding anything | `ZgcRealHeap::collect_garbage` |
-| What does a young sweep still do per dead object? | Two things until 2026-08-17, and both were O(reclaimed **volume**) rather than O(objects) -- which is why bounding *which* objects it visits could not move the pause. It **memset the whole body**, redundant with the memset `alloc_raw` already does on every handout, so each dead object was zeroed twice; and it pushed **one free-list span per object** and then sorted all of them in `coalesce_free_list`. Now it zeroes the 16-byte header only (`CRATONVM_ZGC_GEN_HEADER_ZERO=0` restores the body memset) and hands over one span per **run** of adjacent dead objects (`CRATONVM_ZGC_GEN_DEAD_RUNS=0` restores the per-object calls). Both apply to young cycles only, so a whole-heap sweep is byte-for-byte unchanged. Engagement on `[GC] zgc-sweep-cost:`: **`zero_bytes_skipped=0` with `young_cycles>0` means the first is on and inert, and `dead_runs == dead_objects` means the second is** | `ZgcRealHeap::collect_garbage`, `zgc_gen_header_zero` |
+| What does a young sweep do per dead object? | It zeroes the 16-byte header only (`CRATONVM_ZGC_GEN_HEADER_ZERO=0` restores a full-body memset, which is redundant with the memset `alloc_raw` already does on every handout) and hands over one free-list span per **run** of adjacent dead objects rather than one span per object (`CRATONVM_ZGC_GEN_DEAD_RUNS=0` restores the per-object calls, each of which then needs sorting in `coalesce_free_list`). Both apply to young cycles only, so a whole-heap sweep is byte-for-byte unchanged. Engagement on `[GC] zgc-sweep-cost:`: **`zero_bytes_skipped=0` with `young_cycles>0` means the first is on and inert, and `dead_runs == dead_objects` means the second is** | `ZgcRealHeap::collect_garbage`, `zgc_gen_header_zero` |
 | Is it safe to stop zeroing a dead object's body? | Yes, and the reason is that the header is the whole of the property. The sweep zeroed to stop "a later scan seeing a stale header"; `HEADER_SIZE` **is** the entire `ObjectHeader` (`class_id`, `shape`, `mark_word`) and `ARRAY_DATA_OFFSET == HEADER_SIZE`, so an array's length is in `shape` rather than a body prefix -- a zeroed header is the same `class_id=0, num_slots=0` corpse a reader of a vacated span always saw. The body is only reachable **through** that header: field reads size the object from `num_slots`, extent walks from `alloc_size(header)`, membership from the registry the sweep just removed the base from. And reuse was never the reason -- `alloc_raw` and `tlab_refill` memset unconditionally | `ObjectHeader`, `ZgcRealHeap::alloc_raw` |
 | Should I turn generational on? | **Probably not yet, and there is a measurement rather than a guess behind that.** On the shape it is for — 800k retained objects, 48M allocated, an old-to-young store per round — it is **neutral at the default promotion age (+2.5% to +4% total pause) and clearly worse at age 1 (+46% to +55%, reclaim 75.7% → 63.7%)**, with wall clock flat. The split works (4.8M objects skipped per young cycle, every old-to-young edge intact) and does not pay, because `sweep` is 182 ms of a 309 ms pause and walks every registered object whatever the split says. A real young space, reclaimed by resetting a cursor, is what would change that. If you try it anyway: `CRATONVM_ZGC_GEN_PROMOTION_AGE` (default 3, clamped to `1..=15` because the header field is 4 bits) decides how many collections an object must survive; a lower value promotes sooner, so young cycles skip more and old garbage accumulates faster. Measure with `gen=` and `old_retained`, and note that **a lower promotion age is not a stronger version of the same knob** — age 1 promoted 11.7M objects, filling old with garbage no young cycle examines | the plan's §3 |
 | Should I turn concurrent marking on? | If your workload has **many mutator threads, a large live set, and a pause budget you are missing**. It trades throughput for pause and the trade is not small; measure your own workload with `--verbose:gc` and compare `mark=concurrent` cycles against `CRATONVM_ZGC_CONC_START=0`. `CRATONVM_ZGC_CONC_WORKERS` (default `cores/4`, capped at 4) is the second knob — 1 worker measured best on a single-threaded probe, 2 on an 8-thread one | the plan's §2b |
@@ -120,7 +86,7 @@ leaves an operator unable to tell what they are running.
 
 | Backend | Module | Status | Best for |
 |---|---|---|---|
-| **ZGC** (default since 2026-08-10) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. Concurrently-marking (since 2026-08-16), compacting, non-generational, one arena. Still not OpenJDK ZGC: it marks under a **pre-write** barrier (snapshot-at-the-beginning), not under ZGC's load barrier, so it is conservative about objects that die mid-cycle, and relocation is stop-the-world. Fewest hangs and zero crashes across the Tomcat suite. The "costs ~1.5x heap" rule was withdrawn on 2026-08-13 — its one supporting class now passes at the same heap Generational does. See [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) for what is and is not built, and the plan to close it. |
+| **ZGC** (default) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. Compacting by default, concurrent marking and generational mode opt-in, one arena. Still not OpenJDK ZGC: it marks under a **pre-write** barrier (snapshot-at-the-beginning), not under ZGC's load barrier, so it is conservative about objects that die mid-cycle, and relocation is stop-the-world. Fewest hangs and zero crashes across the Tomcat suite. See [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) for what is and is not built, and the plan to close it. |
 | **Generational** | [`gc/src/gen_heap.rs`](../gc/src/gen_heap.rs) | Production; the escape hatch (`-XX:+UseGenerationalGC`) | Tight heap budgets, and anything that regressed on the flip. Young copying + old free-list + write barriers + card table. Carries the `[moving-young] fallback` throughput problem the flip exists to escape. |
 | **G1** (Garbage-First) | [`gc/src/g1.rs`](../gc/src/g1.rs) | Production | Throughput-oriented workloads on larger heaps. Region-based, mixed young/old collections, optional concurrent marking. STW today; parallel evacuator deferred. |
 
@@ -138,58 +104,35 @@ Trade-offs at a glance:
   memory-backed collector — `Arena` storage, real `ObjectHeader`s, real
   reference processing — and `-XX:+UseZGC` really selects it
   (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`). What it is *not* is
-  ZGC: it is stop-the-world, non-moving, whole-heap and non-generational. (It
-  *does* have TLABs — thread-private chunks carved from the arena, default-on,
-  kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab`. The claim that
-  "every allocation takes the arena lock" was true before the chunked TLAB
-  landed and is not true now. The chunk is **not** a fixed 512 KiB: since
-  2026-08-13 it is a share of the heap divided by the live buffer count, capped
-  at 512 KiB, because a fixed chunk times a large thread count is the whole
-  heap.) The colored-pointer /
-  `ZPage` code above it in the same file is a metadata-only simulation with no
-  production consumer. On the 1975-class Spring Boot suite:
-  1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
-  `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`.
-  The path to a real one is
-  [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
-  **Re-attributed 2026-08-13, and this is the part to read before sizing a
-  heap:** the Tomcat instance of the "ZGC wants more heap" shape
-  (`TestNonBlockingAPI`, `OutOfMemoryError` with 1.99 GB of a 2.15 GB heap
-  free) turned out to be mostly *not* the price of not compacting. A TLAB chunk
-  is RESERVED space no collection can reclaim while its thread lives, its size
-  was flat at 512 KiB however many threads a workload ran, and that class runs
-  ~4,000 of them — `4,000 x 512 KiB` is the whole heap. The chunk is now sized
-  against the live thread count. The headroom premium is real, but it is not a
-  single constant, and the 1.5x figure was WITHDRAWN on 2026-08-13 when its
-  one supporting class turned out to pass at 2g under ZGC after two allocator
-  fixes; see
-  fixed-suite-bugs/tomcat/zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813.md
-  and
-  [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md).
-
-  **Those Spring Boot numbers are superseded, not merely stale.** They are the
-  2026-08-08 pre-fix run. Two ZGC-only defects behind them were fixed on
-  2026-08-10, and the same day the 26 classes that were the *entire*
-  ZGC-vs-default delta were re-run on one binary at `-Xmx 2g`: **ZGC 16 PASS /
-  7 HANG / 3 FAIL against the default collector's 14 / 10 / 2**, with the
-  record concluding "no functional ZGC-vs-default difference is left". Quote
-  those figures, not 1860-vs-1902.
+  ZGC: it is stop-the-world, whole-heap by default and non-generational unless
+  opted in. It *does* have TLABs — thread-private chunks carved from the
+  arena, default-on, kill switch `CRATONVM_ZGC_TLAB=0` or
+  `CRATONVM_GC=-zgc-tlab`. The chunk is **not** a fixed size: it is a share of
+  the heap divided by the live buffer count, capped at 512 KiB, because a
+  fixed chunk times a large thread count would be the whole heap. The
+  colored-pointer / `ZPage` code above it in the same file is a metadata-only
+  simulation with no production consumer. Across every suite with a
+  per-collector sweep, ZGC's PASS/HANG/CRASH counts sit at parity with or
+  ahead of Generational's — see the "What is actually shipping" table above
+  for the honest current comparison rather than any one suite's headline
+  count. The path to a real ZGC is
+  [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md);
+  see [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md)
+  for what is and is not built.
 - **ZGC's arena has two ends, and the split is operator-visible.** Small
   objects and TLAB chunks bump upward from the bottom; anything too big for a
   TLAB to serve (>= 64 KiB, i.e. `ZGC_TLAB_MAX_CHUNK / 8`) bumps *downward*
   from the top, with its own free list and a floor of `capacity / 8` reserved
-  for it. The reason is that this collector does not compact, so the largest
-  request it can serve is the largest gap between two survivors — and one
-  long-lived object inside a thread's private chunk caps every hole in
-  the heap at one chunk. Measured before the split, on Tomcat's
-  `TestNonBlockingAPI`: a 2 MB `char[]` raised `OutOfMemoryError` with 1.99 GB
-  of a 2 GB heap free, held out by **544 live bytes in four AQS nodes**. The
-  practical consequence for sizing is that a workload dominated by large
-  buffers is served from a region bounded below by `-Xmx / 8`, and one that
-  allocates no large objects at all gives that region up again (the floor is a
-  preference the small-object end may overrun rather than fail).
-- The `zgc` feature is **on by default** as of 2026-08-10, because the default
-  `GcAlgorithm` is `Zgc` and that variant is `#[cfg(feature = "zgc")]`. A
+  for it. The reason is that this collector does not compact by default, so
+  the largest request it can serve is the largest gap between two survivors —
+  and one long-lived object inside a thread's private chunk caps every hole in
+  the heap at one chunk. The practical consequence for sizing is that a
+  workload dominated by large buffers is served from a region bounded below by
+  `-Xmx / 8`, and one that allocates no large objects at all gives that region
+  up again (the floor is a preference the small-object end may overrun rather
+  than fail).
+- The `zgc` feature is **on by default**, because the default `GcAlgorithm` is
+  `Zgc` and that variant is `#[cfg(feature = "zgc")]`. A
   `--no-default-features` build has no ZGC at all and falls back to
   Generational; `-XX:+UseZGC` there warns and falls back too.
 

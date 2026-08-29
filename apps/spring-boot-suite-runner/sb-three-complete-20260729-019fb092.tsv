@@ -1,4 +1,0 @@
-module	class
-core/spring-boot-autoconfigure	org.springframework.boot.autoconfigure.condition.OnBeanConditionTypeDeductionFailureTests
-test-support/spring-boot-test-support	org.springframework.boot.testsupport.classpath.resources.ResourcesTests
-module/spring-boot-actuator	org.springframework.boot.actuate.management.ThreadDumpEndpointTests

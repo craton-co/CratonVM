@@ -8596,14 +8596,18 @@ pub(crate) fn fjp_state_flags(o: ObjectRef) -> (bool, bool) {
 /// throw rather than hand back a value; `isDone()`/`isCancelled()`/
 /// `getRawResult()` deliberately keep the plain `fjp_state_get`.
 ///
-/// `RuntimeError` has no dedicated `CancellationException` variant, so this
-/// raises `IllegalStateException` with the spec'd type name in the message —
-/// the same spec-faithful proxy `xnio_async::native_iof_get` already uses.
+/// It raises a REAL `java.util.concurrent.CancellationException`. It used to
+/// raise `IllegalStateException` with the spec'd type name in its message,
+/// because `RuntimeError` had no variant for the real class — and a proxy is
+/// only as good as its message: `catch (CancellationException)` is the one way
+/// a caller tells a cancelled task from a failed one, and it did not fire.
+/// MEASURED, both modes, three rows (`join`, `get`, `invoke` on a cancelled
+/// task). The variant exists now; see `RuntimeError::CancellationException`.
 pub(crate) fn fjp_state_get_checked(o: ObjectRef) -> Result<(bool, Value), MethodCallFailed> {
     let m = fjp_state().lock();
     match m.get(&fjp_key(o)) {
-        Some(e) if e.cancelled => Err(RuntimeError::IllegalStateException {
-            message: "java.util.concurrent.CancellationException: task was cancelled".to_string(),
+        Some(e) if e.cancelled => Err(RuntimeError::CancellationException {
+            message: String::new(),
         }
         .into()),
         Some(e) => Ok((e.done, e.result)),
@@ -8621,6 +8625,117 @@ fn fjp_remap_value_ref(value: &mut Value, pointer_map: &cratonvm_types::PointerM
     }
 }
 
+/// The one `ForkJoinPool.commonPool()` carrier, as a raw address.
+///
+/// `commonPool()` minted a FRESH object on every call. The registration's own
+/// comment had said so since it was written -- "TODO: this allocates a FRESH
+/// pool object on every call instead of caching a true singleton (unlike the
+/// real JDK, where commonPool() always returns the same instance)" -- and the
+/// differential finally asked: `ForkJoinPool.commonPool() ==
+/// ForkJoinPool.commonPool()` is `true` on HotSpot 25.0.4+7 and was `false`
+/// here, in both modes. Any code that keys a map, a registry or a
+/// shutdown-once flag on the pool identity saw a different pool every time it
+/// looked.
+///
+/// An `AtomicUsize` rather than a `Mutex<Option<ObjectRef>>`: one publication
+/// of one address needs no lock, and this file's GC hooks below already own
+/// the rooting and the post-move remap that make an address stored outside the
+/// heap safe.
+static FJP_COMMON_POOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// The `ForkJoinPool` carriers whose submission natives are on THIS
+    /// thread's stack right now, innermost last, each with the pin handle that
+    /// keeps it addressable.
+    ///
+    /// This pool runs every task INLINE on the submitting thread, so the JDK's
+    /// own answer to "am I in a pool?" — `Thread.currentThread() instanceof
+    /// ForkJoinWorkerThread` — is false even in the middle of
+    /// `pool.invoke(task)`. MEASURED against HotSpot 25.0.4+7, both modes:
+    ///
+    /// ```text
+    ///   pool.invoke(task calling ForkJoinTask.inForkJoinPool())
+    ///     HotSpot  true       CratonVM  false
+    ///   pool.invoke(task calling ForkJoinTask.getPool())
+    ///     HotSpot  non-null   CratonVM  null
+    /// ```
+    ///
+    /// It is not a cosmetic pair. `inForkJoinPool()` is how library code
+    /// decides whether it may `fork()` or must run inline, and how
+    /// `ManagedBlocker`-shaped code decides whether to compensate — a
+    /// permanent `false` sends every such caller down the "I am on an ordinary
+    /// thread" branch even while it is executing inside a pool.
+    ///
+    /// A PIN HANDLE, not a bare address: an inline task is arbitrary Java and
+    /// can complete a moving collection, and a thread-local cannot be reached
+    /// by the GC hooks (which run on whichever thread triggered the
+    /// collection). The handle is taken and released by the same native, so
+    /// the stack discipline `unpin_native_roots` needs is preserved.
+    static FJP_POOL_STACK: std::cell::RefCell<Vec<(usize, ObjectRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push `args[0]` as the pool this thread is now inside; returns the pin
+/// handle to hand back to [`fjp_pool_frame_leave`], or `None` when the
+/// receiver is not an object (a static call, or a dispatch defect).
+pub(crate) fn fjp_pool_frame_enter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<usize> {
+    let pool = match args.first().copied() {
+        Some(Value::Object(Some(p))) => p,
+        _ => return None,
+    };
+    let base = ctx.pin_native_root(pool);
+    FJP_POOL_STACK.with(|s| s.borrow_mut().push((base, pool)));
+    Some(base)
+}
+
+/// Pop the frame [`fjp_pool_frame_enter`] pushed. Call on EVERY exit path —
+/// the callers wrap their body in a closure so there is exactly one.
+pub(crate) fn fjp_pool_frame_leave(ctx: &mut dyn NativeContext, base: Option<usize>) {
+    if let Some(base) = base {
+        FJP_POOL_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+        ctx.unpin_native_roots(base);
+    }
+}
+
+/// `ForkJoinTask.inForkJoinPool()`.
+pub(crate) fn fjp_in_pool() -> bool {
+    FJP_POOL_STACK.with(|s| !s.borrow().is_empty())
+}
+
+/// `ForkJoinTask.getPool()` — the innermost pool, re-read through its pin so
+/// a collection during the task cannot hand back a stale address.
+pub(crate) fn fjp_current_pool(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let top = FJP_POOL_STACK.with(|s| s.borrow().last().copied());
+    top.map(|(base, pool)| ctx.read_native_pin(base, pool))
+}
+
+/// The cached common pool, or `None` before the first `commonPool()` call.
+pub(crate) fn fjp_common_pool_get() -> Option<ObjectRef> {
+    match FJP_COMMON_POOL.load(std::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        addr => Some(unsafe { ObjectRef::from_raw(addr as *mut u8) }),
+    }
+}
+
+/// Publish the common pool carrier. Idempotent by construction -- the only
+/// caller mints one when `fjp_common_pool_get` answered `None`.
+pub(crate) fn fjp_common_pool_set(o: ObjectRef) {
+    FJP_COMMON_POOL.store(o.as_ptr() as usize, std::sync::atomic::Ordering::Release);
+}
+
+/// Is this the common pool? `ForkJoinPool.commonPool().shutdown()` is
+/// specified as a NO-OP, so every refusal keyed on shutdown state has to let
+/// the common pool through -- otherwise one stray `shutdown()` anywhere in a
+/// process takes out every later user of it.
+pub(crate) fn fjp_is_common_pool(o: ObjectRef) -> bool {
+    matches!(fjp_common_pool_get(), Some(p) if std::ptr::eq(p.as_ptr(), o.as_ptr()))
+}
+
 /// GC root scan hook for ForkJoinTask's native done/result side-table.
 ///
 /// The table owns both the task key and any cached Object result until the
@@ -8628,6 +8743,13 @@ fn fjp_remap_value_ref(value: &mut Value, pointer_map: &cratonvm_types::PointerM
 /// young GC can reclaim the task, reuse its address for a different task, and
 /// the new task inherits the old cached result.
 pub fn gc_scan_forkjoin_roots(out: &mut Vec<ObjectRef>) {
+    // The cached common pool is reachable ONLY from `FJP_COMMON_POOL` between
+    // two `commonPool()` calls, so without this push a young collection
+    // reclaims it and the next call hands back a dangling reference -- the
+    // exact failure the side table's key push above this one exists to stop.
+    if let Some(p) = fjp_common_pool_get() {
+        out.push(p);
+    }
     let m = fjp_state().lock();
     for (&key, entry) in m.iter() {
         if key != 0 {
@@ -8653,6 +8775,11 @@ pub fn gc_scan_forkjoin_roots(out: &mut Vec<ObjectRef>) {
 pub fn gc_update_forkjoin_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
+    }
+    if let Some(p) = fjp_common_pool_get() {
+        if let Some(&moved) = pointer_map.get(&(p.as_ptr() as usize)) {
+            FJP_COMMON_POOL.store(moved, std::sync::atomic::Ordering::Release);
+        }
     }
     let mut m = fjp_state().lock();
     let mut remapped = rustc_hash::FxHashMap::default();
@@ -9663,9 +9790,18 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             }
             // `ForkJoinPool.invoke(task)` DOES rethrow the task's exception —
             // unlike submit/execute, it is a "run it and give me the answer"
-            // call with nowhere else to report a failure.
+            // call with nowhere else to report a failure. Same COPY as the
+            // real-JDK twin in `register_real_jdk_forkjoin_essentials`: two
+            // registrations of one method that disagree about what they raise
+            // is the drifted-twin shape this campaign keeps finding.
             let (_task, outcome) = fjp_compute_and_complete(ctx, task);
-            Ok(Some(outcome?))
+            match outcome {
+                Ok(v) => Ok(Some(v)),
+                Err(MethodCallFailed::ExceptionThrown(ex)) => {
+                    Err(fjp_pool_invoke_exception(ctx, ex))
+                }
+                Err(internal) => Err(internal),
+            }
         },
     );
     // submit(ForkJoinTask) — eagerly compute inline
@@ -9964,6 +10100,106 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
 /// `register_t12_unsafe_natives`. The hot-path fork/join/invoke is what
 /// loops infinitely without an override (Unsafe CAS on `status` retries
 /// forever in real-JDK mode), so just those are overridden here.
+/// The two guards every `ForkJoinPool` submission runs before it does
+/// anything, neither of which any of the six submission natives had.
+///
+/// MEASURED against HotSpot 25.0.4+7, both modes, nine rows
+/// (`probes/ForkJoinShadowSweep.java`):
+///
+/// ```text
+///   pool.submit((Callable) null)   HotSpot NullPointerException          CratonVM no-throw
+///   pool.execute((Runnable) null)  HotSpot NullPointerException          CratonVM no-throw
+///   pool.invoke(null)              HotSpot NullPointerException          CratonVM no-throw
+///   pool.shutdown(); pool.submit(..)
+///                                  HotSpot RejectedExecutionException    CratonVM no-throw
+/// ```
+///
+/// The second is the one that matters. These natives run the task INLINE on
+/// the calling thread, so "the pool is shut down" had no path to the code that
+/// decides whether to run it — a caller that had shut its pool down and was
+/// draining it still had new work executed, silently, on its own thread.
+///
+/// The shutdown state is read by INVOKING the real `isShutdown()` rather than
+/// by consulting the side table: `ForkJoinPool.shutdown()` is not registered on
+/// the real-JDK path (confirmed against `--dump-native-registry`), so real
+/// bytecode owns `runState` and the side table never learns about it. That is
+/// also why this cannot recurse — there is no native on `isShutdown` to come
+/// back here. Anything other than a definite `true` is treated as "not shut
+/// down", so a pool this VM cannot interrogate keeps the old behaviour rather
+/// than refusing work it would have run.
+///
+/// `commonPool()` is exempt and must be: `ForkJoinPool.commonPool().shutdown()`
+/// is specified as a NO-OP, so the common pool can never be in this state, and
+/// a stray `shutdown()` on it must not take out every later user of it.
+/// `ForkJoinTask.getThrowableException()` — the same-class COPY a POOL hands
+/// back for a task that failed, with the original as its cause.
+///
+/// The JDK does this so a caller on another thread gets a stack trace that
+/// reaches its own frame; the copy's message is `ex.toString()`, which is what
+/// `Throwable(Throwable cause)` sets. MEASURED against HotSpot 25.0.4+7,
+/// EIGHT runs, and the three shapes do NOT agree with each other:
+///
+/// ```text
+///   pool.invoke(throwing task)         cause present   8/8   <- deterministic
+///   task.invoke()                      no cause        8/8   <- deterministic
+///   ForkJoinTask.invokeAll(t1, t2)     cause present   3/8   <- NOT deterministic
+/// ```
+///
+/// So this is applied HERE and nowhere else. `ForkJoinTask.invoke()` must NOT
+/// copy — HotSpot hands back the task's own throwable there, and this VM
+/// already matched. `invokeAll` is a coin HotSpot flips (whether the failing
+/// task ran on a worker or was helped inline decides it), so its probe row
+/// asserts the exception TYPE and nothing else; pinning either face of that
+/// would be a probe reporting the host's load.
+///
+/// A class with no `(Throwable)` constructor, or a constructor that throws,
+/// falls back to the original exception — reporting the failure with a
+/// slightly poorer trace beats reporting a different failure.
+fn fjp_pool_invoke_exception(ctx: &mut dyn NativeContext, ex: ObjectRef) -> MethodCallFailed {
+    let ex_pin = ctx.pin_native_root(ex);
+    let live = ctx.read_native_pin(ex_pin, ex);
+    let class_name = ctx.class_name_arc_of_id(ctx.class_id_of_object(live));
+    let built = match class_name {
+        Some(name) => ctx.new_object_initialized(
+            &name,
+            "(Ljava/lang/Throwable;)V",
+            &[Value::Object(Some(live))],
+        ),
+        None => Ok(None),
+    };
+    let live = ctx.read_native_pin(ex_pin, live);
+    ctx.unpin_native_roots(ex_pin);
+    match built {
+        Ok(Some(Value::Object(Some(copy)))) => MethodCallFailed::ExceptionThrown(copy),
+        _ => MethodCallFailed::ExceptionThrown(live),
+    }
+}
+
+pub(crate) fn fjp_reject_submission(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    task_index: usize,
+) -> Result<(), MethodCallFailed> {
+    if matches!(args.get(task_index), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    if let Some(Value::Object(Some(pool))) = args.first().copied() {
+        if fjp_is_common_pool(pool) {
+            return Ok(());
+        }
+        if matches!(
+            ctx.invoke_virtual(pool, "isShutdown", "()Z", &[]),
+            Ok(Some(Value::Int(v))) if v != 0
+        ) {
+            return Err(RuntimeError::RejectedExecutionException {
+                message: String::new(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -9974,6 +10210,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "invoke",
         "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;",
         |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
             let task = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Object(None))),
@@ -9983,10 +10220,26 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), cached = ?cached, "pool.invoke done");
                 return Ok(Some(cached));
             }
-            // `ForkJoinPool.invoke(task)` DOES rethrow the task's exception.
-            let (task, outcome) = fjp_compute_and_complete(ctx, task);
-            tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), ok = outcome.is_ok(), "pool.invoke result");
-            Ok(Some(outcome?))
+            // The body runs INSIDE this pool, so it is bracketed by the pool
+            // frame `inForkJoinPool()`/`getPool()` read. The closure is what
+            // gives the frame exactly one exit path, `?` included.
+            let frame = fjp_pool_frame_enter(ctx, args);
+            let out = (|| -> MethodCallResult {
+                // `ForkJoinPool.invoke(task)` DOES rethrow the task's
+                // exception, as a same-class copy — see
+                // `fjp_pool_invoke_exception`.
+                let (task, outcome) = fjp_compute_and_complete(ctx, task);
+                tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), ok = outcome.is_ok(), "pool.invoke result");
+                match outcome {
+                    Ok(v) => Ok(Some(v)),
+                    Err(MethodCallFailed::ExceptionThrown(ex)) => {
+                        Err(fjp_pool_invoke_exception(ctx, ex))
+                    }
+                    Err(internal) => Err(internal),
+                }
+            })();
+            fjp_pool_frame_leave(ctx, frame);
+            out
         },
     );
 
@@ -10002,13 +10255,17 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             submit_name,
             "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
             |ctx, args| {
+                fjp_reject_submission(ctx, args, 1)?;
                 let mut task = match args.get(1).copied() {
                     Some(Value::Object(Some(r))) => r,
                     _ => return Ok(args.get(1).copied()),
                 };
                 let (done, _) = fjp_state_get(task);
                 if !done {
-                    task = fjp_compute_for_submit(ctx, task)?;
+                    let frame = fjp_pool_frame_enter(ctx, args);
+                    let out = (|| fjp_compute_for_submit(ctx, task))();
+                    fjp_pool_frame_leave(ctx, frame);
+                    task = out?;
                 }
                 Ok(Some(Value::Object(Some(task))))
             },
@@ -10030,6 +10287,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "submit",
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/ForkJoinTask;",
         |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
             let callable = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Object(None))),
@@ -10039,8 +10297,10 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             // throwing `call()` (`_ => Value::Object(None)`) and marked the
             // task done with a null result, so `Future.get()` reported
             // success for a callable that had blown up.
-            let task = fjp_run_callable_as_task(ctx, callable)?;
-            Ok(Some(Value::Object(Some(task))))
+            let frame = fjp_pool_frame_enter(ctx, args);
+            let out = (|| fjp_run_callable_as_task(ctx, callable))();
+            fjp_pool_frame_leave(ctx, frame);
+            Ok(Some(Value::Object(Some(out?))))
         },
     );
     r.register(
@@ -10048,12 +10308,15 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "submit",
         "(Ljava/lang/Runnable;)Ljava/util/concurrent/ForkJoinTask;",
         |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
             let runnable = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let task = fjp_run_runnable_as_task(ctx, runnable, Value::Object(None))?;
-            Ok(Some(Value::Object(Some(task))))
+            let frame = fjp_pool_frame_enter(ctx, args);
+            let out = (|| fjp_run_runnable_as_task(ctx, runnable, Value::Object(None)))();
+            fjp_pool_frame_leave(ctx, frame);
+            Ok(Some(Value::Object(Some(out?))))
         },
     );
     r.register(
@@ -10061,13 +10324,16 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "submit",
         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
         |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
             let runnable = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(args.get(2).copied()),
             };
             let fixed_result = args.get(2).copied().unwrap_or(Value::Object(None));
-            let task = fjp_run_runnable_as_task(ctx, runnable, fixed_result)?;
-            Ok(Some(Value::Object(Some(task))))
+            let frame = fjp_pool_frame_enter(ctx, args);
+            let out = (|| fjp_run_runnable_as_task(ctx, runnable, fixed_result))();
+            fjp_pool_frame_leave(ctx, frame);
+            Ok(Some(Value::Object(Some(out?))))
         },
     );
     // ForkJoinPool.invokeAll(Collection) / invokeAll(Collection, long, TimeUnit)
@@ -10211,6 +10477,34 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)Z",
         crate::native_forkjoin_await_quiescence,
     );
+
+    // `ForkJoinTask.inForkJoinPool()` / `getPool()`. Both are STATIC and both
+    // were unregistered, so real bytecode answered them from
+    // `Thread.currentThread() instanceof ForkJoinWorkerThread` — which is
+    // false on this VM even inside `pool.invoke`, because the pool runs its
+    // tasks inline on the submitting thread. See `FJP_POOL_STACK` for the
+    // measurement and for why the pair matters.
+    //
+    // Registered on all three task classes for the same
+    // belt-and-braces reason `register_forkjointask_w6_9_residual_bridge`
+    // gives: both are `public static` on `ForkJoinTask`, so real-JDK
+    // resolution always lands there, but synthetic-mode lookup is per class
+    // name.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register(task_class, "inForkJoinPool", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(fjp_in_pool()))))
+        });
+        r.register(
+            task_class,
+            "getPool",
+            "()Ljava/util/concurrent/ForkJoinPool;",
+            |ctx, _args| Ok(Some(Value::Object(fjp_current_pool(&*ctx)))),
+        );
+    }
 
     // ForkJoinTask.fork / join / invoke / get / isDone / isCompletedNormally /
     // isCancelled / cancel / complete — all routed through the side-table.

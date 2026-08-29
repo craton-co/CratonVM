@@ -4,7 +4,7 @@
 **Date** 2026-08-20
 **Lane** H5 (`--jdk-only` completion, wave H)
 **Subject** `native-io/src/**`, the P1 *NIO, files, networking* row of
-[`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md)
+[`docs/jdk-only-runtime-services.md`](runtime-services-blocker-inventory.md)
 **Instrument** `javap -p -s` against JDK 25.0.3+9, plus a static parse of every
 `register*` call site in `native-io/src` (method in §7)
 **Oracle** `C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot` — **not** the

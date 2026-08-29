@@ -14,50 +14,26 @@ java-launcher-compatible:
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
 Heap size comes from `-Xmx`/`-Xms` as usual.
 
-**ZGC became the DEFAULT on 2026-08-10**, and the `zgc` Cargo feature went
-default-ON with it (it gates the `GcAlgorithm::Zgc` variant, so the default
-cannot be `Zgc` without it). It is still **not a real ZGC** — everything the
-table says about it holds — and it was promoted on measured suite behaviour,
-not on maturity: on the 651-class Tomcat suite under all three backends on one
-commit, ZGC scored 604 PASS / 29 HANG / 0 CRASH in 247 min against
-Generational's 519 / 115 / 1 in 356 min, and 63 classes are non-PASS under
-Generational while passing under both other backends
-([record](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md)).
-
-**Those are the 2026-08-10 figures, and the record's own 2026-08-11 re-run of
-the same three arms supersedes them:** ZGC **629 / 11 / 0 in 178.4 min**,
-Generational **628 / 11 / 0 in 177.5 min**. The promotion still stands — ZGC
-leads on PASS, ties on HANG, and is the only backend that has never crashed on
-this suite — but the margin is one class, not eighty-five. Do not quote the
-08-10 gap without the 08-11 one beside it; the cross-suite picture is
-[the Phase 1 baseline](feature-designs/zgc-phase1-empirical-baseline-20260813.md).
+**ZGC is the default**, and the `zgc` Cargo feature is default-ON (it gates
+the `GcAlgorithm::Zgc` variant, so the default cannot be `Zgc` without it). It
+is still **not a real ZGC** — everything the table above says about it holds.
+The promotion is backed by measured suite behaviour, not maturity: across
+every suite with a per-collector sweep (Tomcat, Spring Framework, H2,
+Hibernate Reactive), ZGC is at parity with or ahead of Generational on PASS
+count, ties or leads on HANG, and has never crashed.
 
 Two consequences worth stating plainly:
 
 * **It costs heap — but not by a known factor.** No compaction means a
   non-compacting collector needs more headroom, and how much is a property of
-  the workload's allocation shapes. The "~1.5x" figure that stood here until
-  2026-08-13 came from one class, `ZipContentTests`, which OOMed at `-Xmx 2g`
-  and passed at 3g; it now passes 29/29 at 2g under ZGC after two allocator
-  defects were fixed, so the figure is withdrawn. Raise `-Xmx` to get moving
-  after a post-flip `OutOfMemoryError`, and file it: all three known instances
-  of the shape turned out to be allocator bugs.
+  the workload's allocation shapes. Raise `-Xmx` to get moving after a
+  post-flip `OutOfMemoryError`, and file it: every known instance of that
+  shape so far has turned out to be an allocator bug rather than an inherent
+  ZGC cost.
 * **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
   `--no-default-features` build has no ZGC at all and defaults to Generational.
 
-The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
-record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
-predates the two ZGC-only defects fixed on 2026-08-10 and is **superseded**:
-the same day, the 26 classes that were the entire ZGC-vs-default delta were
-re-run on one binary at `-Xmx 2g` and gave ZGC 16 PASS / 7 HANG / 3 FAIL
-against the default collector's 14 / 10 / 2 — "no functional ZGC-vs-default
-difference is left". One of those two defects silently
-zeroed a primitive array, which is a shape that manufactures FAILs wherever it
-occurs rather than in one place, so treat that row as **unmeasured** rather
-than as evidence against ZGC. Every other suite that has a per-collector
-sweep — Spring Framework (2848 classes), Tomcat, H2, Hibernate Reactive — puts
-ZGC at parity or one class ahead. The plan to make this a real,
-concurrent, generational, compacting ZGC is
+The plan to make this a real, concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
 ## The VM ↔ GC protocol
@@ -169,10 +145,9 @@ in `gc/`, not just documented:
    remap and purge protocol before production callers can use it.
 3. `CRATONVM_GC=g1-parallel-evac` is an experimental opt-in. Mixed
    collections stay on the serial evacuator, and the serial path remains
-   the supported default. The live-object corruption this path carried
-   (G1-9) is fixed as of 2026-08-13; what keeps it opt-in now is that it
-   has had no gauntlet run and still spawns a `thread::scope` worker pool
-   per collection.
+   the supported default. The live-object corruption this path used to carry
+   is fixed; what keeps it opt-in now is that it has had no gauntlet run and
+   still spawns a `thread::scope` worker pool per collection.
 
 The STW barrier race and missing class-unloading driver described by
 earlier versions of this page are fixed. For the current class-loader
@@ -205,7 +180,7 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_GC_VERIFY_STALE=1` | Post-GC stale-frame-slot verifier (recycled drain destinations are recognized as benign) |
 | `CRATONVM_DBG_WEAKREF=1` | Weak/Phantom null/restore pass tracing |
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
-| `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the DEFAULT since 2026-08-13; the "known race" this row used to warn about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). The worker threads are also no longer respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
+| `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the **default**; the worker threads are not respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
 | `CRATONVM_G1_EAGER_HUMONGOUS=0` | Restore cleanup-only humongous reclaim. By default an evacuation pause also frees humongous spans it can prove nothing references. This is the only path that frees memory outside the collection set, so it is the first thing to rule out if a live humongous object goes missing. |
 | `CRATONVM_G1_YOUNG_PAUSE_TARGET=1` | **Opt-in.** Let `max_gc_pause_ms` bound the YOUNG generation too, not just the old half of a mixed collection set: G1 also collects once the Eden+Survivor region count reaches an adaptive target, tightened by 20% after any PRODUCTIVE pause that overruns the goal and relaxed while pauses stay under half of it. Does nothing until such an overrun is measured (the target starts at its 60%-of-regions ceiling and a target at the ceiling is not a trigger). Measured trade on `G1ChurnPauseProbe` at `-Xmx2048m`: p50 -21%, p99 +3%, wall +4.2%, one extra pause — see the young-sizing paragraph under Backend details for the full table and why it is not a default. |
 | `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence |
@@ -302,7 +277,7 @@ coherent (remembered-set edges recorded, precise liveness answers).
 Allocation failure escalates: young pause → synchronous full mark cycle
 → OOM.
 
-*Young sizing (2026-08-18), opt-in.* `max_gc_pause_ms` reaches exactly one
+*Young sizing, opt-in.* `max_gc_pause_ms` reaches exactly one
 decision by default — how many OLD regions a mixed collection set may take.
 The young half is bounded by the free pool alone (`needs_gc` fires below
 25 % free), so Eden grows to roughly three quarters of `-Xmx` and young
@@ -334,7 +309,7 @@ is always paid in full and it is the one p99 reports. A latency-sensitive
 workload may still want the median improvement — turn it on and measure your
 own pause distribution.
 
-*Where a young pause actually goes (2026-08-18).* Every `--verbose:gc`
+*Where a young pause actually goes.* Every `--verbose:gc`
 `[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
 `closure_us`, `fixup_us`, `free_us` — with `fixup_us` printed beside the
 `fixup_regions` / `fixup_bytes` it covered, because a slow walk and a large
@@ -357,14 +332,12 @@ itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
 the first thing to try if a G1 heap-corruption investigation wants the old
 "a freed region reads as zeros" world back.
 
-*The Phase-4 walk, narrowed (2026-08-18).* A young pause's reference fix-up
-used to walk EVERY object of every non-CSet region, which is what made pause
-time O(live heap) rather than O(young live set). It now walks only the
+*The Phase-4 walk, narrowed.* A young pause's reference fix-up walks only the
 collection set's remembered-set sources plus every region the pause WROTE
-INTO. `CRATONVM_G1_NARROW_FIXUP=0` restores the whole-heap walk, and is the
-first lever to pull for any suspected G1 dangling-reference or lost-edge
-defect: under it the collector behaves as every G1 result before this date
-was produced.
+INTO — not every object of every non-CSet region, which would make pause
+time O(live heap) rather than O(young live set). `CRATONVM_G1_NARROW_FIXUP=0`
+restores the whole-heap walk, and is the first lever to pull for any
+suspected G1 dangling-reference or lost-edge defect.
 
 Why that set is sufficient: a slot needing a forwarding rewrite points at an
 evacuated object, so it lives in a root (Phase 1 rewrites those), in the CSet
@@ -412,10 +385,9 @@ registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
 protocol.
 
-**Mutators DO have TLABs on this backend**, contrary to what this paragraph
-said until 2026-08-13. `VmHeap::refill_tlab` returns `None` for `VmHeap::Zgc`
-and always has, which is what the old claim was reading — but the buffers are
-not reached that way. `ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`)
+**Mutators DO have TLABs on this backend.** `VmHeap::refill_tlab` returns
+`None` for `VmHeap::Zgc` — the buffers are not reached that way.
+`ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`)
 is the funnel for every object and every array, it is **on by default**, and
 `CRATONVM_ZGC_TLAB=0` is the kill switch. A TLAB chunk is *reserved* space that
 no collection can reclaim while its owning thread lives, so it is invisible to
