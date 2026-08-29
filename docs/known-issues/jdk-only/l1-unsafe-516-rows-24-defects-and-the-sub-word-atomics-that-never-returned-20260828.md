@@ -734,3 +734,111 @@ Re-adding the probe sources was **not** the resolution taken here. The removal
 is a deliberate release decision by the repo owner, and a merge that quietly
 resurrects three files of a directory somebody just retired is the wrong kind
 of conflict resolution.
+
+---
+
+## 11. The seven retired, and the manifest row that could not be wrong — 2026-08-29
+
+§9.1 left seven registrations as "an adjudicated list, not retired". They are
+retired now, and so is the `deprecated_verify.rs` row §9.1 flagged.
+
+```text
+jdk/internal/misc/Unsafe  defineAnonymousClass  (Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;   x2 registrars
+jdk/internal/misc/Unsafe  getReferencePlain     (Ljava/lang/Object;J)Ljava/lang/Object;
+jdk/internal/misc/Unsafe  putReferencePlain     (Ljava/lang/Object;JLjava/lang/Object;)V
+jdk/internal/misc/Unsafe  monitorEnter          (Ljava/lang/Object;)V
+jdk/internal/misc/Unsafe  monitorExit           (Ljava/lang/Object;)V
+jdk/internal/misc/Unsafe  park                  (Ljava/lang/Object;J)V
+sun/misc/Unsafe           defineClass           (Ljava/lang/String;[BIILjava/lang/ClassLoader;...)
+```
+
+### 11.1 The evidence, in the order this campaign requires it
+
+1. **Absent from every supported image** — JDK 17.0.20.1+1, 21.0.12+8 and
+   25.0.4+7, per §9.1's census of all 212 triples. Not read off one image:
+   three OTHER rows of that same census went the other way.
+2. **Absent from the fourth image too.** The synthetic-JDK mode fabricates
+   these classes through `synthetic_stub_ctor_methods`, a fixed per-class list
+   that gives `Unsafe` only `<clinit>`. There is no on-demand method
+   fabrication — `fabricate_class` mints classes for a constant-pool reference,
+   never methods — so nothing can name these there either.
+3. **No `javac` at any supported release can emit a call to them**, because the
+   class does not declare them. The only caller shape left is bytecode compiled
+   against JDK 8, which this VM does not support.
+4. **0 invocations across 118 corpus vectors, in BOTH modes**, with live
+   controls in the same runs: `objectFieldOffset1` 964/1044 in all 118 vectors,
+   `compareAndSetInt` ~35k, `arrayIndexScale` 166/182 in all 118 — and the
+   tightest control available, **`park(ZJ)V` at 781 invocations in 16 vectors
+   while the `park(Ljava/lang/Object;J)V` retired here is 0**. Two rows
+   differing only by descriptor, one live and one dead.
+5. **Registrar history**: every one traces to the initial open-source commit.
+   No diagnosed defect is behind any of them.
+
+The handler functions are left in place — the crate allows `dead_code` — so a
+future image that declares one can be served by re-registering a line rather
+than by rediscovering a body. `native_unsafe_park_with_blocker` is retained for
+a second reason: a unit test calls it directly.
+
+**One premise died on the way.** `defineAnonymousClass`'s registration was
+justified in-source as *"JDK 8 surface, ByteBuddy still emits"*. Even if
+ByteBuddy does emit it, no supported image declares the method, so the call
+fails resolution against the real class whatever is registered here. A guard
+scoped by a stated premise is only as good as the premise.
+
+### 11.2 The manifest row that nothing could falsify
+
+`deprecated_verify.rs` tagged `sun/misc/Unsafe.defineClass` as
+`ImageStatus::Declared` — whose own doc reads *"At least one supported image
+declares the triple … and MUST stay"*. The census says ABSENT on all three.
+
+**The tag could not be wrong in any way the test could detect.** For a
+`Declared` row the test asserts only that the REGISTRATION is present; it never
+checks the claim the tag makes about the images. The
+`AbsentFromAllSupportedImages` half IS enforced — it asserts the registration is
+gone. So one direction of this manifest was a live assertion and the other was
+decoration.
+
+Retagged, which turns the row into a live assertion and makes the removal the
+manifest's own instruction rather than a judgement of mine.
+
+### 11.3 What the retirement moved, and the three tests that had to move with it
+
+A retirement is never only a deletion here. Four other places recorded the old
+shape, and each is a gate that would otherwise have gone red on `dev` for
+somebody else:
+
+* `registrar_drift.rs` — `defineAnonymousClass` was a recorded DRIFT pair (two
+  registrars, two bodies). It no longer drifts, but **not** for the usual
+  reason: both bodies are gone, so the triple is registered nowhere.
+  Deliberately NOT moved to `FIXED_NOT_DRIFTING`, which asserts a surviving
+  body serves the triple in both modes — there is no surviving body. The row is
+  deleted and `BASELINE_TOTAL_DRIFT` / `BASELINE_TOTAL_PAIRS` move 1225→1224
+  and 1358→1357.
+* `registrar_reachability.rs` — a companion gate cross-checks the drift
+  baseline against a per-family exposure count and said
+  *"recorded 2, measured 1"*. Its own message names the condition under which
+  updating the number is the whole fix: the drift baseline moved in the same
+  commit. 2→1.
+* `deprecated_internal.rs` — two unit tests asserted
+  `sun/misc/Unsafe.defineClass` *"should be registered"*. Their subject is the
+  CAFEBABE validation, not the spelling, and the `jdk.internal.misc` spelling —
+  declared on all three images and still registered — runs the same body, so
+  the coverage was **retargeted rather than deleted**. `H11-3` recorded the
+  opposite outcome, a unit test that blocked a retirement outright; this is the
+  case where it does not have to.
+
+All five gate sets and all three suite arms are green afterwards
+(113/113, 113/113, 73/73).
+
+### 11.4 Method note: a failed write truncated a 2310-line source file
+
+`io.open(path, "w", ...)` **truncates the target before it validates its other
+arguments**. A patch script passed a malformed `newline=` value; the
+`ValueError` fired *after* the file was emptied, and
+`native-builtins/src/deprecated_internal.rs` went to zero bytes. It looked like
+a grep failure first — text I had read minutes earlier was suddenly not there.
+
+Recovered with `git checkout --` and redone through a temp file plus
+`os.replace`. Every patch script here now writes that way. This is the second
+time in this session that an `open(..., "w")` destroyed its target before
+failing; the first cost a probe source.
