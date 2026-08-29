@@ -39,6 +39,7 @@ it, or extend the feature, read on.
 | [`async-completion-reaper.md`](async-completion-reaper.md) | Callback-driven finalization and the completion reaper. |
 | [`launch-work-sizing.md`](launch-work-sizing.md) | Runtime-sized grids for counted-loop kernels. |
 | [`occupancy-launch-config.md`](occupancy-launch-config.md) | Occupancy-selected CUDA block configuration. |
+| [`graph-capture.md`](graph-capture.md) | Recording a launch sequence as a CUDA graph and replaying it as one submission; what capture refuses, and why. |
 | [`lowering-constants.md`](lowering-constants.md) | Numeric `ldc`/`ldc_w`/`ldc2_w` lowering. |
 | [`lowering-fp-remainder.md`](lowering-fp-remainder.md) | Opt-in floating-point remainder lowering. |
 | [`lowering-comparisons.md`](lowering-comparisons.md) | Bit-exact Java comparison opcodes. |

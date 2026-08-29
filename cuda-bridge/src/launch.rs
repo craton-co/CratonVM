@@ -138,14 +138,25 @@ impl DeviceModule {
         // a second, hidden launch on `ctx.compute` to mirror the wait
         // onto. (The previous code launched on `ctx.compute` and had to
         // duplicate every wait there.)
-        for slot in &last_write_slots {
-            let maybe_ev = slot
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-                .cloned();
-            if let Some(ev) = maybe_ev {
-                stream.wait_event(&ev)?;
+        //
+        // Skipped entirely while `stream` is capturing. Inside a
+        // capture the ordering these waits provide is already there:
+        // the driver derives a linear dependency chain from submission
+        // order on a single stream, so node N+1 already depends on
+        // node N. The waits would meanwhile be `cuStreamWaitEvent` on
+        // events recorded OUTSIDE the capture, which is exactly the
+        // class of call that invalidates one.
+        let capturing = stream.is_capturing();
+        if !capturing {
+            for slot in &last_write_slots {
+                let maybe_ev = slot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .cloned();
+                if let Some(ev) = maybe_ev {
+                    stream.wait_event(&ev)?;
+                }
             }
         }
 
@@ -153,7 +164,19 @@ impl DeviceModule {
         // Allocate the completion event before submitting the kernel.
         // If event creation fails, no kernel has been queued and the
         // buffer ordering slots still describe the pre-launch state.
-        let kernel_done = Arc::new(Event::new(ctx)?);
+        //
+        // No event at all while capturing: `cuEventRecord` on a
+        // capturing stream records a node in the graph rather than a
+        // host-observable event, so the handle it produces cannot be
+        // waited on from another stream -- a later `to_host` would fail
+        // with `CUDA_ERROR_INVALID_VALUE` rather than reading the
+        // buffer. Nothing needs it: the graph orders its own nodes, and
+        // a caller waits on the replay's completion event instead.
+        let kernel_done = if capturing {
+            None
+        } else {
+            Some(Arc::new(Event::new(ctx)?))
+        };
 
         #[cfg(not(feature = "cuda"))]
         {
@@ -218,6 +241,20 @@ impl DeviceModule {
         // in stub mode, so the same call serves both backends; a
         // subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
         // correctly gates that stream behind this kernel.
+        let Some(kernel_done) = kernel_done else {
+            // Capturing. Clear the slots rather than leaving them:
+            // whatever event they held describes a write that happened
+            // before this graph, and a later download that waited on it
+            // would be released before the REPLAY's write, reading
+            // through a correctly-ordered wait on the wrong thing. With
+            // the slot empty, the caller's wait on the replay
+            // submission is the only ordering, which is what it should
+            // be.
+            for slot in &last_write_slots {
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+            return Ok(());
+        };
         if let Err(err) = stream.record_event(&kernel_done) {
             return recover_after_completion_event_failure(stream, &last_write_slots, err);
         }
