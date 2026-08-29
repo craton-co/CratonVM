@@ -316,22 +316,49 @@ public class RSslEndpointIdentification {
             ByteBuffer netIn = ByteBuffer.allocate(BUF);
             ByteBuffer appIn = ByteBuffer.allocate(BUF);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
-            String reply = "";
-            while (!reply.contains("server-ok") && System.nanoTime() < deadline) {
-                int n = ch.read(netIn);
-                if (n < 0) {
+            StringBuilder reply = new StringBuilder();
+            boolean eof = false;
+            while (reply.indexOf("server-ok") < 0 && System.nanoTime() < deadline) {
+                // DRAIN what is already buffered before asking the channel for more, and
+                // drain it again after EOF. One read can carry several TLS records: under
+                // load the server's NewSessionTicket, its "server-ok" reply and its
+                // close_notify arrive in a single read, and one unwrap() consumes only the
+                // first of them. Unwrapping once per read and `break`ing on EOF discarded
+                // the rest -- MEASURED, 2 failures in 8 runs on a loaded host: "read=350,
+                // unwrap consumed=222 produced=0, 128 left in netIn, read=-1, break", and
+                // the 128 bytes that were dropped were the reply this check asserts on.
+                // It failed on the HOTSPOT side, so the suite reported the vector as a
+                // cross-VM difference (guard G4) with CratonVM passing all four checks.
+                boolean progressed = true;
+                while (progressed) {
+                    netIn.flip();
+                    SSLEngineResult r = engine.unwrap(netIn, appIn);
+                    netIn.compact();
+                    if (r.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_TASK) {
+                        Runnable task;
+                        while ((task = engine.getDelegatedTask()) != null) {
+                            task.run();
+                        }
+                    }
+                    appIn.flip();
+                    byte[] got = new byte[appIn.remaining()];
+                    appIn.get(got);
+                    appIn.clear();
+                    reply.append(new String(got, java.nio.charset.StandardCharsets.UTF_8));
+                    // A record short of its length, or a closed engine, means the buffer
+                    // holds nothing more this loop can turn into application data.
+                    progressed = (r.bytesConsumed() > 0 || r.bytesProduced() > 0)
+                            && r.getStatus() != SSLEngineResult.Status.BUFFER_UNDERFLOW
+                            && r.getStatus() != SSLEngineResult.Status.CLOSED;
+                }
+                if (reply.indexOf("server-ok") >= 0 || eof) {
                     break;
                 }
-                netIn.flip();
-                engine.unwrap(netIn, appIn);
-                netIn.compact();
-                appIn.flip();
-                byte[] got = new byte[appIn.remaining()];
-                appIn.get(got);
-                appIn.clear();
-                reply += new String(got, java.nio.charset.StandardCharsets.UTF_8);
+                if (ch.read(netIn) < 0) {
+                    eof = true; // one more drain of what arrived with the close, then stop
+                }
             }
-            check(reply.contains("server-ok"),
+            check(reply.indexOf("server-ok") >= 0,
                     "application data must actually flow once the handshake succeeds; got: ["
                             + reply + "]");
         }
