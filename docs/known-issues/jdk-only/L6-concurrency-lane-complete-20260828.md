@@ -477,20 +477,35 @@ campaign keeps finding: **the middles are correct and the perimeters were not.**
   `CompletionHandler` forms with their attachments, `force`, `truncate`,
   `lock`/`tryLock`, EOF, and every other argument refusal.
 
-## 8. The three arms, and the two reds that are NOT this lane's
+## 8. The three arms
 
-Run on the merged tree, release binary. **The attribution is measured, not
-argued**: pristine `origin/dev` (`d17feaad2`) was built in its own worktree and
-target dir and the same three vectors run against it.
+Final run, on the fully merged tree, release binary:
 
-| vector | pristine `origin/dev` | this branch |
+| arm | result |
+| --- | --- |
+| `CRATONVM_ARGS=--jdk-only` | **111 passed, 1 failed** — `RJdkEnumerations` |
+| `SUITE=all` | **112 passed, 0 failed** |
+| `SUITE=core` | **72 passed, 0 failed** |
+
+That is cleaner than the baseline this lane started from
+(`the-roadmaps-phase-1-and-3-re-adjudicated-and-six-fixes-20260827` §6.5:
+111/1, 110/2, 72/0), and both of the reds it lost are recorded below.
+
+### The two reds that were not this lane's, and how that was established
+
+An earlier run of these arms was 109/3, 110/2 and 71/1, with `RExceptions` and
+`RJdkFailure` failing in every arm. **The attribution was measured rather than
+argued**: pristine `origin/dev` (`d17feaad2`) was checked out in its own
+worktree, built into its own target dir, and the same three vectors run against
+it.
+
+| vector | pristine `origin/dev` at `d17feaad2` | this branch, then |
 | --- | --- | --- |
 | `RExceptions` | FAIL both modes | FAIL both modes — unchanged |
 | `RJdkFailure` | FAIL both modes | FAIL both modes — unchanged |
 | `RJdkEnumerations` | FAIL both modes | **PASS compatible**, FAIL `--jdk-only` |
 
-**`RExceptions` and `RJdkFailure` are one defect, and it is not this lane's.**
-Both die on the same assertion:
+`RExceptions` and `RJdkFailure` were ONE defect and not this lane's:
 
 ```text
 Class.forName("[Lcom.cratonvm.absent.NoSuchClass20260812;")
@@ -498,8 +513,19 @@ Class.forName("[Lcom.cratonvm.absent.NoSuchClass20260812;")
   got: [Lcom.cratonvm.absent.NoSuchClass20260812;
 ```
 
-That is `java.lang.Class`'s surface — lane L5's family — and it fails
-identically on pristine dev, with none of this lane's changes present.
+**Lane L1 fixed it in `39e2ded07` while this lane was verifying**, and both
+vectors are green above. The 20-minute pristine-dev build is what made that a
+handoff rather than a hunt: without it the honest options were "chase a
+`java.lang.Class` defect in someone else's family" or "push and hope", and the
+`--jdk-only` arm would have looked two vectors worse than it was.
+
+**One more thing that build settled.** `origin/dev` at `8f9ae7a9c` did not
+COMPILE on a default (no `gpu-offload`) build — two `craton_gpu.rs` functions
+had lost their `#[cfg]` and named symbols that only exist under the feature, 16
+hard errors. Measured on the pristine worktree before assuming a merge artefact.
+L1 fixed it independently in `43088b840`; this branch's identical fix was
+resolved in its favour at the merge, because theirs also restores the doc
+comment that went missing with the attribute.
 
 **`RJdkEnumerations` improved and then hit a different wall.** On dev it fails in
 compatible mode with `ConcurrentHashMap.elements(): hasMoreElements() never
@@ -534,7 +560,9 @@ vector by quietly weakening another lane's blocker.
 Everything else is green: `cargo test -p cratonvm-types`; the seven
 native-builtins gate tests with and without `--features management`; `--lib` for
 `cratonvm-native-collections`, `cratonvm-native-builtins` and
-`cratonvm-native-api`.
+`cratonvm-native-api`; and all four probes 0-diff twice each in both modes on
+the same tree. `tools/check_markdown_links.py` reports the same six pre-existing
+issues it reports on pristine dev.
 
 ## 9. Reproduce
 
