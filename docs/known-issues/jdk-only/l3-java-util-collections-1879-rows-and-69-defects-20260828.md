@@ -446,7 +446,39 @@ find its resource. Filed against the locale-data surface, not L3's.
 
 See the companion page. 13 of `MethodRefDoorProbe`'s 25 rows.
 
-## 7. Reproduce
+## 7. The final verification, on the tree every lane landed into
+
+The numbers above were taken as the lane went. They were RE-TAKEN at the end, on
+the binary built from the merge of all seven lanes plus the release-day
+reorganisation, `cargo fmt` and the GPU work — a tree that differs from the one
+the fixes were written against by far more than this lane contributed. All
+twelve probes recompiled from source and re-run, both modes, one run:
+
+| probe | rows (HotSpot / compat / strict) | differing rows compat / strict |
+| --- | --- | --- |
+| `PropertiesShadowSweep` | 182 / 182 / 182 | 0 / 0 |
+| `TreeShadowSweep` | 232 / 232 / 232 | 2 / 2 |
+| `DequeListShadowSweep` | 172 / 172 / 172 | 1 / 1 |
+| `HashtableVectorShadowSweep` | 136 / 136 / 136 | 0 / 0 |
+| `ArrayListShadowSweep` | 164 / 164 / 164 | 0 / 0 |
+| `LinkedSequencedShadowSweep` | 102 / 102 / 102 | 1 / 1 |
+| `PqOptionalShadowSweep` | 125 / 125 / 125 | 2 / 2 |
+| `CollectionsShadowSweep` | 172 / 172 / 172 | 0 / 0 |
+| `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 1 / 1 |
+| `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 1 |
+| `UtilTailShadowSweep` | 146 / 146 / 146 | 0 / 0 |
+| `MethodRefDoorProbe` | 25 / 25 / 25 | 13 / 13 |
+
+Row counts equal and the trailing `DONE` present on all thirty-six runs, so no
+run is a truncated tail reading as clean. The eight differing rows are §6's
+eight and the thirteen are the companion record's thirteen — the same rows, not
+merely the same count. Nothing the other six lanes landed moved a row of this
+one, and nothing this lane landed moved after the merges.
+
+Gates on that tree: all six RC=0. Arms: 112/112 under `--jdk-only`, 112/112
+`SUITE=all`, 72/72 `SUITE=core`.
+
+## 8. Reproduce
 
 ```bash
 CV=target/release/cratonvm
