@@ -209,10 +209,80 @@ public final class DodArrayStoreSweep {
             System.arraycopy(new Object[] { new long[] { 7L } }, 0, new int[1][], 0, 1);
             return "NO-THROW";
         });
-        row("toArray(new String[0]) over Object[]{Integer}", () -> {
+        // The two toArray(T[]) routes throw from DIFFERENT places and so print
+        // DIFFERENT messages, which a single case could not have shown:
+        // ArrayList's goes through Arrays.copyOf / System.arraycopy and gets
+        // the arraycopy sentence; AbstractCollection's stores through `aastore`
+        // in its own loop and gets the bare class name.
+        row("ArrayList.toArray(new String[0]) copyOf route", () -> {
             List<Object> l = new ArrayList<>();
             l.add(1);
             return l.toArray(new String[0]).length + "";
+        });
+        row("ArrayList.toArray(new String[2]) arraycopy route", () -> {
+            List<Object> l = new ArrayList<>();
+            l.add(1);
+            return l.toArray(new String[2]).length + "";
+        });
+        row("HashSet.toArray(new String[0]) aastore route", () -> {
+            java.util.Set<Object> hs = new java.util.HashSet<>();
+            hs.add(1);
+            return hs.toArray(new String[0]).length + "";
+        });
+        row("LinkedList.toArray(new String[0]) aastore route", () -> {
+            List<Object> ll = new java.util.LinkedList<>();
+            ll.add(1);
+            return ll.toArray(new String[0]).length + "";
+        });
+        // The RESULT TYPE, which is a separate claim from the store check and
+        // the one a `List<Object>` receiver hides: `toArray(T[])` is statically
+        // `Object[]` there, so javac emits no `checkcast` and a wrong runtime
+        // type never surfaces. Printing the class asserts it directly.
+        row("ArrayList.toArray(new String[0]) legal + type", () -> {
+            List<Object> l = new ArrayList<>();
+            l.add("s");
+            Object[] r = l.toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("HashSet.toArray(new String[0]) legal + type", () -> {
+            java.util.Set<Object> hs = new java.util.HashSet<>();
+            hs.add("s");
+            Object[] r = hs.toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("LinkedList.toArray(new String[0]) legal + type", () -> {
+            List<Object> ll = new java.util.LinkedList<>();
+            ll.add("s");
+            Object[] r = ll.toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("TreeSet.toArray(new String[0]) legal + type", () -> {
+            java.util.Set<String> ts = new java.util.TreeSet<>();
+            ts.add("s");
+            Object[] r = ts.toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("ArrayDeque.toArray(new String[0]) legal + type", () -> {
+            java.util.Deque<String> dq = new java.util.ArrayDeque<>();
+            dq.add("s");
+            Object[] r = dq.toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("List.of(..).toArray(new String[0]) legal + type", () -> {
+            Object[] r = List.of("s").toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("HashMap.keySet().toArray(new String[0]) legal + type", () -> {
+            java.util.Map<String, String> m = new java.util.HashMap<>();
+            m.put("s", "v");
+            Object[] r = m.keySet().toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
+        });
+        row("HashMap.values().toArray(new String[0]) legal + type", () -> {
+            java.util.Map<String, String> m = new java.util.HashMap<>();
+            m.put("s", "v");
+            Object[] r = m.values().toArray(new String[0]);
+            return r.getClass().getName() + "/" + r[0];
         });
     }
 

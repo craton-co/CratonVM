@@ -389,6 +389,16 @@ unchanged, and it is `panama.rs`'s own piece of work.
 
 ## 8. Residuals — measured, and why each was not fixed here
 
+> **FOLLOWED UP 2026-08-29: three of these four reasons did not survive contact,
+> and two of the residuals are now closed.** R2 turned out to be a family of
+> THIRTY classes with a second, worse defect underneath it, and R3 was closed by
+> retiring the shadow rather than improving it. R1 is confirmed WILL-NOT-FIX
+> with the reason verified rather than repeated, and R4 is measured properly —
+> seven sites, not one — and left as a lane with a standing assertion.
+> `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`.
+> Read that page for the current status of each; what follows is what was known
+> on the 28th.
+
 Four, each measured, three of them mode-independent and none of them a
 `--jdk-only` blocker.
 

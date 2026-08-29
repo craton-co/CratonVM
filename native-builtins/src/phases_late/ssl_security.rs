@@ -4420,7 +4420,41 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(ssl_sock, "startHandshake", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A `tls_id` at or above `RUSTLS_SOCK_ID_BASE` is a connection whose
+        // handshake has already completed, which is the ONLY case where
+        // `startHandshake()` means "renegotiate". `ensure_layered_handshake_started`
+        // returns immediately for it, so the call succeeds, changes nothing and
+        // says nothing — and an application only calls it there to force fresh
+        // key material.
+        //
+        // rustls implements no TLS 1.2 renegotiation (its manual lists that as
+        // its mitigation for CVE-2009-3555 and 3SHAKE), so declining is right;
+        // firing `HandshakeCompletedEvent` anyway would tell the caller key
+        // material had been derived when none had. What is NOT right is doing
+        // it silently. Once per process, at `warn`: `debug!` is compiled out of
+        // shipping builds and would not be a signal at all.
+        //
+        // `TestSsl.testClientInitiatedRenegotiation[JSSE]` stays red on this
+        // VM and cannot be otherwise: `TesterSupport.isClientRenegotiationSupported`
+        // keys on Tomcat's `sslImplementationName` property alone and never
+        // asks the platform, so no truthful capability report can reach it.
+        // See known-issues/tomcat/ssl-renegotiation-emulation-limits.md.
+        let established = new13_resolve_tls_id(ctx, this) >= crate::servlet::RUSTLS_SOCK_ID_BASE;
         ensure_layered_handshake_started(ctx, this)?;
+        if established {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "tls",
+                    "SSLSocket.startHandshake() on an already-established connection did \
+                     nothing: this VM's TLS backend implements no TLS 1.2 renegotiation, so \
+                     no fresh key material was derived and no HandshakeCompletedEvent will \
+                     fire. The call is not an error and the connection stays usable. \
+                     Reported once per process."
+                );
+            }
+        }
         Ok(None)
     });
     // These two real JDK `SSLSocket` methods originally had no native

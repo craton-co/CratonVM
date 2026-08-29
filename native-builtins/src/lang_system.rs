@@ -759,32 +759,7 @@ fn external_class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String
 /// `java.lang.String[]`, `[I` -> `int[]`, `java/lang/String` ->
 /// `java.lang.String`.
 fn external_class_name(internal: &str) -> String {
-    let mut dims = 0usize;
-    let mut rest = internal;
-    while let Some(stripped) = rest.strip_prefix('[') {
-        dims += 1;
-        rest = stripped;
-    }
-    let base = if dims == 0 {
-        rest.replace('/', ".")
-    } else {
-        match rest.as_bytes().first() {
-            Some(b'L') => rest
-                .trim_start_matches('L')
-                .trim_end_matches(';')
-                .replace('/', "."),
-            Some(b'Z') => "boolean".to_string(),
-            Some(b'B') => "byte".to_string(),
-            Some(b'C') => "char".to_string(),
-            Some(b'S') => "short".to_string(),
-            Some(b'I') => "int".to_string(),
-            Some(b'J') => "long".to_string(),
-            Some(b'F') => "float".to_string(),
-            Some(b'D') => "double".to_string(),
-            _ => rest.replace('/', "."),
-        }
-    };
-    format!("{base}{}", "[]".repeat(dims))
+    cratonvm_types::error::arraycopy_message::external_class_name(internal)
 }
 
 /// HotSpot's per-element `ArrayStoreException` text for a reference copy whose
@@ -798,27 +773,13 @@ pub(crate) fn element_type_mismatch_message(
     src: ObjectRef,
     dst_elem_class: cratonvm_types::ClassId,
 ) -> String {
+    // On a reference array the heap header's class id IS the component class,
+    // so `class_id_of_object(src)` is the source array's component.
     let src_component = ctx
         .class_name_of_id(ctx.class_id_of_object(src))
         .unwrap_or_default();
     let dst_component = ctx.class_name_of_id(dst_elem_class).unwrap_or_default();
-    // The two halves are rendered in DIFFERENT dialects, and that is HotSpot's
-    // sentence rather than an inconsistency to tidy up. The source is the
-    // array's external name; the destination component is the component
-    // Klass's own dotted NAME, which for an array class is a descriptor.
-    // MEASURED on 25.0.4+7:
-    //   ... elements of java.lang.Object[] ... destination array, java.lang.String
-    //   ... elements of java.lang.Object[] ... destination array, [Ljava.lang.Integer;
-    //   ... elements of java.lang.Object[] ... destination array, [I
-    let dst_rendered = if dst_component.starts_with('[') {
-        dst_component.replace('/', ".")
-    } else {
-        external_class_name(&dst_component)
-    };
-    format!(
-        "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {dst_rendered}",
-        external_class_name(&src_component),
-    )
+    cratonvm_types::error::arraycopy_message::element_type_mismatch(&src_component, &dst_component)
 }
 
 pub(crate) fn native_system_arraycopy(
