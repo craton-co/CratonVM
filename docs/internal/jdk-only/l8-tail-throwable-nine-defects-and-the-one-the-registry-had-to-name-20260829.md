@@ -8,7 +8,7 @@ Second batch of the long tail, and the largest single group in it: **117
 bridge-with-code rows across 42 classes**, of which `Throwable` itself is 16 and
 the other 41 are two to five each.
 
-`apps/probes/ThrowableFamilySweep.java`, **3975 rows, 0 differing lines against
+`apps/probes/ThrowableFamilySweep.java`, **3973 rows, 0 differing lines against
 HotSpot in both `--jdk-only` and compatible mode**, from 296.
 
 ---
@@ -190,10 +190,14 @@ whose stack trace is not writable.
 Nothing about these classes is local: `Throwable` is on the path of every
 `catch`, and `addSuppressed` is on the path of every try-with-resources. So the
 change was measured against **every probe in the tree**, both modes — 43 probes,
-and the four that ask about suppression directly are named first:
+and the four that ask about suppression directly are named first.
+
+**These are `tail-run.sh`'s LINE counts, not row counts** -- each probe prints
+two trailer lines (`rows N`, `DONE <name>`), so every figure here is its row
+count plus two. Left as the runner printed them rather than adjusted one by one:
 
 ```text
-IoSystemSweep              154 rows   0-diff   <- setStackTrace / getStackTrace
+IoSystemSweep              154 lines  0-diff   <- setStackTrace / getStackTrace
 Phase3Sweep                 35        0-diff
 JdkOnlyBreadthProbe         16        0-diff
 StringBuilderShadowSweep   747        0-diff
@@ -330,7 +334,7 @@ row plus three new `initCause afterwards` rows per class are what found D8.
   `--synthetic-jdk` gates pass; no synthetic-mode probe asks about suppression,
   so the fallback branch is asserted by construction rather than measured.
 * **`Throwable.computeFormat` is in the 117 and is not reachable from Java.** It
-  is not covered by these 3975 rows.
+  is not covered by these 3973 rows.
 * **The remaining tail is unchanged by this batch**: `java/math/BigInteger` (24
   rows), `java/lang/System` + `Runtime` + `Object` (26), `java/security` (20),
   `jdk/internal` VM/SharedSecrets/Signal (~19), `java/lang/ref` (~12).

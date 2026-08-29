@@ -25,7 +25,7 @@ been removed again.
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
-| **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 108 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
+| **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 141 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
 **ALL EIGHT LANES ARE DONE** — L1 through L8, the last of them (the long tail)
 on 2026-08-29. Seven of the eight lane handoffs are retired to
@@ -202,18 +202,24 @@ bridge rows whose real method has Code and owns its slot   2063  across 195 clas
 unprobed remainder groups into seven batches, and they are what L8 is working:
 
 **ALL SEVEN BATCHES ARE CLOSED (2026-08-29). 56 defects fixed, 4 recorded,
-20 108 probe rows at 0-diff in both modes.**
+20 141 probe rows at 0-diff in both modes.**
 
 | batch | rows | probe | result |
 | --- | ---: | --- | --- |
-| `java/net/URI` + `URL` | 14 | `UriRecompositionSweep` 1258 | **7 defects**; the row §4 deferred was 26 |
-| Throwable and the exception hierarchy | 117 | `ThrowableFamilySweep` 3975 | **9 defects**; `owns_slot` named the registrar that mattered |
-| `java/math/BigInteger` | 24 | `BigIntegerSweep` 13 255 | **3 defects**, all on error paths |
+| `java/net/URI` + `URL` | 14 | `UriRecompositionSweep` 1256 | **7 defects**; the row §4 deferred was 26 |
+| Throwable and the exception hierarchy | 117 | `ThrowableFamilySweep` 3973 | **9 defects**; `owns_slot` named the registrar that mattered |
+| `java/math/BigInteger` | 24 | `BigIntegerSweep` 13 253 | **3 defects**, all on error paths |
 | `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 43 | `SystemRuntimeObjectSweep` 125 | **18 fixed, 4 recorded** |
 | `java/lang/ref` | 19 | `RefFamilySweep` 60 | **2 defects**, one of them a hang |
-| `java/security` | 27 | `SecuritySurfaceSweep` 1335 | **11 defects**, all on refusal paths |
+| `java/security` | 27 | `SecuritySurfaceSweep` 1333 | **11 defects**, all on refusal paths |
 | `jdk/internal` | 29 | `JdkInternalSweep` 120 | **6 defects**; one line of them was 12 rows |
-| *(written along the way)* | — | `HelpfulNpeProbe` 20 | refuted the hypothesis that this VM has no helpful NPEs |
+| *(written along the way)* | — | `HelpfulNpeProbe` 21 | refuted the hypothesis that this VM has no helpful NPEs |
+
+**Row counts here are the probes' own `rows N` lines, not `wc -l`.** Every probe
+in this family prints two trailer lines (`rows N` and `DONE <name>`), and
+`tail-run.sh` reports `hs=<LINES>`. Taking the runner's number as a row count
+overstates every probe by two — small, systematic, and it scales with the number
+of probes. Corrected here and in the four records on 2026-08-29.
 
 Records, under the internal tree at `jdk-only/`:
 `l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md`,

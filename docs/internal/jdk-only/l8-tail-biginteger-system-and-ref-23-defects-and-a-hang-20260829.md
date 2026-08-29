@@ -5,16 +5,16 @@
 `jdk-25.0.4+7`, the same image CratonVM ran against.
 
 Batches three, four and five of the long tail, landed together because they
-share one build. Three probes, **13440 rows**, and the batch's two most
+share one build. Three probes, **13438 rows**, and the batch's two most
 interesting findings are both about how a defect announced itself rather than
 about what it was.
 
 | probe | rows | before | after |
 | --- | ---: | ---: | ---: |
-| `apps/probes/BigIntegerSweep.java` | 13255 | 5 | **0** |
+| `apps/probes/BigIntegerSweep.java` | 13253 | 5 | **0** |
 | `apps/probes/SystemRuntimeObjectSweep.java` | 125 | 22 | **5 / 3** (recorded, §4) |
 | `apps/probes/RefFamilySweep.java` | 60 | *truncated at 54* | **0** |
-| `apps/probes/HelpfulNpeProbe.java` | 20 | 2 | **0** |
+| `apps/probes/HelpfulNpeProbe.java` | 21 | 2 | **0** |
 
 ---
 
@@ -31,7 +31,7 @@ and runs **every ordered pair through every binary operation**, plus the algebra
 those operations owe each other (`a.divide(b).multiply(b).add(a.remainder(b))`
 is `a`; `and`/`or`/`xor` cover; `not` is an involution).
 
-**13255 rows and five differences.** Which is the useful result: the limb
+**13253 rows and five differences.** Which is the useful result: the limb
 arithmetic is right, and everything wrong with it was on an error path.
 
 ### D1 — `modPow` accepted a negative modulus

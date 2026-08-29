@@ -4,12 +4,12 @@
 `/data/cvm-l2s-20260828`. Oracle: HotSpot `jdk-25.0.4+7`, the same image
 CratonVM ran against.
 
-Batches six and seven — the last two. Two probes, **1455 rows, 0 differing lines
+Batches six and seven — the last two. Two probes, **1453 rows, 0 differing lines
 in both `--jdk-only` and compatible mode**, from 47.
 
 | probe | rows | before | after |
 | --- | --- | ---: | ---: |
-| `apps/probes/SecuritySurfaceSweep.java` | 1335 | 20 | **0** |
+| `apps/probes/SecuritySurfaceSweep.java` | 1333 | 20 | **0** |
 | `apps/probes/JdkInternalSweep.java` | 120 | 27 | **0** |
 
 ---
