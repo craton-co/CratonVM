@@ -15,7 +15,8 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| L1, L3, L6, L7 | unclaimed | your own worktree | your own branch |
+| **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
+| L1, L3, L7 | unclaimed | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
 Everything else is unclaimed.
@@ -192,12 +193,14 @@ planning:
 
 | item | owner |
 | --- | --- |
-| `ConcurrentHashMap.elements()` never terminates | **dev's `a0168ed03`**, bisected in two builds. L6 must know; it is not L6's to fix without talking to that lane. |
+| ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
 | `Arena`/`MemorySegment` report an INTERFACE as an instance's class | `panama.rs` — unclaimed, closest to L1 |
-| `AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture` | L6 |
+| ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
+| **NEW.** `Properties.values().iterator()` mints the fabricated `cratonvm/internal/ArrayListViewItr`, and its `try_alloc_synthetic(..)?` has **no refusal arm** — so `--jdk-only` kills the caller with `NoClassDefFoundError`. This is what `RJdkEnumerations` fails on under `--jdk-only` now that L6 fixed the CHM half. | **L3** (`Properties`/`Hashtable` cluster). Its two sibling mint sites land refusals on `real_snapshot_iterator`, which needs a `SnapshotItrRoute` for a Hashtable-backed values view. Falling back to `java/util/ArrayList$Itr` instead would add a `modCount`-less receiver to that class, which is the precondition the bytecode-yield allow-list is waiting on. |
+| **NEW.** `Class.forName("[L<absent>;")`'s `ClassNotFoundException` names the DESCRIPTOR, not the element. Fails `RExceptions` and `RJdkFailure` in both modes, **on pristine `origin/dev`** — measured, not inferred. | **L5's family** (`java.lang.Class`), and it is the reason arms 1–3 are not clean for anybody right now. |
 
 ---
 

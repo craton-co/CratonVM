@@ -491,6 +491,15 @@ receivers. Almost everything already has its own cursor — every map view of
 yield is STILL NOT SAFE — for a reason that invalidates the criterion I was
 using.**
 
+* **2026-08-29, lane L6:** the entry below landed only HALF of what it needed.
+  Registering the snapshot bodies on `ConcurrentHashMap$ValueIterator` captured
+  the REAL cursor `ConcurrentHashMap.elements()` was independently building, and
+  `elements()` then handed back `null` forever — `RJdkEnumerations` red on `dev`
+  for two days. Closed by removing the other producer rather than the entry:
+  `elements()`/`keys()` now hand back the same snapshot carriers
+  `values().iterator()`/`keySet().iterator()` do. **The yield's precondition is
+  unchanged and still unmet** — see `L6-concurrency-lane-complete-20260828.md`
+  §2.2 and §5.5.
 * `ConcurrentHashMap$ValuesView → ConcurrentHashMap$ValueIterator` **landed**.
   A HotSpot-parity fix on its own: census divergences go 21 → 20 of 66, and the
   one row that changes is exactly that one.
