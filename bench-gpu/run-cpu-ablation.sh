@@ -23,7 +23,10 @@ JDK="${JDK:-C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot}"
 # `<construct> <ns_per_elem>` per line.
 hs()  { "$JDK/bin/java" -Xmx4g -cp "$HERE_W" RayTracerCpuAblation "$N" "$ITERS" 2>/dev/null; }
 cv()  { "$CV" --java-home "$JDK" --Xmx 4g -cp "$HERE_W" RayTracerCpuAblation "$N" "$ITERS" 2>/dev/null; }
-pairs() { sed -n 's/^\([a-z]*\) *best_ms=.*ns_per_elem= *\([0-9,.]*\).*/\1 \2/p' | tr ',' '.'; }
+# `[a-zA-Z]`, not `[a-z]`: the construct names are camelCase, and an
+# `[a-z]*` class silently dropped `mulAdd` -- the one row the whole
+# measurement is about.
+pairs() { sed -n 's/^\([a-zA-Z]*\) *best_ms=.*ns_per_elem= *\([0-9,.]*\).*/\1 \2/p' | tr ',' '.'; }
 
 tmp="$(mktemp)"
 for r in $(seq 1 "$ROUNDS"); do

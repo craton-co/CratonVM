@@ -1,21 +1,153 @@
 # Ray tracer kernel: CratonVM GPU offload vs TornadoVM, RTX 2060
 
-**Status: RESOLVED 2026-08-21.** The checksum divergence this record opened
-on was a real CratonVM defect, is root-caused, is fixed, and the fix is
-pinned by a regression test. CratonVM's GPU output is now bit-identical to
-HotSpot on every pixel at every resolution measured. Two further defects
-found on the way — one in each benchmark twin — are also fixed. The
-headline speedup claim the original record made **did not survive**
-measurement across a resolution sweep and has been replaced with the
-decomposition below.
+**Status: RESOLVED 2026-08-21. Residuals CLOSED 2026-08-29.** The checksum
+divergence this record opened on was a real CratonVM defect, is root-caused,
+is fixed, and the fix is pinned by a regression test. CratonVM's GPU output
+is bit-identical to HotSpot on every pixel at every resolution measured, now
+including 8K and 11520×6480. Two further defects found on the way — one in
+each benchmark twin — are also fixed. The headline speedup claim the original
+record made **did not survive** measurement across a resolution sweep and has
+been replaced with the decomposition below.
+
+Every item §9 left open has been taken to an answer — see §13. **Three of
+those answers are that the residual's own hypothesis was wrong**, which is
+why they are written up rather than quietly dropped: the branch machinery is
+real and if-converting it is a LOSS (§13.4); the per-launch event
+bookkeeping is real and removing it moves this kernel not at all (§13.5);
+and the fixed-cost fit §12 doubted does hold past 8K, after three loaded
+passes each said otherwise with a mechanism ready to explain it (§13.6).
 
 Superseded documents: the original open record at
-`bench-gpu/results/raytracer-vs-tornadovm-20260821.md`.
+`bench-gpu/results/raytracer-vs-tornadovm-20260821.md`, and the copy that
+lived under `docs/known-issues/gpu/` between 2026-08-23 and 2026-08-29
+while the residuals were open. That copy is deleted by the commit that
+files this one: it was public because there were open questions a reader
+might otherwise re-derive, and there are none left. The findings a public
+reader needs are in `README.md`'s benchmark table and in `docs/gpu/`.
 
 Durable documentation this produced:
 [`docs/gpu/README.md` -> "Float bit-exactness"](../../gpu/README.md#float-bit-exactness).
 
 ---
+
+## Update, 2026-08-23: TornadoVM, and the dispatch floor
+
+Two things landed after this record was first written. The tokenizer
+defect in §Residuals is fixed, so the comparison no longer needs a
+one-word prompt; and the fire-and-forget dispatch named in §What is
+left is done.
+
+Three arms interleaved, full prompt, 128 tokens, greedy:
+
+| round | HotSpot CPU | CratonVM GPU | TornadoVM GPU |
+|---|---|---|---|
+| 1 | 8.68 | 16.56 | 17.82 |
+| 2 | 8.71 | 17.10 | 17.75 |
+| 3 | 8.47 | 17.19 | 17.63 |
+
+**TornadoVM produces garbage output** — `stillinghaminghamingham...`,
+in six runs across both models and both sampling settings. TornadoVM
+itself is healthy here (the repo's validated vector-add fixture computes
+the right checksum on the GPU), so this is GPULlama3's TornadoVM path.
+Its throughput is therefore NOT a like-for-like baseline: a computation
+that produces the wrong answer may also be doing less work. CratonVM's
+output is byte-identical to HotSpot's over 128 tokens.
+
+The two systems have opposite bottlenecks, which is visible in how they
+respond to host CPU state. Across a window where this machine's CPU
+dropped off boost, TornadoVM moved 15.0 -> 18.4 while CratonVM went
+19.2 -> 10.5; `drain_ms` stayed at 5-6 ms throughout. TornadoVM is
+GPU-bound, CratonVM is host-dispatch-bound. An absolute number from
+this machine is only meaningful beside the other arms measured in the
+same window, which is why every table here is interleaved.
+
+## Update, 2026-08-29: the margin at three resolutions, confirmed
+
+Fresh measurement on a rebuilt `--features gpu-driver` binary (`target-gpu`,
+current `dev`), same host, same RTX 2060, using the exact reduced kernel this
+record's §6-§8 established (`bench-gpu/RayTracerKernel.java` /
+`bench-tornado/RayTracerTornado.java`) via
+`bench-gpu/run-raytracer-interleaved.sh` — 6 interleaved rounds per
+resolution, arm order alternated per round, a HotSpot control every round.
+Three resolutions this time, including one never measured before:
+
+| resolution | pixels | HotSpot C2 | TornadoVM PTX | CratonVM `--gpu` | vs HotSpot | vs TornadoVM | rounds won |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1920×1440 | 2.76M | 72.7 ms | 2.70 ms | **1.08 ms** | 67x | **2.5x** | 6/6 |
+| 3840×2160 (4K) | 8.29M | 208.4 ms | 6.65 ms | **3.06 ms** | 68x | **2.2x** | 12/12 |
+| 7680×4320 (8K) | 33.2M | 837.1 ms | 24.29 ms | **12.29 ms** | 68x | **2.0x** | 6/6 |
+
+The 4K row is pooled over two independent 6-round passes run ~30 minutes
+apart (12 rounds total), which agreed within noise — 54.6% and 53.4% ahead of
+TornadoVM on the two passes' individual means. CratonVM won every round at
+every resolution: 24/24 total across the three sizes.
+
+**This is §7's shrinking-margin finding, confirmed with a cleaner three-point
+curve and extended one octave past anything previously measured.** §7 found
+the margin collapsing with n in an early (buggy) measurement, then — after
+the kernel-quality fixes in §8 — found it *growing* with n instead, from
+52%/44%/37% at three sizes up to 56.4% at 2.76M pixels after chunked overlap
+landed. That 2026-08-21 table stopped at 2.76M pixels. This one starts there
+and goes three resolutions further, and the shape has changed again: the
+margin now shrinks smoothly and monotonically as resolution grows —
+2.5x -> 2.2x -> 2.0x — which is the *opposite* trend from §8d's chunked-overlap
+table's own top row. Read together with §7's honest final paragraph ("the
+margin still shrinks with n, because the fixed-cost advantage amortises away
+and what remains is a per-pixel ratio"), that is exactly the mechanism this
+new curve traces out directly: CratonVM's ~3.1x lower fixed per-call cost
+(§7's closing numbers: 0.104 ms vs 0.319 ms) dominates at small n, and as n
+grows the comparison converges toward the two engines' per-pixel compute
+rates, which are closer together than their launch overheads are.
+
+The vs-HotSpot ratio, by contrast, holds flat at ~67-68x across all three
+sizes — both GPU arms scale against the CPU baseline the same way, so that
+axis is insensitive to the launch-cost-vs-compute-cost split that moves the
+GPU-vs-GPU axis.
+
+**Not done in this pass**: a fourth point past 8K to see whether the
+TornadoVM margin keeps shrinking toward the ~33% floor extrapolated in §7, or
+crosses it; a fresh checksum verification at 8K specifically (this pass
+measured timing only, via the interleaved script — correctness at every
+resolution up to 2.76M pixels was verified bit-identical in §6, and the
+kernel is unchanged since, but 8K's own frame was not independently diffed
+against a HotSpot reference this round).
+
+**Both were done later the same day — see §13.1 and §13.2.**
+
+## The measurement
+
+`Llama-3.2-1B-Instruct-F16.gguf`, greedy decode (temperature 0), RTX
+2060, the application's own `achieved tok/s`. The arms are interleaved
+so a busy host cannot favour whichever ran first:
+
+| round | HotSpot CPU | CratonVM GPU |
+|---|---|---|
+| 1 | 9.89 tok/s | **17.47 tok/s** |
+| 2 | 9.74 tok/s | **17.41 tok/s** |
+| 3 | 10.25 tok/s | **17.42 tok/s** |
+
+**1.76x.** Both arms generate the same 35 tokens and print the same
+text, character for character.
+
+Two things about that comparison are deliberate and both matter.
+
+**The prompt is a single word.** CratonVM's tokenizer truncates a
+multi-word prompt — `"Why is the sky blue?"` becomes 11 prompt ids
+where HotSpot builds 16, keeping `Why` and dropping ` is`, ` the`,
+` sky`, ` blue`, `?`. That is a real defect, it is **pre-existing on
+dev** (a binary built before any change in this branch reproduces it
+exactly), and it is upstream of everything here: the pretokenizer regex
+produces identical pieces on both VMs, so the loss is in BPE
+aggregation, and it affects the CPU path identically. Comparing
+generated text across VMs on a prompt they tokenize differently would
+be comparing answers to two different questions. A one-word prompt
+tokenizes identically on both, which makes the comparison sound — and
+turns it into a correctness oracle, because greedy decoding from an
+identical prompt must produce an identical sequence. It does. See
+§Residuals.
+
+**The weight upload is outside the measured window.** It used to run
+lazily inside the first forward pass, which put 7 s of one-time setup
 
 ## 1. What the open record said, and what was actually true
 
@@ -253,6 +385,19 @@ GPU arms barely move under that load (they are GPU-bound), which is
 exactly why they can be compared to each other and not to numbers from
 another day. The interleaved script prints the control alongside each
 round and flags it, rather than silently averaging a loaded round in.
+
+**§12 continues this table one octave further, at 3840×2160 and
+7680×4320; §13.1 adds a fourth point at 11520×6480.** Read together, the two tables span 307,200 pixels to
+33,177,600 — a 108x range — and the margin traces a single smooth arc:
+up through §8d's three points (38.2/12.4/3.9% -> then, post-fix,
+52.0/44.1/36.9% -> then, post-overlap, 52.0/47.0/56.4%), then down
+through §12's three (59.8/53.4-54.6/49.4% averaged as ~2.5x/2.2x/2.0x).
+The direction flips because the mechanism changes: §8d's overlap fix
+specifically targeted the *large*-n transfer cost, so it helped big
+frames more than small ones, reversing the arc's slope at the sizes
+then measured. §12 picks up past where §8d stopped and the arc resumes
+shrinking, consistent with fixed launch cost mattering less as n grows
+once both large-transfer and fixed-cost work are already optimised.
 
 ## 8. The join-state blowup found while looking at the kernel
 
@@ -528,6 +673,11 @@ out0=0 outMid=3145725 outAfter=0 outLast=0
 
 ## 9. Residuals
 
+**Every "Still open" item below was taken to an answer on 2026-08-29;
+§13 is that pass.** The list is kept as written so the answers can be read
+against the questions, including the two answers that are "the hypothesis in
+this bullet was wrong".
+
 **Closed by this work:**
 
 * The lowerer rejected `for (int i = 0; i < out.length; i++)` — the
@@ -548,11 +698,12 @@ out0=0 outMid=3145725 outAfter=0 outLast=0
   thing to rule out. Ruled out: it changes no checksum, before or after
   the fix.
 
-**Still open:**
+**Was still open on 2026-08-21, and every one is answered in §13:**
 
 * **A bare scalar loop bound (`for (i = 0; i < n; i++)` where `n` is an
-  `int` parameter) is still rejected.** Unlike the `.length` case this is
-  not a free acceptance: the launch grid is sized from
+  `int` parameter) is still rejected.** **DONE — §13.3, and the paired
+  grid change this bullet correctly insisted on came with it.**
+  Unlike the `.length` case this is not a free acceptance: the launch grid is sized from
   `largest_primitive_array_len`, so a bound larger than every array
   argument would under-provision threads and silently do less work than
   the Java loop. Doing it properly means recording the bound's parameter
@@ -560,20 +711,41 @@ out0=0 outMid=3145725 outAfter=0 outLast=0
   from `max(largest_array_len, that_scalar)`. Worth doing; not done here.
 * **The CratonVM CPU path is still ~5.3x HotSpot on this kernel** after
   the `Math.min` work in §8b took it from ~11x. Where the remaining 5.3x
-  goes is unprofiled.
+  goes is unprofiled. **PROFILED — §13.7.** About 2.2x of it is CratonVM's
+  scalar float code; everything from 4.4x to 34x is auto-vectorisation
+  HotSpot does and CratonVM does not. There is no second `Math.min` in it.
 * TornadoVM's own GPU-vs-Java divergence (§6) is reported, not diagnosed.
+  **CLOSED as out of scope — §13.8.** §6 already names it at instruction
+  level; the rest is inside a third-party backend.
 * **The chunked stream overlap is DONE** (§8d) — 1.51x on the GPU-side
   work, and it took the margin over TornadoVM at 2.76M pixels from 36.9%
   to 56.4%. What remains on the transfer side is the bridge's per-launch
   `last_write` event bookkeeping, which is why the VM lands at 1.51x
-  where a raw prototype of the same shape reached 1.67x.
+  where a raw prototype of the same shape reached 1.67x. **That
+  attribution was WRONG — §13.5.** The bookkeeping is gone now and the
+  ratio did not move; a frame is 8 launches, so the whole saving here was
+  bounded at two or three percent before anyone measured it.
 * **18% of the kernel SASS is branch-reconvergence machinery** — 67 `BRA`
   plus 32 `BSSY`/`BSYNC`/`BMOV` triples — from the short-circuit `&&`s and
   from ternaries whose arms contain a call. The kernel is written
   branchlessly on purpose and the lowerer turns it back into branches.
   If-converting a branch whose arms are short and side-effect-free into
   `selp` would remove most of that, but it is maybe 6% of total time, so
-  it is worth less than the overlap above.
+  it is worth less than the overlap above. **BUILT, MEASURED, and it goes
+  the WRONG WAY — §13.4.** It does remove the branches, and it costs 56%
+  of the compute half, because "short" was the wrong screen: the arms are
+  one instruction each and one of those instructions is a square root.
+  Re-screened by weighted cost and swept, the best budget ties with the
+  feature off. It ships opt-in.
+* **§12's shrinking-margin curve at 4K/8K is not yet explained down to a
+  mechanism the way §8/§8c were** — **DECOMPOSED in §13.6, and the
+  fixed-cost model this bullet expected it to confirm turns out not to
+  hold past 8K.** The bullet as written: it is read off the same
+  fixed-cost / per-pixel-cost decomposition §7 already established, not independently
+  re-decomposed at these two new sizes. A `GpuTransferFloor`-style split
+  at 4K and 8K would confirm whether the same ~0.104 ms fixed / ~0.564 ns
+  per-pixel fit still holds, or whether something changes past 8.3M
+  pixels (a device memory or PCIe-queueing effect, say). Not done.
 
 ## 10. Reproduction
 
@@ -587,14 +759,37 @@ PYTHON3_DIR=<dir containing python3.exe> \
 # paired, order-alternating rounds with a per-round HotSpot control.
 PYTHON3_DIR=<dir containing python3.exe> \
   bench-gpu/run-raytracer-interleaved.sh 1920 1440 6
+# §12's three rows used 1920 1440, 3840 2160 (twice), and 7680 4320.
 ```
 
 The script exists because three separate footguns turn this measurement
 into a plausible-looking lie: `java.exe` silently produces no output when
 handed an MSYS `/c/...` classpath, TornadoVM silently runs on the CPU
 when its compiler bails out, and its launcher needs a `python3` on PATH
-that a Windows Python install does not provide. Each is handled and each
-is commented at the point it is handled.
+that a Windows Python install does not provide (a `python3.exe` shim
+copied from the system `python.exe` and passed via `PYTHON3_DIR` — e.g.
+`C:/craton/tornadovm/py3shim` — resolves this without installing anything
+new). Each is handled and each is commented at the point it is handled.
+
+The residual pass in §13 added four more, all in `bench-gpu/`:
+
+```sh
+# Fixed-cost / per-pixel decomposition at any set of sizes (§13.6).
+GPU_JAR=<craton-gpu jar>   bench-gpu/run-transfer-decomposition.sh <cratonvm.exe> 1920 1440 3840 2160                                           7680 4320 11520 6480
+
+# Bit-exactness at one resolution, against a HotSpot reference frame (§13.2).
+GPU_JAR=... bench-gpu/verify-frame.sh <cratonvm.exe> 7680 4320
+
+# What the chunked overlap is worth, as a same-binary A/B (§13.5).
+GPU_JAR=... bench-gpu/run-chunk-overlap.sh <cratonvm.exe> 1920 1440 5
+
+# PTX and SASS branch counts, both arms of the if-conversion switch (§13.4).
+GPU_JAR=... bench-gpu/count-kernel-branches.sh <cratonvm.exe> 640 480
+```
+
+and two for the GPULlama3 comparison the dispatch work in §13.5 is really
+about — `run-gpullama3-ab.sh` (token rate) and `run-gpullama3-submit-ab.sh`
+(host dispatch cost, with a per-round CPU control).
 
 To see what a kernel actually compiled to:
 
@@ -619,3 +814,450 @@ The TornadoVM twin bundles its 20 sphere scalars into one `FloatArray`
 because `TaskGraph.task()` caps at 15 arguments. CratonVM has no such cap
 and takes them as 25 separate parameters, which is why the two `render`
 signatures differ.
+
+## 12. The margin at 4K and 8K, 2026-08-29
+
+Full detail and the reconciliation with §7's own tables is in the
+"Update, 2026-08-29" section near the top of this document. Summary: the
+same interleaved harness, extended past §7/§8d's largest point
+(2,764,800 pixels) to 8,294,400 (4K) and 33,177,600 (8K), finds the
+vs-TornadoVM margin shrinking smoothly — 2.5x at 1920×1440, 2.2x at 4K,
+2.0x at 8K — while the vs-HotSpot margin holds flat at ~67-68x
+regardless of size. 24/24 rounds won by CratonVM across the three sizes.
+This is the same amortising-fixed-cost mechanism §7 named, traced one
+octave further than any measurement in this document had previously
+reached.
+
+**§13 continues it one octave further still (1.85x at 11520×6480, §13.1)
+and decomposes all four sizes with `GpuTransferFloor` (§13.6) — where the
+amortising-fixed-cost explanation this section leans on turns out not to
+survive: the transfer floor's own per-pixel cost RISES with n, which no
+fixed term can produce.**
+
+---
+
+# 13. The residual pass, 2026-08-29
+
+Everything §9 left open, taken to an answer. Two of the answers are that
+the residual's own hypothesis was wrong; those are the interesting ones,
+because a residual that is quietly dropped leaves the wrong belief behind.
+
+Every number below was measured on the same box on the same afternoon, and
+that box is shared: up to twenty-four `rustc` and `cargo` processes
+belonging to other sessions came and went through the pass. Every
+comparison here is therefore paired, arm-alternating, and reported as a
+ratio or a per-round win count, and the absolute milliseconds are labelled
+with whether their pass was quiet.
+
+That is not a caveat, it is one of the findings. §13.6's decomposition took
+four passes, and the first three each produced a confident wrong answer
+with a mechanism ready to explain it. They are all written down there,
+because the failure mode is not "noisy numbers" — it is plausible
+structure, and a loaded box produces that as readily as a real effect.
+
+## 13.1 A fourth resolution, 11520×6480 — the margin keeps shrinking
+
+74,649,600 pixels, 2.25x the 8K point and 27x the largest size §7 ever
+reached. `bench-gpu/run-raytracer-interleaved.sh`, 6 rounds, arm order
+alternated, `XMX=10g` (the frame is an `int[]` of 298 MB and all three arms
+allocate one), on a host gated quiet:
+
+| round | CratonVM `--gpu` | TornadoVM PTX | ratio |
+|---|---:|---:|---:|
+| 1 | 35.08 | 60.83 | 1.73x |
+| 2 | 29.15 | 56.50 | 1.94x |
+| 3 | 33.43 | 60.58 | 1.81x |
+| 4 | 34.69 | 61.45 | 1.77x |
+| 5 | 29.20 | 60.91 | 2.09x |
+| 6 | 35.30 | 63.97 | 1.81x |
+| **mean** | **32.81** | **60.71** | **1.85x** |
+
+CratonVM won 6/6. An earlier pass of the same six rounds against a loaded
+box put both arms 30% higher (43.64 vs 84.55) and returned the same ratio to
+within 5% — which is what pairing is for, and is the only thing about the
+loaded pass worth keeping.
+
+So the curve now reads **2.5x → 2.2x → 2.0x → 1.85x** across 2.76M, 8.29M,
+33.2M and 74.6M pixels. §7 extrapolated a ~33% floor (1.5x) from the
+per-pixel rates; four points later the margin is still above it and still
+falling. It has not crossed.
+
+## 13.2 8K and 11520×6480 are bit-identical to HotSpot
+
+§12 measured timing only. `bench-gpu/verify-frame.sh` renders the same
+frame on HotSpot and on CratonVM's `--gpu` path, dumps both, and diffs them
+pixel by pixel:
+
+```text
+7680x4320    FRAMEDIFF n=33177600 differing=0 max_channel_delta=0 checksum_delta=0
+             FRAMEDIFF verdict=BIT_IDENTICAL
+11520x6480   FRAMEDIFF n=74649600 differing=0 max_channel_delta=0 checksum_delta=0
+             FRAMEDIFF verdict=BIT_IDENTICAL
+```
+
+107.8 million pixels checked, none differing. §6's table now runs
+unbroken from 160×120 to 11520×6480.
+
+## 13.3 A bare scalar loop bound is accepted
+
+`for (int i = 0; i < n; i++)` with `n` an `int` parameter. §9 called this
+"worth doing; not done here", and named exactly what makes it different
+from the `.length` case it sat next to: the launch grid is sized from the
+largest array argument, so a bound larger than every array would
+under-provision threads. A thread that is never created reaches no bounds
+check, so the failure would be a silently short result rather than a
+deopt — which is why the acceptance and the grid change are one change.
+
+`emitter::WorkBound::ParamScalar` carries the parameter index to the
+dispatch site, the marshaller records every `int` argument's value beside
+the array lengths it already records, and the grid is sized from
+`max(largest array length, that parameter)`. A scalar that did not reach
+the marshaller refuses the launch rather than guessing. Only an unmodified
+parameter qualifies — the host sizes the grid from the ARGUMENT while the
+guard compares against whatever the local holds, and `n = n - 1` makes
+those two different numbers. A 2-D rectangular nest bounded by two scalars
+is still refused: its trip count is `rows * cols`, a product, and
+`WorkBound` names one parameter.
+
+`EligibleScalarBound.java` pins all four cases, and
+`ptxas_round_trip_scalar_bounds` assembles the new guard shape — the only
+one in the tree that reads a scalar `.param` where every other reads a
+`_len`.
+
+## 13.4 If-converting the branches makes this kernel SLOWER
+
+This is the residual that came back with the opposite answer.
+
+§9 read 18% of the kernel's SASS as branch machinery — 67 `BRA` plus 32
+`BSSY`/`BSYNC`/`BMOV` triples, from short-circuit `&&`s and from ternaries
+whose arms contain a call — and proposed if-converting the short,
+side-effect-free ones into `selp`. That was implemented (see
+`gpu/lowering-branches.md`), it engages, it is bit-exact, and it costs
+time.
+
+**It engages, and the census says exactly which half of it does what.**
+`bench-gpu/count-kernel-branches.sh` dumps the kernel's PTX with
+`CRATONVM_GPU_DUMP_PTX`, assembles it with the real `ptxas`, and counts
+both levels. Three budgets, one binary:
+
+| budget | PTX instr | `selp` | `bra` | SASS instr | `BRA` | `BSSY`/`BSYNC`/`BMOV` | branch machinery |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 (default) | 649 | 81 | 51 | 936 | 67 | 96 | **17.4%** |
+| 8 | 615 | 92 | 29 | 920 | 66 | 93 | **17.3%** |
+| unbounded | 603 | 96 | 21 | 904 | 58 | 81 | **15.4%** |
+
+The 67 `BRA` and 96 reconvergence instructions at budget 0 reproduce §9's
+count exactly.
+
+Read the middle row against the bottom one and the whole answer is there.
+**Budget 8 removes 22 PTX branches and 1 SASS branch.** The diamonds cheap
+enough to be worth converting are ones `ptxas` was already converting by
+itself, so doing it in the lowerer changes the PTX and not the machine
+code — which is why budget 8 measures as a tie rather than a small win.
+The 9 SASS branches that only fall at an unbounded budget are precisely
+the ones `ptxas` declined to convert, and it declined for the same reason
+the timing punishes converting them: they guard a square root.
+
+**It is bit-exact.** Both arms, 1920×1440, against the HotSpot reference:
+`differing=0`, `checksum_delta=0`.
+
+**And it is slower.** The transfer floor is the control here — the same
+launch shape and the same bytes out with no arithmetic, so
+`CRATONVM_GPU_IF_CONVERT` cannot touch it — and eight interleaved rounds
+at 1920×1440, minimum per arm:
+
+| | best of 8 |
+|---|---:|
+| transfer floor (control) | 1.0062 ms |
+| tracer, if-convert **off** | 1.1341 ms |
+| tracer, if-convert **on** | 1.2056 ms |
+
+The floor held between 1.0062 and 1.0399 across all eight rounds, so this
+is not host drift; `on` was slower than `off` in **8 of 8**. Subtracting
+the floor, the compute half goes **0.128 ms → 0.199 ms, 56% worse.**
+
+The mechanism is in the kernel's own shape. A branch a warp does not
+diverge on is nearly free — all 32 lanes skip the untaken arm together —
+while `selp` makes every lane compute both. Four of this kernel's ternaries
+are `disc > 0f ? (float) Math.sqrt(disc) : 1e9f`, one per sphere, and most
+of a frame is background where a whole warp misses every sphere. Converted,
+those warps compute four square roots they had been skipping, and
+`sqrt.rn.f32` is a `MUFU.RSQ` plus a Newton-Raphson chain rather than one
+instruction.
+
+So the screen was counting the wrong thing. It capped an arm's LENGTH, and
+the arms in question are one instruction each — a length cap cannot tell
+`sqrt.rn.f32` from `mov.f32`. It now costs an arm instead, weighting
+`sqrt`/`div`/`rcp`/`ex2` at 16 and everything else at 1, with the budget
+tunable through `CRATONVM_GPU_IF_CONVERT_MAX_OPS` so the curve can be swept
+in one binary rather than one build per point. Same host, same 1920×1440
+frame, minimum of 5 rounds per setting, against the same transfer floor:
+
+| budget | tracer | compute | vs off |
+|---:|---:|---:|---:|
+| 0 (off) | 1.1440 ms | 0.1305 ms | — |
+| 2 | 1.1608 ms | 0.1473 ms | +13% |
+| 4 | 1.1549 ms | 0.1414 ms | +8% |
+| **8** | **1.1436 ms** | **0.1301 ms** | **−0.3%** |
+| 16 | 1.1675 ms | 0.1540 ms | +18% |
+| 32 | 1.2298 ms | 0.2163 ms | +66% |
+| unbounded | 1.2244 ms | 0.2109 ms | +62% |
+
+Floor 1.0135 ms. **The best budget is a tie with the feature switched off,**
+and everything else is worse; the non-monotonicity between 2 and 8 is the
+noise floor talking, since the whole compute half is 0.13 ms of a 1.14 ms
+frame. And the census above says why a tie is the ceiling: at budget 8 the
+lowerer is converting diamonds `ptxas` already converts, so it is rewriting
+PTX that assembles to the same SASS.
+
+**So the transform ships OPT-IN.** `CRATONVM_GPU_IF_CONVERT=1` turns it on
+at budget 8, `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` at `n`, and unset does
+nothing. It is kept, and kept reachable, rather than deleted: this is one
+kernel, and a kernel with cheap arms and heavy divergence is exactly the
+shape it was built for. The flags are how the next person measures whether
+theirs is one — which is the whole point of the exercise, since this
+residual sat in the record for eight days as an unpriced "would remove most
+of that".
+
+## 13.5 The per-launch event bookkeeping is real, and it is not this kernel's problem
+
+§8d landed the chunked overlap at 1.51x where a raw prototype of the same
+shape reached 1.67x, and attributed the gap to "the bridge's per-launch
+`last_write` event bookkeeping for every device-pointer argument that the
+raw prototype did not do". That bookkeeping has now been removed twice
+over, and the gap did not move.
+
+**What was removed.** Every kernel submission minted TWO `CUevent`s — one
+inside `DeviceModule::launch_on_stream` for the per-buffer `last_write`
+marker, one in `vm::runtime::offload` for the submission-completion marker
+— and destroyed both on finalize. `DeviceContext` now keeps a capped free
+list and `Event::drop` returns the handle to it; recycling is sound because
+`cuStreamWaitEvent` captures an event's contents at the time of the call,
+so a wait already issued cannot be reached back into by a later re-record.
+Separately, every launch issued a `cuStreamWaitEvent` per device-pointer
+argument, including the common case where that event was recorded on the
+very stream about to launch — a driver round trip for an ordering the
+stream already guarantees. `Event` now remembers which raw stream recorded
+it, and both wait sites skip that case.
+
+**The engagement census says both fire.** `cratonvm_types::gpu_event_census`,
+printed under `CRATONVM_GPU_TIME_DISPATCH=1`, on a 32-token GPULlama3 run:
+
+```text
+[cratonvm] gpu events: created=15042 recycled=14178 (pool served 48.5%);
+                       stream waits issued=0 elided=52512 (100.0% elided)
+[cratonvm] gpu dispatch: calls=14610
+```
+
+Two events per dispatch, 29,220 in all, of which the pool served 48.5%.
+And **every single one** of the 52,512 stream waits was a stream waiting on
+itself.
+
+**On the ray tracer it buys nothing measurable.** Same-binary A/B with
+`CRATONVM_GPU_CHUNKS=1` as the kill switch, 1920x1440, 5 paired rounds
+each:
+
+| binary | chunks=1 | chunks=8 | overlap |
+|---|---:|---:|---:|
+| dev tip, before this work | 1.8135 ms | 1.2489 ms | **1.452x** |
+| with the pool and the elision | 1.8494 ms | 1.2727 ms | **1.453x** |
+| the same, on a quiet host | 1.6892 ms | 1.1558 ms | **1.462x** |
+
+The third row is the one to read: five rounds spanning 1.441x to 1.493x,
+a 3.6% spread, against a first pair taken while the box was busy. The
+overlap is where it was.
+
+That is the arithmetic, not a surprise: a frame is 8 chunk launches, so the
+whole per-launch saving here is ~16 driver calls against a 1.25 ms frame —
+a ceiling of two or three percent even if a driver call were free. **§8d's
+attribution of the 1.51-vs-1.67 gap to event bookkeeping is not supported.**
+What the remaining gap IS was not found by this pass; the page-locked
+staging pool, the writeback into the Java heap, and the residency-cache
+lookup are all still inside the difference and none of them has been
+priced.
+
+**Where it does pay is where launches are dense.** GPULlama3's forward pass
+makes 453 submissions per token, not 8 per frame. `submit_ms` is the host
+time one token spends BUILDING those submissions, which is the only part a
+dispatch-path change can move — `drain_ms` beside it is device time and
+moves the other way when the host slows down. Two independent six-round
+passes, each with a per-round HotSpot CPU control, comparing median
+per-token `submit_ms`:
+
+| pass | B lower in | median per-round B/A |
+|---|---:|---:|
+| first | **6 of 6** | **0.886** |
+| second | 4 of 6 | 0.938 |
+
+Ten of twelve paired rounds, and both medians on the same side. Call it 5
+to 10% off host dispatch cost; this box does not support a tighter number,
+and the second pass ran with two to five of somebody else's `rustc`
+processes on it, with per-round `submit_ms` ranging from 22 ms to 55 ms on
+the SAME binaries.
+
+The census above is the part that is exact, and it is the part worth
+quoting: 52,456 driver calls that used to be issued and no longer are, plus
+14,125 create/destroy pairs that used to happen and no longer do, per
+32-token run.
+
+The lesson is the one §8d's own numbers already implied and the residual
+mis-stated: this is a per-LAUNCH saving, so it is worth what the launch
+rate makes it worth, and the ray tracer's launch rate is two orders of
+magnitude below the workload where it matters.
+
+## 13.6 The fit still holds past 8K — and a loaded box said three times that it did not
+
+§12 asked whether "the same ~0.104 ms fixed / ~0.564 ns per-pixel fit still
+holds, or whether something changes past 8.3M pixels". Nothing changes. Four
+sizes spanning a 27x range, `bench-gpu/run-transfer-decomposition.sh` running
+`GpuTransferFloor` (same launch shape, same bytes out, no arithmetic) and
+`RayTracerKernel` alternately within each size, minimum per arm across
+rounds, on a host gated quiet by `bench-gpu/wait-for-quiet.sh`:
+
+| pixels | floor | tracer | floor ns/px | tracer ns/px | **compute ns/px** |
+|---:|---:|---:|---:|---:|---:|
+| 2,764,800 | 1.0015 ms | 1.0828 ms | 0.362 | 0.392 | **0.029** |
+| 8,294,400 | 2.9939 ms | 3.1862 ms | 0.361 | 0.384 | **0.023** |
+| 33,177,600 | 12.5718 ms | 13.1611 ms | 0.379 | 0.397 | **0.018** |
+| 74,649,600 | 31.4237 ms | 33.3750 ms | 0.421 | 0.447 | **0.026** |
+
+**The compute half — the quantity this decomposition exists to isolate — is
+flat at 0.018 to 0.029 ns/px over a 27x range in n.** After §8c collapsed
+the double-precision square roots, this kernel is a transfer with some
+arithmetic attached, and nothing about that changes at 4K, at 8K, or an
+octave past 8K. §12's shrinking vs-TornadoVM margin is therefore a transfer
+story, and the thing to profile next is the writeback path, not the kernel.
+
+The transfer floor's own per-pixel figure is quoted with less confidence
+than the compute column. A second quiet pass over the same four sizes read
+0.354 / 0.356 / 0.345 / 0.355 ns/px — flat where the table above rises 16% —
+so the floor is not resolved here to better than about 18% at the large
+sizes, and any trend inside that band is not a finding. (It is also why the
+least-squares fit over these four points returns a small NEGATIVE intercept:
+a slope that wanders by 16% across the range makes a two-parameter fit
+report the wander rather than a fixed cost. The per-size numbers are the
+measurement; the fit is not.)
+
+### The three answers this produced before it produced the right one
+
+That table took four passes, and the first three each produced a confident
+wrong finding. They are worth writing down, because the failure mode is not
+"noisy numbers" — it is *plausible structure*:
+
+1. **Mean over rounds, loaded box.** One loaded tracer round put a tracer
+   reading BELOW its own floor, and the fit returned a negative fixed cost
+   with a straight face.
+2. **Minimum over rounds, loaded box.** No more impossibilities, and a clean
+   monotone story instead: the floor's per-pixel cost "rises 40% with n",
+   0.340 to 0.475 ns/px. It is the kind of finding that gets written up —
+   PCIe queueing, device-memory pressure, a page-locked slab past some
+   threshold. It is not there.
+3. **Minimum over rounds, quiet until the last size.** The floor came out
+   flat and the tracer tracked it to 33.2M, then added 13.7 ms at 74.6M — a
+   sharp, localised cliff at exactly one size, which is the most convincing
+   shape of all. The chunk A/B settles it: quiet, `chunks=8` at that size is
+   30.89 ms, and the 40.24 ms the loaded pass recorded is almost exactly its
+   own `chunks=1` number. The loaded pass had measured the un-overlapped
+   path.
+
+Each of those had a mechanism ready for it. None of them was the mechanism.
+`wait-for-quiet.sh` exists because of the third one.
+
+### And the overlap is alive at every size
+
+The cliff hypothesis was worth testing on its own terms, since serial
+dispatch is `kernel + transfer` where overlapped is `max(kernel, transfer)`
+— and a floor whose kernel is ~0 cannot tell the two apart, which is exactly
+why it would stay linear while the tracer did not. Same-binary A/B on
+`CRATONVM_GPU_CHUNKS`, quiet, paired rounds:
+
+| pixels | `chunks=1` | `chunks=8` | overlap |
+|---:|---:|---:|---:|
+| 2,764,800 | 1.6892 ms | 1.1558 ms | **1.462x** |
+| 8,294,400 | 4.6381 ms | 3.7354 ms | **1.242x** |
+| 33,177,600 | 17.3413 ms | 13.6579 ms | **1.270x** |
+| 74,649,600 | 42.4034 ms | 30.8858 ms | **1.373x** |
+
+It never stops working. The 1.462x at 1920×1440 also reproduces §8d's 1.51x
+at the same size to within the 3.6% spread of its own five rounds — which,
+for a number first measured eight days and several hundred commits earlier,
+is the closest thing this record has to a control.
+
+## 13.7 Where the CPU path's remaining 5.3x goes: the vectorizer, and only the vectorizer
+
+§8b took the CratonVM CPU path from ~11x HotSpot to ~5.3x on this kernel by
+intrinsifying `Math.min(float,float)`, and left "where the remaining 5.3x
+goes is unprofiled".
+
+A whole-kernel ratio cannot answer that — the kernel is ~40 float ops, 8
+square roots, 12 divisions, a dozen selects and one packed store per pixel,
+and any one of them could carry the factor.
+`bench-gpu/RayTracerCpuAblation.java` isolates each construct the kernel
+actually contains, over the same arrays at the same length (2,764,800) with
+the same loop shape. `bench-gpu/run-cpu-ablation.sh` alternates the two VMs
+and keeps the minimum per construct across rounds, on a host gated quiet.
+Four rounds of best-of-12, ns per element:
+
+| construct | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| 6 x `Math.min(float,float)` | 3.297 | 7.226 | **2.19x** |
+| 4 float divisions | 1.226 | 5.350 | 4.36x |
+| 4 compare-and-select ternaries | 1.082 | 5.145 | 4.76x |
+| 4 x `(float) Math.sqrt` | 1.534 | 8.689 | 5.66x |
+| `out[i] = a[i] + b[i]` (memory floor) | 0.214 | 1.516 | 7.08x |
+| clamp + `f2i` + shifts + `int` store | 0.360 | 3.629 | 10.08x |
+| 8 chained `x*k + y` | 0.246 | 8.378 | **34.06x** |
+
+**The table is sorted by ratio, and that sort is the answer: it is also the
+order of how much of each loop HotSpot's vectorizer can take.**
+
+At the bottom, `Math.min(float,float)` at **2.19x** — the one construct
+HotSpot cannot vectorise, because Java's NaN and signed-zero rules are not
+what `MINPS` implements (the same two rules §8b had to reproduce by hand for
+the scalar intrinsic). That is what CratonVM's scalar float code costs
+against HotSpot's scalar float code.
+
+At the top, the multiply-add chain at **34x** — and look at HotSpot's own
+column rather than the ratio. Eight multiply-adds per element cost HotSpot
+0.246 ns, against 0.214 ns for a loop that does no arithmetic at all. It is
+not computing them 34 times faster than CratonVM; it is computing eight of
+them per lane of a vector register, on a loop that was already
+memory-bound, for free. CratonVM's 8.378 ns is 5.5x its own memory floor,
+which is what actually doing the arithmetic costs.
+
+So the profile reads:
+
+* **~2.2x is CratonVM's scalar float code.** That is the irreducible part
+  visible where the semantics switch HotSpot's vectoriser off.
+* **Everything from 4.4x to 34x is auto-vectorisation CratonVM does not
+  do.** Nothing here is a single slow construct of the kind `Math.min` was
+  in §8b. There is no second `Math.min` to find; the next move on this path
+  is a vectoriser, which is a different project.
+
+That the whole-kernel ratio is 5.3x rather than 34x is consistent with
+both: the real kernel's per-pixel branches and dependent chains stop
+HotSpot's vectoriser doing to it what it does to the ablation's cleanest
+loop, so the gap it opens on the real thing lands between the two ends of
+this table.
+
+## 13.8 TornadoVM's own divergence: not ours, and already named as far as it can be
+
+§9 carried "TornadoVM's own GPU-vs-Java divergence (§6) is reported, not
+diagnosed". §6 does in fact name the mechanism at instruction level, from
+`tornado --printKernel`: 42 `mad.rn.f32` (a fused multiply-add where the
+JLS requires two roundings — the same defect this record found and fixed in
+CratonVM's own lowerer, §2), 12 `div.full.f32` (the ~2 ULP approximate
+divide where Java requires correctly-rounded, and where CratonVM emits
+`div.rn.f32`), and `min.f32` (which implements neither Java's NaN rule nor
+its signed-zero rule — the same two rules §8b had to hand-build).
+
+What is left is attributing those to lines of a third-party backend's
+compiler, which is TornadoVM's to do and is not diagnosable from outside
+it. Reconfirmed at 11520x6480 in §13.1: TornadoVM's checksum is
+196463340438801 where CratonVM's and HotSpot's agree at 196463343925950.
+
+**Closed as out of scope.** The correctness claim this record makes is
+about CratonVM's output against HotSpot, and that claim is now verified
+bit-for-bit at every resolution from 160x120 to 11520x6480. The TornadoVM
+column is a throughput comparison against a computation that produces a
+different answer, and every table here says so.

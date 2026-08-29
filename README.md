@@ -82,8 +82,10 @@ kernel is the reduced proxy (`bench-gpu/RayTracerKernel.java`), documented in
 not the full `apps/TornadoVM-Ray-Tracer` app (whose real kernel — reflections,
 soft shadows, a skybox — needs dynamic-length scene loops neither engine's
 analyzer admits yet). The margin over TornadoVM shrinks with resolution
-(2.5x → 2.2x → 2.0x) as CratonVM's fixed per-launch cost advantage amortises
-away, leaving a smaller but still consistent per-pixel-throughput edge.
+(2.5x → 2.2x → 2.0x → 1.85x, the last at 11520×6480 / 74.6M pixels, 6/6
+rounds) as CratonVM's fixed per-launch cost advantage amortises away,
+leaving a smaller but still consistent per-pixel-throughput edge. Every
+frame from 160×120 to 11520×6480 is bit-identical to HotSpot's.
 
 Unlike TornadoVM, the supported automatic path needs no `@Parallel`
 annotations or TaskGraph API — within a deliberately narrow eligibility
