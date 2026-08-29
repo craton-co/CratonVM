@@ -22583,34 +22583,47 @@ fn native_arrays_fill_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let arr = *arr;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     // A null value stores into any reference array, and a component type of
-    // `java/lang/Object` accepts everything; both short-circuit.
-    if let Value::Object(Some(v)) = val {
-        let comp = ctx.class_id_of_object(arr);
-        let actual = ctx.class_id_of_object(v);
-        let exact_admits = actual == comp
-            || ctx.is_subclass(actual, comp)
-            || ctx.class_name_of_id(comp).as_deref() == Some("java/lang/Object");
-        // The exact check above compares `arr`'s own reported class id against
-        // `v`'s, which is wrong whenever the component itself has no ordinary
-        // class id to compare against -- e.g. a `char[][]`'s component is the
-        // primitive array class `char[]`, which `class_id_of_object` cannot
-        // resolve the same way for the array (`arr`) and the value (`v`).
-        // Fall back to the shared, hardened JVMS aastore covariance predicate --
-        // already used by `java.lang.reflect.Array.set` for the identical
-        // "may this be stored into a reference array" question (see
-        // `reflect_array_element_assignable` in native-builtins/src/lib.rs) --
-        // before refusing. MEASURED: `Arrays.fill((Object[]) new char[3][],
-        // new char[]{'a'})` incorrectly threw `ArrayStoreException:
-        // java.lang.Object` under CratonVM while HotSpot filled it fine
-        // (`sun.nio.cs.HKSCS$Encoder.initc2b`'s `Arrays.fill(c2b,
-        // C2B_UNMAPPABLE)` hit exactly this, breaking every real
-        // `Big5-HKSCS`/`MS950_HKSCS`/etc. charset's static init).
-        if !exact_admits && !ctx.aastore_element_assignable(arr, v).unwrap_or(false) {
-            return Err(RuntimeError::ArrayStoreException {
-                message: ctx.class_name_of_id(actual).unwrap_or_default(),
-            }
-            .into());
-        }
+    // `java/lang/Object` accepts everything; `reject_unstorable` short-circuits
+    // both.
+    //
+    // THE `ClassId` COMPARISON THIS REPLACES WAS WRONG IN BOTH DIRECTIONS, and
+    // the fix arrived in two halves. The first half kept an exact
+    // `class_id_of_object(arr) == class_id_of_object(v)` test and only
+    // *consulted* the shared predicate when it failed, because on a REFERENCE
+    // ARRAY the header's class id holds the COMPONENT class -- so a `char[][]`'s
+    // component is the primitive array class `char[]`, which the two sides
+    // cannot report the same way. MEASURED: `Arrays.fill((Object[]) new
+    // char[3][], new char[]{'a'})` threw `ArrayStoreException:
+    // java.lang.Object` here while HotSpot filled it fine
+    // (`sun.nio.cs.HKSCS$Encoder.initc2b`'s `Arrays.fill(c2b, C2B_UNMAPPABLE)`
+    // hit exactly this, breaking every real `Big5-HKSCS`/`MS950_HKSCS`/etc.
+    // charset's static init).
+    //
+    // That half left two defects standing, both of them the SAME root cause
+    // wearing different clothes:
+    //
+    //  * `unwrap_or(false)` made the fallback fail CLOSED. `None` is "this
+    //    context models no hierarchy", which is the one answer that must never
+    //    become a refusal -- the shared predicate's whole contract is that it
+    //    is ADDITIVE and never manufactures a false `ArrayStoreException`.
+    //  * the REFUSAL MESSAGE named `class_id_of_object(v)`, i.e. the component
+    //    again, so an array-valued element was reported one dimension short.
+    //    That is how the hibernate-reactive failure was identifiable at all:
+    //    `ArrayStoreException: org.hibernate.sql.results.graph.Initializer`
+    //    names an INTERFACE, and no instance can ever have an interface as its
+    //    class.
+    //
+    // `reject_unstorable` is the one place a native's store rule lives: the
+    // shared predicate, failing open on `None`, with `aastore`'s own external
+    // name of the VALUE. `StoreRoute::Aastore` because the JDK's
+    // `Arrays.fill(Object[], Object)` is a plain `a[i] = val` loop.
+    if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+        ctx,
+        arr,
+        val,
+        cratonvm_native_api::array_store::StoreRoute::Aastore,
+    ) {
+        return Err(e);
     }
     let len = ctx.array_length(arr);
     for i in 0..len {
