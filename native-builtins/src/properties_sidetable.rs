@@ -2477,6 +2477,12 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // refreshes `this` through its own pin, but `args` still holds the
     // PRE-COLLECTION receiver, so the `cloneHashtable()` step below is handed
     // the refreshed reference rather than `args`.
+    //
+    // The same fix landed independently from the L3 lane as `c5f66112d`, which
+    // records the history worth keeping: this function and that witness each
+    // landed green from a different lane and only met in a merge. Its code half
+    // is superseded here — it kept passing `args` to `native_object_clone`
+    // below, which is the stale receiver described above.
     let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
@@ -2566,6 +2572,9 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let func_pin = ctx.pin_native_root(func);
     let entries = ordered_snapshot_kv(ctx, &mut this);
     let func = ctx.read_native_pin(func_pin, func);
+    //
+    // Superseding `c5f66112d`'s half of the same fix, which pinned `func` AFTER
+    // this call rather than before it — that is the window described above.
     if entries.is_empty() {
         ctx.unpin_native_roots(func_pin);
         return Ok(None);

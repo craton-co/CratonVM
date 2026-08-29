@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1225;
+const BASELINE_TOTAL_DRIFT: usize = 1224;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1358;
+const BASELINE_TOTAL_PAIRS: usize = 1357;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -2633,7 +2633,15 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_unsafe_define_class",
         &[
-            ("jdk/internal/misc/Unsafe", "defineAnonymousClass", "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;"),
+            // `defineAnonymousClass` was here until 2026-08-29. It drifted
+            // because TWO registrars gave the triple two bodies; both were
+            // RETIRED, so it no longer drifts for the reason a stale row
+            // usually does -- it is registered nowhere at all. The method is
+            // absent from JDK 17, 21 and 25, the synthetic-JDK mode does not
+            // declare it either, and it took 0 invocations across 118 corpus
+            // vectors in both modes. Deliberately NOT moved to
+            // FIXED_NOT_DRIFTING: that bucket asserts a surviving body serves
+            // the triple in both modes, and there is no surviving body.
             ("jdk/internal/misc/Unsafe", "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
         ],
     ),

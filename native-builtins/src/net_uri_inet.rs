@@ -1709,6 +1709,16 @@ pub(crate) fn uri_ipv6_authority_fail(s: &str) -> Option<UriParseFail> {
 
 /// Build the `java.net.URISyntaxException` for a [`UriParseFail`], choosing the
 /// two- or three-argument constructor exactly as the JDK's `fail` overloads do.
+/// [`uri_syntax_exception`] for callers outside this module — `URI`'s natives
+/// live in `net_phase_e` and need the same exception shape.
+pub(crate) fn uri_syntax_exception_pub(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    fail: &UriParseFail,
+) -> Option<MethodCallFailed> {
+    uri_syntax_exception(ctx, input, fail)
+}
+
 fn uri_syntax_exception(
     ctx: &mut dyn NativeContext,
     input: &str,
@@ -1738,6 +1748,178 @@ fn uri_syntax_exception(
     match built {
         Ok(Some(Value::Object(Some(exc)))) => Some(MethodCallFailed::ExceptionThrown(exc)),
         _ => None,
+    }
+}
+
+/// The index at which `java.net.URI` would throw
+/// `URISyntaxException("Expected closing bracket for IPv6 address", index)`.
+///
+/// An IPv6 literal in the authority must be `[` <non-empty> `]`. MEASURED
+/// 2026-08-13 (/tmp/W.java) — both of these are `URISyntaxException` on HotSpot
+/// and were once accepted here, i.e. a malformed URI parsed clean:
+///
+/// ```text
+///   new URI("http://[::1/")  Expected closing bracket for IPv6 address at index 11
+///   new URI("http://[]/")    Expected closing bracket for IPv6 address at index 8
+/// ```
+///
+/// The reported index is where the address parse stopped: the end of the
+/// authority when the `]` is missing, and the position just past `[` when the
+/// body is empty. `http://[fe80::1]/` and `http://[::1]:80/` stay legal.
+///
+/// **This is a FUNCTION because the rule had two doors and only one of them
+/// enforced it.** It was written inline in `native_uri_init`, so `URI.create`
+/// — which is `new URI(str)` with the checked exception translated — could not
+/// reach it: `URI.create("http://[::1/a")` returned a URI where the constructor
+/// threw. MEASURED by `apps/probes/UriRecompositionSweep.java`.
+pub(crate) fn uri_closing_bracket_fail_index(s: &str) -> Option<usize> {
+    let open = s.find("://").map(|i| i + 3)?;
+    let auth_end = s[open..]
+        .find(['/', '?', '#'])
+        .map(|r| open + r)
+        .unwrap_or(s.len());
+    let auth = &s[open..auth_end];
+    let br = auth.find('[')?;
+    let abs_br = open + br;
+    match s[abs_br + 1..auth_end].find(']') {
+        None => Some(auth_end),
+        Some(0) => Some(abs_br + 1),
+        Some(_) => None,
+    }
+}
+
+/// The `UriParseFail` `java.net.URI.parseServerAuthority()` raises, or `None`
+/// when the authority really is server-based (or there is none at all, which
+/// the JDK treats as success).
+///
+/// MEASURED against HotSpot 25.0.4+7 — the index is the offending character's
+/// own position, and the two reasons are distinct:
+///
+/// ```text
+///   URI.create("http://host:x/a").parseServerAuthority()
+///     Illegal character in port number at index 12
+///   URI.create("http://ho_st/a").parseServerAuthority()
+///     Illegal character in hostname at index 9
+///   URI.create("http://host:99999/a")  accepted — there is NO range check
+///   URI.create("urn:x:y")              accepted — opaque, no authority
+///   URI.create("//host/a")             accepted — authority without a scheme
+/// ```
+///
+/// The host character set is deliberately NARROW rather than a full hostname
+/// grammar: it refuses what is outside `[A-Za-z0-9.-]`, which is what separates
+/// a registry-based authority from a server-based one for every shape measured,
+/// and refusing a URI the JDK accepts is the worse half of this bug (the same
+/// reasoning `uri_first_char_fault`'s bracket exemption records). A bracketed
+/// IPv6 host is skipped entirely — the constructor has already validated it.
+pub(crate) fn uri_server_authority_fail(s: &str) -> Option<UriParseFail> {
+    // The authority begins after `//`, with or without a scheme.
+    let after_scheme = match s.find("://") {
+        Some(i) => i + 3,
+        None if s.starts_with("//") => 2,
+        None => return None,
+    };
+    let auth_end = s[after_scheme..]
+        .find(['/', '?', '#'])
+        .map(|r| after_scheme + r)
+        .unwrap_or(s.len());
+    if auth_end == after_scheme {
+        return None;
+    }
+    // `parseServer` takes the userinfo off first: `scan(p, n, "/?#", "@")`.
+    let host_start = s[after_scheme..auth_end]
+        .find('@')
+        .map(|i| after_scheme + i + 1)
+        .unwrap_or(after_scheme);
+    if s.as_bytes().get(host_start) == Some(&b'[') {
+        return None;
+    }
+    // The port is whatever follows the LAST `:` of the host region.
+    let host_end = s[host_start..auth_end]
+        .rfind(':')
+        .map(|i| host_start + i)
+        .unwrap_or(auth_end);
+    for (i, c) in s[host_start..host_end].char_indices() {
+        if !(c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            return Some(UriParseFail::at(
+                "Illegal character in hostname",
+                host_start + i,
+            ));
+        }
+    }
+    if host_end < auth_end {
+        for (i, c) in s[host_end + 1..auth_end].char_indices() {
+            if !c.is_ascii_digit() {
+                return Some(UriParseFail::at(
+                    "Illegal character in port number",
+                    host_end + 1 + i,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Returns the index at which `java.net.URI`'s parser would throw
+/// `URISyntaxException("Expected authority", index)`, or `None`.
+///
+/// `Parser.parseHierarchical` scans the authority region and then branches
+/// three ways, and only the third is a failure:
+///
+/// ```text
+///   p += 2;                          // past the "//"
+///   int q = scan(p, n, "", "/?#");
+///   if (q > p)      parseAuthority(p, q);   // a real authority
+///   else if (q < n) { /* DEVIATION: empty authority before a non-empty
+///                        path, query or fragment is ALLOWED */ }
+///   else            failExpecting("authority", p);
+/// ```
+///
+/// So an empty authority is legal exactly when something follows it. `http://`
+/// and `file://` and the bare relative `//` have nothing following, and the JDK
+/// rejects all three; `http:///a`, `http://?q` and `http://#f` are accepted.
+/// This VM accepted the first three as well, and then answered for them — the
+/// probe row `[file://] path` was `""` against HotSpot's
+/// `THREW java.net.URISyntaxException`, and twenty-one more accessors beside
+/// it, three specs deep: **66 of `UriRecompositionSweep`'s 111 differing rows.**
+///
+/// The index is the position just past the `//`, which is what
+/// `failExpecting("authority", p)` reports.
+pub(crate) fn uri_expected_authority_fail_index(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    // Where the hierarchical part starts: after `scheme:` if there is a
+    // well-formed scheme, else at 0 for a relative reference.
+    let start = {
+        let mut end = None;
+        for (i, c) in b.iter().enumerate() {
+            if *c == b':' {
+                if i > 0
+                    && b[0].is_ascii_alphabetic()
+                    && b[..i]
+                        .iter()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+                {
+                    end = Some(i);
+                }
+                break;
+            }
+            if !(c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')) {
+                break;
+            }
+        }
+        end.map(|i| i + 1).unwrap_or(0)
+    };
+    if b.len() < start + 2 || b[start] != b'/' || b[start + 1] != b'/' {
+        return None;
+    }
+    let p = start + 2;
+    let q = s[p..]
+        .find(['/', '?', '#'])
+        .map(|r| p + r)
+        .unwrap_or(s.len());
+    if q == p && q == s.len() {
+        Some(p)
+    } else {
+        None
     }
 }
 
@@ -1864,20 +2046,9 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // The reported index is where the address parse stopped: the end of the
     // authority when the `]` is missing, and the position just past `[` when the
     // body is empty. `http://[fe80::1]/` and `http://[::1]:80/` stay legal.
-    if let Some(open) = url_str.find("://").map(|s| s + 3) {
-        let auth_end = url_str[open..]
-            .find(['/', '?', '#'])
-            .map(|r| open + r)
-            .unwrap_or(url_str.len());
-        let auth = &url_str[open..auth_end];
-        if let Some(br) = auth.find('[') {
-            let abs_br = open + br;
-            let rest = &url_str[abs_br + 1..auth_end];
-            let bad = match rest.find(']') {
-                None => Some(auth_end),
-                Some(0) => Some(abs_br + 1),
-                Some(_) => None,
-            };
+    {
+        let bad = uri_closing_bracket_fail_index(&url_str);
+        {
             if let Some(pos) = bad {
                 let input = ctx.create_string(&url_str);
                 let reason = ctx.create_string("Expected closing bracket for IPv6 address");
@@ -1986,6 +2157,16 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             if let Some(exc) = uri_syntax_exception(ctx, &url_str, &fail) {
                 return Err(exc);
             }
+        }
+    }
+    // Reject `scheme://` and a bare `//` — an empty authority with NOTHING
+    // after it. See [`uri_expected_authority_fail_index`] for the JDK's
+    // three-way branch and the sixty-six probe rows this was worth.
+    if let Some(pos) = uri_expected_authority_fail_index(&url_str) {
+        if let Some(exc) =
+            uri_syntax_exception(ctx, &url_str, &UriParseFail::at("Expected authority", pos))
+        {
+            return Err(exc);
         }
     }
     // Reject an absolute URI with an empty scheme-specific part (`file:`,
