@@ -246,7 +246,7 @@ failure, so it is usable as a bisect target. The same command against
   bears out.
 - `docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
   — the `--Xmx 256m` row this page could not close, moved out unabridged.
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the ZGC relocation work whose binary the arms above were A/B'd against.
 - `docs/known-issues/h2/correctness-issues-consolidated.md` — indexes this
   finding alongside the rest of the 48-class union's correctness results.

@@ -72,7 +72,7 @@ because of the high-end compactor, and saying so is the point of printing them.
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the parent page: the whole diagnosis, the three repairs, and the H2
   measurements.
 - `docs/known-issues/gc/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`

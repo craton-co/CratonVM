@@ -62,7 +62,7 @@ CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of, and the differential that separated them.
 - `docs/known-issues/h2/correctness-issues-consolidated.md` — the index this
   class appears in.

@@ -83,7 +83,7 @@ Two rows in this group are *not* at the cap and still lost: `TestKillProcessWhil
 > found and fixed on 2026-08-29 (the slide discarding what it emptied, the
 > large-object end never being compacted, and the TLAB refill floor spending
 > that end's reserve). See
-> `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+> `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
 > for the whole measurement chain. The lesson is the one §2b
 > already states, applied to §2a: a row that finishes and fails deserves the
 > mechanism to be read before it is filed under the throughput story.

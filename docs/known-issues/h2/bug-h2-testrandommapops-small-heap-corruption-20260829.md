@@ -88,7 +88,7 @@ the failure is a GC/JIT schedule, not a function of the operation sequence.
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-classcastexception-20260821-RETIRED-20260829.md`
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testrandommapops-classcastexception-20260821-RETIRED-20260829.md`
   — the parent page, with the G1 fix and the eleven-run non-reproduction.
 - `docs/known-issues/gc/G30-1-the-silent-reference-slot-coercion-20260817.md`
   — the WARN family this may or may not belong to. The parent page's own
