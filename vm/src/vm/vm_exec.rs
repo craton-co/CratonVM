@@ -2801,6 +2801,35 @@ fn prefers_exact_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/foreign/DowncallHandle"
 }
 
+/// Whether this dispatch should publish its CALL-SITE descriptor on
+/// [`cratonvm_native_api::poly_call_site`] for the native it is about to run.
+///
+/// Two names need it, for two different reasons:
+///
+/// * `invoke` -- its collect-or-passthrough answer for a trailing `null`
+///   depends on the type the caller WROTE, and a `null` carries no runtime
+///   type. This is the original consumer the channel was built for.
+/// * `invokeExact` -- the rule that the call site must match the handle's
+///   `type()` EXACTLY is a statement about the call site, so the check cannot
+///   be made anywhere that cannot see it. See
+///   `lang_invoke::exact_call_site_refusal`.
+///
+/// `java/lang/foreign/DowncallHandle` is excluded from the `invokeExact` arm on
+/// purpose. Its `invokeExact` resolves to Panama's OWN native, not
+/// `MethodHandle`'s, and that native does not TAKE the channel -- an armed
+/// descriptor it left behind would be read by a later dispatch as its own, and
+/// the module doc is explicit that a WRONG call-site type is worse than none.
+pub(crate) fn arms_poly_call_site(class_name: &str, method_name: &str) -> bool {
+    match method_name {
+        "invoke" => is_method_handle_signature_polymorphic_receiver(class_name),
+        "invokeExact" => {
+            is_method_handle_signature_polymorphic_receiver(class_name)
+                && !prefers_exact_signature_polymorphic_receiver(class_name)
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
@@ -18512,16 +18541,17 @@ pub fn invoke_or_native(
         cratonvm_native_api::registry::lookup_census::INVOKE_GENERAL,
     );
     dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
-    // Publish the CALL-SITE descriptor for `MethodHandle.invoke`, whose
-    // collect-or-passthrough answer for a trailing `null` depends on the type
-    // the caller WROTE and on nothing observable at dispatch. See
-    // `cratonvm_native_api::poly_call_site`.
+    // Publish the CALL-SITE descriptor for the two signature-polymorphic names
+    // that cannot do their job without it. `arms_poly_call_site` owns WHICH,
+    // and why, so this site and the two others cannot drift apart: `invoke`
+    // needs the type the caller WROTE to decide collect-or-passthrough for a
+    // trailing `null`, and `invokeExact` needs it because "the call site must
+    // match the handle's type exactly" is a statement ABOUT the call site.
     //
-    // Narrowed to a MethodHandle receiver so nothing else can leave a
-    // descriptor armed, and never CLEARED here — the signature-polymorphic
-    // block in `invoke_on_class_shared_inner` owns the clearing, and this door
-    // may run before it.
-    if method_name == "invoke" && is_method_handle_signature_polymorphic_receiver(class_name) {
+    // Never CLEARED here — the signature-polymorphic block in
+    // `invoke_on_class_shared_inner` owns the clearing, and this door may run
+    // before it.
+    if arms_poly_call_site(class_name, method_name) {
         cratonvm_native_api::poly_call_site::arm(descriptor);
     }
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
@@ -26926,17 +26956,13 @@ fn invoke_on_class_shared_inner(
                         // confirm it does not flip that assertion off zero,
                         // which is a measurement this lane could not make.
                         //
-                        // Publish the CALL-SITE descriptor for the one native
-                        // that cannot decide without it —
-                        // `MethodHandle.invoke`, whose collect-or-passthrough
-                        // answer for a trailing `null` depends on the type the
-                        // caller WROTE. See
-                        // `cratonvm_native_api::poly_call_site`. Armed for
-                        // `invoke` and CLEARED for every other
-                        // signature-polymorphic name, so nothing here can leave
-                        // a stale descriptor for a later dispatch to read as
-                        // its own.
-                        if method_name == "invoke" {
+                        // Publish the CALL-SITE descriptor for the natives
+                        // that cannot decide without it. `arms_poly_call_site`
+                        // owns which names those are and why; everything else
+                        // signature-polymorphic is CLEARED, so nothing here can
+                        // leave a stale descriptor for a later dispatch to read
+                        // as its own. See `cratonvm_native_api::poly_call_site`.
+                        if arms_poly_call_site(&class_name, method_name) {
                             cratonvm_native_api::poly_call_site::arm(descriptor);
                         } else {
                             cratonvm_native_api::poly_call_site::clear();

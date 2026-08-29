@@ -285,11 +285,54 @@ of on the test result.
 
 * `RJdkEnumerations` — dev's `a0168ed03`, bisected, recorded. Expect it red in
   the strict and `all` arms.
+* `RExceptions` and `RJdkFailure` — **red on `dev` from `c6ccccbc8` (the L5
+  lane) until `L5-residuals-...-20260828.md` §6 fixed it. If you ran the arms in
+  that window you saw two reds that were not yours and are not yours to chase.**
+  Both assert the same thing: an array `ClassNotFoundException` must name the
+  ELEMENT, not the descriptor. Fixed; verify against a binary newer than that
+  fix before spending anything on them.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
+
+**And run the ARMS before you push, not only the gates.** The two vectors above
+went red on a commit whose acceptance was 20 green gate binaries. The gates are
+registration counts, conformance manifests, flag declarations and doc
+citations; a message string inside an exception raised by a native is
+behaviour, and only the corpus runs behaviour. The two instruments are
+disjoint, and each has now landed a red on `dev` that the other would have
+caught.
+
+### Two reds cleared on 2026-08-28 that were nobody's lane, and one DEBT
+
+Both were on pristine `origin/dev`, so every lane running gates hit them:
+
+* **`cargo test -p cratonvm-native-builtins --doc`** — `a07dd621c` documented
+  the old `Arrays` code inside a ```rust fence. Rustdoc COMPILES those. Retagged
+  ```text. If you write a doc comment quoting code that no longer exists, the
+  fence language is load-bearing.
+* **`cargo test -p cratonvm-vm --lib runtime::resolve::guard`** — three guards,
+  one cause. `1dbbe2b36` (JIT final-devirtualisation) added
+  `invokevirtual_site_final_owner` to `interpreter/invoke.rs` without touching
+  its `ALLOWED` row.
+
+**The second one left a debt I am flagging rather than burying.** Clearing it
+meant raising `the_split_did_not_change_the_interpreter_budget` from 29 to 30 —
+and that guard's own doc says "a migration lowers them; **nothing raises
+them**". I raised a one-way ratchet belonging to a lane that is not mine,
+because the alternative was leaving `cargo test -p cratonvm-vm` red for
+everyone. Both numbers carry the provenance inline.
+
+**JIT lane: the migration is available and the debt is yours.**
+`MemberResolver::declared_method(cm, owner, name, descriptor)` does the same
+recursive walk, caches it in the `link_resolver` and returns the declaring
+`ClassId` plus the method index — what that site wants. It returns `Result`
+where the site wants `Option` and it caches where the site does not, so it is a
+change to a JIT fast path that should be made and MEASURED by whoever can price
+the `612 ir-direct-call MISSED` claim. When you do, the row goes back to 3 and
+the budget to 29.
 
 ### dev's tip is frequently red
 

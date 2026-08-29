@@ -12614,6 +12614,368 @@ fn build_varargs_array(
 
 /// Extract the return type descriptor from a method descriptor.
 /// e.g. "(II)I" → "I", "(Ljava/lang/String;)V" → "V"
+// ---------------------------------------------------------------------------
+// `invokeExact` -- the CALL SITE must match the handle's type exactly
+// ---------------------------------------------------------------------------
+
+/// Kill switch for the two rules below. Deliberately the SAME declared name the
+/// return-value half already uses (`vm_exec::mh_strict_invokeexact`,
+/// `CRATONVM_COMPAT=mh-strict-invokeexact`), because it is the same rule seen
+/// from the other end -- one switch turns `invokeExact` strictness off wherever
+/// it is enforced. Set the exact string `0` to restore the pre-2026-08-28
+/// permissive dispatch.
+///
+/// Latches, like every declared flag: exporting the variable before launching
+/// the process is the only way to set it.
+///
+/// **What it does NOT revert, measured rather than assumed.** Setting it to `0`
+/// restores every REFUSAL to the permissive answer — `invokeExact` accepts a
+/// mismatched call site again, a null receiver answers `0` again, `invoke`
+/// accepts a narrowing argument again. It does NOT revert
+/// [`box_return_against_target`], and deliberately: `(long) max.invoke(1, 2)`
+/// answers `2` with the switch off as well as on. That is a wrong VALUE being
+/// corrected, not a rule being enforced, and there is no state of the world in
+/// which a caller wants the fabricated zero back. A kill switch for a
+/// strictness rule should not carry an unrelated correction out with it.
+fn mh_strict_exact_signature() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_MH_STRICT_INVOKEEXACT").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// The `MH_KIND_*` values whose `type` field is written from a resolved
+/// member's OWN descriptor, and is therefore an authoritative statement of what
+/// the handle's signature is.
+///
+/// **This allowlist is the whole safety argument, so it is worth being exact
+/// about what the recorded objection did and did not say.** The `invokeExact`
+/// registration below has carried a warning since a strict ARITY check there
+/// aborted the VM and killed every Groovy `IndyInterface` call site
+/// ("expected 2 args, got 1"). That check read `MH_DESC` -- the raw bytecode
+/// descriptor -- and `MH_DESC` is genuinely unusable for this: the adapter
+/// kinds keep their inner target's, and it omits the receiver that a virtual
+/// handle's `type` prepends. The check below reads `type` instead, which
+/// `mh_type_descriptor` documents as the ADAPTED MethodType that "combinators
+/// must chain off so a stack of adapters tracks arity correctly".
+///
+/// That is a good reason to believe the adapters would survive a check too. It
+/// is not a measurement, and the failure mode on the other side is a refusal of
+/// working code on Groovy's hot path, so the adapters stay out until someone
+/// runs them. What is in: the six kinds `finish_method_handle` builds, with the
+/// two HotSpot adjustments it applies (receiver prepended for virtual/special,
+/// the constructed class as a constructor's return). `bindTo` and `asType`
+/// preserve the direct kind AND restamp `type`, so a bound or retyped direct
+/// handle IS checked -- against its restamped signature, which is the correct
+/// one.
+///
+/// **The field accessors are IN, and it took a measurement to say so.** I first
+/// excluded `MH_KIND_GETTER`/`MH_KIND_SETTER` after reading
+/// `finish_method_handle`'s own comment -- "STATIC/CONSTRUCTOR/GETTER keep raw
+/// `desc`", where VIRTUAL and SPECIAL get the receiver prepended -- and
+/// concluding that an instance `findGetter` handle must report `()int` where
+/// HotSpot reports `(Box)int`, which would make this check refuse the correct
+/// call at `regression-suite/src/RJdkHandles.java:159`.
+///
+/// It does not. `findGetter`'s raw `desc` ALREADY names the receiver, so there
+/// is nothing to prepend, and CratonVM renders `(Box)int` / `(Box,int)void` /
+/// `()int` for an instance getter, an instance setter and a static getter --
+/// byte-identical to the oracle (`probes/L5ModuleInvokeSweep.java`,
+/// `ie.type.getter` / `ie.type.setter` / `ie.type.sget`). The comment is about
+/// a prepend that would be redundant, not about a signature that is short.
+/// Reading it as a claim about `type` cost two rows the check can make.
+fn kind_has_authoritative_type(kind: i32) -> bool {
+    matches!(
+        kind,
+        MH_KIND_STATIC
+            | MH_KIND_VIRTUAL
+            | MH_KIND_SPECIAL
+            | MH_KIND_CONSTRUCTOR
+            | MH_KIND_GETTER
+            | MH_KIND_SETTER
+    )
+}
+
+/// The handle's declared signature, read from the `type` field ONLY.
+///
+/// Never `mh_type_descriptor`, whose `MH_DESC` fallback would hand back a
+/// virtual handle's receiver-less descriptor and make every correct call look
+/// like an arity mismatch. Same rule as `bindTo`'s leading-parameter guard: no
+/// `type`, or one whose mirrors do not render, means the signature is UNKNOWN,
+/// and an unknown signature is an accept.
+fn mh_declared_descriptor(ctx: &mut dyn NativeContext, mh: ObjectRef) -> Option<String> {
+    match ctx.get_field_by_name(mh, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt),
+        _ => None,
+    }
+}
+
+/// The `NullPointerException` an UNBOUND virtual or special handle must raise
+/// when its receiver argument is null, or `None`.
+///
+/// `findVirtual(String.class, "length", ()int).invokeExact((String) null)`
+/// answers `0` here and throws NPE on HotSpot -- and `0` is `length()`'s
+/// ordinary answer for the empty string, so the caller cannot tell the failed
+/// call from a real one. Same shape as the `Field.getAnnotation(null)` defect
+/// in this campaign: a null answer that is ALSO the method's legitimate answer.
+///
+/// Restricted to `MH_KIND_VIRTUAL`/`MH_KIND_SPECIAL` with no `MH_BOUND`, which
+/// is exactly the `needs_receiver && !has_bound` condition `invoke` already
+/// uses to decide that `extra[0]` is a receiver and not a descriptor
+/// parameter. A GETTER/SETTER is deliberately out: those kinds cover the
+/// STATIC field accessors too, and this cannot tell which from the kind alone.
+fn null_receiver_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    kind: i32,
+    extra: &[Value],
+) -> Option<MethodCallFailed> {
+    if !mh_strict_exact_signature() {
+        return None;
+    }
+    if !matches!(kind, MH_KIND_VIRTUAL | MH_KIND_SPECIAL) {
+        return None;
+    }
+    if matches!(ctx.get_field(mh, MH_BOUND), Value::Object(Some(_))) {
+        return None;
+    }
+    if !matches!(extra.first(), Some(Value::Object(None))) {
+        return None;
+    }
+    Some(
+        RuntimeError::NullPointerException {
+            message: Some(format!(
+                "MethodHandle receiver is null for {}.{}",
+                mh_read_class(ctx, mh).unwrap_or_default().replace('/', "."),
+                mh_read_name(ctx, mh).unwrap_or_default()
+            )),
+        }
+        .into(),
+    )
+}
+
+/// The `WrongMethodTypeException` `mh.invokeExact(...)` must raise when the
+/// call site's symbolic descriptor is not IDENTICAL to the handle's type, or
+/// `None`.
+///
+/// `invokeExact` performs no conversion at all -- no widening, no boxing, no
+/// `asType` (JLS 15.12.3, `java.lang.invoke.MethodHandle`). `invoke` is the
+/// opposite and must never reach here; `invokeBasic` and the `VarHandle`
+/// accessors are likewise permissive.
+///
+/// Measured against jdk-25.0.3.9-hotspot (`probes/L5ModuleInvokeSweep.java`):
+/// before this, `findStatic(Math,"max",(int,int)int).invokeExact` accepted
+/// `(long,long)`, `(short,short)`, `(byte,byte)`, `(char,char)`,
+/// `(Integer,Integer)` and `(int,long)` arguments, an `Object`/`Integer`/`void`
+/// return, and -- the shape hardest to explain away -- ONE argument and THREE,
+/// answering `1` and `2` rather than throwing. A handle for `String.length()`
+/// answered 4 for an `(Object)` and a `(CharSequence)` receiver. Every one of
+/// those is the exact case `invokeExact` exists to refuse: a caller reaches for
+/// it over `invoke` precisely to be told when the signature has drifted.
+///
+/// Every way of not knowing is an accept -- unknown kind, no `type`, either
+/// descriptor unparseable, either signature unrenderable.
+fn exact_call_site_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    kind: i32,
+    call_site: &str,
+) -> Option<MethodCallFailed> {
+    if !mh_strict_exact_signature() || !kind_has_authoritative_type(kind) {
+        return None;
+    }
+    let declared = mh_declared_descriptor(ctx, mh)?;
+    if declared == call_site {
+        return None;
+    }
+    // `finish_method_handle` writes a FABRICATED `()V` whenever no usable
+    // descriptor was supplied ("C21: Always populate `type`"), so that
+    // JDK-internal walks never read a null MethodType. That is a stand-in for
+    // "unknown", not a claim that the handle takes nothing and returns nothing
+    // -- and treating it as one would turn every such handle into a throw at
+    // its first real call site. Unknown is an accept, here as everywhere else
+    // in this check.
+    if declared == "()V" && call_site != "()V" {
+        return None;
+    }
+    // Both must be well-formed before a difference between them means anything.
+    let shown_declared = method_type_display(&declared)?;
+    let shown_site = method_type_display(call_site)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("expected {shown_declared} but found {shown_site}"),
+    ))
+}
+
+/// The primitive descriptor char of a single descriptor token, or `None` for a
+/// reference or array type.
+fn primitive_char(token: &str) -> Option<u8> {
+    let b = token.as_bytes();
+    match (b.len(), b.first()) {
+        (1, Some(c @ (b'B' | b'S' | b'C' | b'I' | b'J' | b'F' | b'D' | b'Z'))) => Some(*c),
+        _ => None,
+    }
+}
+
+/// JLS 5.1.2 widening primitive conversion: can `from` reach `to` without a
+/// cast? `boolean` reaches nothing and nothing reaches it.
+fn primitive_widens(from: u8, to: u8) -> bool {
+    if from == to {
+        return true;
+    }
+    let reach: &[u8] = match from {
+        b'B' => b"SIJFD",
+        b'S' | b'C' => b"IJFD",
+        b'I' => b"JFD",
+        b'J' => b"FD",
+        b'F' => b"D",
+        _ => b"",
+    };
+    reach.contains(&to)
+}
+
+/// The `WrongMethodTypeException` `mh.invoke(...)` must raise when a call-site
+/// PRIMITIVE argument would have to NARROW to reach the handle's declared
+/// parameter, or `None`.
+///
+/// `invoke` is `asType(callSiteType)` followed by an exact invocation, and
+/// `asType` performs the method-invocation conversions -- which include
+/// widening but NOT narrowing. `(int) findStatic(Math,"max",(int,int)int)
+/// .invoke(1L, 2L)` is a `WrongMethodTypeException` on HotSpot; here it
+/// answered `0`, so the missing refusal came with a wrong VALUE attached.
+///
+/// **Primitive positions only, and that restriction is the safety argument.**
+/// The reference half of this conversion is a `cast`, i.e. an assignability
+/// question, and `bindTo`'s in-tree note records why that is not yet safe: the
+/// only predicate `NativeContext` offers is `is_subclass`, which answers FALSE
+/// for a fabricated stand-in against a real JDK interface, and `bindTo` sits on
+/// the Groovy-indy / SpEL / log4j paths where interfaces and subtypes are the
+/// norm. A false `ClassCastException` there refuses working code. A primitive
+/// pair needs no hierarchy at all: both sides are single descriptor chars and
+/// the conversion table is closed, so this cannot be wrong for a reason outside
+/// its own two lines.
+///
+/// Arity is deliberately not this rule's business -- a length mismatch means
+/// the two descriptors are not describing the same call and every positional
+/// comparison below would be meaningless, so it returns `None` and leaves
+/// whatever handles arity to handle it.
+fn invoke_narrowing_arg_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    kind: i32,
+    call_site: &str,
+) -> Option<MethodCallFailed> {
+    if !mh_strict_exact_signature() || !kind_has_authoritative_type(kind) {
+        return None;
+    }
+    let declared = mh_declared_descriptor(ctx, mh)?;
+    if declared == call_site || (declared == "()V" && call_site != "()V") {
+        return None;
+    }
+    let (declared_params, _) = split_descriptor_params(&declared)?;
+    let (site_params, _) = split_descriptor_params(call_site)?;
+    if declared_params.len() != site_params.len() {
+        return None;
+    }
+    let narrows = declared_params
+        .iter()
+        .zip(site_params.iter())
+        .any(|(d, site)| match (primitive_char(d), primitive_char(site)) {
+            (Some(to), Some(from)) => !primitive_widens(from, to),
+            _ => false,
+        });
+    if !narrows {
+        return None;
+    }
+    let shown_declared = method_type_display(&declared)?;
+    let shown_site = method_type_display(call_site)?;
+    Some(crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot convert MethodHandle{shown_declared} to {shown_site}"),
+    ))
+}
+
+/// Widen `value` from the return type dispatch produced to the return type the
+/// handle DECLARES, or `None` when no widening applies.
+///
+/// **Why a retyped handle needs this at all.** `asType` here is a STAMP:
+/// `mh_with_stamped_type` clones the handle and writes the new `MethodType`
+/// into `type`, leaving `MH_DESC` -- the descriptor dispatch actually runs
+/// against -- as the leaf member's. So
+/// `findStatic(Math,"max",(int,int)int).asType((int,int)long)` ran the leaf,
+/// produced an `int`, and boxed it as `Integer` against the LEAF descriptor.
+/// The call site wanted `J`, so the return coercion downstream fabricated a
+/// zero -- and, once the strict return-type check landed, threw instead -- on a
+/// call HotSpot answers `2`. Recorded as the known blind spot in
+/// `vm_exec::mh_strict_invokeexact`'s own comment; this is the half that closes
+/// it.
+///
+/// Widening only, and only between primitives, exactly the set JLS 5.1.2
+/// permits. `byte`/`short`/`char`/`int` share `Value::Int` here, so the
+/// integral-to-integral widenings need no conversion and are absent below.
+/// Anything else -- a narrowing, a reference, a `void` -- returns `None` and
+/// leaves today's behaviour untouched.
+fn widen_return_value(value: Value, from_ret: u8, to_ret: u8) -> Option<Value> {
+    if from_ret == to_ret {
+        return None;
+    }
+    let as_i64 = |v: Value| match v {
+        Value::Int(i) => Some(i64::from(i)),
+        Value::Long(l) => Some(l),
+        _ => None,
+    };
+    Some(match (from_ret, to_ret) {
+        (b'B' | b'S' | b'C' | b'I', b'J') => Value::Long(as_i64(value)?),
+        (b'B' | b'S' | b'C' | b'I', b'F') => Value::Float(as_i64(value)? as f32),
+        (b'B' | b'S' | b'C' | b'I', b'D') => Value::Double(as_i64(value)? as f64),
+        (b'J', b'F') => Value::Float(as_i64(value)? as f32),
+        (b'J', b'D') => Value::Double(as_i64(value)? as f64),
+        (b'F', b'D') => match value {
+            Value::Float(f) => Value::Double(f64::from(f)),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Apply [`widen_return_value`] to a dispatch result and re-box it against the
+/// TARGET descriptor rather than the leaf one.
+///
+/// `target` is the handle's declared type for `invokeExact` and the CALL SITE
+/// for `invoke` -- the two places the JDK's own `asType(callSiteType)` step
+/// would have performed the conversion. Falls back to today's leaf-descriptor
+/// boxing whenever the target is absent, unparseable, or not a widening.
+fn box_return_against_target(
+    ctx: &mut dyn NativeContext,
+    result: MethodCallResult,
+    leaf_desc: &str,
+    target: Option<&str>,
+) -> MethodCallResult {
+    let Some(target) = target else {
+        return auto_box_return(ctx, result, leaf_desc);
+    };
+    let from = return_type_desc(leaf_desc).as_bytes().first().copied();
+    let to = return_type_desc(target).as_bytes().first().copied();
+    let (Some(from), Some(to)) = (from, to) else {
+        return auto_box_return(ctx, result, leaf_desc);
+    };
+    if from == to {
+        return auto_box_return(ctx, result, leaf_desc);
+    }
+    match result {
+        Ok(Some(value)) => match widen_return_value(value, from, to) {
+            Some(widened) => auto_box_return(ctx, Ok(Some(widened)), target),
+            None => auto_box_return(ctx, Ok(Some(value)), leaf_desc),
+        },
+        other => auto_box_return(ctx, other, leaf_desc),
+    }
+}
+
 fn return_type_desc(desc: &str) -> &str {
     if let Some(pos) = desc.rfind(')') {
         &desc[pos + 1..]
@@ -12706,6 +13068,14 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // wrapper receiver. Skip the receiver, then adapt the params 1:1.
             let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
             let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
+            if let Some(refusal) = null_receiver_refusal(ctx, this, kind, extra) {
+                return Err(refusal);
+            }
+            if let Some(site) = call_site.as_deref() {
+                if let Some(refusal) = invoke_narrowing_arg_refusal(ctx, this, kind, site) {
+                    return Err(refusal);
+                }
+            }
             let adapted = if needs_receiver && !has_bound && !extra.is_empty() {
                 let mut v = Vec::with_capacity(extra.len());
                 v.push(extra[0]);
@@ -12724,6 +13094,10 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // A virtual or special call site names the receiver and `MH_DESC`
             // does not, so strip it here rather than teach every comparison
             // downstream about the difference.
+            // Kept before the receiver strip below consumes `call_site`: the
+            // RETURN type is the same in both spellings, and the conversion
+            // after dispatch needs it.
+            let call_site_ret = call_site.clone();
             if let Some(cs) = call_site {
                 let cs = if needs_receiver && !has_bound {
                     descriptor_without_first_param(&cs).unwrap_or(cs)
@@ -12738,7 +13112,16 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             if kind == MH_KIND_CONSTRUCTOR {
                 result
             } else {
-                auto_box_return(ctx, result, &desc)
+                // `invoke` is specified as `asType(callSiteType)` followed by an
+                // exact invocation, so the CALL SITE names the return type the
+                // caller gets -- and a widening return conversion is part of
+                // that `asType`. `(long) findStatic(Math,"max",(int,int)int)
+                // .invoke(1, 2)` is `2L` on HotSpot; boxing the `int` result
+                // against the leaf descriptor made it an `Integer`, which the
+                // coercion downstream could not match against `J` and replaced
+                // with a fabricated `0`. A well-formed call, a wrong VALUE, no
+                // exception anywhere.
+                box_return_against_target(ctx, result, &desc, call_site_ret.as_deref())
             }
         },
         NativeKind::Bridge,
@@ -12754,26 +13137,48 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let extra = &args[1..];
+            // TAKEN FIRST and unconditionally, for the reason `invoke` above
+            // takes first: anything that re-enters the interpreter can reach
+            // the signature-polymorphic dispatch block, which CLEARS the
+            // channel for every name it does not arm. Taking it here also
+            // guarantees this native never leaves a descriptor armed for a
+            // later dispatch through a door that armed none.
+            let call_site = cratonvm_native_api::poly_call_site::take();
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            // NOTE: a strict invokeExact arity check (throwing
-            // WrongMethodTypeException) cannot be enforced on CratonVM's
-            // synthetic `MH_KIND_*` model — adapters (insertArguments /
-            // asCollector / asSpreader / dropArguments / guardWithTest) keep
-            // their inner target's descriptor, so the apparent arity often
-            // differs from the real call-site arity. Throwing here aborted the
-            // VM mid-dispatch (Groovy's `IndyInterface` invokes its dispatch
-            // chains via invokeExact: "internal error: WrongMethodTypeException:
-            // expected 2 args, got 1"). Fall through to `mh_dispatch`, whose
-            // kind-specific arms splice/gather/forward the actual arguments.
+            // The historical NOTE here said a strict `invokeExact` check
+            // "cannot be enforced on CratonVM's synthetic `MH_KIND_*` model",
+            // because adapters keep their inner target's descriptor and a
+            // strict ARITY check aborted the VM mid-dispatch (Groovy's
+            // `IndyInterface` dispatches its chains through `invokeExact`:
+            // "internal error: WrongMethodTypeException: expected 2 args, got
+            // 1"). That is true of `MH_DESC`, which is what such a check would
+            // have read. It is not true of `type`, the adapted MethodType every
+            // combinator in this file already chains off. See
+            // `exact_call_site_refusal` for the check, and
+            // `kind_has_authoritative_type` for exactly which kinds it is
+            // allowed to speak about -- the adapter kinds are still excluded,
+            // and deliberately, until someone runs Groovy against them.
             let kind = match ctx.get_field(this, MH_KIND) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
+            if let Some(site) = call_site.as_deref() {
+                if let Some(refusal) = exact_call_site_refusal(ctx, this, kind, site) {
+                    return Err(refusal);
+                }
+            }
+            if let Some(refusal) = null_receiver_refusal(ctx, this, kind, extra) {
+                return Err(refusal);
+            }
+            // A retyped handle (`asType`) dispatches against the LEAF
+            // descriptor and must return the DECLARED one -- see
+            // `box_return_against_target`.
+            let declared = mh_declared_descriptor(ctx, this);
             let result = mh_dispatch(ctx, this, extra);
             if kind == MH_KIND_CONSTRUCTOR {
                 result
             } else {
-                auto_box_return(ctx, result, &desc)
+                box_return_against_target(ctx, result, &desc, declared.as_deref())
             }
         },
         NativeKind::Bridge,

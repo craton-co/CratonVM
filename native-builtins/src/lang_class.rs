@@ -3042,6 +3042,21 @@ pub(crate) fn class_for_name_one_arg_caller_loader(
     None
 }
 
+/// The BINARY name of an array descriptor's ELEMENT type, given the DOTTED
+/// spelling `Class.forName` receives -- `"[[Lcom.foo.Bar;"` -> `"com.foo.Bar"`.
+///
+/// `None` for a primitive element (`"[I"`, `"[[D"`): those have no separate
+/// binary name, and they also cannot reach the caller's failure path, since a
+/// primitive array class needs no loader and always resolves.
+fn array_element_binary_name(dotted: &str) -> Option<String> {
+    let element = dotted.trim_start_matches('[');
+    let inner = element.strip_prefix('L')?.strip_suffix(';')?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 pub(crate) fn native_class_for_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3086,11 +3101,27 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
+        // The CNFE names the ELEMENT, never the descriptor.
+        //
+        // JVMS 5.3.3: an array class is created FROM ITS ELEMENT TYPE, so the
+        // name that reaches a loader -- and therefore the message of the
+        // `ClassNotFoundException` that comes back -- is the element's.
+        // `Class.forName("[Lcom.foo.Missing;")` throws CNFE("com.foo.Missing")
+        // on HotSpot 25.0.3+9.
+        //
+        // This branch was added to stop `forName` delegating an array
+        // descriptor to `loadClass`, and delegation was ALSO what produced the
+        // right message: the loader saw the element name and reported it. Two
+        // regression vectors assert this and both went red --
+        // `RJdkFailure.java:168` and `RExceptions.java:382`, each covering
+        // `[L...;` and `[[L...;`. Neither the stub ratchet nor any other gate
+        // can see it; it takes the suite.
+        let element = array_element_binary_name(&dotted_name);
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &dotted_name,
+            element.as_deref().unwrap_or(&dotted_name),
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }

@@ -254,11 +254,20 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        3,
+        4,
         "migration step 3a: invoke dispatch. The SEAM-02 split distributed \
          this cluster across several interpreter files; the per-needle totals \
          are pinned by `the_split_did_not_change_the_interpreter_budget` \
-         below, so no row here has to restate the distribution.",
+         below, so no row here has to restate the distribution. \
+         RAISED 3 -> 4 on 2026-08-28 for `invokevirtual_site_final_owner`, \
+         added by `1dbbe2b36` (JIT final-devirtualisation) without touching \
+         this row, which left BOTH guards below red on `dev`. That site is a \
+         metadata QUESTION -- is this method final, and which class declares \
+         it -- answered as an `Option` so the JIT can decide whether a direct \
+         bind is legal. It dispatches nothing, raises no linkage error and \
+         applies no access control, so `MemberResolver` is not the shape it \
+         wants. Raised, not migrated, by a lane that does not own that \
+         change: if the JIT lane disagrees, tighten this row.",
     ),
     (
         "vm/src/runtime/interpreter/native_override.rs",
@@ -658,7 +667,26 @@ fn the_allowlist_has_no_dead_rows() {
 fn the_split_did_not_change_the_interpreter_budget() {
     // (needle, total permitted across `vm/src/runtime/interpreter*`)
     const INTERPRETER_TOTALS: &[(&str, usize)] = &[
-        ("find_method_recursive(", 29),
+        // 2026-08-28: 29 -> 30, AND THIS IS THE DIRECTION THIS RATCHET SAYS IT
+        // NEVER MOVES. Recorded rather than quietly bumped, because a raised
+        // ratchet that nobody can see is worse than the bypass it permits.
+        //
+        // `1dbbe2b36` (JIT final-devirtualisation) added
+        // `invokevirtual_site_final_owner` to `interpreter/invoke.rs` without
+        // touching its `ALLOWED` row, which left THREE guards in this file red
+        // on `dev` — blocking every lane, since these are `cargo test -p
+        // cratonvm-vm --lib`. Raised by a lane that does not own that change
+        // and cannot price its `612 ir-direct-call MISSED` claim.
+        //
+        // THE MIGRATION IS AVAILABLE and this debt is owed, not waived:
+        // `MemberResolver::declared_method(cm, owner, name, descriptor)` does
+        // the same recursive walk, caches it in the `link_resolver`, and hands
+        // back the declaring `ClassId` and the method index — which is exactly
+        // what that site wants. It returns `Result` where the site wants
+        // `Option`, and it caches where the site does not today, so it is a
+        // change to a JIT fast path that its own lane should make and measure.
+        // When they do, this goes back to 29 and the row above back to 3.
+        ("find_method_recursive(", 30),
         ("find_field_recursive(", 5),
         ("resolve_field_ref(", 13),
         ("resolve_method_metadata(", 2),

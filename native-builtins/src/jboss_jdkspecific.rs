@@ -587,21 +587,70 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> Result<O
 
 /// The package set to record for `name` in `module_packages_table`.
 ///
-/// `java.base`/`java.xml` keep their hand-maintained boot lists (the registry
-/// does not enumerate jimage packages). Every other name answers from the VM's
-/// `ModuleRegistry`, which is populated both by the boot `module-info` scan and
-/// by `--module-path` resolution — so a module resolved from a module path now
-/// reports ITS packages instead of an empty list. An unregistered name still
-/// gets the empty vec it got before.
+/// **The VM's `ModuleRegistry` is the source; the hand-maintained lists below
+/// are a FLOOR for names it does not know.** That order used to be the other
+/// way round for `java.base` and `java.xml`, on the stated premise that "the
+/// registry does not enumerate jimage packages". Measured against
+/// jdk-25.0.3.9-hotspot (`probes/L5ModuleInvokeSweep.java`), it does: the
+/// registry answers >100 packages for `java.base` where `BOOT_JDK_PACKAGES`
+/// has 63, and `build_module_descriptor` — which has always read the registry
+/// — was already publishing the larger set through
+/// `getDescriptor().packages()`. So the two answers DISAGREED IN BOTH
+/// DIRECTIONS on the same VM: `getPackages()` was missing packages the
+/// descriptor exported (54 of them, `jdk.internal.loader` among them), and
+/// carried names the descriptor did not. HotSpot has
+/// `m.getPackages().equals(m.getDescriptor().packages())`.
+///
+/// A premise in a comment is not a link to the thing it describes: this one
+/// outlived the day the registry learned to enumerate the boot modules, and
+/// the special case kept the stale answer alive for exactly the two names the
+/// registry knows best.
+///
+/// The fallback direction is unchanged and still deliberate — an OVER-inclusive
+/// package set is safe for the `getPackages().contains(pn)` callers this file
+/// serves, an under-inclusive one is not — so an empty registry answer still
+/// falls back to the hand list rather than to nothing.
 fn module_package_names(ctx: &mut dyn NativeContext, name: &str) -> Vec<String> {
+    let from_registry: Vec<String> = ctx
+        .module_packages(name)
+        .iter()
+        .map(|p| dotted(p))
+        .collect();
+    if !from_registry.is_empty() {
+        return from_registry;
+    }
     match name {
         "java.base" => BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect(),
         "java.xml" => JAVA_XML_PACKAGES.iter().map(|s| s.to_string()).collect(),
-        _ => ctx
-            .module_packages(name)
-            .iter()
-            .map(|p| dotted(p))
-            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Wrap `set` in `java.util.Collections.unmodifiableSet`.
+///
+/// Every `Module`/`ModuleDescriptor` collection accessor is immutable on
+/// HotSpot — `getPackages()`, and the descriptor's `packages()`, `uses()`,
+/// `exports()`, `opens()`, `requires()` and `provides()` all raise
+/// `UnsupportedOperationException` from `add`/`clear` and from
+/// `iterator().remove()`. This file handed back the live `HashSet` it had just
+/// built, so a caller could edit the VM's published view of the module graph
+/// and hand it on; nothing downstream could tell the edited set from a real
+/// one.
+///
+/// On failure the plain set is returned: an immutability wrapper is not worth
+/// turning a correct answer into a thrown exception. Note the `--synthetic-jdk`
+/// caveat recorded on `jca::provider_chain::wrap_unmodifiable` — in that mode
+/// `Collections.unmodifiableSet` is bound to the identity function, so this
+/// wrapper is inert there and a probe will still report a mutable set.
+fn wrap_unmodifiable_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
+    match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(view)))) => view,
+        _ => set,
     }
 }
 
@@ -1063,6 +1112,7 @@ pub(crate) fn native_module_get_packages(
     };
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let set = build_package_set(ctx, &refs)?;
+    let set = wrap_unmodifiable_set(ctx, set);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1702,14 +1752,23 @@ pub(crate) fn build_module_descriptor(
     // constants have no data source reachable from here. See
     // `build_module_modifier_set` for what is deliberately NOT fabricated.
     let modifiers = build_module_modifier_set(ctx, is_open)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let modifiers = wrap_unmodifiable_set(ctx, modifiers);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "modifiers", Value::Object(Some(modifiers)));
 
     let uses_set = build_string_hash_set(ctx, &uses)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let uses_set = wrap_unmodifiable_set(ctx, uses_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
 
     let packages_set = build_string_hash_set(ctx, &packages)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let packages_set = wrap_unmodifiable_set(ctx, packages_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "packages", Value::Object(Some(packages_set)));
 
@@ -1718,19 +1777,31 @@ pub(crate) fn build_module_descriptor(
         "java/lang/module/ModuleDescriptor$Exports",
         &exports,
     )?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let exports_set = wrap_unmodifiable_set(ctx, exports_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "exports", Value::Object(Some(exports_set)));
 
     let opens_set =
         build_export_like_set(ctx, "java/lang/module/ModuleDescriptor$Opens", &opens)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let opens_set = wrap_unmodifiable_set(ctx, opens_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "opens", Value::Object(Some(opens_set)));
 
     let provides_set = build_provides_set(ctx, &provides)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let provides_set = wrap_unmodifiable_set(ctx, provides_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "provides", Value::Object(Some(provides_set)));
 
     let requires_set = build_requires_set(ctx, &requires)?;
+    // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
+    // because the wrapper allocates and can therefore move `desc`.
+    let requires_set = wrap_unmodifiable_set(ctx, requires_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "requires", Value::Object(Some(requires_set)));
 
