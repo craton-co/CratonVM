@@ -43,3 +43,19 @@ scripts/baselines/*.txt text eol=lf
 # written by the generator and have not yet been through a checkout; the first
 # clone on Windows is where they would flip.
 scripts/baselines/jdk25-*.tsv text eol=lf
+
+# Rust sources, pinned to LF for the same class of reason as the scripts above,
+# but a subtler failure. Several tests in native-builtins read
+# native-builtins/src/lib.rs *as text* and match 
+-anchored patterns against
+# it -- counting registration sites, locating a column-0 closing brace after a
+# named fn. Any tool that rewrites a .rs file with CRLF endings (a Python
+# read_text/write_text round trip on Windows does exactly that) breaks four of
+# those tests at once, and every failure message points at registration
+# bookkeeping rather than at line endings.
+*.rs text eol=lf
+
+# The same reasoning for the other tracked text the toolchain parses rather
+# than merely compiles.
+*.toml text eol=lf
+*.tsv  text eol=lf
