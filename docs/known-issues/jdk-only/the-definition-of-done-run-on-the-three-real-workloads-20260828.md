@@ -455,7 +455,7 @@ cargo test -p cratonvm-types                       589 passed, 0 failed  (see th
 cargo test -p cratonvm-native-builtins  (the seven ratchets)   PASS
   ... --features management (three of them)                    PASS
 cargo test -p cratonvm-native-builtins --lib      4177 passed, 0 failed
-cargo test -p cratonvm-vm --lib                   2637 passed, 2 failed   <- see below
+cargo test -p cratonvm-vm --lib                   2639 passed, 0 failed   <- see below
 SUITE=core                bash regression-suite/run.sh          72 / 72
 SUITE=all                 bash regression-suite/run.sh         111 / 112
 CRATONVM_ARGS=--jdk-only  bash regression-suite/run.sh         111 / 112
@@ -474,10 +474,16 @@ It **passes alone and passes in a full clean re-run** — the dial it asserts on
 is a process-global latch, so the failure is test interleaving under load, not a
 verdict. Checked rather than assumed, and recorded rather than quietly re-run.
 
-**The two `cratonvm-vm --lib` failures are red on pristine `origin/dev` and are
-in a file this branch does not touch.**
+**`cratonvm-vm --lib` was red for most of this lane, and the red was never
+this branch's. It went green on the last merge, fixed at its source by the lane
+that owns the site — which is the outcome the section below argued for.** Kept
+because the reasoning is the transferable part.
+
+The two failures were
 `runtime::resolve::guard::no_unallowlisted_metadata_table_bypass_exists` and
-`the_allowlist_has_no_dead_rows` both report
+`the_allowlist_has_no_dead_rows`, red on pristine `origin/dev` and in a file
+this branch does not touch.
+Both reported
 
 ```text
 vm/src/runtime/interpreter/invoke.rs
@@ -490,7 +496,8 @@ origin/dev:vm/src/runtime/interpreter/invoke.rs | grep -c` is **4** against an
 allowlist row of **3** on the same commit. Both tests are pure source scans, so
 the count settles it without a build.
 
-**Not fixed here, deliberately.** The fourth site is `loader_interface_override`
+**Not fixed here, deliberately — and that turned out to be right.** The fourth
+site was `loader_interface_override`
 in `invoke.rs` — a documented, loader-accurate override check added for
 `SpringBootContextLoaderAotTests`. Raising the row 3 → 4 alone then trips
 `the_split_did_not_change_the_interpreter_budget`, whose interpreter total is 29
@@ -501,6 +508,12 @@ bypass this lane neither added nor adjudicated turns a ratchet into a rubber
 stamp. The two honest resolutions both belong to whoever owns that dispatch
 path: route the site through `MemberResolver`, or move the count off another row
 in the same commit.
+
+**They took the first one.** `dev`'s `fix/ir-inline-unresumable-deopt-20260828`
+work landed while this lane was merging and `invoke.rs` is back to three sites,
+so both tests are green on the tree being pushed. Raising the row to 4 would
+have left a rubber-stamped allowlist behind a green gate; declining to left the
+ratchet doing its job until its owner moved the site.
 
 `RJdkEnumerations` is dev's recorded red, bisected to `a0168ed03`
 (`rjdkenumerations-is-red-on-dev-from-the-chm-values-cursor-20260827.md`), and
