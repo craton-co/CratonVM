@@ -76,7 +76,8 @@ Remaining large families: `java/lang/System$1` (28), `java/lang/ClassLoader`
 (27), `java/lang/Module` (23), `java/lang/invoke/MethodHandles` (23),
 `ForkJoinTask`/`ForkJoinPool` (42), `ResourceBundle` (15) — plus the 176-row
 StringBuilder cluster, which stays out of this series while
-`WORKER-3-NOTE-3` has it open with a diagnosed mechanism.
+`WORKER-3-NOTE-3` had it open with a diagnosed mechanism.
+**Closed 2026-08-28 by lane L2**: 747 rows, 0 diffs in both modes.
 
 ## Reproduce
 

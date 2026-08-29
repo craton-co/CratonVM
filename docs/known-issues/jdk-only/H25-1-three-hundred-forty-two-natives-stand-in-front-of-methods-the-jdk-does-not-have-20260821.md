@@ -182,6 +182,32 @@ $ javap -p java.lang.StringUTF16 | grep -Ei 'isBigEndian|getChars'
 `System.runFinalizersOnExit` were **removed from the JDK**, not deprecated. The
 registrations are stubs for an API surface that stopped existing.
 
+> **CORRECTION, 2026-08-28 — that is true of JDK 25 and of no other supported
+> image, so this list is an UPPER BOUND on what may be deleted.** The `javap`
+> above was run against ONE image. Re-run against all three on the build host,
+> `--system` pointed at each image in turn:
+>
+> | ★ row | JDK 17.0.20.1+1 | JDK 21.0.12+8 | JDK 25.0.4+7 |
+> | --- | --- | --- | --- |
+> | `Thread.stop0(Object)V` | **declared, `native`** | gone | gone |
+> | `Thread.suspend0()V` | **declared, `native`** | gone | gone |
+> | `Thread.resume0()V` | **declared, `native`** | gone | gone |
+> | `Thread.countStackFrames()I` | **declared** | **declared** | gone |
+> | `StringUTF16.isBigEndian()Z` | **declared, `native`** | **declared, `native`** | gone |
+> | `Thread.destroy()V` | gone | gone | gone |
+> | `System.runFinalizersOnExit(Z)V` | gone | gone | gone |
+>
+> **Five of the seven ★ rows are live on a supported image**, and a `native`
+> declaration with no `Code` is a row where the registration is the only
+> implementation there is — deleting it is a `NoSuchMethodError` on that image,
+> not a cleanup. Only `destroy` and `runFinalizersOnExit` are absent everywhere.
+>
+> This confirms `WORKER-3-NOTE-3` §4 R1 and R2 by re-measurement rather than by
+> citation, and closes that note's **N2**. Nothing in the list needs to change;
+> what needs to change is how it is read. `WORKER-3-NOTE-2`'s "192, not 342"
+> makes the same correction to this page's headline number for the same reason:
+> **one image is not the image set.**
+
 ### 1.5 One caveat that removes 5 of the 342
 
 Five of the 342 are registered on **`java/lang/Object`** itself
