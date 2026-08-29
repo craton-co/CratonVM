@@ -557,6 +557,26 @@ that scans a directory has to be re-run.
 **Both halves of the list matter.** This section lists known-red VECTORS, and a
 lane that runs the gates first had nothing to check a gate red against.
 
+**And a second one is OPEN as of `ff92ca9a4` (2026-08-29 evening).** Same test,
+different row:
+
+```
+cargo test -p cratonvm-native-builtins --test registrar_drift   (also with --features management)
+  the_drift_baseline_has_no_stale_rows
+  STALE BASELINE — 1 recorded drift pair(s) no longer drift.
+    register_phase54_atomics
+      java/util/concurrent/atomic/AtomicReference.compareAndSet(Ljava/lang/Object;Ljava/lang/Object;)Z
+```
+
+It arrived with `7c90ec930` ("de-register the now-slower `AtomicReference
+.compareAndSet` stub"), which collapsed the pair and did not regenerate the
+baseline — the failure text says to do both in one commit. `registrar_drift.rs`,
+`phases_early.rs` and `vm/src/jit/helpers.rs` are byte-identical to `origin/dev`
+on any branch that has not touched them, which is how to tell it from yours.
+Left for that lane: the fix is to move the triple to `FIXED_NOT_DRIFTING` with
+`--dump-native-registry` evidence, which is a claim about their change, not
+about the gate.
+
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
 
