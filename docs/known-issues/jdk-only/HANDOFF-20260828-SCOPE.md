@@ -305,34 +305,28 @@ behaviour, and only the corpus runs behaviour. The two instruments are
 disjoint, and each has now landed a red on `dev` that the other would have
 caught.
 
-### Two reds cleared on 2026-08-28 that were nobody's lane, and one DEBT
+### Three lanes fixed the same three things on the same evening
 
-Both were on pristine `origin/dev`, so every lane running gates hit them:
+While this lane verified, other lanes fixed every one of the reds it had just
+fixed — and one of them fixed it BETTER:
 
-* **`cargo test -p cratonvm-native-builtins --doc`** — `a07dd621c` documented
-  the old `Arrays` code inside a ```rust fence. Rustdoc COMPILES those. Retagged
-  ```text. If you write a doc comment quoting code that no longer exists, the
-  fence language is load-bearing.
-* **`cargo test -p cratonvm-vm --lib runtime::resolve::guard`** — three guards,
-  one cause. `1dbbe2b36` (JIT final-devirtualisation) added
-  `invokevirtual_site_final_owner` to `interpreter/invoke.rs` without touching
-  its `ALLOWED` row.
+* the ```rust doc fence in `a07dd621c` (rustdoc COMPILES those): fixed
+  identically on `dev`;
+* the array-CNFE regression from `c6ccccbc8`: fixed on `dev` by `39e2ded07`,
+  with a control this lane had not run — a detached worktree at pristine
+  `d17feaad2`, built from scratch, failing both vectors on its own;
+* the three `runtime::resolve::guard` reds from `1dbbe2b36`'s un-rowed
+  `find_method_recursive` site: **fixed by REMOVING the site.** This lane had
+  raised the allowlist 3 -> 4 and the one-way budget 29 -> 30 to unblock
+  everyone. That was the wrong repair, and by the time `dev` was re-read it
+  would have re-broken both guards. All three were backed out in favour of
+  `dev`.
 
-**The second one left a debt I am flagging rather than burying.** Clearing it
-meant raising `the_split_did_not_change_the_interpreter_budget` from 29 to 30 —
-and that guard's own doc says "a migration lowers them; **nothing raises
-them**". I raised a one-way ratchet belonging to a lane that is not mine,
-because the alternative was leaving `cargo test -p cratonvm-vm` red for
-everyone. Both numbers carry the provenance inline.
-
-**JIT lane: the migration is available and the debt is yours.**
-`MemberResolver::declared_method(cm, owner, name, descriptor)` does the same
-recursive walk, caches it in the `link_resolver` and returns the declaring
-`ClassId` plus the method index — what that site wants. It returns `Result`
-where the site wants `Option` and it caches where the site does not, so it is a
-change to a JIT fast path that should be made and MEASURED by whoever can price
-the `612 ir-direct-call MISSED` claim. When you do, the row goes back to 3 and
-the budget to 29.
+**Re-read `dev` immediately before you merge, not only before you start.** This
+lane read it at 39 commits behind. Every duplicate above was landed by someone
+else inside the window this lane spent building and running arms — which on
+this host is over an hour. A fix that was correct when you wrote it can be
+wrong by the time you merge it.
 
 ### dev's tip is frequently red
 
