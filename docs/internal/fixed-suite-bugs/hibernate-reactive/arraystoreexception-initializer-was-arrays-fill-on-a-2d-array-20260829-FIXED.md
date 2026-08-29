@@ -146,6 +146,15 @@ The one red row on the pre-change VM is the message defect, and the vector was
 red before the change and green after — which is the only thing that
 distinguishes a gate from a decoration.
 
+The rest of the suite does not move: `SUITE=core` is **76 passed, 0 failed, 0
+list/coverage errors, 0 harness-blindness flags** both before and after the
+`dev` merge, and the three sibling vectors that ask the OPCODE the same
+question keep their exact counts (`RArrayStoreTiers` 63, `RArrayStoreInterfaces`
+108, `RJitArrayTypecheck` 18, `RArraysMismatch` 44500). A stand-alone
+23-shape library-door probe run side by side with real HotSpot is now
+**byte-identical on all 23 rows**; before the change it differed on exactly the
+one that stores an array into a two-dimensional array.
+
 ## The nine classes
 
 Re-run on `dev@84a98929e` against a live Postgres via Testcontainers,
@@ -163,10 +172,12 @@ Re-run on `dev@84a98929e` against a live Postgres via Testcontainers,
 | `EmbeddedIdWithManyTest` | FAIL 2/0 | **PASS 2/2** |
 | `EmbeddedIdWithOneToOneTest` | FAIL 1/0 | **PASS 1/1** |
 
-`status: PASS=9` in 4m9s. Re-run again on the binary carrying THIS page's
-change (`cratonvm-hibloc-fixed.exe`): `status: PASS=9` in 3m49s, same
-per-class `found`/`ok`. So the message repair does not disturb the nine, which
-is the only thing it could have done to them — they were already green.
+`status: PASS=9` in 4m9s. Re-run on the binary carrying THIS page's change:
+`status: PASS=9` in 3m49s. Re-run a THIRD time after merging current `dev`
+(21 commits) and rebuilding: `status: PASS=9` in 3m2s, same per-class
+`found`/`ok` every time. `dev` moves hourly here and a green measured against a
+stale base is not a green, so the merged binary is the one the verdict rests
+on.
 
 ## "Does this reproduce on H2 too?" — the open page's fourth question
 

@@ -126,6 +126,13 @@ this page is the durable record of what it must contain — a fresh host that
 reports these two classes red should add the two rows before reading anything
 else.
 
+## Re-measured after merging current `dev`
+
+`dev` moves hourly here, so the four-arm table was re-taken on a binary built
+from this branch with 21 further `dev` commits merged in:
+`FunctionTests` `ok=117 failed=0`, `StandardFunctionTests` `ok=44 failed=0`,
+both with the pair. Same answers.
+
 ## What did NOT need changing
 
 CratonVM. No VM-side code was touched for this finding. In particular
