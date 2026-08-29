@@ -1166,7 +1166,10 @@ pub fn check_memory_order(
     if pos.len() != cand_mem.len() {
         return Err(not_a_permutation);
     }
-    let pairs = base_mem.len().saturating_mul(base_mem.len().saturating_sub(1)) / 2;
+    let pairs = base_mem
+        .len()
+        .saturating_mul(base_mem.len().saturating_sub(1))
+        / 2;
     if pairs > MEMORY_ORDER_PAIR_BUDGET {
         return Err(OrderViolation {
             earlier: base_mem.first().copied().unwrap_or(NO_NODE),
@@ -1423,7 +1426,8 @@ pub fn compute_frequencies(
                     out.edge_prob[b][1 - ti] = 1.0 - pt;
                 } else {
                     out.static_branches += 1;
-                    let (p0, p1) = static_branch_probs(blocks, dom, &loop_body, &innermost, &out, b);
+                    let (p0, p1) =
+                        static_branch_probs(blocks, dom, &loop_body, &innermost, &out, b);
                     out.edge_prob[b][0] = p0;
                     out.edge_prob[b][1] = p1;
                 }
@@ -1682,11 +1686,7 @@ pub fn layout_blocks(
 /// This is what stops cold-block sinking from lifting a block out of an
 /// exception handler's protected range: a cold block inside the range is still
 /// ordered after the hot ones *within* the range, but it cannot leave it.
-fn repair_regions(
-    order: &mut Vec<usize>,
-    regions: &[Vec<usize>],
-    n: usize,
-) -> Result<(), Bailout> {
+fn repair_regions(order: &mut Vec<usize>, regions: &[Vec<usize>], n: usize) -> Result<(), Bailout> {
     for region in regions {
         let mut members: Vec<usize> = region.iter().copied().filter(|&b| b < n).collect();
         members.sort_unstable();
@@ -2328,18 +2328,30 @@ mod tests {
         let mut f = mem_graph();
         let load = f.load(f.mem, f.off_a);
         let store = f.store(load, f.off_b);
-        let enter = f
-            .graph
-            .add(Op::MonitorEnter, IrType::Memory, vec![f.ctrl, store, f.base], None);
-        let exit = f
-            .graph
-            .add(Op::MonitorExit, IrType::Memory, vec![f.ctrl, enter, f.base], None);
-        let call = f
-            .graph
-            .add(Op::Call { info_ptr: 0 }, IrType::Int, vec![f.ctrl, exit], None);
-        let guard = f
-            .graph
-            .add(Op::Guard { bci: 0 }, IrType::Void, vec![f.ctrl, f.value], None);
+        let enter = f.graph.add(
+            Op::MonitorEnter,
+            IrType::Memory,
+            vec![f.ctrl, store, f.base],
+            None,
+        );
+        let exit = f.graph.add(
+            Op::MonitorExit,
+            IrType::Memory,
+            vec![f.ctrl, enter, f.base],
+            None,
+        );
+        let call = f.graph.add(
+            Op::Call { info_ptr: 0 },
+            IrType::Int,
+            vec![f.ctrl, exit],
+            None,
+        );
+        let guard = f.graph.add(
+            Op::Guard { bci: 0 },
+            IrType::Void,
+            vec![f.ctrl, f.value],
+            None,
+        );
         let add = f
             .graph
             .add(Op::Add, IrType::Int, vec![f.value, f.value], None);
@@ -2378,9 +2390,7 @@ mod tests {
         let mut f = mem_graph();
         let load = f.load(f.mem, f.off_a);
         let store = f.store(load, f.off_b);
-        let add = f
-            .graph
-            .add(Op::Add, IrType::Int, vec![load, f.value], None);
+        let add = f.graph.add(Op::Add, IrType::Int, vec![load, f.value], None);
         let seq = vec![load, store, add];
         assert_eq!(check_memory_order(&f.graph, &seq, &seq), Ok(()));
     }
@@ -2592,9 +2602,7 @@ mod tests {
     /// never colours and `ir_lower` never emits.)
     #[test]
     fn priority_scheduling_preserves_every_block_node_set() {
-        let code = [
-            0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0,
-        ];
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0];
         let builder = IrBuilder::new(2, 2);
         let mut graph = builder.build(&code, 8).expect("build failed");
         ir_optimize::optimize(&mut graph);

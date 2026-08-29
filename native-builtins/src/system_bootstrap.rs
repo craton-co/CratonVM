@@ -166,10 +166,14 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     if let Ok(dir) = std::env::current_dir() {
         set(USER_DIR_NDX, &dir.to_string_lossy());
     }
-    if let Ok(home) = cratonvm_types::flags::runtime_var("USERPROFILE").or_else(|_| cratonvm_types::flags::runtime_var("HOME")) {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("USERPROFILE")
+        .or_else(|_| cratonvm_types::flags::runtime_var("HOME"))
+    {
         set(USER_HOME_NDX, &home);
     }
-    if let Ok(user) = cratonvm_types::flags::runtime_var("USERNAME").or_else(|_| cratonvm_types::flags::runtime_var("USER")) {
+    if let Ok(user) = cratonvm_types::flags::runtime_var("USERNAME")
+        .or_else(|_| cratonvm_types::flags::runtime_var("USER"))
+    {
         set(USER_NAME_NDX, &user);
     }
 
@@ -453,10 +457,13 @@ pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn t14_platform_properties_returns_correct_length() {

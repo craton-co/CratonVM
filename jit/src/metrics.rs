@@ -624,7 +624,10 @@ impl CompilationReport {
 
     /// `Class.name descriptor` as one grep-able key.
     pub fn method_key(&self) -> String {
-        format!("{}.{}{}", self.class_name, self.method_name, self.descriptor)
+        format!(
+            "{}.{}{}",
+            self.class_name, self.method_name, self.descriptor
+        )
     }
 
     /// This compilation's record for `phase`.
@@ -650,7 +653,11 @@ impl CompilationReport {
         let _ = write!(
             s,
             ",\"tier_requested\":\"{}\",\"path\":\"{}\",\"fell_through_to_single_pass\":{}",
-            if self.optimizing_requested { "c2" } else { "c1" },
+            if self.optimizing_requested {
+                "c2"
+            } else {
+                "c1"
+            },
             self.path.name(),
             self.fell_through_to_single_pass,
         );
@@ -1097,9 +1104,7 @@ impl CompileRecorder {
     /// (`ir_lower::lower_inner` has no recorder in scope); this form exists for
     /// a caller that holds one. See [`CompilationReport::peak_live_values`].
     pub fn set_peak_live_values(&self, n: usize) {
-        self.with_report(|r| {
-            r.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32)
-        });
+        self.with_report(|r| r.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32));
     }
 
     /// Spill count, recorded against *this* recorder — the form
@@ -1206,9 +1211,8 @@ impl Drop for CompileRecorder {
                 // panicking inside the compiler.
                 return;
             };
-            report.total_wall_ns = Measured::Value(
-                state.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            );
+            report.total_wall_ns =
+                Measured::Value(state.start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             if report.outcome == Outcome::InProgress {
                 report.outcome = if report.bailouts.is_empty() {
                     Outcome::Abandoned
@@ -2379,7 +2383,11 @@ mod tests {
         }
         let published =
             last_compilation_report(Some("metrics/Probe.run")).expect("recorder must publish");
-        assert_eq!(published.outcome, Outcome::BailedOut, "bailout was recorded");
+        assert_eq!(
+            published.outcome,
+            Outcome::BailedOut,
+            "bailout was recorded"
+        );
         assert_eq!(published.path, CompilerPath::SinglePass);
         assert!(published.fell_through_to_single_pass);
         assert_eq!(published.nodes_built, Measured::Value(12));
@@ -2687,7 +2695,9 @@ mod tests {
         let names: Vec<&str> = s.scheduling.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, SCHEDULING_EVENTS.to_vec());
         assert_eq!(
-            s.scheduling.iter().find(|(n, _)| *n == SCHEDULING_EVENTS[0]),
+            s.scheduling
+                .iter()
+                .find(|(n, _)| *n == SCHEDULING_EVENTS[0]),
             Some(&(SCHEDULING_EVENTS[0], 3))
         );
         let json = s.to_json();
@@ -2878,8 +2888,7 @@ pub const CALL_SPILL_MOVING_UNPUBLISHABLE: usize = 6;
 /// complete copy (no publish plan, >64 locals, or an explicit `=all`), which is
 /// the difference between "narrowing is off" and "narrowing ran and kept
 /// everything".
-pub const SPILL_WIDTH_NAMES: [&str; 3] =
-    ["stores-emitted", "stores-if-full", "full-refused"];
+pub const SPILL_WIDTH_NAMES: [&str; 3] = ["stores-emitted", "stores-if-full", "full-refused"];
 
 static SPILL_WIDTH_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -2915,8 +2924,10 @@ pub fn spill_args_published_count() -> u64 {
 /// narrowed, and whether the narrowing refused outright.
 #[inline]
 pub fn note_spill_width(emitted: u64, if_full: u64, refused: bool) {
-    SPILL_WIDTH_COUNTS[SPILL_WIDTH_EMITTED].fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
-    SPILL_WIDTH_COUNTS[SPILL_WIDTH_IF_FULL].fetch_add(if_full, std::sync::atomic::Ordering::Relaxed);
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_EMITTED]
+        .fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+    SPILL_WIDTH_COUNTS[SPILL_WIDTH_IF_FULL]
+        .fetch_add(if_full, std::sync::atomic::Ordering::Relaxed);
     if refused {
         SPILL_WIDTH_COUNTS[SPILL_WIDTH_FULL_REFUSED]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

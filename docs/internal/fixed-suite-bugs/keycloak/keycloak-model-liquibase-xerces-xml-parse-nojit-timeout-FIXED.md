@@ -137,7 +137,7 @@ BitSet.clone -> CloneNotSupportedException
 ```
 
 It instead reaches Liquibase changelog execution and is still applying schema
-updates near `META-INF/jpa-changelog-authz-3.4.0.CR1` when the 900-second
+updates near `../../../../apps/META-INF/jpa-changelog-authz-3.4.0.CR1` when the 900-second
 watchdog fires.
 
 ## Follow-up

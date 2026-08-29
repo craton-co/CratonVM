@@ -59,10 +59,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use cratonvm_gc::collector::GarbageCollector;
 use cratonvm_gc::gen_heap::{
     self, GenerationalHeap, JIT_READ_BOUNDS, JIT_REGION_BOUNDS, MOVABLE_BOUNDS,
 };
-use cratonvm_gc::collector::GarbageCollector;
 use cratonvm_gc::zgc::{vaddr, ZgcRealHeap};
 use cratonvm_types::ClassId;
 

@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 /// Public re-export for JIT helpers — see [`lambda_proxy_satisfies`].
 pub fn lambda_proxy_satisfies_public(
     shared: &SharedVm,
@@ -234,7 +233,11 @@ pub(crate) fn proxy_instance_satisfies_target(
 /// first: the name form neither loads nor looks up, which keeps this on the
 /// no-safepoint side of [`unmod_stamp_display_name`]'s contract. Slot 0 is
 /// `UNMOD_FIELD_BACKING` in `native-collections`.
-fn unmod_backing_reaches(shared: &SharedVm, obj_ref: cratonvm_types::ObjectRef, iface_name: &str) -> bool {
+fn unmod_backing_reaches(
+    shared: &SharedVm,
+    obj_ref: cratonvm_types::ObjectRef,
+    iface_name: &str,
+) -> bool {
     if shared.mem.heap.num_fields(obj_ref) == 0 {
         return false;
     }
@@ -350,7 +353,9 @@ pub(crate) fn unmod_stamp_display_name(
         "cratonvm/internal/UnmodifiableNavigableSet" => {
             "java/util/Collections$UnmodifiableNavigableSet"
         }
-        "cratonvm/internal/UnmodifiableCollection" => "java/util/Collections$UnmodifiableCollection",
+        "cratonvm/internal/UnmodifiableCollection" => {
+            "java/util/Collections$UnmodifiableCollection"
+        }
         _ => return None,
     })
 }
@@ -446,7 +451,11 @@ pub(crate) fn display_class_satisfies_target(
             let pin = thread.native_pin_roots.len();
             thread.native_pin_roots.push(*obj_ref);
             let loaded = shared.load_class_concurrent(display_name);
-            *obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(*obj_ref);
+            *obj_ref = thread
+                .native_pin_roots
+                .get(pin)
+                .copied()
+                .unwrap_or(*obj_ref);
             thread.native_pin_roots.truncate(pin);
             match loaded {
                 Ok(cid) => cid,
@@ -1582,7 +1591,11 @@ fn simple_name_has_word(obj_name: &str, term: &str) -> bool {
 /// relationships in the ClassStore because they were created in Rust without
 /// loading a real .class file. This function provides a name-based fallback
 /// for common patterns where a concrete inner class should satisfy an interface.
-pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_name: &str) -> bool {
+pub(super) fn synthetic_implements(
+    shared: &SharedVm,
+    obj_class_id: ClassId,
+    target_class_name: &str,
+) -> bool {
     let obj_class_name = shared
         .classes
         .class_manager
@@ -2409,7 +2422,10 @@ mod f32_pure_predicate_tests {
         }
         // 3. "contains" is not "is". Both MEASURED false on HotSpot.
         assert!(
-            !simple_name_has_word("java/util/concurrent/locks/AbstractQueuedSynchronizer", "Queue"),
+            !simple_name_has_word(
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer",
+                "Queue"
+            ),
             "AbstractQueuedSynchronizer contains \"Queue\" and is not one"
         );
         assert!(

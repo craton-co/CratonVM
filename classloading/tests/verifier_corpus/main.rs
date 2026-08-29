@@ -285,7 +285,13 @@ fn local_index_past_max_locals_rejected() {
     let bytes = one_method(
         "corpus/BadLocal",
         JAVA_8,
-        MethodSpec::new("m", "()V", 1, 1, vec![op::ICONST_0, op::ISTORE_3, op::RETURN]),
+        MethodSpec::new(
+            "m",
+            "()V",
+            1,
+            1,
+            vec![op::ICONST_0, op::ISTORE_3, op::RETURN],
+        ),
     );
     reject("local index past max_locals", &bytes, "max_locals");
 }
@@ -295,7 +301,13 @@ fn local_index_within_max_locals_accepted() {
     let bytes = one_method(
         "corpus/BadLocalOk",
         JAVA_8,
-        MethodSpec::new("m", "()V", 1, 4, vec![op::ICONST_0, op::ISTORE_3, op::RETURN]),
+        MethodSpec::new(
+            "m",
+            "()V",
+            1,
+            4,
+            vec![op::ICONST_0, op::ISTORE_3, op::RETURN],
+        ),
     );
     accept("local index within max_locals", &bytes);
 }
@@ -646,7 +658,11 @@ fn new_with_an_out_of_range_operand_rejected() {
     code.push(op::POP);
     code.push(op::RETURN);
     b.add_method(MethodSpec::new("m", "()V", 1, 1, code));
-    reject("new with an out-of-range index", &b.build(), "CONSTANT_Class");
+    reject(
+        "new with an out-of-range index",
+        &b.build(),
+        "CONSTANT_Class",
+    );
 }
 
 #[test]

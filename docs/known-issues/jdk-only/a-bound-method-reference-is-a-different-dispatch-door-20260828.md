@@ -2,7 +2,7 @@
 
 **Status: OPEN.** Found by L3 (`java.util` collections) while shrinking two
 `Properties` probe rows; the defect is not in `java.util` and not in any one
-lane's files. Reproducer: `probes/MethodRefDoorProbe.java`.
+lane's files. Reproducer: `apps/probes/MethodRefDoorProbe.java`.
 
 ## The measurement
 

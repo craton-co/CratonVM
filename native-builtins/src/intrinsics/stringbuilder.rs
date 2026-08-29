@@ -90,9 +90,12 @@ mod tests {
     //! What we CAN assert without a VM is structural: every handler has the
     //! exact `NativeCallback` signature, so it is wirable into the registry's
     //! dispatch path. A signature drift here fails to compile.
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// `NativeCallback` shape (see `cratonvm_native_api::NativeCallback`).
     type Cb = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;

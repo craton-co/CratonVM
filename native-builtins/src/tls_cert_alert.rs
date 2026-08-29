@@ -129,7 +129,11 @@ struct TrustManagerRejection(String);
 
 impl std::fmt::Display for TrustManagerRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TrustManager rejected the peer certificate chain: {}", self.0)
+        write!(
+            f,
+            "TrustManager rejected the peer certificate chain: {}",
+            self.0
+        )
     }
 }
 

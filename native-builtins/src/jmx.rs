@@ -11,7 +11,7 @@ use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::{try_alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{native_noop_with_this, obj_arg, try_alloc_concurrent_synthetic};
 // The live-thread helpers live in `crate::phases_late::management` rather than
 // here: this module is gated on the `management` feature, that one is
 // not, and both register the same `ThreadMXBean` triples. One copy is what
@@ -1052,7 +1052,10 @@ fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: Strin
     ctx.set_field(obj, slot, Value::Object(Some(s)));
 }
 
-fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> Result<ObjectRef, MethodCallFailed> {
+fn object_name_new(
+    ctx: &mut dyn NativeContext,
+    text: String,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Requested width stays 1: `try_alloc_concurrent_synthetic` already widens
     // the allocation to the loaded class's real instance-field count when one
     // exists (`max(real, requested)`), so a real `ObjectName` gets all five
@@ -1814,20 +1817,34 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 
     // Management interface version. OpenJDK reports "10.0" for JDK 8+.
     // Format: "<major>.<minor>" — JBoss / Hotspot consumers parse only major.
-    r.register_with_kind(cls, "getVersion0", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("10.0");
-        Ok(Some(Value::Object(Some(s))))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getVersion0",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("10.0");
+            Ok(Some(Value::Object(Some(s))))
+        },
+        NativeKind::Bridge,
+    );
 
     // JVM init-done time, epoch millis. Mirrors RuntimeMXBean.getStartTime.
-    r.register_with_kind(cls, "getStartupTime", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(vm_start_epoch_ms() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getStartupTime",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(vm_start_epoch_ms() as i64))),
+        NativeKind::Bridge,
+    );
 
     // Process id. Same plumbing as RuntimeMXBean.getName which embeds PID.
-    r.register_with_kind(cls, "getProcessId", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(std::process::id() as i32)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getProcessId",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(std::process::id() as i32))),
+        NativeKind::Bridge,
+    );
 
     // REAL: seed the ten static `boolean` support fields the JDK's own
     // `VMManagementImpl` declares, from the same sources the `is*Supported()`
@@ -1844,35 +1861,41 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // `set_static_field_by_name` resolves class + field by name and no-ops when
     // either is absent, so this is inert in synthetic-JDK mode (where there is
     // no real `VMManagementImpl`) and cannot fail during `<clinit>`.
-    r.register_with_kind(cls, "initOptionalSupportFields", "()V", |ctx, _args| {
-        let current_cpu = i32::from(current_thread_cpu_time_ns().is_some());
-        let boot_cp = i32::from(boot_class_path(ctx).is_some());
-        // Every non-constant below is the SAME expression its `is*Supported()`
-        // native uses, evaluated once here — that is what keeps the seeded field
-        // and the native from disagreeing.
-        let other_cpu = i32::from(arbitrary_thread_cpu_time_supported(ctx));
-        let comp_time = i32::from(ctx.jit_total_compile_time_ms().is_some());
-        let synchronizer = i32::from(synchronizer_usage_supported());
-        for (field, supported) in [
-            ("compTimeMonitoringSupport", comp_time),
-            ("threadContentionMonitoringSupport", 0),
-            ("currentThreadCpuTimeSupport", current_cpu),
-            ("otherThreadCpuTimeSupport", other_cpu),
-            ("bootClassPathSupport", boot_cp),
-            ("objectMonitorUsageSupport", 0),
-            ("synchronizerUsageSupport", synchronizer),
-            ("threadAllocatedMemorySupport", 0),
-            ("gcNotificationSupport", 0),
-            ("remoteDiagnosticCommandsSupport", 0),
-        ] {
-            ctx.set_static_field_by_name(
-                "sun/management/VMManagementImpl",
-                field,
-                Value::Int(supported),
-            );
-        }
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "initOptionalSupportFields",
+        "()V",
+        |ctx, _args| {
+            let current_cpu = i32::from(current_thread_cpu_time_ns().is_some());
+            let boot_cp = i32::from(boot_class_path(ctx).is_some());
+            // Every non-constant below is the SAME expression its `is*Supported()`
+            // native uses, evaluated once here — that is what keeps the seeded field
+            // and the native from disagreeing.
+            let other_cpu = i32::from(arbitrary_thread_cpu_time_supported(ctx));
+            let comp_time = i32::from(ctx.jit_total_compile_time_ms().is_some());
+            let synchronizer = i32::from(synchronizer_usage_supported());
+            for (field, supported) in [
+                ("compTimeMonitoringSupport", comp_time),
+                ("threadContentionMonitoringSupport", 0),
+                ("currentThreadCpuTimeSupport", current_cpu),
+                ("otherThreadCpuTimeSupport", other_cpu),
+                ("bootClassPathSupport", boot_cp),
+                ("objectMonitorUsageSupport", 0),
+                ("synchronizerUsageSupport", synchronizer),
+                ("threadAllocatedMemorySupport", 0),
+                ("gcNotificationSupport", 0),
+                ("remoteDiagnosticCommandsSupport", 0),
+            ] {
+                ctx.set_static_field_by_name(
+                    "sun/management/VMManagementImpl",
+                    field,
+                    Value::Int(supported),
+                );
+            }
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // No JVM args plumbed through to JMM yet — return an empty String[].
     r.register_with_kind(
@@ -1912,10 +1935,10 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     //     DURATIONS, which nothing in the VM records; also `register_thread_mxbean`.
     let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
-    // `isThreadAllocatedMemoryEnabled` and `isThreadContentionMonitoringEnabled`
-    // are ACC_NATIVE on both images — they read live JVM state, so `false` is a
-    // real answer from a VM that does not track it. The `*Supported` siblings
-    // are ordinary bytecode on `VMManagementImpl` and stay ambient.
+                                               // `isThreadAllocatedMemoryEnabled` and `isThreadContentionMonitoringEnabled`
+                                               // are ACC_NATIVE on both images — they read live JVM state, so `false` is a
+                                               // real answer from a VM that does not track it. The `*Supported` siblings
+                                               // are ordinary bytecode on `VMManagementImpl` and stay ambient.
     for name in [
         "isThreadAllocatedMemoryEnabled",
         "isThreadContentionMonitoringEnabled",
@@ -2014,13 +2037,23 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // literally `return jvm.getVerboseClass()` / `return jvm.getVerboseGC()`,
     // so a constant here silently discarded every `setVerbose(true)` a JMX
     // client made. Read the process-wide flags the setters now write.
-    r.register_with_kind(cls, "getVerboseClass", "()Z", |_ctx, _args| {
-        let on = VERBOSE_CLASS.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(Some(Value::Int(i32::from(on))))
-    }, NativeKind::Bridge);
-    r.register_with_kind(cls, "getVerboseGC", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(i32::from(verbose_gc_get()))))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getVerboseClass",
+        "()Z",
+        |_ctx, _args| {
+            let on = VERBOSE_CLASS.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(Value::Int(i32::from(on))))
+        },
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        cls,
+        "getVerboseGC",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(i32::from(verbose_gc_get())))),
+        NativeKind::Bridge,
+    );
 
     // -- VMManagementImpl long-typed counters / timers --
     //
@@ -2066,32 +2099,50 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // `isCompilationTimeMonitoringSupported()` says yes, so it MUST be driven by
     // the same accessor that answers that flag, or the real-JDK bean promises a
     // number and then reports 0. Already in milliseconds, the JMX spec's unit.
-    r.register_with_kind(cls, "getTotalCompileTime", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(
-            ctx.jit_total_compile_time_ms()
-                .map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
-        )))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getTotalCompileTime",
+        "()J",
+        |ctx, _args| {
+            Ok(Some(Value::Long(
+                ctx.jit_total_compile_time_ms()
+                    .map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+            )))
+        },
+        NativeKind::Bridge,
+    );
     // (b) REAL: cumulative count of classes the VM has loaded. Same source
     // (`loaded_class_count`) as ClassLoadingMXBean.getTotalLoadedClassCount.
-    r.register_with_kind(cls, "getTotalClassCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.loaded_class_count() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getTotalClassCount",
+        "()J",
+        |ctx, _args| Ok(Some(Value::Long(ctx.loaded_class_count() as i64))),
+        NativeKind::Bridge,
+    );
     // (b) REAL: classes reclaimed by class-loader unloading. This was in the
     // FLAGGED-0 batch above under "we never unload classes", but the VM does
     // track it — `unloaded_class_count()` is the same accessor
     // `ClassLoadingMXBean.getUnloadedClassCount` already reads — so the 0 was
     // stale, not honest.
-    r.register_with_kind(cls, "getUnloadedClassCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.unloaded_class_count() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getUnloadedClassCount",
+        "()J",
+        |ctx, _args| Ok(Some(Value::Long(ctx.unloaded_class_count() as i64))),
+        NativeKind::Bridge,
+    );
     // (b) REAL: cumulative started-thread count. We don't keep a historical
     // high-water "ever started" counter, so the closest honest value is the
     // current alive-thread count (same source as ThreadMXBean's count). This
     // is a lower bound on threads-ever-started, not a fabricated constant.
-    r.register_with_kind(cls, "getTotalThreadCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.active_thread_count() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getTotalThreadCount",
+        "()J",
+        |ctx, _args| Ok(Some(Value::Long(ctx.active_thread_count() as i64))),
+        NativeKind::Bridge,
+    );
 
     // -- VMManagementImpl int-typed counters --
     //
@@ -2103,24 +2154,36 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // chain on Keycloak boot.
     // REAL: live thread count — same `active_thread_count()` source as
     // ThreadMXBean.getThreadCount.
-    r.register_with_kind(cls, "getLiveThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.active_thread_count())))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getLiveThreadCount",
+        "()I",
+        |ctx, _args| Ok(Some(Value::Int(ctx.active_thread_count()))),
+        NativeKind::Bridge,
+    );
     // REAL: a genuine high-water mark now (`peak_thread_count`). Reporting the
     // CURRENT live count as the peak, as this used to, is not merely imprecise
     // — a peak that FALLS when threads exit is not a peak, and it left
     // `resetPeakThreadCount` below with no state to reset.
-    r.register_with_kind(cls, "getPeakThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(peak_thread_count(ctx))))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getPeakThreadCount",
+        "()I",
+        |ctx, _args| Ok(Some(Value::Int(peak_thread_count(ctx)))),
+        NativeKind::Bridge,
+    );
     // REAL: daemon-thread count. The previous FLAGGED-0 ("not tracked
     // separately by the VM") was wrong — the flag IS carried, on
     // `Thread.holder.daemon`, which is exactly where the VM's own shutdown
     // logic reads it (`vm_exec.rs::read_thread_daemon_flag`). Counting the
     // live threads that carry it is a measurement, not a fabricated split.
-    r.register_with_kind(cls, "getDaemonThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(daemon_thread_count(ctx))))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getDaemonThreadCount",
+        "()I",
+        |ctx, _args| Ok(Some(Value::Int(daemon_thread_count(ctx)))),
+        NativeKind::Bridge,
+    );
     // REAL: "resets the peak thread count to the current number of live
     // threads" (JMM). There IS peak state to reset now — the old comment's
     // premise was the missing high-water mark, not a spec exemption.
@@ -2135,14 +2198,24 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // track this for `getStartupTime`); `getAvailableProcessors` reports
     // Rust's view of the host's parallelism, matching what
     // `Runtime.availableProcessors()` would report.
-    r.register_with_kind(cls, "getUptime0", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(uptime_ms() as i64)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(cls, "getAvailableProcessors", "()I", |ctx, _args| {
-        // Container-aware (cgroup CPU quota under -XX:+UseContainerSupport),
-        // matching what Runtime.availableProcessors() reports.
-        Ok(Some(Value::Int(ctx.available_processor_count())))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getUptime0",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(uptime_ms() as i64))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        cls,
+        "getAvailableProcessors",
+        "()I",
+        |ctx, _args| {
+            // Container-aware (cgroup CPU quota under -XX:+UseContainerSupport),
+            // matching what Runtime.availableProcessors() reports.
+            Ok(Some(Value::Int(ctx.available_processor_count())))
+        },
+        NativeKind::Bridge,
+    );
 
     // -- sun.management.MemoryImpl --
     // Wave 1 / Task A: ManagementFactory.getMemoryPoolMXBeans() /
@@ -2199,10 +2272,16 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // setVerboseGC(boolean) — the write side of the `-verbose:gc` round-trip.
     // Accepting and ignoring made `MemoryMXBean.setVerbose(b)` unobservable
     // through `isVerbose()`, which the JMM contract requires.
-    r.register_with_kind(memory_impl, "setVerboseGC", "(Z)V", |_ctx, args| {
-        verbose_gc_set(bool_flag_arg(args));
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        memory_impl,
+        "setVerboseGC",
+        "(Z)V",
+        |_ctx, args| {
+            verbose_gc_set(bool_flag_arg(args));
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
     // isVerbose()Z — `alloc_memory_mxbean` allocates this bean as a real
     // `sun/management/MemoryImpl` (not a purely-synthetic interface stamp,
     // unlike e.g. `ClassLoadingMXBean`), so the real-JDK bytecode
@@ -2604,7 +2683,9 @@ fn try_delegate_to_real_provider(
             Ok(Some(v)) => return Some(Ok(Some(v))),
             Ok(None) => {}
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let is_malformed = ctx.class_name_arc_of_id(ctx.class_id_of_object(exc)).as_deref()
+                let is_malformed = ctx
+                    .class_name_arc_of_id(ctx.class_id_of_object(exc))
+                    .as_deref()
                     == Some("java/net/MalformedURLException");
                 if !is_malformed && first_exception.is_none() {
                     first_exception = Some(exc);
@@ -2704,10 +2785,16 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         native_set_thread_contention_monitoring_enabled,
         NativeKind::Bridge,
     );
-    r.register_with_kind(cls, "resetContentionTimes0", "(J)V", |ctx, _args| {
-        ctx.reset_thread_jmx_contention_stats();
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "resetContentionTimes0",
+        "(J)V",
+        |ctx, _args| {
+            ctx.reset_thread_jmx_contention_stats();
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // REAL — arbitrary-thread CPU/user time on the real-JDK surface, the twin of
     // `ThreadMXBean.getThreadCpuTime(J)` in `register_thread_mxbean`. Now that
@@ -2758,12 +2845,20 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         user_cpu_time_scalar,
         NativeKind::Bridge,
     );
-    r.register_with_kind(cls, "getThreadTotalCpuTime1", "([J[J)V", |ctx, args| {
-        fill_thread_cpu_times(ctx, args, false)
-    }, NativeKind::Bridge);
-    r.register_with_kind(cls, "getThreadUserCpuTime1", "([J[J)V", |ctx, args| {
-        fill_thread_cpu_times(ctx, args, true)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getThreadTotalCpuTime1",
+        "([J[J)V",
+        |ctx, args| fill_thread_cpu_times(ctx, args, false),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        cls,
+        "getThreadUserCpuTime1",
+        "([J[J)V",
+        |ctx, args| fill_thread_cpu_times(ctx, args, true),
+        NativeKind::Bridge,
+    );
     // REAL — `dumpThreads0(long[] ids, boolean lockedMonitors, boolean
     // lockedSynchronizers, int maxDepth)`, STATIC, so ids is `args[0]` and a
     // null ids means "every live thread". This was UNREGISTERED, which was
@@ -2799,27 +2894,39 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     // high-water mark to reset now (see `peak_thread_count`). Shares the one
     // process-wide counter with the `VMManagementImpl` and `ThreadMXBean`
     // surfaces so a reset through any of the three is visible from all of them.
-    r.register_with_kind(cls, "resetPeakThreadCount0", "()V", |ctx, _args| {
-        reset_peak_thread_count(ctx);
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "resetPeakThreadCount0",
+        "()V",
+        |ctx, _args| {
+            reset_peak_thread_count(ctx);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // getThreads()[Ljava/lang/Thread; — REAL: enumerate the live Thread
     // objects the VM is tracking (`enumerate_threads`, the same source
     // backing `active_thread_count`). Previously returned an empty array,
     // which is a fabricated "no threads" answer for a VM that always has at
     // least the main thread alive.
-    r.register_with_kind(cls, "getThreads", "()[Ljava/lang/Thread;", |ctx, _args| {
-        let threads = ctx.enumerate_threads(usize::MAX);
-        let thread_cid = ctx
-            .class_id_by_name("java/lang/Thread")
-            .unwrap_or(ClassId::new(0));
-        let arr = ctx.new_ref_array(thread_cid, threads.len());
-        for (i, t) in threads.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*t)));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getThreads",
+        "()[Ljava/lang/Thread;",
+        |ctx, _args| {
+            let threads = ctx.enumerate_threads(usize::MAX);
+            let thread_cid = ctx
+                .class_id_by_name("java/lang/Thread")
+                .unwrap_or(ClassId::new(0));
+            let arr = ctx.new_ref_array(thread_cid, threads.len());
+            for (i, t) in threads.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Object(Some(*t)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+        NativeKind::Bridge,
+    );
 
     // The JDK implementation stores ownership in this otherwise tiny final
     // helper. Intercepting it gives the VM a precise, JIT-independent index of
@@ -2881,8 +2988,10 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
                             // Take a free slot, else evict slot 0. The policy does
                             // not need to be clever at this size, but the table
                             // must not be able to grow without bound.
-                            let victim =
-                                memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                            let victim = memo
+                                .iter()
+                                .position(|(cid, _)| *cid == u32::MAX)
+                                .unwrap_or(0);
                             memo[victim] = (raw_cid, index as u32);
                         });
                         ctx.set_field(this, index, Value::Object(owner));
@@ -2944,10 +3053,16 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
     // `ClassLoadingMXBean.setVerbose(b)` unobservable — the JMM contract says
     // it must not be. CratonVM has no class-load tracing to switch on, so the
     // flag is state-only; see `VERBOSE_CLASS`.
-    r.register_with_kind(cls, "setVerboseClass", "(Z)V", |_ctx, args| {
-        VERBOSE_CLASS.store(bool_flag_arg(args), std::sync::atomic::Ordering::Relaxed);
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "setVerboseClass",
+        "(Z)V",
+        |_ctx, args| {
+            VERBOSE_CLASS.store(bool_flag_arg(args), std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // <init>(Lsun/management/VMManagement;)V — mirror the real
     // `ClassLoadingImpl(VMManagement vm) { this.jvm = vm; }`. Dropping the
@@ -3039,17 +3154,25 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
     // counter (`gc_collection_count`), the same source the Bridge
     // GarbageCollectorMXBean.getCollectionCount uses. Previously a
     // fabricated 0, which made H2's collectGarbage() delta-loop spin.
-    r.register_with_kind(cls, "getCollectionCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getCollectionCount",
+        "()J",
+        |ctx, _args| Ok(Some(Value::Long(ctx.gc_collection_count() as i64))),
+        NativeKind::Bridge,
+    );
     // getCollectionTime — FLAGGED: we don't track wall-clock GC pause time.
     // Mirror the count (matching the Bridge MXBean's getCollectionTime),
     // which gives a monotonically-increasing value so delta-based callers
     // (H2) make progress; a real millisecond timer is a follow-up. This is
     // an honest stand-in, not a fabricated constant.
-    r.register_with_kind(cls, "getCollectionTime", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "getCollectionTime",
+        "()J",
+        |ctx, _args| Ok(Some(Value::Long(ctx.gc_collection_count() as i64))),
+        NativeKind::Bridge,
+    );
 
     // <init>(Ljava/lang/String;Lsun/management/VMManagement;)V — the `name`
     // argument is exactly what `getName()` below reads back, so discarding it
@@ -3289,17 +3412,23 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     // pre- and post-reset answers are equal. The state machine is the real
     // one, so this becomes correct for free once per-pool accounting lands;
     // what is missing is the metric, not the reset.
-    r.register_with_kind(cls, "resetPeakUsage0", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Building the snapshot allocates, which can relocate the receiver —
-        // keep it rooted and re-read it before the field write.
-        let pin = ctx.pin_native_root(this);
-        let now = undefined_memory_usage(ctx)?;
-        let this = ctx.read_native_pin(pin, this);
-        ctx.set_field_by_name(this, "peakUsage", Value::Object(Some(now)));
-        ctx.unpin_native_roots(pin);
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        cls,
+        "resetPeakUsage0",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Building the snapshot allocates, which can relocate the receiver —
+            // keep it rooted and re-read it before the field write.
+            let pin = ctx.pin_native_root(this);
+            let now = undefined_memory_usage(ctx)?;
+            let this = ctx.read_native_pin(pin, this);
+            ctx.set_field_by_name(this, "peakUsage", Value::Object(Some(now)));
+            ctx.unpin_native_roots(pin);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // getMemoryManagers0()[Ljava/lang/management/MemoryManagerMXBean; --
     // backs the pure-Java getMemoryManagerNames(), which Tomcat's
@@ -3324,7 +3453,11 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
 /// `isHeap` populated.  The remaining fields default-initialise to zero
 /// (longs) / null (refs) which matches a "no-threshold" pool — fine for
 /// JConsole-style enumeration.
-pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: bool) -> Result<ObjectRef, MethodCallFailed> {
+pub fn alloc_memory_pool_impl(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    is_heap: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12)?;
     let n = ctx.create_string(name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
@@ -3339,7 +3472,10 @@ pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: 
 /// `getMemoryManagerMXBeans()`) and `GarbageCollectorMXBean` (so it
 /// passes the `instanceof` filter in
 /// `ManagementFactoryHelper.getGarbageCollectorMXBeans`).
-pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub fn alloc_garbage_collector_impl(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4)?;
     let n = ctx.create_string(name);
     init_memory_manager_fields(ctx, obj, Value::Object(Some(n)));
@@ -3422,7 +3558,13 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // KEEP: same reasoning as the legacy class's `initialize0` above — no
     // counter handles for it to open, and no getter here reads any state it
     // could establish.
-    r.register_with_kind(mcls, "initialize0", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
+    r.register_with_kind(
+        mcls,
+        "initialize0",
+        "()V",
+        |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
+    );
 
     // `jdk.internal.platform.CgroupMetrics.isUseContainerSupport()Z` gates
     // `Metrics.getInstance()`: when it returns `false`, `getInstance()`
@@ -3646,8 +3788,6 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/Flag";
 
-
-
     // Empty Flag[] — same reference-array pattern as getAllFlagNames; the
     // element type is `Lsun/management/Flag;` but our synthetic ref-array
     // doesn't carry the element class beyond ClassId::new(0).
@@ -3662,7 +3802,13 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     // `Flag` through its constructor and resolves nothing by field id, so there
     // is no cache to fill and nothing that reads one; the registration exists
     // so `Flag.<clinit>` links.
-    r.register_with_kind(internal_cls, "initialize", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
+    r.register_with_kind(
+        internal_cls,
+        "initialize",
+        "()V",
+        |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
+    );
     // REAL: the number of flags `getFlags(null, …)` will produce, so the two
     // agree. `Flag.getAllFlags()` sizes its `Flag[]` from this value and then
     // trusts `getFlags`'s return, so a count that over- or under-states the
@@ -4020,7 +4166,10 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+fn init_runtime_mxbean_fields(
+    ctx: &mut dyn NativeContext,
+    obj: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*obj);
     let w5_out = init_runtime_mxbean_fields_body(ctx, *obj);
     *obj = ctx.read_native_pin(w5_pin, *obj);
@@ -4033,7 +4182,10 @@ fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) 
 /// `<init>` native, so a bean carries the same state however it was built —
 /// without this, a directly-constructed bean answers `getName() == null` and
 /// hands back an untyped default slot for the `long` getters.
-fn init_runtime_mxbean_fields_body(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<(), MethodCallFailed> {
+fn init_runtime_mxbean_fields_body(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let pid = std::process::id();
     // `RuntimeMXBean.getName()` is specified only as "a name representing the
     // running VM", but every JDK implements it as `pid + "@" + hostname`
@@ -4282,7 +4434,11 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(try_alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)?)
+    Ok(try_alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/management/PlatformLoggingMXBean",
+        0,
+    )?)
 }
 
 /// The live `java.util.logging.LogManager` singleton.
@@ -4499,7 +4655,10 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
 /// `addNotificationListener` synchronizes on `listenerLock` and then mutates
 /// `listenerList`. Leaving either field null makes a real JMX client (notably
 /// Micrometer's `JvmHeapPressureMetrics`) fail during bootstrap.
-fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn init_notification_emitter_support(
+    ctx: &mut dyn NativeContext,
+    emitter: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Both construction paths can allocate and relocate the receiver, so keep
     // it rooted and re-read it before every field access.
     let pin = ctx.pin_native_root(emitter);
@@ -4942,7 +5101,11 @@ fn alloc_basic_thread_info(
 /// build one ThreadInfo per actually-enumerated live thread (Tomcat's
 /// Diagnostics.getThreadDump() calls dumpAllThreads and greps the result for
 /// connector I/O thread names like "http-nio-...").
-fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_named_thread_info(
+    ctx: &mut dyn NativeContext,
+    thread_id: i64,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
     let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
     let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
@@ -5532,7 +5695,9 @@ fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
     // needs a hook at thread start, which is a larger change than converging
     // two bodies. `max(1)` because the calling thread is always one of them.
     r.register(cls, "getTotalStartedThreadCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(i64::from(ctx.active_thread_count()).max(1))))
+        Ok(Some(Value::Long(
+            i64::from(ctx.active_thread_count()).max(1),
+        )))
     });
     // Live, same reason. `daemon_thread_count` is the helper
     // `init_thread_mxbean_fields` already calls to FILL slot 3 -- calling it
@@ -5922,16 +6087,22 @@ fn register_thread_mxbean_extensions(r: &mut NativeMethodRegistry) {
     let allocated_scalar: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
         let requested = requested_thread_id(args);
         Ok(Some(Value::Long(
-            allocated_bytes_for(ctx, requested).map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+            allocated_bytes_for(ctx, requested)
+                .map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
         )))
     };
     r.register(cls, "getThreadAllocatedBytes", "(J)J", allocated_scalar);
-    r.register(cls, "getCurrentThreadAllocatedBytes", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(
-            ctx.current_thread_allocated_bytes()
-                .map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
-        )))
-    });
+    r.register(
+        cls,
+        "getCurrentThreadAllocatedBytes",
+        "()J",
+        |ctx, _args| {
+            Ok(Some(Value::Long(
+                ctx.current_thread_allocated_bytes()
+                    .map_or(-1, |b| i64::try_from(b).unwrap_or(i64::MAX)),
+            )))
+        },
+    );
     // Array form: one entry per requested id, `-1` where the id is not the
     // caller's. Sized from the input array, as the JMM specifies.
     r.register(cls, "getThreadAllocatedBytes", "([J)[J", |ctx, args| {
@@ -5968,12 +6139,17 @@ fn register_thread_mxbean_extensions(r: &mut NativeMethodRegistry) {
             ))))
         },
     );
-    r.register(cls, "isThreadAllocatedMemoryEnabled", "()Z", |ctx, _args| {
-        Ok(Some(Value::Int(i32::from(
-            THREAD_ALLOCATED_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-                && ctx.current_thread_allocated_bytes().is_some(),
-        ))))
-    });
+    r.register(
+        cls,
+        "isThreadAllocatedMemoryEnabled",
+        "()Z",
+        |ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                THREAD_ALLOCATED_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    && ctx.current_thread_allocated_bytes().is_some(),
+            ))))
+        },
+    );
     // Stored, not no-op'd — same argument as `setThreadCpuTimeEnabled`: the
     // underlying accounting cannot be switched off, but the JMM lets a caller
     // disable *measurement*, and a no-op would leave `isEnabled()` reporting
@@ -6014,12 +6190,10 @@ fn register_thread_mxbean_extensions(r: &mut NativeMethodRegistry) {
     // The bulk CPU/user-time forms the extension interface adds. Same
     // per-id resolution the scalar `getThreadCpuTime(J)` uses, so the two
     // surfaces cannot disagree.
-    let cpu_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
-        thread_time_array(ctx, args, true)
-    };
-    let user_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
-        thread_time_array(ctx, args, false)
-    };
+    let cpu_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |ctx, args| thread_time_array(ctx, args, true);
+    let user_time_array: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |ctx, args| thread_time_array(ctx, args, false);
     r.register(cls, "getThreadCpuTime", "([J)[J", cpu_time_array);
     r.register(cls, "getThreadUserTime", "([J)[J", user_time_array);
 }
@@ -6037,18 +6211,18 @@ fn thread_time_array(
         Some(Value::Object(Some(arr))) => read_long_array(ctx, *arr),
         _ => Vec::new(),
     };
-    let answers: Vec<i64> = ids
-        .iter()
-        .map(|id| {
-            cpu_time_for_requested_tid(ctx, Some(*id)).map_or(-1, |(cpu, user)| {
-                if want_cpu {
-                    cpu
-                } else {
-                    user
-                }
+    let answers: Vec<i64> =
+        ids.iter()
+            .map(|id| {
+                cpu_time_for_requested_tid(ctx, Some(*id)).map_or(-1, |(cpu, user)| {
+                    if want_cpu {
+                        cpu
+                    } else {
+                        user
+                    }
+                })
             })
-        })
-        .collect();
+            .collect();
     let out = ctx.new_array(ArrayElementType::Long, answers.len());
     for (i, v) in answers.iter().enumerate() {
         ctx.set_array_element(out, i, Value::Long(*v));
@@ -6385,8 +6559,11 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
 // / `getQueuedVirtualThreadCount()` are REAL as of 2026-07-28 — they read the
 // live `ForkJoinScheduler` counters through `NativeContext::vt_scheduler_stats`;
 // see the note on their registrations below.
-fn alloc_virtual_thread_scheduler_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1)?;
+fn alloc_virtual_thread_scheduler_mxbean(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let obj =
+        try_alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1)?;
     ctx.set_field(obj, 0, Value::Int(ctx.available_processor_count()));
     Ok(obj)
 }
@@ -6452,7 +6629,8 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
+    let obj =
+        try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
     init_gc_mxbean_fields(ctx, obj);
     Ok(obj)
 }
@@ -6579,7 +6757,10 @@ fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCa
 
 /// Allocate an in-process MBeanServer whose default domain follows the
 /// `MBeanServerFactory` overload that created it.
-fn alloc_mbean_server_with_domain(ctx: &mut dyn NativeContext, domain: Option<&str>) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_mbean_server_with_domain(
+    ctx: &mut dyn NativeContext,
+    domain: Option<&str>,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS)?;
     let domain = ctx.create_string(domain.unwrap_or("DefaultDomain"));
     ctx.set_field(obj, MBS_DOMAIN, Value::Object(Some(domain)));
@@ -6780,7 +6961,10 @@ fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCal
 /// HashSet via [`build_real_hash_set`] — a synthetic stand-in's real `size()` /
 /// `iterator()` read its (empty) backing map, so callers see an empty set
 /// regardless of contents (the TC0622 defect).
-fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_synthetic_hash_set(
+    ctx: &mut dyn NativeContext,
+    elems: &[ObjectRef],
+) -> Result<ObjectRef, MethodCallFailed> {
     let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
@@ -6797,7 +6981,10 @@ fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) ->
 /// GC-safe: the elements are parked in a single ref-array and the set is pinned
 /// across the (allocating) `add` calls, so a moving collector can't strand them.
 /// Falls back to the synthetic stand-in only if the real class is unavailable.
-fn build_real_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_real_hash_set(
+    ctx: &mut dyn NativeContext,
+    elems: &[ObjectRef],
+) -> Result<ObjectRef, MethodCallFailed> {
     // Park the elements in one heap array we can re-read across each add().
     let arr = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
@@ -8183,7 +8370,8 @@ mod jmx_tests {
         let name = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(name))],
@@ -8282,7 +8470,8 @@ mod jmx_tests {
         let concrete = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let is_pattern = |ctx: &mut dyn NativeContext,
                           f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
                           obj: ObjectRef| {

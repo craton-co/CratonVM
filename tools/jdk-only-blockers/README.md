@@ -416,4 +416,4 @@ new origin must be classified by a human, not defaulted into "allowed".
 - [`docs/feature-designs/jdk-only-mode.md`](../../docs/feature-designs/jdk-only-mode.md) — the normative contract
 - [`audits/jdk-only-audit.md`](../../audits/jdk-only-audit.md) — the reproducible audit, §6 defines these artifacts
 - [`docs/jdk-only-native-review.md`](../../docs/jdk-only-native-review.md) — the per-native promotion checklist
-- [`docs/jdk-only-runtime-services.md`](../../docs/jdk-only-runtime-services.md) — the blocker inventory
+- [`docs/known-issues/jdk-only/runtime-services-blocker-inventory.md`](../../docs/known-issues/jdk-only/runtime-services-blocker-inventory.md) — the blocker inventory

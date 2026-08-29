@@ -171,7 +171,6 @@ fn pipe_cache() -> &'static Mutex<HashMap<i64, PipeFds>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-
 #[derive(Clone, Copy, Debug)]
 struct ExitCache {
     pid: i64,
@@ -287,7 +286,10 @@ enum StdioRedirect {
     Inherit,
     Null,
     ReadFile(String),
-    WriteFile { path: String, append: bool },
+    WriteFile {
+        path: String,
+        append: bool,
+    },
     /// A descriptor the caller has already opened, named by its `FdTable` id.
     ///
     /// The real JDK's `ProcessImpl` opens file redirects itself and passes the
@@ -363,9 +365,7 @@ fn stdio_from_existing_fd(
     let file = fd_table
         .clone_file(id as FdId)
         .map_err(|e| RuntimeError::IOException {
-            message: format!(
-                "ProcessBuilder.{op}: descriptor {id} is not backed by a file: {e}"
-            ),
+            message: format!("ProcessBuilder.{op}: descriptor {id} is not backed by a file: {e}"),
         })?;
     Ok(Stdio::from(file))
 }
@@ -644,7 +644,11 @@ fn spawn_and_wrap_with_redirects(
     let proc_class = crate::refused_class(ctx, SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT)?;
     let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
     ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
-    ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(spawned.fds.stdin_fd));
+    ctx.set_field(
+        proc_ref,
+        PROC_FIELD_STDIN_FD,
+        Value::Int(spawned.fds.stdin_fd),
+    );
     ctx.set_field(
         proc_ref,
         PROC_FIELD_STDOUT_FD,
@@ -782,9 +786,13 @@ fn spawn_child(
 
     let mut command = Command::new(program);
     command.args(args);
-    let (stdin_piped, stdout_piped, stderr_piped, merged_reader) =
-        configure_stdio(ctx.fd_table(), &mut command, redirects, redirect_error_stream)
-            .map_err(cratonvm_types::error::MethodCallFailed::from)?;
+    let (stdin_piped, stdout_piped, stderr_piped, merged_reader) = configure_stdio(
+        ctx.fd_table(),
+        &mut command,
+        redirects,
+        redirect_error_stream,
+    )
+    .map_err(cratonvm_types::error::MethodCallFailed::from)?;
 
     if clear_env {
         command.env_clear();
@@ -887,8 +895,8 @@ fn spawn_child(
         );
     }
     process_table()
-            .lock()
-            .insert(handle, Arc::new(Mutex::new(child)));
+        .lock()
+        .insert(handle, Arc::new(Mutex::new(child)));
     exit_cache().lock().insert(
         handle,
         ExitCache {
@@ -1832,10 +1840,7 @@ fn native_process_impl_is_process_alive(
 /// catchable termination, so `ProcessImpl.destroyForcibly()` is literally
 /// `destroy(); return this;`. Hence the unconditional `force`.
 #[cfg(windows)]
-fn native_process_impl_terminate(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_process_impl_terminate(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let handle = long_arg(args, 0);
     if known_handle(handle) {
         destroy_handle(handle, true);
@@ -1961,14 +1966,15 @@ fn native_process_impl_open_for_atomic_append(
             .into())
         }
     };
-    let validated = validate_redirect_path(&path, "redirectOutput").map_err(MethodCallFailed::from)?;
+    let validated =
+        validate_redirect_path(&path, "redirectOutput").map_err(MethodCallFailed::from)?;
     ctx.check_capability_or_throw(Capability::file_write(&validated))?;
-    let fd = ctx
-        .fd_table()
-        .open_write(&validated, true)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("ProcessImpl.openForAtomicAppend({path:?}): {e}"),
-        })?;
+    let fd =
+        ctx.fd_table()
+            .open_write(&validated, true)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("ProcessImpl.openForAtomicAppend({path:?}): {e}"),
+            })?;
     Ok(Some(Value::Long(fd as i64)))
 }
 
@@ -2323,10 +2329,7 @@ fn linux_stat_line_times(stat: &str) -> Option<(i64, i64)> {
     // the start time is the one this record cannot do without.
     let utime: i64 = fields.get(11).and_then(|f| f.parse().ok()).unwrap_or(0);
     let stime: i64 = fields.get(12).and_then(|f| f.parse().ok()).unwrap_or(0);
-    let cpu_nanos = utime
-        .saturating_add(stime)
-        .saturating_mul(1_000_000_000)
-        / hz;
+    let cpu_nanos = utime.saturating_add(stime).saturating_mul(1_000_000_000) / hz;
     Some((start_ms, cpu_nanos))
 }
 
@@ -2647,7 +2650,13 @@ fn os_process_user(pid: i64) -> Option<String> {
         // carries is, so there is no fixed struct to hand in. The probe call is
         // EXPECTED to fail (`ERROR_INSUFFICIENT_BUFFER`); only `needed` matters.
         let mut needed: u32 = 0;
-        GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut needed);
+        GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
         if needed == 0 {
             CloseHandle(token);
             return None;
@@ -3993,8 +4002,7 @@ fn collect_descendant_pids(pid: i64) -> Result<Vec<i64>, ProcessScanError> {
     // used to arrive here as an empty `Vec`, and an empty `by_parent` makes
     // every node a leaf — so `descendants()` reported a childless tree for a
     // process that had a subtree, and said nothing.
-    let mut by_parent: std::collections::HashMap<i64, Vec<i64>> =
-        std::collections::HashMap::new();
+    let mut by_parent: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
     for (child, parent) in os_snapshot_processes()? {
         by_parent.entry(parent).or_default().push(child);
     }
@@ -4745,11 +4753,7 @@ fn os_list_processes(of_pid: i64) -> Result<Vec<(i64, i64)>, ProcessScanError> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir("/proc") {
         Ok(entries) => entries,
-        Err(e) => {
-            return Err(ProcessScanError::new(format!(
-                "Unable to open /proc: {e}"
-            )))
-        }
+        Err(e) => return Err(ProcessScanError::new(format!("Unable to open /proc: {e}"))),
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -5636,7 +5640,10 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 /// them harmless, and a registration-order change would have reintroduced the
 /// empty-CGI-body bug the same shape caused on the `Runtime.exec` route. See
 /// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
-pub fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub fn native_process_builder_start(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if pb_debug_enabled() {
         eprintln!("[PB-START-IO] ProcessBuilder.start via native-io");
     }
@@ -5788,10 +5795,13 @@ pub fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value])
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Serializes the tests that call `spawn_and_wrap`.
     ///
@@ -5953,9 +5963,8 @@ mod tests {
         let code = wait_for_handle(handle);
         assert!(code != 0, "killed child should not report success: {code}");
 
-        let dead =
-            native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
-                .unwrap();
+        let dead = native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
+            .unwrap();
         assert_eq!(dead, Some(Value::Long(-1)), "exited, by pid");
     }
 
@@ -6361,10 +6370,8 @@ mod tests {
 
         // --- deny arm: the error propagates verbatim and nothing is spawned.
         let mut ctx = MockNativeContext::new();
-        let marker = std::env::temp_dir().join(format!(
-            "cratonvm-spawn-policy-{}",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("cratonvm-spawn-policy-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let denied = spawn_and_wrap(
             &mut ctx,
@@ -6530,14 +6537,16 @@ mod tests {
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(pid), Value::Int(1)])
                 .unwrap()
                 .unwrap();
-        assert_eq!(killed, Value::Int(1), "destroyProcess0 must find the child by pid");
+        assert_eq!(
+            killed,
+            Value::Int(1),
+            "destroyProcess0 must find the child by pid"
+        );
 
-        let code = native_proc_handle_wait_for_process_exit0(
-            &mut ctx,
-            &[Value::Long(pid), Value::Int(0)],
-        )
-        .unwrap()
-        .unwrap();
+        let code =
+            native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(pid), Value::Int(0)])
+                .unwrap()
+                .unwrap();
         assert!(
             matches!(code, Value::Int(c) if c != -1 && c != -2),
             "waitForProcessExit0 must find the child by pid, got {code:?}"
@@ -6689,12 +6698,10 @@ mod tests {
         // contract. See `handle_for_pid`.
         let (_handle, pid) = install_child_for_test(child);
         let mut ctx = MockNativeContext::new();
-        let result = native_proc_handle_wait_for_process_exit0(
-            &mut ctx,
-            &[Value::Long(pid), Value::Int(0)],
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(pid), Value::Int(0)])
+                .unwrap()
+                .unwrap();
         assert_eq!(result, Value::Int(0));
         assert_eq!(ctx.blocking_region_counts(), (1, 1));
     }
@@ -6767,7 +6774,11 @@ mod tests {
         // never sees an exit and the wait times out — which is the specified
         // answer for a process that has not exited, and the answer the
         // pre-guard code got wrong by reading slot bytes off a stranger.
-        assert_eq!(result, Value::Int(0), "a never-exiting process waits out its timeout");
+        assert_eq!(
+            result,
+            Value::Int(0),
+            "a never-exiting process waits out its timeout"
+        );
         let (begin, end) = ctx.blocking_region_counts();
         assert!(
             begin >= 1,

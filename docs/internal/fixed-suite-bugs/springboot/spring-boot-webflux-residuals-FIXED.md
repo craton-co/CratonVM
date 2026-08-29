@@ -115,7 +115,7 @@ While reverifying Issue B after merging 122 new `origin/dev` commits into
 this branch, `WebFluxManagementChildContextConfigurationIntegrationTests`
 started hanging again — but at a **different, later** point than the
 original bug: after Tomcat actually starts, stalled inside Hibernate
-Validator's classloader resource lookup for `META-INF/validation.xml`
+Validator's classloader resource lookup for `../../../../apps/META-INF/validation.xml`
 (`ResourceLoaderHelper: Trying to load ... via user class loader` → `via
 TCCL` → `via Hibernate Validator's class loader`, then nothing further).
 

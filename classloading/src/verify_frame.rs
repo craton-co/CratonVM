@@ -750,7 +750,10 @@ mod tests {
         // `max_locals` is 1, so slots 1 and 2 are DESCRIBED by the frame while
         // the runtime frame does not have them. They must be unaddressable.
         let frame = VerificationFrame::initial_frame("Foo", "m", "(J)V", false, 1, 1);
-        assert!(frame.locals.len() > 1, "descriptor over-fills the locals vec");
+        assert!(
+            frame.locals.len() > 1,
+            "descriptor over-fills the locals vec"
+        );
         assert!(frame.local_load(0).is_ok());
         assert!(
             frame.local_load(1).is_err(),
@@ -811,7 +814,11 @@ mod tests {
         let mut frame = VerificationFrame::initial_frame("Foo", "m", "()V", true, 4, 1);
         frame.local_store_wide(1, VType::Long).unwrap();
         frame.local_store(2, VType::Int).unwrap();
-        assert_eq!(frame.locals[1], VType::Top, "cat-2 base must be invalidated");
+        assert_eq!(
+            frame.locals[1],
+            VType::Top,
+            "cat-2 base must be invalidated"
+        );
         assert!(
             frame.local_load_wide(1, &VType::Long).is_err(),
             "the split pair must not read back as a long"

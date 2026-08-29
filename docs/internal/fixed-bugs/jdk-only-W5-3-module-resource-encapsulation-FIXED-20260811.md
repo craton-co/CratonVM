@@ -112,7 +112,7 @@ Supporting rules, all from `Resources`:
   `> 6`, not `>= 6`: a resource literally named `.class` *is* encapsulable.
 * `toPackageName`: the text before the **last** `/`; `""` when there is no `/`
   or the name ends with one. This — not a special case — is why
-  `META-INF/MANIFEST.MF` and top-level names are never encapsulated: `META-INF`
+  `../../../apps/META-INF/MANIFEST.MF` and top-level names are never encapsulated: `META-INF`
   is not a legal package name, so it is not in `getPackages()`.
 * The leading `/` is stripped *before* the package is derived.
 

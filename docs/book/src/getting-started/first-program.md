@@ -70,7 +70,7 @@ for anything performance-sensitive — debug builds are 10–50× slower.
 
 If your program is packaged as a JAR with a `Main-Class` in its manifest, run it
 with `--jar`. The classpath flag is ignored in this mode (the main class comes
-from `META-INF/MANIFEST.MF`):
+from `../../../../apps/META-INF/MANIFEST.MF`):
 
 ```bash
 cratonvm --jar app.jar arg1 arg2

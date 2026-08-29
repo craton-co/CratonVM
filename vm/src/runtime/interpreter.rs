@@ -614,7 +614,6 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
 // the moving-collector remap, plus the provenance tracing built to debug
 // them: `interpreter/gc_and_alloc.rs`.
 
-
 // ---------------------------------------------------------------------------
 // Instruction execution result (internal)
 // ---------------------------------------------------------------------------
@@ -904,10 +903,7 @@ fn resolve_native_for_dispatch(
     method_name: &str,
     method_descriptor: &str,
     bytecode_available: bool,
-) -> Result<
-    Option<cratonvm_native_api::NativeCallback>,
-    cratonvm_types::error::JdkOnlyViolation,
-> {
+) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
     let registry = &shared.natives.native_methods;
     let id = match registry.resolve_id(class_name, method_name, method_descriptor) {
         Some(id) => id,
@@ -1708,8 +1704,7 @@ pub fn execute(
                         // record warns that "removing shim mappings has
                         // regressed real-JDK boot before", and `Compatible`
                         // keeps the mapping untouched.
-                        if !canonical.is_empty()
-                            && crate::vm::dispatch_policy(shared).is_jdk_only()
+                        if !canonical.is_empty() && crate::vm::dispatch_policy(shared).is_jdk_only()
                         {
                             crate::vm::record_canonical_substitution(
                                 &class_name_owned,
@@ -1955,7 +1950,8 @@ pub fn execute(
         // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
         // here. The two `Arc` clones are refcount bumps, not allocations.
         let gate_pass_key = (skip_key.1.clone(), skip_key.2.clone());
-        let gate_pass_memo = if already_skipped || !crate::runtime::env_cache::jit_gate_pass_memo() {
+        let gate_pass_memo = if already_skipped || !crate::runtime::env_cache::jit_gate_pass_memo()
+        {
             None
         } else {
             let epoch = cratonvm_jit::redefine_epoch();
@@ -3572,7 +3568,9 @@ pub fn execute(
                             // hasn't been consulted yet (no frame pushed). Instead, save the
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
-                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
+                            if let Some(exc) =
+                                crate::jit::helpers::take_jit_pending_exception(thread)
+                            {
                                 // This legacy sink routes the exception against a
                                 // freshly pushed, method-entry frame rather than
                                 // through `route_jit_signal_exception`, so a frame
@@ -3599,7 +3597,7 @@ pub fn execute(
                                         is_synchronized,
                                         is_static,
                                         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+                                        intercept_shape_cache: std::sync::OnceLock::new(),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3924,7 +3922,7 @@ pub fn execute(
                                             is_synchronized,
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+                                            intercept_shape_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
@@ -4062,54 +4060,54 @@ pub fn execute(
                                             );
                                         }
                                     } else {
-                                    // Precise reconstruction is a correctness
-                                    // requirement once native code has executed
-                                    // past bci 0. Refuse a whole-method replay:
-                                    // it is observably wrong for methods with
-                                    // stores, I/O, monitor actions, or callbacks.
-                                    let why = if !resume_gate_ok {
-                                        "can_deopt_resume=false (no deopt points, \
+                                        // Precise reconstruction is a correctness
+                                        // requirement once native code has executed
+                                        // past bci 0. Refuse a whole-method replay:
+                                        // it is observably wrong for methods with
+                                        // stores, I/O, monitor actions, or callbacks.
+                                        let why = if !resume_gate_ok {
+                                            "can_deopt_resume=false (no deopt points, \
                                          or an elided monitor)"
-                                    } else if materialize_failed {
-                                        "the frame could not be materialised from its map"
-                                    } else {
-                                        "unknown"
-                                    };
-                                    // `deopt_reason` DEFAULTS to `UnreachedCode` when no
-                                    // point carries this bci, so printing it bare names a
-                                    // reason nothing ever requested — which is how the
-                                    // spliced-bci defect read as an `UnreachedCode` trap
-                                    // for a day. Say which of the two this is.
-                                    let reason_is_real = compiled
-                                        .deopt_points
-                                        .iter()
-                                        .any(|dp| dp.bci == rframe_for_despec.bci);
-                                    let reason_note = if reason_is_real {
-                                        "reason"
-                                    } else {
-                                        "NO deopt point carries this bci, so the reason \
+                                        } else if materialize_failed {
+                                            "the frame could not be materialised from its map"
+                                        } else {
+                                            "unknown"
+                                        };
+                                        // `deopt_reason` DEFAULTS to `UnreachedCode` when no
+                                        // point carries this bci, so printing it bare names a
+                                        // reason nothing ever requested — which is how the
+                                        // spliced-bci defect read as an `UnreachedCode` trap
+                                        // for a day. Say which of the two this is.
+                                        let reason_is_real = compiled
+                                            .deopt_points
+                                            .iter()
+                                            .any(|dp| dp.bci == rframe_for_despec.bci);
+                                        let reason_note = if reason_is_real {
+                                            "reason"
+                                        } else {
+                                            "NO deopt point carries this bci, so the reason \
                                          below is this sink's default rather than a \
                                          request — reason"
-                                    };
-                                    return Err(MethodCallFailed::InternalError(
-                                        VmError::Internal {
-                                            message: format!(
-                                                "precise deoptimization unavailable for \
+                                        };
+                                        return Err(MethodCallFailed::InternalError(
+                                            VmError::Internal {
+                                                message: format!(
+                                                    "precise deoptimization unavailable for \
                                                  {}.{}{} at bci {} ({}, stashed key {:?}, \
                                                  inline callers {}, {} {:?}); \
                                                  refusing side-effecting replay",
-                                                class_name_str,
-                                                method_name,
-                                                method_descriptor,
-                                                rframe_for_despec.bci,
-                                                why,
-                                                rframe_for_despec.method_key,
-                                                rframe_for_despec.caller_frames.len(),
-                                                reason_note,
-                                                deopt_reason,
-                                            ),
-                                        },
-                                    ));
+                                                    class_name_str,
+                                                    method_name,
+                                                    method_descriptor,
+                                                    rframe_for_despec.bci,
+                                                    why,
+                                                    rframe_for_despec.method_key,
+                                                    rframe_for_despec.caller_frames.len(),
+                                                    reason_note,
+                                                    deopt_reason,
+                                                ),
+                                            },
+                                        ));
                                     }
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
@@ -4252,21 +4250,19 @@ pub fn execute(
         // `jit_local_athrow_pc_in_frame` refuses it unless it lands in one of
         // THIS method's ranges, so a foreign stamp still degrades to the
         // pc-unknown search rather than picking a handler at random.
-        let found = match jit_local_athrow_pc_in_frame(
-            &thread.frames[frame_idx],
-            jit_early_throw_bci,
-        ) {
-            JitThrowPc::InRange(pc) => {
-                find_exception_handler_any_pc(shared, &thread.frames[frame_idx], pc, exc)
-            }
-            // The compiled body named a throw site of its own that no `try`
-            // covers: nothing here can catch it, and the pc-unknown search
-            // would match a typed row by exception class alone.
-            JitThrowPc::OutsideAllRanges(_) => None,
-            JitThrowPc::Unknown => {
-                find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc)
-            }
-        };
+        let found =
+            match jit_local_athrow_pc_in_frame(&thread.frames[frame_idx], jit_early_throw_bci) {
+                JitThrowPc::InRange(pc) => {
+                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], pc, exc)
+                }
+                // The compiled body named a throw site of its own that no `try`
+                // covers: nothing here can catch it, and the pc-unknown search
+                // would match a typed row by exception class alone.
+                JitThrowPc::OutsideAllRanges(_) => None,
+                JitThrowPc::Unknown => {
+                    find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc)
+                }
+            };
         match found {
             Some((handler_pc, exc_ref)) => {
                 thread.frames[frame_idx].stack.clear();
@@ -4875,9 +4871,7 @@ fn loop_work_tierup_enabled() -> bool {
 /// credits, so an inert lever is visibly inert instead of quietly so.
 fn loop_work_dbg() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LOOP_WORK").is_some()
-    })
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LOOP_WORK").is_some())
 }
 
 /// Run the standard back-edge OSR orchestration: backoff check → try_osr →
@@ -5609,8 +5603,8 @@ fn execute_frame_from_index(
         let code_len = padded_code_len.wrapping_sub(2); // original unpadded length
         if use_fast_path && saved_pc < code_len {
             // SAFETY: same live frame as the `padded_code_len` read above; the
-        // pointer is only read within this push-free region.
-        let code_ptr = unsafe { (*hot_fp).code.as_ptr() };
+            // pointer is only read within this push-free region.
+            let code_ptr = unsafe { (*hot_fp).code.as_ptr() };
             // SAFETY: code_ptr points to the method's bytecode array; saved_pc is bounds-checked against code_len above, and the bytecode is padded with 2 trailing bytes.
             let opcode = unsafe { *code_ptr.add(saved_pc) };
             let b1 = unsafe { *code_ptr.add(saved_pc + 1) };
@@ -6960,7 +6954,10 @@ fn execute_frame_from_index(
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
-                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
+                                RuntimeError::aioobe(
+                                    index,
+                                    shared.mem.heap.array_length(arr_ref) as i32,
+                                ),
                                 saved_pc,
                             ));
                             continue;
@@ -6975,7 +6972,10 @@ fn execute_frame_from_index(
                             Err(i) => {
                                 let _ = frame;
                                 pending_runtime_error = Some((
-                                    RuntimeError::aioobe(i, shared.mem.heap.array_length(arr_ref) as i32),
+                                    RuntimeError::aioobe(
+                                        i,
+                                        shared.mem.heap.array_length(arr_ref) as i32,
+                                    ),
                                     saved_pc,
                                 ));
                                 continue;
@@ -7010,15 +7010,17 @@ fn execute_frame_from_index(
                             if kind_of_popped == crate::runtime::ValueStack::KIND_MARK_DOUBLE {
                                 Value::Double(f64::from_bits(cv.to_bits()))
                             } else {
-                            match cv.tag() {
-                                CompactTag::Double => Value::Double(f64::from_bits(cv.to_bits())),
-                                CompactTag::Long => {
-                                    // Rare: NaN-tagged-collision long landing
-                                    // in a double slot; reinterpret the bits.
-                                    Value::Double(f64::from_bits(cv.to_bits()))
+                                match cv.tag() {
+                                    CompactTag::Double => {
+                                        Value::Double(f64::from_bits(cv.to_bits()))
+                                    }
+                                    CompactTag::Long => {
+                                        // Rare: NaN-tagged-collision long landing
+                                        // in a double slot; reinterpret the bits.
+                                        Value::Double(f64::from_bits(cv.to_bits()))
+                                    }
+                                    _ => cv.to_value(),
                                 }
-                                _ => cv.to_value(),
-                            }
                             }
                         }
                         // iastore / fastore / bastore / castore / sastore —
@@ -7034,7 +7036,10 @@ fn execute_frame_from_index(
                         if index < 0 {
                             let _ = frame;
                             pending_runtime_error = Some((
-                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
+                                RuntimeError::aioobe(
+                                    index,
+                                    shared.mem.heap.array_length(arr_ref) as i32,
+                                ),
                                 saved_pc,
                             ));
                             continue;
@@ -7458,7 +7463,9 @@ fn execute_frame_from_index(
                     }
                     // invokeinterface: thread is_interface=true so γ's stash
                     // arms the default-method rescue.
-                    match execute_invoke_kind(shared, thread, frame_idx, cp_index, false, true, saved_pc) {
+                    match execute_invoke_kind(
+                        shared, thread, frame_idx, cp_index, false, true, saved_pc,
+                    ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -8452,7 +8459,6 @@ fn execute_frame_from_index(
 //
 // `execute_instruction`, one arm per JVM opcode: `interpreter/opcodes.rs`.
 
-
 // ---------------------------------------------------------------------------
 // Helper: lambda proxy type-check for checkcast/instanceof
 // ---------------------------------------------------------------------------
@@ -8493,8 +8499,7 @@ pub use field_access::*;
 pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
-    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo,
-    ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
@@ -9155,13 +9160,12 @@ pub(crate) fn multianewarray_alloc(
             .ok_or_else(|| VmError::Internal {
                 message: "current class not found".to_string(),
             })?;
-        let array_class_name =
-            class
-                .constant_pool
-                .get_class_name(cp_index)
-                .ok_or_else(|| VmError::Internal {
-                    message: format!("invalid class ref at cp#{cp_index}"),
-                })?;
+        let array_class_name = class
+            .constant_pool
+            .get_class_name(cp_index)
+            .ok_or_else(|| VmError::Internal {
+                message: format!("invalid class ref at cp#{cp_index}"),
+            })?;
         // Strip leading '[' to find the leaf type descriptor; the count of
         // stripped `[`s is the total array depth.
         let total_depth = array_class_name
@@ -9277,14 +9281,7 @@ pub(crate) fn multianewarray_alloc(
         );
     }
 
-    alloc_multi_array(
-        shared,
-        sizes,
-        0,
-        leaf_et,
-        total_array_depth,
-        &component_ids,
-    )
+    alloc_multi_array(shared, sizes, 0, leaf_et, total_array_depth, &component_ids)
 }
 
 /// Maximum recursion depth for multianewarray to prevent stack overflow.

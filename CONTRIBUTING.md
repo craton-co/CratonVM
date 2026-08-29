@@ -57,10 +57,9 @@ workflow is advisory; do not add to that list to make a branch green.
 
 **Steps 1 and 4 are not green today.** `cargo fmt --all --check` reports over a
 thousand diffs tree-wide, and `cargo test --workspace` has a residual failure
-set that predates any given change. Both are tracked in
-`jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`.
-Compare your run against that list rather than against zero, and note in the PR
-which entries you saw — a *new* name in the output is the signal.
+set that predates any given change and is tracked internally. Compare your run
+against that known set rather than against zero, and note in the PR which
+entries you saw — a *new* name in the output is the signal.
 
 ### Code Style
 
@@ -197,20 +196,17 @@ When your PR adds a feature, fixes a bug, or changes behavior:
    function you are editing sets one.
 
    This is not hypothetical. `native-api/src/registry.rs` carries a permanent
-   diagnostic (`CRATONVM_DBG_DROPPED_STUBS`) added on 2026-07-14 while chasing a
-   real-JDK boot regression — `InternalError: null property: java.home` — that
-   traced to a whole `register_*` function's worth of permanent
+   diagnostic (`CRATONVM_DBG_DROPPED_STUBS`) added while chasing a real-JDK
+   boot regression — `InternalError: null property: java.home` — that traced
+   to a whole `register_*` function's worth of permanent
    `java.util.Properties` bridges inheriting the wrong ambient category at one
    of its call sites. Mis-tagging does not merely mislabel: under
    `CRATONVM_NO_STUBS`, and under `--jdk-only`, `register()` **refuses** a
    `SyntheticStub` outright, so a mis-tagged bridge is never registered at all
-   and the failure surfaces far from its cause. Background:
-   the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
-   (RETIRED 2026-08-06 — the ambient default no longer decides anything). The
-   reclassification it pointed at was re-homed and then closed: all four of its
-   items landed 2026-08-11, and the population is now five slack-free ratchets
-   scored by `regression-suite/bridge-ratchet.sh` rather than a number in a
-   document. Background: the retired `bridge-reclassification-wave` write-up.
+   and the failure surfaces far from its cause. The ambient default no longer
+   decides anything: reclassification work closed out into five slack-free
+   ratchets scored by `regression-suite/bridge-ratchet.sh` rather than a
+   number in a document.
 
    One class of mis-tag is now decided centrally rather than at the site: a
    registration whose receiver class **no supported JDK image declares** cannot

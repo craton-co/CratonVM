@@ -25,8 +25,7 @@ use super::*;
 /// many splices would have handed a caller-owned frame slot out twice. Zero
 /// means the guard never engaged on this run, which is what a report of it has
 /// to say next to any result that credits it.
-static INLINE_LIVE_SLOT_CLAMPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static INLINE_LIVE_SLOT_CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn note_inline_live_slot_clamp() {
     INLINE_LIVE_SLOT_CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -83,8 +82,6 @@ impl Compiler {
     // -----------------------------------------------------------------------
     //
     // Moved to `x64/objects.rs`.
-
-
 
     /// Emit inlined callee bytecode at the given caller PC.
     ///
@@ -581,11 +578,9 @@ impl Compiler {
                         }
                     }
                 } else {
-                    let Some((depth, marks)) = self.spill_callee_stack_to_merge_slots(
-                        caller_base_depth,
-                        merge_base,
-                        R11,
-                    ) else {
+                    let Some((depth, marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
@@ -1342,18 +1337,13 @@ impl Compiler {
                     // region, and record what the target must agree with. R11
                     // rather than RAX: the comparison operands are already
                     // loaded and must survive to the `Jcc` below.
-                    let Some((merge_depth, merge_marks)) = self
-                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    let Some((merge_depth, merge_marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
                     else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !record_merge_state(
-                        &mut merge_states,
-                        target,
-                        merge_depth,
-                        &merge_marks,
-                    ) {
+                    if !record_merge_state(&mut merge_states, target, merge_depth, &merge_marks) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1394,18 +1384,13 @@ impl Compiler {
                     // region, and record what the target must agree with. R11
                     // rather than RAX: the comparison operands are already
                     // loaded and must survive to the `Jcc` below.
-                    let Some((merge_depth, merge_marks)) = self
-                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    let Some((merge_depth, merge_marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
                     else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !record_merge_state(
-                        &mut merge_states,
-                        target,
-                        merge_depth,
-                        &merge_marks,
-                    ) {
+                    if !record_merge_state(&mut merge_states, target, merge_depth, &merge_marks) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1444,18 +1429,13 @@ impl Compiler {
                     // region, and record what the target must agree with. R11
                     // rather than RAX: the comparison operands are already
                     // loaded and must survive to the `Jcc` below.
-                    let Some((merge_depth, merge_marks)) = self
-                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    let Some((merge_depth, merge_marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
                     else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !record_merge_state(
-                        &mut merge_states,
-                        target,
-                        merge_depth,
-                        &merge_marks,
-                    ) {
+                    if !record_merge_state(&mut merge_states, target, merge_depth, &merge_marks) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1832,18 +1812,13 @@ impl Compiler {
                     // region, and record what the target must agree with. R11
                     // rather than RAX: the comparison operands are already
                     // loaded and must survive to the `Jcc` below.
-                    let Some((merge_depth, merge_marks)) = self
-                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    let Some((merge_depth, merge_marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
                     else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !record_merge_state(
-                        &mut merge_states,
-                        target,
-                        merge_depth,
-                        &merge_marks,
-                    ) {
+                    if !record_merge_state(&mut merge_states, target, merge_depth, &merge_marks) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1876,18 +1851,13 @@ impl Compiler {
                     // region, and record what the target must agree with. R11
                     // rather than RAX: the comparison operands are already
                     // loaded and must survive to the `Jcc` below.
-                    let Some((merge_depth, merge_marks)) = self
-                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    let Some((merge_depth, merge_marks)) =
+                        self.spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
                     else {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     };
-                    if !record_merge_state(
-                        &mut merge_states,
-                        target,
-                        merge_depth,
-                        &merge_marks,
-                    ) {
+                    if !record_merge_state(&mut merge_states, target, merge_depth, &merge_marks) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -2391,9 +2361,9 @@ impl Compiler {
         self.load_slot_to_reg(RAX, recv_slot);
         self.emit_test_r64_r64(RAX);
         let null_miss = self.emit_jcc_rel32_patch(0x84); // JZ miss
-        // CMP DWORD [RAX+0], guard_class_id — the same encoding the top-level
-        // guarded-virtual arm and the String/CRC32 intrinsic guards use
-        // (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
+                                                         // CMP DWORD [RAX+0], guard_class_id — the same encoding the top-level
+                                                         // guarded-virtual arm and the String/CRC32 intrinsic guards use
+                                                         // (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
         self.buf.emit(&[0x81, 0x78, 0x00]);
         self.buf.emit(&nested.guard_class_id.to_le_bytes());
         let class_miss = self.emit_jcc_rel32_patch(0x85); // JNE miss
@@ -2410,7 +2380,8 @@ impl Compiler {
             self.forward_patches.truncate(forward_patches_checkpoint);
             self.jump_table_patches
                 .truncate(jump_table_patches_checkpoint);
-            self.self_call_patches.truncate(self_call_patches_checkpoint);
+            self.self_call_patches
+                .truncate(self_call_patches_checkpoint);
             self.bounds_check_stubs
                 .truncate(bounds_check_stubs_checkpoint);
             self.null_check_store_stubs
@@ -2447,7 +2418,8 @@ impl Compiler {
                 self.forward_patches.truncate(forward_patches_checkpoint);
                 self.jump_table_patches
                     .truncate(jump_table_patches_checkpoint);
-                self.self_call_patches.truncate(self_call_patches_checkpoint);
+                self.self_call_patches
+                    .truncate(self_call_patches_checkpoint);
                 self.bounds_check_stubs
                     .truncate(bounds_check_stubs_checkpoint);
                 self.null_check_store_stubs
@@ -2478,7 +2450,8 @@ impl Compiler {
             self.forward_patches.truncate(forward_patches_checkpoint);
             self.jump_table_patches
                 .truncate(jump_table_patches_checkpoint);
-            self.self_call_patches.truncate(self_call_patches_checkpoint);
+            self.self_call_patches
+                .truncate(self_call_patches_checkpoint);
             self.bounds_check_stubs
                 .truncate(bounds_check_stubs_checkpoint);
             self.null_check_store_stubs
@@ -2553,7 +2526,8 @@ impl Compiler {
         self.forward_patches.truncate(forward_patches_checkpoint);
         self.jump_table_patches
             .truncate(jump_table_patches_checkpoint);
-        self.self_call_patches.truncate(self_call_patches_checkpoint);
+        self.self_call_patches
+            .truncate(self_call_patches_checkpoint);
         self.bounds_check_stubs
             .truncate(bounds_check_stubs_checkpoint);
         self.null_check_store_stubs

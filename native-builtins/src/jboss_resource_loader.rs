@@ -192,9 +192,12 @@ pub fn register_resource_loader_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// **THIS TEST CANNOT FAIL, and it is standing in for a SECURITY control.**
     ///
@@ -245,10 +248,16 @@ mod tests {
         assert!(has_parent_segment(Path::new("../evil.jar")));
         // And it must not fire on names that merely CONTAIN dots, or the guard
         // would refuse legitimate WildFly/Keycloak module roots.
-        assert!(!has_parent_segment(Path::new("/opt/kc/modules/foo/bar.jar")));
+        assert!(!has_parent_segment(Path::new(
+            "/opt/kc/modules/foo/bar.jar"
+        )));
         assert!(!has_parent_segment(Path::new("/opt/kc/modules/./foo.jar")));
-        assert!(!has_parent_segment(Path::new("/opt/kc/modules/..foo/a.jar")));
-        assert!(!has_parent_segment(Path::new("/opt/kc/modules/foo../a.jar")));
+        assert!(!has_parent_segment(Path::new(
+            "/opt/kc/modules/..foo/a.jar"
+        )));
+        assert!(!has_parent_segment(Path::new(
+            "/opt/kc/modules/foo../a.jar"
+        )));
     }
 
     #[test]

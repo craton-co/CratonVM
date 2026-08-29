@@ -438,7 +438,7 @@ would restart the whole wait on every GC. Winsock has no EINTR and needs no arm.
 ## 4. What gets NO loop, and why that is a measurement rather than caution
 
 * **`rustls_stream_write` and `s2_tls_write`.** Measured on HotSpot 25.0.3 /
-  Windows 11, 2026-08-12 and recorded at `probes/AsyncCloseProbe.java:1114`:
+  Windows 11, 2026-08-12 and recorded at `apps/probes/AsyncCloseProbe.java:1114`:
   `SSLSocket.close()` from another thread while a writer is parked inside
   `getOutputStream().write()` **does not return** — JSSE serialises
   `duplexCloseOutput()` behind the write. There is therefore no reference
@@ -462,8 +462,8 @@ would restart the whole wait on every GC. Winsock has no EINTR and needs no arm.
 
 ### 5.1 The instrument exists and already has the rows
 
-`probes/AsyncCloseProbe.java`, with its HotSpot oracle transcript in
-`probes/AsyncCloseProbe.expected.txt`. W7-61 added three TLS rows on top of the
+`apps/probes/AsyncCloseProbe.java`, with its HotSpot oracle transcript in
+`apps/probes/AsyncCloseProbe.expected.txt`. W7-61 added three TLS rows on top of the
 original thirteen: `tlsSelfTestNoPark` (`:997`), `tlsReadIntegrity` (`:1036`),
 `tlsRead` (`:1090`), `tlsWrite` (`:1110`). The pilot needs no new probe.
 
@@ -536,9 +536,9 @@ scheduled fixture cannot close a record — applies to it twice over.
 
 ### 5.4 Scheduling — the standing gap this design does not close
 
-`probes/AsyncCloseProbe.java` **has never run in any suite and cannot**:
+`apps/probes/AsyncCloseProbe.java` **has never run in any suite and cannot**:
 `regression-suite/run.sh` compiles `"$HERE"/src/*.java` and runs a
-hand-maintained word list, and reads nothing from `probes/`. Moving it to
+hand-maintained word list, and reads nothing from `apps/probes/`. Moving it to
 `regression-suite/src/RAsyncClose.java` and adding that name to `CORE_CLASSES`
 (core, not `JDKONLY_CLASSES` — this family is a Compatible-mode defect strict
 merely inherits) is a two-part edit in files this lane does not own. It is in
@@ -642,11 +642,11 @@ blocking call.
 Out-of-file changes this design implies. None was made.
 
 1. **`regression-suite/run.sh` + file move — schedule the instrument.**
-   Move `probes/AsyncCloseProbe.java` → `regression-suite/src/RAsyncClose.java`
+   Move `apps/probes/AsyncCloseProbe.java` → `regression-suite/src/RAsyncClose.java`
    (renaming the class) and add `RAsyncClose` to `CORE_CLASSES`, not
    `JDKONLY_CLASSES`. Rationale and the two gotchas are in §5.4. Until this is
    done, no TLS async-close row can close a record.
-2. **`probes/AsyncCloseProbe.java` — add `tlsReadBufferedRemainder`.** §5.3. The
+2. **`apps/probes/AsyncCloseProbe.java` — add `tlsReadBufferedRemainder`.** §5.3. The
    pilot's central risk currently has no gate. Register it with
    `expectPark == false`, `want = "returned:65536"`.
 3. **`native-builtins/src/t27_tls.rs` — the pilot itself.** §3. Specifically:

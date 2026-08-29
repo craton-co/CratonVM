@@ -102,7 +102,8 @@ fn node_allocator_asks_for_the_real_jdk_entry_class_and_never_the_invented_one()
 
     // Nothing has touched either name yet.
     assert!(
-        ctx.class_id_by_name("java/util/LinkedHashMap$Entry").is_none(),
+        ctx.class_id_by_name("java/util/LinkedHashMap$Entry")
+            .is_none(),
         "the entry class must not be registered before the first put",
     );
 
@@ -111,11 +112,13 @@ fn node_allocator_asks_for_the_real_jdk_entry_class_and_never_the_invented_one()
     put(&reg, &mut ctx, lhm, k, v);
 
     assert!(
-        ctx.class_id_by_name("java/util/LinkedHashMap$Entry").is_some(),
+        ctx.class_id_by_name("java/util/LinkedHashMap$Entry")
+            .is_some(),
         "lhm_alloc_node must allocate the real java/util/LinkedHashMap$Entry",
     );
     assert!(
-        ctx.class_id_by_name("java/util/LinkedHashMap$Node").is_none(),
+        ctx.class_id_by_name("java/util/LinkedHashMap$Node")
+            .is_none(),
         "java/util/LinkedHashMap$Node does not exist in the JDK — the node \
          allocator must never ask for it (this is the class name that made \
          LinkedHashMap.afterNodeRemoval's `(LinkedHashMap.Entry) e` throw)",

@@ -539,9 +539,12 @@ pub static TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384: Tls12CipherSuite = Tls12Ciph
 
 #[cfg(test)]
 mod t_cbc_1_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn compute_mac_is_deterministic_and_key_sensitive() {

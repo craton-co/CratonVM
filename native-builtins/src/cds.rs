@@ -955,10 +955,13 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod cds_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -----------------------------------------------------------------------
     // Archive constant tests
@@ -1547,7 +1550,6 @@ mod cds_tests {
     struct PanicContext;
 
     impl cratonvm_native_api::NativeClassAccess for PanicContext {
-
         fn is_package_exported_unqualified(&self, _: &str, _: &str) -> bool {
             panic!("MockNativeContext: is_package_exported_unqualified not implemented for testing")
         }
@@ -1712,7 +1714,6 @@ mod cds_tests {
     }
 
     impl cratonvm_native_api::NativeInvokeAccess for PanicContext {
-
         fn invoke(
             &mut self,
             _: &str,
@@ -1734,7 +1735,6 @@ mod cds_tests {
     }
 
     impl cratonvm_native_api::NativeHeapAccess for PanicContext {
-
         fn resolve_field_index_by_class_id(
             &self,
             _: cratonvm_types::ClassId,
@@ -1847,7 +1847,6 @@ mod cds_tests {
     }
 
     impl cratonvm_native_api::NativeThreadAccess for PanicContext {
-
         fn thread_id(&self) -> u64 {
             panic!("MockNativeContext: thread_id not implemented for testing")
         }
@@ -1927,7 +1926,6 @@ mod cds_tests {
     }
 
     impl cratonvm_native_api::NativeExceptionAccess for PanicContext {
-
         fn capture_stack_trace(&mut self, _: i32) -> Vec<cratonvm_native_api::StackTraceEntry> {
             panic!("MockNativeContext: capture_stack_trace not implemented for testing")
         }
@@ -1936,12 +1934,9 @@ mod cds_tests {
         }
     }
 
-    impl cratonvm_native_api::NativeGpuAccess for PanicContext {
-
-    }
+    impl cratonvm_native_api::NativeGpuAccess for PanicContext {}
 
     impl cratonvm_native_api::NativeSystemAccess for PanicContext {
-
         fn record_printed_value(&mut self, _: Value) {
             panic!("MockNativeContext: record_printed_value not implemented for testing")
         }
@@ -1998,9 +1993,6 @@ mod cds_tests {
         }
         fn force_gc(&mut self) {}
     }
-
-
-
 
     // F17-1 (2026-08-13): `test_is_dumping_class_list_returns_zero` was deleted
     // with the native it exercised. It is worth naming what that test was

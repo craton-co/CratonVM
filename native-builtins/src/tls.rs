@@ -14,7 +14,7 @@
 #[path = "tls_impl.rs"]
 pub mod tls_impl;
 
-use crate::{try_alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{native_noop, native_noop_with_this, obj_arg, try_alloc_concurrent_synthetic};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::ClassId;
@@ -131,7 +131,10 @@ fn epoch_millis() -> i64 {
 // Allocation helpers
 // ---------------------------------------------------------------------------
 
-fn alloc_ssl_context(ctx: &mut dyn NativeContext, protocol_idx: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_ssl_context(
+    ctx: &mut dyn NativeContext,
+    protocol_idx: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 12)?;
     ctx.set_field(obj, CTX_PROTOCOL_IDX, Value::Int(protocol_idx));
     ctx.set_field(obj, CTX_INITIALIZED, Value::Int(0));
@@ -208,7 +211,11 @@ fn alloc_ssl_parameters(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
     Ok(obj)
 }
 
-fn alloc_ssl_engine_result(ctx: &mut dyn NativeContext, status: i32, hs_status: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_ssl_engine_result(
+    ctx: &mut dyn NativeContext,
+    status: i32,
+    hs_status: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 2)?;
     ctx.set_field(obj, 0, Value::Int(status));
     ctx.set_field(obj, 1, Value::Int(hs_status));
@@ -593,7 +600,8 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
             }
             let this = obj_arg(args, 0)?;
             require_initialized_context(ctx, this, "getServerSocketFactory()")?;
-            let ssf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2)?;
+            let ssf =
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2)?;
             Ok(Some(Value::Object(Some(ssf))))
         },
     );
@@ -820,8 +828,11 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             // Return the enum as a synthetic object carrying the int status
             let hs_val = ctx.get_field(this, ENG_HANDSHAKE_STATUS);
-            let hs_obj =
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1)?;
+            let hs_obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                1,
+            )?;
             ctx.set_field(hs_obj, 0, hs_val);
             Ok(Some(Value::Object(Some(hs_obj))))
         },
@@ -1125,8 +1136,8 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(s))))
                 }
                 _ => {
-                    let s = ctx
-                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    let s =
+                        ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
                     Ok(Some(Value::Object(Some(s))))
                 }
             }
@@ -1786,10 +1797,16 @@ fn trust_store_keystore_id(ctx: &mut dyn NativeContext, allow_jdk_cacerts: bool)
     // `return`, and the `insert` at the end. The file read and parse happen
     // between them, with no guard held and no `ctx` in this function at all.
     static CACHE: std::sync::OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<(String, String), i32>>,
+        cratonvm_types::lock_order::OrderedPlMutex<
+            std::collections::HashMap<(String, String), i32>,
+        >,
     > = std::sync::OnceLock::new();
-    let cache =
-        CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch));
+    let cache = CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    });
     let key = (path.clone(), password.clone());
     if let Some(id) = cache.lock().get(&key).copied() {
         return id;
@@ -3526,8 +3543,8 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(s))))
                 }
                 _ => {
-                    let s = ctx
-                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    let s =
+                        ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
                     Ok(Some(Value::Object(Some(s))))
                 }
             }
@@ -3554,8 +3571,7 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(s))))
                 }
                 _ => {
-                    let s =
-                        ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+                    let s = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
                     Ok(Some(Value::Object(Some(s))))
                 }
             }
@@ -3774,11 +3790,14 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tls_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // --- TLS deny-by-default -------------------------------------------------
     //
@@ -3814,7 +3833,11 @@ mod tls_tests {
         context: ObjectRef,
     ) -> String {
         let f = r
-            .find("javax/net/ssl/SSLContext", "getProtocol", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getProtocol",
+                "()Ljava/lang/String;",
+            )
             .expect("getProtocol registered");
         match f(ctx, &[Value::Object(Some(context))]) {
             Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
@@ -4501,10 +4524,7 @@ mod tls_tests {
         for (name, descriptor) in [
             ("<init>", "()V"),
             ("getDefault", "()Ljavax/net/ssl/SSLSocketFactory;"),
-            (
-                "createSocket",
-                "(Ljava/lang/String;I)Ljava/net/Socket;",
-            ),
+            ("createSocket", "(Ljava/lang/String;I)Ljava/net/Socket;"),
             (
                 "createSocket",
                 "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",

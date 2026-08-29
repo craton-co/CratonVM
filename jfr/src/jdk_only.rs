@@ -1128,9 +1128,16 @@ mod tests {
     fn module_allow_list_is_sorted_and_sized() {
         let mut sorted = JDK_MODULES.to_vec();
         sorted.sort_unstable();
-        assert_eq!(sorted, JDK_MODULES, "JDK_MODULES must be sorted for binary_search");
+        assert_eq!(
+            sorted, JDK_MODULES,
+            "JDK_MODULES must be sorted for binary_search"
+        );
         sorted.dedup();
-        assert_eq!(sorted.len(), JDK_MODULES.len(), "JDK_MODULES must be unique");
+        assert_eq!(
+            sorted.len(),
+            JDK_MODULES.len(),
+            "JDK_MODULES must be unique"
+        );
         assert_eq!(JDK_MODULES.len() + 2, N_MODULE);
     }
 
@@ -1450,9 +1457,9 @@ mod tests {
         assert_eq!(JDK_ONLY_TELEMETRY_SCHEMA_VERSION, 1);
         let c = JdkOnlyTelemetry::enabled().finish();
         assert_eq!(c.schema_version(), JDK_ONLY_TELEMETRY_SCHEMA_VERSION);
-        assert!(c
-            .to_json()
-            .contains(&format!("\"counter_schema_version\": {JDK_ONLY_TELEMETRY_SCHEMA_VERSION}")));
+        assert!(c.to_json().contains(&format!(
+            "\"counter_schema_version\": {JDK_ONLY_TELEMETRY_SCHEMA_VERSION}"
+        )));
     }
 
     #[test]
@@ -1522,7 +1529,11 @@ mod tests {
         assert!(!enabled_by_args(["--jdk-only", "com.acme.Main"]));
         assert!(!enabled_by_args(["--explain-jdk-only"]));
 
-        assert!(enabled_by_args(["--jdk-only", "--jdk-only-report", "r.json"]));
+        assert!(enabled_by_args([
+            "--jdk-only",
+            "--jdk-only-report",
+            "r.json"
+        ]));
         assert!(enabled_by_args(["--dump-class-origins=o.json"]));
         assert!(enabled_by_args(["--trace-jdk-only"]));
 

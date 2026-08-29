@@ -1017,12 +1017,15 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::agroal_pool::{create_pool, pool_stats, test_lock, PoolConfig};
     use crate::ironjacamar_pool::bind_pool;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn fresh_state() {
         reset_jndi_for_tests();

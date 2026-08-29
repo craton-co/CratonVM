@@ -852,7 +852,9 @@ fn native_bridge_get_transformer_count(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(transformer_count(ctx.vm_identity()) as i32)))
+    Ok(Some(
+        Value::Int(transformer_count(ctx.vm_identity()) as i32),
+    ))
 }
 
 fn native_bridge_get_all_loaded_classes(
@@ -2676,8 +2678,7 @@ mod tests {
     #[test]
     fn retransform_base_accepts_a_matching_classpath_fallback() {
         let bytes = minimal_class_file("com/foo/Bar");
-        let got =
-            adjudicate_retransform_base("com/foo/Bar", None, Some(bytes.clone()), Some(true));
+        let got = adjudicate_retransform_base("com/foo/Bar", None, Some(bytes.clone()), Some(true));
         assert_eq!(got.as_deref(), Ok(&bytes[..]));
     }
 
@@ -3116,7 +3117,10 @@ mod tests {
         // sizes moved together by exactly the 8 bytes the 2026-08-06 header
         // shrink returned, and a literal only records which day it was written.
         let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
-        assert_eq!(sz as usize, cratonvm_types::HEADER_SIZE + 5 * cratonvm_types::SLOT_SIZE);
+        assert_eq!(
+            sz as usize,
+            cratonvm_types::HEADER_SIZE + 5 * cratonvm_types::SLOT_SIZE
+        );
     }
 
     #[test]
@@ -3178,10 +3182,16 @@ mod tests {
         // descriptor here that the JDK does not declare is a registration that
         // binds to nothing, and this assertion would hide it.
         for (name, descriptor) in [
-            ("redefineClasses0", "(J[Ljava/lang/instrument/ClassDefinition;)V"),
+            (
+                "redefineClasses0",
+                "(J[Ljava/lang/instrument/ClassDefinition;)V",
+            ),
             ("retransformClasses0", "(J[Ljava/lang/Class;)V"),
             ("getAllLoadedClasses0", "(J)[Ljava/lang/Class;"),
-            ("getInitiatedClasses0", "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;"),
+            (
+                "getInitiatedClasses0",
+                "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;",
+            ),
             ("isModifiableClass0", "(JLjava/lang/Class;)Z"),
             ("getObjectSize0", "(JLjava/lang/Object;)J"),
             ("isRetransformClassesSupported0", "(J)Z"),
@@ -3198,7 +3208,10 @@ mod tests {
         // the assertions above pass while binding nothing, which is exactly the
         // state this test was in before 2026-08-11.
         for (name, descriptor) in [
-            ("redefineClasses0", "([Ljava/lang/instrument/ClassDefinition;)V"),
+            (
+                "redefineClasses0",
+                "([Ljava/lang/instrument/ClassDefinition;)V",
+            ),
             ("retransformClasses0", "([Ljava/lang/Class;)V"),
             ("getAllLoadedClasses0", "()[Ljava/lang/Class;"),
             ("isModifiableClass0", "(Ljava/lang/Class;)Z"),
@@ -3213,9 +3226,18 @@ mod tests {
         // `jvmtienv`. These are ours, not the JDK's, and the census scores them
         // `method-nowhere` for that reason.
         for (name, descriptor) in [
-            ("removeTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)Z"),
-            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)V"),
-            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;Z)V"),
+            (
+                "removeTransformer",
+                "(Ljava/lang/instrument/ClassFileTransformer;)Z",
+            ),
+            (
+                "addTransformer",
+                "(Ljava/lang/instrument/ClassFileTransformer;)V",
+            ),
+            (
+                "addTransformer",
+                "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
+            ),
         ] {
             assert!(
                 r.find(impl_class, name, descriptor).is_some(),

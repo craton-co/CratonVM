@@ -20,7 +20,7 @@ Message appears **twice** at startup. Placeholder `%s` not substituted (logging 
 
 ## HotSpot behavior
 
-No duplicate-PU warning for the same fixture. Only one `META-INF/persistence.xml` exists on classpath (`fixture/META-INF/persistence.xml` with single PU `smoke`).
+No duplicate-PU warning for the same fixture. Only one `../../../../apps/META-INF/persistence.xml` exists on classpath (`fixture/META-INF/persistence.xml` with single PU `smoke`).
 
 Verified: no `persistence.xml` inside `hibernate-core-6.5.2.Final.jar`.
 
@@ -29,7 +29,7 @@ Verified: no `persistence.xml` inside `hibernate-core-6.5.2.Final.jar`.
 Hibernate’s `PersistenceXmlParser` believes it saw **multiple stanzas** named `smoke`. Possible explanations:
 
 1. **Classpath scanning** lists the same resource URL twice (duplicate classpath entries or broken `URLClassLoader` enumeration)
-2. **Jar scanning** reads `META-INF/persistence.xml` from fixture **and** incorrectly from another entry
+2. **Jar scanning** reads `../../../../apps/META-INF/persistence.xml` from fixture **and** incorrectly from another entry
 3. **XML parser** double-invokes element handlers for one file
 
 ## Root cause (suspected)
@@ -50,7 +50,7 @@ bash test-infra/run-three-apps-suite.sh
 grep HHH015018 test-infra/suite-results/apps-three-*/hibernate-smoke-cratonvm-run1.err
 ```
 
-Debug probe: enumerate all `META-INF/persistence.xml` URLs on classpath under both VMs.
+Debug probe: enumerate all `../../../../apps/META-INF/persistence.xml` URLs on classpath under both VMs.
 
 ## What to fix
 

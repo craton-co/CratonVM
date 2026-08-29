@@ -53,7 +53,10 @@ fn manifest_dir() -> &'static Path {
 const TAG: &str = "rbigdec1";
 
 fn workspace_root() -> PathBuf {
-    manifest_dir().parent().expect("vm/ has a parent").to_path_buf()
+    manifest_dir()
+        .parent()
+        .expect("vm/ has a parent")
+        .to_path_buf()
 }
 
 fn probe_dir() -> PathBuf {
@@ -78,7 +81,10 @@ fn probe_source() -> [PathBuf; 2] {
 /// Per-test-binary output directory under `target/`, so the two RBIGDEC.1
 /// harnesses never write the same class files concurrently.
 fn probe_classes_dir() -> PathBuf {
-    workspace_root().join("target").join("bd-probe-classes").join(TAG)
+    workspace_root()
+        .join("target")
+        .join("bd-probe-classes")
+        .join(TAG)
 }
 
 /// Prefer a JDK-relative `javac` over whatever is on `PATH`, so the probe is

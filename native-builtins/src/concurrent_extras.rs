@@ -48,7 +48,7 @@ use parking_lot::{Condvar, Mutex};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{error::MethodCallResult, ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ===========================================================================
 // Part 1: Real work-stealing ForkJoin pool
@@ -816,9 +816,12 @@ pub fn register_concurrent_extras(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn work_stealing_pool_spawns_workers() {

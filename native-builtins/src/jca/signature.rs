@@ -51,8 +51,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
+use crate::try_alloc_concurrent_synthetic;
 
 // `java.security.Signature` (JDK 25) extends `SignatureSpi` and declares
 // instance fields that overlap our intended synthetic state. To avoid the
@@ -201,11 +201,18 @@ fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigK
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — both sites (`get_sig_pss` and
 /// `setParameter`) compute `sig_key(ctx, ..)` first and then do one
 /// `get(..).copied()` / `insert(..)` under a temporary guard.
-fn sig_pss_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
+fn sig_pss_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
     use std::sync::OnceLock;
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
-        OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
+    static T: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>>,
+    > = OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams> {
@@ -222,13 +229,19 @@ fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams
 /// dispatch tables — the whole point of the application having registered it.
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — same shape and the same
 /// key-before-guard discipline as [`sig_pss_table`].
-fn sig_user_spi_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
-{
+fn sig_user_spi_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    rustc_hash::FxHashMap<SigKey, (String, String)>,
+> {
     use std::sync::OnceLock;
     static T: OnceLock<
         cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
     > = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn get_sig_user_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, String)> {
@@ -518,7 +531,11 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
         Value::Int(n) => n,
         _ => 0,
     };
-    sig_slot_set(ctx, this, SIG_OFF_PENDING, Value::Int(cur + data.len() as i32),
+    sig_slot_set(
+        ctx,
+        this,
+        SIG_OFF_PENDING,
+        Value::Int(cur + data.len() as i32),
     );
     let key = sig_key(ctx, this);
     sig_payload_table()
@@ -607,13 +624,7 @@ fn sign_dispatch_with(
 ) -> Option<Vec<u8>> {
     use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
     if let (Some(p), true) = (pss, is_pss(alg)) {
-        return crypto_impl::rsa_sign_pss_ex_by_id(
-            key_id,
-            p.hash,
-            p.mgf_hash,
-            p.salt_len,
-            data,
-        );
+        return crypto_impl::rsa_sign_pss_ex_by_id(key_id, p.hash, p.mgf_hash, p.salt_len, data);
     }
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_sign(key_id, data),
@@ -768,12 +779,7 @@ fn verify_dispatch_with(
     use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
     if let (Some(p), true) = (pss, is_pss(alg)) {
         return crypto_impl::rsa_verify_pss_ex_by_id(
-            key_id,
-            p.hash,
-            p.mgf_hash,
-            p.salt_len,
-            data,
-            sig,
+            key_id, p.hash, p.mgf_hash, p.salt_len, data, sig,
         );
     }
     match alg {
@@ -900,7 +906,10 @@ fn sig_algorithm_name(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
             }
         }
     }
-    get_sig_algo(ctx, this).map(algo_name).unwrap_or("Unknown").to_string()
+    get_sig_algo(ctx, this)
+        .map(algo_name)
+        .unwrap_or("Unknown")
+        .to_string()
 }
 
 /// Construct `spi_class`, init it with `key`, feed it `data`, and sign or
@@ -1043,10 +1052,12 @@ fn drive_real_signature_spi(
         // The bound JDK SPI refused. Do what the JDK's own delayed provider
         // selection does and offer the key to the next provider that claims the
         // algorithm — see `try_chain_signature_spi`.
-        Err(refusal) => match try_chain_signature_spi(ctx, this, Some(key), &data, verify_sig.as_deref()) {
-            Some(result) => result,
-            None => Err(refusal),
-        },
+        Err(refusal) => {
+            match try_chain_signature_spi(ctx, this, Some(key), &data, verify_sig.as_deref()) {
+                Some(result) => result,
+                None => Err(refusal),
+            }
+        }
     }
 }
 
@@ -1319,7 +1330,8 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         &alg,
     );
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
+    let obj =
+        try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
     // SigProbe fix: side-table is the authoritative store; the base-offset
     // slot writes remain for any synthetic-mode caller that goes through
     // slot indexing.  C15: keyed on identity hash code so GC compaction
@@ -1347,15 +1359,16 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 ctx.unpin_native_roots(obj_pin);
                 return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
                     ctx,
-                    &format!("{alg} Signature: provider class {spi_class} could not be instantiated"),
+                    &format!(
+                        "{alg} Signature: provider class {spi_class} could not be instantiated"
+                    ),
                 ));
             }
         };
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.unpin_native_roots(obj_pin);
         let owner = requested_provider.unwrap_or_else(|| {
-            crate::jca::provider_chain::find_service_provider("Signature", &alg)
-                .unwrap_or_default()
+            crate::jca::provider_chain::find_service_provider("Signature", &alg).unwrap_or_default()
         });
         // THE JDK'S OWN RULE, which this engine did not implement.
         // `Signature.getInstance` wraps the SPI in a `Signature$Delegate` ONLY
@@ -1399,9 +1412,7 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             set_sig_state(ctx, spi, STATE_UNINIT);
             set_sig_keyid(ctx, spi, 0);
             let key = sig_key(ctx, spi);
-            sig_user_spi_table()
-                .lock()
-                .insert(key, (owner, spi_class));
+            sig_user_spi_table().lock().insert(key, (owner, spi_class));
             return Ok(Some(Value::Object(Some(spi))));
         }
         ctx.set_field(obj, base + SIG_OFF_SPIOBJ, Value::Object(Some(spi)));
@@ -1958,7 +1969,10 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
-        return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
+        return Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for signing",
+        ));
     }
     if let Some(spi) = sig_user_spi_obj(ctx, this) {
         return drive_user_spi(ctx, this, spi, None);
@@ -2011,7 +2025,10 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
-        return Err(refuse_uninitialized(ctx, "object not initialized for signing"));
+        return Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for signing",
+        ));
     }
     if let Some(spi) = sig_user_spi_obj(ctx, this) {
         // Produce the bytes through the application SPI, then apply the same
@@ -2093,7 +2110,10 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
-        return Err(refuse_uninitialized(ctx, "object not initialized for verification"));
+        return Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for verification",
+        ));
     }
     if let Some(spi) = sig_user_spi_obj(ctx, this) {
         let provided = match args.get(1) {
@@ -2168,7 +2188,10 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = this_arg(args)?;
     let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
-        return Err(refuse_uninitialized(ctx, "object not initialized for verification"));
+        return Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for verification",
+        ));
     }
     let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
@@ -2409,10 +2432,7 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             };
             let owner = match requested.is_empty() {
                 true => None,
-                false => crate::jca::provider_chain::find_service_provider(
-                    "Signature",
-                    &requested,
-                ),
+                false => crate::jca::provider_chain::find_service_provider("Signature", &requested),
             };
             let Some(owner) = owner else {
                 return Ok(Some(Value::Object(None)));
@@ -2665,9 +2685,12 @@ fn sigutil_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn algo_idx_canonical() {
@@ -3093,7 +3116,10 @@ mod tests {
             other => panic!("sign() must succeed for a registered key, got {other:?}"),
         };
         let sig_bytes = read_byte_array_full(&mut ctx, sig_arr);
-        assert!(!sig_bytes.is_empty(), "sign() must not return an empty array");
+        assert!(
+            !sig_bytes.is_empty(),
+            "sign() must not return an empty array"
+        );
 
         // Genuine positive.
         let verify_key = key_object(&mut ctx, id);

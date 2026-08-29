@@ -127,7 +127,9 @@ fn helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,
@@ -440,12 +442,12 @@ fn compile_despec_arraycopy_with_dispatch(
                 guard_class_id: 0,
             },
         )],
-        Vec::new(), // mic_slots
-        Vec::new(), // pic_slots
-        Vec::new(), // ldc_info
-        Vec::new(), // ldc_string_info
-        Vec::new(), // ldc_class_info
-        Vec::new(), // ldc2w_info
+        Vec::new(),         // mic_slots
+        Vec::new(),         // pic_slots
+        Vec::new(),         // ldc_info
+        Vec::new(),         // ldc_string_info
+        Vec::new(),         // ldc_class_info
+        Vec::new(),         // ldc2w_info
         Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
@@ -453,7 +455,7 @@ fn compile_despec_arraycopy_with_dispatch(
         HashSet::new(),
         HashMap::new(),
         HashMap::new(), // inline_guard_variants (PGO-02)
-        None, // string_layout
+        None,           // string_layout
         &[],
         0,
         0,

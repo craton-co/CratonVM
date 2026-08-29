@@ -92,7 +92,7 @@ fails.
   (`ResourceLoaders.createJarResourceLoader`) than raw URLClassLoader.
 - **Confidence**: medium — needs validation after gap #1 is resolved.
 
-### Phase 4 — `LogManager` SPI discovery (`META-INF/services/java.util.logging.LogManager`)
+### Phase 4 — `LogManager` SPI discovery (`../../../apps/META-INF/services/java.util.logging.LogManager`)
 
 - **Java surface**: `java.util.logging.LogManager.<clinit>` reads
   `-Djava.util.logging.manager=org.jboss.logmanager.LogManager`,

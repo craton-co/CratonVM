@@ -815,7 +815,9 @@ pub(crate) fn bc_f2m_arg_value(
     idx: usize,
 ) -> Result<Vec<u64>, MethodCallFailed> {
     let obj = obj_arg(args, idx)?;
-    if ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
         != Some("org/bouncycastle/math/ec/ECFieldElement$F2m")
     {
         return Err(RuntimeError::IllegalArgumentException {
@@ -3232,9 +3234,12 @@ pub(crate) fn register_bc_sect_point_methods(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 pub(crate) mod bc_longarray_poly_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bc_poly_inverse, bc_poly_mul_raw, bc_poly_reduce};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn sect131r1_longarray_inverse_matches_bc() {
@@ -3306,7 +3311,9 @@ pub(crate) fn bc_fp_arg_value(
     idx: usize,
 ) -> Result<crate::bigint::BigInt, MethodCallFailed> {
     let obj = obj_arg(args, idx)?;
-    if ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
         == Some("org/bouncycastle/math/ec/ECFieldElement$Fp")
     {
         let x_obj = bc_fp_obj_field(ctx, obj, "x")?;
@@ -8640,7 +8647,10 @@ struct BcSha256Slots {
 /// `bc_sha256_slots` (`class_id_of_object`, `declared_fields`) runs with no
 /// guard held.
 static BC_SHA256_SLOTS: cratonvm_types::lock_order::OrderedPlRwLock<Option<(u32, BcSha256Slots)>> =
-    cratonvm_types::lock_order::OrderedPlRwLock::new(None, cratonvm_types::lock_order::LockLevel::Scratch);
+    cratonvm_types::lock_order::OrderedPlRwLock::new(
+        None,
+        cratonvm_types::lock_order::LockLevel::Scratch,
+    );
 
 fn bc_sha256_slots(
     ctx: &dyn NativeContext,
@@ -11052,7 +11062,10 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                     this,
                     "generateDerivedParameters",
                     "(II)Lorg/bouncycastle/crypto/CipherParameters;",
-                    &[args.get(1).copied().unwrap_or(Value::Int(0)), args.get(2).copied().unwrap_or(Value::Int(0))],
+                    &[
+                        args.get(1).copied().unwrap_or(Value::Int(0)),
+                        args.get(2).copied().unwrap_or(Value::Int(0)),
+                    ],
                 );
             }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;

@@ -9,7 +9,7 @@ Original location: `docs/known-issues/wp1-8-real-jar-serviceloader-hang.md`
 ## Original report
 
 `vm/tests/wp1_8_real_jar_serviceloader.rs::driver_discovered_from_jar_on_classpath`
-hung when the fixture class and `META-INF/services/java.sql.Driver` descriptor
+hung when the fixture class and `../../../apps/META-INF/services/java.sql.Driver` descriptor
 were loaded exclusively from a synthesized JAR classpath entry. The
 directory-classpath companion
 `vm/tests/wp1_8_serviceloader_e2e.rs::service_loader_iterator_discovers_driver`
@@ -62,4 +62,4 @@ Both `#[ignore]` markers removed
 (`../../../vm/tests/wp1_8_real_jar_serviceloader.rs`,
 `../../../vm/tests/wp1_8_serviceloader_e2e.rs`); the WP1.8 acceptance bar
 ("`ServiceLoader.load(java.sql.Driver.class)` finds a driver JAR via
-`META-INF/services` on classpath") is enforced by default again.
+`../../../apps/META-INF/services` on classpath") is enforced by default again.

@@ -89,7 +89,7 @@ java.lang.IllegalStateException: Not able to load any cryptoProvider with the cl
 
 `CryptoIntegration.detectProvider` calls
 `ServiceLoader.load(CryptoProvider.class, classLoader)` and gets zero
-providers back. The `META-INF/services/org.keycloak.common.crypto.CryptoProvider`
+providers back. The `../../../../apps/META-INF/services/org.keycloak.common.crypto.CryptoProvider`
 descriptor file demonstrably exists on disk under
 `crypto/fips1402/target/classes/` (and the sibling `crypto/default`,
 `crypto/elytron` modules), so the artifact isn't missing from the build
@@ -110,7 +110,7 @@ Not yet disambiguated:
    `run-keycloak-suite.ps1`, which always adds `<moduleRoot>/target/classes`),
    then CratonVM's classpath-resource walk (`find_all_resource_urls` /
    `ClassLoader.getResources`, see `../../../../native-builtins/src/classloader.rs`) is
-   failing to surface this module's own `META-INF/services` entry to
+   failing to surface this module's own `../../../../apps/META-INF/services` entry to
    `ServiceLoader`.
 2. **Harness classpath-assembly gap** — if the module classpath is built from
    a jar/dependency graph that doesn't include this module's *own*

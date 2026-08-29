@@ -40,7 +40,10 @@ use super::*;
 /// not registered, and `AbstractPreferences.toString()`, which is defined as
 /// `(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()`,
 /// had no state to render.
-pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p72_alloc_prefs(
+    ctx: &mut dyn NativeContext,
+    user: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     let prefs = try_alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 6)?;
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
@@ -260,7 +263,11 @@ fn p72_prefs_walk<F>(
     mut step: F,
 ) -> Result<Option<ObjectRef>, MethodCallFailed>
 where
-    F: FnMut(&mut dyn NativeContext, ObjectRef, Value) -> Result<Option<ObjectRef>, MethodCallFailed>,
+    F: FnMut(
+        &mut dyn NativeContext,
+        ObjectRef,
+        Value,
+    ) -> Result<Option<ObjectRef>, MethodCallFailed>,
 {
     let mut cur = start;
     for seg in segments {
@@ -295,7 +302,10 @@ fn p72_prefs_removed_ex() -> MethodCallFailed {
 ///
 /// Mirrors `p72_prefs_map`'s lazy-init shape (including its pinning), so a
 /// `Preferences` built before slots 2/3 existed still works.
-pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<ObjectRef>, MethodCallFailed> {
+pub(crate) fn p72_prefs_children(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if ctx.object_num_fields(this) < 4 {
         return Ok(None);
     }
@@ -315,7 +325,10 @@ pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -
     Ok(Some(map))
 }
 
-pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p72_prefs_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.get_field(this, 0) {
         Value::Object(Some(m)) => Ok(m),
         _ => {
@@ -898,10 +911,11 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) if v != 0
             );
             let this = ctx.read_native_pin(this_pin, this);
-            let path = match ctx.invoke_virtual(this, "absolutePath", "()Ljava/lang/String;", &[])? {
-                Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
+            let path =
+                match ctx.invoke_virtual(this, "absolutePath", "()Ljava/lang/String;", &[])? {
+                    Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
             let tree = if user { "User" } else { "System" };
             let s = ctx.create_string(&format!("{tree} Preference Node: {path}"));
             Ok(Some(Value::Object(Some(s))))
@@ -1008,14 +1022,20 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 /// Box a primitive int as java.lang.Integer (1-field synthetic with int value at field 0).
-pub(crate) fn pcs_box_int(ctx: &mut dyn NativeContext, v: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn pcs_box_int(
+    ctx: &mut dyn NativeContext,
+    v: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
     ctx.set_field(obj, 0, Value::Int(v));
     Ok(obj)
 }
 
 /// Box a primitive bool as java.lang.Boolean (1-field synthetic with int 0/1 at field 0).
-pub(crate) fn pcs_box_bool(ctx: &mut dyn NativeContext, v: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn pcs_box_bool(
+    ctx: &mut dyn NativeContext,
+    v: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
     ctx.set_field(obj, 0, Value::Int(if v != 0 { 1 } else { 0 }));
     Ok(obj)
@@ -2049,7 +2069,10 @@ fn resolve_accessor_type_in_bean(
             "com/sun/beans/TypeResolver",
             "resolveInClass",
             "(Ljava/lang/Class;Ljava/lang/reflect/Type;)Ljava/lang/reflect/Type;",
-            &[Value::Object(Some(bean_mirror)), Value::Object(Some(generic))],
+            &[
+                Value::Object(Some(bean_mirror)),
+                Value::Object(Some(generic)),
+            ],
         ) {
             Ok(Some(v @ Value::Object(Some(_)))) => v,
             _ => return None,

@@ -771,7 +771,7 @@ Two additional stock-domain blockers exposed after the caller-loader fix were cl
 
 1. **JBoss Modules caller/context loader accessors - FIXED/EXTENDED.** The rebased `dev` branch already fixes `Module.getBootModuleLoader()` / `getCallerModuleLoader()` for the datasource null receiver. This branch keeps that helper and registers the same boot `LocalModuleLoader` for `Module.getContextModuleLoader()` as well, matching the rest of the synthetic JBoss Modules bridge.
 2. **XNIO `createTcpConnectionServer` - FIXED for the management HTTP boot path.** Once the caller-loader NPE was gone, stock `domain.sh` reached `XNIO000900: Method 'createTcpConnectionServer' is not supported on this implementation`. CratonVM now provides focused natives for `XnioWorker.createTcpConnectionServer` and `NioXnioWorker.createTcpConnectionServer`, binds a real Rust `TcpListener` for the requested `InetSocketAddress`, stores it in a registry, and returns a synthetic `AcceptingChannel` mirror with the channel methods WildFly/XNIO expects during boot (`getAcceptSetter`, `resumeAccepts`, `getLocalAddress`, `close`, option probes, worker/thread accessors, and related no-op await/wakeup paths).
-3. **JBoss Modules `module-alias` resolution - FIXED.** After the XNIO bridge, host boot failed parsing the stock domain because `org.jboss.as.modcluster` has no direct service descriptor: it is a `module-alias` to `org.wildfly.extension.mod_cluster`. The `module.xml` parser now captures `target-name`, and module resolution follows aliases before collecting resources/service providers. A real WildFly distribution regression test now asserts that `org.jboss.as.modcluster` exposes `org.wildfly.extension.mod_cluster.ModClusterExtension` for `META-INF/services/org.jboss.as.controller.Extension`.
+3. **JBoss Modules `module-alias` resolution - FIXED.** After the XNIO bridge, host boot failed parsing the stock domain because `org.jboss.as.modcluster` has no direct service descriptor: it is a `module-alias` to `org.wildfly.extension.mod_cluster`. The `module.xml` parser now captures `target-name`, and module resolution follows aliases before collecting resources/service providers. A real WildFly distribution regression test now asserts that `org.jboss.as.modcluster` exposes `org.wildfly.extension.mod_cluster.ModClusterExtension` for `../../../../apps/META-INF/services/org.jboss.as.controller.Extension`.
 
 Validation:
 
@@ -786,7 +786,7 @@ cargo check -p cratonvm-classloading -p cratonvm-native-builtins
 cargo build --release -p cratonvm-cli --features java-bin-alias --bins
 ```
 
-Stock WildFly 32.0.1.Final `bin/domain.sh` was rerun no-JIT against fresh domain bases using the rebuilt `java` shim. The old signatures are gone: no `moduleLoader` NPE, no `XNIO000900`, no `WFLYCTL0153`, and no missing `META-INF/services` for modcluster. A pre-rebase run reached both the earlier network-interface success and the alias-dependent extension success:
+Stock WildFly 32.0.1.Final `bin/domain.sh` was rerun no-JIT against fresh domain bases using the rebuilt `java` shim. The old signatures are gone: no `moduleLoader` NPE, no `XNIO000900`, no `WFLYCTL0153`, and no missing `../../../../apps/META-INF/services` for modcluster. A pre-rebase run reached both the earlier network-interface success and the alias-dependent extension success:
 
 ```text
 NetworkInterfaceService matched interface binding

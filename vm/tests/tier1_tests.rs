@@ -265,7 +265,10 @@ fn d12_dump_recording_via_the_stashed_exit_target_produces_a_real_jfr_file() {
 
     let raw = std::fs::read(&path).unwrap();
     // JFR v2.0 binary format magic: "FLR\0".
-    assert!(raw.starts_with(b"FLR\0"), "file must start with the JFR magic");
+    assert!(
+        raw.starts_with(b"FLR\0"),
+        "file must start with the JFR magic"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1573,7 +1576,10 @@ fn t9b_inline_constant_native_census() {
         if n > 0 {
             total += n;
             per_file.push((
-                path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string(),
                 n,
             ));
         }
@@ -1662,13 +1668,7 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             // checked out is a gate people switch off.
             if matches!(
                 name.as_ref(),
-                "target"
-                    | ".git"
-                    | ".claude"
-                    | "vendor"
-                    | "node_modules"
-                    | "test_classes"
-                    | "apps"
+                "target" | ".git" | ".claude" | "vendor" | "node_modules" | "test_classes" | "apps"
             ) {
                 continue;
             }
@@ -1948,7 +1948,9 @@ fn is_constant_expr(body: &str) -> bool {
     if inner == "Value::Object(None)" {
         return true;
     }
-    for ty in ["Int", "Long", "Float", "Double", "Boolean", "Char", "Short", "Byte"] {
+    for ty in [
+        "Int", "Long", "Float", "Double", "Boolean", "Char", "Short", "Byte",
+    ] {
         if let Some(lit) = inner
             .strip_prefix(&format!("Value::{ty}("))
             .and_then(|s| s.strip_suffix(')'))
@@ -2133,7 +2135,6 @@ fn t1_gc_pause_budget_100k_objects_under_200ms() {
     );
 }
 
-
 // ===========================================================================
 // obsaudit D15 (2026-07-26) — the attach socket speaks the real HotSpot
 // Attach API wire protocol, not a bespoke one.
@@ -2310,8 +2311,7 @@ fn t9c_synthetic_field_tables_cover_their_factories() {
 
     let mut short: Vec<String> = Vec::new();
     for (class_name, (requested, site)) in &wanted {
-        let declared =
-            cratonvm_classloading::synthetic_stub_instance_field_count(class_name);
+        let declared = cratonvm_classloading::synthetic_stub_instance_field_count(class_name);
         // A class with NO entry declares zero and is not exposed: the table is
         // consulted only for classes CratonVM synthesizes, and a name with no
         // arm has no synthesized form for `new` to size. Only a class that HAS
@@ -2353,7 +2353,9 @@ fn literal_synthetic_allocations(src: &str) -> Vec<(String, usize)> {
         from = open;
         // (ctx, "name", n)
         let Some(rest) = src.get(open..) else { break };
-        let Some(close_rel) = rest.find(')') else { break };
+        let Some(close_rel) = rest.find(')') else {
+            break;
+        };
         let args = &rest[..close_rel];
         let mut parts = args.split(',');
         // The first argument must be exactly `ctx`. Production sites pass the

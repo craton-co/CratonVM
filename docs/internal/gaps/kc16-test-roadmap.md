@@ -77,7 +77,7 @@ generalizes.
 
 | | |
 |---|---|
-| Repro | Java probe `apps/classloader_probe/ClProbe.java`: lookup `META-INF/services/foo.svc` from a synthesized JAR + `META-INF/MANIFEST.MF` from `rt.jar`/jimage; verify both return at least one URL each. The S96 RSLF4J.1 fix landed for the first; verify the second path (boot-loader resources) too. |
+| Repro | Java probe `apps/classloader_probe/ClProbe.java`: lookup `../../../apps/META-INF/services/foo.svc` from a synthesized JAR + `../../../apps/META-INF/MANIFEST.MF` from `rt.jar`/jimage; verify both return at least one URL each. The S96 RSLF4J.1 fix landed for the first; verify the second path (boot-loader resources) too. |
 | Cross-app verify | (1) ClProbe — direct test. (2) Apache Maven `mvn --version` — currently fails because Maven uses `plexus-classworlds` which calls `getResources` heavily for plugin discovery. Spawn a tiny `apache-maven-3.9.6` install in `/tmp/maven` and try `target/release/cratonvm.exe --java-home <jdk> -c "/tmp/maven/boot/plexus-classworlds-2.8.0.jar" org.codehaus.plexus.classworlds.launcher.Launcher --version`. Confirm the failure (or success) gets visibly closer. |
 | Success | ClProbe + plexus-classworlds Launcher both find their resources. |
 | Files | `native-builtins/src/classloader.rs`, possibly `classloading/src/loaders.rs`. |

@@ -916,7 +916,10 @@ mod tests {
         // VM chatter is preserved verbatim, because a historical mode's
         // recorded stderr must not change shape.
         assert_eq!(n.apply("a\r\nb\r\n"), "a\nb");
-        assert_eq!(n.apply_stderr(VM_CHATTER), normalize_line_endings(VM_CHATTER));
+        assert_eq!(
+            n.apply_stderr(VM_CHATTER),
+            normalize_line_endings(VM_CHATTER)
+        );
         assert!(n.apply_stderr(VM_CHATTER).contains("\u{1b}["));
     }
 
@@ -953,7 +956,10 @@ mod tests {
         // Chatter-only stderr vs HotSpot's silence: agrees.
         let a = obs("42", VM_CHATTER, Some(0));
         let b = obs("42", "", Some(0));
-        assert!(compare(&a, &b, &n).agrees(), "VM chatter alone is not a diff");
+        assert!(
+            compare(&a, &b, &n).agrees(),
+            "VM chatter alone is not a diff"
+        );
 
         // A real refusal message on stderr is a Stderr-channel divergence.
         let c = obs("42", "jdk-only: refused java/foo/Bar", Some(0));

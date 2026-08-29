@@ -67,8 +67,8 @@ use cratonvm_types::{ObjectRef, Value};
 
 use cratonvm_native_io::eintr::EintrIo;
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::servlet;
+use crate::try_alloc_concurrent_synthetic;
 use cratonvm_types::error::MethodCallFailed;
 
 thread_local! {
@@ -102,7 +102,10 @@ thread_local! {
 #[cfg(test)]
 mod test_fixtures {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     pub(crate) const CA_CRT_PEM: &str = include_str!("t27_certs/ca.crt");
     pub(crate) const SERVER_CRT_PEM: &str = include_str!("t27_certs/server.crt");
     pub(crate) const SERVER_KEY_PEM: &str = include_str!("t27_certs/server.key");
@@ -376,11 +379,20 @@ fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, Metho
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — one acquisition site
 /// (`ctx_client_session_store`), an `entry(key).or_insert_with(..)` whose
 /// closure builds a rustls store and touches no `ctx`.
-fn ctx_client_session_store_table(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>>> =
-        OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn ctx_client_session_store_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>,
+> {
+    static T: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<
+            HashMap<u64, Arc<dyn rustls::client::ClientSessionStore>>,
+        >,
+    > = OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Built `ClientConfig`s, keyed by `(SSLContext key, engine shape)`.
@@ -404,9 +416,18 @@ fn ctx_client_session_store_table(
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both
 /// temporary guards over an already-built key: a `.get(..).cloned()` inside an
 /// `and_then` closure and an `entry(..).or_insert(config).clone()`.
-fn ctx_client_config_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn ctx_client_config_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>>
+{
+    static T: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String), Arc<ClientConfig>>>,
+    > = OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn ctx_client_session_store(key: u64) -> Arc<dyn rustls::client::ClientSessionStore> {
@@ -434,10 +455,17 @@ struct TracingClientSessionStore {
 }
 
 impl rustls::client::ClientSessionStore for TracingClientSessionStore {
-    fn set_kx_hint(&self, server_name: rustls::pki_types::ServerName<'static>, group: rustls::NamedGroup) {
+    fn set_kx_hint(
+        &self,
+        server_name: rustls::pki_types::ServerName<'static>,
+        group: rustls::NamedGroup,
+    ) {
         self.inner.set_kx_hint(server_name, group)
     }
-    fn kx_hint(&self, server_name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+    fn kx_hint(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'_>,
+    ) -> Option<rustls::NamedGroup> {
         self.inner.kx_hint(server_name)
     }
     fn set_tls12_session(
@@ -486,12 +514,20 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 #[allow(clippy::type_complexity)]
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
 /// `ctx_client_session_store_table`, same single `or_insert_with` site.
-fn ctx_server_session_store_table(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+fn ctx_server_session_store_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>,
+> {
     static T: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<
+            HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>,
+        >,
     > = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// One session cache per `SSLContext` **and per client-auth policy**.
@@ -680,9 +716,16 @@ pub(crate) fn attach_trust_managers_to_ctx(
 /// (which this VM stands in for) is the one that identifies.
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — three sites, all one-statement
 /// `remove` / `insert` / `.get(&key).copied()` over a key built beforehand.
-fn ctx_jsse_identifies_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn ctx_jsse_identifies_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, bool>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn ctx_jsse_identifies(ctx_key: Option<u64>) -> bool {
@@ -1058,8 +1101,10 @@ pub(crate) fn client_config_for_ssl_context_with_ciphers(
     ctx_obj: ObjectRef,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
-    let key = ctx_obj_key(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
-    let identity = ctx_identity(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
+    let key = ctx_obj_key(ctx, ctx_obj)
+        .map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
+    let identity = ctx_identity(ctx, ctx_obj)
+        .map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     build_engine_client_config_with_identity_ciphers(
         &["http/1.1"],
         identity
@@ -1228,7 +1273,10 @@ pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
     *huc_default_km_ctx_key_slot().lock()
 }
 
-fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+fn capture_huc_trust_managers_ctx_key(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_managers = ctx_trust_managers_table()
         .lock()
@@ -1250,7 +1298,10 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn capture_huc_key_managers_ctx_key(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*ctx_obj);
     let w5_out = capture_huc_key_managers_ctx_key_body(ctx, *ctx_obj);
     *ctx_obj = ctx.read_native_pin(w5_pin, *ctx_obj);
@@ -1265,7 +1316,10 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
 /// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
 /// back to `client_identity`/no-client-auth instead of spuriously trying (and
 /// failing) to consult an empty resolver.
-pub(crate) fn capture_huc_key_managers_ctx_key_body(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn capture_huc_key_managers_ctx_key_body(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
     if crate::nbflags().dbg_tls_auth_ok {
@@ -1282,7 +1336,10 @@ pub(crate) fn capture_huc_key_managers_ctx_key_body(ctx: &mut dyn NativeContext,
 /// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
 /// roots even when it returns no client certificate, and every context needs a
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
-pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, mut ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn capture_huc_ssl_context(
+    ctx: &mut dyn NativeContext,
+    mut ctx_obj: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
     capture_huc_key_managers_ctx_key(ctx, &mut ctx_obj)?;
@@ -1978,7 +2035,6 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
-
 /// Build **this side's own** TLS identity from a certificate chain and its
 /// private key.
 ///
@@ -2308,9 +2364,9 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
     // `with_single_cert` is exactly `CertifiedKey::from_der` + this resolver;
     // the only difference is the `keys_match` parse. See
     // `identity_certified_key`.
-    let mut config = builder.with_cert_resolver(Arc::new(
-        rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
-    ));
+    let mut config = builder.with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+        identity_certified_key(chain, key)?,
+    )));
 
     // T2.7.11 — server ALPN advertisement.
     config.alpn_protocols = alpn_protocols
@@ -2377,9 +2433,9 @@ pub(crate) fn build_client_config(
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             // See `identity_certified_key` for why this is not
             // `with_client_auth_cert`.
-            builder.with_client_cert_resolver(Arc::new(
-                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
-            ))
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                identity_certified_key(chain, key)?,
+            )))
         }
         None => builder.with_no_client_auth(),
     };
@@ -2482,7 +2538,8 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
             chain.push(end_entity.as_ref().to_vec());
             chain.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
             if let Err(e) = crate::x509_manager::check_endpoint_identity(&chain, host) {
-                let detail = format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
+                let detail =
+                    format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
                 if crate::nbflags().dbg_tls_auth_ok {
                     eprintln!("[dbg-tls-auth] (in-handshake) {detail}");
                 }
@@ -2877,9 +2934,9 @@ fn build_client_config_ex_with_provider(
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             // See `identity_certified_key` for why this is not
             // `with_client_auth_cert`.
-            builder.with_client_cert_resolver(Arc::new(
-                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
-            ))
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                identity_certified_key(chain, key)?,
+            )))
         }
         ClientAuthMode::Fixed(None) => builder.with_no_client_auth(),
     };
@@ -3189,7 +3246,10 @@ fn key_types_from_sigschemes(schemes: &[SignatureScheme]) -> Vec<String> {
 /// fix — see the `SSLContext.init` comment in `net_phase_e.rs` for the
 /// measurement that showed a stale copy silently produces an anonymous client.
 /// The caller must root the returned array itself before allocating again.
-fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[u8]]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_issuer_principals(
+    ctx: &mut dyn NativeContext,
+    root_hint_subjects: &[&[u8]],
+) -> Result<ObjectRef, MethodCallFailed> {
     let dn_strings: Vec<String> = root_hint_subjects
         .iter()
         .filter_map(|der| crate::security_manager::x509::parse_name_dn(der).ok())
@@ -3201,8 +3261,11 @@ fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[
     let arr = scope.new_ref_array(cls_id, dn_strings.len());
     let arr_h = scope.root(arr);
     for (i, dn) in dn_strings.iter().enumerate() {
-        let princ =
-            try_alloc_concurrent_synthetic(&mut *scope, "javax/security/auth/x500/X500Principal", 1)?;
+        let princ = try_alloc_concurrent_synthetic(
+            &mut *scope,
+            "javax/security/auth/x500/X500Principal",
+            1,
+        )?;
         let princ_h = scope.root(princ);
         let s = scope.create_string(dn);
         let princ = scope.get(&princ_h);
@@ -3938,7 +4001,10 @@ pub(crate) fn jsse_would_send_sni(host: &str) -> bool {
         return false;
     }
     // Dotted-quad IPv4 literal: every label is numeric.
-    if host.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit())) {
+    if host
+        .split('.')
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+    {
         return false;
     }
     true
@@ -4212,9 +4278,9 @@ pub(crate) fn build_client_config_ciphers(
             let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             // See `identity_certified_key` for why this is not
             // `with_client_auth_cert`.
-            builder.with_client_cert_resolver(Arc::new(
-                rustls::sign::SingleCertAndKey::from(identity_certified_key(chain, key)?),
-            ))
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                identity_certified_key(chain, key)?,
+            )))
         }
         None => builder.with_no_client_auth(),
     };
@@ -4315,9 +4381,7 @@ pub(crate) fn rustls_client_connect(
         .conn
         .negotiated_cipher_suite()
         .map(|cs| suite_to_java_cipher_name(cs.suite()))
-        .unwrap_or_else(|| {
-            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
-        });
+        .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string());
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -4891,9 +4955,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
         .conn
         .negotiated_cipher_suite()
         .map(|cs| suite_to_java_cipher_name(cs.suite()))
-        .unwrap_or_else(|| {
-            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
-        });
+        .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string());
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -4978,9 +5040,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
         .conn
         .negotiated_cipher_suite()
         .map(|cs| suite_to_java_cipher_name(cs.suite()))
-        .unwrap_or_else(|| {
-            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
-        });
+        .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string());
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -5136,12 +5196,15 @@ pub(crate) fn stash_pending_layered_socket(
     // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
     // narrowing is known too.
     let use_java_trust_manager = java_tm_key.is_some();
-    let client_identity = ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
+    let client_identity = ctx_identity(ctx, ssl_context)
+        .map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     // Server identity: same resolution `rustls_server_handshake_over_stream`'s
     // former caller used (this SSLContext's own identity, else the
     // process-wide runtime-configured one) — resolved here too so SERVER mode
     // never needs to touch `ssl_context` again.
-    let server_identity = match ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())? {
+    let server_identity = match ctx_identity(ctx, ssl_context)
+        .map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?
+    {
         Some(identity) => Some(identity),
         None => runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)),
     };
@@ -5294,10 +5357,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
 /// Note this is genuinely NOT the same as making the read close-aware. It
 /// converts a wakeup into the RIGHT answer; something else still has to
 /// produce the wakeup, and on Windows nothing can — see `rustls_stream_close`.
-fn rustls_classify_after_block(
-    id: i32,
-    result: std::io::Result<usize>,
-) -> std::io::Result<usize> {
+fn rustls_classify_after_block(id: i32, result: std::io::Result<usize>) -> std::io::Result<usize> {
     {
         let reg = sreg().lock();
         if reg.client_streams.contains_key(&id) || reg.server_streams.contains_key(&id) {
@@ -5894,8 +5954,11 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
             let mut arr = arr0;
             let result = (|| -> Result<(), cratonvm_types::error::MethodCallFailed> {
                 for (i, der) in ders.iter().enumerate() {
-                    let cert0 =
-                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    let cert0 = try_alloc_concurrent_synthetic(
+                        ctx,
+                        "java/security/cert/X509Certificate",
+                        4,
+                    )?;
                     let cert_pin = ctx.pin_native_root(cert0);
                     // Best-effort CN extraction via the existing DER parser.
                     let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
@@ -6323,7 +6386,8 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ServerSocketFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -6934,9 +6998,16 @@ const SSS_MODE_DEFAULT: (i32, i32) = (0, 1);
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition takes
 /// the guard after `gc_stable_objref_key` has already produced the key, and
 /// holds it only across a `HashMap::entry` on a `(i32, i32)`.
-fn sss_mode_states() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn sss_mode_states() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>>
+{
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
@@ -6953,9 +7024,16 @@ fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
 /// one, which would say this socket can negotiate nothing.
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions are one
 /// statement over an already-built key and an already-built `Vec<String>`.
-fn sss_enabled_suites_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn sss_enabled_suites_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn stash_sss_enabled_suites(ctx: &dyn NativeContext, socket: ObjectRef, suites: Vec<String>) {
@@ -7459,8 +7537,8 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                 capture_huc_ssl_context(ctx, sslctx)?;
             }
         }
-            Ok(())
-}
+        Ok(())
+    }
     // FIX (tls-handshake-enforcement-gap, doc 21): this native REPLACES the
     // real `HttpsURLConnection.setDefaultSSLSocketFactory` bytecode, so the
     // real JDK static field `HttpsURLConnection.defaultSSLSocketFactory` was
@@ -7499,8 +7577,8 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             return Ok(());
         };
         ctx.set_static_field(cid, idx, Value::Object(Some(factory)));
-    Ok(())
-}
+        Ok(())
+    }
     r.register(
         hurl,
         "setDefaultSSLSocketFactory",
@@ -7549,11 +7627,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             // is the counter-example). It also keeps the setter and
             // `getSSLSocketFactory` reading one location, so they cannot
             // drift apart.
-            ctx.set_field_by_name(
-                connection,
-                "sslSocketFactory",
-                Value::Object(Some(factory)),
-            );
+            ctx.set_field_by_name(connection, "sslSocketFactory", Value::Object(Some(factory)));
             Ok(None)
         },
     );
@@ -8246,11 +8320,14 @@ mod ec_pkcs8_v1_identity_tests {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::test_fixtures::*;
     use super::*;
     use cratonvm_native_api::NativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ObjectRef;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -8965,10 +9042,16 @@ mod tests {
         let mut stream = StreamOwned::new(conn, tcp);
         while stream.conn.is_handshaking() {
             if stream.conn.wants_write() {
-                stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                stream
+                    .conn
+                    .write_tls(&mut EintrIo::new(&mut stream.sock))
+                    .unwrap();
             }
             if stream.conn.wants_read() {
-                stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                stream
+                    .conn
+                    .read_tls(&mut EintrIo::new(&mut stream.sock))
+                    .unwrap();
                 stream.conn.process_new_packets().unwrap();
             }
         }
@@ -9040,10 +9123,16 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .write_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .read_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }
@@ -9098,10 +9187,16 @@ mod tests {
         // Drive handshake.
         while stream.conn.is_handshaking() {
             if stream.conn.wants_write() {
-                stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                stream
+                    .conn
+                    .write_tls(&mut EintrIo::new(&mut stream.sock))
+                    .unwrap();
             }
             if stream.conn.wants_read() {
-                stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                stream
+                    .conn
+                    .read_tls(&mut EintrIo::new(&mut stream.sock))
+                    .unwrap();
                 stream.conn.process_new_packets().unwrap();
             }
         }
@@ -9186,10 +9281,16 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .write_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .read_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }
@@ -9217,10 +9318,16 @@ mod tests {
             let mut stream = StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .write_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                 }
                 if stream.conn.wants_read() {
-                    stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock)).unwrap();
+                    stream
+                        .conn
+                        .read_tls(&mut EintrIo::new(&mut stream.sock))
+                        .unwrap();
                     stream.conn.process_new_packets().unwrap();
                 }
             }
@@ -9936,8 +10043,14 @@ mod tests {
         );
         server.is_client = false;
         server.server_config = Some(
-            super::build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
-                .unwrap(),
+            super::build_server_config_single_cert(
+                SERVER_CRT_PEM,
+                SERVER_KEY_PEM,
+                &[],
+                false,
+                None,
+            )
+            .unwrap(),
         );
         super::engine_begin(&mut client).expect("client begin");
         super::engine_begin(&mut server).expect("server begin");
@@ -9955,7 +10068,10 @@ mod tests {
             super::engine_capture_negotiation(&mut client);
             super::engine_capture_negotiation(&mut server);
             let done = |s: &super::EngineState| {
-                s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+                s.conn
+                    .as_ref()
+                    .map(|c| !c.is_handshaking())
+                    .unwrap_or(false)
             };
             if done(&client) && done(&server) {
                 break;
@@ -10021,11 +10137,10 @@ mod tests {
             Some(("HTTPS".to_string(), "localhost".to_string()))
         );
         // The host the engine actually dialled matches the leaf: accepted.
-        assert!(crate::x509_manager::check_endpoint_identity(
-            &pending.peer_chain_der,
-            "localhost"
-        )
-        .is_ok());
+        assert!(
+            crate::x509_manager::check_endpoint_identity(&pending.peer_chain_der, "localhost")
+                .is_ok()
+        );
 
         // 3. The CVE shape: same trusted chain, different host. The in-tree
         //    test leaf names localhost/foo.test/bar.test/127.0.0.1, so a host
@@ -10041,7 +10156,10 @@ mod tests {
         client.trust_check_done = false;
         client.is_client = false;
         let pending = super::engine_take_pending_trust_check(TEST_ENGINE_ID, &mut client);
-        assert!(pending.is_none(), "server engines do not identify endpoints");
+        assert!(
+            pending.is_none(),
+            "server engines do not identify endpoints"
+        );
     }
 
     /// REGRESSION (`NettyReactiveWebServerFactoryTests.whenSslBundleIsUpdatedThenSslIsReloaded`):
@@ -10098,7 +10216,10 @@ mod tests {
 
         // 3b. The class itself, not only a subclass.
         let direct = ctx.alloc_object(extended, 1);
-        assert!(!super::jsse_owns_endpoint_identification(&mut ctx, &[direct]));
+        assert!(!super::jsse_owns_endpoint_identification(
+            &mut ctx,
+            &[direct]
+        ));
 
         // 4. `chooseTrustManager` takes the FIRST manager, so a plain one ahead
         //    of an extended one still means JSSE identifies.
@@ -10164,8 +10285,14 @@ mod tests {
         );
         server.is_client = false;
         server.server_config = Some(
-            super::build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
-                .unwrap(),
+            super::build_server_config_single_cert(
+                SERVER_CRT_PEM,
+                SERVER_KEY_PEM,
+                &[],
+                false,
+                None,
+            )
+            .unwrap(),
         );
         super::engine_begin(&mut client).expect("client begin");
         super::engine_begin(&mut server).expect("server begin");
@@ -10315,13 +10442,13 @@ mod tests {
         // it) with a real stream id.
         let live = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
         ctx.set_field(live, 2, Value::Int(0)); // id 0 is a VALID stream id
-        // E42 — the 4-field accept/NEW-13 shape, which is what the tree mints
-        // TODAY. Two rows, because `>= 0` is the boundary and `0` is on it:
-        // `SSLServerSocket.accept` writes `RUSTLS_SOCK_ID_BASE + stream_id`, so
-        // its ids are large, while `invalidate()`/`close()` bugs in this family
-        // have historically produced exactly `Int(0)`. Both must read as
-        // negotiated, which is what makes the merged arm a NO-OP for the accept
-        // shape rather than a change to it.
+                                               // E42 — the 4-field accept/NEW-13 shape, which is what the tree mints
+                                               // TODAY. Two rows, because `>= 0` is the boundary and `0` is on it:
+                                               // `SSLServerSocket.accept` writes `RUSTLS_SOCK_ID_BASE + stream_id`, so
+                                               // its ids are large, while `invalidate()`/`close()` bugs in this family
+                                               // have historically produced exactly `Int(0)`. Both must read as
+                                               // negotiated, which is what makes the merged arm a NO-OP for the accept
+                                               // shape rather than a change to it.
         let live4 = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
         ctx.set_field(live4, 2, Value::Int(0));
         ctx.set_field(live4, 3, Value::Object(None));
@@ -10381,7 +10508,11 @@ mod tests {
         let this = &[Value::Object(Some(sess))];
 
         let proto = r
-            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getProtocol",
+                "()Ljava/lang/String;",
+            )
             .expect("getProtocol registered");
         match proto(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => assert_eq!(
@@ -10392,7 +10523,11 @@ mod tests {
         }
 
         let cipher = r
-            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getCipherSuite",
+                "()Ljava/lang/String;",
+            )
             .expect("getCipherSuite registered");
         match cipher(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => assert_eq!(
@@ -11002,9 +11137,7 @@ mod tests {
         super::negotiated_session_keys().lock().remove(&key);
         match answer {
             Some(Value::Object(Some(_))) => {}
-            other => panic!(
-                "a completed engine session must answer a real context. Got {other:?}"
-            ),
+            other => panic!("a completed engine session must answer a real context. Got {other:?}"),
         }
     }
 
@@ -11501,8 +11634,16 @@ mod tests {
             assert_eq!(session_proto_slot(n), None, "width {n} carries neither");
         }
         for n in [2usize, 3, 4] {
-            assert_eq!(session_proto_slot(n), Some(0), "width {n} is protocol-first");
-            assert_eq!(session_cipher_slot(n), Some(1), "width {n} is protocol-first");
+            assert_eq!(
+                session_proto_slot(n),
+                Some(0),
+                "width {n} is protocol-first"
+            );
+            assert_eq!(
+                session_cipher_slot(n),
+                Some(1),
+                "width {n} is protocol-first"
+            );
         }
         for n in [6usize, 8] {
             assert_eq!(session_cipher_slot(n), Some(0), "width {n} is cipher-first");
@@ -13072,11 +13213,9 @@ fn engine_begin_failure(
     e: String,
 ) -> MethodCallFailed {
     match e.strip_prefix(HANDSHAKE_ERR_PREFIX) {
-        Some(rest) => crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            rest,
-        ),
+        Some(rest) => {
+            crate::phases_early::throw_jca_exc(ctx, "javax/net/ssl/SSLHandshakeException", rest)
+        }
         None => RuntimeError::IOException { message: e }.into(),
     }
 }
@@ -13337,9 +13476,12 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         );
         let shareable = state.identity_override.is_none() && state.client_config.is_none();
         let cached = if shareable {
-            state
-                .trust_managers_ctx_key
-                .and_then(|k| ctx_client_config_table().lock().get(&(k, shape.clone())).cloned())
+            state.trust_managers_ctx_key.and_then(|k| {
+                ctx_client_config_table()
+                    .lock()
+                    .get(&(k, shape.clone()))
+                    .cloned()
+            })
         } else {
             None
         };
@@ -13687,7 +13829,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
-                    let optional_client_cert = (state.want_client_auth || speculative_optional_auth)
+                    let optional_client_cert = (state.want_client_auth
+                        || speculative_optional_auth)
                         && !state.need_client_auth;
                     // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
                     // optional client auth (WANT) with no trust source at all
@@ -13792,8 +13935,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         let config = match state.trust_managers_ctx_key {
             Some(k) => {
                 let mut cloned = (*config).clone();
-                cloned.session_storage =
-                    ctx_server_session_store(k, state.client_auth_requested);
+                cloned.session_storage = ctx_server_session_store(k, state.client_auth_requested);
                 Arc::new(cloned)
             }
             None => config,
@@ -14309,9 +14451,16 @@ fn peek_server_hello_session_id(buf: &[u8]) -> Option<Vec<u8>> {
 /// which `drop` each guard before taking the next. The GC scan runs with the
 /// heap lock (L8) held, which is legal: L0 < L8 is the descending order the
 /// wrapper asserts.
-fn engine_alpn_selector_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn engine_alpn_selector_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, ObjectRef>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Run the installed server-side ALPN selector against the ClientHello sitting
@@ -14676,12 +14825,7 @@ fn engine_run_trust_check(
     pending: PendingTrustCheck,
     engine_obj: Option<ObjectRef>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    match engine_consult_trust_managers(
-        ctx,
-        pending,
-        engine_obj,
-        TrustCheckMode::PostHandshake,
-    )? {
+    match engine_consult_trust_managers(ctx, pending, engine_obj, TrustCheckMode::PostHandshake)? {
         TrustOutcome::Accepted => Ok(()),
         // Unreachable: `PostHandshake` throws from inside
         // `engine_consult_trust_managers` rather than returning `Rejected`.
@@ -14951,10 +15095,7 @@ fn engine_consult_trust_managers(
 ///
 /// Takes no `NativeContext` and calls no Java: it must be safe to run on the
 /// rejection path, which is already unwinding.
-fn reject_peer_with_fatal_alert(
-    engine_id: i32,
-    alert: crate::tls_cert_alert::JsseCertAlert,
-) {
+fn reject_peer_with_fatal_alert(engine_id: i32, alert: crate::tls_cert_alert::JsseCertAlert) {
     with_engine(engine_id, |s| {
         if let Some(c) = s.conn.as_mut() {
             c.queue_fatal_alert(alert.alert_description());
@@ -15077,7 +15218,10 @@ fn jsse_owns_endpoint_identification(
         let Some(c) = cid else { break };
         let name = ctx.class_name_of_id(c);
         if dbg {
-            chain.push(name.clone().unwrap_or_else(|| format!("<id {}>", c.as_u32())));
+            chain.push(
+                name.clone()
+                    .unwrap_or_else(|| format!("<id {}>", c.as_u32())),
+            );
         }
         // JSSE's OWN default trust manager is an `X509ExtendedTrustManager`,
         // and on HotSpot it is the thing that identifies the endpoint.
@@ -15185,8 +15329,7 @@ fn engine_check_endpoint_identity(
     match crate::x509_manager::check_endpoint_identity(&pending.peer_chain_der, host) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let detail =
-                format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
+            let detail = format!("endpoint identification ({alg}) failed for host {host:?}: {e}");
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!("[dbg-tls-auth] {detail}");
             }
@@ -15383,21 +15526,38 @@ mod session_phase_tests {
     /// `engine_session_for` copies the bindings across.
     #[test]
     fn the_negotiated_session_is_the_one_that_was_pending() {
-        assert_eq!(session_phase(SessionDoor::Current, true), SessionPhase::Negotiated);
-        assert_eq!(session_phase(SessionDoor::Handshake, false), SessionPhase::Handshaking);
+        assert_eq!(
+            session_phase(SessionDoor::Current, true),
+            SessionPhase::Negotiated
+        );
+        assert_eq!(
+            session_phase(SessionDoor::Handshake, false),
+            SessionPhase::Handshaking
+        );
     }
 
     /// `getSession()` while a handshake is in flight is still the NULL
     /// session, not the pending one.
     #[test]
     fn get_session_mid_handshake_is_still_the_null_session() {
-        assert_eq!(session_phase(SessionDoor::Current, false), SessionPhase::Fresh);
+        assert_eq!(
+            session_phase(SessionDoor::Current, false),
+            SessionPhase::Fresh
+        );
     }
 }
 
-fn engine_session_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, SessionPhase), ObjectRef>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, SessionPhase), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn engine_session_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, SessionPhase), ObjectRef>> {
+    static T: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, SessionPhase), ObjectRef>>,
+    > = OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The client-side session cache: `(SSLContext key, host, port)` → the
@@ -15425,9 +15585,17 @@ fn engine_session_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex
 /// `engine_session_for` was bound to a local so its guard drops before the body
 /// (see there). The remaining sites are a `contains_key` inside a debug
 /// `eprintln!`, a one-statement `insert`, and the GC scan/remap pair.
-fn client_session_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn client_session_cache(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>> {
+    static T: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, String, i32), ObjectRef>>,
+    > = OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The cache key for a client engine, or `None` when this engine has no
@@ -15453,9 +15621,16 @@ fn client_session_cache_key(id: i32) -> Option<(u64, String, i32)> {
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both with the key
 /// computed before the guard: `touch_session_access_time`'s `insert`, and a
 /// `get(..).copied()` whose `if let` body is a bare `return`.
-fn session_last_accessed_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_last_accessed_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, i64>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn touch_session_access_time(ctx: &mut dyn NativeContext, ses: ObjectRef) {
@@ -15501,9 +15676,16 @@ fn engine_handshake_was_resumed(id: i32) -> bool {
 /// behavioural note from here.
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, a `contains` and an
 /// `insert`, each a single statement over a key built beforehand.
-fn negotiated_session_keys() -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn negotiated_session_keys(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Has this session object been through a COMPLETED handshake — as opposed to
@@ -15524,7 +15706,10 @@ fn engine_session_for(
     door: SessionDoor,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let handshaked = with_engine(id, |s| {
-        s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+        s.conn
+            .as_ref()
+            .map(|c| !c.is_handshaking())
+            .unwrap_or(false)
     })
     .unwrap_or(false);
     let phase = session_phase(door, handshaked);
@@ -15606,7 +15791,10 @@ fn engine_session_for(
 /// negotiated" answers. Shared by `getSession()` and `getHandshakeSession()`
 /// — see the latter's registration for why real JDK's `getHandshakeSession()`
 /// cannot be left un-intercepted on this engine implementation.
-fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn build_synthetic_ssl_session(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let (proto, cipher, alpn) = with_engine(id, |s| {
         let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
             Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
@@ -15631,9 +15819,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
             .as_ref()
             .and_then(|c| c.negotiated_cipher_suite())
             .map(|cs| suite_to_java_cipher_name(cs.suite()))
-            .unwrap_or_else(|| {
-                crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into()
-            });
+            .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into());
         let alpn = s.negotiated_alpn.clone().unwrap_or_default();
         (proto.to_string(), cipher, alpn)
     })
@@ -15796,11 +15982,11 @@ fn engine_peer_port_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> Stri
 /// this engine cannot produce renders as `null`, which is what string
 /// concatenation of a null reference does.
 fn engine_session_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
-    let session = match ctx.invoke_virtual(engine, "getSession", "()Ljavax/net/ssl/SSLSession;", &[])
-    {
-        Ok(Some(Value::Object(Some(sess)))) => sess,
-        _ => return "null".to_string(),
-    };
+    let session =
+        match ctx.invoke_virtual(engine, "getSession", "()Ljavax/net/ssl/SSLSession;", &[]) {
+            Ok(Some(Value::Object(Some(sess)))) => sess,
+            _ => return "null".to_string(),
+        };
     match ctx.invoke_virtual(session, "toString", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
         _ => "null".to_string(),
@@ -16551,7 +16737,12 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id, SessionDoor::Current)?))))
+            Ok(Some(Value::Object(Some(engine_session_for(
+                ctx,
+                this,
+                id,
+                SessionDoor::Current,
+            )?))))
         },
     );
 
@@ -16630,7 +16821,12 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             // every call: the session OBJECT's identity is what
             // `putValue`/`getValue`, `invalidate()` and `getCreationTime()` are
             // answered from — see `engine_session_table`.
-            Ok(Some(Value::Object(Some(engine_session_for(ctx, this, id, SessionDoor::Handshake)?))))
+            Ok(Some(Value::Object(Some(engine_session_for(
+                ctx,
+                this,
+                id,
+                SessionDoor::Handshake,
+            )?))))
         },
     );
 
@@ -17035,7 +17231,14 @@ fn do_wrap(
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
         let pending_trust_check = engine_take_pending_trust_check(id, s);
-        (cons, status, hs, drained, pending_trust_check, deferred_failure)
+        (
+            cons,
+            status,
+            hs,
+            drained,
+            pending_trust_check,
+            deferred_failure,
+        )
     };
     // `engine_run_trust_check` runs the application's TrustManager — arbitrary
     // Java that allocates and can collect for as long as it likes. `this` and
@@ -17717,8 +17920,10 @@ fn do_unwrap(
                         if matches!(&*conn, EngineConn::Server(_)) {
                             // Deferred, not discarded: the next `wrap` drains
                             // the alert and then raises this.
-                            deferred_error =
-                                Some((jsse_handshake_exception_class(&e), handshake_error_message(&e)));
+                            deferred_error = Some((
+                                jsse_handshake_exception_class(&e),
+                                handshake_error_message(&e),
+                            ));
                             offset = rec_end;
                             break;
                         }
@@ -18420,9 +18625,16 @@ pub(crate) fn set_engine_trust_ctx_key(
 /// remove-or-insert whose guard covers only that choice, a
 /// `match ..get(..).cloned()` that ends before the `ctx.create_string` below
 /// it, and the GC scan/remap pair.
-fn engine_sni_matchers_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn engine_sni_matchers_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<ObjectRef>>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
@@ -18771,9 +18983,16 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 /// Populated for TLS 1.2 sessions only — see [`peek_server_hello_session_id`].
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites, both of which now
 /// compute their `gc_stable_objref_key` before taking the guard (see there).
-fn session_wire_id_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_wire_id_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<u8>>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
@@ -18901,9 +19120,16 @@ pub(crate) fn record_local_cert_chain(
 /// `gc_stable_objref_key` — which calls `ctx.identity_hash_code` — into a local
 /// BEFORE acquiring. It used to sit inside the lock expression, which is the
 /// same shape the 2026-08-17 round hoisted out of five other tables.
-fn session_peer_endpoint_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_peer_endpoint_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Record the endpoint a session's peer was reached at. See
@@ -19156,9 +19382,16 @@ pub(crate) fn peer_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef
 /// [`session_peer_endpoint_table`]: `gc_stable_objref_key` is evaluated into a
 /// local before either acquisition, so no `NativeContext` call runs under the
 /// guard.
-fn session_invalidated_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_invalidated_table(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> =
+        OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Record that `invalidate()` was called on this session. Crate-visible so
@@ -19769,13 +20002,12 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         // Bound to a `let` on purpose: a closure written directly in a match
         // scrutinee is a temporary whose `&ctx` capture lives to the end of the
         // match, which collides with the `&mut ctx` the sentinel arms need.
-        let raw = session_proto_slot(ctx.object_num_fields(this))
-            .map(|slot| ctx.get_field(this, slot));
+        let raw =
+            session_proto_slot(ctx.object_num_fields(this)).map(|slot| ctx.get_field(this, slot));
         match raw {
             Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
             _ => {
-                let s =
-                    ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+                let s = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
                 Ok(Some(Value::Object(Some(s))))
             }
         }
@@ -19793,8 +20025,8 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             match raw {
                 Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
                 _ => {
-                    let s = ctx
-                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    let s =
+                        ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
                     Ok(Some(Value::Object(Some(s))))
                 }
             }
@@ -19839,7 +20071,11 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // genuinely negotiated session.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if session_is_valid(ctx, this) { 1 } else { 0 })))
+        Ok(Some(Value::Int(if session_is_valid(ctx, this) {
+            1
+        } else {
+            0
+        })))
     });
 
     // invalidate() -> void
@@ -20167,13 +20403,13 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         "getValue",
         "(Ljava/lang/String;)Ljava/lang/Object;",
         |ctx, args| {
-        // MEASURED: IllegalArgumentException, SINGULAR "argument".
-        if matches!(args.get(1), None | Some(Value::Object(None))) {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "argument can not be null".into(),
+            // MEASURED: IllegalArgumentException, SINGULAR "argument".
+            if matches!(args.get(1), None | Some(Value::Object(None))) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "argument can not be null".into(),
+                }
+                .into());
             }
-            .into());
-        }
             let this = obj_arg(args, 0)?;
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
             // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc.
@@ -20277,67 +20513,72 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let empty = |ctx: &mut dyn NativeContext| {
-            Ok(Some(Value::Object(Some(
-                ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
-            ))))
-        };
-        // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc. On the
-        // then-3-field shape the old spelling read the STREAM ID as a map
-        // reference; it missed (an `Int`) and answered empty, so this arm was
-        // unchanged in effect and changed in correctness. E42: that shape is
-        // width 4 now and slot 3 really is the map, so this door reports the
-        // names a `putValue` actually stored.
-        let slot = match sslsess_attrs_slot(ctx, this) {
-            Some(s) => s,
-            None => return empty(ctx),
-        };
-        let map = match ctx.get_field(this, slot) {
-            Value::Object(Some(m)) => m,
-            _ => return empty(ctx),
-        };
-        let key_set = match ctx.invoke(
-            "java/util/HashMap",
-            "keySet",
-            "()Ljava/util/Set;",
-            &[Value::Object(Some(map))],
-        )? {
-            Some(Value::Object(Some(s))) => s,
-            _ => return empty(ctx),
-        };
-        // `keySet()`'s runtime type is `HashMap$KeySet`, not `HashSet` — resolve
-        // `toArray`'s declaring class dynamically rather than guessing a name,
-        // since a wrong static class name here would use the wrong field/vtable
-        // layout for the dispatch.
-        let key_set_class = ctx.class_id_of_object(key_set);
-        let key_set_class_name = match ctx.class_name_of_id(key_set_class) {
-            Some(n) => n,
-            None => return empty(ctx),
-        };
-        let raw_arr = match ctx.invoke(
-            &key_set_class_name,
-            "toArray",
-            "()[Ljava/lang/Object;",
-            &[Value::Object(Some(key_set))],
-        )? {
-            Some(Value::Object(Some(arr))) => arr,
-            _ => return empty(ctx),
-        };
-        // `Collection.toArray()` reifies as `Object[]`, not `String[]` — real
-        // JDK's own `SSLSessionImpl.getValueNames()` has the same mismatch and
-        // copies into a freshly-typed array rather than returning it directly.
-        // Mirror that: allocate our own array (same `ClassId::new(0)` "generic
-        // String[]" convention already used elsewhere in this file, e.g.
-        // `getEnabledProtocols`) and copy each key across.
-        let len = ctx.array_length(raw_arr);
-        let out = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
-        for i in 0..len {
-            ctx.set_array_element(out, i, ctx.get_array_element(raw_arr, i));
-        }
-        Ok(Some(Value::Object(Some(out))))
-    });
+    r.register(
+        cls,
+        "getValueNames",
+        "()[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let empty = |ctx: &mut dyn NativeContext| {
+                Ok(Some(Value::Object(Some(
+                    ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
+                ))))
+            };
+            // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc. On the
+            // then-3-field shape the old spelling read the STREAM ID as a map
+            // reference; it missed (an `Int`) and answered empty, so this arm was
+            // unchanged in effect and changed in correctness. E42: that shape is
+            // width 4 now and slot 3 really is the map, so this door reports the
+            // names a `putValue` actually stored.
+            let slot = match sslsess_attrs_slot(ctx, this) {
+                Some(s) => s,
+                None => return empty(ctx),
+            };
+            let map = match ctx.get_field(this, slot) {
+                Value::Object(Some(m)) => m,
+                _ => return empty(ctx),
+            };
+            let key_set = match ctx.invoke(
+                "java/util/HashMap",
+                "keySet",
+                "()Ljava/util/Set;",
+                &[Value::Object(Some(map))],
+            )? {
+                Some(Value::Object(Some(s))) => s,
+                _ => return empty(ctx),
+            };
+            // `keySet()`'s runtime type is `HashMap$KeySet`, not `HashSet` — resolve
+            // `toArray`'s declaring class dynamically rather than guessing a name,
+            // since a wrong static class name here would use the wrong field/vtable
+            // layout for the dispatch.
+            let key_set_class = ctx.class_id_of_object(key_set);
+            let key_set_class_name = match ctx.class_name_of_id(key_set_class) {
+                Some(n) => n,
+                None => return empty(ctx),
+            };
+            let raw_arr = match ctx.invoke(
+                &key_set_class_name,
+                "toArray",
+                "()[Ljava/lang/Object;",
+                &[Value::Object(Some(key_set))],
+            )? {
+                Some(Value::Object(Some(arr))) => arr,
+                _ => return empty(ctx),
+            };
+            // `Collection.toArray()` reifies as `Object[]`, not `String[]` — real
+            // JDK's own `SSLSessionImpl.getValueNames()` has the same mismatch and
+            // copies into a freshly-typed array rather than returning it directly.
+            // Mirror that: allocate our own array (same `ClassId::new(0)` "generic
+            // String[]" convention already used elsewhere in this file, e.g.
+            // `getEnabledProtocols`) and copy each key across.
+            let len = ctx.array_length(raw_arr);
+            let out = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
+            for i in 0..len {
+                ctx.set_array_element(out, i, ctx.get_array_element(raw_arr, i));
+            }
+            Ok(Some(Value::Object(Some(out))))
+        },
+    );
     ()
 }
 

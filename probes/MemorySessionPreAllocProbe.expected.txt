@@ -1,6 +1,0 @@
-beforeAllocate.scope.stable = true
-beforeAllocate.scope.isAlive = true
-afterAllocate.scope.stable = true
-afterClose.scope.isAlive = false
-neverAllocated.scope.stable = true
-neverAllocated.closed.isAlive = false

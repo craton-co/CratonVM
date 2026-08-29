@@ -312,7 +312,10 @@ mod tests {
         }
         .into();
         assert!(
-            matches!(refused, VmError::ClassFile(ClassFileError::ClassNotFound { .. })),
+            matches!(
+                refused,
+                VmError::ClassFile(ClassFileError::ClassNotFound { .. })
+            ),
             "{refused:?}",
         );
     }

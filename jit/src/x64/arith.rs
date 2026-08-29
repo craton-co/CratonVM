@@ -23,17 +23,12 @@ impl Compiler {
     // Moved to `x64/osr.rs`. OSR *entry* publication still lives in
     // `compile_with_param_slots` below.
 
-
-
     // -----------------------------------------------------------------------
     // Safepoints, shadow stack and oop maps
     // -----------------------------------------------------------------------
     //
     // Moved to `x64/safepoint.rs`: the polls, the live-oop publication, and the
     // two elision proofs that let a poll skip publishing.
-
-
-
 
     /// Emit IEEE 754 NaN/overflow fixup after a CVTT instruction.
     ///
@@ -87,7 +82,11 @@ impl Compiler {
             // .nan: XOR EAX, EAX
             let nan_off = self.buf.pos();
             // Widening: usize offset -> i64 (no truncation; for displacement math)
-            Self::patch_rel8_or_bail(&mut self.buf, jp_patch, nan_off as i64 - jp_patch as i64 - 1);
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jp_patch,
+                nan_off as i64 - jp_patch as i64 - 1,
+            );
             self.buf.emit(&[0x31, 0xC0]);
 
             // .done:
@@ -154,7 +153,11 @@ impl Compiler {
             // .nan: XOR RAX, RAX (48 31 C0)
             let nan_off = self.buf.pos();
             // Widening: usize offset -> i64 (no truncation; for displacement math)
-            Self::patch_rel8_or_bail(&mut self.buf, jp_patch, nan_off as i64 - jp_patch as i64 - 1);
+            Self::patch_rel8_or_bail(
+                &mut self.buf,
+                jp_patch,
+                nan_off as i64 - jp_patch as i64 - 1,
+            );
             self.buf.emit(&[0x48, 0x31, 0xC0]);
 
             // .done:
@@ -177,7 +180,6 @@ impl Compiler {
             );
         }
     }
-
 
     /// LICM: emit a hoisted loop-invariant integer-arithmetic expression.
     ///
@@ -285,11 +287,6 @@ impl Compiler {
         // Result is the single value left in scratch slot 0.
         self.emit_load_local(RAX, slot(0));
     }
-
-
-
-
-
 
     // -----------------------------------------------------------------------
     // Peephole: constant + arithmetic fusion

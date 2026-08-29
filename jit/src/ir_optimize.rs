@@ -83,7 +83,9 @@ pub fn optimize(graph: &mut Graph) {
 pub fn licm_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_LICM").map_or(true, |v| v != "0"))
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_LICM").map_or(true, |v| v != "0")
+    })
 }
 
 /// `true` when `CRATONVM_JIT_REASSOC` is set (cached). Enables the affine
@@ -2282,7 +2284,9 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
 pub fn unroll_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNROLL").map_or(true, |v| v != "0"))
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNROLL").map_or(true, |v| v != "0")
+    })
 }
 
 /// Only fully unroll loops whose constant trip count is at most this (bounds
@@ -2760,10 +2764,9 @@ fn unroll(graph: &mut Graph) -> bool {
         // represent per-iteration frames with one snapshot. Representing them
         // needs a per-iteration snapshot index, which is a lowerer change.
         let body_named_by_safepoint = graph.safepoints.iter().any(|sp| {
-            sp.locals
-                .iter()
-                .chain(sp.stack.iter())
-                .any(|&slot| slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot)))
+            sp.locals.iter().chain(sp.stack.iter()).any(|&slot| {
+                slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot))
+            })
         });
         if body_named_by_safepoint {
             continue;

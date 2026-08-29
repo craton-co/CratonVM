@@ -441,14 +441,17 @@ See the companion page. 13 of `MethodRefDoorProbe`'s 25 rows.
 
 ```bash
 CV=target/release/cratonvm
+# The twelve sources live in `apps/probes/`; the repo moved `probes/` there on
+# 2026-08-29 and this block is written for the layout after that move.
+"$JDK/bin/javac" -d apps/probes/out apps/probes/*ShadowSweep.java apps/probes/MethodRefDoorProbe.java
 for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep \
          HashtableVectorShadowSweep ArrayListShadowSweep \
          LinkedSequencedShadowSweep PqOptionalShadowSweep \
          CollectionsShadowSweep LocaleDateTzShadowSweep \
          MapViewsShadowSweep UtilTailShadowSweep MethodRefDoorProbe; do
-  "$JDK/bin/java" -cp probes/out "$C" > /tmp/$C.hs 2>/dev/null
-  "$CV" --java-home "$JDK"            -cp probes/out "$C" > /tmp/$C.compat 2>/dev/null
-  "$CV" --java-home "$JDK" --jdk-only -cp probes/out "$C" > /tmp/$C.strict 2>/dev/null
+  "$JDK/bin/java" -cp apps/probes/out "$C" > /tmp/$C.hs 2>/dev/null
+  "$CV" --java-home "$JDK"            -cp apps/probes/out "$C" > /tmp/$C.compat 2>/dev/null
+  "$CV" --java-home "$JDK" --jdk-only -cp apps/probes/out "$C" > /tmp/$C.strict 2>/dev/null
   diff /tmp/$C.hs /tmp/$C.strict
 done
 ```

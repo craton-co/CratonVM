@@ -159,7 +159,10 @@ mod tests {
 
         add_metadata_pin(A, 0x1000, 0x2000);
         assert!(NON_EMPTY.load(Ordering::Relaxed));
-        assert!(roots_for_loader(0x1000).is_some(), "and the read path agrees");
+        assert!(
+            roots_for_loader(0x1000).is_some(),
+            "and the read path agrees"
+        );
 
         // TWO VMs. Clearing A must NOT lower the latch, because B still has a
         // row -- and B's row is exactly what a stale `false` would hide.

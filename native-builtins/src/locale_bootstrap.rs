@@ -73,16 +73,26 @@ impl LocaleCategory {
 /// the remap holds the guard across pure `PointerMap` arithmetic. The
 /// `getDefault` fast path's `if let` body is a bare `return`, so the allocation
 /// that follows it runs with no guard held.
-fn cached_locale(category: LocaleCategory) -> &'static cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>> {
-    static BASE: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
-    static DISPLAY: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
-    static FORMAT: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> = OnceLock::new();
+fn cached_locale(
+    category: LocaleCategory,
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>> {
+    static BASE: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> =
+        OnceLock::new();
+    static DISPLAY: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> =
+        OnceLock::new();
+    static FORMAT: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<Option<ObjectRef>>> =
+        OnceLock::new();
     let cell = match category {
         LocaleCategory::Base => &BASE,
         LocaleCategory::Display => &DISPLAY,
         LocaleCategory::Format => &FORMAT,
     };
-    cell.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(None, cratonvm_types::lock_order::LockLevel::Scratch))
+    cell.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            None,
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Every cache slot, for the whole-cache operations (GC scan/remap and
@@ -1286,8 +1296,8 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             }
             None => ("en".to_string(), String::new()),
         };
-        let named = crate::locale_resources::cldr_locale_display_name(ctx, &code, &dl, &dc)
-            .unwrap_or(code);
+        let named =
+            crate::locale_resources::cldr_locale_display_name(ctx, &code, &dl, &dc).unwrap_or(code);
         Ok(Some(Value::Object(Some(ctx.create_string(&named)))))
     }
 
@@ -1550,7 +1560,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // which dereferences it. Substituting `""` handed a caller with a
             // null variable a usable `Locale.ROOT` instead of the NPE that names
             // the mistake. MEASURED no-throw
-            // (probes/LocaleDateTzShadowSweep 39).
+            // (apps/probes/LocaleDateTzShadowSweep 39).
             if matches!(args.first(), Some(Value::Object(None))) {
                 return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: None,
@@ -1782,18 +1792,12 @@ mod tests {
     /// A bare language code keeps an empty country, as `new Locale("en")` does.
     #[test]
     fn posix_bare_language_has_empty_country() {
-        assert_eq!(
-            parse_posix_locale("en"),
-            ("en".to_string(), String::new())
-        );
+        assert_eq!(parse_posix_locale("en"), ("en".to_string(), String::new()));
         assert_eq!(
             parse_posix_locale("fr.UTF-8"),
             ("fr".to_string(), String::new())
         );
         // `en_` — a country that is present but empty.
-        assert_eq!(
-            parse_posix_locale("en_"),
-            ("en".to_string(), String::new())
-        );
+        assert_eq!(parse_posix_locale("en_"), ("en".to_string(), String::new()));
     }
 }

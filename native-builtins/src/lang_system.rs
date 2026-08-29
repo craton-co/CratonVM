@@ -7,7 +7,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg, platform_lib_name};
+use crate::{obj_arg, platform_lib_name, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // System.exit / Runtime.exit pre-termination hook.
@@ -371,7 +371,10 @@ pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: Object
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-pub(crate) fn capture_inheritable_tl_at_construction(ctx: &mut dyn NativeContext, child: &mut ObjectRef) {
+pub(crate) fn capture_inheritable_tl_at_construction(
+    ctx: &mut dyn NativeContext,
+    child: &mut ObjectRef,
+) {
     let w5_pin = ctx.pin_native_root(*child);
     let w5_out = capture_inheritable_tl_at_construction_body(ctx, *child);
     *child = ctx.read_native_pin(w5_pin, *child);
@@ -649,7 +652,10 @@ fn report_filechannel_fast_io() {
     if !asked && !cratonvm_native_io::file_channel_fast_read::stats::touched() {
         return;
     }
-    eprintln!("{}", cratonvm_native_io::file_channel_fast_read::stats::report());
+    eprintln!(
+        "{}",
+        cratonvm_native_io::file_channel_fast_read::stats::report()
+    );
 }
 
 type PreExitHook = fn(code: i32);
@@ -872,8 +878,8 @@ pub(crate) fn native_system_arraycopy(
     // `ObjArrayKlass::copy_array`; `probes/PreconditionsFormatterProbe`'s
     // "arraycopy check precedence" rows pin every pairwise ordering that a
     // reordering would flip.
-    use cratonvm_types::ObjectKind;
     use cratonvm_types::error::arraycopy_message;
+    use cratonvm_types::ObjectKind;
     if ctx.heap_kind_of(src) != ObjectKind::Array {
         let name = external_class_name_of(ctx, src);
         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
@@ -983,7 +989,10 @@ pub(crate) fn native_system_arraycopy(
         // both sides (the two are equal by the time we get here).
         let ty = arraycopy_message::element_type_name(src_elem);
         let (index, message) = if src_pos < 0 {
-            (src_pos, arraycopy_message::source_index(src_pos, ty, src_len))
+            (
+                src_pos,
+                arraycopy_message::source_index(src_pos, ty, src_len),
+            )
         } else if dest_pos < 0 {
             (
                 dest_pos,
@@ -1383,11 +1392,9 @@ fn sleep_interrupted(ctx: &mut dyn NativeContext) -> cratonvm_types::error::Meth
     ) {
         return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
     }
-    cratonvm_types::error::MethodCallFailed::InternalError(
-        cratonvm_types::error::VmError::Runtime(
-            cratonvm_types::error::RuntimeError::InterruptedException,
-        ),
-    )
+    cratonvm_types::error::MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+        cratonvm_types::error::RuntimeError::InterruptedException,
+    ))
 }
 
 pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2263,10 +2270,16 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(i32::from(removed))))
         },
     );
-    registry.register_with_kind("java/lang/Runtime", "gc", "()V", |ctx, _args| {
-        ctx.force_gc();
-        Ok(None)
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/lang/Runtime",
+        "gc",
+        "()V",
+        |ctx, _args| {
+            ctx.force_gc();
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
     // `Runtime.halt(int)` is NOT intercepted — its real bytecode runs, and it
@@ -2279,10 +2292,16 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     // `UnsatisfiedLinkError: java/lang/Shutdown.beforeHalt()V` and the process
     // kept running: a caller asking to die immediately got a linkage error out
     // of a method that cannot legally return.
-    registry.register_with_kind("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
-        // HotSpot's does nothing an application can observe.
-        Ok(None)
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/lang/Shutdown",
+        "beforeHalt",
+        "()V",
+        |_ctx, _args| {
+            // HotSpot's does nothing an application can observe.
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // W7-92: `java.lang.Shutdown.runHooks()` is `private static void` WITH a
     // `Code` attribute in the real JDK, so this is an interception of the same
@@ -2389,7 +2408,13 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
                 let name_obj = obj_arg(args, 0)?;
                 let name = ctx.read_string(name_obj).unwrap_or_default();
                 crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-                load_library_or_throw(ctx, &name, LibrarySpelling::BareName, None, LoaderScoping::On)
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    None,
+                    LoaderScoping::On,
+                )
             },
         );
         registry.register(
@@ -3343,7 +3368,9 @@ pub(crate) fn native_runtime_version(
         ctx.set_field_by_name(version, "optional", optional);
     }
     ctx.unpin_native_roots(pin);
-    Ok(Some(Value::Object(Some(runtime_version_publish(ctx, version)))))
+    Ok(Some(Value::Object(Some(runtime_version_publish(
+        ctx, version,
+    )))))
 }
 
 /// Global-root handle for the `Runtime.version()` singleton.
@@ -3357,7 +3384,9 @@ static RUNTIME_VERSION_ROOT: std::sync::Mutex<Option<usize>> = std::sync::Mutex:
 
 /// The already-built `Runtime.version()` singleton, if there is one.
 fn runtime_version_cached(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let handle = (*RUNTIME_VERSION_ROOT.lock().unwrap_or_else(|e| e.into_inner()))?;
+    let handle = (*RUNTIME_VERSION_ROOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()))?;
     ctx.resolve_global_root(handle)
 }
 
@@ -3365,7 +3394,9 @@ fn runtime_version_cached(ctx: &dyn NativeContext) -> Option<ObjectRef> {
 /// concurrent first call may have published its own, and identity is the whole
 /// point of memoising.
 fn runtime_version_publish(ctx: &mut dyn NativeContext, version: ObjectRef) -> ObjectRef {
-    let mut slot = RUNTIME_VERSION_ROOT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = RUNTIME_VERSION_ROOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(winner) = slot.and_then(|handle| ctx.resolve_global_root(handle)) {
         return winner;
     }
@@ -4090,7 +4121,11 @@ fn wrap_system_env_map(
     let pin = ctx.pin_native_root(map);
 
     // 1. The real `java.util.Collections.unmodifiableMap(Map)`.
-    if allow_java_call && ctx.ensure_class_initialized("java/util/Collections").is_ok() {
+    if allow_java_call
+        && ctx
+            .ensure_class_initialized("java/util/Collections")
+            .is_ok()
+    {
         let backing = ctx.read_native_pin(pin, map);
         // A failure here is deliberately swallowed rather than propagated: it
         // means the real wrapper is unavailable, which is what steps 2 and 3
@@ -4512,7 +4547,9 @@ pub(crate) fn build_stack_trace_element_array(
     for (i, e) in trace.iter().rev().enumerate() {
         let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
         let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
-            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name),
+            Some(cid) => {
+                crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name)
+            }
             None => std::sync::Arc::from(e.class_name.replace('/', ".")),
         };
         crate::lang_misc::fill_stack_trace_element(
@@ -4863,7 +4900,8 @@ pub(crate) fn native_system_init_phase1(
             ) {
                 Ok(Some(Value::Object(Some(real))))
                     if !matches!(
-                        ctx.class_name_of_id(ctx.class_id_of_object(real)).as_deref(),
+                        ctx.class_name_of_id(ctx.class_id_of_object(real))
+                            .as_deref(),
                         Some("java/nio/charset/Charset")
                     ) =>
                 {
@@ -5567,7 +5605,10 @@ fn typed_define_class_error(class_name: &str, method: &str, msg: &str) -> Option
             class_name: named("class_name"),
             // This variant carries `major`/`minor` ints rather than a message,
             // so build HotSpot's shape by hand instead of dumping the fields.
-            message: format!("{} has an unsupported class file version", named("class_name")),
+            message: format!(
+                "{} has an unsupported class file version",
+                named("class_name")
+            ),
         }
         .into(),
 
@@ -6052,8 +6093,9 @@ fn classify_duplicate_define(
     // before the object association is made.
     if loader_id != 0 {
         if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
-            let same = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
-                .is_some_and(|def| def.as_ptr() == loader_obj.as_ptr());
+            let same =
+                crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
+                    .is_some_and(|def| def.as_ptr() == loader_obj.as_ptr());
             if same {
                 if dbg {
                     eprintln!(
@@ -6213,7 +6255,11 @@ pub(crate) fn native_classloader_define_class1(
             // The JDK's Class.getClassLoader bytecode reads this instance
             // field directly. Keep it aligned with the VM's loader registry.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(
+                    ctx.vm_identity(),
+                    class_id.as_u32(),
+                    *loader_obj,
+                );
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -6301,7 +6347,11 @@ pub(crate) fn native_classloader_define_class2(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(
+                    ctx.vm_identity(),
+                    class_id.as_u32(),
+                    *loader_obj,
+                );
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -6437,7 +6487,11 @@ pub(crate) fn native_classloader_define_class0(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(
+                    ctx.vm_identity(),
+                    class_id.as_u32(),
+                    *loader_obj,
+                );
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -7154,10 +7208,7 @@ mod exec_cmdarray_tests {
         let mut ctx = mock_ctx();
         let arr = string_array(&mut ctx, &[Some("/bin/sleep"), Some("5")]);
         let started = std::time::Instant::now();
-        let result = native_runtime_exec_array(
-            &mut ctx,
-            &[Value::Object(None), arr],
-        );
+        let result = native_runtime_exec_array(&mut ctx, &[Value::Object(None), arr]);
         let elapsed = started.elapsed();
         assert!(
             result.is_ok(),
@@ -7274,7 +7325,8 @@ mod checkexec_security_tests {
         }
 
         // args[0] = Runtime instance (irrelevant here), args[1] = command.
-        let runtime_instance = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0).unwrap();
+        let runtime_instance =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0).unwrap();
         let cmd = ctx.create_string("/path/to/definitely-nonexistent-binary-xyz");
         let result = native_runtime_exec_string(
             &mut ctx,
@@ -7519,7 +7571,13 @@ mod define_class_error_typing_tests {
             // exception's message. `Debug` of the *outcome* is a Rust value dump
             // by definition and asserting on it would measure nothing.
             let text = format!("{failed}");
-            for artifact in ["class_name:", "message:", "Linkage(", "Runtime(", "ClassFile("] {
+            for artifact in [
+                "class_name:",
+                "message:",
+                "Linkage(",
+                "Runtime(",
+                "ClassFile(",
+            ] {
                 assert!(
                     !text.contains(artifact),
                     "a Debug artifact {artifact:?} reached the Java-visible error \
@@ -7535,9 +7593,9 @@ mod define_class_error_typing_tests {
             message: "Prohibited package name: java.evil".to_string(),
         }));
         match define_class_linkage_error("java/evil/X", "defineClass1", backend) {
-            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
-                message,
-            })) => {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::SecurityException { message },
+            )) => {
                 assert_eq!(message, "Prohibited package name: java.evil");
             }
             other => panic!("JVMS §5.3.5 wants a SecurityException, got {other:?}"),
@@ -7565,7 +7623,10 @@ mod define_class_error_typing_tests {
         ] {
             let failed = define_class_linkage_error("P", "defineClass1", format!("{err:?}"));
             assert!(
-                matches!(&failed, MethodCallFailed::InternalError(VmError::Linkage(_))),
+                matches!(
+                    &failed,
+                    MethodCallFailed::InternalError(VmError::Linkage(_))
+                ),
                 "a ClassFile error must be re-homed onto a Linkage variant, got {failed:?}"
             );
         }

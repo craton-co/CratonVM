@@ -45,7 +45,7 @@ accumulate). Combine entries into a single value instead.
 cratonvm --jar app.jar arg1 arg2
 ```
 
-The main class is read from the JAR's `META-INF/MANIFEST.MF` (`Main-Class`
+The main class is read from the JAR's `../../../../apps/META-INF/MANIFEST.MF` (`Main-Class`
 header). When `--jar` is used, `--classpath` is ignored.
 
 ## Program arguments

@@ -138,9 +138,7 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
         // calls `deregister_fd_everywhere(id)` BEFORE dropping the registry
         // entry that closes the socket — so the selector can never be left
         // polling a handle the OS has recycled.
-        Some(TcpHandle::UnixListener(l)) => {
-            Some(TcpHandleClone::UnixListenerRaw(l.raw() as i64))
-        }
+        Some(TcpHandle::UnixListener(l)) => Some(TcpHandleClone::UnixListenerRaw(l.raw() as i64)),
         _ => None,
     }
 }
@@ -753,7 +751,10 @@ fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
 /// Returns the (possibly relocated) channel ref.
 #[must_use]
 fn seed_channel_interruptor(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
-    if matches!(ctx.get_field_by_name(ch, "interruptor"), Value::Object(Some(_))) {
+    if matches!(
+        ctx.get_field_by_name(ch, "interruptor"),
+        Value::Object(Some(_))
+    ) {
         return ch;
     }
     // `new_object_initialized` allocates and runs bytecode, either of which can
@@ -1526,7 +1527,6 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(ch))))
 }
 
-
 /// The classes CratonVM's own NIO factories allocate their objects AS.
 ///
 /// CORRECTED 2026-08-21 (H21). This comment used to say `sc_open` / `ssc_open`
@@ -1834,7 +1834,11 @@ fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// `SocketChannelImpl.isInputOpen()` / `isOutputOpen()` (package-private) —
 /// consulted by sun.nio.ch.SocketAdaptor's input/output streams (the streams
 /// returned by socket().getInputStream()/getOutputStream()).
-fn sc_io_open(ctx: &mut dyn NativeContext, args: &[Value], shutdown_field: usize) -> MethodCallResult {
+fn sc_io_open(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    shutdown_field: usize,
+) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) => {
             let open = matches!(cf_get(ctx, o, F_OPEN), Value::Int(1));
@@ -1864,7 +1868,9 @@ fn sc_shutdown(
         .ok_or_else(|| ioex(format!("{operation}: channel not connected")))?;
     match resolve_stream(id) {
         StreamTarget::Ready(stream) => stream.shutdown(how).map_err(|e| map_err(operation, e))?,
-        StreamTarget::Connecting => return Err(ioex(format!("{operation}: channel not connected"))),
+        StreamTarget::Connecting => {
+            return Err(ioex(format!("{operation}: channel not connected")))
+        }
         StreamTarget::Failed(error) => return Err(map_err(operation, error)),
         StreamTarget::Unavailable => return Err(ioex(format!("{operation}: channel is closed"))),
     }
@@ -4405,9 +4411,7 @@ fn supported_options_for_receiver(
     match (server, unix) {
         (true, true) => supported_options_set(ctx, &["SO_RCVBUF"]),
         (false, true) => supported_options_set(ctx, &["SO_LINGER", "SO_RCVBUF", "SO_SNDBUF"]),
-        (true, false) => {
-            supported_options_set(ctx, &["SO_RCVBUF", "SO_REUSEADDR", "SO_REUSEPORT"])
-        }
+        (true, false) => supported_options_set(ctx, &["SO_RCVBUF", "SO_REUSEADDR", "SO_REUSEPORT"]),
         (false, false) => supported_options_set(
             ctx,
             &[
@@ -5271,12 +5275,34 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "isOutputOpen", "()Z", |ctx, args| {
             sc_io_open(ctx, args, F_OUTPUT_SHUTDOWN)
         });
-        r.register(c, "shutdownInput", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
-            sc_shutdown(ctx, args, std::net::Shutdown::Read, F_INPUT_SHUTDOWN, "shutdownInput")
-        });
-        r.register(c, "shutdownOutput", "()Ljava/nio/channels/SocketChannel;", |ctx, args| {
-            sc_shutdown(ctx, args, std::net::Shutdown::Write, F_OUTPUT_SHUTDOWN, "shutdownOutput")
-        });
+        r.register(
+            c,
+            "shutdownInput",
+            "()Ljava/nio/channels/SocketChannel;",
+            |ctx, args| {
+                sc_shutdown(
+                    ctx,
+                    args,
+                    std::net::Shutdown::Read,
+                    F_INPUT_SHUTDOWN,
+                    "shutdownInput",
+                )
+            },
+        );
+        r.register(
+            c,
+            "shutdownOutput",
+            "()Ljava/nio/channels/SocketChannel;",
+            |ctx, args| {
+                sc_shutdown(
+                    ctx,
+                    args,
+                    std::net::Shutdown::Write,
+                    F_OUTPUT_SHUTDOWN,
+                    "shutdownOutput",
+                )
+            },
+        );
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
         r.register(c, "write", "(Ljava/nio/ByteBuffer;)I", sc_write);
         // The byte[] pair the `Socket` VIEW of a channel reads and writes
@@ -5494,9 +5520,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // listener. Wrapping it here would make this crate the winner for every
     // accept in the VM and put a cross-crate hop in front of the common case.
     // Instead we hand RE.2 a way to bounce the adapter case back to us.
-    cratonvm_native_api::plain_server_socket::set_channel_backed_accept(
-        ss_adapter_channel_accept,
-    );
+    cratonvm_native_api::plain_server_socket::set_channel_backed_accept(ss_adapter_channel_accept);
     let server_socket = "java/net/ServerSocket";
     r.register(
         server_socket,
@@ -5889,10 +5913,13 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `new_object` allocates, so pin `this` across it for the same reason as
     // the adaptor arm above.
     let pin = ctx.pin_native_root(this);
-    let allocated = ctx.new_object("java/net/ServerSocket").ok().and_then(|v| match v {
-        Some(Value::Object(Some(o))) => Some(o),
-        _ => None,
-    });
+    let allocated = ctx
+        .new_object("java/net/ServerSocket")
+        .ok()
+        .and_then(|v| match v {
+            Some(Value::Object(Some(o))) => Some(o),
+            _ => None,
+        });
     this = ctx.read_native_pin(pin, this);
     ctx.unpin_native_roots(pin);
     let ss_value = allocated.ok_or_else(|| ioex("socket: could not allocate ServerSocket"))?;
@@ -6109,11 +6136,17 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Only the owner knows whether the socket was ever bound (-1) versus bound and
     // since closed (still the port), so ask it rather than reconstructing an answer
     // from the port side table.
-    plain_server_socket_delegate(ctx, args, |ops| ops.local_port, |ctx| {
-        let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
-            .unwrap_or(0);
-        Ok(Some(Value::Int(p)))
-    })
+    plain_server_socket_delegate(
+        ctx,
+        args,
+        |ops| ops.local_port,
+        |ctx| {
+            let p =
+                cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+                    .unwrap_or(0);
+            Ok(Some(Value::Int(p)))
+        },
+    )
 }
 
 fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6127,12 +6160,17 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // address); see `ss_wrapper_local_port`. The `server_socket_ports`
         // side table is the fallback for a VM with no handler set installed.
         let identity = ctx.identity_hash_code(this);
-        return plain_server_socket_delegate(ctx, args, |ops| ops.local_socket_address, |ctx| {
-            match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
-                Some((host, port)) if port > 0 => new_resolved_inet_socket_address(ctx, &host, port),
+        return plain_server_socket_delegate(
+            ctx,
+            args,
+            |ops| ops.local_socket_address,
+            |ctx| match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
+                Some((host, port)) if port > 0 => {
+                    new_resolved_inet_socket_address(ctx, &host, port)
+                }
                 _ => Ok(Some(Value::Object(None))),
-            }
-        });
+            },
+        );
     };
     let (port, host) = {
         let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
@@ -6413,9 +6451,12 @@ fn ss_adapter_accept_on(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::{Read as _, Write as _};
 
     #[test]
@@ -6431,7 +6472,10 @@ mod tests {
             advertised_listener_host("0.0.0.0:49152".parse().unwrap()),
             "0.0.0.0"
         );
-        assert_eq!(advertised_listener_host("[::]:49152".parse().unwrap()), "::");
+        assert_eq!(
+            advertised_listener_host("[::]:49152".parse().unwrap()),
+            "::"
+        );
         assert_eq!(
             advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
             "127.0.0.2"
@@ -6527,9 +6571,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut buf = [0_u8; 16];
             let start = std::time::Instant::now();
-            let outcome = read_close_aware(id, &client, &mut buf, &|| {
-                flag.load(Ordering::SeqCst)
-            });
+            let outcome = read_close_aware(id, &client, &mut buf, &|| flag.load(Ordering::SeqCst));
             (outcome.map_err(|e| e.kind()), start.elapsed())
         });
 
@@ -6905,9 +6947,7 @@ mod tests {
         });
 
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let id = tcp_register(TcpHandle::Stream(Arc::new(
-            client.try_clone().unwrap(),
-        )));
+        let id = tcp_register(TcpHandle::Stream(Arc::new(client.try_clone().unwrap())));
         let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let n = write_close_aware(id, &client, &payload, &|| false)
             .expect("write must succeed")

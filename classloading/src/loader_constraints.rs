@@ -281,7 +281,9 @@ mod tests {
         let mut c = LoaderConstraints::new();
         assert!(c.impose("Bar", 1, 2).is_none(), "nothing pinned yet");
         assert!(c.pin("Bar", 1, 100).is_none());
-        let v = c.pin("Bar", 2, 200).expect("must violate on the second pin");
+        let v = c
+            .pin("Bar", 2, 200)
+            .expect("must violate on the second pin");
         assert_eq!((v.existing, v.conflicting), (100, 200));
     }
 
@@ -292,7 +294,9 @@ mod tests {
         c.impose("Baz", 2, 3);
         assert!(c.pin("Baz", 1, 100).is_none());
         // Loader 3 was never named alongside 1 directly.
-        let v = c.pin("Baz", 3, 300).expect("transitive constraint must bind");
+        let v = c
+            .pin("Baz", 3, 300)
+            .expect("transitive constraint must bind");
         assert_eq!((v.existing, v.conflicting), (100, 300));
     }
 

@@ -306,7 +306,11 @@ pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 /// Copy a Java `byte[]` into a packed host `Vec<i8>`.
 pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i8> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind(), ObjectKind::Array, "host_view_i8: not an array");
+    assert_eq!(
+        header.kind(),
+        ObjectKind::Array,
+        "host_view_i8: not an array"
+    );
     assert_eq!(
         header.element_type(),
         ArrayElementType::Byte,
@@ -686,7 +690,8 @@ where
 fn zerocopy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
+    *FLAG
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
 }
 
 /// Returns `true` only when `obj`'s header describes a primitive array whose
@@ -1253,9 +1258,27 @@ macro_rules! write_back_range {
     };
 }
 
-write_back_range!(write_back_range_i32, i32, ArrayElementType::Int, Value::Int, "int[]");
-write_back_range!(write_back_range_i64, i64, ArrayElementType::Long, Value::Long, "long[]");
-write_back_range!(write_back_range_f32, f32, ArrayElementType::Float, Value::Float, "float[]");
+write_back_range!(
+    write_back_range_i32,
+    i32,
+    ArrayElementType::Int,
+    Value::Int,
+    "int[]"
+);
+write_back_range!(
+    write_back_range_i64,
+    i64,
+    ArrayElementType::Long,
+    Value::Long,
+    "long[]"
+);
+write_back_range!(
+    write_back_range_f32,
+    f32,
+    ArrayElementType::Float,
+    Value::Float,
+    "float[]"
+);
 write_back_range!(
     write_back_range_f64,
     f64,
