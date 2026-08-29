@@ -1376,20 +1376,33 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         cratonvm_native_api::NativeKind::Bridge,
     );
 
-    // monitorEnter / monitorExit — manual synchronization. These take the
-    // VM's real monitor, not a no-op: see `native_unsafe_monitor_enter`.
-    r.register(
-        u2,
-        "monitorEnter",
-        "(Ljava/lang/Object;)V",
-        native_unsafe_monitor_enter,
-    );
-    r.register(
-        u2,
-        "monitorExit",
-        "(Ljava/lang/Object;)V",
-        native_unsafe_monitor_exit,
-    );
+    // RETIRED 2026-08-29. Every triple below stood in front of a method NO
+    // supported JDK image declares, so nothing could ever dispatch to it.
+    // Evidence, in the order the campaign requires it:
+    //
+    //   * ABSENT from JDK 17.0.20.1+1, 21.0.12+8 and 25.0.4+7 -- measured by
+    //     `UnsafeImageCensus` over all 212 registration triples, not read off
+    //     one image. Three OTHER rows of that census went the other way
+    //     (`weakCompareAndSetObject`, `sun` `ensureClassInitialized` and
+    //     `shouldBeInitialized` are bytecode on 17 and 21 and absent only on
+    //     25), which is why the census had to be run before any of this.
+    //   * the synthetic-JDK mode fabricates these two classes with
+    //     `synthetic_stub_ctor_methods`, a fixed per-class list that gives
+    //     `Unsafe` only `<clinit>` -- so the fourth "image" does not declare
+    //     them either.
+    //   * 0 invocations across 118 corpus vectors in BOTH modes, against live
+    //     controls in the same runs: `objectFieldOffset1` 964/1044 in all 118,
+    //     `compareAndSetInt` ~35k, and -- the tightest control available --
+    //     `park(ZJ)V` at 781 invocations in 16 vectors while the
+    //     `park(Ljava/lang/Object;J)V` retired here is 0. Two rows differing
+    //     only by descriptor, one live and one dead.
+    //   * registrar history: all of them trace to the initial open-source
+    //     commit. No diagnosed defect is behind any of them.
+    //
+    // The handler functions are left in place (the crate allows `dead_code`)
+    // so a future image that declares one of these can be served by
+    // re-registering a line, rather than by rediscovering the body.
+    // `monitorEnter` / `monitorExit`: registrations retired here.
 
     // throwException — throws a checked exception without declaring it
     r.register(
@@ -1611,12 +1624,9 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Object(None))),
         }
     }
-    r.register(
-        u2,
-        "defineAnonymousClass",
-        "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
-        native_unsafe_define_anonymous_class,
-    );
+    // `defineAnonymousClass`: registration retired 2026-08-29, see the note on
+    // the `monitorEnter` retirement above for the evidence. This was the second
+    // of two registrations of this triple; the other was in `unsafe_natives.rs`.
     r.set_category(__prev_cat);
 }
 

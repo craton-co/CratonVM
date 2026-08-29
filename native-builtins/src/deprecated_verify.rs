@@ -134,7 +134,22 @@ fn deprecated_api_manifest() -> Vec<DeprecatedApi> {
         DeprecatedApi { class: "java/rmi/server/RemoteRef", method: "getRefClass", descriptor: "(Ljava/io/ObjectOutput;)Ljava/lang/String;", images: ImageStatus::Declared, section: "T8.3.2" },
 
         // ── T8.4 — sun.* / jdk.internal.* ──────────────────────────────
-        DeprecatedApi { class: "sun/misc/Unsafe", method: "defineClass", descriptor: "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", images: ImageStatus::Declared, section: "T8.4.1" },
+        // MEASURED 2026-08-29 against JDK 17.0.20.1+1, 21.0.12+8 and
+        // 25.0.4+7 (the `UnsafeImageCensus` sweep recorded in the L1 page):
+        // `sun.misc.Unsafe.defineClass` is declared by NONE of them.
+        //
+        // It was tagged `Declared` -- "at least one supported image declares
+        // the triple ... and MUST stay" -- and that tag was UNFALSIFIABLE:
+        // the test below asserts only that a `Declared` row IS registered, and
+        // never checks the claim the tag makes about the images. The
+        // `AbsentFromAllSupportedImages` half IS enforced, so retagging turns
+        // this row from an unchecked assertion into a live one -- the
+        // registration is now required to be ABSENT, and was removed from
+        // `deprecated_internal.rs` in the same commit.
+        //
+        // The `jdk/internal/misc` spelling is declared on all three images and
+        // keeps its own registration; only the `sun.misc` one is gone.
+        DeprecatedApi { class: "sun/misc/Unsafe", method: "defineClass", descriptor: "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", images: ImageStatus::AbsentFromAllSupportedImages, section: "T8.4.1" },
         DeprecatedApi { class: "sun/misc/Unsafe", method: "allocateMemory", descriptor: "(J)J", images: ImageStatus::Declared, section: "T8.4.2" },
         DeprecatedApi { class: "sun/misc/Unsafe", method: "freeMemory", descriptor: "(J)V", images: ImageStatus::Declared, section: "T8.4.2" },
         DeprecatedApi { class: "sun/misc/Unsafe", method: "reallocateMemory", descriptor: "(JJ)J", images: ImageStatus::Declared, section: "T8.4.2" },
