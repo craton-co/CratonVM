@@ -162,6 +162,39 @@ when you need a happens-before relation that isn't already carried by
 a shared buffer (e.g. gating one stream's kernel on a completely
 separate stream's unrelated kernel).
 
+### Two things `Event` does that the API does not show
+
+Both landed 2026-08-29, both are invisible to callers, and both exist
+because a kernel submission is a per-launch cost multiplied by hundreds:
+GPULlama3's forward pass makes 453 of them per token, and each one mints
+two events — one inside `launch_on_stream` for the `last_write` marker,
+one in `vm::runtime::offload` for the submission-completion marker.
+
+**`Event::new` recycles.** `DeviceContext` keeps a capped free list of
+`CUevent` handles, and `Event::drop` returns its handle to that list
+instead of destroying it. ~900 `cuEventCreate` / `cuEventDestroy` pairs a
+token become ~900 `Vec` pops. This is sound because `cuStreamWaitEvent`
+captures an event's contents **at the time of the call**: a wait already
+issued against a handle cannot be reached back into and satisfied by a
+later re-record of that same handle. A handle only ever returns to the
+pool when the last `Arc<Event>` holding it is gone.
+
+**`Stream::wait_event` skips a wait on its own stream.** An event recorded
+on stream `S` needs no `cuStreamWaitEvent(S, …)`: everything queued on a
+stream before a point is already ordered before everything queued after
+it. `Event` remembers which raw stream last recorded it, and both wait
+sites — `Stream::wait_event` and the compute-stream loop in
+`backend_cuda::launch_raw_inner` — skip that case. It is not a rare one:
+it is every launch in a single-stream chain, and every launch after the
+first in a chunked dispatch, each of which would otherwise wait on the
+`last_write` its predecessor stamped on the same stream.
+
+`cratonvm_types::gpu_event_census` counts created vs recycled and waits
+issued vs elided, printed on the exit path under
+`CRATONVM_GPU_TIME_DISPATCH=1`. A change that never fires and a change
+that fires without helping look identical from a wall clock; the census is
+what tells them apart.
+
 ### Cross-stream dependency graph: three streams
 
 A common shape: upload, compute, download — overlapped, but ordered
