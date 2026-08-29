@@ -5039,6 +5039,20 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // We scan `args` for the LAST String-typed slot (mirroring the bulk
     // path) so the same native can serve `getSystemResource` (static —
     // name at index 0) and instance `getResource` (name at index 1).
+    // The STATIC forms (`getSystemResource`, `getSystemResourceAsStream`) take
+    // the name at index 0 with NO receiver, so the `args.len() >= 2` guard just
+    // below never saw them and a null name answered null instead of throwing.
+    // MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`): HotSpot
+    // NullPointerException, this VM no-throw.
+    if args.len() == 1 && !matches!(args.first(), Some(Value::Object(Some(_)))) {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/NullPointerException",
+            1,
+            "ClassLoader.getSystemResource name is null",
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+    }
     if args.len() >= 2 && !matches!(args.get(1), Some(Value::Object(Some(_)))) {
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
@@ -5062,7 +5076,31 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         found.unwrap_or_default()
     };
-    let resource_name = name.trim_start_matches('/');
+    // A LEADING SLASH makes the lookup FAIL; it is not stripped.
+    //
+    // This is the asymmetry that catches everyone: `Class.getResource` takes a
+    // name that may be absolute (leading `/`) OR relative to the class's
+    // package, while `ClassLoader.getResource` takes an always-absolute name
+    // that must NOT begin with `/`. The JDK uses the name verbatim, so `/X`
+    // simply matches nothing.
+    //
+    // MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`):
+    //
+    //   APP.getResource("/ClassLoaderShadowSweep.class")
+    //     HotSpot  null      CratonVM  file:/.../ClassLoaderShadowSweep.class
+    //
+    // `trim_start_matches('/')` made the two spellings equivalent -- more
+    // permissive than the JDK in the direction that HIDES a bug: code passing a
+    // `Class.getResource`-shaped name to a ClassLoader works here and returns
+    // null on every other VM.
+    //
+    // Scoped to THIS native. The four sibling `trim_start_matches` calls in
+    // this file serve `Class.getResource`-shaped doors, where stripping is
+    // CORRECT, and were not in the measured set.
+    if name.starts_with('/') {
+        return Ok(Some(Value::Object(None)));
+    }
+    let resource_name = name.as_str();
 
     // A URLClassLoader has a private, receiver-owned URL set. Its public
     // `getResource` is nevertheless parent-first: Spring's
@@ -8116,7 +8154,19 @@ pub(crate) fn ucl_try_define_local_class(
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Ok(Err(msg)) if msg.contains("already defined by") => {
+        // Matches BOTH renderings. `define_class_full` hands this boundary a
+        // `String` built with `format!("{e:?}")`, so the test is on the VmError's
+        // DEBUG text. The duplicate raise site now produces
+        // `DuplicateClassDefinition { .. }` (HotSpot throws
+        // `java.lang.LinkageError` itself) where it used to produce an
+        // `IncompatibleClassChangeError` whose message read "already defined
+        // by" -- and this arm keyed on that wording, so correcting the type
+        // without touching it here would have silently turned a RECOVERED
+        // concurrent-definition race into a hard failure. The older spelling is
+        // kept because this same arm serves other producers of that text.
+        Ok(Err(msg))
+            if msg.contains("DuplicateClassDefinition") || msg.contains("already defined by") =>
+        {
             // Benign concurrent-definition race: ANOTHER thread (e.g. a
             // background thread pool eagerly resolving classes, or a
             // recursive supertype/interface resolution nested inside a

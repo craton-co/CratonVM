@@ -2993,10 +2993,35 @@ pub(crate) fn native_module_add_exports(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let module_name = read_module_name(ctx, this);
-    let pkg_name = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(Some(this)))),
+    // The TWO nulls have DIFFERENT types, and this native refused neither.
+    //
+    // MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`), on an
+    // unnamed module where both calls are otherwise documented no-ops:
+    //
+    //   m.addExports(null, base)   HotSpot IllegalArgumentException  CratonVM no-throw
+    //   m.addExports("x.y", null)  HotSpot NullPointerException      CratonVM no-throw
+    //
+    // The split is not arbitrary: the JDK validates the PACKAGE NAME (a null or
+    // malformed package is an illegal argument) and dereferences the TARGET
+    // MODULE (a null one is a null pointer). A caller distinguishing them --
+    // which is the reason to catch either -- cannot, if both are swallowed.
+    //
+    // Returning `this` for both made the whole call a silent no-op, which on
+    // the unnamed module is ALSO the correct behaviour for a well-formed call:
+    // the bug was invisible precisely because the success path looks identical.
+    let Some(Value::Object(Some(pkg_obj))) = args.get(1) else {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "package is null".to_string(),
+        }
+        .into());
     };
+    let pkg_name = ctx.read_string(*pkg_obj).unwrap_or_default();
+    if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Module.addExports: other is null".to_string()),
+        }
+        .into());
+    }
     let target = dynamic_edge_target(ctx, args, Some(2));
     let pkg_slash = pkg_name.replace('.', "/");
     ctx.module_add_exports(&module_name, &pkg_slash, &target);
