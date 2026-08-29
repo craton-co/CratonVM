@@ -11,8 +11,13 @@ root-cause (the G1 `NoSuchMethodError Object.toArray()`, an unpinned receiver
 across a GC point) was fixed on 2026-08-24.
 
 This page carries the row that page could not close: **`org.h2.test.store.TestRandomMapOps`
-at `--Xmx 256m` corrupts the heap, at roughly one failure in three runs of
-~20 minutes, with a DIFFERENT signature every time.**
+at `--Xmx 256m` corrupts the heap.**
+
+**And as of 2026-08-29 it is cheap: 9 failures in 9 runs, 22–471 s, on a host at
+load ~3** — against the inherited base rate of "roughly one in three runs of
+~20 minutes", which was measured on a contended box. See the section below; the
+lever is host quietness, not a flag, and it is the difference between a defect
+nobody could bisect and one anybody can.
 
 ## The three faces
 
@@ -54,23 +59,38 @@ runs:
 `CRATONVM_DBG_COLL_REFRESH` reports **zero** engagements on the failing runs, so
 the receiver-pinning path the parent page fixed is not involved at all.
 
-## 2026-08-29: it is CHEAP now — 2/2 in under 90 s on a quiet host
+## 2026-08-29: it is CHEAP now — 9/9 in 22–471 s, and the lever is a QUIET HOST
 
 The page's own next move was *"make the defect cheaper before diagnosing it"*.
-That happened, and not by tuning the heap: on the 2026-08-29 tip, `--Xmx 256m`,
-host load ~3:
+It is cheaper by about **thirty times**, and not because of any flag.
 
-| rep | rc | secs | `oom` | `arena` | failure |
-|---|---:|---:|---:|---:|---|
-| 1 | 1 | **88** | 0 | 0 | `NullPointerException` at `TestRandomMapOps.openStore`, `seed:-67298774724213935 op:1349` |
-| 2 | 1 | **46** | 0 | 0 | `NullPointerException` |
+`--Xmx 256m`, 2026-08-29 tip, host load 2.7–4.7, three arms interleaved, three
+reps each — all nine runs `rc=1`, all `oom=0 arena=0`, all
+`NullPointerException`:
 
-**Two failures in two runs, in 46 and 88 seconds**, against a documented base
-rate of roughly one in three runs of twenty minutes. Zero `OutOfMemoryError`
-and zero arena failures, so this is not the fragmentation family — it is the
-corruption this page is about, arriving an order of magnitude sooner.
+| arm | switches OFF | rep 1 | rep 2 | rep 3 |
+|---|---|---:|---:|---:|
+| `base` | — | 38 s | 22 s | 39 s |
+| `novac` | `PUBLISH_VACATED` | 40 s | 471 s | 42 s |
+| `neither` | all three | 322 s | 39 s | 41 s |
 
-The collector census from the first of them, on a 256 MB heap:
+**9 of 9 failed, and no arm is distinguishable from any other.** So:
+
+* **The 2026-08-29 collector repairs did not cause this and do not accelerate
+  it.** That mattered enough to test: the vacated-span publication hands the
+  slide's emptied space back to the allocator, which removes the leak that used
+  to leave a stale holder facing a zeroed corpse — the parent work predicted in
+  writing that the FACE of such defects would change. It does not change the
+  RATE here. `neither` is the pre-change behaviour byte for byte and it fails
+  just as reliably.
+* **The lever is the host.** The base rate this page inherited — "roughly one
+  failure in three runs of ~20 minutes" — was measured on the shared Azure box
+  under load. At load ~3 it is 9/9 with a median around 40 s. A contended host
+  was hiding a defect that reproduces almost every time, which is the mirror
+  image of the trap the parent page documents (a quiet host hiding a race).
+  **Any future arm on this class must record `/proc/loadavg` beside `rc`.**
+
+One failing run's collector census, on a 256 MB heap, for scale:
 
 ```text
 collections=30 compaction_cycles=24 objects_relocated=159832
@@ -79,21 +99,20 @@ zgc-high-compaction: cycles=12 declined=12 vacated_spans=331
                      vacated_bytes=691546832
 ```
 
-**The obvious hypothesis is that the 2026-08-29 vacated-span publication raised
-the rate, and it is the one the parent work predicted in writing.** Before that
-change, a span the slide emptied under a pinned cursor was leaked — so a holder
-still naming a vacated address met a zeroed corpse. It is handed back to the
-allocator now, so the same stale read meets whatever was allocated over it,
-sooner and louder. `bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md`
-carries the same warning for the same reason.
+The failing seed and op are printed by the test itself
+(`seed:-67298774724213935 op:1349`) and are, per this page's own history, not a
+lever — but the stack is:
 
-**That hypothesis needs the arm, not the argument.** The A/B is
-`CRATONVM_ZGC_PUBLISH_VACATED=0` on the same binary, and until it is run this
-section claims only what it measured: 2/2 at under 90 s on the current tip.
+```text
+Exception in thread "main" java/lang/NullPointerException
+    at org/h2/test/store/TestRandomMapOps.openStore(TestRandomMapOps.java)
+    at org/h2/test/store/TestRandomMapOps.testOps(TestRandomMapOps.java:90)
+```
 
-Either way the page gains: a defect that reproduces in a minute is one somebody
-can bisect, which is exactly what its own "repro-and-dump is the wrong
-instrument at this rate" paragraph was waiting for.
+**This is now a defect somebody can bisect in a lunch break**, which is exactly
+what the section below was waiting for. `CRATONVM_ZGC_RELOCATE=0` is the first
+arm to run: it restores non-moving behaviour byte for byte, so a failure that
+survives it is not a relocation defect at all.
 
 ## Why "repro and dump" WAS the wrong instrument
 
