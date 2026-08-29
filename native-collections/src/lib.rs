@@ -21147,6 +21147,16 @@ fn key_itr_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         .saturating_sub(MAP_KEY_ITR_NUM_FIELDS)
 }
 
+/// The map a key/entry view was taken over, for a view carried by a set.
+///
+/// The same two steps `map_itr_comod_source` takes, without the iterator: a
+/// set-shaped view's backing map, and then the SOURCE behind that backing when
+/// the backing is itself a view.
+fn key_itr_view_source(ctx: &dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
+    let backing = hs_backing_map(ctx, set)?;
+    Some(view_backing_source(ctx, backing).unwrap_or(backing))
+}
+
 /// The iterator class a `HashSet`-shaped receiver's `iterator()` should mint,
 /// matching what HotSpot answers for that receiver.
 ///
@@ -21162,6 +21172,40 @@ fn key_itr_carrier_for(
     entryset: bool,
 ) -> &'static str {
     let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(receiver));
+    // A VIEW WHOSE SOURCE IS A `Properties` answers the CHM family, because
+    // JDK 25 backs `Properties` with a `ConcurrentHashMap` and
+    // `Properties.keySet()` is `map.keySet()`. MEASURED
+    // (`apps/probes/ItrClassNameProbe`): HotSpot 25.0.4+7 answers
+    // `ConcurrentHashMap$KeyIterator` where this VM answered
+    // `HashMap$KeyIterator`. The view's own class already matches
+    // (`Collections$SynchronizedSet`) and the view is already live, so the
+    // iterator's class was the last of the three to disagree.
+    //
+    // Checked before the class-name tests because this VM's `Properties`
+    // keySet is carried by a `LinkedHashSet`, which would otherwise take the
+    // LinkedHashMap pair.
+    //
+    // NOT the `two-producers-of-one-carrier-class` trap, and the difference is
+    // worth stating because it is the same class the CHM views mint. Every
+    // name in `MAP_KEY_ITR_CARRIERS` shares ONE object shape -- five fields at
+    // `key_itr_base`, derived from the object's WIDTH -- and ONE registrar,
+    // `native_map_key_itr_*`. A second producer is a problem when the two
+    // shapes differ, as the dormant `PriorityQueue$Itr` row was; here the
+    // class name is a LABEL over an identical object, and the natives cannot
+    // tell the producers apart because there is nothing to tell apart.
+    if let Some(src) = key_itr_view_source(ctx, receiver) {
+        if ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(src))
+            .as_deref()
+            == Some("java/util/Properties")
+        {
+            return if entryset {
+                "java/util/concurrent/ConcurrentHashMap$EntryIterator"
+            } else {
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator"
+            };
+        }
+    }
     // The CHM views answer their OWN family's classes, like every other map
     // family in this function. Checked before the LinkedHashMap test because a
     // CHM view is neither, and falling through would give it the HashMap pair.

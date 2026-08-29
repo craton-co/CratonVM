@@ -146,8 +146,9 @@ fresh five-constructor-deep assert object 300 000 times in a loop.
 
 ## Related
 
-* `known-issues/netty/unexplained-npes-in-randomized-tests-20260826.md` — the
-  original report.
+* `fixed-suite-bugs/netty/unexplained-npes-in-randomized-tests-CLOSED-20260829.md`
+  — the original report, retired 2026-08-29 once its other two classes were
+  cleared under load.
 * `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` — the chain
   that introduced relocate-under-proven-JIT and the band verifier's map-liveness
   screen.

@@ -1375,6 +1375,189 @@ pub fn mark_class_verification_skipped(class_id: ClassId) -> bool {
     install(class_id, ClassTypeMaps::skipped_marker(), false)
 }
 
+// ---------------------------------------------------------------------------
+// Class-name index (diagnostics only, off by default)
+// ---------------------------------------------------------------------------
+
+/// `class name -> ClassId`, for a consumer that has a NAME and needs the maps.
+///
+/// # Why this exists at all, when the class manager already answers it
+///
+/// The one consumer is the compiled-frame oop-map oracle
+/// (`vm::jit::conservative_roots::verify_precise_covers_conservative`), and it
+/// runs **inside a stop-the-world root scan** holding only a raw `rbp`. All it
+/// has to identify the frame's method with is
+/// `CompiledMethod::method_label` — `"org/h2/mvstore/MVStore.closeStore:(ZI)V"`
+/// — because the JIT is handed class NAMES, not `ClassId`s, at every one of its
+/// compile doors.
+///
+/// Resolving that through `class_id_by_name` means taking the class manager's
+/// lock, and a thread suspended at a safepoint while holding it deadlocks the
+/// collector. That is the same hazard [`chunk_directory`]'s doc records, and it
+/// is why this index is lock-free: two atomic acquire loads and a string
+/// compare, allocation-free, safe to call from a stopped world.
+///
+/// # It is OFF unless the oracle is
+///
+/// Nothing in production reads it, so nothing in production should pay for it.
+/// [`note_class_name`] returns immediately unless `CRATONVM_DBG_VERIFY_OOP_MAPS`
+/// is set, which is read once. With the flag off this costs one relaxed bool
+/// load per class loaded and allocates nothing.
+///
+/// # What it deliberately cannot do
+///
+/// **It is keyed on the name alone, so it cannot tell two loaders' versions of
+/// one class apart.** First writer wins and [`NAME_INDEX_COLLISIONS`] counts
+/// the rest, so a reader can see whether the answer is trustworthy for the run
+/// in front of them. That is acceptable for a diagnostic and would not be for a
+/// consumer that acted on the answer — which is why this is `pub` next to a
+/// doc comment saying so rather than folded into [`class_type_maps`].
+struct NameEntry {
+    name: Box<str>,
+    class_id: u32,
+}
+
+/// Open-addressed, power-of-two, fixed. A Spring application loads 15k+
+/// classes; 64Ki slots keeps the load factor under 25%, where linear probing
+/// is still short. An index that fills up stops accepting entries rather than
+/// growing — a full index degrades to "unknown", which is the fail-open
+/// direction for something that only ever narrows a diagnostic.
+const NAME_INDEX_SLOTS: usize = 1 << 16;
+
+static NAME_INDEX_LIVE: AtomicUsize = AtomicUsize::new(0);
+static NAME_INDEX_COLLISIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn name_index() -> &'static [AtomicPtr<NameEntry>] {
+    static IDX: OnceLock<Box<[AtomicPtr<NameEntry>]>> = OnceLock::new();
+    IDX.get_or_init(|| {
+        let mut v = Vec::with_capacity(NAME_INDEX_SLOTS);
+        for _ in 0..NAME_INDEX_SLOTS {
+            v.push(AtomicPtr::new(ptr::null_mut()));
+        }
+        v.into_boxed_slice()
+    })
+}
+
+/// Is the one consumer switched on? Read once.
+fn name_index_wanted() -> bool {
+    #[cfg(test)]
+    if NAME_INDEX_FORCED_ON.load(Ordering::Relaxed) {
+        // The gate below is a `OnceLock` over a process-wide variable, so a
+        // test cannot turn it on for itself -- whichever test ran first would
+        // decide it for the whole binary. See `NAME_INDEX_FORCED_ON`.
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some()
+    })
+}
+
+/// Test-only override for [`name_index_wanted`]. Never read in a release build.
+#[cfg(test)]
+static NAME_INDEX_FORCED_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn name_hash(name: &str) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    (h as usize) & (NAME_INDEX_SLOTS - 1)
+}
+
+/// Record `name -> class_id` for [`class_id_of_name`]. No-op unless the oracle
+/// that consumes it is enabled; see [`NameEntry`].
+///
+/// Called beside every [`publish_class_type_maps`] so the index and the maps
+/// are populated by the same event — a name that resolves but has no maps would
+/// be worse than no name at all, because the oracle would then read a `None`
+/// as "this pc is not an instruction start".
+pub fn note_class_name(class_id: ClassId, name: &str) {
+    if !name_index_wanted() || name.is_empty() {
+        return;
+    }
+    let idx = name_index();
+    let mut i = name_hash(name);
+    for _ in 0..64 {
+        let slot = &idx[i];
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            let fresh = Box::into_raw(Box::new(NameEntry {
+                name: name.into(),
+                class_id: class_id.as_u32(),
+            }));
+            match slot.compare_exchange(
+                ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    NAME_INDEX_LIVE.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    // Lost the race for this slot; reclaim and re-probe it.
+                    // SAFETY: `fresh` was never published.
+                    drop(unsafe { Box::from_raw(fresh) });
+                    continue;
+                }
+            }
+        }
+        // SAFETY: published entries are leaked, so a non-null pointer is valid
+        // for the rest of the process.
+        let e = unsafe { &*p };
+        if &*e.name == name {
+            if e.class_id != class_id.as_u32() {
+                NAME_INDEX_COLLISIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        i = (i + 1) & (NAME_INDEX_SLOTS - 1);
+    }
+}
+
+/// `ClassId` for a binary class name (`org/h2/mvstore/MVStore`), or `None`.
+///
+/// Lock-free and allocation-free: safe from a stop-the-world root scan, which
+/// is the only reason it exists. `None` whenever the index is off, full, or the
+/// name was never loaded — every one of those is "cannot say", and every
+/// consumer must treat it that way.
+pub fn class_id_of_name(name: &str) -> Option<ClassId> {
+    if !name_index_wanted() || name.is_empty() {
+        return None;
+    }
+    let idx = name_index();
+    let mut i = name_hash(name);
+    for _ in 0..64 {
+        let p = idx[i].load(Ordering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: as in `note_class_name` — published entries are immortal.
+        let e = unsafe { &*p };
+        if &*e.name == name {
+            return Some(ClassId::new(e.class_id));
+        }
+        i = (i + 1) & (NAME_INDEX_SLOTS - 1);
+    }
+    None
+}
+
+/// `(entries, name collisions)` — how much of the index is usable.
+///
+/// A non-zero collision count means at least one name was loaded by two
+/// different loaders and this index answers with the FIRST, so a reader can
+/// discount a diagnostic that depended on it.
+pub fn name_index_shape() -> (usize, usize) {
+    (
+        NAME_INDEX_LIVE.load(Ordering::Relaxed),
+        NAME_INDEX_COLLISIONS.load(Ordering::Relaxed),
+    )
+}
+
 /// Total heap bytes held by all published type maps.
 pub fn store_heap_bytes() -> usize {
     STORE_HEAP_BYTES.load(Ordering::Relaxed)
@@ -1395,6 +1578,48 @@ mod tests {
 
     fn oref(n: &str) -> VType {
         VType::ObjectRef(Arc::from(n))
+    }
+
+    // -- Class-name index ----------------------------------------------------
+
+    /// The index answers what the oop-map oracle asks it: a binary class name,
+    /// back to the `ClassId` whose maps describe it.
+    #[test]
+    fn the_name_index_round_trips_a_class_name() {
+        NAME_INDEX_FORCED_ON.store(true, Ordering::Relaxed);
+        let id = ClassId::new(0x51_0001);
+        note_class_name(id, "org/h2/mvstore/MVStore$NameIndexRoundTrip");
+        assert_eq!(
+            class_id_of_name("org/h2/mvstore/MVStore$NameIndexRoundTrip"),
+            Some(id)
+        );
+        assert_eq!(class_id_of_name("org/h2/mvstore/NeverLoaded"), None);
+    }
+
+    /// Two loaders' versions of one class collapse onto the FIRST, and the
+    /// collision is COUNTED.
+    ///
+    /// A name-keyed index cannot tell them apart, and the consumer is a
+    /// diagnostic that would otherwise read the second class's frame against
+    /// the first class's maps and report a coverage gap that is really a
+    /// loader mix-up. Counting it is what lets a reader discount the run;
+    /// silently answering with the first is what would make the diagnostic
+    /// lie.
+    #[test]
+    fn a_duplicate_class_name_keeps_the_first_and_counts_the_collision() {
+        NAME_INDEX_FORCED_ON.store(true, Ordering::Relaxed);
+        let first = ClassId::new(0x51_0002);
+        let second = ClassId::new(0x51_0003);
+        note_class_name(first, "com/example/TwoLoaders");
+        let (_, before) = name_index_shape();
+        note_class_name(second, "com/example/TwoLoaders");
+        let (_, after) = name_index_shape();
+        assert_eq!(
+            class_id_of_name("com/example/TwoLoaders"),
+            Some(first),
+            "first writer wins"
+        );
+        assert_eq!(after, before + 1, "and the collision is counted, not hidden");
     }
 
     // -- Row encoding --------------------------------------------------------

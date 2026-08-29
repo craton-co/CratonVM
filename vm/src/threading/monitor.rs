@@ -2512,7 +2512,13 @@ impl MonitorTable {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
                         message: format!(
-                            "thread {thread_id} called notifyAll() without owning the monitor"
+                            // The SAME text `wait` and `notify` use twenty lines
+                            // up. HotSpot's `IllegalMonitorStateException` for
+                            // all three is `current thread is not owner`; this
+                            // arm alone spelled it differently, and named a
+                            // thread id no other arm names. MEASURED by
+                            // `apps/probes/SystemRuntimeObjectSweep.java`.
+                            "current thread is not owner"
                         ),
                     },
                 ))

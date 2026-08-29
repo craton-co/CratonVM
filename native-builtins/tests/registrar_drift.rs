@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1224;
+const BASELINE_TOTAL_DRIFT: usize = 1223;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1357;
+const BASELINE_TOTAL_PAIRS: usize = 1356;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -481,7 +481,34 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// really is gone rather than merely losing the race. `Bridge` is
 /// `allowed_in(JdkOnly)`, and the strict dump reports `synthetic-stub: 0`
 /// whole-registry, so the surviving bodies serve both modes.
+/// **`AtomicReference.compareAndSet` (1), 2026-08-29.** The synthetic twin in
+/// `util_concurrent_ext.rs` was deleted deliberately by the JUC VarHandle
+/// composition lane, whose comment at that site records why: the real body is
+/// one line -- `return VALUE.compareAndSet(this, expectedValue, newValue);` --
+/// and `VarHandle.compareAndSet` is now thin-direct-bound, so the stub bought
+/// nothing. `register_phase54_atomics` is the sole remaining registrar, which
+/// is what "no longer drifts" means.
+///
+/// EVIDENCE, and it is source-side plus a negative runtime one rather than the
+/// usual both-modes dump, because the surviving registrar is not reached in
+/// either mode of the run used here. `--dump-native-registry` lists SIX
+/// `AtomicReference` rows in compatible mode (`<init>` x2, `get`, `getAndSet`,
+/// `lazySet`, `set`, `toString`, all `synthetic-stub` from
+/// `util_concurrent_ext.rs`) and **no `compareAndSet` among them**, and no
+/// `AtomicReference` rows at all under `--jdk-only` where the stubs are
+/// dropped. So there is no duplicate registration in either mode -- which is
+/// the property this bucket asserts -- and the sibling triples still in
+/// `DRIFT_TRIPLES` are the control: they are still listed, so the scanner has
+/// not simply lost sight of the class.
+///
+/// Moved by lane L3 while landing, because a stale baseline row fails this gate
+/// for every lane and the deletion that made it stale is not L3's.
 const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
+    (
+        "java/util/concurrent/atomic/AtomicReference",
+        "compareAndSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
     (
         "java/lang/management/ThreadMXBean",
         "getAllThreadIds",
@@ -537,6 +564,43 @@ const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
         "cratonvm/internal/foreign/MemorySegmentImpl",
         "reinterpret",
         "(J)Ljava/lang/foreign/MemorySegment;",
+    ),
+    // **AtomicReference.compareAndSet (1), 2026-08-29.** Collapsed by DELETION
+    // of the shipping twin, not by a merge: `7c90ec930` de-registered
+    // `util_concurrent_ext`'s copy because the method is one line on a real JDK
+    // -- `VALUE.compareAndSet(this, expectedValue, newValue)` -- and the stub
+    // had become the SLOWER of the two once the VarHandle reference CAS
+    // underneath it was bound. The baseline was not re-taken in that commit, so
+    // this row went stale and `the_drift_baseline_has_no_stale_rows` went red on
+    // `dev`.
+    //
+    // MEASURED on `--dump-native-registry`, not read off the source, on a
+    // `--features synthetic-jdk` debug binary (2026-08-29 18:34):
+    //
+    //   compareAndSet (Ljava/lang/Object;Ljava/lang/Object;)Z
+    //     registered_by = native-builtins/src/phases_early.rs:20828
+    //     owns_slot = true   kind = intrinsic   overwrote = null
+    //
+    // `overwrote = null` is the load-bearing field this list's header names: it
+    // is positive evidence that nothing registers the triple ahead of the
+    // survivor, so the duplicate is gone rather than merely losing the race.
+    // Every OTHER AtomicReference method still shows the three-row
+    // synthetic-stub / intrinsic / synthetic-stub chain and still drifts, which
+    // is the negative control sitting in the same dump.
+    //
+    // ON "BOTH MODES", which for this triple is not the usual shape.
+    // `register_phase54_atomics` is reached only through
+    // `register_synthetic_overrides`, so the survivor exists ONLY in
+    // synthetic-JDK mode. Compatible-mode and `--jdk-only` dumps from the same
+    // tree carry SEVEN AtomicReference rows and `compareAndSet` is not among
+    // them: there the JDK's own body runs, which is exactly what `7c90ec930`
+    // intended and measured as faster. So no mode is served by a drifting pair,
+    // which is what this list asserts -- one mode by the surviving native, the
+    // other two by real bytecode.
+    (
+        "java/util/concurrent/atomic/AtomicReference",
+        "compareAndSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     ),
     ("java/io/ByteArrayOutputStream", "<init>", "()V"),
     ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
@@ -1960,7 +2024,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/concurrent/atomic/AtomicLongArray", "set", "(IJ)V"),
             ("java/util/concurrent/atomic/AtomicReference", "<init>", "()V"),
             ("java/util/concurrent/atomic/AtomicReference", "<init>", "(Ljava/lang/Object;)V"),
-            ("java/util/concurrent/atomic/AtomicReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
             ("java/util/concurrent/atomic/AtomicReference", "get", "()Ljava/lang/Object;"),
             ("java/util/concurrent/atomic/AtomicReference", "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/concurrent/atomic/AtomicReference", "lazySet", "(Ljava/lang/Object;)V"),
@@ -2633,15 +2696,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_unsafe_define_class",
         &[
-            // `defineAnonymousClass` was here until 2026-08-29. It drifted
-            // because TWO registrars gave the triple two bodies; both were
-            // RETIRED, so it no longer drifts for the reason a stale row
-            // usually does -- it is registered nowhere at all. The method is
-            // absent from JDK 17, 21 and 25, the synthetic-JDK mode does not
-            // declare it either, and it took 0 invocations across 118 corpus
-            // vectors in both modes. Deliberately NOT moved to
-            // FIXED_NOT_DRIFTING: that bucket asserts a surviving body serves
-            // the triple in both modes, and there is no surviving body.
             ("jdk/internal/misc/Unsafe", "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
         ],
     ),

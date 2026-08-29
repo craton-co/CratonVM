@@ -495,9 +495,33 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
             message: format!("Permission denied: {ctx}: {e}"),
         }
         .into(),
-        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => {
-            ioex(format!("SocketException: {ctx}: {e}"))
+        // Same reason as `Connection refused` above, and the same wording as
+        // the sibling mapper in `net.rs`: `std::io::Error`'s Display is the
+        // OS's LOCALIZED text, so on a Russian Windows this message read
+        // "Программа на вашем хост-компьютере разорвала установленное
+        // подключение" where HotSpot says "Software caused connection abort".
+        //
+        // That is not only a cosmetic difference. Callers match on this text.
+        // netty's `SslHandler.ignoreException` decides whether a read error
+        // after `close_notify` is harmless by running
+        // `^.*(?:connection.*(?:reset|closed|abort|broken)|broken.*pipe).*$`
+        // over the message; on a non-English host nothing matched, so a
+        // routine TLS teardown surfaced through `exceptionCaught` and
+        // `ProxyHandlerTest` recorded a client-side exception where it asserts
+        // there are none. Its second chance — walk the stack for a `read` frame
+        // in a `*SocketChannel*` class — cannot fire here either, because our
+        // `SocketChannelImpl.read` is a native and leaves no Java frame.
+        //
+        // The localized text is kept after the portable phrase: it is the only
+        // place the real OS error survives, and the regex is anchored with
+        // `.*` on both sides so the suffix does not stop it matching.
+        ErrorKind::ConnectionReset => {
+            ioex(format!("SocketException: Connection reset: {ctx}: {e}"))
         }
+        ErrorKind::ConnectionAborted => {
+            ioex(format!("SocketException: Connection aborted: {ctx}: {e}"))
+        }
+        ErrorKind::BrokenPipe => ioex(format!("SocketException: Broken pipe: {ctx}: {e}")),
         ErrorKind::NotConnected => ioex(format!("SocketException: Not connected: {ctx}: {e}")),
         _ => ioex(format!("SocketException: {ctx}: {e}")),
     }
