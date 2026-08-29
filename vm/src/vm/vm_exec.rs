@@ -24983,6 +24983,13 @@ fn invoke_on_class_shared_inner(
                                 | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"
+                                // `clone`: the real body's
+                                // `clone.map = new ConcurrentHashMap<>(map)`
+                                // NPEs on the permanently-null `map` of a
+                                // synthetic Properties. See
+                                // `properties_sidetable::native_properties_clone`.
+                                | "clone"
+                                | "replaceAll"
                             ))
                         // S111r7: HashMap / LinkedHashMap / Hashtable /
                         // ConcurrentHashMap and HashSet view-method

@@ -133,9 +133,10 @@ cd <worktree>
 cargo build --release -p cratonvm-cli --features synthetic-jdk -j6
 S=target/release/cratonvm
 
-# SynHello is twelve lines and is inlined here rather than cited: `probes/` was
-# deleted from the tree by `3b2901531`, and a reproduce block should not point
-# at a file the reader has to restore.
+# SynHello is twelve lines and is inlined rather than cited: a block you can
+# paste beats one that sends you to a file. (It was written when `3b2901531`
+# had deleted `probes/`; dev has since restored the tree, and inlining is still
+# the better call for something this small.)
 cat > SynHello.java <<'EOF'
 public final class SynHello {
     public static void main(String[] a) {

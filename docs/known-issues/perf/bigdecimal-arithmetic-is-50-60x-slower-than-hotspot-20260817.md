@@ -458,11 +458,11 @@ breakdown is needed.
 ## Related
 
 * retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
-* [`bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md)
+* `bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`, now closed
   — the other CratonVM-only "hang" found in the same run. It was first filed as
   an OSR refusal; that gate was real and is now fixed, and the wall time did not
   move. It is the SAME root cause as this page — compiled-code throughput, not
   an admission gap — that happens to produce the same symptom (a test that never
   finishes).
-* [`lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`](lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md)
+* `lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md`, now retired
   — why the first per-op breakdown here measured its own harness.

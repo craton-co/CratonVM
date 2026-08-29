@@ -928,12 +928,54 @@ pub(crate) fn pe_arena_allocate(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     pe_arena_allocate_impl(ctx, this, size, align)
 }
 
+/// `Arena.allocate`'s two argument guards, which this body had neither of.
+///
+/// MEASURED against HotSpot 25.0.4+7, both modes
+/// (`apps/probes/FfmSegmentSweep.java`, messages from
+/// `apps/probes/FfmMsgProbe.java`):
+///
+/// ```text
+///   arena.allocate(-1)      IllegalArgumentException: The provided allocation size is negative: -1
+///   arena.allocate(8, 0)    IllegalArgumentException: Invalid alignment constraint : 0
+///   arena.allocate(8, 3)    IllegalArgumentException: Invalid alignment constraint : 3
+///   arena.allocate(8, -4)   IllegalArgumentException: Invalid alignment constraint : -4
+/// ```
+///
+/// against no-throw here — and the body then did `size.max(1)` and
+/// `align.max(1)`, so a negative size allocated ONE byte and a bogus alignment
+/// silently became 1. **Clamping an argument is not validating it**, which is
+/// the third family in this campaign to be caught by that exact sentence
+/// (`Arrays.copyOfRange`, then `ConcurrentHashMap`'s `concurrencyLevel`).
+///
+/// The messages are TRANSCRIBED, including the space before the colon in
+/// `"Invalid alignment constraint : 0"`, which is the JDK's own spacing and not
+/// a typo. Inventing them would be the shape `G1-1` records ten times over.
+///
+/// The size check is `< 0`, not `<= 0`: `allocate(0)` is legal and answers a
+/// zero-length segment, which the sweep also asks.
+fn pe_arena_check_allocation(size: i64, align: i64) -> Result<(), MethodCallFailed> {
+    if size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("The provided allocation size is negative: {size}"),
+        }
+        .into());
+    }
+    if align <= 0 || (align & (align - 1)) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid alignment constraint : {align}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn pe_arena_allocate_impl(
     ctx: &mut dyn NativeContext,
     arena_obj: ObjectRef,
     size: i64,
     align: i64,
 ) -> MethodCallResult {
+    pe_arena_check_allocation(size, align)?;
     // TWO arena layouts reach this body, and only one of them is the one it was
     // written for (W7-89). `register_pe_arena`'s own arena is four slots wide --
     // [0] global flag, [1] alloc-id array, [2] closed flag, [3] count -- and
@@ -1873,6 +1915,15 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         |ctx, args| {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
+                // `ofArray(null)` is a message-less NPE on the oracle. All five
+                // arms of this family answered a NULL SEGMENT instead, which is
+                // the shape `phase-2-worklist` calls the worst a refusal can
+                // take: the caller does not learn it passed null until the null
+                // it got back is dereferenced somewhere else. A MISSING
+                // argument stays a dispatch defect and keeps the old return.
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
@@ -1917,6 +1968,15 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         |ctx, args| {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
+                // `ofArray(null)` is a message-less NPE on the oracle. All five
+                // arms of this family answered a NULL SEGMENT instead, which is
+                // the shape `phase-2-worklist` calls the worst a refusal can
+                // take: the caller does not learn it passed null until the null
+                // it got back is dereferenced somewhere else. A MISSING
+                // argument stays a dispatch defect and keeps the old return.
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
@@ -1961,6 +2021,15 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         r.register(owner, method, descriptor, |ctx, args| {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
+                // `ofArray(null)` is a message-less NPE on the oracle. All five
+                // arms of this family answered a NULL SEGMENT instead, which is
+                // the shape `phase-2-worklist` calls the worst a refusal can
+                // take: the caller does not learn it passed null until the null
+                // it got back is dereferenced somewhere else. A MISSING
+                // argument stays a dispatch defect and keeps the old return.
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
@@ -2006,6 +2075,15 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         |ctx, args| {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
+                // `ofArray(null)` is a message-less NPE on the oracle. All five
+                // arms of this family answered a NULL SEGMENT instead, which is
+                // the shape `phase-2-worklist` calls the worst a refusal can
+                // take: the caller does not learn it passed null until the null
+                // it got back is dereferenced somewhere else. A MISSING
+                // argument stays a dispatch defect and keeps the old return.
+                Some(Value::Object(None)) => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into())
+                }
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
@@ -4375,10 +4453,14 @@ fn pe_segment_as_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn pe_of_array_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let array = match args.first() {
         Some(Value::Object(Some(a))) => *a,
-        // Consistent with the four sibling arms, which also answer a null
-        // segment rather than raising. The oracle raises `NullPointerException`
-        // for `ofArray(null)`; that is one row for the whole family and is not
-        // diverged from in passing here.
+        // The row this comment used to defer. MEASURED: `ofArray(null)` is a
+        // message-less `NullPointerException` on HotSpot 25.0.4+7, and all
+        // FIVE arms of the family now raise it rather than answering a null
+        // segment. "One row for the whole family" was right about the scope and
+        // wrong about the cost.
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
         _ => return Ok(Some(Value::Object(None))),
     };
     let width = match heap_element_width(ctx.heap_element_type_of(array)) {
@@ -4778,6 +4860,38 @@ fn pe_segment_set_impl(
     offset: i64,
     value: Value,
 ) -> MethodCallResult {
+    // A READ-ONLY SEGMENT REFUSES THE WRITE, and this body never asked.
+    // MEASURED against HotSpot 25.0.4+7, in BOTH modes
+    // (`apps/probes/FfmSegmentSweep.java`):
+    //
+    //   MemorySegment ro = Arena.ofConfined().allocate(16).asReadOnly();
+    //   ro.set(ValueLayout.JAVA_INT, 0, 1)
+    //     HotSpot   IllegalArgumentException: Attempt to write a read-only segment
+    //     CratonVM  no-throw -- and the next read shows the write LANDED
+    //
+    // `isReadOnly()` already answered `true` on that receiver, so the flag was
+    // right and nothing consulted it: `asReadOnly()` handed back a reference
+    // that had not lost the one capability the call exists to remove. F26
+    // records the same shape one level down ("a copying slice is a wrong
+    // capability").
+    //
+    // The HEAP path has had this since `heap_segment_check_access`; the
+    // raw-address path never did. Unlike the ALIGNMENT rule beside it -- which
+    // that function's comment explains cannot be transplanted, because a native
+    // segment's real `maxByteAlignment` is not knowable from the carrier -- the
+    // read-only flag IS on the carrier, and `craton_segment_check_read_only`
+    // reads it through `p67_segment_is_read_only`, the registered `isReadOnly()`
+    // body. One source of truth, not a second copy.
+    //
+    // WHERE THIS HAD TO GO. `phases_late/foreign_ffm.rs` registers the same four
+    // `set` descriptors and carries the identical check, and
+    // `--dump-native-registry` says those rows are `owns_slot: false` while
+    // these are `owns_slot: true`. The first attempt put the guard only there
+    // and measured EXACTLY the pre-fix transcript. Both halves are kept, and
+    // deliberately: registration order is what picks between them, and a pair
+    // where only one half refuses is the half-fixed duplicate this file's own
+    // history keeps finding.
+    craton_segment_check_read_only(ctx, seg, false)?;
     let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
     // Symmetric with `pe_segment_get_impl`: an unclassifiable carrier used to
     // reach the `_ => {}` arm below, i.e. a WRITE that silently did nothing.
