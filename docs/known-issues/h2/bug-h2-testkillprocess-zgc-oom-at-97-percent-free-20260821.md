@@ -1506,6 +1506,14 @@ below, and items 2 and 3 are what let it get there.
 > So: read `relocation_on_proven_jit` before reading `rc`. A run with a zero
 > there is a measurement of the host, and this page has a long history of
 > readings that turned out to be exactly that.
+>
+> **And check what the control arm actually turns off.** The first pass at the
+> A/B here ran `neither` as
+> `CRATONVM_ZGC_HIGH_COMPACTION=0 CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` — written
+> before item 2 existed, so it left the LARGEST of the four repairs switched ON
+> in the "pre-change" arm. Both arms then survived 400 s and the table said
+> nothing. A control that is missing a switch is not a control, and the tell was
+> that it agreed with the treatment too well.
 
 ### 2. The slide was LOSING what it emptied — the largest of the four
 
