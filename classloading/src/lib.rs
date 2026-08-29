@@ -158,10 +158,11 @@ pub use resolution::{LinkResolver, ResolvedMember};
 // at the crate root — their names are too generic there; reach them as
 // `type_maps::store_heap_bytes`.)
 pub use type_maps::{
-    class_type_maps, mark_class_verification_skipped, publish_class_type_maps,
-    replace_class_type_maps, type_maps_for, type_maps_for_named, verification_status,
-    ClassTypeMaps, CompactBitmapArray, FastPathVeto, FrameOopMap, LocalOopBits, MethodTypeMaps,
-    MethodTypeMapsBuilder, OopBits, SetBitIter, StackOopBits, VerificationStatus,
+    class_id_of_name, class_type_maps, mark_class_verification_skipped, name_index_shape,
+    note_class_name, publish_class_type_maps, replace_class_type_maps, type_maps_for,
+    type_maps_for_named, verification_status, ClassTypeMaps, CompactBitmapArray, FastPathVeto,
+    FrameOopMap, LocalOopBits, MethodTypeMaps, MethodTypeMapsBuilder, OopBits, SetBitIter,
+    StackOopBits, VerificationStatus,
 };
 // Round 5 audit fix (LOW #11) / Round 7 carry-over: pre-flattened
 // built-in loader delegation chain. Used by VM-side callers that

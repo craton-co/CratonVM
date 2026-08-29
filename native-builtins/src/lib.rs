@@ -93,7 +93,76 @@ fn jboss_home_dir_fallback() -> Option<String> {
         })
 }
 
+/// Has the application called `System.setProperties`?
+///
+/// One process-global latch, set once and never cleared, read only by
+/// [`system_property_fallback`]. It is a latch rather than a comparison against
+/// the map's contents because the question is about an EVENT ("the application
+/// took ownership of the property map"), not about a state -- and because the
+/// alternative, listing the whole map on every missing-property lookup, is a
+/// per-lookup cost on a path that misses often.
+static SYSTEM_PROPERTIES_REPLACED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn system_properties_explicitly_replaced() -> bool {
+    SYSTEM_PROPERTIES_REPLACED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `java.lang.System.checkKey` -- the two-line validation every property entry
+/// point runs before it touches the map:
+///
+/// ```java
+/// private static void checkKey(String key) {
+///     if (key == null) throw new NullPointerException("key can't be null");
+///     if (key.isEmpty()) throw new IllegalArgumentException("key can't be empty");
+/// }
+/// ```
+///
+/// `getProperty(String)` had the null half and none of the four had the empty
+/// half, so `System.getProperty("")` answered null and `System.clearProperty("")`
+/// actually removed a key stored under the empty name -- a value where the JDK
+/// raises. MEASURED by `apps/probes/SystemRuntimeObjectSweep.java`.
+fn system_property_check_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    let key_obj = match args.first() {
+        Some(Value::Object(Some(k))) => *k,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("key can't be null".to_string()),
+            }
+            .into())
+        }
+    };
+    let key = property_key_from_java_string(ctx, key_obj);
+    if key.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "key can't be empty".to_string(),
+        }
+        .into());
+    }
+    Ok(key)
+}
+
 pub(crate) fn system_property_fallback(ctx: &dyn NativeContext, key: &str) -> Option<String> {
+    // An explicit `System.setProperties(p)` REPLACES the property map, and a
+    // key absent from the replacement is absent -- not a cue to fall back to a
+    // platform default.
+    //
+    // [`bootstrap_property_fallback`] says of itself that it "is reached only
+    // before that map exists". That premise holds for the boot path it was
+    // written for and fails for this one: after `setProperties` the map exists
+    // and is simply missing the key, so the fallback answered `"/"` for a
+    // `file.separator` the caller had just removed, where HotSpot answers null.
+    // MEASURED by `apps/probes/SystemRuntimeObjectSweep.java`.
+    //
+    // Narrow on purpose. The latch is set only by `setProperties`, so nothing
+    // changes for a program that never calls it -- which is every boot path
+    // this fallback exists for.
+    if system_properties_explicitly_replaced() {
+        return None;
+    }
     if key == "jboss.home.dir" {
         return bootstrap_property_fallback(key)
             .or_else(|| {
@@ -10648,16 +10717,11 @@ pub fn register_essential_natives_with_shims(
             // "property not set", which is the failure this whole override
             // exists to avoid on the OTHER side. MEASURED against HotSpot
             // 25.0.3+9, `probes/IoSystemSweep.java`, both modes.
-            let key_obj = match args.first() {
-                Some(Value::Object(Some(k))) => *k,
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("key can't be null".to_string()),
-                    }
-                    .into())
-                }
-            };
-            let key = property_key_from_java_string(ctx, key_obj);
+            //
+            // The EMPTY key is the other half of the same JDK method, added
+            // 2026-08-29 -- see [`system_property_check_key`], which all four
+            // entry points now share so they cannot drift apart again.
+            let key = system_property_check_key(ctx, args)?;
             match ctx
                 .get_system_property(&key)
                 .or_else(|| system_property_fallback(ctx, &key))
@@ -10672,11 +10736,11 @@ pub fn register_essential_natives_with_shims(
         "getProperty",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
-            let key_obj = match args.first() {
-                Some(Value::Object(Some(k))) => *k,
-                _ => return Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
-            };
-            let key = property_key_from_java_string(ctx, key_obj);
+            // The two-argument form runs the SAME `checkKey`: a null or empty
+            // key is a throw, not a fall back to the default. Answering the
+            // default was the more misleading of the two, because it looks
+            // exactly like a correctly-handled missing property.
+            let key = system_property_check_key(ctx, args)?;
             match ctx
                 .get_system_property(&key)
                 .or_else(|| system_property_fallback(ctx, &key))
@@ -10691,15 +10755,17 @@ pub fn register_essential_natives_with_shims(
         "setProperty",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
-            let key_obj = match args.first() {
-                Some(Value::Object(Some(k))) => *k,
-                _ => return Ok(Some(Value::Object(None))),
-            };
+            let key = system_property_check_key(ctx, args)?;
+            // `Properties.setProperty` -> `Hashtable.put`, whose null-value NPE
+            // carries NO message. MEASURED: `System.setProperty("k", null)` is
+            // `NullPointerException` with a null message on HotSpot and was a
+            // silent `null` return here.
             let val_obj = match args.get(1) {
                 Some(Value::Object(Some(v))) => *v,
-                _ => return Ok(Some(Value::Object(None))),
+                _ => {
+                    return Err(RuntimeError::NullPointerException { message: None }.into());
+                }
             };
-            let key = ctx.read_string(key_obj).unwrap_or_default();
             let val = ctx.read_string(val_obj).unwrap_or_default();
             let old = ctx.set_system_property(&key, &val);
             // Keep the cached `System.getProperties()` singleton's side-table in
@@ -10726,11 +10792,7 @@ pub fn register_essential_natives_with_shims(
         "clearProperty",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
-            let key_obj = match args.first() {
-                Some(Value::Object(Some(k))) => *k,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let key = ctx.read_string(key_obj).unwrap_or_default();
+            let key = system_property_check_key(ctx, args)?;
             // Actually REMOVE the key (not soft-clear to ""): after
             // `System.clearProperty`, `System.getProperty` must return null, not
             // "" — keycloak's `${name}` placeholder resolution (and any code that
@@ -10765,6 +10827,11 @@ pub fn register_essential_natives_with_shims(
                 }
                 _ => Vec::new(),
             };
+
+            // From here on the application owns the property map, so the
+            // bootstrap fallback must stop answering for keys it no longer
+            // contains -- see [`system_property_fallback`].
+            SYSTEM_PROPERTIES_REPLACED.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Replace the VM's canonical system-property map, rather than
             // layering the supplied Properties on top of the old map. Keycloak's
@@ -13630,15 +13697,25 @@ pub fn register_essential_natives_with_shims(
             _ => Ok(Some(Value::Object(None))),
         },
     );
+    // `CodeSource.getCertificates()` is `certs == null ? null : certs.clone()`.
+    // NULL is the answer for a code source with no certificates, and it is what
+    // `new CodeSource(url, (Certificate[]) null)` produces -- which is the
+    // common shape. This fabricated an EMPTY ARRAY instead, so a caller's
+    // `if (certs != null)` took the wrong branch and then found nothing in it.
+    //
+    // The array was also an `Object[]` in a slot declared
+    // `[Ljava/security/cert/Certificate;`, which nothing inside this VM
+    // objects to and real bytecode does -- the same descriptor mismatch that
+    // made `Throwable.suppressedExceptions` unserialisable. Reading the field
+    // avoids inventing either. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     registry.register(
         "java/security/CodeSource",
         "getCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |ctx, _args| {
-            Ok(Some(Value::Object(Some(ctx.new_array(
-                cratonvm_types::ArrayElementType::Reference,
-                0,
-            )))))
+        |ctx, args| match args.first() {
+            Some(Value::Object(Some(cs))) => Ok(Some(ctx.get_field_by_name(*cs, "certs"))),
+            _ => Ok(Some(Value::Object(None))),
         },
     );
     // URL.getPath() — prefer real-JDK 13-field layout (path@6, file@3,
@@ -15462,7 +15539,22 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            let ok = (45..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            // A PREVIEW minor (65535) is legal only for the CURRENT major.
+            // JDK 25's own predicate:
+            //
+            //     if (major < 45 || major > classFileMajorVersion) return false;
+            //     if (major <= 55) return true;   // any minor
+            //     return minor == 0
+            //         || (minor == 65535 && major == classFileMajorVersion);
+            //
+            // Accepting `(68, 65535)` -- a JDK 24 class file claiming preview
+            // -- is the shape this gate exists to refuse: preview features are
+            // not forward-compatible, and a class file that says "preview" for
+            // an older release is one whose bytecode this VM has no business
+            // running. MEASURED by `apps/probes/JdkInternalSweep.java`.
+            const CURRENT_MAJOR: i32 = 69;
+            let ok = (45..=CURRENT_MAJOR).contains(&major)
+                && (major < 56 || minor == 0 || (minor == 65535 && major == CURRENT_MAJOR));
             Ok(Some(Value::Int(ok as i32)))
         },
     );
@@ -19983,7 +20075,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;Ljava/util/ResourceBundle;)Ljava/lang/System$Logger;",
-        native_system_get_logger,
+        native_system_get_logger_with_bundle,
     );
 
     // T19_H11_SYSTEM_LOGGER_INTERFACE — the instance side of the logger the
@@ -25620,6 +25712,47 @@ fn native_protection_domain_implies(
     if args.len() < 2 {
         return Ok(Some(Value::Int(1)));
     }
+    // A STATIC domain answers from its OWN permission collection and never
+    // consults the policy. `ProtectionDomain(CodeSource, PermissionCollection)`
+    // -- the two-argument constructor -- sets `staticPermissions = true`, and
+    // the JDK's `implies` is then
+    //
+    //     if (hasAllPerm) return true;
+    //     if (permissions != null) return permissions.implies(perm);
+    //     return false;
+    //
+    // Falling through to the policy core instead meant a domain constructed
+    // with NO permissions answered TRUE for `AllPermission`, because the core
+    // is allow-all with no `java.policy` loaded. **That is a security answer
+    // given the permissive way for a reason that has nothing to do with the
+    // domain being asked about**, and it is the one shape of wrong answer this
+    // predicate must not produce. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`:
+    // `new ProtectionDomain(null, null).implies(new AllPermission())` is
+    // `false` on HotSpot and was `true` here.
+    if let Some(Value::Object(Some(pd))) = args.first() {
+        if matches!(ctx.get_field_by_name(*pd, "staticPermissions"), Value::Int(1)) {
+            if matches!(ctx.get_field_by_name(*pd, "hasAllPerm"), Value::Int(1)) {
+                return Ok(Some(Value::Int(1)));
+            }
+            let Value::Object(Some(perms)) = ctx.get_field_by_name(*pd, "permissions") else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let perm = args.get(1).copied().unwrap_or(Value::Object(None));
+            return match ctx.invoke_virtual(
+                perms,
+                "implies",
+                "(Ljava/security/Permission;)Z",
+                &[perm],
+            ) {
+                Ok(Some(v @ Value::Int(_))) => Ok(Some(v)),
+                // The collection could not be asked: deny rather than fall
+                // through to the allow-all core, which is the failure mode
+                // this arm exists to remove.
+                _ => Ok(Some(Value::Int(0))),
+            };
+        }
+    }
     // A null permission carries no grant to satisfy: deny, matching the
     // `Policy.implies` native's null handling (security_manager.rs).
     let perm = match args.get(1) {
@@ -26988,6 +27121,54 @@ fn dbg_clone_cached() -> bool {
     *CACHE.get_or_init(|| crate::nbflags().dbg_clone)
 }
 
+/// Does `class_id` -- or any of its superclasses, or any interface either of
+/// them implements, transitively -- implement `java.lang.Cloneable`?
+///
+/// Written as an explicit walk rather than routed through an assignability
+/// helper because the two facts it needs are the two the `NativeContext` trait
+/// actually exposes: the superclass chain and the DECLARED interfaces at each
+/// level. `Cloneable` is a marker with no methods, so there is nothing else
+/// about it to ask. The worklist is transitive because an interface may extend
+/// another, and `Cloneable` is often reached that way rather than declared.
+fn object_class_is_cloneable(ctx: &dyn NativeContext, class_id: cratonvm_types::ClassId) -> bool {
+    let Some(cloneable) = ctx.class_id_by_name("java/lang/Cloneable") else {
+        // No `Cloneable` in this image at all -- refusing every clone would be
+        // far worse than allowing them, so keep the pre-2026-08-29 behaviour.
+        return true;
+    };
+    let mut seen: Vec<cratonvm_types::ClassId> = Vec::new();
+    let mut work: Vec<cratonvm_types::ClassId> = Vec::new();
+    let mut cls = Some(class_id);
+    while let Some(c) = cls {
+        work.push(c);
+        if work.len() > 256 {
+            break;
+        }
+        cls = ctx.superclass_of(c);
+    }
+    while let Some(c) = work.pop() {
+        if c == cloneable {
+            return true;
+        }
+        if seen.contains(&c) {
+            continue;
+        }
+        seen.push(c);
+        if seen.len() > 512 {
+            break;
+        }
+        for i in ctx.class_interfaces(c) {
+            if i == cloneable {
+                return true;
+            }
+            if !seen.contains(&i) {
+                work.push(i);
+            }
+        }
+    }
+    false
+}
+
 fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -27000,6 +27181,25 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
+    // `Object.clone()` is `throw new CloneNotSupportedException()` for a
+    // receiver whose class does not implement `Cloneable`. Arrays are always
+    // cloneable and are handled below; every other kind has to be asked.
+    //
+    // Without this, a subclass of `Object` that reaches `super.clone()` got a
+    // COPY where the JDK gives an exception -- a fabricated success, and the
+    // kind that only shows up much later as two objects where the program
+    // expects one. MEASURED by `apps/probes/SystemRuntimeObjectSweep.java`.
+    if kind == cratonvm_types::ObjectKind::Object && !object_class_is_cloneable(ctx, class_id) {
+        let name = ctx
+            .class_name_of_id(class_id)
+            .unwrap_or_default()
+            .replace('/', ".");
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/CloneNotSupportedException",
+            &name,
+        ));
+    }
     if dbg_clone_cached() {
         let name = ctx
             .class_name_of_id(class_id)
@@ -28349,13 +28549,79 @@ fn system_logger_level_arg_is_null(level: Option<&Value>) -> bool {
 /// `SimpleConsoleLogger` road NPEs at a different expression and so would
 /// carry different text; the TYPE is what both roads agree on and what any
 /// `catch` sees.
-fn system_logger_require_level(level: Option<&Value>) -> Result<(), MethodCallFailed> {
+/// Does this image ship `java.logging` -- i.e. is `System.getLogger` backed by
+/// `LoggingProviderImpl$JULWrapper` rather than by `SimpleConsoleLogger`?
+///
+/// The two implementations disagree about `isLoggable(OFF)` and about which
+/// method a null `Level` is dereferenced through, so several rows of the
+/// `System.Logger` surface hang on this one fact. See
+/// [`system_logger_is_loggable`] for the disagreement itself.
+///
+/// **Asked as a RESOURCE, not as a loaded class and not by loading one.**
+/// `class_id_by_name` answers only for classes already loaded, and a caller
+/// asking `isLoggable` before anything has touched logging gets `None` from it
+/// -- which is exactly how the first attempt at this predicate came out wrong.
+/// `load_class` would answer correctly and would also run
+/// `java.util.logging.Logger`'s static initialiser, bringing up the whole
+/// `LogManager`: far too large a side effect for a predicate. `find_resource`
+/// asks the image and touches nothing.
+///
+/// Memoised because the answer is a property of the image and cannot change
+/// within a process, and because the later arms are not free.
+///
+/// THREE ARMS, and the first two are not enough on their own -- both were tried
+/// and both answered "absent" for a class the image plainly ships:
+///
+/// 1. `class_id_by_name` sees only classes ALREADY LOADED, and nothing has
+///    touched logging when the first `isLoggable` arrives;
+/// 2. `find_resource` searches the application's resource path and does not
+///    reach the boot image;
+/// 3. `load_class` asks the loader properly. It LOADS but does not INITIALISE,
+///    so `java.util.logging.Logger`'s static initialiser -- which brings up the
+///    whole `LogManager` -- does not run. Once, behind the memo.
+///
+/// Worth writing down because arms 1 and 2 are the two an author reaches for
+/// first, they are the cheap ones, and they are both wrong here for reasons
+/// that have nothing to do with logging.
+fn system_logger_provider_is_jul(ctx: &mut dyn NativeContext) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const UNKNOWN: u8 = 0;
+    const JUL: u8 = 1;
+    const SIMPLE: u8 = 2;
+    static CACHED: AtomicU8 = AtomicU8::new(UNKNOWN);
+    match CACHED.load(Ordering::Relaxed) {
+        JUL => return true,
+        SIMPLE => return false,
+        _ => {}
+    }
+    let present = ctx.class_id_by_name("java/util/logging/Logger").is_some()
+        || ctx
+            .find_resource("java/util/logging/Logger.class")
+            .is_some()
+        || ctx.load_class("java/util/logging/Logger").is_ok();
+    CACHED.store(if present { JUL } else { SIMPLE }, Ordering::Relaxed);
+    present
+}
+
+/// The NPE a null `Level` argument earns -- naming the method the provider in
+/// force would have dereferenced it through.
+///
+/// `java.util.logging.Level.intValue()` on the JUL-backed provider,
+/// `PlatformLogger$Level.ordinal()` on `SimpleConsoleLogger`. Same question as
+/// [`system_logger_provider_is_jul`], second row. MEASURED by
+/// `apps/probes/SystemRuntimeObjectSweep.java`.
+fn system_logger_require_level(
+    ctx: &mut dyn NativeContext,
+    level: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
     if system_logger_level_arg_is_null(level) {
+        let message = if system_logger_provider_is_jul(ctx) {
+            "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null"
+        } else {
+            "Cannot invoke \"sun.util.logging.PlatformLogger$Level.ordinal()\" because \"level\" is null"
+        };
         return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "Cannot invoke \"java.util.logging.Level.intValue()\" because \"level\" is null"
-                    .to_string(),
-            ),
+            message: Some(message.to_string()),
         }
         .into());
     }
@@ -28388,12 +28654,29 @@ fn system_logger_require_level(level: Option<&Value>) -> Result<(), MethodCallFa
 /// and answers **false**.
 ///
 /// Which one is the oracle for a given CratonVM run depends on whether
-/// `java.logging` is resolved, which this lane could not determine without
-/// running the VM. **The `OFF` arm is therefore left as it is and recorded, not
-/// changed**: flipping it would be right for the stock module graph and wrong
-/// for the strict fallback this file's own
-/// `CRATON_SYSTEM_LOGGER_CLASS` road replaces with a real
-/// `SimpleConsoleLogger`. See
+/// `java.logging` is resolved. The lane that wrote the paragraph above could
+/// not determine that without running the VM, and left the arm at `false` and
+/// recorded it rather than flipping a coin -- which was the right call on the
+/// evidence it had.
+///
+/// **ANSWERED 2026-08-29 by running the VM.** The question was never which
+/// answer is nicer; it is which provider `System.getLogger` resolves to, and
+/// that is a property of the image the run is using, decidable at the moment
+/// the question is asked. `LoggingProviderImpl` is the JUL-backed provider and
+/// exists exactly when `java.util.logging.Logger` does, so:
+///
+/// * `java.logging` present -> `JULWrapper` -> `isLoggable(OFF)` is **true**
+///   (`level.intValue() >= levelValue && levelValue != offValue` excludes the
+///   LOGGER's level, not the argument's, and `Level.OFF.intValue()` is
+///   `Integer.MAX_VALUE`);
+/// * absent -> `SimpleConsoleLogger` -> **false**
+///   (`level != Level.OFF && level.ordinal() >= effectiveLevel.ordinal()`).
+///
+/// So the arm is now conditional rather than constant, which is what the
+/// original paragraph was actually asking for. MEASURED by
+/// `apps/probes/SystemRuntimeObjectSweep.java`: HotSpot answers `true` on this
+/// image, and so does this body now.
+/// See
 /// `docs/known-issues/jdk-only/F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic-20260813.md`.
 /// The remaining severity rows above all agree with this body.
 fn system_logger_is_loggable(
@@ -28403,7 +28686,7 @@ fn system_logger_is_loggable(
 ) -> bool {
     let name = system_logger_level_name(ctx, level);
     if name.as_deref() == Some("OFF") {
-        return false;
+        return system_logger_provider_is_jul(ctx);
     }
     let severity = name
         .as_deref()
@@ -28492,7 +28775,7 @@ fn system_logger_emit(
     // Ordering is observable — `log(null, (String) null)` throws on HotSpot and
     // used to return silently here, since the `message == None` early-return
     // below came first. See `system_logger_require_level`.
-    system_logger_require_level(level)?;
+    system_logger_require_level(ctx, level)?;
     let message = match message {
         Some(message) => message,
         // MEASURED residual, NOT fixed here: HotSpot publishes a null message
@@ -28661,9 +28944,36 @@ pub(crate) fn native_system_get_logger(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let name = args.first().copied().unwrap_or(Value::Object(None));
+    // `System.getLogger` is `Objects.requireNonNull(name)` first. The NPE
+    // carries no message. Answering a logger for a null name turned a caller's
+    // bug into a logger nobody can find again by name. MEASURED by
+    // `apps/probes/SystemRuntimeObjectSweep.java`.
+    let name = match args.first() {
+        Some(v @ Value::Object(Some(_))) => *v,
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+    };
     let logger = craton_alloc_system_logger(ctx, name)?;
     Ok(Some(Value::Object(Some(logger))))
+}
+
+/// `System.getLogger(String, ResourceBundle)` -- the one overload whose SECOND
+/// argument may not be null either (`Objects.requireNonNull(bundle)`).
+///
+/// A separate body rather than an arity test inside
+/// [`native_system_get_logger`], because
+/// `jdk/internal/logger/LazyLoggers.getLogger(String, Module)` is registered
+/// against that same body and ITS second argument is allowed to be null. Two
+/// call sites with two different contracts need two functions; deciding at run
+/// time would mean asking the frame which descriptor it is serving, which is a
+/// question this boundary cannot answer.
+pub(crate) fn native_system_get_logger_with_bundle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if matches!(args.get(1), None | Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    native_system_get_logger(ctx, args)
 }
 
 fn native_system_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -28678,7 +28988,7 @@ fn native_system_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    system_logger_require_level(args.get(1))?;
+    system_logger_require_level(ctx, args.get(1))?;
     let loggable = system_logger_is_loggable(ctx, system_logger_this(args), args.get(1));
     Ok(Some(Value::Int(i32::from(loggable))))
 }
@@ -28733,7 +29043,7 @@ fn native_system_logger_log_supplier(
     let this = system_logger_this(args);
     // Before the Supplier is invoked: HotSpot dereferences the level in
     // `isLoggable` and never reaches `Supplier.get()` for a null level.
-    system_logger_require_level(args.get(1))?;
+    system_logger_require_level(ctx, args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }
@@ -28750,7 +29060,7 @@ fn native_system_logger_log_supplier_throwable(
     let this = system_logger_this(args);
     // Before the Supplier is invoked: HotSpot dereferences the level in
     // `isLoggable` and never reaches `Supplier.get()` for a null level.
-    system_logger_require_level(args.get(1))?;
+    system_logger_require_level(ctx, args.get(1))?;
     if !system_logger_is_loggable(ctx, this, args.get(1)) {
         return Ok(None);
     }

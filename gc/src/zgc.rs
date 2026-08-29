@@ -3070,6 +3070,40 @@ pub struct ZgcRealHeap {
     parallel_mark_cycles: AtomicUsize,
     compaction_cycles: AtomicUsize,
     objects_relocated: AtomicUsize,
+    /// The same three questions for the LARGE-OBJECT end's compactor, plus the
+    /// one the low end does not need: how often it looked and declined.
+    ///
+    /// `compact_high_region` runs on every relocating cycle and does nothing
+    /// unless merging this end's holes would gain at least one large object's
+    /// worth of contiguity, so `high_compaction_cycles=0
+    /// high_compaction_declined=812` is the reading for "this workload never
+    /// fragmented its large-object end" and is a different fact from
+    /// `high_compaction_declined=0`, which would mean the pass never ran at
+    /// all. The predecessor feature this replaces
+    /// (`CRATONVM_ZGC_TARGETED_COMPACTION`) shipped with `targeted_pages=0` on
+    /// every workload measured, and the only reason anyone found out is that it
+    /// carried a counter.
+    /// Per heap, seeded from `CRATONVM_ZGC_HIGH_COMPACTION` at construction —
+    /// the same shape as [`ZgcRealHeap::relocation_enabled`] and for the same
+    /// reason. A `OnceLock` on the variable would latch the answer for the
+    /// whole PROCESS, so the A/B this switch exists to be could not be run
+    /// inside one test binary, and `a_pinned_large_object_...`'s control arm
+    /// would silently inherit whichever arm ran first.
+    /// Spans and bytes the slide emptied and handed BACK to the free list.
+    ///
+    /// The engagement counter for the 2026-08-29 repair described on
+    /// `Arena::compact_low_to`. `spans=0` on a run with a non-zero
+    /// `compaction_cycles` means every cycle's vacated space was inside the
+    /// cursor drop, which is the benign case; a large `bytes` is the measure of
+    /// what used to be lost outright.
+    publish_vacated_enabled: AtomicBool,
+    vacated_spans_published: AtomicUsize,
+    vacated_bytes_published: AtomicUsize,
+    high_compaction_enabled: AtomicBool,
+    high_compaction_cycles: AtomicUsize,
+    high_compaction_declined: AtomicUsize,
+    high_objects_relocated: AtomicUsize,
+    high_bytes_copied: AtomicUsize,
     /// The arena window (offsets, `start..end`) the last allocation failure
     /// needs emptied, or `None`.
     ///
@@ -3542,6 +3576,14 @@ impl ZgcRealHeap {
             parallel_mark_cycles: AtomicUsize::new(0),
             compaction_cycles: AtomicUsize::new(0),
             objects_relocated: AtomicUsize::new(0),
+            publish_vacated_enabled: AtomicBool::new(publish_vacated_requested_by_default()),
+            vacated_spans_published: AtomicUsize::new(0),
+            vacated_bytes_published: AtomicUsize::new(0),
+            high_compaction_enabled: AtomicBool::new(zgc_high_compaction_requested_by_default()),
+            high_compaction_cycles: AtomicUsize::new(0),
+            high_compaction_declined: AtomicUsize::new(0),
+            high_objects_relocated: AtomicUsize::new(0),
+            high_bytes_copied: AtomicUsize::new(0),
             compaction_target: Mutex::new(None),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
@@ -4217,6 +4259,32 @@ impl ZgcRealHeap {
             self.parallel_mark_cycles.load(Ordering::Relaxed),
             self.compaction_cycles.load(Ordering::Relaxed),
             self.objects_relocated.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(cycles, declined, objects, bytes)` — did the LARGE-OBJECT end's
+    /// compactor engage this run?
+    ///
+    /// Reported at shutdown beside `compaction_cycles`, and the pairing is the
+    /// point: those numbers describe the low end only, and a heap can compact
+    /// its low end on every cycle while the request that is actually failing is
+    /// served from the other one. See [`ZgcRealHeap::compact_high_region`].
+    /// `(spans, bytes)` the slide handed back to the free list rather than
+    /// losing — see [`ZgcRealHeap::compact_high_region`]'s neighbour,
+    /// `Arena::compact_low_to`.
+    pub fn vacated_publication(&self) -> (usize, usize) {
+        (
+            self.vacated_spans_published.load(Ordering::Relaxed),
+            self.vacated_bytes_published.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn high_compaction_engagement(&self) -> (usize, usize, usize, usize) {
+        (
+            self.high_compaction_cycles.load(Ordering::Relaxed),
+            self.high_compaction_declined.load(Ordering::Relaxed),
+            self.high_objects_relocated.load(Ordering::Relaxed),
+            self.high_bytes_copied.load(Ordering::Relaxed),
         )
     }
 
@@ -5605,6 +5673,23 @@ impl ZgcRealHeap {
         self.relocation_enabled.store(on, Ordering::Relaxed);
     }
 
+    /// Turn the LARGE-OBJECT end's compactor on or off for THIS heap.
+    ///
+    /// The process-wide default is `CRATONVM_ZGC_HIGH_COMPACTION` (on unless
+    /// set to `0`/`off`/`false`/`no`). Per heap for the reason
+    /// [`Self::set_relocation_enabled`] is: the A/B this switch exists to be
+    /// has to be runnable inside one test binary.
+    pub fn set_high_compaction_enabled(&self, on: bool) {
+        self.high_compaction_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Turn the publication of the slide's vacated spans on or off for THIS
+    /// heap. Process-wide default: `CRATONVM_ZGC_PUBLISH_VACATED` (on unless
+    /// `0`/`off`/`false`/`no`).
+    pub fn set_publish_vacated_enabled(&self, on: bool) {
+        self.publish_vacated_enabled.store(on, Ordering::Relaxed);
+    }
+
     /// The process-wide default for [`Self::set_relocation_enabled`].
     fn relocation_requested_by_default() -> bool {
         // DEFAULT-ON since 2026-08-13, for the gauntlet.
@@ -5722,6 +5807,265 @@ impl ZgcRealHeap {
         live: &[usize],
     ) -> (usize, usize, cratonvm_types::PointerMap) {
         self.relocate_stw(live)
+    }
+
+    /// Compact the arena's LARGE-OBJECT end — the half of the heap
+    /// `relocate_stw`'s slide has never been able to reach.
+    ///
+    /// # Why a second compactor, and not a wider first one
+    ///
+    /// The arena has two ends (`Arena::high_cursor`): the low one bumps up and
+    /// holds everything a TLAB can serve, the high one bumps DOWN from
+    /// `capacity` and holds objects at or above `ZGC_LARGE_OBJECT_MIN`. The
+    /// slide above compacts the low end only — `logical_pages` builds
+    /// candidates over `base .. base + used_low_for_compaction()`, and
+    /// `used_low_for_compaction` is the low cursor by construction.
+    ///
+    /// That was not an oversight so much as an unmeasured assumption, and
+    /// `org.h2.test.store.TestMVStoreTool` is where it came due. Its failing
+    /// request is **262 160 bytes**, above `ZGC_LARGE_OBJECT_MIN`, so it is
+    /// served from the high end — and the window the fragmentation profile
+    /// named as cheapest to empty began **3.9 MB above** the low cursor:
+    ///
+    /// ```text
+    /// [zgc-target] recorded window start=1072365328 end=1072627680 width=262352
+    ///              request=262160 used_low=1068498592 in_low_region=false
+    /// ```
+    ///
+    /// So targeted compaction (`CRATONVM_ZGC_TARGETED_COMPACTION`) selected the
+    /// right window and could evacuate nothing in it: `targeted_pages` read 0
+    /// on every workload measured. Large-object fragmentation had no repair at
+    /// all. This is that repair.
+    ///
+    /// # The geometry is the low slide's, mirrored
+    ///
+    /// Survivors are packed against `capacity` in DESCENDING address order, so
+    /// an object is only ever copied into space a higher-addressed survivor has
+    /// already vacated — the mirror of the low slide's ascending walk, and just
+    /// as load-bearing: out-of-order copying overwrites a survivor that has not
+    /// moved yet, which is silent heap corruption rather than a failed assert.
+    ///
+    /// There are no logical pages up here and no relocation-set selector, and
+    /// neither is missing. A page is an accounting unit for "which parts of a
+    /// million-object region pay for their copy"; this region holds thousands
+    /// of objects at most (that is the definition of the population it serves),
+    /// the copy is all-or-nothing, and the profitability question is asked once
+    /// for the whole region by `gain` below instead of once per page.
+    ///
+    /// # What it costs when it declines
+    ///
+    /// One `high_free_shape()` — three field reads and a sum over a list whose
+    /// length is measured in tens. `high_compaction_declined` counts the
+    /// declines, so a run in which this never engaged says so rather than
+    /// looking clean.
+    fn compact_high_region(
+        &self,
+        arena: &mut Arena,
+        live: &[usize],
+        pins: &[usize],
+        pairs: &mut Vec<(usize, usize)>,
+    ) -> (usize, usize) {
+        if !self.high_compaction_enabled.load(Ordering::Relaxed) {
+            return (0, 0);
+        }
+        let base = arena.base_ptr() as usize;
+        let high_lo = base + arena.high_cursor();
+        let high_hi = base + arena.capacity();
+        if high_lo >= high_hi {
+            // The high end has never been used, which is the state every
+            // workload that allocates no large object stays in forever.
+            return (0, 0);
+        }
+
+        // ---- IS IT WORTH THE COPY? ------------------------------------
+        //
+        // The gain from merging this end's holes is bounded below by
+        // `free_bytes - largest`: after the pass every free byte the slide can
+        // reach is in one block, so the largest block grows by at least that
+        // much. Under one large object's worth of gain there is nothing here a
+        // large allocation could use that it could not already have, and the
+        // pass would be pure copying — so decline, and COUNT the decline.
+        let (blocks_before, free_bytes, largest) = arena.high_free_shape();
+        let gain = free_bytes.saturating_sub(largest);
+        if gain < ZGC_LARGE_OBJECT_MIN {
+            self.high_compaction_declined.fetch_add(1, Ordering::Relaxed);
+            return (0, 0);
+        }
+
+        // Survivors, HIGHEST FIRST — see the header.
+        let mut survivors: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|b| *b >= high_lo && *b < high_hi)
+            .collect();
+        survivors.sort_unstable_by(|a, b| b.cmp(a));
+
+        // A pin makes its OBJECT immovable, and object granularity is right
+        // here where the low slide's page granularity was right there: there
+        // are no pages up here to withhold, and the population is small enough
+        // that a linear probe per survivor costs nothing beside the memmove.
+        // The set is the one the low slide consults — JNI critical sections
+        // plus the CONSERVATIVE JIT root scan, whose entries may be interior
+        // pointers or plain `long`s, so the object they name must not move even
+        // though nothing can rewrite the slot they came from.
+        let high_pins: Vec<usize> = pins
+            .iter()
+            .copied()
+            .filter(|p| *p >= high_lo && *p < high_hi)
+            .collect();
+
+        let first_pair = pairs.len();
+        // Offsets, because that is what `Arena::compact_high_to` speaks.
+        let mut vacated: Vec<(usize, usize)> = Vec::new();
+        let mut floor = high_lo;
+        let mut dest = high_hi;
+        let mut moved = 0usize;
+        let mut copied = 0usize;
+        let mut pinned = 0usize;
+        for from in survivors {
+            let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
+                // A header this collector cannot size cannot be moved, and its
+                // EXTENT is what the vacated span below it would be measured
+                // from — so nothing below it can be claimed dead either. Stop,
+                // and make the packed region's current floor the authoritative
+                // floor: everything below is left exactly as it was, free list
+                // included. The low slide documents the same break as an
+                // amplifier; here it under-reclaims instead, which is the
+                // conservative direction.
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    addr = from,
+                    "zgc relocate: unsizable survivor stops the HIGH slide"
+                );
+                floor = dest;
+                break;
+            };
+            let size = size.max(8);
+            if from.saturating_add(size) > dest {
+                // An extent that runs into the region already packed above it
+                // — `dest` starts at `capacity`, so this also catches one that
+                // runs past the top of the arena — is impossible for a live
+                // object met in descending address order, and means the header
+                // is not one. Refuse it rather than let it drive a memmove:
+                // the same answer the low slide gives a survivor whose extent
+                // runs past the bump cursor.
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    addr = from,
+                    size,
+                    dest,
+                    high_hi,
+                    "zgc relocate: a HIGH survivor's extent overlaps the packed \
+                     region -- refusing to compact past it"
+                );
+                floor = dest;
+                break;
+            }
+            let immovable = high_pins.iter().any(|p| *p >= from && *p < from + size);
+            // Pack against `dest` on the object grid. The DELTA is aligned, not
+            // the address: nothing guarantees the arena's base is 8-aligned,
+            // every object start is `base + 8k`, so rounding the difference is
+            // what keeps the destination on the same grid — and, because it
+            // rounds the move DOWN, keeps `to >= from` without a second check.
+            let to = if immovable {
+                pinned += 1;
+                from
+            } else {
+                from + ((dest - size - from) & !7)
+            };
+            if to != from {
+                // SAFETY: `size` bytes are live at `from`; `to` is inside the
+                // high region, strictly above `from`, and `to + size <= dest <=
+                // high_hi`. The regions may overlap — `copy` is memmove, which
+                // is correct in this direction.
+                unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
+                pairs.push((from, to));
+                moved += 1;
+                copied += size;
+            }
+            // Whatever lies between this object's end and the floor of the run
+            // above it is dead: every survivor that was there has just been
+            // packed above, and anything else was free already. Recorded per
+            // object rather than once at the end, because a pinned survivor
+            // splits the region in two and a single span would either swallow
+            // it or abandon the free space on its far side — the memory loss
+            // `Arena::compact_low_to` records having made once already.
+            if to + size < dest {
+                vacated.push((to + size - base, dest - base));
+            }
+            dest = to;
+        }
+        // The walk reached the bottom, so the span below the lowest survivor is
+        // vacated too. (When it broke early, `floor` is the packed region's own
+        // bottom and there is nothing further to claim.)
+        if floor == high_lo && dest > high_lo {
+            vacated.push((high_lo - base, dest - base));
+        }
+
+        // ---- NOTHING LIVE MAY REMAIN INSIDE A VACATED SPAN -------------
+        //
+        // `compact_high_to` zeroes every span it is handed and publishes it as
+        // free. A live object still inside one would be erased AND its address
+        // re-issued while the object-start registry still named it — the
+        // failure the low slide's `live_ceiling` check exists to prevent, from
+        // the other end.
+        //
+        // Derived from a second pass over `live` rather than from the loop's
+        // own bookkeeping, for the reason that check gives: every argument that
+        // the loop's spans miss every survivor is an argument about the
+        // partition, not a check on the answer. Cheap beside the slide, and it
+        // can only DROP spans — i.e. reclaim less.
+        let moved_to: FxHashMap<usize, usize> = pairs[first_pair..].iter().copied().collect();
+        let mut survivor_now: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|b| *b >= high_lo && *b < high_hi)
+            .map(|b| moved_to.get(&b).copied().unwrap_or(b) - base)
+            .collect();
+        survivor_now.sort_unstable();
+        let spans_before = vacated.len();
+        vacated.retain(|&(s, e)| match survivor_now.binary_search(&s) {
+            // A survivor based exactly at the span's start settles it.
+            Ok(_) => false,
+            Err(i) => {
+                // The greatest base below `s` may still extend into the span,
+                // and the least base at or above `s` may start inside it.
+                let below_clear = i == 0 || {
+                    let b = survivor_now[i - 1];
+                    let sz = Self::alloc_size(self.header_ref((b + base) as *mut u8))
+                        .unwrap_or(usize::MAX);
+                    b.saturating_add(sz) <= s
+                };
+                below_clear && survivor_now.get(i).is_none_or(|&b| b >= e)
+            }
+        });
+        if vacated.len() != spans_before {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                dropped = spans_before - vacated.len(),
+                spans = spans_before,
+                moved,
+                "zgc relocate: a HIGH vacated span still covered a live object — \
+                 dropping it and reclaiming less"
+            );
+        }
+
+        let reclaimed = arena.compact_high_to(floor - base, &vacated);
+        self.high_compaction_cycles.fetch_add(1, Ordering::Relaxed);
+        self.high_objects_relocated.fetch_add(moved, Ordering::Relaxed);
+        self.high_bytes_copied.fetch_add(copied, Ordering::Relaxed);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_HIGH").is_some() {
+            let (blocks_after, bytes_after, largest_after) = arena.high_free_shape();
+            eprintln!(
+                "[zgc-high] region={} moved={moved} copied={copied} pinned={pinned} \
+                 spans={} reclaimed={reclaimed} \
+                 before=(blocks={blocks_before} bytes={free_bytes} largest={largest}) \
+                 after=(blocks={blocks_after} bytes={bytes_after} largest={largest_after})",
+                high_hi - high_lo,
+                vacated.len(),
+            );
+        }
+        (moved, reclaimed)
     }
 
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
@@ -5874,7 +6218,7 @@ impl ZgcRealHeap {
         let record = relocate::ZRelocationRecord::new(true, live.len());
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         let mut moved = 0usize;
-        let reclaimed;
+        let mut reclaimed = 0usize;
         // Captured out of the arena scope for the post-slide verifier, which
         // runs after the guard is dropped.
         let mut arena_lo = 0usize;
@@ -6043,7 +6387,7 @@ impl ZgcRealHeap {
             if !pins.is_empty() {
                 let page_span = Self::Z_LOGICAL_PAGE_BYTES;
                 let mut dropped = 0usize;
-                for addr in pins {
+                for &addr in &pins {
                     if addr >= base && addr < low_end {
                         if selected.remove(&(((addr - base) / page_span) as u64)) {
                             dropped += 1;
@@ -6060,304 +6404,409 @@ impl ZgcRealHeap {
                 }
             }
             if selected.is_empty() {
-                // Nothing profitable to move. Not a failure -- it is the
-                // selector doing its job on a heap whose pages are all dense.
-                let reclaimed = arena.retract_cursor_into_free_tail();
-                return (0, reclaimed, cratonvm_types::PointerMap::default());
-            }
-
-            let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
-            // Survivors ON THE SELECTED PAGES ONLY. An object on an unselected
-            // page must not move, so the slide's destination cursor has to
-            // start above the highest unselected survivor -- see below.
-            let mut survivors: Vec<usize> = live
-                .iter()
-                .copied()
-                .filter(|b| *b >= base && *b < low_end)
-                .filter(|b| selected.contains(&page_of(*b)))
-                .collect();
-            survivors.sort_unstable();
-
-            // The slide may only use space below the first page it is allowed
-            // to disturb. Sliding into an unselected page would overwrite
-            // survivors this cycle promised not to touch.
-            // From the FILTERED set, not `reloc_set`: a pinned page dropped
-            // above may have been the lowest, and starting the slide at a page
-            // that is no longer selected would place survivors on top of the
-            // very object the pin exists to hold still.
-            let first_selected_page = *selected.iter().min().expect("non-empty, checked above");
-            let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
-
-            // OBSTACLES: live objects that will not move but occupy bytes of a
-            // page that IS selected.
-            //
-            // Page membership is decided by an object's BASE, so an object
-            // based in an unselected page and extending across the boundary
-            // keeps its tail inside the selected page above -- and it is not in
-            // `survivors`, so it never moves. "This page is selected" and
-            // "these bytes are free" are therefore different claims, and the
-            // slide had only the first one.
-            //
-            // The probe aimed straight at the hazard: when a span touched an
-            // unselected page it restarted at `base + (blocked + 1) * PAGE` --
-            // the first byte of the next page, which is exactly where a
-            // straddler from the previous page lies. `slide_floor` has the same
-            // shape. Measured by
-            // `compaction_never_writes_into_an_object_it_did_not_move`.
-            //
-            // The list is tiny -- only an object crossing a boundary out of an
-            // unselected page can qualify, at most one per boundary -- so a
-            // sorted `Vec` and a short scan cost nothing beside the slide.
-            let mut obstacles: Vec<(usize, usize)> = live
-                .iter()
-                .copied()
-                .filter(|b| *b >= base && *b < low_end)
-                .filter(|b| !selected.contains(&page_of(*b)))
-                .filter_map(|b| {
-                    let sz = Self::alloc_size(self.header_ref(b as *mut u8))?;
-                    (page_of(b) != page_of(b + sz - 1)).then_some((b, b + sz))
-                })
-                .collect();
-            obstacles.sort_unstable();
-            // End of an obstacle overlapping `[lo, hi)`, if any.
-            let blocked_until = |lo: usize, hi: usize| -> Option<usize> {
-                obstacles
+                // Nothing profitable to move AT THE LOW END. Not a failure --
+                // it is the selector doing its job on a heap whose pages are
+                // all dense.
+                //
+                // A SKIP, not a return, since 2026-08-29: the large-object end
+                // is compacted below and may move objects whose slots this
+                // function still has to rewrite. Returning here meant a heap
+                // whose low end was dense could never have its high end
+                // repaired, which is exactly the shape `TestMVStoreTool`
+                // fails in.
+                reclaimed = arena.retract_cursor_into_free_tail();
+            } else {
+                let page_of = |addr: usize| ((addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+                // Survivors ON THE SELECTED PAGES ONLY. An object on an unselected
+                // page must not move, so the slide's destination cursor has to
+                // start above the highest unselected survivor -- see below.
+                let mut survivors: Vec<usize> = live
                     .iter()
-                    .take_while(|(ob, _)| *ob < hi)
-                    .find(|(_, oe)| *oe > lo)
-                    .map(|(_, oe)| *oe)
-            };
+                    .copied()
+                    .filter(|b| *b >= base && *b < low_end)
+                    .filter(|b| selected.contains(&page_of(*b)))
+                    .collect();
+                survivors.sort_unstable();
 
-            // The floor itself can land inside a straddler's tail.
-            let mut dest = slide_floor;
-            if let Some(end) = blocked_until(dest, dest + 1) {
-                dest = end;
-            }
-            for from in survivors {
-                let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
-                    // A header this collector cannot size cannot be moved, and
-                    // nothing above it may move either or the slide would run
-                    // over it. Stop here rather than guess.
-                    //
-                    // THIS BREAK IS AN AMPLIFIER, and the live-ceiling check
-                    // after the loop is what disarms it. Abandoning the loop
-                    // leaves `dest` at `from`, so every selected-page survivor
-                    // ABOVE this one -- all of which are alive and none of
-                    // which have moved -- is above the cursor `compact_low_to`
-                    // is about to retract to. Their bytes get zeroed and
-                    // handed back to the bump allocator while the object-start
-                    // registry still names them, and the next allocation
-                    // writes over a contiguous RUN of live objects. That is
-                    // how one unsizable header becomes "492 of 27858 survivors
-                    // could not be walked" a cycle later, with the offending
-                    // headers decoding as whatever String the allocator put
-                    // there. See the reopened
-                    // `zgc-rewrite-pass-walks-off-a-reference-array` page.
-                    //
-                    // Deliberately NOT fixed by setting `dest = low_end` here.
-                    // That would be a second mechanism for the same property,
-                    // and the two would drift on exactly the case that matters.
-                    // The check on the answer belongs in one place, after every
-                    // exit path from this loop.
-                    tracing::warn!(
-                        target: "cratonvm::gc::guard",
-                        addr = from,
-                        "zgc relocate: unsizable survivor stops the slide"
-                    );
-                    dest = from;
-                    break;
+                // The slide may only use space below the first page it is allowed
+                // to disturb. Sliding into an unselected page would overwrite
+                // survivors this cycle promised not to touch.
+                // From the FILTERED set, not `reloc_set`: a pinned page dropped
+                // above may have been the lowest, and starting the slide at a page
+                // that is no longer selected would place survivors on top of the
+                // very object the pin exists to hold still.
+                let first_selected_page = *selected.iter().min().expect("non-empty, checked above");
+                let slide_floor = base + first_selected_page as usize * Self::Z_LOGICAL_PAGE_BYTES;
+
+                // OBSTACLES: live objects that will not move but occupy bytes of a
+                // page that IS selected.
+                //
+                // Page membership is decided by an object's BASE, so an object
+                // based in an unselected page and extending across the boundary
+                // keeps its tail inside the selected page above -- and it is not in
+                // `survivors`, so it never moves. "This page is selected" and
+                // "these bytes are free" are therefore different claims, and the
+                // slide had only the first one.
+                //
+                // The probe aimed straight at the hazard: when a span touched an
+                // unselected page it restarted at `base + (blocked + 1) * PAGE` --
+                // the first byte of the next page, which is exactly where a
+                // straddler from the previous page lies. `slide_floor` has the same
+                // shape. Measured by
+                // `compaction_never_writes_into_an_object_it_did_not_move`.
+                //
+                // The list is tiny -- only an object crossing a boundary out of an
+                // unselected page can qualify, at most one per boundary -- so a
+                // sorted `Vec` and a short scan cost nothing beside the slide.
+                let mut obstacles: Vec<(usize, usize)> = live
+                    .iter()
+                    .copied()
+                    .filter(|b| *b >= base && *b < low_end)
+                    .filter(|b| !selected.contains(&page_of(*b)))
+                    .filter_map(|b| {
+                        let sz = Self::alloc_size(self.header_ref(b as *mut u8))?;
+                        (page_of(b) != page_of(b + sz - 1)).then_some((b, b + sz))
+                    })
+                    .collect();
+                obstacles.sort_unstable();
+                // End of an obstacle overlapping `[lo, hi)`, if any.
+                let blocked_until = |lo: usize, hi: usize| -> Option<usize> {
+                    obstacles
+                        .iter()
+                        .take_while(|(ob, _)| *ob < hi)
+                        .find(|(_, oe)| *oe > lo)
+                        .map(|(_, oe)| *oe)
                 };
-                // THE DESTINATION MUST LIE ENTIRELY INSIDE SELECTED PAGES.
-                //
-                // `ZRelocationSet::select` ranks by descending garbage ratio
-                // and takes a prefix, so the selected ids are an arbitrary,
-                // NON-CONTIGUOUS set -- every page at or above
-                // `max_live_occupancy` is skipped. Until 2026-08-14 this loop
-                // marched one cursor up from `slide_floor` and placed every
-                // survivor consecutively, so as soon as the selected pages'
-                // live bytes exceeded the gap below the first dense page, this
-                // memmove copied survivors straight over the live objects ON
-                // it. Silent heap corruption; it reached the outside world as
-                // `compaction must not raise the cursor: 15348137664 > ...`
-                // (a clobbered header read back as a 1.9-billion-element
-                // array) and, on one run, as a bare SIGSEGV.
-                //
-                // The comment eight lines above the old code said the cursor
-                // "has to start above the highest unselected survivor". That
-                // was the right rule and the code implemented something else.
-                //
-                // Skipping rather than clamping keeps the selector's choice:
-                // pages above a dense one are still compacted, into the next
-                // selected page, which is what makes a non-contiguous
-                // selection worth having at all.
-                let span = size.max(1);
-                let mut probe = dest;
-                let mut chosen: Option<usize> = None;
-                while probe < from {
-                    let cand = (probe + 7) & !7;
-                    // Only a strictly-downward move is worth anything, and an
-                    // upward one would overwrite a survivor not yet visited.
-                    if cand >= from || cand + span > low_end {
-                        break;
-                    }
-                    let first_page = page_of(cand);
-                    let last_page = page_of(cand + span - 1);
-                    match (first_page..=last_page).find(|pg| !selected.contains(pg)) {
-                        // The span would touch an unselected page: restart the
-                        // probe at the page after it. Strictly increasing, so
-                        // this terminates in at most one pass over the grid.
-                        Some(blocked) => {
-                            probe = base + (blocked as usize + 1) * Self::Z_LOGICAL_PAGE_BYTES;
-                        }
-                        // Every page of the span is selected -- which still
-                        // does not mean the bytes are free. Re-check against the
-                        // straddlers that reach into these pages from below,
-                        // and restart above the one in the way. Also strictly
-                        // increasing (an obstacle's end exceeds `cand`), so the
-                        // loop still terminates.
-                        None => match blocked_until(cand, cand + span) {
-                            Some(end) => probe = end,
-                            None => {
-                                chosen = Some(cand);
-                                break;
-                            }
-                        },
-                    }
+
+                // The floor itself can land inside a straddler's tail.
+                let mut dest = slide_floor;
+                if let Some(end) = blocked_until(dest, dest + 1) {
+                    dest = end;
                 }
-                match chosen {
-                    Some(to) => {
-                        debug_assert!(to < from, "the slide must never move an object UP");
-                        // SAFETY: `size` bytes are live at `from`, `to` is
-                        // inside the arena and strictly below `from`, and the
-                        // regions may overlap -- `copy` is memmove, correct in
-                        // that direction.
-                        unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
-                        pairs.push((from, to));
-                        moved += 1;
-                        dest = to + size;
-                    }
-                    // Nowhere below it inside a selected page: it stays put,
-                    // and the cursor continues above it so a later survivor
-                    // cannot be placed on top of it.
-                    None => dest = from + size,
-                }
-            }
-            // The cursor may only drop to the compacted end if nothing that
-            // STAYED PUT lives above it.
-            //
-            // Only UNSELECTED survivors count here. An object on a selected
-            // page has already been slid down, so its entry in `live` names an
-            // address it no longer occupies -- taking the maximum over the
-            // whole live set pins the cursor at the pre-compaction top and
-            // reclaims exactly nothing, which is what the first draft did.
-            let highest_pinned_end = live
-                .iter()
-                .copied()
-                .filter(|b| *b >= base && *b < low_end)
-                .filter(|b| !selected.contains(&page_of(*b)))
-                .map(|b| {
-                    let size = Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0);
-                    // An extent that runs past the bump cursor is impossible
-                    // for a live object and means the header is not one --
-                    // which is how the 2026-08-14 corruption presented: a
-                    // clobbered header sized at 15,348,137,664 bytes on a
-                    // 168 MB arena, carried into `compact_low_to` as a cursor
-                    // 91x the heap.
-                    //
-                    // Refuse it here rather than let it set the cursor. Pinning
-                    // at `low_end` reclaims nothing this cycle, which is the
-                    // conservative answer and strictly better than either
-                    // trusting the number or panicking: `alloc_size` has no
-                    // arena to check against, and this is the caller that does.
-                    if size > low_end.saturating_sub(b) {
+                for from in survivors {
+                    let Some(size) = Self::alloc_size(self.header_ref(from as *mut u8)) else {
+                        // A header this collector cannot size cannot be moved, and
+                        // nothing above it may move either or the slide would run
+                        // over it. Stop here rather than guess.
+                        //
+                        // THIS BREAK IS AN AMPLIFIER, and the live-ceiling check
+                        // after the loop is what disarms it. Abandoning the loop
+                        // leaves `dest` at `from`, so every selected-page survivor
+                        // ABOVE this one -- all of which are alive and none of
+                        // which have moved -- is above the cursor `compact_low_to`
+                        // is about to retract to. Their bytes get zeroed and
+                        // handed back to the bump allocator while the object-start
+                        // registry still names them, and the next allocation
+                        // writes over a contiguous RUN of live objects. That is
+                        // how one unsizable header becomes "492 of 27858 survivors
+                        // could not be walked" a cycle later, with the offending
+                        // headers decoding as whatever String the allocator put
+                        // there. See the reopened
+                        // `zgc-rewrite-pass-walks-off-a-reference-array` page.
+                        //
+                        // Deliberately NOT fixed by setting `dest = low_end` here.
+                        // That would be a second mechanism for the same property,
+                        // and the two would drift on exactly the case that matters.
+                        // The check on the answer belongs in one place, after every
+                        // exit path from this loop.
                         tracing::warn!(
                             target: "cratonvm::gc::guard",
-                            addr = b,
-                            size,
-                            low_end,
-                            "zgc relocate: a pinned survivor's extent runs past the \
-                             bump cursor -- refusing to reclaim this cycle rather than \
-                             trust the header"
+                            addr = from,
+                            "zgc relocate: unsizable survivor stops the slide"
                         );
-                        low_end
-                    } else {
-                        b + size
+                        dest = from;
+                        break;
+                    };
+                    // THE DESTINATION MUST LIE ENTIRELY INSIDE SELECTED PAGES.
+                    //
+                    // `ZRelocationSet::select` ranks by descending garbage ratio
+                    // and takes a prefix, so the selected ids are an arbitrary,
+                    // NON-CONTIGUOUS set -- every page at or above
+                    // `max_live_occupancy` is skipped. Until 2026-08-14 this loop
+                    // marched one cursor up from `slide_floor` and placed every
+                    // survivor consecutively, so as soon as the selected pages'
+                    // live bytes exceeded the gap below the first dense page, this
+                    // memmove copied survivors straight over the live objects ON
+                    // it. Silent heap corruption; it reached the outside world as
+                    // `compaction must not raise the cursor: 15348137664 > ...`
+                    // (a clobbered header read back as a 1.9-billion-element
+                    // array) and, on one run, as a bare SIGSEGV.
+                    //
+                    // The comment eight lines above the old code said the cursor
+                    // "has to start above the highest unselected survivor". That
+                    // was the right rule and the code implemented something else.
+                    //
+                    // Skipping rather than clamping keeps the selector's choice:
+                    // pages above a dense one are still compacted, into the next
+                    // selected page, which is what makes a non-contiguous
+                    // selection worth having at all.
+                    let span = size.max(1);
+                    let mut probe = dest;
+                    let mut chosen: Option<usize> = None;
+                    while probe < from {
+                        let cand = (probe + 7) & !7;
+                        // Only a strictly-downward move is worth anything, and an
+                        // upward one would overwrite a survivor not yet visited.
+                        if cand >= from || cand + span > low_end {
+                            break;
+                        }
+                        let first_page = page_of(cand);
+                        let last_page = page_of(cand + span - 1);
+                        match (first_page..=last_page).find(|pg| !selected.contains(pg)) {
+                            // The span would touch an unselected page: restart the
+                            // probe at the page after it. Strictly increasing, so
+                            // this terminates in at most one pass over the grid.
+                            Some(blocked) => {
+                                probe = base + (blocked as usize + 1) * Self::Z_LOGICAL_PAGE_BYTES;
+                            }
+                            // Every page of the span is selected -- which still
+                            // does not mean the bytes are free. Re-check against the
+                            // straddlers that reach into these pages from below,
+                            // and restart above the one in the way. Also strictly
+                            // increasing (an obstacle's end exceeds `cand`), so the
+                            // loop still terminates.
+                            None => match blocked_until(cand, cand + span) {
+                                Some(end) => probe = end,
+                                None => {
+                                    chosen = Some(cand);
+                                    break;
+                                }
+                            },
+                        }
                     }
-                })
-                .max()
-                .unwrap_or(base);
-            // ---- NOTHING LIVE MAY END ABOVE THE NEW CURSOR ---------------
-            //
-            // `compact_low_to` zeroes `[new_cursor, cursor)` and hands the span
-            // straight back to the bump allocator. A live object still up there
-            // is therefore erased AND its address re-issued: the registry keeps
-            // its base, a mutator writes a fresh object over it, and the next
-            // slide's rewrite pass reads a "header" made of somebody else's
-            // payload. That is precisely the failure
-            // `rewrite_target_is_walkable` reports -- a contiguous run of
-            // registered bases whose class ids and slot counts decode as ASCII,
-            // because what is actually there now is string data.
-            //
-            // `dest` and `highest_pinned_end` above are each derived from a
-            // DIFFERENT subset of `live` -- selected-page survivors and
-            // unselected ones -- and every argument that their maximum covers
-            // the whole live set is an argument about the partition, not a
-            // check on the answer. This is the check on the answer: one pass
-            // over `live`, resolved through the slide's own from->to pairs, of
-            // the one property the allocator is about to depend on.
-            //
-            // Cheap next to the slide (one hash probe and one `alloc_size` per
-            // survivor, against a memmove per survivor), and it can only
-            // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
-            // is a cost; handing out occupied memory is heap corruption whose
-            // symptom surfaces cycles later in an unrelated subsystem.
-            let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
-            let mut stranded = 0usize;
-            let mut live_ceiling = base;
-            for &b in live {
-                if b < base || b >= low_end {
-                    continue;
+                    match chosen {
+                        Some(to) => {
+                            debug_assert!(to < from, "the slide must never move an object UP");
+                            // SAFETY: `size` bytes are live at `from`, `to` is
+                            // inside the arena and strictly below `from`, and the
+                            // regions may overlap -- `copy` is memmove, correct in
+                            // that direction.
+                            unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
+                            pairs.push((from, to));
+                            moved += 1;
+                            dest = to + size;
+                        }
+                        // Nowhere below it inside a selected page: it stays put,
+                        // and the cursor continues above it so a later survivor
+                        // cannot be placed on top of it.
+                        None => dest = from + size,
+                    }
                 }
-                let now = moved_to.get(&b).copied().unwrap_or(b);
-                // An unsizable header cannot be bounded, so it cannot be
-                // proven dead either. Refuse to reclaim past `low_end` rather
-                // than guess -- the same answer `highest_pinned_end` gives an
-                // extent that runs past the cursor, and for the same reason.
-                let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
-                    Some(sz) => now.saturating_add(sz).min(low_end),
-                    None => low_end,
-                };
-                if end > live_ceiling {
-                    live_ceiling = end;
-                }
-            }
-            let proposed = dest.max(highest_pinned_end);
-            if live_ceiling > proposed {
-                stranded = live
+                // The cursor may only drop to the compacted end if nothing that
+                // STAYED PUT lives above it.
+                //
+                // Only UNSELECTED survivors count here. An object on a selected
+                // page has already been slid down, so its entry in `live` names an
+                // address it no longer occupies -- taking the maximum over the
+                // whole live set pins the cursor at the pre-compaction top and
+                // reclaims exactly nothing, which is what the first draft did.
+                let highest_pinned_end = live
                     .iter()
-                    .filter(|b| **b >= proposed && **b < low_end)
-                    .count();
-                tracing::error!(
-                    target: "cratonvm::gc::guard",
-                    proposed_cursor = proposed - base,
-                    raised_to = live_ceiling - base,
-                    stranded_live_objects = stranded,
-                    low_end = low_end - base,
-                    moved,
-                    survivors = live.len(),
-                    "zgc relocate: the compaction cursor would have been left BELOW live \
-                     objects -- their bytes would have been zeroed and re-issued while the \
-                     object-start registry still named them. Raising it and reclaiming less."
-                );
+                    .copied()
+                    .filter(|b| *b >= base && *b < low_end)
+                    .filter(|b| !selected.contains(&page_of(*b)))
+                    .map(|b| {
+                        let size = Self::alloc_size(self.header_ref(b as *mut u8)).unwrap_or(0);
+                        // An extent that runs past the bump cursor is impossible
+                        // for a live object and means the header is not one --
+                        // which is how the 2026-08-14 corruption presented: a
+                        // clobbered header sized at 15,348,137,664 bytes on a
+                        // 168 MB arena, carried into `compact_low_to` as a cursor
+                        // 91x the heap.
+                        //
+                        // Refuse it here rather than let it set the cursor. Pinning
+                        // at `low_end` reclaims nothing this cycle, which is the
+                        // conservative answer and strictly better than either
+                        // trusting the number or panicking: `alloc_size` has no
+                        // arena to check against, and this is the caller that does.
+                        if size > low_end.saturating_sub(b) {
+                            tracing::warn!(
+                                target: "cratonvm::gc::guard",
+                                addr = b,
+                                size,
+                                low_end,
+                                "zgc relocate: a pinned survivor's extent runs past the \
+                                 bump cursor -- refusing to reclaim this cycle rather than \
+                                 trust the header"
+                            );
+                            low_end
+                        } else {
+                            b + size
+                        }
+                    })
+                    .max()
+                    .unwrap_or(base);
+                // ---- NOTHING LIVE MAY END ABOVE THE NEW CURSOR ---------------
+                //
+                // `compact_low_to` zeroes `[new_cursor, cursor)` and hands the span
+                // straight back to the bump allocator. A live object still up there
+                // is therefore erased AND its address re-issued: the registry keeps
+                // its base, a mutator writes a fresh object over it, and the next
+                // slide's rewrite pass reads a "header" made of somebody else's
+                // payload. That is precisely the failure
+                // `rewrite_target_is_walkable` reports -- a contiguous run of
+                // registered bases whose class ids and slot counts decode as ASCII,
+                // because what is actually there now is string data.
+                //
+                // `dest` and `highest_pinned_end` above are each derived from a
+                // DIFFERENT subset of `live` -- selected-page survivors and
+                // unselected ones -- and every argument that their maximum covers
+                // the whole live set is an argument about the partition, not a
+                // check on the answer. This is the check on the answer: one pass
+                // over `live`, resolved through the slide's own from->to pairs, of
+                // the one property the allocator is about to depend on.
+                //
+                // Cheap next to the slide (one hash probe and one `alloc_size` per
+                // survivor, against a memmove per survivor), and it can only
+                // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
+                // is a cost; handing out occupied memory is heap corruption whose
+                // symptom surfaces cycles later in an unrelated subsystem.
+                let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
+                let mut stranded = 0usize;
+                let mut live_ceiling = base;
+                for &b in live {
+                    if b < base || b >= low_end {
+                        continue;
+                    }
+                    let now = moved_to.get(&b).copied().unwrap_or(b);
+                    // An unsizable header cannot be bounded, so it cannot be
+                    // proven dead either. Refuse to reclaim past `low_end` rather
+                    // than guess -- the same answer `highest_pinned_end` gives an
+                    // extent that runs past the cursor, and for the same reason.
+                    let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
+                        Some(sz) => now.saturating_add(sz).min(low_end),
+                        None => low_end,
+                    };
+                    if end > live_ceiling {
+                        live_ceiling = end;
+                    }
+                }
+                let proposed = dest.max(highest_pinned_end);
+                if live_ceiling > proposed {
+                    stranded = live
+                        .iter()
+                        .filter(|b| **b >= proposed && **b < low_end)
+                        .count();
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        proposed_cursor = proposed - base,
+                        raised_to = live_ceiling - base,
+                        stranded_live_objects = stranded,
+                        low_end = low_end - base,
+                        moved,
+                        survivors = live.len(),
+                        "zgc relocate: the compaction cursor would have been left BELOW live \
+                         objects -- their bytes would have been zeroed and re-issued while the \
+                         object-start registry still named them. Raising it and reclaiming less."
+                    );
+                }
+                let new_cursor = proposed.max(live_ceiling) - base;
+                // The bytes this slide actually wrote: it places survivors from
+                // `slide_floor` upwards and stops at `dest`. Everything outside
+                // that window is where it was before, so a free block there is
+                // still free -- see `Arena::compact_low_to` for what dropping them
+                // wholesale cost.
+                let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
+
+                // ---- WHAT THE SLIDE EMPTIED, AND WHY IT HAD TO BE SAID ----
+                //
+                // Reclaim used to be the cursor drop and nothing else, and that
+                // is only the whole answer when the cursor can reach `dest`.
+                // One survivor on an unselected dense page above the compacted
+                // region pins `new_cursor` above it, and then the bytes the
+                // slide just emptied are neither below the cursor nor on the
+                // free list. **No later sweep can find them either**: the sweep
+                // walks the object-start REGISTRY, which this slide is about to
+                // rebuild with the survivors' NEW bases, so the old ones stop
+                // existing as far as every other subsystem is concerned.
+                //
+                // Measured on `TestMVStoreTool` at `--Xmx 1g`: four compaction
+                // cycles, 885 793 objects relocated, and the largest free block
+                // at the failing 262 160-byte request is 8 184 bytes. The
+                // slide's own output is page-granular and contiguous -- exactly
+                // the shape that request needs -- and it was being discarded.
+                //
+                // A SELECTED page above `dest` is dead by construction: every
+                // survivor based on it was packed below `dest` (a survivor the
+                // probe could not place sets `dest` past its own end, so it is
+                // below too). What can still be alive up there is an OBSTACLE:
+                // an object based on an unselected page whose tail straddles
+                // into a selected one, which never moves.
+                //
+                // Rather than argue that the page partition excludes them, the
+                // spans are SCREENED against the live set at its post-slide
+                // addresses -- one pass, a prefix maximum, and a binary search
+                // per page. That is a check on the answer, and it is the same
+                // shape as the `live_ceiling` check above and for the same
+                // reason: every argument that the partition is exhaustive is an
+                // argument about the partition, not about what is in the span.
+                // It can only DROP a span, i.e. reclaim less.
+                let mut vacated: Vec<(usize, usize)> = Vec::new();
+                if self.publish_vacated_enabled.load(Ordering::Relaxed) {
+                    let cursor_addr = base + new_cursor;
+                    // (start, end) of every low-region survivor where it is NOW.
+                    let mut live_after: Vec<(usize, usize)> = live
+                        .iter()
+                        .copied()
+                        .filter(|b| *b >= base && *b < low_end)
+                        .map(|b| {
+                            let now = moved_to.get(&b).copied().unwrap_or(b);
+                            let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
+                                Some(sz) => now.saturating_add(sz).min(low_end),
+                                // Unsizable: bound it at the cursor rather than
+                                // guess, which makes it overlap everything above
+                                // and refuses every span. Fail-closed.
+                                None => low_end,
+                            };
+                            (now, end)
+                        })
+                        .collect();
+                    live_after.sort_unstable();
+                    // Prefix maximum of the ends, so "does anything starting
+                    // below `hi` reach past `lo`" is one binary search and one
+                    // array read instead of a scan.
+                    let mut max_end: Vec<usize> = Vec::with_capacity(live_after.len());
+                    let mut running = 0usize;
+                    for &(_, e) in &live_after {
+                        running = running.max(e);
+                        max_end.push(running);
+                    }
+                    let mut pages: Vec<u64> = selected.iter().copied().collect();
+                    pages.sort_unstable();
+                    for pg in pages {
+                        let page_lo = base + pg as usize * Self::Z_LOGICAL_PAGE_BYTES;
+                        let lo = page_lo.max(dest);
+                        let hi = (page_lo + Self::Z_LOGICAL_PAGE_BYTES).min(cursor_addr);
+                        if hi <= lo {
+                            continue;
+                        }
+                        let idx = live_after.partition_point(|(st, _)| *st < hi);
+                        if idx > 0 && max_end[idx - 1] > lo {
+                            continue; // something live is in there
+                        }
+                        vacated.push((lo - base, hi - base));
+                    }
+                    let bytes: usize = vacated.iter().map(|(s, e)| e - s).sum();
+                    self.vacated_spans_published
+                        .fetch_add(vacated.len(), Ordering::Relaxed);
+                    self.vacated_bytes_published
+                        .fetch_add(bytes, Ordering::Relaxed);
+                }
+                reclaimed = arena.compact_low_to(new_cursor, touched, &vacated);
             }
-            let new_cursor = proposed.max(live_ceiling) - base;
-            // The bytes this slide actually wrote: it places survivors from
-            // `slide_floor` upwards and stops at `dest`. Everything outside
-            // that window is where it was before, so a free block there is
-            // still free -- see `Arena::compact_low_to` for what dropping them
-            // wholesale cost.
-            let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
-            reclaimed = arena.compact_low_to(new_cursor, touched);
+
+            // ---- THE LARGE-OBJECT END ---------------------------------
+            //
+            // Everything above compacts the LOW end only. The arena has two,
+            // and the requests that were failing at 97 % free came from the
+            // other one -- see `compact_high_region`, which is where the
+            // measurement that says so lives. Its pairs join `pairs`, so the
+            // rewrite pass, the registry rebuild and the returned
+            // `PointerMap` below cover both ends with no second mechanism.
+            let (high_moved, high_reclaimed) =
+                self.compact_high_region(&mut arena, live, &pins, &mut pairs);
+            moved += high_moved;
+            reclaimed += high_reclaimed;
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
@@ -9101,6 +9550,59 @@ fn targeted_compaction_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_ZGC_HIGH_COMPACTION=0` — the kill switch for the LARGE-OBJECT
+/// end's compactor. Default ON.
+///
+/// **Default-ON where `CRATONVM_ZGC_TARGETED_COMPACTION` is default-OFF, and
+/// the difference is engagement.** That flag ships off because it engaged zero
+/// times on every workload measured; this one exists because the measurement
+/// which proved that also named what would engage — `in_low_region=false` on
+/// the very window it was selecting — and repairs precisely it. Shipping it off
+/// would leave the H2 fragmentation family with no repair in any default
+/// configuration, which is the state this replaces.
+///
+/// `=0` is the bisect, and it is a re-run rather than a rebuild: with it the
+/// high end is left exactly as it was before 2026-08-29, so a same-binary A/B
+/// is possible. The counters on the `[GC] zgc-features:` line
+/// (`high_compaction_cycles`, `high_compaction_declined`) say which arm ran,
+/// because a kill switch nobody can see the effect of is not a bisect lever.
+///
+/// Read once at heap construction into [`ZgcRealHeap::high_compaction_enabled`]:
+/// it decides what a collection does and must not change mid-cycle.
+/// `CRATONVM_ZGC_PUBLISH_VACATED=0` — the kill switch for handing the slide's
+/// vacated spans back to the free list. Default ON.
+///
+/// With it off, reclaim is the cursor drop and nothing else, which is what it
+/// was before 2026-08-29 — so the A/B is a re-run and not a rebuild. It is a
+/// switch rather than an unconditional change because this is the one repair on
+/// this branch that ADDS memory to the allocator's free list on a claim about
+/// what is dead, and a wrong claim there is a double hand-out rather than a
+/// missed optimisation. The screen that backs the claim is a check on the
+/// answer (see the call site), and this is what a future reader bisects with if
+/// it is ever wrong.
+/// Read once at heap construction into
+/// [`ZgcRealHeap::publish_vacated_enabled`], per heap rather than as a
+/// process-wide `OnceLock`, so the A/B is runnable inside one test binary.
+fn publish_vacated_requested_by_default() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_PUBLISH_VACATED") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+fn zgc_high_compaction_requested_by_default() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_HIGH_COMPACTION") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 const ZGC_TLAB_MAX_CHUNK: usize = 512 * 1024;
 
 /// Size at or above which an allocation is served from the arena's HIGH end
@@ -9148,15 +9650,106 @@ const ZGC_LARGE_OBJECT_MIN: usize = ZGC_TLAB_MAX_CHUNK / 8;
 /// through the heap's public API: it takes ~4,000 threads and a full 2 GB arena
 /// to reproduce the shape, and the shape is one comparison.
 ///
-/// The floor is `want / 8`, which is `ZTlabConfig::max_tlab_alloc` — the bound
-/// that decides what a TLAB will serve at all. A chunk at the floor therefore
+/// The PREFERRED floor is `want / 8`, which is `ZTlabConfig::max_tlab_alloc` —
+/// the bound that decides what a TLAB will serve at all. A chunk at that floor
 /// still holds at least eight of the largest object it can ever be asked for.
-/// Below that a buffer is churning rather than buffering.
+/// Below it a buffer is churning rather than buffering.
+///
+/// # …and a STARVED floor of `want / 64`, because the alternative changes
+///
+/// "Is a short chunk worth taking?" has two answers and they depend on what
+/// happens if it is refused. With bump headroom left, the refusal costs one
+/// clean full-size bump and the short chunk is pure churn. With none, the
+/// refusal walks straight down `Arena::alloc` — free list, un-reserved bump,
+/// merge — to the arm that **eats the large-object reserve rather than fail**.
+/// The chunk is taken either way; the only question is whether it comes out of
+/// recycled space or out of the space the large-object end was promised.
+///
+/// MEASURED on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`, 2026-08-29,
+/// at the failing 262 160-byte request:
+///
+/// ```text
+/// used=1073540152 capacity=1073741824 free_list_bytes=757199136
+/// largest_free_block=102128 high_cursor=1069219280 high_bytes=102128
+/// high_reserve_unclaimed=129695184
+/// span_hist=8:72610 16:28157 32:12819 … 1K:45234 2K:15565 8K:65060 32K:53 64K:1
+/// ```
+///
+/// 757 MB free and the largest LOW block under 64 KiB — one notch below a
+/// `want / 8` floor of exactly 64 KiB, with 65 060 spans of 8–16 KiB sitting
+/// unusable beneath it. Every refill in the process therefore bumped, the
+/// cursor reached capacity, the 128 MiB reserve was spent on TLAB churn, and a
+/// 262 160-byte request that the reserve existed to serve had nowhere to go.
+///
+/// `need` is still the hard bound in both regimes — a chunk that cannot serve
+/// the request that forced the refill is not a chunk — so the starved floor
+/// cannot produce a refill that immediately fails.
 #[inline]
-fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Option<usize> {
+fn recycled_chunk_size(
+    want: usize,
+    need: usize,
+    largest_low_free: usize,
+    bump_headroom: usize,
+    publish_vacated: bool,
+) -> Option<usize> {
     let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
-    let floor = (want / 8).max(need);
-    (size >= floor && size < want).then_some(size)
+    if size >= want || size < need {
+        return None;
+    }
+    if size >= (want / 8).max(need) {
+        return Some(size);
+    }
+    // Below the preferred floor: worth it only when a full chunk can no longer
+    // be bumped without spending the large-object reserve.
+    (starved_recycle_permitted(publish_vacated)
+        && bump_headroom < want
+        && size >= (want / 64).max(need))
+        .then_some(size)
+}
+
+/// Is the starved floor allowed to fire at all?
+///
+/// **The two switches are not independent, and the measurement that says so is
+/// on the page this work belongs to.** `TestMVStoreTool` at `--Xmx 1g`, one
+/// binary, arms interleaved: with `CRATONVM_ZGC_PUBLISH_VACATED=0` alone the
+/// class fails 2/2 (`oom=6` at 60 s and 81 s, on a **9 888-byte** request with
+/// 797 MB free and `largest_free_block=8184`), while the arm with that switch
+/// off AND this one off passes 2/2.
+///
+/// The floor takes 8–64 KiB blocks off the free list when the bump is out of
+/// headroom. While the slide is publishing page-granular spans back, that is
+/// recycling. With the publication off, nothing replenishes the large end of
+/// the free list and the floor grinds the last of it into TLAB chunks — a
+/// bisect arm strictly worse than either endpoint, which is a footgun rather
+/// than a lever.
+///
+/// So the floor is gated on the publication. Both default ON, so the shipped
+/// configuration is byte-for-byte the one that was measured; this only affects
+/// somebody turning the publication off to bisect.
+fn starved_recycle_permitted(publish_vacated: bool) -> bool {
+    publish_vacated && starved_recycle_enabled()
+}
+
+/// `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` — the kill switch for the starved
+/// floor in [`recycled_chunk_size`]. Default ON.
+///
+/// It exists so the change is a RE-RUN and not a rebuild: with it off, the
+/// refill floor is `want / 8` in every regime, byte for byte what it was before
+/// 2026-08-29. `CRATONVM_ZGC_TLAB=0` is not a substitute — it turns the whole
+/// thread-local buffer off and changes the allocation path, the free-list
+/// shape and the run time (561 s against 103 s on `TestMVStoreTool`), so an arm
+/// that differs by it differs by far more than this decision.
+fn starved_recycle_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_STARVED_RECYCLE") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        },
+    )
 }
 
 /// Share of the arena that TLAB chunks may hold in RESERVATION at one time.
@@ -10561,7 +11154,14 @@ impl ZgcRealHeap {
             // and the honest answer is a full-size chunk (or the failure that
             // follows it).
             let largest = arena.largest_low_free_block();
-            let sized = recycled_chunk_size(want, need, largest)
+            let headroom = arena.low_bump_headroom();
+            let sized = recycled_chunk_size(
+                want,
+                need,
+                largest,
+                headroom,
+                self.publish_vacated_enabled.load(Ordering::Relaxed),
+            )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // `alloc(want)` covers both the "the free list has a full-size
             // block" case and the bump.
@@ -13687,7 +14287,7 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         const NODE: usize = 96;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - NODE),
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true),
             Some(CHUNK - NODE),
             "a chunk short by one AQS node must still be recycled",
         );
@@ -13699,19 +14299,19 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true), None);
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true), None);
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 8),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true),
             Some(CHUNK / 8),
             "the floor itself is acceptable",
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true), None);
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -13723,6 +14323,7 @@ pub(crate) mod tests {
     fn a_recycled_chunk_is_never_shorter_than_the_request_that_forced_it() {
         const CHUNK: usize = 512 * 1024;
         for need in [8usize, 1024, CHUNK / 8, CHUNK / 8 + 8, CHUNK / 2] {
+            for headroom in [0usize, CHUNK - 8, CHUNK, CHUNK * 4] {
             for largest in [
                 0usize,
                 4096,
@@ -13732,7 +14333,7 @@ pub(crate) mod tests {
                 CHUNK,
                 CHUNK * 2,
             ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest) {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true) {
                     assert!(
                         size >= need,
                         "need={need} largest={largest} produced a {size}-byte chunk",
@@ -13741,7 +14342,81 @@ pub(crate) mod tests {
                     assert_eq!(size % ZGC_TLAB_ALIGN, 0, "chunks stay on the object grid");
                 }
             }
+            }
         }
+    }
+
+    /// **The starved floor, and the exact numbers that produced it.**
+    ///
+    /// With bump headroom, a 32 KiB block against a 512 KiB chunk is churn and
+    /// is refused -- that is the preferred `want / 8` floor, unchanged. Without
+    /// it, refusing does not buy a full chunk: it walks `Arena::alloc` down to
+    /// the arm that eats the large-object reserve. So the same block is taken.
+    ///
+    /// `TestMVStoreTool` at `--Xmx 1g` reached its failing 262 160-byte request
+    /// with `largest_free_block=102128`, 757 MB free and
+    /// `high_reserve_unclaimed=129695184`: every refill bumped, past a floor of
+    /// exactly 64 KiB, over 65 060 spans of 8-16 KiB.
+    #[test]
+    fn a_starved_bump_takes_a_chunk_the_preferred_floor_refuses() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16; // 32 KiB -- below `want / 8`, above `want / 64`
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true),
+            None,
+            "with headroom the alternative is a clean full-size bump, so a              short chunk is pure churn",
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            Some(short),
+            "without it the alternative is spending the large-object reserve,              and the chunk is taken either way -- the only question is out of              WHICH space",
+        );
+        // The starved floor is a floor, not an abolition: dust is still refused
+        // however starved the bump is.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true),
+            None,
+            "below `want / 64` a buffer is churning rather than buffering, and              that does not change with the alternative",
+        );
+        // ...and `need` still bounds it in the starved regime, or the refill
+        // would install a chunk its own allocation cannot use.
+        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true), None);
+    }
+
+    /// **The starved floor is INERT while the vacated-span publication is off,
+    /// and that coupling is measured rather than tidy.**
+    ///
+    /// `TestMVStoreTool` at `--Xmx 1g`, one binary, arms interleaved: with
+    /// `CRATONVM_ZGC_PUBLISH_VACATED=0` alone the class fails 2/2 (`oom=6` at
+    /// 60 s and 81 s, on a **9 888-byte** request with 797 MB free and
+    /// `largest_free_block=8184`) — while the arm with that switch off AND the
+    /// starved floor off passes 2/2. A bisect arm strictly worse than either
+    /// endpoint is a footgun, not a lever.
+    ///
+    /// The floor takes 8-64 KiB blocks off the free list when the bump is out
+    /// of headroom, which is recycling while the slide is publishing
+    /// page-granular spans back and is grinding when it is not.
+    #[test]
+    fn the_starved_floor_is_inert_without_the_vacated_publication() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16;
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            Some(short),
+            "the starved regime with the publication on"
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false),
+            None,
+            "...and inert without it, because nothing would replenish what it takes"
+        );
+        // The PREFERRED floor is unaffected -- it is not the hazard, and gating
+        // it would change the shipped behaviour of a switch nobody set.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false),
+            Some(CHUNK - 96),
+            "a chunk short by one AQS node is still worth taking either way"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -15741,6 +16416,224 @@ pub(crate) mod tests {
         }
     }
 
+    // -- The LARGE-OBJECT end -----------------------------------------------
+
+    /// Enough bytes to be served from the arena's high end. `alloc_raw` routes
+    /// on the TOTAL allocation size, so the array data alone has to clear
+    /// `ZGC_LARGE_OBJECT_MIN`.
+    const BIG: usize = ZGC_LARGE_OBJECT_MIN;
+
+    /// **The failure this whole page of work is about, in one test.**
+    ///
+    /// Alternate live and dead large objects at the high end, collect, and ask
+    /// for a block bigger than any single hole. Before the high-end compactor
+    /// that request failed with most of the region free — which is
+    /// `TestMVStoreTool`'s `oom=4` at 64 % free, scaled down to a unit test.
+    ///
+    /// The control is the same heap with the compactor off, and it is what
+    /// makes this a measurement rather than an assertion that the code ran:
+    /// the arm without it must still fail, or the test is passing for some
+    /// reason that has nothing to do with the change.
+    #[test]
+    fn compacting_the_high_end_serves_a_request_no_single_hole_could() {
+        fn run(high_compaction: bool) -> (usize, bool) {
+            let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_high_compaction_enabled(high_compaction);
+            // Six large objects, every other one reachable. The survivors are
+            // the walls: each hole is one object wide and no wider, whatever
+            // the total.
+            let mut keep = Vec::new();
+            for i in 0..6 {
+                let a = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+                if i % 2 == 0 {
+                    keep.push(a);
+                }
+            }
+            let mut roots: Vec<ObjectRef> = keep.clone();
+            {
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            let largest = heap.arena.lock().high_free_shape().2;
+            // Two holes' worth, asked of the FREE LIST rather than of
+            // `alloc_high`. `alloc_high` would also take the shared middle,
+            // which on a 4 MiB heap holding 400 KiB is most of the arena, so a
+            // real allocation here would succeed on both arms and measure
+            // nothing. The workload reaches the free list because the two ends
+            // have met (`used=1073545800 capacity=1073741824` on
+            // `TestMVStoreTool`); this asks the same question without having to
+            // exhaust a heap to do it.
+            let served = largest >= 2 * (BIG + HEADER_SIZE);
+            // Keep the survivors alive across the measurement, or the
+            // collection above was free to reclaim them.
+            assert_eq!(roots.len(), 3);
+            (largest, served)
+        }
+
+        let (off_largest, off_served) = run(false);
+        let (on_largest, on_served) = run(true);
+
+        assert!(
+            !off_served,
+            "the CONTROL must fail: with the high end left alone, three \
+             one-object holes cannot serve a two-object request. It did not, \
+             so this test proves nothing about the arm below"
+        );
+        assert!(
+            on_served,
+            "the request must be servable once the large-object end is \
+             compacted -- that is the entire feature"
+        );
+        assert!(
+            on_largest > off_largest,
+            "and the reason must be a bigger CONTIGUOUS block, not luck: \
+             on={on_largest} off={off_largest}"
+        );
+    }
+
+    /// A reference INTO the large-object end must be rewritten when the object
+    /// it names is packed upward.
+    ///
+    /// The high slide publishes its moves into the same `ZRelocationRecord` the
+    /// low slide uses, so the rewrite pass, the registry rebuild and the
+    /// returned `PointerMap` cover both ends with one mechanism. That is a
+    /// claim about wiring, and wiring is exactly what a second compactor gets
+    /// wrong: a slide that moves objects without rewriting the references
+    /// between them leaves every holder pointing at bytes `compact_high_to`
+    /// has just zeroed.
+    #[test]
+    fn the_high_slide_rewrites_references_into_the_objects_it_moves() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A small holder in the LOW end pointing at a large array in the HIGH
+        // end, with dead large objects on either side of it so the slide has
+        // somewhere to pack it to.
+        heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+        let target = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+        heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+        let holder = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(holder, 0, Value::Object(Some(target)));
+        let before = target.as_ptr() as usize;
+
+        let mut roots = vec![holder, target];
+        {
+            // SAFETY: single-threaded unit test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+
+        let holder_now = roots[0];
+        let Value::Object(Some(target_now)) = heap.get_field(holder_now, 0) else {
+            panic!("the holder's reference must still name an object");
+        };
+        assert_ne!(
+            target_now.as_ptr() as usize, before,
+            "the target had two dead large objects around it; it must have been \
+             packed upward, or this test is not exercising the slide"
+        );
+        assert_eq!(
+            roots[1].as_ptr() as usize,
+            target_now.as_ptr() as usize,
+            "the ROOT and the FIELD must have been rewritten to the same \
+             address; a `PointerMap` that reaches one and not the other is how \
+             half a graph survives a collection"
+        );
+        // And the object at the new address is the one that moved, not
+        // whatever the slide happened to leave there.
+        assert_eq!(
+            heap.header_ref(target_now.as_ptr()).array_length(),
+            BIG as u32,
+            "the address must hold the array, not a corpse"
+        );
+    }
+
+    /// A workload with no large objects must not pay for this pass, and must
+    /// SAY it did not — `cycles=0 declined=0` is "the pass never ran", which is
+    /// a different fact from "it ran and found nothing worth doing", and the
+    /// predecessor feature (`CRATONVM_ZGC_TARGETED_COMPACTION`) shipped for a
+    /// week reading zero because nothing separated the two.
+    #[test]
+    fn the_high_compactor_declines_a_heap_with_no_large_objects_and_counts_it() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        heap.set_tlab_enabled(false);
+        for _ in 0..8 {
+            heap.alloc_object(ClassId::new(1), 4);
+        }
+        let keep = heap.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![keep];
+        {
+            // SAFETY: single-threaded unit test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        let (cycles, _declined, moved, bytes) = heap.high_compaction_engagement();
+        assert_eq!(
+            (cycles, moved, bytes),
+            (0, 0, 0),
+            "a heap whose high end was never used must not be compacted"
+        );
+    }
+
+    /// A PINNED large object splits the region, and the free space on its far
+    /// side must survive.
+    ///
+    /// The slide compacts what is above the pin and stops; everything below is
+    /// left exactly as it was, free list included. Publishing one span over the
+    /// whole region instead would swallow the pinned object, and dropping the
+    /// blocks below it would lose that memory for the rest of the run — the
+    /// failure `Arena::compact_low_to` records having made once at the other
+    /// end (the `repros/frag-churn` OOM with 99 % of the heap dead).
+    #[test]
+    fn a_pinned_large_object_does_not_cost_the_free_space_below_it() {
+        fn run(high_compaction: bool) -> (usize, usize, u32) {
+            let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_high_compaction_enabled(high_compaction);
+            let mut keep = Vec::new();
+            for i in 0..8 {
+                let a = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+                if i % 2 == 0 {
+                    keep.push(a);
+                }
+            }
+            // The high end bumps DOWN, so the LAST survivor allocated sits
+            // lowest and has three dead large objects below it. Pinning it is
+            // what puts free space on the far side of an immovable wall.
+            let pinned = *keep.last().expect("survivors exist");
+            heap.pin_critical(pinned.as_ptr() as usize);
+
+            let mut roots: Vec<ObjectRef> = keep.clone();
+            {
+                // SAFETY: single-threaded unit test.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            let (blocks, free_after, _largest) = heap.arena.lock().high_free_shape();
+            let still_itself = heap.header_ref(pinned.as_ptr()).array_length();
+            heap.unpin_critical(pinned.as_ptr() as usize);
+            assert_eq!(roots.len(), 4);
+            (blocks, free_after, still_itself)
+        }
+
+        let (_off_blocks, off_free, _off_len) = run(false);
+        let (on_blocks, on_free, on_len) = run(true);
+
+        assert!(
+            on_free >= off_free,
+            "a pin must never cost free BYTES. Dropping the blocks on its far              side is how `Arena::compact_low_to` lost 400 MB permanently at the              other end (`repros/frag-churn`, 99 % of the heap dead and an              OutOfMemoryError anyway): on={on_free} off={off_free}"
+        );
+        assert_eq!(
+            on_blocks, 2,
+            "and the shape must be TWO blocks -- one merged above the pin, one              preserved below it. A single block would mean the publish had              swallowed the pinned object"
+        );
+        assert_eq!(
+            on_len, BIG as u32,
+            "the pinned object must not have moved: its old address still has              to hold it, unzeroed and still an array of this length"
+        );
+    }
+
     // -- Phase 4: stop-the-world compaction --------------------------------
 
     /// **The object graph must survive a compaction.**
@@ -15791,6 +16684,70 @@ pub(crate) mod tests {
             heap.get_field(moved_parent, 0),
             Value::Object(Some(unsafe { ObjectRef::from_raw(new_child as *mut u8) })),
             "the reference between two moved survivors was not rewritten"
+        );
+    }
+
+    /// **A slide that cannot drop the cursor must still hand back what it
+    /// emptied.**
+    ///
+    /// Reclaim used to be the cursor drop and nothing else. One survivor on an
+    /// unselected dense page above the compacted region pins the cursor, and
+    /// then the bytes the slide just emptied are neither below the cursor nor
+    /// on the free list -- and no later sweep can find them, because the sweep
+    /// walks the object-start REGISTRY and the slide has just rebuilt it with
+    /// the survivors' NEW bases. Lost for the life of the process.
+    ///
+    /// Measured on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`: four
+    /// compaction cycles, 885 793 objects relocated, largest free block at the
+    /// failing 262 160-byte request **8 184 bytes**.
+    ///
+    /// The control arm is what makes this a measurement: with publication off
+    /// the same heap must reclaim NOTHING here, or the test is passing for a
+    /// reason that has nothing to do with the change.
+    #[test]
+    fn a_slide_that_cannot_drop_the_cursor_still_frees_what_it_emptied() {
+        fn run(publish: bool) -> (usize, usize) {
+            let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_publish_vacated_enabled(publish);
+            // Sparse region: 1 in 16 objects survives, so its pages are far
+            // below `max_live_occupancy` and the selector takes them.
+            let mut survivors = Vec::new();
+            for i in 0..4096 {
+                let o = heap.alloc_object(ClassId::new(1), 32);
+                if i % 16 == 0 {
+                    survivors.push(o);
+                }
+            }
+            // ...and a DENSE tail that is wholly live, so the selector refuses
+            // it and `new_cursor` cannot come down past it. This is the shape
+            // the repair is about; without it the cursor drop alone reclaims
+            // everything and the two arms agree.
+            for _ in 0..512 {
+                survivors.push(heap.alloc_object(ClassId::new(1), 32));
+            }
+            let live: Vec<usize> = survivors.iter().map(|o| o.as_ptr() as usize).collect();
+            let before = heap.arena.lock().free_list_bytes();
+            let (moved, reclaimed, _map) = heap.relocate_stw(&live);
+            assert!(moved > 0, "the sparse pages must have been compacted");
+            let after = heap.arena.lock().free_list_bytes();
+            (after - before, reclaimed)
+        }
+
+        let (off_freed, _off_reclaimed) = run(false);
+        let (on_freed, _on_reclaimed) = run(true);
+
+        assert_eq!(
+            off_freed, 0,
+            "the CONTROL must reclaim nothing to the free list: reclaim was the \
+             cursor drop and nothing else, and the cursor cannot move past the \
+             dense tail. It reclaimed {off_freed}, so this test proves nothing \
+             about the arm below"
+        );
+        assert!(
+            on_freed > 0,
+            "the slide emptied whole logical pages below a pinned cursor and \
+             every one of those bytes was being thrown away"
         );
     }
 

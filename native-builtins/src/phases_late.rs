@@ -7531,6 +7531,56 @@ fn p71_bi_checked_shl(
     Ok(v.shl(k))
 }
 
+/// `obj_arg` for a `java.math.BigInteger` parameter, raising the HELPFUL
+/// `NullPointerException` the shadowed method's own bytecode would have raised.
+///
+/// HotSpot computes these from the bytecode at the throwing BCI plus the
+/// local-variable table (JEP 358, on by default since JDK 15), and **CratonVM
+/// already computes them correctly** -- `apps/probes/HelpfulNpeProbe.java`
+/// measures thirteen shapes (a null local, a null field, an array length, a
+/// load, a store, an unbox, an `athrow`, a `monitorenter`, an interface call)
+/// and every one matches. What flattened them here is the SHADOW: the native
+/// intercepts before the bytecode that would have produced the message, and the
+/// shared [`obj_arg`] -- some 3900 call sites -- has only a generic string to
+/// give.
+///
+/// The proof that it is the shadow and not the machinery is in the probe's own
+/// output. `andNot`, `min`, `max`, `compareTo` and `divideAndRemainder` take a
+/// `BigInteger` and have NO native, so real bytecode runs and their messages
+/// are already right; the thirteen beside them that are shadowed were the
+/// thirteen that were wrong.
+///
+/// The message is a per-METHOD constant because the JDK's is: it names the
+/// first member the real body touches on that parameter, and the parameter's
+/// own declared name. Harvested on HotSpot 25.0.4+7, one row per method.
+fn bi_obj_arg(
+    args: &[Value],
+    idx: usize,
+    npe: &str,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Object(Some(o))) => Ok(*o),
+        _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(npe.to_string()),
+        }
+        .into()),
+    }
+}
+
+/// `add`, `subtract`, `multiply`, `gcd` -- and the unshadowed `min`, `max`,
+/// `compareTo`, whose real bytecode produces this same text today.
+const BI_NPE_SIGNUM_VAL: &str = "Cannot read field \"signum\" because \"val\" is null";
+/// `divide`, `remainder` -- and the unshadowed `divideAndRemainder`.
+const BI_NPE_MAG_VAL: &str = "Cannot read field \"mag\" because \"val\" is null";
+/// `mod`, `modInverse`, and `modPow`'s SECOND parameter.
+const BI_NPE_SIGNUM_M: &str = "Cannot read field \"signum\" because \"m\" is null";
+/// `modPow`'s FIRST parameter.
+const BI_NPE_SIGNUM_EXPONENT: &str = "Cannot read field \"signum\" because \"exponent\" is null";
+/// `and`, `or`, `xor` -- and the unshadowed `andNot`. These four reach
+/// `intLength()` before they read a field.
+const BI_NPE_INTLENGTH_VAL: &str =
+    "Cannot invoke \"java.math.BigInteger.intLength()\" because \"val\" is null";
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7542,7 +7592,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read(ctx, obj_arg(args, 0)?);
-            let b = bi_read(ctx, obj_arg(args, 1)?);
+            let b = bi_read(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_VAL)?);
             let g = bi_gcd_str(&a, &b);
             Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
@@ -7653,7 +7703,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_INTLENGTH_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))?))))
         },
     );
@@ -7663,7 +7713,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_INTLENGTH_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))?))))
         },
     );
@@ -7673,7 +7723,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_INTLENGTH_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))?))))
         },
     );
@@ -7872,14 +7922,35 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             // on limbs (windowed Montgomery for an odd modulus, see
             // `crate::montgomery`), write mag:[I back, with NO decimal round
             // trip.
-            let m_int = bi_read_int(ctx, obj_arg(args, 2)?);
-            if m_int.is_zero() {
+            let m_int = bi_read_int(ctx, bi_obj_arg(args, 2, BI_NPE_SIGNUM_M)?);
+            // `if (m.signum <= 0) throw new ArithmeticException("BigInteger:
+            // modulus not positive")` -- the JDK's first statement, and BOTH
+            // halves of it were wrong here.
+            //
+            // The zero arm threw with the wrong text (`modulus is zero`, where
+            // the sibling `modInverse` thirty lines below already carries the
+            // right one), and the NEGATIVE arm did not throw at all: the code
+            // below took `|m|` on the strength of a comment saying "a negative
+            // modulus is outside the BigInteger spec". Outside the spec is
+            // exactly what the spec REFUSES, so that produced values where the
+            // JDK produces an exception -- a fabricated success, and the worse
+            // half of this defect:
+            //
+            //   a.modPow(TWO, -7)   HotSpot ArithmeticException   was 1
+            //   a.modPow(-3,  -7)   HotSpot ArithmeticException   was 1
+            //   a.modPow(TWO, -1)   HotSpot ArithmeticException   was 0
+            //
+            // `math_bignum.rs`'s own doc comment recorded the correct answer
+            // (`3.modPow(2, -7) !! ArithmeticException: BigInteger: modulus not
+            // positive`) the whole time; nothing linked it to this body.
+            // MEASURED by `apps/probes/BigIntegerSweep.java`.
+            if m_int.is_zero() || m_int.is_neg() {
                 return Err(RuntimeError::ArithmeticException {
-                    message: "modulus is zero".into(),
+                    message: "BigInteger: modulus not positive".into(),
                 }
                 .into());
             }
-            let exp_int = bi_read_int(ctx, obj_arg(args, 1)?);
+            let exp_int = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_EXPONENT)?);
             if !exp_int.is_neg() {
                 let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
                 let res = base_int.modpow(&exp_int, &m_int);
@@ -7891,9 +7962,9 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             // `bi_mod_inverse_str`/`bi_mod_pow_str` round trip this used to take
             // was the last O(digits^2) hop left in modPow.
             //
-            // `mod_inverse` needs a positive modulus; the decimal reference
-            // inverted against `|m|`, so keep that (a negative modulus is
-            // outside the BigInteger spec, which requires m > 0).
+            // `mod_inverse` needs a positive modulus, and the guard above now
+            // guarantees one -- this used to invert against `|m|` instead,
+            // which is what let a negative modulus through.
             let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
             let m_abs = m_int.abs_value();
             let inv = base_int.mod_inverse(&m_abs).ok_or_else(|| {
@@ -7911,7 +7982,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let m = bi_read_int(ctx, obj_arg(args, 1)?);
+            let m = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_M)?);
             if m.signum() <= 0 {
                 return Err(RuntimeError::ArithmeticException {
                     message: "BigInteger: modulus not positive".into(),
@@ -7943,7 +8014,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))?))))
         },
     );
@@ -7953,7 +8024,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))?))))
         },
     );
@@ -7963,7 +8034,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_VAL)?);
             Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))?))))
         },
     );
@@ -7973,7 +8044,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let m = bi_read_int(ctx, obj_arg(args, 1)?);
+            let m = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_SIGNUM_M)?);
             if m.is_zero() || m.is_neg() {
                 return Err(RuntimeError::ArithmeticException {
                     message: "BigInteger: modulus not positive".into(),
@@ -7989,7 +8060,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_MAG_VAL)?);
             if b.is_zero() {
                 return Err(RuntimeError::ArithmeticException {
                     message: "BigInteger divide by zero".into(),
@@ -8005,7 +8076,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
-            let b = bi_read_int(ctx, obj_arg(args, 1)?);
+            let b = bi_read_int(ctx, bi_obj_arg(args, 1, BI_NPE_MAG_VAL)?);
             if b.is_zero() {
                 return Err(RuntimeError::ArithmeticException {
                     message: "BigInteger divide by zero".into(),

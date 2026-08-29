@@ -2,20 +2,30 @@
 
 ## Status
 
-**OPEN 2026-08-24 — one of the two live failures is now FIXED, the other is
-not, and neither is the signature this page was filed for.** The
-`ClassCastException: String cannot be cast to Map$Entry` did not occur once in
-**eleven runs** of this class across seven configurations and roughly two and a
-half hours of runtime, on the 2026-08-23 `dev` tip. The seed the page records
-as the reproducer passes on CratonVM *and* on stock HotSpot 25.
+**RETIRED 2026-08-29. The signature in the title does not reproduce, the one
+live failure this page root-caused is fixed, and the row it could not close has
+moved to its own page.**
 
 | failure | state |
 |---|---|
-| `-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'` | **FIXED** — an unpinned receiver across a GC point; see below |
-| `--Xmx 256m`: a stale/corrupted reference | **OPEN** — THREE faces, ~1 failure in 3 runs of ~20 min, a different signature each time |
-| the recorded `ClassCastException` | **not reproduced**, retired as a starting point |
+| the recorded `ClassCastException: String cannot be cast to Map$Entry` | **NOT REPRODUCED** — zero occurrences in eleven runs across seven configurations and ~2.5 h of runtime; the recorded seed passes on CratonVM *and* on stock HotSpot 25, so the operation sequence is not the lever |
+| `-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'` | **FIXED 2026-08-24** — an unpinned receiver across a GC point in `collect_collection_elements_or_real`; measured by `CRATONVM_DBG_COLL_REFRESH`, 46 and 42 real moves absorbed per run, 3/3 clean past 500 s |
+| `--Xmx 256m`: a stale/corrupted reference with three faces | **MOVED** to `bug-h2-testrandommapops-small-heap-corruption-20260829.md` |
 
-The page stays open on the second row.
+The third row is why this page stayed open, and it was never the defect the
+title names: a different site, a different face each time (`NPE "d" is null` at
+823 s, `NoSuchMethodError` on a truncated-pointer class id at 845 s, SIGSEGV at
+155 s), and `CRATONVM_DBG_COLL_REFRESH` reporting **zero** engagements on the
+failing runs. Keeping it here would have meant this page's title claiming
+something its own evidence contradicts, which is the failure mode its
+*"the recorded message is not the lever, the same way the recorded seed was
+not"* paragraph is about.
+
+Everything below is kept verbatim as the record of how the two closed rows were
+closed — in particular the `--nojit` / `--Xmx 8g` / per-collector table that
+separated "needs a collection" from "needs an EVACUATING collector" from "a lost
+JIT root", and the `COLL-REFRESH` counter that is the difference between "the fix
+works" and "the symptom did not happen this time".
 
 ## The G1 failure: an unpinned receiver across a GC point — FIXED
 
@@ -80,72 +90,20 @@ mappers, `COWAL.addAll`); they are listed here rather than patched blind,
 because nothing measured reaches them and an unmeasured fix to nine sites is
 nine chances to break something.
 
-## The `--Xmx 256m` failure is still open, and has THREE faces
+## The `--Xmx 256m` failure — MOVED
 
-On the **fixed** binary, `--Xmx 256m` (default collector) still fails at
-**845 s** — close to the 823 s this page recorded, but with a different
-message:
+Everything this page had on that row — the three faces, the base rate of about
+one failure in three runs of ~20 minutes, the reading of `2460030832` as a
+truncated pointer rather than a class id, why the segfault's Java frames are not
+a location, and why repro-and-dump is the wrong instrument at that rate — is now
+`docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+unabridged.
 
-```
-NoSuchMethodError: 'boolean <unknown class 2460030832>.equals(java.lang.Object)'
-  at org/h2/test/store/TestRandomMapOps.assertEquals(TestRandomMapOps.java)
-  at org/h2/test/store/TestRandomMapOps.testOps(TestRandomMapOps.java:162)
-```
-
-Same family as the G1 one — a receiver read at an address that no longer holds
-the object it was — but a **different site and a different face**: a garbage
-class id rather than `ClassId(0)`, which is what a recycled address looks like
-once something else has been allocated over it. `CRATONVM_DBG_COLL_REFRESH`
-reports **zero** engagements on that run, so the path fixed above is not
-involved at all.
-
-Two faces (`NullPointerException: "d" is null` at 823 s, this one at 845 s) at
-nearly the same point is itself the finding: the recorded message is not the
-lever, the same way the recorded seed was not.
-
-**A THIRD face, 2026-08-26: SIGSEGV at 155 s.** Five further 256 m runs on the
-post-fix binary, receiver dump armed:
-
-| rep | cap | outcome |
-|---|---|---|
-| 1 | 1300 s | clean to cap |
-| 2 | 1300 s | clean to cap |
-| 3 | — | **SIGSEGV at 155 s** |
-| (earlier) | 1500 s | clean to cap |
-| (earlier) | — | `NoSuchMethodError` at 845 s |
-
-So the measured base rate is **roughly one failure in three runs of ~20 min**,
-and the *face changes every time*. That is the profile of heap corruption
-surfacing wherever the recycled memory happens to land — not of one localised
-defect with one signature.
-
-Two readings that follow from it, both worth having before spending runs:
-
-* **`2460030832` is not a class id.** It reads as a truncated pointer, so that
-  cell had been REUSED, not merely zeroed. That places this at the opposite end
-  of the stale-reference family from the G1 bug fixed above, whose receiver was
-  an all-zero header (`ClassId(0)` = `java.lang.Object`). The two ends need
-  different questions: "who freed it" versus "who else allocated over it".
-* **The segfault's Java frames are not a location.** They name
-  `TzdbZoneRulesProvider.load` / `BufferedInputStream.fill`, but the crash
-  header says in as many words that frames are "published at the last
-  blocking/safepoint deposit — may lag the faulting instruction". Registers at
-  the fault (`rax=0x0000FFFFFFFFFFFC`, `r10=0xFFFFFFFFFFFFFB05`, unreadable)
-  look like a length or index computed off a bad header, which is consistent
-  with the other two faces and NOT with a timezone-loading defect.
-
-**Repro-and-dump is the wrong instrument at this rate.** One in three, twenty
-minutes a run, and a different symptom each time means an attempt costs an hour
-and buys a signature you have not seen before. The next move is to make the
-defect cheaper before diagnosing it — raise the rate (smaller heap: `128m` /
-`192m` were the arms being tried when this was written, results not yet in), or
-find a smaller workload that corrupts the heap the same way. Only then is a
-kill-switch bisect worth running, because only then does a clean arm mean
-something.
-
-Until that exists, no clean arm shorter than the base rate says anything about
-this row — the same trap this page already documents for the
-`ClassCastException`, and the reason the recorded seed was retired.
+It moved because it was never this page's defect: a different site, a different
+face every time, and `CRATONVM_DBG_COLL_REFRESH` reporting **zero** engagements
+on the failing runs, so the receiver-pinning path fixed above is not involved at
+all. Leaving it here would have made this page's title claim something its own
+evidence contradicts.
 
 ## The recorded signature, and why it is not a reproducer
 
@@ -286,7 +244,9 @@ failure, so it is usable as a bisect target. The same command against
 - `docs/known-issues/h2/nonpassed-40-census-20260818.md` §1 — the methodology
   warning about over-reading that WARN shape, which this page's own history
   bears out.
-- `docs/known-issues/h2/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`
+- `docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+  — the `--Xmx 256m` row this page could not close, moved out unabridged.
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the ZGC relocation work whose binary the arms above were A/B'd against.
 - `docs/known-issues/h2/correctness-issues-consolidated.md` — indexes this
   finding alongside the rest of the 48-class union's correctness results.

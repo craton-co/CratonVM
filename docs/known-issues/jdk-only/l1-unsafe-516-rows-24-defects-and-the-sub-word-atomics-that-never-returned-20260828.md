@@ -842,3 +842,59 @@ Recovered with `git checkout --` and redone through a temp file plus
 `os.replace`. Every patch script here now writes that way. This is the second
 time in this session that an `open(..., "w")` destroyed its target before
 failing; the first cost a probe source.
+
+---
+
+## 12. R5 CORRECTED — the fix I specified would have broken a DoD workload
+
+§9.3 measured 0 unclassified null-base offsets across 118 corpus vectors, said
+the specified refusal was "free on this corpus", and declined to take it because
+the corpus excludes the three definition-of-done workloads. **That caution was
+right, and this section is why.**
+
+L7 completed on 2026-08-29: all three DoD workloads now run under `--jdk-only`,
+and the H2 corpus — 218 test classes — is checked out on the build host with a
+per-vector runner that keeps stderr. Its strict run is dated 13:18–13:22, after
+this lane's instrument landed at ~11:20, so the answer was already sitting in
+those logs. **The marker string exists only in this lane's code, so its presence
+in the logs is self-verifying: that binary carried the instrument.**
+
+```text
+UNCLASSIFIED-NULL-BASE, H2 strict corpus, 218 classes
+  org.h2.test.db.TestFullText      11 warn lines, occurrence reached 513   PASS rc=0  57s
+  org.h2.test.unit.TestRecovery     6 warn lines, occurrence reached  17   PASS rc=0  22s
+  the other 216 classes             none
+  every hit:  offset = 0x0
+```
+
+The warn fires on the first occurrence and then at powers of two, so occurrence
+513 means **between 513 and 1024 calls in one passing vector**.
+
+**So the refusal §9.3 specified — an `IllegalArgumentException` for an
+unclassified null-base offset — would have thrown five hundred times inside a
+vector that currently passes.** It is not "licensed but untaken". It is
+measured unsafe, and the 0-of-118 that made it look free was the corpus being
+blind to the workload the path serves. This is the second time in this lane that
+widening the input made a counter confess; the first was the instrument that
+could not fire at all (§9.4).
+
+**The shape is narrower than R5 assumed, and that is the useful part.** Every
+hit is `offset = 0x0` — a null base at absolute address zero, not a scattered
+range of unrecognised offsets. On HotSpot that is a read or write of address 0
+and a SIGSEGV; here it lands in the side store and the caller continues. A
+future fix has one specific case to explain rather than a category:
+
+* what calls `Unsafe.<get/put/CAS>(null, 0)` hundreds of times in H2's full-text
+  and recovery paths, and is it H2's own code, a JDK class, or one of this VM's
+  internal callers? The instrument records the offset but not the caller, so
+  this is the next measurement, not a conclusion.
+* if those calls are writes whose values are never read back, the side store is
+  absorbing a no-op and the correct fix may be at the producer rather than here.
+
+**What is NOT claimed.** The compatible arm of that corpus run has only 5 of 218
+logs, so its zero is an unrun arm, not a measurement — the same trap this record
+already recorded once. And 216 clean classes do not make the other two rare;
+they make them specific.
+
+R5 stays OPEN, with a stronger reason than before: not "unmeasured", but
+"measured, and the obvious fix is refuted".

@@ -433,6 +433,12 @@ fn verify_class_bytecode_inner(
     // verification is never loaded, so half-built maps must not be visible.
     // `publish_class_type_maps` is a CAS install — if `verify_bytecode` also
     // ran for this class the first writer wins and this is a no-op.
+    // The oop-map oracle identifies a compiled frame by NAME (the JIT is
+    // handed class names, not ids), and cannot take the class manager's lock
+    // from inside a stop-the-world scan to resolve one. Recorded beside the
+    // maps so a name that resolves always HAS maps; a no-op unless
+    // `CRATONVM_DBG_VERIFY_OOP_MAPS` is set. See `type_maps::note_class_name`.
+    crate::type_maps::note_class_name(class.id, &class.name);
     crate::type_maps::publish_class_type_maps(class.id, ClassTypeMaps::new(collected));
 
     Ok(())
@@ -581,6 +587,12 @@ pub fn collect_class_type_maps(class: &Class, hierarchy: &dyn ClassHierarchy) ->
 /// ever does run for this class id, its maps are not clobbered by these.
 /// Returns `true` if these maps were the ones installed.
 pub fn publish_deferred_class_type_maps(class: &Class, hierarchy: &dyn ClassHierarchy) -> bool {
+    // The oop-map oracle identifies a compiled frame by NAME (the JIT is
+    // handed class names, not ids), and cannot take the class manager's lock
+    // from inside a stop-the-world scan to resolve one. Recorded beside the
+    // maps so a name that resolves always HAS maps; a no-op unless
+    // `CRATONVM_DBG_VERIFY_OOP_MAPS` is set. See `type_maps::note_class_name`.
+    crate::type_maps::note_class_name(class.id, &class.name);
     crate::type_maps::publish_class_type_maps(class.id, collect_class_type_maps(class, hierarchy))
 }
 

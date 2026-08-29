@@ -34,6 +34,17 @@ public class ItrClassNameProbe {
         pr.setProperty("k", "v");
         pr.setProperty("k2", "v2");
         p("Properties keySet itr", pr.keySet().iterator().getClass().getName());
+        // The VIEW's own class, which is what decides the iterator's.
+        p("Properties keySet cls", pr.keySet().getClass().getName());
+        p("Properties entrySet cls", pr.entrySet().getClass().getName());
+        p("Properties values cls", pr.values().getClass().getName());
+        p("Hashtable keySet cls", ht.keySet().getClass().getName());
+        // Is the keySet a LIVE view of the Properties?
+        pr.setProperty("k3", "v3");
+        p("Properties keySet live size", pr.keySet().size());
+        java.util.Set<Object> ks = pr.keySet();
+        pr.setProperty("k4", "v4");
+        p("Properties keySet live after put", ks.size());
 
         // And the interface the bound reference resolves through.
         Iterator<String> it = hs.iterator();
