@@ -43,6 +43,20 @@ control() {
     | sed -n 's/.*[[:space:]]best_ms=\([^[:space:]]*\).*/\1/p'
 }
 
+# The second control, and on this box the more informative one. An idle
+# RTX 2060 sits at P8 and 300 MHz against a 2100 MHz maximum, and a
+# 32-token run is 1.4 s of work -- not obviously enough to pull it up. A
+# round whose `gpu_mhz` is near idle is measuring the ramp, not the
+# binary. Sampled right after the arms run, so it reports the state they
+# left the device in.
+gpu_mhz() { nvidia-smi --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/dev/null | head -1; }
+
+# How many compiler processes are running. This machine is shared between
+# concurrent sessions and four other `rustc` processes have been observed
+# mid-measurement; a round taken against somebody else's build should be
+# visible rather than silently averaged in.
+busy() { ps -W 2>/dev/null | grep -cE 'rustc|cargo|link\.exe' || echo 0; }
+
 # median submit_ms and the run's own achieved tok/s
 run() {
   ( cd "$APP" && CRATON_EXTRA="-Dllama.craton.verbose=true" \
@@ -63,8 +77,8 @@ run() {
       }'
 }
 
-printf '%-6s %9s | %9s %8s %9s | %9s %8s %9s | %s\n' \
-  round control A_sub A_tok A_norm B_sub B_tok B_norm order
+printf '%-6s %9s %7s %6s | %9s %8s %9s | %9s %8s %9s | %s\n' \
+  round control gpuMHz build A_sub A_tok A_norm B_sub B_tok B_norm order
 tmp="$(mktemp)"
 for r in $(seq 1 "$ROUNDS"); do
   ctl=$(control)
@@ -77,8 +91,8 @@ for r in $(seq 1 "$ROUNDS"); do
   set -- $b; bsub=$1; btok=$2
   read an bn <<<"$(awk -v c="$ctl" -v x="$asub" -v y="$bsub" \
       'BEGIN { if (c+0 > 0) printf "%.4f %.4f", x/c, y/c; else print "0 0" }')"
-  printf '%-6s %9s | %9s %8s %9s | %9s %8s %9s | %s\n' \
-    "$r" "$ctl" "$asub" "$atok" "$an" "$bsub" "$btok" "$bn" "$order"
+  printf '%-6s %9s %7s %6s | %9s %8s %9s | %9s %8s %9s | %s\n' \
+    "$r" "$ctl" "$(gpu_mhz)" "$(busy)" "$asub" "$atok" "$an" "$bsub" "$btok" "$bn" "$order"
   echo "$an $bn" >> "$tmp"
 done
 echo

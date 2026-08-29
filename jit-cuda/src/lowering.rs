@@ -252,6 +252,7 @@ fn lower_method_with_pool_impl(
 
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
+    check_every_branch_has_its_label(&body)?;
 
     let kernel = PtxKernel {
         name: kernel_name,
@@ -375,6 +376,50 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
         kind: PtxParamKind::S32,
     });
     out
+}
+
+/// Refuse a body containing a `bra` to a label it never emits.
+///
+/// A dangling label is not a compile error here and not a runtime error
+/// either: `ptxas` rejects the module, the VM records the method as
+/// unloadable, and the kernel runs on the CPU forever after. The Java
+/// answer stays correct, so every correctness check keeps passing and the
+/// only symptom is a workload that quietly stopped using the GPU. That is
+/// the most expensive kind of bug this file can produce, and it is cheap
+/// to make impossible: the emitter has exactly one label namespace
+/// (`L_body_<pc>` plus a fixed handful), so a text scan settles it.
+///
+/// Written as a whole-body invariant rather than a check inside whichever
+/// transform is under suspicion, because the point is to catch the NEXT
+/// one. The 2026-08-29 if-conversion could consume a block that a
+/// short-circuit `&&`'s first branch still jumped to; this is what makes
+/// that class of mistake loud.
+fn check_every_branch_has_its_label(body: &str) -> Result<(), LoweringError> {
+    let mut labels = std::collections::HashSet::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_suffix(':') {
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                labels.insert(name);
+            }
+        }
+    }
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(idx) = t.find("bra ") else { continue };
+        let target = t[idx + 4..].trim().trim_end_matches(';').trim();
+        if target.is_empty() || target.starts_with('%') {
+            // An indirect branch. Nothing here emits one; if something
+            // ever does, it is not this check's business.
+            continue;
+        }
+        if !labels.contains(target) {
+            return Err(LoweringError::Internal(format!(
+                "emitted `bra {target}` but no `{target}:` label - a block was                  consumed by a transform while something still branched to it"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn mangle(class_name: &str, method_name: &str, descriptor: &str) -> String {
@@ -1283,6 +1328,16 @@ mod tests {
             &lower_fixture("EligibleTernary", "withStore", "([F[F)V").render(),
             "ternary_with_store",
         );
+        ptxas_round_trip(
+            &lower_fixture_with_pool("EligibleTernary", "shortCircuit", "([F[F[F)V").render(),
+            "ternary_short_circuit",
+        );
+        // The one that matters most: the real kernel this whole record is
+        // about, which is where the short-circuit shape came from.
+        ptxas_round_trip(
+            &lower_fixture("EligibleTernary", "select", "([F[F[F)V").render(),
+            "ternary_select_again",
+        );
     }
 
     /// The scalar-bounded shapes must assemble too: the guard reads a
@@ -1832,6 +1887,39 @@ mod tests {
             "a store-carrying diamond must keep its branch:
 {branching}"
         );
+    }
+
+    /// A short-circuit `&&` is refused, and the reason is the label.
+    ///
+    /// `(x > 0 && y > x) ? p : q` compiles to two conditional branches to
+    /// the SAME else-label. The second one's diamond looks perfect: its
+    /// fall-through arm ends in a `goto` to the join, and the else-block
+    /// falls into it. Consuming the else-block would leave the FIRST
+    /// branch's `bra` pointing at a label nothing emits -- and the failure
+    /// would be silent, because `ptxas` rejecting the module makes the VM
+    /// blacklist the method and run it on the CPU, with the right answer.
+    #[test]
+    fn a_short_circuit_condition_is_not_if_converted() {
+        let m = lower_fixture_with_pool("EligibleTernary", "shortCircuit", "([F[F[F)V");
+        let text = m.render();
+        assert!(
+            text.contains("bra L_body_"),
+            "both branches of a short-circuit condition must survive:
+{text}"
+        );
+        // And the whole-body invariant must hold for it, which is the
+        // check that would have caught the bug rather than describing it.
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(idx) = t.find("bra ") {
+                let target = t[idx + 4..].trim().trim_end_matches(';').trim();
+                assert!(
+                    text.contains(&format!("{target}:")),
+                    "`bra {target}` with no `{target}:` label:
+{text}"
+                );
+            }
+        }
     }
 
     /// An arm that STORES is refused, and the refusal comes from the PTX

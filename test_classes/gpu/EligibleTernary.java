@@ -38,6 +38,26 @@ public class EligibleTernary {
         }
     }
 
+    /**
+     * A short-circuit `&&` in the condition: TWO conditional branches to
+     * the SAME else-label.
+     *
+     * The second branch's diamond passes every shape test -- its
+     * fall-through arm ends in a `goto` to the join and the else-block
+     * falls into it -- but consuming that else-block would leave the FIRST
+     * branch jumping to a label nothing emits. `ptxas` rejects the module,
+     * the VM blacklists the method, and the kernel silently runs on the
+     * CPU with the right answer, so a correctness check sees nothing. Both
+     * arms must therefore keep their branches.
+     */
+    public static void shortCircuit(float[] a, float[] b, float[] out) {
+        for (int i = 0; i < out.length; i++) {
+            float x = a[i];
+            float y = b[i];
+            out[i] = (x > 0.0f && y > x) ? y - x : 1.0e9f;
+        }
+    }
+
     /** Both arms store. Speculating either would write a cell the Java
      *  program does not write, so this must stay a branch. */
     public static void withStore(float[] a, float[] out) {

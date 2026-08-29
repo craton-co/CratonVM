@@ -821,8 +821,8 @@ impl<'a> Emitter<'a> {
                         // reconvergence at all. See `plan_if_conversion`.
                         let mut converted = false;
                         if if_conversion_enabled() {
-                            if let Some(plan) =
-                                self.plan_if_conversion(next, target, &starts, index, end)
+                            if let Some(plan) = self
+                                .plan_if_conversion(pc, next, target, &starts, index, start, end)
                             {
                                 if self.try_emit_if_converted(
                                     &plan,
@@ -950,10 +950,12 @@ impl<'a> Emitter<'a> {
     /// they emit rather than from the bytecode they came from.
     fn plan_if_conversion(
         &self,
+        branch_pc: usize,
         next: usize,
         target: usize,
         starts: &[usize],
         index: usize,
+        region_start: usize,
         end: usize,
     ) -> Option<IfConversion> {
         // The branch must end this block and the fall-through must be the
@@ -984,6 +986,23 @@ impl<'a> Emitter<'a> {
         if self.has_control_flow(next, goto_pc) || self.has_control_flow(target, join) {
             return None;
         }
+        // Neither arm may have a predecessor other than this branch.
+        //
+        // This is not a refinement, it is the thing that makes the
+        // conversion legal at all. A short-circuit `a && b ? x : y`
+        // compiles to TWO conditional branches to the SAME else-label,
+        // and the second one's diamond passes every test above -- so
+        // consuming the else-block would leave the FIRST branch's
+        // `bra L_body_<else>` pointing at a label nothing emits. That is
+        // PTX `ptxas` rejects, which the VM turns into a blacklisted
+        // method and a silent CPU fallback: the kernel would still
+        // produce the right answer, just never on the device, and a
+        // correctness check would read BIT_IDENTICAL either way.
+        if self.has_other_predecessor(region_start, end, branch_pc, next)
+            || self.has_other_predecessor(region_start, end, branch_pc, target)
+        {
+            return None;
+        }
         Some(IfConversion {
             then_start: next,
             then_goto_pc: goto_pc,
@@ -1006,6 +1025,44 @@ impl<'a> Emitter<'a> {
             pc += size;
         }
         last
+    }
+
+    /// Whether any control transfer in `[from, to)` other than the one at
+    /// `this_branch` targets `block`.
+    ///
+    /// Conservative by construction: an undecodable instruction or a
+    /// switch (whose table this does not read) answers "yes", which
+    /// refuses the conversion rather than risking a dangling label.
+    fn has_other_predecessor(
+        &self,
+        from: usize,
+        to: usize,
+        this_branch: usize,
+        block: usize,
+    ) -> bool {
+        let mut pc = from;
+        while pc < to {
+            let Ok(size) = instr_size(self.bytes, pc) else {
+                return true;
+            };
+            if size == 0 || pc + size > to {
+                return true;
+            }
+            let op = self.bytes[pc];
+            match op {
+                0xAA | 0xAB => return true,
+                0x99..=0xA4 | 0xA7 | 0xC6..=0xC8 if pc != this_branch => {
+                    match self.branch_target(pc, op) {
+                        Ok(t) if t == block => return true,
+                        Err(_) => return true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            pc += size;
+        }
+        false
     }
 
     /// Whether `[from, to)` contains any branch, switch or return.
