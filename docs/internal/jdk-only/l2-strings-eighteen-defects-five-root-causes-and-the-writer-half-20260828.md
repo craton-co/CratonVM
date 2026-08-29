@@ -436,6 +436,127 @@ and that note's banner says so.
 
 ---
 
+---
+
+## 8. The retirement, SIMULATED — and the two numbers that decide it
+
+`WORKER-3-NOTE-3` §6 N1 named the acceptance test for the layout migration and
+this lane had not run it: **`RStringBuilderContent` with
+`CRATONVM_ENFORCE_NATIVE_SHADOW` armed on the three builder classes.** That note
+§5 was explicit about what it had NOT established — *"The armed StringBuilder arm
+is NOT green, and this record does not claim the registrar is now safe to arm"*,
+and *"no arm of `regression-suite/run.sh` was run with
+`CRATONVM_ENFORCE_NATIVE_SHADOW` set"*.
+
+Both have now been run.
+
+### 8.1 The dial FIRED — checked before the result was read
+
+An armed pass is worth nothing if arming changed no dispatch. So the
+`--jdk-only-report` was taken both ways over the same vector and the OUTCOME of
+this lane's three families compared:
+
+```text
+                       unarmed              armed
+L2-family shadow rows  75                   67
+  native-won           39                   0
+  bytecode-won         36                   67
+triples whose outcome flipped native-won -> bytecode-won:   38
+triples the armed run reached that the unarmed one did not: 27
+```
+
+**Zero native-won.** Every registered builder operation — `<init>`, `append` in
+eight overloads, `insert`, `delete`, `replace`, `reverse`, `charAt`, `getChars`,
+`getValue`, `getCoder`, `capacity`, `length`, `substring`, `repeat`,
+`codePointAt`, `codePointCount`, `indexOf` — yielded to real JDK bytecode. That
+is the retirement, minus the registration edit.
+
+### 8.2 Correctness: the retirement costs NOTHING
+
+```text
+RStringBuilderContent   armed   PASS (118 checks)   unarmed  PASS (118 checks)
+RStrings                armed   PASS (46)           unarmed  PASS (46)
+RJdkStringCodePoints    armed   PASS (186)          unarmed  PASS (186)
+RJitStringLayout        armed   PASS (7)            unarmed  PASS (7)
+
+probes/StringBuilderShadowSweep.java, ARMED, against HotSpot jdk-25.0.4+7
+    747 rows, 0 differing lines
+
+the whole --jdk-only regression corpus, ARMED on the three classes
+    111 of 112
+```
+
+`WORKER-3-NOTE-3` §3 measured `RStringBuilderContent` armed dying after 56
+assertions with `ArrayStoreException: arraycopy: type mismatch: can not copy
+byte[] into char[]`. It completes all 118 now, with every builder call running
+real `AbstractStringBuilder` bytecode against CratonVM's objects — which is the
+strongest statement available that the objects ARE real, and it is a stronger
+one than this lane's own 0-diff probe, because the dial produces by construction
+the mixed native/bytecode traffic that created the torn object in the first
+place.
+
+The single corpus failure is `RJdkEnumerations`, and it is not the dial's — §8.4.
+
+### 8.3 Throughput: the retirement costs 2.0x to 3.4x
+
+The same dial, the same binary, `apps/probes/SbLayoutBench.java`,
+ABBA-interleaved over four rounds, on a host at load average 6:
+
+```text
+shape          A (natives, today)      B (armed = retired)     B/A
+appendString   1375 [1296-1492]        2774 [2684-3072]        2.02x  slower
+appendChar      914 [ 850- 933]        2358 [2196-2509]        2.58x  slower
+appendInt       954 [ 905-1001]        2404 [2256-2562]        2.52x  slower
+toString         28 [  25-  46]          32 [  27-  45]        1.14x  ranges overlap
+charAt         5482 [5015-6860]       18691 [16914-19571]      3.41x  slower
+inflating      2876 [2753-2951]        5779 [5440-6410]        2.01x  slower
+```
+
+Five of six shapes separate cleanly — non-overlapping ranges, eight samples each
+way. **So `java/lang/StringBuilder`'s 62 rows are retirable on correctness and
+expensive on throughput**, and that is the whole answer to §7's N2, which had
+been "declined, take N1's number first". Both numbers exist now:
+
+* the layout migration itself costs nothing measurable (§6) — so the natives are
+  not carrying the object model any more, they are carrying speed;
+* retiring them costs 2-3.4x on the hottest path in the VM.
+
+`toString` is the exception and it says why the rest are what they are: it is
+the one shape where the native and the bytecode do the same amount of work, so
+it is the one shape where the dispatch route does not decide the cost.
+
+**This lane therefore leaves the registrations in place, and the reason is a
+measurement rather than a caution.** A future lane that wants them gone needs a
+different argument — a JIT intrinsic for the bytecode path, most likely — not a
+re-run of this one.
+
+### 8.4 `RJdkEnumerations`, which every lane has been writing off, is not what the brief says
+
+The brief's known-red list still reads *"`RJdkEnumerations` — dev's `a0168ed03`,
+bisected, recorded"*, and the scope table records L6 as having FIXED the
+`ConcurrentHashMap.elements()` mechanism behind it. Under `--jdk-only` it still
+fails, and MEASURED here, running the vector directly on the final binary:
+
+```text
+unarmed  rc=1  NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
+armed    rc=1  NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
+```
+
+**Identical both ways**, so it is not this lane's dial and not this lane's
+families. It is a FABRICATED compatibility class that `--jdk-only` refuses — the
+Phase-1 shape the roadmap tracks separately, not a shadow-retirement item at
+all.
+
+What the next reader needs to know before starting: the obvious mint site is not
+the one. `native-collections/src/lib.rs:7206` (`alloc_arraylist_iterator`)
+already HAS the refusal landing, added for exactly this symptom and documented
+at length there — it falls back to `real_snapshot_iterator` over an
+exact-length copy. So the surviving request comes from somewhere else, and
+`grep AL_VIEW_ITR_CLASS` shows the other candidates are the three
+`r.register(AL_VIEW_ITR_CLASS, …)` rows: a native registered on a fabricated
+class NAME, where the class may be resolved for dispatch rather than allocated.
+**Unowned** — L3 owned `java.util` and is closed.
+
 ## INDEX ROW
 
 * `l2-strings-...` — L2's three families: 118 native-won triples probed at 747
