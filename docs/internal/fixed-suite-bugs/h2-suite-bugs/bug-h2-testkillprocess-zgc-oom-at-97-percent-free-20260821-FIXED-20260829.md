@@ -1940,6 +1940,21 @@ on `TestMultiThread`, which passes. A cycle the handshake refuses does not
 relocate at all, so none of the four repairs above runs on it. That is where
 `TestCachedQueryResults` should be attacked, and it is on its own page now.
 
+And the eight-bucket census the flag was there for, run on the same class
+(`CRATONVM_DBG_OOPCOV=1`):
+
+```text
+scauses(gate=0 desync=0 marks=83 scratch=0 locals64=0
+        dataflow=151 nopush=0 inline_scope=5)
+```
+
+**`dataflow=151` and `marks=83` are the whole of it.** The forward "must be
+oop" dataflow never reaching a bytecode pc (so there is no local oop mask to
+publish from), and the operand-stack oop marks not being exact at the safepoint
+(a revived dead-code merge reconstructing the stack at a nonzero depth). Not the
+gate, not a missing push, not a slot count. Two shapes to attack, both in the
+compiler rather than the collector.
+
 ### 10. …and the census below is still the instrument for it
 
 §"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the

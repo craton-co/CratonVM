@@ -74,6 +74,20 @@ before attacking the allocator.**
 carried: it recorded `incomplete=5` here as *"the first time anywhere that a map
 refuses on its OWN claim"*. It does not reproduce on this tip.
 
+`CRATONVM_DBG_OOPCOV=1` on the same class says which shapes DO make a
+safepoint's shadow claim incomplete at compile time:
+
+```text
+scauses(gate=0 desync=0 marks=83 scratch=0 locals64=0
+        dataflow=151 nopush=0 inline_scope=5)
+```
+
+`dataflow=151` (the forward "must be oop" dataflow never reached that bytecode
+pc, so there is no local oop mask to publish from) and `marks=83` (the
+operand-stack oop marks are not exact there — a revived dead-code merge
+reconstructing the stack at a nonzero depth). Both are compiler shapes, not
+collector ones, and both feed the refusal above.
+
 ## What to do first
 
 1. **Find the retry loop.** `rc=124` at the cap with `oom` in the thousands is a
