@@ -27,7 +27,7 @@ been removed again.
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 
 **All seven lanes are DONE** — L1 through L7, the last of them on 2026-08-29.
-Six of the seven lane handoffs are retired to `docs/internal/jdk-only/`; L5's
+Six of the seven lane handoffs are retired to `internal/jdk-only/`; L5's
 lives with its records in this directory.
 
 **This page is NOT retired with them, and should not be.** Three things on it
