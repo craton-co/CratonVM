@@ -56,8 +56,8 @@ characteristic rather than a host artifact, and it stays open —
 [hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead-20260817.md)
 is the detail.
 | `annotations.uniqueconstraint.UniqueConstraintBatchingTest` | PASS | PASS | No longer reproduces |
-| `query.hql.FunctionTests` | PASS (124/118/6skip) | PASS (124/118/6skip) | No longer reproduces |
-| `query.hql.StandardFunctionTests` | PASS (44/44) | PASS (44/44) | No longer reproduces |
+| `query.hql.FunctionTests` | PASS (124/118/6skip) | PASS (124/118/6skip) | Host locale — see below |
+| `query.hql.StandardFunctionTests` | PASS (44/44) | PASS (44/44) | Host locale — see below |
 
 `HqlParserMemoryUsageTest` (regression test for upstream `HHH-19240`) asserts a
 single cold HQL parse allocates under 256 MiB. A standalone probe replicating
@@ -79,6 +79,37 @@ on both VMs with byte-for-byte matching `found/ok/failed/skipped` counts.
 `dev` moves fast; whatever caused the earlier Windows failures has already
 been resolved by unrelated fixes merged since. They are not currently known
 issues.
+
+### The two `testFormat` rows are the HOST LOCALE, and the harness was missing the sysprop that pins it
+
+**Measured 2026-08-29.** `FunctionTests.testFormat` and
+`StandardFunctionTests.testFormat` came back red on the Windows host's H2
+complete-suite run with
+
+```
+Expected: is "Monday, 25/03/1974"
+     but: was "понедельник, 25/03/1974"
+```
+
+The A/B settles it in four runs on that host — the two VMs agree in **both**
+arms:
+
+| VM | `-Duser.language=en -Duser.country=US` | result |
+|---|---|---|
+| real HotSpot | no | **FAIL** — `"понедельник, 25/03/1974"` |
+| real HotSpot | yes | PASS |
+| CratonVM | no | **FAIL** — `"понедельник, 25/03/1974"` |
+| CratonVM | yes | PASS |
+
+hibernate-orm's own Gradle build sets that pair on every test JVM
+(`local-build-plugins/src/main/groovy/local.java-module.gradle:260-261`), and
+`apps/hib-suite-runner/common.args` carried `-Duser.timezone=UTC` but not the
+locale half — so the harness was running the suite in a configuration upstream
+never runs it in, on the one host whose OS locale is not English. The two rows
+are now in the tracked-by-intent `required-sysprops.tsv` (`run-hib.sh sysprops`
+reports `state: 4 (3 injected)`), which is the mechanism that exists precisely
+because `common.args` is generated and untracked. Same family as the
+`ru_RU` hibernate-validator row in the Hibernate Reactive section below.
 
 No HANGs exist in the current default-collector Hibernate ORM full-suite
 baseline (`FAIL=4→1, HANG=0, ABORTED=6` matching the known-benign self-skip

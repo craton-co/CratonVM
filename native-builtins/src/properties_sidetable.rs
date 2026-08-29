@@ -2468,6 +2468,9 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // `snapshot_sidetable` is the other public reader and is not usable here:
     // it renders each entry `to_lossy()`, and a clone must not quietly mangle
     // a key or value whose text this VM stores faithfully but cannot render.
+    //
+    // Two lanes fixed this witness independently and met in a merge; the
+    // surviving copy is the one that also refreshes the receiver below.
     let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already

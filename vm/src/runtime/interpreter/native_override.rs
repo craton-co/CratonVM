@@ -2824,6 +2824,28 @@ pub(super) fn force_native_over_real_jdk_bytecode(
             // attempts each failed).
             | "java/util/concurrent/ConcurrentHashMap$KeyIterator"
             | "java/util/concurrent/ConcurrentHashMap$EntryIterator"
+            // The two remaining collection families, 2026-08-29 (L3 residual
+            // 6.1). `TreeMap$KeyIterator` above already covers `TreeSet` and
+            // `TreeMap.keySet()`; these are the other two receivers that were
+            // handing out a class HotSpot does not name -- `ArrayDeque` and
+            // `PriorityQueue` answered `Arrays$ArrayItr` and `ArrayList$Itr`.
+            //
+            // WITHOUT THESE ROWS THE REGISTRATION IS SILENT, and it fails in
+            // the most confusing available way: the real bodies run, walk
+            // declared fields nothing populated, and report the collection
+            // EXHAUSTED. Measured exactly that on the first build --
+            // `PqOptionalShadowSweep` died at row 54 with
+            // `NoSuchElementException: No more elements` from a freshly minted
+            // iterator over a three-element queue. The inverse of
+            // `a-force-native-gate-entry-with-no-registration-is-silent`, and
+            // the same lesson: a registration and its gate row are one edit.
+            //
+            // Each is single-producer -- `native_ad_iterator` and
+            // `native_pq_iterator` are the only mint sites, and both families'
+            // `iterator()` is itself overridden, so no bytecode path can
+            // present an object of either class to these natives.
+            | "java/util/ArrayDeque$DeqIterator"
+            | "java/util/PriorityQueue$Itr"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {
         return true;
