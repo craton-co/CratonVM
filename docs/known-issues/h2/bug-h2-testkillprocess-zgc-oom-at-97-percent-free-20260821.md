@@ -1628,6 +1628,21 @@ free_list_bytes=797496464 largest_free_block=8184
 large-object request this page opened on, a ten-kilobyte one. That arm reports
 `vacated_spans=0 vacated_bytes=0`, which is what the switch is for.
 
+**The page's own class, on the merged tip with all four repairs:**
+
+```text
+org.h2.test.store.TestKillProcessWhileWriting  rc=0  secs=403  oom=0  arena=0
+  compaction_cycles=47 objects_relocated=336650
+  relocation_skipped_jit=4 relocation_on_proven_jit=46
+  zgc-high-compaction: cycles=16 declined=31 objects_relocated=24
+                       bytes_copied=25166208
+                       vacated_spans=996 vacated_bytes=2082517560
+```
+
+`rc=0`, and **46 of 47 collections compacted** — the number this page spent
+2026-08-21 to 2026-08-26 getting off the floor, still there. 2.08 GB of vacated
+span republished on the way.
+
 **Closed in code, not only in prose.** `recycled_chunk_size` now takes the
 publication's state and the starved floor is inert without it
 (`starved_recycle_permitted`), with a test carrying these numbers. Both default
