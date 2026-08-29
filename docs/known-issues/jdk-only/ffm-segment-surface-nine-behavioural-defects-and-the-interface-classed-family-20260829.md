@@ -217,10 +217,45 @@ fields included -- these are the layouts a by-name resolver has to land on:
   jdk.internal.foreign.layout.StructLayoutImpl       6   (kind, elements, minByteAlignment + the same three)
 ```
 
-None of them is large. The segment family is the one that also clears
-`compatibility_classes > 0`, since it is the only one with a fabricated
-stand-in; it is also the widest, at 118 registered natives to move rather than
-the arena's 14.
+None of them is large -- **but the field count is the wrong axis, and it is the
+axis I first priced them on.** What the move costs is step 2 of the recipe: the
+number of places that read those fields by a RAW INDEX, each of which has to go
+through the resolver or become the next `Arena is closed`. Counted by walking
+every function in the two files and matching `get_field(x, N)` / `set_field(x, N)`:
+
+```text
+                    functions   raw-index accesses   already by-name
+  layout family        19              37                  2
+  segment family       17             112                 19
+  (arena, for scale)    3               4                  0
+```
+
+**So the layout families really are the smaller half -- by 3x, not by the
+handful the field counts suggested -- and the arena was smaller than either by
+an order of magnitude.** That is why it went first and why it was the right
+place to learn the recipe; it is not evidence that the others are the same size.
+
+Two things the count does not show, both found while sizing it:
+
+* **The layout accessors already SHAPE-GUESS between carriers**, which is the
+  same species as the width test in §4.3 and has to be replaced in the same
+  change, not after it. `p67_layout_name_value` picks slot 2 or slot 3 by asking
+  whether slot 0 holds an `Int`; `p67_layout_byte_alignment` reads slot 1 and
+  falls back to slot 0 when it is not a `Long`. Value, group and sequence
+  carriers all pass through them. Move one family and the others' reads move
+  with it, so the layout half is **all thirteen carriers or none** -- nine
+  `ValueLayout`s plus struct, sequence, union and padding.
+* **Some of the work is already done, and it argues the design is right.**
+  `p67_layout_is_little` resolves the real `order` field BY NAME and separates
+  real from fabricated by asking `declared_fields` for `carrier`/`order`;
+  `p67_layout_carrier_name` already answers for both spellings; and
+  `ValueLayouts$OfIntImpl` carries 11 of the interface's 17 natives, needing
+  only `byteSize`, `byteAlignment`, `byteOffset` and `varHandle`. `StructLayoutImpl`
+  and `SequenceLayoutImpl` carry none of theirs (0 of 7, 0 of 10).
+
+The segment family remains the one that clears `compatibility_classes > 0`,
+since it is the only one with a fabricated stand-in -- and it is now measured as
+the most expensive of the three, not merely the widest by native count.
 
 ## 5. Reproduce
 
