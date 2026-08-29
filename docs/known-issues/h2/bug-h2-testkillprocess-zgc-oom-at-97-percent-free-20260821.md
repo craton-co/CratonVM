@@ -28,6 +28,14 @@
 > feature this work supersedes shipped reading zero for a week and the only
 > reason anyone found out is that it carried a counter.
 >
+> **One tracked class is NOT fixed.** `org.h2.test.jdbc.TestCachedQueryResults`
+> still livelocks — `oom=2990` in 900 s on the fixed tip against 18 048 in
+> 1 500 s before, a 3.6x lower rate and the same outcome. It throws thousands
+> and keeps running, which is a different shape from every other class here
+> (those failed once and died), so something is catching and retrying and that
+> is not a collector question. It has its own page:
+> `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+>
 > **Everything below this box is the record of how the diagnosis got here**,
 > including three attributions this page had to withdraw. Read
 > §"What this page no longer tracks, and where it went" for where each 2026-08-28
@@ -1907,8 +1915,16 @@ it.
 | `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
 | `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` | `bug-h2-testkillprocesswhilewriting-g1-oom-20260829.md` |
 | the same fragmentation symptom in Spring Framework and Hibernate, never censused | `../gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md` |
+| `TestCachedQueryResults`: still a LIVELOCK, `oom=2990` in 900 s on the fixed tip against 18 048 in 1 500 s before — a 3.6× lower rate and the same outcome | `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` |
 
-Each of those was already labelled "not this defect" here, with a measurement
+The last row is the one that matters most, and it is the reason this page
+retires with a caveat rather than a clean sweep: **`TestCachedQueryResults` is
+not fixed.** It throws thousands of `OutOfMemoryError` and keeps running, which
+is a different shape from every other class here — those failed once and died.
+Something catches and retries, and that is not a collector question. A rate
+improvement on a livelock is not a fix and this page does not claim one.
+
+The others were already labelled "not this defect" here, with a measurement
 behind the label; splitting them out is what stops this page's Status line from
 being read as a verdict on them. The G1 one in particular has a five-arm
 interleaved A/B behind it and is identical before and after every repair on
