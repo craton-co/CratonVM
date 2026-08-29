@@ -2458,10 +2458,18 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return crate::native_object_clone(ctx, args);
     };
     // Snapshot before anything allocates: this side-table IS the store.
-    // `snapshot_kv`, not the public `snapshot_sidetable`: the latter renders
-    // each entry `to_lossy()`, and a clone must not quietly mangle a key or
-    // value whose text this VM stores faithfully but cannot render.
-    let entries = snapshot_kv(ctx, this);
+    // `ordered_snapshot_kv`, not the public `snapshot_sidetable`: the latter
+    // renders each entry `to_lossy()`, and a clone must not quietly mangle a
+    // key or value whose text this VM stores faithfully but cannot render.
+    //
+    // ORDERED, because these entries become the CLONE's iteration order --
+    // `only_order_insensitive_functions_read_the_unordered_snapshot` is exactly
+    // this question, and it went red when this function and that witness met in
+    // a merge: each landed green from a different lane, and the unordered read
+    // here would have handed a `FxHashMap` order to every caller that walks the
+    // copy.
+    let mut this = this;
+    let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
@@ -2534,7 +2542,13 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // Snapshot first: the function is free to call back into this Properties,
     // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
-    let entries = snapshot_kv(ctx, this);
+    //
+    // ORDERED, because `replaceAll` VISITS the entries and the function it is
+    // handed is free to have side effects, so the order is observable -- the
+    // same question `only_order_insensitive_functions_read_the_unordered_snapshot`
+    // asks, which this function met in a merge with.
+    let mut this = this;
+    let entries = ordered_snapshot_kv(ctx, &mut this);
     if entries.is_empty() {
         return Ok(None);
     }
