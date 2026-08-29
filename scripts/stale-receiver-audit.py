@@ -76,8 +76,7 @@ CRATES = ["native-builtins", "native-collections", "native-io", "native-api",
 ALLOC0 = re.compile(
     r"\balloc_ref_array\b|\btry_alloc_synthetic\b|\bctx\.alloc_object\b"
     r"|\bctx\.new_array\b|\bctx\.new_string\b|\bctx\.alloc_"
-    r"|\bctx\.invoke\b|\bctx\.invoke_virtual\b|\bctx\.invoke_static\b"
-    r"|\bctx\.invoke_special\b|\bctx\.invoke_interface\b"
+    r"|\bctx\.invoke[a-z_0-9]*\s*\("
     r"|\bctx\.ensure_class_initialized\b|\bctx\.intern\b|\bctx\.box_")
 FNDEF = re.compile(r"^(pub(\([a-z ]+\))? )?(async )?(unsafe )?fn ([a-z_][a-z_0-9]*)")
 CALL = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\(\s*ctx\s*,\s*([a-z_][a-z_0-9]*)\s*\)")
