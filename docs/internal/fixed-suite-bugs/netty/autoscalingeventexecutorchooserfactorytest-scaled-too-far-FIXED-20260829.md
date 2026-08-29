@@ -8,18 +8,20 @@ A/B'd against itself with `CRATONVM_WIN_HIRES_PARK`:
 
 | arm | pass | fail |
 |---|---:|---:|
-| `CRATONVM_WIN_HIRES_PARK=0` (pre-fix behaviour) | 54 | **23** |
-| default (fixed) | **77** | **0** |
+| `CRATONVM_WIN_HIRES_PARK=0` (pre-fix behaviour) | 60 | **29** |
+| default (fixed) | **89** | **0** |
 
-77 runs per arm over four batches, the last three interleaved run-for-run so
+89 runs per arm over five batches, the last four interleaved run-for-run so
 host drift lands on both arms equally: 12/12 vs 10/12, 25/25 vs 22/25, 20/20 vs
-15/20, and 20/20 vs 7/20 on the final binary. The OFF arm's rate is not stable
+15/20, 20/20 vs 7/20, and 12/12 vs 6/12 after merging 121 commits of `dev`
+and rebuilding. The OFF arm's rate is not stable
 between batches (2/12 to 13/20) and is not expected to be — it is a beat
 between two ~50 ms periods, so its phase, and with it the fraction of runs that
 step over the window, drifts with anything that moves either one. What is
 stable is the fixed arm: 77 runs, 0 failures.
 
-Also `regression-suite/run.sh` 76/76, and a 150-class netty slice (every
+Also `regression-suite/run.sh` 77/77 on the post-merge binary, and a 150-class
+netty slice (every
 `io.netty.util.*`, `io.netty.channel.*`, `io.netty.resolver.*`,
 `io.netty.bootstrap.*`, `io.netty.handler.proxy.*`) run on the pre-branch and
 post-branch binaries: identical, except `ProxyHandlerTest` going 8 failures to
