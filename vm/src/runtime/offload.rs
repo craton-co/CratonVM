@@ -68,6 +68,7 @@ use crate::config::VmConfig;
 use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::method::ClassFileMethod;
 
+use cratonvm_native_api::registry::GpuErrorKind;
 use cuda_bridge::{DeviceContext, DeviceModule};
 use jit_cuda::annotations::read_method_annotations;
 use jit_cuda::emitter::PtxModule;
@@ -428,11 +429,33 @@ impl OffloadCache {
             }
         };
 
+        // AUDIT 2026-08-28: honour `@GpuKernel(blockX = ...)`.
+        //
+        // `block_x` was parsed off the annotation and then read by
+        // nothing, so a user who picked a block size got the
+        // occupancy-tuned one instead and no indication that their
+        // choice had been discarded. Seeding the memo with it is exactly
+        // what the memo is for: a non-zero value means "already decided",
+        // so the launch path skips the `cuOccupancyMaxPotentialBlockSize`
+        // round trip and uses this. Zero keeps the autotuned default,
+        // which is what `blockX`'s Java documentation already promises
+        // that value means.
+        //
+        // `blockY` / `blockZ` are deliberately still not honoured: the
+        // only launch shape the emitter produces is 1-D, so a Y or Z
+        // extent has nothing to apply to. The analyzer rejects a kernel
+        // that asks for one rather than ignoring it — same reasoning as
+        // `UnsupportedGridShape`.
+        let declared_block = method_annotations
+            .gpu_kernel
+            .as_ref()
+            .map(|k| k.block_x)
+            .unwrap_or(0);
         let kernel = Arc::new(CompiledKernel {
             module,
             signature: sig,
             kernel_name,
-            block_size: std::sync::atomic::AtomicU32::new(0),
+            block_size: std::sync::atomic::AtomicU32::new(declared_block),
         });
         self.kernels.write().insert(key, Arc::clone(&kernel));
         LookupOutcome::Hit(kernel)
@@ -1112,6 +1135,7 @@ mod tests {
             event: None,
             status: parking_lot::Mutex::new(SubmissionStatus::Failed {
                 message: "test: dispatch-time failure".to_string(),
+                    kind: GpuErrorKind::Unknown,
             }),
             finalize: parking_lot::Mutex::new(None),
             device_done: std::sync::atomic::AtomicBool::new(false),
@@ -1559,8 +1583,14 @@ pub enum SubmissionStatus {
     /// Kernel finished; payload is ready for the Java side to consume.
     Completed { result: SerializedResult },
     /// Dispatch or launch failed. The Java layer surfaces `message`
-    /// as `GpuException`.
-    Failed { message: String },
+    /// as `GpuException`, and picks which `GpuException` subclass from
+    /// `kind` — recorded here, at the point of failure, rather than
+    /// reconstructed on the Java side by matching substrings against
+    /// the driver's wording.
+    Failed {
+        message: String,
+        kind: GpuErrorKind,
+    },
 }
 
 /// Async kernel submission handle.
@@ -1965,6 +1995,7 @@ impl OffloadCache {
                         "no CUDA device available (class_id={:?}, method={})",
                         class_id, method_index,
                     ),
+                    kind: GpuErrorKind::Launch,
                 });
             }
         };
@@ -1980,6 +2011,7 @@ impl OffloadCache {
                         "no compiled kernel for class_id={:?} method={} (lookup_or_compile not called?)",
                         class_id, method_index,
                     ),
+                    kind: GpuErrorKind::Compile,
                 });
             }
         };
@@ -2062,6 +2094,7 @@ impl OffloadCache {
                                                 "chunked join wait (lo={}): {e}",
                                                 c.lo
                                             ),
+                                            kind: GpuErrorKind::Launch,
                                         });
                                     }
                                 }
@@ -2086,6 +2119,7 @@ impl OffloadCache {
                             // writeback and returning stale Java state.
                             return make(SubmissionStatus::Failed {
                                 message: format!("chunked dispatch failed: {msg}"),
+                    kind: GpuErrorKind::Launch,
                             });
                         }
                     }
@@ -2107,6 +2141,7 @@ impl OffloadCache {
             {
                 return make(SubmissionStatus::Failed {
                     message: format!("launch_on_stream({}): {}", kernel.kernel_name, e,),
+                    kind: kind_of_device_error(&e),
                 });
             }
         }
@@ -2123,12 +2158,14 @@ impl OffloadCache {
             Err(e) => {
                 return make(SubmissionStatus::Failed {
                     message: format!("Event::new after launch: {e}"),
+                    kind: kind_of_device_error(&e),
                 });
             }
         };
         if let Err(e) = stream.record_event(&event) {
             return make(SubmissionStatus::Failed {
                 message: format!("Stream::record_event: {e}"),
+                    kind: kind_of_device_error(&e),
             });
         }
 
@@ -2251,11 +2288,69 @@ fn submissions(
 /// handle. The caller (typically the Java glue right after
 /// `dispatch_async`) keeps the handle and hands it back when the Java
 /// side polls for completion.
+/// Live-submission count past which [`register_submission`] starts
+/// warning.
+///
+/// AUDIT 2026-08-28: a submission that has not been finalized owns its
+/// host-side writeback buffers, its device buffers, and a GC-critical
+/// token — and the collector deliberately steps aside while such a token
+/// is alive (`Heap::gpu_blocked_gc_count` counts the bail-outs). A caller
+/// that dispatches in a loop without draining therefore does not merely
+/// leak: it holds collection off for the whole run while the leak grows,
+/// and neither `-Xmx` nor the Java-side cleaner can recover anything,
+/// because both need a collection to happen. A benchmark doing exactly
+/// that — a thousand un-drained `dispatchNamedHandle` calls — exhausted
+/// 64 GB of host RAM and hung the machine, with no diagnostic anywhere
+/// on the way down.
+///
+/// A legitimate deep pipeline is nowhere near this: the fire-and-forget
+/// pattern this supports is tens of kernels between waits, not thousands.
+#[cfg(feature = "gpu-offload")]
+const SUBMISSION_WARN_THRESHOLD: usize = 1024;
+
+/// Register `sub` in the global submission table and return its
+/// handle. The caller (typically the Java glue right after
+/// `dispatch_async`) keeps the handle and hands it back when the Java
+/// side polls for completion.
+///
+/// Warns — once per doubling past [`SUBMISSION_WARN_THRESHOLD`], so the
+/// log cannot itself become the flood — when the number of live
+/// submissions suggests the caller is not draining. Deliberately a
+/// warning and not a hard cap: refusing a dispatch would turn a
+/// recoverable leak into a failed kernel for a caller whose pipeline is
+/// merely deep, and the VM has no way to tell those apart. The warning
+/// names the obligation and the two calls that discharge it, which is
+/// what was missing when this cost a machine.
 #[cfg(feature = "gpu-offload")]
 pub fn register_submission(sub: std::sync::Arc<StreamSubmission>) -> u64 {
     let h = sub.handle;
-    submissions().write().insert(h, sub);
+    let live = {
+        let mut table = submissions().write();
+        table.insert(h, sub);
+        table.len()
+    };
+    if live >= SUBMISSION_WARN_THRESHOLD && live.is_power_of_two() {
+        tracing::warn!(
+            live_submissions = live,
+            "gpu offload: {live} submissions are alive and un-finalized. Each one \
+             pins host writeback buffers, device buffers and a GC-critical token, \
+             and the collector does not run while any such token is alive — so \
+             this grows until the host runs out of memory, outside the Java heap \
+             and beyond what -Xmx bounds. Drain each handle with \
+             GpuExecutor.awaitSubmission(h) then releaseSubmission(h), or call \
+             GpuFuture.get(); a fire-and-forget chain must be bounded."
+        );
+    }
     h
+}
+
+/// Number of submissions currently registered and not yet released.
+///
+/// Exposed so a test can assert that a dispatch path drains what it
+/// creates, rather than inferring it from memory use.
+#[cfg(feature = "gpu-offload")]
+pub fn live_submission_count() -> usize {
+    submissions().read().len()
 }
 
 /// Look up a previously-registered submission by handle. Returns
@@ -2521,8 +2616,54 @@ fn enqueue_completion(
 // the analyzer's "last array is output" rule without needing to
 // know which is which here. Phase 6 narrows it.
 
+/// Classify a `cuda_bridge::DeviceError` for the Java side.
+///
+/// The variant carries most of the answer: a module that would not load
+/// or an entry point that is not in it are compilation problems, and
+/// everything else happened against a live device. The one thing the
+/// variant does not distinguish is exhaustion, so the driver's own
+/// message is consulted for that — at the point the driver produced it,
+/// where the wording is CUDA's canonical text, rather than on the Java
+/// side after it has been reformatted into a sentence.
 #[cfg(feature = "gpu-offload")]
-fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: String) -> u64 {
+fn kind_of_device_error(e: &cuda_bridge::DeviceError) -> GpuErrorKind {
+    use cuda_bridge::DeviceError;
+    match e {
+        DeviceError::Load(_) | DeviceError::KernelNotFound(_) => GpuErrorKind::Compile,
+        DeviceError::NoDriver => GpuErrorKind::Launch,
+        DeviceError::Driver(m) | DeviceError::Launch(m) | DeviceError::Memcpy(m) => {
+            kind_of_device_message(m)
+        }
+    }
+}
+
+/// Same classification for a device failure that has already been
+/// flattened to a `String` — the marshaller's upload helpers return
+/// `Result<_, String>`, so the `DeviceError` is gone by the time the
+/// dispatch path sees it.
+///
+/// Anything that is not recognisably exhaustion is `Launch`: reaching
+/// these call sites means the kernel resolved and compiled, so a
+/// compilation category would be wrong.
+#[cfg(feature = "gpu-offload")]
+fn kind_of_device_message(m: &str) -> GpuErrorKind {
+    let lower = m.to_ascii_lowercase();
+    if lower.contains("out_of_memory")
+        || lower.contains("out of memory")
+        || lower.contains("outofmemory")
+    {
+        GpuErrorKind::OutOfMemory
+    } else {
+        GpuErrorKind::Launch
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
+fn record_failed_submission(
+    stream: Option<std::sync::Arc<Stream>>,
+    kind: GpuErrorKind,
+    message: String,
+) -> u64 {
     // Every explicit-dispatch failure ends here, and until this line
     // existed none of them said anything: the reason was stored on the
     // submission and only ever surfaced if the Java side successfully
@@ -2534,7 +2675,7 @@ fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: Str
         handle,
         stream,
         event: None,
-        status: parking_lot::Mutex::new(SubmissionStatus::Failed { message }),
+        status: parking_lot::Mutex::new(SubmissionStatus::Failed { message, kind }),
         finalize: parking_lot::Mutex::new(None),
         device_done: std::sync::atomic::AtomicBool::new(false),
     });
@@ -2661,8 +2802,8 @@ pub fn dispatch_method_from_native_on_stream(
         if let Err(e) = shared.load_class_concurrent(class_name) {
             return record_failed_submission(
                 None,
-                format!("submitMethod: load class failed for {class_name}: {e:?}"),
-            );
+                GpuErrorKind::Compile,
+                format!("submitMethod: load class failed for {class_name}: {e:?}"),);
         }
         let cm = shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
@@ -2670,10 +2811,10 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: class not loaded after load_class_concurrent: {class_name}"
-                    ),
-                );
+                    ),);
             }
         };
         let class = match cm.get_class(class_id) {
@@ -2681,8 +2822,8 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                    format!("submitMethod: class id missing in manager: {class_name}"),
-                );
+                GpuErrorKind::Compile,
+                    format!("submitMethod: class id missing in manager: {class_name}"),);
             }
         };
         let mi = match class
@@ -2694,10 +2835,10 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method not found: {class_name}.{method_name}{descriptor}",
-                    ),
-                );
+                    ),);
             }
         };
         let is_static_local = class.methods[mi as usize].is_static();
@@ -2730,25 +2871,25 @@ pub fn dispatch_method_from_native_on_stream(
                     else {
                         return record_failed_submission(
                             None,
+                GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} is not a FieldReference \
                                  entry in {class_name}'s constant pool — analyzer / class \
                                  mismatch",
                                 names.len(),
-                            ),
-                        );
+                            ),);
                     };
                     let Some((nm, _desc)) =
                         class.constant_pool.get_name_and_type(*name_and_type_index)
                     else {
                         return record_failed_submission(
                             None,
+                GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} has no resolvable \
                                  NameAndType",
                                 names.len(),
-                            ),
-                        );
+                            ),);
                     };
                     names.push(nm.to_string());
                 }
@@ -2765,18 +2906,18 @@ pub fn dispatch_method_from_native_on_stream(
             LookupOutcome::Skip => {
                 return record_failed_submission(
                     None,
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method not offloadable (Skip): {class_name}.{method_name}{descriptor}",
-                    ),
-                );
+                    ),);
             }
             LookupOutcome::Blacklisted => {
                 return record_failed_submission(
                     None,
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method blacklisted: {class_name}.{method_name}{descriptor}",
-                    ),
-                );
+                    ),);
             }
         }
     };
@@ -2796,10 +2937,10 @@ pub fn dispatch_method_from_native_on_stream(
         None => {
             return record_failed_submission(
                 None,
+                GpuErrorKind::Launch,
                 format!(
                     "submitMethod: no CUDA device available ({class_name}.{method_name}{descriptor})",
-                ),
-            );
+                ),);
         }
     };
 
@@ -2833,11 +2974,11 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
+                GpuErrorKind::Launch,
                     format!(
                         "submitMethod: unknown or released stream handle {h} \
                          ({class_name}.{method_name}{descriptor})",
-                    ),
-                );
+                    ),);
             }
         },
         None => match CudaStream::new(ctx) {
@@ -2845,6 +2986,7 @@ pub fn dispatch_method_from_native_on_stream(
             Err(e) => {
                 return record_failed_submission(
                     None,
+                    kind_of_device_error(&e),
                     format!("submitMethod: Stream::new failed: {e}"),
                 );
             }
@@ -2905,29 +3047,29 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static receiver is null ({class_name}.{method_name}{descriptor})",
-                    ),
-                );
+                    ),);
             }
             Some(other) => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static receiver is not an object reference: {other:?}",
-                    ),
-                );
+                    ),);
             }
             None => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static method called with no arguments \
                          (expected receiver as arg 0): {class_name}.{method_name}{descriptor}",
-                    ),
-                );
+                    ),);
             }
         };
 
@@ -2958,11 +3100,11 @@ pub fn dispatch_method_from_native_on_stream(
                         drop(token);
                         return record_failed_submission(
                             Some(stream.clone()),
+                GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field `{field_name}` not found on receiver's \
                                  class hierarchy (receiver class_id={receiver_class_id:?})",
-                            ),
-                        );
+                            ),);
                     }
                 }
             };
@@ -2973,31 +3115,31 @@ pub fn dispatch_method_from_native_on_stream(
                     drop(token);
                     return record_failed_submission(
                         Some(stream.clone()),
+                GpuErrorKind::Compile,
                         format!(
                             "submitMethod: this_field `{field_name}` (pthis_{i}) is null on receiver",
-                        ),
-                    );
+                        ),);
                 }
                 other => {
                     drop(token);
                     return record_failed_submission(
                         Some(stream.clone()),
+                GpuErrorKind::Compile,
                         format!(
                             "submitMethod: this_field `{field_name}` (pthis_{i}) is not an \
                              object reference: {other:?}",
-                        ),
-                    );
+                        ),);
                 }
             };
             let Some(etype) = shared.mem.heap.array_element_type(field_obj) else {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
+                GpuErrorKind::Compile,
                     format!(
                         "submitMethod: this_field `{field_name}` (pthis_{i}) does not point at a \
                          primitive array",
-                    ),
-                );
+                    ),);
             };
             // Phase 10 #2 — `pthis_*` (receiver-field) params are not
             // represented in `KernelSignature::param_kinds` (the
@@ -3020,7 +3162,11 @@ pub fn dispatch_method_from_native_on_stream(
                 }
                 Err(msg) => {
                     drop(token);
-                    return record_failed_submission(Some(stream.clone()), msg);
+                    return record_failed_submission(
+                        Some(stream.clone()),
+                        kind_of_device_message(&msg),
+                        msg,
+                    );
                 }
             }
         }
@@ -3065,7 +3211,11 @@ pub fn dispatch_method_from_native_on_stream(
                         }
                         Err(msg) => {
                             drop(token);
-                            return record_failed_submission(Some(stream.clone()), msg);
+                            return record_failed_submission(
+                        Some(stream.clone()),
+                        kind_of_device_message(&msg),
+                        msg,
+                    );
                         }
                     }
                     continue;
@@ -3092,7 +3242,11 @@ pub fn dispatch_method_from_native_on_stream(
                         }
                         Err(msg) => {
                             drop(token);
-                            return record_failed_submission(Some(stream.clone()), msg);
+                            return record_failed_submission(
+                        Some(stream.clone()),
+                        kind_of_device_message(&msg),
+                        msg,
+                    );
                         }
                     }
                     continue;
@@ -3108,10 +3262,10 @@ pub fn dispatch_method_from_native_on_stream(
                         drop(token);
                         return record_failed_submission(
                             Some(stream.clone()),
+                GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: arg #{i} is not a primitive array, GpuArray, or boxed primitive",
-                            ),
-                        );
+                            ),);
                     }
                 }
                 continue;
@@ -3120,15 +3274,15 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                    format!("submitMethod: arg #{i} is null"),
-                );
+                GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} is null"),);
             }
             _ => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),
-                );
+                GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),);
             }
         }
     }
@@ -3168,6 +3322,7 @@ pub fn dispatch_method_from_native_on_stream(
                     drop(token);
                     return record_failed_submission(
                         Some(stream.clone()),
+                        kind_of_device_error(&e),
                         format!(
                             "submitMethod: failed to allocate scalar-return ({}) buffer: {e}",
                             $tag,
@@ -3232,8 +3387,8 @@ pub fn dispatch_method_from_native_on_stream(
             drop(token);
             return record_failed_submission(
                 Some(stream.clone()),
-                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),
-            );
+                GpuErrorKind::Compile,
+                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),);
         }
     };
     {
@@ -3408,12 +3563,13 @@ pub fn finalize_submission(
                 let mut status = submission.status.lock();
                 *status = SubmissionStatus::Failed {
                     message: format!("event.synchronize: {e}"),
+                    kind: kind_of_device_error(&e),
                 };
                 // _gc_critical drops here (releases GC gate).
                 drop(writebacks);
                 drop(_gc_critical);
                 return Err(match &*status {
-                    SubmissionStatus::Failed { message } => message.clone(),
+                    SubmissionStatus::Failed { message, .. } => message.clone(),
                     _ => unreachable!(),
                 });
             }
@@ -3503,6 +3659,10 @@ pub fn finalize_submission(
             (SubmissionStatus::Running, Some(msg)) => {
                 *status = SubmissionStatus::Failed {
                     message: msg.clone(),
+                    // Reached only from the writeback drain below, i.e.
+                    // after the kernel itself launched: a device-side
+                    // failure, not a compilation one.
+                    kind: GpuErrorKind::Launch,
                 };
                 Err(msg)
             }
@@ -3510,7 +3670,7 @@ pub fn finalize_submission(
             // it had. (Shouldn't happen given we took the FinalizeState
             // under the same submission, but defensive.)
             (SubmissionStatus::Completed { .. }, _) => Ok(()),
-            (SubmissionStatus::Failed { message }, _) => Err(message.clone()),
+            (SubmissionStatus::Failed { message, .. }, _) => Err(message.clone()),
         }
     } else {
         // Already finalized (or never had a FinalizeState — e.g.
@@ -3526,7 +3686,7 @@ pub fn finalize_submission(
                 ))
             }
             SubmissionStatus::Completed { .. } => Ok(()),
-            SubmissionStatus::Failed { message } => Err(message.clone()),
+            SubmissionStatus::Failed { message, .. } => Err(message.clone()),
         }
     }
 }
@@ -3642,11 +3802,102 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
                 if matches!(&*status, SubmissionStatus::Running) {
                     *status = SubmissionStatus::Failed {
                         message: format!("event.query: {e}"),
+                    kind: kind_of_device_error(&e),
                     };
                 }
             }
             drop(pending);
             Some(PollOutcome::Failed)
+        }
+    }
+}
+
+/// The recorded failure category for a submission, or `None` when the
+/// handle is unknown or the submission did not fail.
+///
+/// Backs `NativeContext::gpu_future_error_kind`, and through it
+/// `Native.futureErrorKind`. The category was stamped by whichever code
+/// path actually failed, so this is a lookup rather than a guess.
+#[cfg(feature = "gpu-offload")]
+pub fn submission_error_kind(handle: u64) -> Option<GpuErrorKind> {
+    let submission = lookup_submission(handle)?;
+    let status = submission.status.lock();
+    match &*status {
+        SubmissionStatus::Failed { kind, .. } => Some(*kind),
+        _ => None,
+    }
+}
+
+/// How long [`await_submission`] sleeps between device queries once it
+/// has stopped spinning.
+///
+/// The spin phase covers a kernel that is about to finish anyway; past
+/// that, sleeping is cheaper than burning a core. 50 us is short enough
+/// that the sleep is not what bounds a short kernel's observed latency
+/// and long enough that a multi-millisecond kernel is not queried tens
+/// of thousands of times.
+#[cfg(feature = "gpu-offload")]
+const AWAIT_SLEEP: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// How many times [`await_submission`] spins before it starts sleeping.
+#[cfg(feature = "gpu-offload")]
+const AWAIT_SPINS: u32 = 64;
+
+/// Block until the submission completes or `timeout_nanos` elapses.
+///
+/// Returns [`GPU_AWAIT_COMPLETED`] (the submission reached a terminal
+/// state — completed *or* failed; the caller reads which from the
+/// status) or [`GPU_AWAIT_TIMED_OUT`].
+///
+/// # Why this is not just the Java loop moved down here
+///
+/// The Java fallback for a timed `get` polls `Native.futureStatus` on a
+/// sleep loop. That costs a native crossing per poll and floors the
+/// observed latency at the sleep interval — on a kernel that finishes in
+/// 60 us, a 1 ms Java-side sleep reports it 16x late. Running the wait
+/// here keeps the whole loop on one side of the boundary and lets the
+/// spin phase observe completion at roughly device-callback latency.
+///
+/// A zero or negative `timeout_nanos` is a pure poll: the status is
+/// checked once and the answer returned without sleeping.
+#[cfg(feature = "gpu-offload")]
+pub fn await_submission(
+    shared: &crate::vm::SharedVm,
+    handle: u64,
+    timeout_nanos: u64,
+) -> i32 {
+    use cratonvm_native_api::registry::{GPU_AWAIT_COMPLETED, GPU_AWAIT_TIMED_OUT};
+
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_nanos(timeout_nanos))
+        // A timeout large enough to overflow `Instant` is, for every
+        // practical purpose, "wait forever" — clamp rather than panic.
+        .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86_400));
+
+    let mut spins = 0u32;
+    loop {
+        match poll_submission_status(shared, handle) {
+            // An unknown handle is terminal in the only sense that
+            // matters here: no further waiting can change the answer.
+            None => return GPU_AWAIT_COMPLETED,
+            Some(PollOutcome::Completed) | Some(PollOutcome::Failed) => {
+                return GPU_AWAIT_COMPLETED
+            }
+            Some(PollOutcome::Running) => {}
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return GPU_AWAIT_TIMED_OUT;
+        }
+
+        if spins < AWAIT_SPINS {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            // Never overshoot the caller's deadline by a whole sleep
+            // quantum: a 10 us timeout must not block for 50 us.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(AWAIT_SLEEP.min(remaining));
         }
     }
 }
