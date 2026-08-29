@@ -143,7 +143,6 @@ pub(super) fn unwind_to_handler(
 // The `fire_jvmti_*` sites and the frame-push ordering they depend on:
 // `interpreter/jvmti_events.rs`.
 
-
 /// Best-effort JVMS opcode mnemonic + trailing-operand-byte-count lookup,
 /// covering the opcodes relevant to a call-site-shaped bytecode sequence
 /// (stack shuffles, loads/stores, field/invoke family, branches, `ldc`/
@@ -154,7 +153,11 @@ pub(super) fn unwind_to_handler(
 /// `dup_x1`, `swap`, `aload`, ...) near a known indy call site's operand
 /// bytes (which ARE handled precisely, so the scan re-syncs at each
 /// `invokedynamic`/`invokestatic`/etc. it passes).
-pub(super) fn opcode_mnemonic_and_operand_len(op: u8, code: &[u8], pc: usize) -> (&'static str, usize) {
+pub(super) fn opcode_mnemonic_and_operand_len(
+    op: u8,
+    code: &[u8],
+    pc: usize,
+) -> (&'static str, usize) {
     match op {
         0x00 => ("nop", 0),
         0x01 => ("aconst_null", 0),

@@ -170,8 +170,10 @@ mod tests {
     #[test]
     fn differing_names_reports_value_and_presence_splits() {
         let a = extract("##DIFFTEST-CHECKSUM## same 1\n##DIFFTEST-CHECKSUM## diff a\n");
-        let b = extract("##DIFFTEST-CHECKSUM## same 1\n##DIFFTEST-CHECKSUM## diff b\n\
-                         ##DIFFTEST-CHECKSUM## only-b x\n");
+        let b = extract(
+            "##DIFFTEST-CHECKSUM## same 1\n##DIFFTEST-CHECKSUM## diff b\n\
+                         ##DIFFTEST-CHECKSUM## only-b x\n",
+        );
         assert_eq!(differing_names(&a, &b), vec!["diff", "only-b"]);
         assert!(differing_names(&a, &a).is_empty());
     }

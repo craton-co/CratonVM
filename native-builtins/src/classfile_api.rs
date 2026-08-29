@@ -18,7 +18,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 /// Throw a clear `UnsupportedOperationException` from a Class-File API entry
 /// point that CratonVM cannot honestly implement (real parsing / bytecode
@@ -218,8 +218,11 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 3);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/ClassEntry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -265,8 +268,11 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         "constantPool",
         "()Ljava/lang/classfile/constantpool/ConstantPool;",
         |ctx, _args| {
-            let cp =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ConstantPool", 2)?;
+            let cp = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/ConstantPool",
+                2,
+            )?;
             ctx.set_field(cp, 0, Value::Int(0));
             ctx.set_field(cp, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(cp))))
@@ -298,8 +304,11 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 4);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/ClassEntry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(opt, 0, Value::Object(Some(entry)));
@@ -335,8 +344,11 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 1);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/Utf8Entry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -349,8 +361,11 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 2);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/Utf8Entry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -433,8 +448,11 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 1);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/Utf8Entry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -447,8 +465,11 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 2);
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
+            let entry = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/classfile/constantpool/Utf8Entry",
+                1,
+            )?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -1046,7 +1067,8 @@ fn register_attribute(r: &mut NativeMethodRegistry) {
         "attributeMapper",
         "()Ljava/lang/classfile/AttributeMapper;",
         |ctx, _args| {
-            let mapper = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1)?;
+            let mapper =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1)?;
             ctx.set_field(mapper, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(mapper))))
         },
@@ -1109,10 +1131,13 @@ pub(crate) fn register_classfile_api_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod classfile_api_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

@@ -22,8 +22,8 @@ mod common;
 
 #[allow(unused_imports)]
 use cratonvm_native_api::{
-    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess,
-    NativeSystemAccess, NativeThreadAccess,
+    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
 };
 
 use common::{boxed_int, build_registry, call, MockCtx};
@@ -49,7 +49,15 @@ fn construct_under_relocation(
     let obj = ctx.alloc_object(cid, fields);
     let pin = ctx.pin_native_root(obj);
     ctx.set_relocate_pins_on_alloc(true);
-    call(reg, ctx, class, "<init>", "()V", &[Value::Object(Some(obj))]).unwrap();
+    call(
+        reg,
+        ctx,
+        class,
+        "<init>",
+        "()V",
+        &[Value::Object(Some(obj))],
+    )
+    .unwrap();
     ctx.set_relocate_pins_on_alloc(false);
     ctx.read_native_pin(pin, obj)
 }
@@ -274,7 +282,15 @@ fn hashset_add_and_contains_under_relocation() {
     ctx.set_relocate_pins_on_alloc(false);
     let set = ctx.read_native_pin(pin, cur);
     assert_eq!(
-        call(&reg, &mut ctx, HS, "size", "()I", &[Value::Object(Some(set))]).unwrap(),
+        call(
+            &reg,
+            &mut ctx,
+            HS,
+            "size",
+            "()I",
+            &[Value::Object(Some(set))]
+        )
+        .unwrap(),
         Some(Value::Int(48))
     );
 }
@@ -305,7 +321,15 @@ fn arraylist_grows_under_relocation() {
     ctx.set_relocate_pins_on_alloc(false);
     let list = ctx.read_native_pin(pin, cur);
     assert_eq!(
-        call(&reg, &mut ctx, AL, "size", "()I", &[Value::Object(Some(list))]).unwrap(),
+        call(
+            &reg,
+            &mut ctx,
+            AL,
+            "size",
+            "()I",
+            &[Value::Object(Some(list))]
+        )
+        .unwrap(),
         Some(Value::Int(64))
     );
 }

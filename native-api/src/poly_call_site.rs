@@ -70,7 +70,10 @@ mod tests {
     fn the_call_site_descriptor_is_taken_once() {
         assert_eq!(take(), None, "a fresh thread has nothing armed");
         arm("(Ljava/lang/Object;)Ljava/lang/String;");
-        assert_eq!(take().as_deref(), Some("(Ljava/lang/Object;)Ljava/lang/String;"));
+        assert_eq!(
+            take().as_deref(),
+            Some("(Ljava/lang/Object;)Ljava/lang/String;")
+        );
         assert_eq!(take(), None, "a second reader must not see the first's");
         arm("(I)V");
         clear();

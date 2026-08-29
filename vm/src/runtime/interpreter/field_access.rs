@@ -7,9 +7,8 @@
 //! section. Lint levels declared at the parent module level (including
 //! its no-panic `deny` gate, where it has one) are inherited here.
 
-use super::*;
 use super::site_cache::{site_stats, FieldSiteCache, MethodSiteCache, MethodSiteInfo};
-
+use super::*;
 
 /// Resolve a constant-pool field reference.
 ///
@@ -409,9 +408,12 @@ fn fill_field_site(
         site_stats::bump(site_stats::FIELD_REJECT_LOADER);
         return;
     }
-    thread
-        .field_sites
-        .put(current_class_id, cp_index, epochs_at_entry, resolved.clone());
+    thread.field_sites.put(
+        current_class_id,
+        cp_index,
+        epochs_at_entry,
+        resolved.clone(),
+    );
     site_stats::bump(site_stats::FIELD_FILL);
 }
 
@@ -474,7 +476,6 @@ fn method_site_info(
     site_stats::bump(site_stats::METHOD_FILL);
     Ok(info)
 }
-
 
 /// Shared tail of [`resolve_field_ref`] / [`resolve_field_ref_loader_aware`]:
 /// given an already-resolved field-owning `field_class_id`, look up
@@ -539,18 +540,18 @@ pub(super) fn resolve_field_in_class(
         // reach it only on a resolution-cache MISS, so the lookup is cold.
         // `None` (a malformed or non-fieldref entry) keeps the historical
         // name-only key, which is what those callers got before.
-        let descriptor: Option<&str> = cm.get_class(current_class_id).and_then(|c| {
-            match c.constant_pool.get(cp_index) {
-                Some(ConstantPoolEntry::FieldReference {
-                    name_and_type_index,
-                    ..
-                }) => c
-                    .constant_pool
-                    .get_name_and_type(*name_and_type_index)
-                    .map(|(_, d)| d),
-                _ => None,
-            }
-        });
+        let descriptor: Option<&str> =
+            cm.get_class(current_class_id)
+                .and_then(|c| match c.constant_pool.get(cp_index) {
+                    Some(ConstantPoolEntry::FieldReference {
+                        name_and_type_index,
+                        ..
+                    }) => c
+                        .constant_pool
+                        .get_name_and_type(*name_and_type_index)
+                        .map(|(_, d)| d),
+                    _ => None,
+                });
         let resolver = crate::runtime::resolve::MemberResolver::new(shared);
         let accessor = resolver.scope(current_class_id);
         let owner = resolver.scope(field_class_id);
@@ -685,7 +686,11 @@ pub(super) fn retarget_instance_field_to_receiver(
 ///
 /// Used at the getstatic/putstatic opcode boundary to build a
 /// `NoClassDefFoundError` message when class resolution fails.
-pub(super) fn field_ref_class_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<String> {
+pub(super) fn field_ref_class_name(
+    shared: &SharedVm,
+    class_id: ClassId,
+    cp_index: u16,
+) -> Option<String> {
     let cm = shared.classes.class_manager.read();
     let class = cm.get_class(class_id)?;
     if let Some(ConstantPoolEntry::FieldReference { class_index, .. }) =

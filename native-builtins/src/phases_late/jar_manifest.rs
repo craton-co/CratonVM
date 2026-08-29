@@ -130,7 +130,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let entry_name = match args.get(1) {
                 Some(Value::Object(Some(e)))
-                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(*e)).as_deref()
+                    if ctx
+                        .class_name_arc_of_id(ctx.class_id_of_object(*e))
+                        .as_deref()
                         == Some(
                             "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
                         ) =>
@@ -538,7 +540,10 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // (Mockito's inline-mock-maker bootstrap JAR, JaCoCo, etc.). Detect the
     // real layout by field count and use the by-name accessors there.
     let je = "java/util/jar/JarEntry";
-    fn je_is_real_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<bool, MethodCallFailed> {
+    fn je_is_real_layout(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+    ) -> Result<bool, MethodCallFailed> {
         Ok(ctx.object_num_fields(this) > 5)
     }
     r.register(je, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
@@ -1747,9 +1752,7 @@ fn mtime_memo() -> &'static OrderedPlMutex<std::collections::HashMap<String, u12
     // only because `HashMap::new` is not `const`.
     static MEMO: std::sync::OnceLock<OrderedPlMutex<std::collections::HashMap<String, u128>>> =
         std::sync::OnceLock::new();
-    MEMO.get_or_init(|| {
-        OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch)
-    })
+    MEMO.get_or_init(|| OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch))
 }
 
 /// Stat `path` for real and record the answer.
@@ -1943,7 +1946,10 @@ pub(crate) fn jar_entry_bytes_cached(
 /// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
 /// any I/O / zip-parse error so callers see an empty Stream rather than
 /// an exception path.
-pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Result<Vec<Value>, MethodCallFailed> {
+pub(crate) fn p59_jar_collect_entries(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<Vec<Value>, MethodCallFailed> {
     if path.is_empty() {
         return Ok(Vec::new());
     }
@@ -2893,7 +2899,10 @@ pub(crate) fn sb2_launcher_create_class_loader_bypass_archive_walk(
 /// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,
 /// `path`, and `full` populated so URL.toString / URL.toURI / URL.getPath
 /// all return the right thing for downstream classpath consumers.
-pub(crate) fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p59_alloc_url(
+    ctx: &mut dyn NativeContext,
+    full: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
     let proto = if let Some(idx) = full.find(':') {
         &full[..idx]
@@ -3134,14 +3143,20 @@ pub(crate) fn p59_jar_file_manifest(
 /// cost again on every construction. Route through the same lazily-cached
 /// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
 /// FIRST touch of a given (path, mtime) pays for the archive open.
-pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p98_read_jar_manifest(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<Value, MethodCallFailed> {
     Ok(p98_read_jar_manifest_impl(ctx, path, true)?)
 }
 
 /// Constructor variant of [`p98_read_jar_manifest`]. The main attributes are
 /// sufficient during JarFile construction; signed entry sections are expanded
 /// only when a caller asks for the full manifest.
-pub(crate) fn p98_read_jar_manifest_main(ctx: &mut dyn NativeContext, path: &str) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p98_read_jar_manifest_main(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<Value, MethodCallFailed> {
     Ok(p98_read_jar_manifest_impl(ctx, path, false)?)
 }
 
@@ -3259,7 +3274,9 @@ fn p98_read_jar_manifest_impl(
 
 /// Allocate a fresh synthetic `java.util.jar.Attributes` with an empty
 /// buckets array (alternating key/value Strings; fixed cap=64 for simplicity).
-pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p59_manifest_new_attributes(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Build a REAL java.util.jar.Attributes: its single `map` field is a real
     // LinkedHashMap, so every access path — Map.put/entrySet (real bytecode),
     // getValue/putValue/size (also real bytecode now) and Manifest.write's
@@ -3276,7 +3293,11 @@ pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Result
     }
     // Fallback: a bare allocation (map left at its default) is still better
     // than the broken synthetic layout.
-    Ok(try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 1)?)
+    Ok(try_alloc_concurrent_synthetic(
+        ctx,
+        "java/util/jar/Attributes",
+        1,
+    )?)
 }
 
 /// Allocate a fresh HashMap-shaped synthetic for per-entry Attributes
@@ -3285,7 +3306,9 @@ pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Result
 /// of the codebase already mixes the real HashMap-node layout with this
 /// pair-list one, and `getEntries()` callers only walk the entries via
 /// their own iteration so the layout choice is local).
-pub(crate) fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p59_manifest_new_entries_map(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     // A REAL LinkedHashMap (name -> Attributes), for the same reason as
     // p59_manifest_new_attributes: the synthetic 3-slot layout did not match
     // java.util.HashMap's real field layout, so real Map ops (put/get/entrySet,

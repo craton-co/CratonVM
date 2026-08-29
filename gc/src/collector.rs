@@ -112,8 +112,7 @@ pub fn volatile_stripe_lock(
 /// snapshot already carries the `Monitor` pointer, so resolving is a pointer
 /// dereference, not a lookup in an address-keyed table that would then need its
 /// own GC re-keying.
-static DISPLACED_HASH_RESOLVER: std::sync::OnceLock<fn(u64) -> i32> =
-    std::sync::OnceLock::new();
+static DISPLACED_HASH_RESOLVER: std::sync::OnceLock<fn(u64) -> i32> = std::sync::OnceLock::new();
 
 /// Install the displaced-hash resolver. Idempotent; the first install wins.
 pub fn set_displaced_hash_resolver(resolver: fn(u64) -> i32) {

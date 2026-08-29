@@ -96,7 +96,7 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layout for sun.net.www.protocol.http.HttpURLConnection
@@ -201,9 +201,16 @@ struct HttpsPeerInfo {
 /// guard across `throw_jca_exc`) were restructured to compute the key, or clone
 /// the row out, first. The fourth site already did: a `get(..).map(..)` whose
 /// result is matched after the guard has dropped.
-fn https_peer_info() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>> {
-    static R: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>>> = OnceLock::new();
-    R.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn https_peer_info(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>> {
+    static R: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, HttpsPeerInfo>>> =
+        OnceLock::new();
+    R.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn record_https_peer_info(
@@ -287,9 +294,17 @@ fn https_recycle_carrier(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// `note_response_stream`, which is where it used to sit inside the
 /// `table.insert(..)` argument list.
 fn https_response_streams(
-) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>> {
-    static R: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>> = OnceLock::new();
-    R.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>
+{
+    static R: OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<HashMap<u64, crate::net_phase_e::NativeObjKey>>,
+    > = OnceLock::new();
+    R.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Remember that `stream` is the response body of `carrier`, so draining it
@@ -647,31 +662,36 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
             Ok(Some(Value::Object(None)))
         },
     );
-    r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
-        let mut this = obj_arg(args, 0)?;
-        https_ensure_exchanged(ctx, &mut this);
-        let key = ctx.identity_hash_code(this) as u32 as u64;
-        // `filter` before `map`: a recycled connection has no cipher suite to
-        // report, and falls through to the refusal below. See
-        // `https_recycle_carrier`.
-        let cipher = https_peer_info()
-            .lock()
-            .unwrap()
-            .get(&key)
-            .filter(|i| !i.recycled)
-            .map(|i| i.cipher.clone());
-        match cipher {
-            Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
-            // G7: `IllegalStateException`, not `SSLPeerUnverifiedException`.
-            // `getCipherSuite()` is declared `public abstract String
-            // getCipherSuite();` with NO throws clause (SOURCE-VERIFIED by
-            // `javap` — see `https_not_yet_open`), so the old refusal was an
-            // undeclared checked exception out of a method whose signature
-            // cannot name it. HotSpot's measured refusal in this state is
-            // `IllegalStateException: connection not yet open`.
-            _ => Err(https_not_yet_open(ctx)),
-        }
-    });
+    r.register(
+        cls,
+        "getCipherSuite",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let mut this = obj_arg(args, 0)?;
+            https_ensure_exchanged(ctx, &mut this);
+            let key = ctx.identity_hash_code(this) as u32 as u64;
+            // `filter` before `map`: a recycled connection has no cipher suite to
+            // report, and falls through to the refusal below. See
+            // `https_recycle_carrier`.
+            let cipher = https_peer_info()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .filter(|i| !i.recycled)
+                .map(|i| i.cipher.clone());
+            match cipher {
+                Some(c) if !c.is_empty() => Ok(Some(Value::Object(Some(ctx.create_string(&c))))),
+                // G7: `IllegalStateException`, not `SSLPeerUnverifiedException`.
+                // `getCipherSuite()` is declared `public abstract String
+                // getCipherSuite();` with NO throws clause (SOURCE-VERIFIED by
+                // `javap` — see `https_not_yet_open`), so the old refusal was an
+                // undeclared checked exception out of a method whose signature
+                // cannot name it. HotSpot's measured refusal in this state is
+                // `IllegalStateException: connection not yet open`.
+                _ => Err(https_not_yet_open(ctx)),
+            }
+        },
+    );
     r.register(
         cls,
         "getPeerPrincipal",
@@ -1377,10 +1397,12 @@ fn huc_real_perform(
         // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
         // reach Java as `ConnectException`, not a generic IOException — real
         // code catches it specifically (see the type's own doc).
-        Err(ref e) if e.starts_with(CONNECT_REFUSED_SENTINEL) => Err(RuntimeError::ConnectException {
-            message: e.trim_start_matches(CONNECT_REFUSED_SENTINEL).to_string(),
+        Err(ref e) if e.starts_with(CONNECT_REFUSED_SENTINEL) => {
+            Err(RuntimeError::ConnectException {
+                message: e.trim_start_matches(CONNECT_REFUSED_SENTINEL).to_string(),
+            }
+            .into())
         }
-        .into()),
         // A transport failure before a response is available is an IOException.
         Err(e) => Err(ioex(format!("HttpURLConnection response failed: {e}"))),
     }
@@ -1466,10 +1488,14 @@ fn make_response_input_stream(
                 Ok(Some(seq @ Value::Object(Some(_)))) => Ok(Some(seq)),
                 // Could not wrap — hand back the partial body on its own rather
                 // than losing it.
-                _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+                _ => Ok(Some(Value::Object(Some(
+                    ctx.read_native_pin(pin, head_ref),
+                )))),
             }
         }
-        _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+        _ => Ok(Some(Value::Object(Some(
+            ctx.read_native_pin(pin, head_ref),
+        )))),
     };
     ctx.unpin_native_roots(pin);
     out
@@ -1581,7 +1607,10 @@ fn new_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 
 /// Build a `java/io/ByteArrayInputStream` over `body` (4-field synthetic:
 /// buf=0, pos=1, mark=2, count=3).
-fn make_byte_array_input_stream(ctx: &mut dyn NativeContext, body: &[u8]) -> Result<Value, MethodCallFailed> {
+fn make_byte_array_input_stream(
+    ctx: &mut dyn NativeContext,
+    body: &[u8],
+) -> Result<Value, MethodCallFailed> {
     let body_arr = new_byte_array(ctx, body);
     let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
     ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
@@ -2223,12 +2252,11 @@ fn huc_client_tls_restrictions(
     // Read before anything below allocates or runs bytecode: `connection` is
     // the caller's already-pin-refreshed reference, and a moving collection
     // during the probe up-call would strand it.
-    let instance_factory = connection.and_then(|c| {
-        match ctx.get_field_by_name(c, "sslSocketFactory") {
+    let instance_factory =
+        connection.and_then(|c| match ctx.get_field_by_name(c, "sslSocketFactory") {
             Value::Object(Some(f)) => Some(f),
             _ => None,
-        }
-    });
+        });
     // The process default lives in a GC-rooted native slot, NOT in the real
     // JDK static field: writing that field does not stick on this VM
     // (measured — see `t27_tls::huc_default_factory_slot`), which silently
@@ -2884,18 +2912,20 @@ fn huc_verify_hostname(
         };
     let session0 = match carrier_session {
         Some(session) => session,
-        None => match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der, host, port) {
-            Ok(session) => session,
-            // The pins taken above are released on THIS exit too. The
-            // `map_err(..)?` this replaces returned straight out of the
-            // function with `verifier_pin` and `host_pin` still on the pin
-            // stack — a leak on the one path that already had nothing to
-            // hand back.
-            Err(message) => {
-                ctx.unpin_native_roots(verifier_pin);
-                return Err(message);
+        None => {
+            match huc_mint_verifier_session(ctx, protocol, cipher, peer_chain_der, host, port) {
+                Ok(session) => session,
+                // The pins taken above are released on THIS exit too. The
+                // `map_err(..)?` this replaces returned straight out of the
+                // function with `verifier_pin` and `host_pin` still on the pin
+                // stack — a leak on the one path that already had nothing to
+                // hand back.
+                Err(message) => {
+                    ctx.unpin_native_roots(verifier_pin);
+                    return Err(message);
+                }
             }
-        },
+        }
     };
     let session_pin = ctx.pin_native_root(session0);
 
@@ -3160,8 +3190,9 @@ fn https_post_handshake_exchange(
             Ok(0) => break,
             Ok(_) => {
                 if let Err(e) = stream.conn.process_new_packets() {
-                    drain_err =
-                        Some(format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}"));
+                    drain_err = Some(format!(
+                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}"
+                    ));
                     break;
                 }
             }
@@ -3273,7 +3304,8 @@ fn perform(
     let tcp = match tcp {
         Some(t) => t,
         None => {
-            let msg = last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"));
+            let msg =
+                last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"));
             return Err(if last_err_refused {
                 format!("{CONNECT_REFUSED_SENTINEL}{msg}")
             } else {
@@ -3800,7 +3832,8 @@ fn is_poolable(resp_headers: &[(String, String)], req_headers: &[(String, String
     let has_close = |hs: &[(String, String)]| {
         hs.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("connection")
-                && v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+                && v.split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("close"))
         })
     };
     let is_chunked = resp_headers.iter().any(|(k, v)| {
@@ -3821,10 +3854,11 @@ fn connect_plain(parsed: &Url1, connect_timeout: Duration) -> Result<TcpStream, 
     // Same IPv4-mapped fold as `perform`'s loop above — see the comment there.
     // This function is a deliberate duplicate of that loop, so a fix to one is
     // only half a fix.
-    let mut addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
-        .map_err(|e| format!("resolve {addr}: {e}"))?
-        .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
-        .collect();
+    let mut addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+            .map_err(|e| format!("resolve {addr}: {e}"))?
+            .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
+            .collect();
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
     let mut last_err: Option<String> = None;
     let mut last_err_refused = false;
@@ -4333,8 +4367,8 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 
     ensure_connected(ctx, this)?;
-    let (body_bytes, truncated) = with_state(ctx, this, |s| (s.response_body.clone(), s.truncated))
-        .unwrap_or_default();
+    let (body_bytes, truncated) =
+        with_state(ctx, this, |s| (s.response_body.clone(), s.truncated)).unwrap_or_default();
     // Mark consumed so a follow-up read doesn't double-pull.
     if let Value::Int(id) = ctx.get_field(this, HUC_CONN_ID) {
         if let Ok(mut reg) = registry().lock() {
@@ -5379,7 +5413,12 @@ fn register_https_delegate_forwarders(r: &mut NativeMethodRegistry, cls: &str) {
             (fwd_set_if_modified_since, UC, "setIfModifiedSince", "(J)V"),
             (fwd_get_if_modified_since, UC, "getIfModifiedSince", "()J"),
             (fwd_get_default_use_caches, UC, "getDefaultUseCaches", "()Z"),
-            (fwd_set_default_use_caches, UC, "setDefaultUseCaches", "(Z)V"),
+            (
+                fwd_set_default_use_caches,
+                UC,
+                "setDefaultUseCaches",
+                "(Z)V"
+            ),
             (fwd_get_connect_timeout, UC, "getConnectTimeout", "()I"),
             (fwd_get_read_timeout, UC, "getReadTimeout", "()I"),
             (fwd_get_url, UC, "getURL", "()Ljava/net/URL;"),
@@ -5414,12 +5453,7 @@ fn register_https_delegate_forwarders(r: &mut NativeMethodRegistry, cls: &str) {
                 "getHeaderFieldLong",
                 "(Ljava/lang/String;J)J"
             ),
-            (
-                fwd_get_content,
-                UC,
-                "getContent",
-                "()Ljava/lang/Object;"
-            ),
+            (fwd_get_content, UC, "getContent", "()Ljava/lang/Object;"),
             (
                 fwd_get_content_typed,
                 UC,
@@ -5521,9 +5555,12 @@ pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod http_url_connection_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// **Which of the two `register_https_session_accessors` functions owns
     /// each of the six names.**
@@ -5560,8 +5597,14 @@ mod http_url_connection_tests {
             "javax/net/ssl/HttpsURLConnection",
         ] {
             for (name, desc) in [
-                ("getServerCertificates", "()[Ljava/security/cert/Certificate;"),
-                ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+                (
+                    "getServerCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                ),
+                (
+                    "getLocalCertificates",
+                    "()[Ljava/security/cert/Certificate;",
+                ),
                 ("getCipherSuite", "()Ljava/lang/String;"),
                 ("getPeerPrincipal", "()Ljava/security/Principal;"),
                 ("getLocalPrincipal", "()Ljava/security/Principal;"),
@@ -5577,7 +5620,8 @@ mod http_url_connection_tests {
                 );
             }
             assert!(
-                r.find(cls, "getSSLSession", "()Ljava/util/Optional;").is_none(),
+                r.find(cls, "getSSLSession", "()Ljava/util/Optional;")
+                    .is_none(),
                 "{cls}.getSSLSession()Ljava/util/Optional; must NOT be \
                  registered here. net_phase_e owns it precisely because this \
                  file leaves it alone; registering it here would run last and \
@@ -5640,8 +5684,14 @@ mod http_url_connection_tests {
             ("isConnected", "()Z"),
             ("setConnected", "(Z)V"),
             ("getCipherSuite", "()Ljava/lang/String;"),
-            ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
-            ("getServerCertificates", "()[Ljava/security/cert/Certificate;"),
+            (
+                "getLocalCertificates",
+                "()[Ljava/security/cert/Certificate;",
+            ),
+            (
+                "getServerCertificates",
+                "()[Ljava/security/cert/Certificate;",
+            ),
             ("getPeerPrincipal", "()Ljava/security/Principal;"),
             ("getLocalPrincipal", "()Ljava/security/Principal;"),
             ("getOutputStream", "()Ljava/io/OutputStream;"),
@@ -5653,10 +5703,19 @@ mod http_url_connection_tests {
             ("getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;"),
             ("getHeaderField", "(I)Ljava/lang/String;"),
             ("getHeaderFieldKey", "(I)Ljava/lang/String;"),
-            ("setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
-            ("addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+            (
+                "setRequestProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+            ),
+            (
+                "addRequestProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+            ),
             ("getResponseCode", "()I"),
-            ("getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+            (
+                "getRequestProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            ),
             ("getRequestProperties", "()Ljava/util/Map;"),
             ("setInstanceFollowRedirects", "(Z)V"),
             ("getInstanceFollowRedirects", "()Z"),
@@ -5978,7 +6037,12 @@ mod http_url_connection_tests {
         let stranger = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
         let key = ctx.identity_hash_code(carrier) as u32 as u64;
 
-        record_https_peer_info(&ctx, Some(carrier), &[vec![0x30u8]], "TLS_AES_128_GCM_SHA256");
+        record_https_peer_info(
+            &ctx,
+            Some(carrier),
+            &[vec![0x30u8]],
+            "TLS_AES_128_GCM_SHA256",
+        );
         // Deliberately NOT noted, and noted with no carrier — both are the
         // shapes an ordinary BAIS arrives in.
         note_response_stream(&ctx, stranger, None);
@@ -6197,11 +6261,20 @@ mod http_url_connection_tests {
     #[test]
     fn builtin_endpoint_identification_accepts_a_localhost_leaf() {
         let chain = vec![localhost_leaf_der()];
-        assert_eq!(huc_builtin_endpoint_identification("localhost", &chain), Ok(()));
+        assert_eq!(
+            huc_builtin_endpoint_identification("localhost", &chain),
+            Ok(())
+        );
         // Case-insensitive, per RFC 6125.
-        assert_eq!(huc_builtin_endpoint_identification("LOCALHOST", &chain), Ok(()));
+        assert_eq!(
+            huc_builtin_endpoint_identification("LOCALHOST", &chain),
+            Ok(())
+        );
         // The same leaf's IP SAN.
-        assert_eq!(huc_builtin_endpoint_identification("127.0.0.1", &chain), Ok(()));
+        assert_eq!(
+            huc_builtin_endpoint_identification("127.0.0.1", &chain),
+            Ok(())
+        );
     }
 
     /// ...and must REJECT a host the leaf does not assert, so the fallback to
@@ -6734,7 +6807,7 @@ mod http_url_connection_tests {
         let port = 1;
         pool_put(&host, port, client);
         drop(server); // peer close -> FIN visible to a peek on `client`
-        // Give the FIN a moment to actually land in the kernel buffer.
+                      // Give the FIN a moment to actually land in the kernel buffer.
         std::thread::sleep(Duration::from_millis(50));
         assert!(pool_take(&host, port).is_none());
     }
@@ -6745,10 +6818,13 @@ mod http_url_connection_tests {
         let host = format!("test-idle-window-{}", client.local_addr().unwrap().port());
         let port = 1;
         if let Ok(mut guard) = conn_pool().lock() {
-            guard.entry((host.clone(), port)).or_default().push(PooledConn {
-                stream: client,
-                returned_at: Instant::now() - POOL_IDLE_WINDOW - Duration::from_millis(1),
-            });
+            guard
+                .entry((host.clone(), port))
+                .or_default()
+                .push(PooledConn {
+                    stream: client,
+                    returned_at: Instant::now() - POOL_IDLE_WINDOW - Duration::from_millis(1),
+                });
         }
         assert!(pool_take(&host, port).is_none());
     }

@@ -22,7 +22,7 @@ use crate::phases_late::{
     p56_build_stream, p58_new_cf, CLEANABLE_ACTION, CLEANABLE_CLEANED, CLEANABLE_FIELDS,
     CLEANABLE_INDEX, REF_TYPE_CLEANER,
 };
-use crate::{try_alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{native_noop_with_this, obj_arg, try_alloc_concurrent_synthetic};
 
 use std::collections::HashMap;
 use std::io::{Read as StdRead, Write as StdWrite};
@@ -161,7 +161,9 @@ fn jython_py_none(ctx: &mut dyn NativeContext) -> Value {
 }
 
 fn jython_object_class_is(ctx: &mut dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
-    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+        == Some(expected)
 }
 
 fn jython_map_field(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<ObjectRef> {
@@ -1277,7 +1279,8 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                     for (i, &b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
-                    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+                    let stream =
+                        try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
                     ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
                     ctx.set_field(stream, 1, Value::Int(0)); // pos
                     ctx.set_field(stream, 2, Value::Int(0)); // mark
@@ -1680,8 +1683,8 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         if !paths.is_empty() {
             ctx.register_dynamic_classpath(&paths);
         }
-    ()
-}
+        ()
+    }
 
     // URLClassLoader(URL[])
     r.register(ucl, "<init>", "([Ljava/net/URL;)V", |ctx, args| {
@@ -2352,7 +2355,10 @@ pub(crate) fn s2_tls_connect_on(
 
     let raw = tls_stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Native(tls_stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(
+            TlsClientStream::Native(tls_stream),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2426,13 +2432,16 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     let connector = builder.build();
     let mut connection = connector.configure().map_err(|e| hs(&e))?;
     connection.set_verify_hostname(false);
-    let stream = connection.connect(host, tcp).map_err(|e| {
-        TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}"))
-    })?;
+    let stream = connection
+        .connect(host, tcp)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}")))?;
     let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(
+            TlsClientStream::Openssl(stream),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2446,7 +2455,6 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     reg.tls_streams.insert(id, entry);
     Ok(id)
 }
-
 
 /// The certificate SECURITY LEVEL the default client connector runs at.
 ///
@@ -2661,7 +2669,10 @@ pub(crate) fn s2_openssl_tls_connect_on(
 
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(
+            TlsClientStream::Openssl(stream),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2675,7 +2686,6 @@ pub(crate) fn s2_openssl_tls_connect_on(
     reg.tls_streams.insert(id, entry);
     Ok(id)
 }
-
 
 /// [`OpensslClientConfig`]'s Windows counterpart, minus one field.
 ///
@@ -2849,9 +2859,7 @@ where
 /// order the platform does not contract. The unit tests above `order_chain_from_leaf`
 /// are what exercise it, since the live store declines to.
 #[cfg(windows)]
-fn schannel_peer_chain_der(
-    stream: &schannel::tls_stream::TlsStream<TcpStream>,
-) -> Vec<Vec<u8>> {
+fn schannel_peer_chain_der(stream: &schannel::tls_stream::TlsStream<TcpStream>) -> Vec<Vec<u8>> {
     let leaf_ctx = match stream.peer_certificate() {
         Ok(c) => c,
         // No peer certificate (PSK / anonymous suite). An empty chain is the
@@ -2974,7 +2982,10 @@ pub(crate) fn s2_schannel_tls_connect_on(
         .map(|p| String::from_utf8_lossy(&p).into_owned());
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Schannel(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(
+            TlsClientStream::Schannel(stream),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -3217,10 +3228,7 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 /// What this does NOT do on its own is END the wait. That is
 /// [`s2_tls_close`]'s job (it shuts the duplicate handle down), and on Windows
 /// it still cannot: see the note there.
-fn s2_tls_classify_after_block(
-    id: i32,
-    result: std::io::Result<usize>,
-) -> std::io::Result<usize> {
+fn s2_tls_classify_after_block(id: i32, result: std::io::Result<usize>) -> std::io::Result<usize> {
     // Cheap and exact: a live id is still in the table. Taken AFTER the call,
     // deliberately — a close that landed while this thread was parked is then
     // observed on the very next instruction, and a close that raced a
@@ -3520,7 +3528,10 @@ fn s2_bb_heap_class(ctx: &mut dyn NativeContext, read_only: bool) -> &'static st
     }
 }
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn s2_bb_alloc(
+    ctx: &mut dyn NativeContext,
+    cap: usize,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
     // and on a full heap the backing `new byte[n]` must raise a *catchable*
@@ -3841,14 +3852,14 @@ fn s2_check_from_index_size(from: i32, size: i32, length: i32) -> Result<(), Met
     if !bad {
         return Ok(());
     }
-    Err(RuntimeError::ioobe(
-        crate::preconditions::CheckKind::FromIndexSize.message(&[
+    Err(
+        RuntimeError::ioobe(crate::preconditions::CheckKind::FromIndexSize.message(&[
             i64::from(from),
             i64::from(size),
             i64::from(length),
-        ]),
+        ]))
+        .into(),
     )
-    .into())
 }
 
 /// Read a ByteBuffer's `mark`, preferring the real-JDK named field.
@@ -4518,7 +4529,10 @@ fn s2_bb_no_backing_array() -> MethodCallFailed {
 /// `name` to slot 0 and gets the String, which `toString`/`s2_byte_order_ord`
 /// already decode; a resolved index out of range is skipped rather than
 /// written out of bounds.
-pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn s2_byte_order_object(
+    ctx: &mut dyn NativeContext,
+    ord: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
         .ok()
@@ -4791,7 +4805,9 @@ fn s2_bb_write_n<const N: usize>(
             };
             let len = ctx.array_length(arr);
             for (k, &b) in bytes.iter().enumerate() {
-                let Some(i) = start.checked_add(k) else { return };
+                let Some(i) = start.checked_add(k) else {
+                    return;
+                };
                 if i >= len {
                     return;
                 }
@@ -5637,11 +5653,9 @@ pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
     //
     // `Ok(false)` (no poll primitive on this target) falls through to the plain
     // blocking accept, which cannot see the close but at least still accepts.
-    match s2_wait_ready_close_aware(
-        listener_pollreq_fd(&listener),
-        false,
-        &|| s2_listener_still_registered(lid),
-    ) {
+    match s2_wait_ready_close_aware(listener_pollreq_fd(&listener), false, &|| {
+        s2_listener_still_registered(lid)
+    }) {
         Ok(_) => {}
         // Closed under us. `None` is this function's existing "no connection"
         // answer and every caller already handles it.
@@ -6088,9 +6102,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             // ANY earlier caller has already minted the stub (it short-circuits
             // on `resolve_fast_path_class_id`); `is_class_synthetic_stub`
             // covers exactly that case by asking what the loaded class IS.
-            let real_direct_byte_buffer =
-                !ctx.would_fabricate_synthetic_stub("java/nio/DirectByteBuffer")
-                    && !ctx.is_class_synthetic_stub("java/nio/DirectByteBuffer");
+            let real_direct_byte_buffer = !ctx
+                .would_fabricate_synthetic_stub("java/nio/DirectByteBuffer")
+                && !ctx.is_class_synthetic_stub("java/nio/DirectByteBuffer");
             if real_direct_byte_buffer {
                 return ctx.new_object_initialized(
                     "java/nio/DirectByteBuffer",
@@ -6109,7 +6123,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let arr = obj_arg(args, 0)?;
         let len = ctx.array_length(arr) as i32;
         let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+        let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
         bb_write_hb(ctx, buf, arr, len);
         Ok(Some(Value::Object(Some(buf))))
     });
@@ -6130,7 +6144,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::ioobe_no_message().into());
         }
         let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+        let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
         bb_write_hb(ctx, buf, arr, cap);
         // Override position/limit set by bb_write_hb.
         ctx.set_field_by_name(buf, "position", Value::Int(off));
@@ -6446,11 +6460,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let dst_start = dst_base + pos as usize;
                 if !ctx.write_byte_array_from(dst_arr, dst_start, &bytes) {
                     for (i, b) in bytes.iter().enumerate() {
-                        ctx.set_array_element(
-                            dst_arr,
-                            dst_start + i,
-                            Value::Int(*b as i8 as i32),
-                        );
+                        ctx.set_array_element(dst_arr, dst_start + i, Value::Int(*b as i8 as i32));
                     }
                 }
             } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
@@ -6908,7 +6918,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             s2_bb_arr(ctx, this).is_some(),
             s2_bb_is_read_only(ctx, this),
         ) {
-            BufferArrayAccess::Accessible => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+            BufferArrayAccess::Accessible => {
+                Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
+            }
             BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
             BufferArrayAccess::Absent if s2_bb_direct_addr(ctx, this).is_some() => {
                 Err(s2_bb_no_backing_array())
@@ -7044,7 +7056,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
             }
             let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+            let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
             bb_write_hb(ctx, buf, new_arr, rem);
             s2_bb_set_order(ctx, buf, ord);
             // `ro` was computed above and used ONLY by the two aliasing arms
@@ -7076,7 +7088,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             None => {
                 let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
                 let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+                let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
                 s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
@@ -7130,7 +7142,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     }
                 }
                 let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+                let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
                 s2_bb_set_read_only(ctx, buf, ro);
@@ -7158,7 +7170,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 // Bare-synthetic / storage-less: legacy shared-array
                 // rebuild (aliases the array, no offset support needed).
                 let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+                let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 if let Some(src_arr) = s2_bb_arr(ctx, this) {
                     bb_write_hb(ctx, buf, src_arr, cap);
                     ctx.set_field_by_name(buf, "position", Value::Int(pos));
@@ -7195,7 +7207,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 _ => {
                     let cls = s2_bb_heap_class(ctx, false);
-    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
+                    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                     if let Some(src_arr) = s2_bb_arr(ctx, this) {
                         bb_write_hb(ctx, buf, src_arr, cap);
                         ctx.set_field_by_name(buf, "position", Value::Int(pos));
@@ -8585,7 +8597,8 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/ServerSocketChannel;",
         |ctx, _| {
-            let ch = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5)?;
+            let ch =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5)?;
             ctx.set_field(ch, S2SSC_OPEN, Value::Int(1));
             ctx.set_field(ch, S2SSC_BOUND, Value::Int(0));
             ctx.set_field(ch, S2SSC_LISTENER_ID, Value::Int(-1));
@@ -8766,7 +8779,11 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Object(Some(key))))
 }
 
-fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bool) -> Result<Value, MethodCallFailed> {
+fn s2_keys_as_set(
+    ctx: &mut dyn NativeContext,
+    sel: ObjectRef,
+    selected_only: bool,
+) -> Result<Value, MethodCallFailed> {
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
     // GC-safety: `alloc_concurrent_synthetic`/`new_ref_array` below allocate
     // and can trigger a collection that relocates `sel`/`set` (both read
@@ -9243,7 +9260,6 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 // Web frameworks (Spring Boot, Tomcat, Jetty) work when the VM can execute
 // their bytecode from the real .class files.
 
-
 /// The client-connector tests that the whole existing TLS corpus could not
 /// express.
 ///
@@ -9313,10 +9329,8 @@ mod openssl_client_tests {
         b.set_pubkey(&leaf_key).expect("pubkey");
         b.set_not_before(&not_before).expect("nb");
         b.set_not_after(&not_after).expect("na");
-        b.append_extension(
-            BasicConstraints::new().critical().build().expect("bc"),
-        )
-        .expect("bc ext");
+        b.append_extension(BasicConstraints::new().critical().build().expect("bc"))
+            .expect("bc ext");
         let ctx = b.x509v3_context(Some(&ca), None);
         let san = SubjectAlternativeName::new()
             .dns("localhost")
@@ -9466,10 +9480,13 @@ mod openssl_client_tests {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeContext as _;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     /// SHIM-AUDIT regression (fails before the 2026-08-01 fix).
@@ -10193,7 +10210,9 @@ mod tests {
         let bb = ctx.alloc_object(bb_class, 10);
         bb_write_hb(ctx, bb, arr, 64);
 
-        let view_class_id = ctx.ensure_class_initialized(view_class).expect("class init");
+        let view_class_id = ctx
+            .ensure_class_initialized(view_class)
+            .expect("class init");
         let names = [
             ("mark", "I"),
             ("position", "I"),

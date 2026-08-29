@@ -530,30 +530,208 @@ fn array_type_name(atype: Option<u8>) -> &'static str {
 /// report that could only name opcodes it had already seen would be useless.
 pub fn opcode_name(op: u8) -> Option<&'static str> {
     const NAMES: [&str; 202] = [
-        "nop", "aconst_null", "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3",
-        "iconst_4", "iconst_5", "lconst_0", "lconst_1", "fconst_0", "fconst_1", "fconst_2",
-        "dconst_0", "dconst_1", "bipush", "sipush", "ldc", "ldc_w", "ldc2_w", "iload", "lload",
-        "fload", "dload", "aload", "iload_0", "iload_1", "iload_2", "iload_3", "lload_0", "lload_1",
-        "lload_2", "lload_3", "fload_0", "fload_1", "fload_2", "fload_3", "dload_0", "dload_1",
-        "dload_2", "dload_3", "aload_0", "aload_1", "aload_2", "aload_3", "iaload", "laload",
-        "faload", "daload", "aaload", "baload", "caload", "saload", "istore", "lstore", "fstore",
-        "dstore", "astore", "istore_0", "istore_1", "istore_2", "istore_3", "lstore_0", "lstore_1",
-        "lstore_2", "lstore_3", "fstore_0", "fstore_1", "fstore_2", "fstore_3", "dstore_0",
-        "dstore_1", "dstore_2", "dstore_3", "astore_0", "astore_1", "astore_2", "astore_3",
-        "iastore", "lastore", "fastore", "dastore", "aastore", "bastore", "castore", "sastore",
-        "pop", "pop2", "dup", "dup_x1", "dup_x2", "dup2", "dup2_x1", "dup2_x2", "swap", "iadd",
-        "ladd", "fadd", "dadd", "isub", "lsub", "fsub", "dsub", "imul", "lmul", "fmul", "dmul",
-        "idiv", "ldiv", "fdiv", "ddiv", "irem", "lrem", "frem", "drem", "ineg", "lneg", "fneg",
-        "dneg", "ishl", "lshl", "ishr", "lshr", "iushr", "lushr", "iand", "land", "ior", "lor",
-        "ixor", "lxor", "iinc", "i2l", "i2f", "i2d", "l2i", "l2f", "l2d", "f2i", "f2l", "f2d",
-        "d2i", "d2l", "d2f", "i2b", "i2c", "i2s", "lcmp", "fcmpl", "fcmpg", "dcmpl", "dcmpg",
-        "ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle", "if_icmpeq", "if_icmpne", "if_icmplt",
-        "if_icmpge", "if_icmpgt", "if_icmple", "if_acmpeq", "if_acmpne", "goto", "jsr", "ret",
-        "tableswitch", "lookupswitch", "ireturn", "lreturn", "freturn", "dreturn", "areturn",
-        "return", "getstatic", "putstatic", "getfield", "putfield", "invokevirtual",
-        "invokespecial", "invokestatic", "invokeinterface", "invokedynamic", "new", "newarray",
-        "anewarray", "arraylength", "athrow", "checkcast", "instanceof", "monitorenter",
-        "monitorexit", "wide", "multianewarray", "ifnull", "ifnonnull", "goto_w", "jsr_w",
+        "nop",
+        "aconst_null",
+        "iconst_m1",
+        "iconst_0",
+        "iconst_1",
+        "iconst_2",
+        "iconst_3",
+        "iconst_4",
+        "iconst_5",
+        "lconst_0",
+        "lconst_1",
+        "fconst_0",
+        "fconst_1",
+        "fconst_2",
+        "dconst_0",
+        "dconst_1",
+        "bipush",
+        "sipush",
+        "ldc",
+        "ldc_w",
+        "ldc2_w",
+        "iload",
+        "lload",
+        "fload",
+        "dload",
+        "aload",
+        "iload_0",
+        "iload_1",
+        "iload_2",
+        "iload_3",
+        "lload_0",
+        "lload_1",
+        "lload_2",
+        "lload_3",
+        "fload_0",
+        "fload_1",
+        "fload_2",
+        "fload_3",
+        "dload_0",
+        "dload_1",
+        "dload_2",
+        "dload_3",
+        "aload_0",
+        "aload_1",
+        "aload_2",
+        "aload_3",
+        "iaload",
+        "laload",
+        "faload",
+        "daload",
+        "aaload",
+        "baload",
+        "caload",
+        "saload",
+        "istore",
+        "lstore",
+        "fstore",
+        "dstore",
+        "astore",
+        "istore_0",
+        "istore_1",
+        "istore_2",
+        "istore_3",
+        "lstore_0",
+        "lstore_1",
+        "lstore_2",
+        "lstore_3",
+        "fstore_0",
+        "fstore_1",
+        "fstore_2",
+        "fstore_3",
+        "dstore_0",
+        "dstore_1",
+        "dstore_2",
+        "dstore_3",
+        "astore_0",
+        "astore_1",
+        "astore_2",
+        "astore_3",
+        "iastore",
+        "lastore",
+        "fastore",
+        "dastore",
+        "aastore",
+        "bastore",
+        "castore",
+        "sastore",
+        "pop",
+        "pop2",
+        "dup",
+        "dup_x1",
+        "dup_x2",
+        "dup2",
+        "dup2_x1",
+        "dup2_x2",
+        "swap",
+        "iadd",
+        "ladd",
+        "fadd",
+        "dadd",
+        "isub",
+        "lsub",
+        "fsub",
+        "dsub",
+        "imul",
+        "lmul",
+        "fmul",
+        "dmul",
+        "idiv",
+        "ldiv",
+        "fdiv",
+        "ddiv",
+        "irem",
+        "lrem",
+        "frem",
+        "drem",
+        "ineg",
+        "lneg",
+        "fneg",
+        "dneg",
+        "ishl",
+        "lshl",
+        "ishr",
+        "lshr",
+        "iushr",
+        "lushr",
+        "iand",
+        "land",
+        "ior",
+        "lor",
+        "ixor",
+        "lxor",
+        "iinc",
+        "i2l",
+        "i2f",
+        "i2d",
+        "l2i",
+        "l2f",
+        "l2d",
+        "f2i",
+        "f2l",
+        "f2d",
+        "d2i",
+        "d2l",
+        "d2f",
+        "i2b",
+        "i2c",
+        "i2s",
+        "lcmp",
+        "fcmpl",
+        "fcmpg",
+        "dcmpl",
+        "dcmpg",
+        "ifeq",
+        "ifne",
+        "iflt",
+        "ifge",
+        "ifgt",
+        "ifle",
+        "if_icmpeq",
+        "if_icmpne",
+        "if_icmplt",
+        "if_icmpge",
+        "if_icmpgt",
+        "if_icmple",
+        "if_acmpeq",
+        "if_acmpne",
+        "goto",
+        "jsr",
+        "ret",
+        "tableswitch",
+        "lookupswitch",
+        "ireturn",
+        "lreturn",
+        "freturn",
+        "dreturn",
+        "areturn",
+        "return",
+        "getstatic",
+        "putstatic",
+        "getfield",
+        "putfield",
+        "invokevirtual",
+        "invokespecial",
+        "invokestatic",
+        "invokeinterface",
+        "invokedynamic",
+        "new",
+        "newarray",
+        "anewarray",
+        "arraylength",
+        "athrow",
+        "checkcast",
+        "instanceof",
+        "monitorenter",
+        "monitorexit",
+        "wide",
+        "multianewarray",
+        "ifnull",
+        "ifnonnull",
+        "goto_w",
+        "jsr_w",
     ];
     NAMES.get(op as usize).copied()
 }
@@ -665,9 +843,7 @@ impl Gap {
                 "put the opcode inside a method with a backward branch — there is no back-edge to \
                  OSR from otherwise"
             }
-            Gap::NoHandlerSite => {
-                "put the opcode inside a method with a non-empty exception table"
-            }
+            Gap::NoHandlerSite => "put the opcode inside a method with a non-empty exception table",
         }
     }
 }
@@ -913,7 +1089,10 @@ impl CoverageMatrix {
 
     /// How many `(opcode, form)` rows cover every axis.
     pub fn fully_covered_rows(&self) -> usize {
-        self.rows.iter().filter(|r| r.uncovered().is_empty()).count()
+        self.rows
+            .iter()
+            .filter(|r| r.uncovered().is_empty())
+            .count()
     }
 
     /// How many of the 202 named opcodes are covered on every axis.
@@ -923,7 +1102,10 @@ impl CoverageMatrix {
 
     /// How many are out of reach entirely (every axis unreachable).
     pub fn unreachable_opcodes(&self) -> usize {
-        self.opcodes.iter().filter(|o| o.fully_unreachable()).count()
+        self.opcodes
+            .iter()
+            .filter(|o| o.fully_unreachable())
+            .count()
     }
 
     /// Pretty JSON, for the committed artifact.
@@ -1184,7 +1366,10 @@ pub fn scan_class_dir(dir: &Path) -> (Vec<ProgramScan>, Vec<(String, String)>) {
     let mut scans = Vec::new();
     let mut failed = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return (scans, vec![(dir.display().to_string(), "unreadable directory".into())]);
+        return (
+            scans,
+            vec![(dir.display().to_string(), "unreadable directory".into())],
+        );
     };
     let mut paths: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
@@ -1330,7 +1515,7 @@ mod tests {
         assert!(scan.sites.contains_key("16:s8")); // bipush
         assert!(scan.sites.contains_key("96:implicit")); // iadd
         assert!(scan.sites.contains_key("172:implicit")); // ireturn
-        // No handlers, no back-edge.
+                                                          // No handlers, no back-edge.
         for facts in scan.sites.values() {
             assert!(!facts.in_exception_method);
             assert!(!facts.in_loop_method);
@@ -1452,7 +1637,10 @@ mod tests {
             iadd.cells["direct-jit"],
             CellState::uncovered(Gap::NoModeDrivesAxis)
         );
-        assert_eq!(iadd.cells["osr"], CellState::uncovered(Gap::NoModeDrivesAxis));
+        assert_eq!(
+            iadd.cells["osr"],
+            CellState::uncovered(Gap::NoModeDrivesAxis)
+        );
         assert_eq!(
             iadd.cells["exception"],
             CellState::uncovered(Gap::NoHandlerSite)
@@ -1547,12 +1735,7 @@ mod tests {
         // changed), so the claim is louder than the evidence.
         let mut generators = GeneratorIndex::new();
         generators.insert(0xba, GeneratorStatus::Generated);
-        let m = CoverageMatrix::build(
-            Vec::new(),
-            Mode::execution_paths(),
-            Vec::new(),
-            &generators,
-        );
+        let m = CoverageMatrix::build(Vec::new(), Mode::execution_paths(), Vec::new(), &generators);
         assert_eq!(m.reconciliation.len(), 1);
         assert_eq!(m.reconciliation[0].name, "invokedynamic");
         let indy = m.opcodes.iter().find(|o| o.opcode == 0xba).unwrap();
@@ -1592,12 +1775,7 @@ mod tests {
     fn the_matrix_round_trips_through_json() {
         let class = class_with_code(&[0x1a, 0x60, 0xac], 0);
         let scan = scan_class_bytes("K", &class).expect("well-formed");
-        let m = CoverageMatrix::build(
-            vec![scan],
-            &[Mode::NoJit],
-            Vec::new(),
-            &known_generators(),
-        );
+        let m = CoverageMatrix::build(vec![scan], &[Mode::NoJit], Vec::new(), &known_generators());
         let json = m.to_json().expect("serialize");
         let back: CoverageMatrix = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.rows.len(), m.rows.len());
@@ -1633,7 +1811,11 @@ mod tests {
         for m in Mode::all() {
             let axes = axes_for(*m);
             if *m == Mode::InterpDecoded {
-                assert!(axes.contains(&PathAxis::InterpreterDecoded), "{}", m.label());
+                assert!(
+                    axes.contains(&PathAxis::InterpreterDecoded),
+                    "{}",
+                    m.label()
+                );
                 assert!(!axes.contains(&PathAxis::InterpreterFast), "{}", m.label());
             } else {
                 assert!(axes.contains(&PathAxis::InterpreterFast), "{}", m.label());

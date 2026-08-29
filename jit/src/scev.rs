@@ -932,9 +932,7 @@ impl BoundSource {
             BoundSource::Local(l) | BoundSource::ArrayLength(l) => {
                 *l < 64 && (modified_locals & (1u64 << *l)) == 0
             }
-            BoundSource::Field {
-                receiver_local, ..
-            } => {
+            BoundSource::Field { receiver_local, .. } => {
                 heap_stable
                     && match receiver_local {
                         None => true,
@@ -1407,7 +1405,10 @@ impl CountedLoop {
     /// body can change, an entry value the loop form needs but does not have,
     /// or an unavoidable `int` wrap each return [`RefusalReason`].
     pub fn iv_span(&self, env: &RangeEnv) -> Result<ProvenSpan, RefusalReason> {
-        if !self.bound.is_invariant(self.modified_locals, self.heap_stable) {
+        if !self
+            .bound
+            .is_invariant(self.modified_locals, self.heap_stable)
+        {
             return Err(RefusalReason::BoundNotInvariant);
         }
         let bound_range = self.bound_range_in(env);
@@ -1478,10 +1479,7 @@ impl CountedLoop {
             // every executed value at or above the entry value.
             let tested = IntRange::from_i64(i32::MIN as i64, gov_hi.min(i32::MAX as i64))
                 .unwrap_or_else(IntRange::unknown)
-                .meet(IntRange::new(
-                    init.lo().unwrap_or(i32::MIN),
-                    i32::MAX,
-                ));
+                .meet(IntRange::new(init.lo().unwrap_or(i32::MIN), i32::MAX));
             let mut max_terms = vec![gov.clone()];
             let min_terms = vec![entry.clone()];
             let numeric = match self.form {
@@ -1614,11 +1612,7 @@ impl CountedLoop {
     /// symbolic multiply here) and keeps only the numeric hull — which is
     /// sound, and simply proves less. Any wrap in the index arithmetic itself
     /// is a refusal, never a wrapped range.
-    pub fn index_span(
-        &self,
-        idx: &IndexExpr,
-        env: &RangeEnv,
-    ) -> Result<ProvenSpan, RefusalReason> {
+    pub fn index_span(&self, idx: &IndexExpr, env: &RangeEnv) -> Result<ProvenSpan, RefusalReason> {
         if idx.iv_local != self.iv.local {
             return Err(RefusalReason::NotTheInductionVariable);
         }
@@ -1942,7 +1936,10 @@ impl CountedLoop {
         // Preconditions in the same order, and with the same verdicts, as
         // `iv_span` — the two proofs must never disagree about *why* a loop is
         // unusable.
-        if !self.bound.is_invariant(self.modified_locals, self.heap_stable) {
+        if !self
+            .bound
+            .is_invariant(self.modified_locals, self.heap_stable)
+        {
             return TripCountProof::Refused(RefusalReason::BoundNotInvariant);
         }
         if self.form != LoopForm::PreTested {
@@ -2433,10 +2430,7 @@ mod range_tests {
         );
         // The `>= 0` half is free: the comparator itself pins the low end.
         // The high end is the entry value, so `length > i_entry`.
-        assert_eq!(
-            guards(&p),
-            [PreheaderGuard::LengthAtLeast(entry_term(1))]
-        );
+        assert_eq!(guards(&p), [PreheaderGuard::LengthAtLeast(entry_term(1))]);
         assert_eq!(l.direction(), Direction::Decreasing);
     }
 
@@ -2457,10 +2451,7 @@ mod range_tests {
             IntRange::array_length(),
             &RangeEnv::new(),
         );
-        assert_eq!(
-            guards(&p),
-            [PreheaderGuard::LengthAtLeast(entry_term(0))]
-        );
+        assert_eq!(guards(&p), [PreheaderGuard::LengthAtLeast(entry_term(0))]);
     }
 
     #[test]
@@ -2494,10 +2485,7 @@ mod range_tests {
             ExitCmp::Ge,
             BoundSource::Local(N),
         );
-        assert_eq!(
-            l.iv_span(&RangeEnv::new()),
-            Err(RefusalReason::ZeroStride)
-        );
+        assert_eq!(l.iv_span(&RangeEnv::new()), Err(RefusalReason::ZeroStride));
     }
 
     // -- non-unit strides ---------------------------------------------------
@@ -2608,12 +2596,7 @@ mod range_tests {
             cp_index: 7,
             receiver_local: Some(0),
         };
-        let mut l = mk(
-            IntRange::constant(0),
-            Stride::Const(1),
-            ExitCmp::Ge,
-            field,
-        );
+        let mut l = mk(IntRange::constant(0), Stride::Const(1), ExitCmp::Ge, field);
         // MUST REFUSE: the body can store to the field between the pre-header
         // guard and a later iteration's exit test.
         l.heap_stable = false;
@@ -3155,11 +3138,7 @@ mod range_tests {
         let env = RangeEnv::new().with_loop_iv(&outer);
         assert_eq!(env.local(IV), IntRange::new(0, 7));
         assert_eq!(
-            inner.prove_index_in_bounds(
-                &IndexExpr::identity(3),
-                IntRange::constant(16),
-                &env
-            ),
+            inner.prove_index_in_bounds(&IndexExpr::identity(3), IntRange::constant(16), &env),
             BoundsProof::Static
         );
     }

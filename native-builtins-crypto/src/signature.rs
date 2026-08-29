@@ -88,9 +88,8 @@ pub fn verify_rsa_pkcs1_v15_checked(
     // The previous code turned every one of these into `false`, which reads at
     // the call site as "the signature did not verify" — a security decision we
     // never actually made.
-    let key = RsaPublicKey::new(n, e).map_err(|err| {
-        CryptoFailure::invalid_key(format!("RSA public key rejected: {err}"))
-    })?;
+    let key = RsaPublicKey::new(n, e)
+        .map_err(|err| CryptoFailure::invalid_key(format!("RSA public key rejected: {err}")))?;
 
     // Signature length is a structural property of the encoding, not evidence
     // about the message. SunRsaSign raises SignatureException here; the rsa
@@ -183,10 +182,13 @@ mod tests {
     // safe rather than merely convenient.
     #![allow(deprecated)]
 
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::failure::{INVALID_KEY_EXCEPTION, SIGNATURE_EXCEPTION};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use rsa::pkcs1v15::SigningKey;
     use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding, Signer};
@@ -199,11 +201,7 @@ mod tests {
         let public = private.to_public_key();
         let signer = SigningKey::<Sha256>::new(private);
         let sig = signer.sign(msg).to_vec();
-        (
-            public.n().to_bytes_be(),
-            public.e().to_bytes_be(),
-            sig,
-        )
+        (public.n().to_bytes_be(), public.e().to_bytes_be(), sig)
     }
 
     // ---- supported algorithm succeeds; genuine mismatch stays a `false` ----
@@ -236,11 +234,22 @@ mod tests {
     fn genuine_mismatch_is_ok_false_not_an_error() {
         let (n, e, sig) = fixture(b"the real message");
         assert_eq!(
-            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"the real message", &sig),
+            verify_rsa_pkcs1_v15_checked(
+                &n,
+                &e,
+                DigestAlgorithm::Sha256,
+                b"the real message",
+                &sig
+            ),
             Ok(true)
         );
-        let mismatch =
-            verify_rsa_pkcs1_v15_checked(&n, &e, DigestAlgorithm::Sha256, b"a different message", &sig);
+        let mismatch = verify_rsa_pkcs1_v15_checked(
+            &n,
+            &e,
+            DigestAlgorithm::Sha256,
+            b"a different message",
+            &sig,
+        );
         assert_eq!(
             mismatch,
             Ok(false),
@@ -278,15 +287,21 @@ mod tests {
             ),
             (
                 DigestAlgorithm::Sha256,
-                SigningKey::<Sha256>::new(private.clone()).sign(msg).to_vec(),
+                SigningKey::<Sha256>::new(private.clone())
+                    .sign(msg)
+                    .to_vec(),
             ),
             (
                 DigestAlgorithm::Sha384,
-                SigningKey::<Sha384>::new(private.clone()).sign(msg).to_vec(),
+                SigningKey::<Sha384>::new(private.clone())
+                    .sign(msg)
+                    .to_vec(),
             ),
             (
                 DigestAlgorithm::Sha512,
-                SigningKey::<Sha512>::new(private.clone()).sign(msg).to_vec(),
+                SigningKey::<Sha512>::new(private.clone())
+                    .sign(msg)
+                    .to_vec(),
             ),
         ];
         for (alg, sig) in cases {

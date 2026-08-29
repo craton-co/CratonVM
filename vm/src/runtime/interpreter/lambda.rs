@@ -221,9 +221,7 @@ pub(super) fn checkcast_lambda_instantiated_args(
                 .map(|c| c.name.to_string())
                 // Name the id, not just "?" — see the matching note on the
                 // `checkcast` opcode's fallback.
-                .unwrap_or_else(|| {
-                    format!("?class_id={}", shared.mem.heap.class_id_of(obj_ref))
-                });
+                .unwrap_or_else(|| format!("?class_id={}", shared.mem.heap.class_id_of(obj_ref)));
             let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
             let target_binary = inst_tok
                 .strip_prefix('L')
@@ -281,7 +279,11 @@ pub(super) fn checkcast_lambda_instantiated_args(
 /// change: no new re-export, and the JIT reaches it as
 /// `crate::runtime::interpreter::cce_display_class_name`, the same module path
 /// it already uses for `aastore_element_assignable`.
-pub(crate) fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+pub(crate) fn cce_display_class_name(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    raw_name: &str,
+) -> String {
     // An array receiver must render as its own type, not its component's.
     // The header word of a reference array holds the COMPONENT class id, so
     // the caller's `class_id_of` -> `class.name` lookup yields
@@ -379,7 +381,11 @@ fn unmod_backing_size(shared: &SharedVm, obj_ref: ObjectRef) -> Option<i32> {
 /// an array-vs-non-array shape we can't decide, or a non-class descriptor — so a
 /// genuine instance is never rejected. Only consults already-loaded classes (no
 /// class loading → no GC, no stale `obj_ref`).
-pub(super) fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_tok: &str) -> bool {
+pub(super) fn lambda_arg_provably_not_instance(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    desc_tok: &str,
+) -> bool {
     // Array instantiated type: decide via the array-assignability rules.
     if desc_tok.starts_with('[') {
         return match array_descriptor_of(shared, obj_ref) {
@@ -674,11 +680,7 @@ pub fn coerce_lambda_args(
     //     only casts where the instantiated type NARROWS the erased SAM type.
     // The work below is therefore pure overhead here: two descriptor walks, a
     // `handles` vector, and one pin push/truncate per argument, on every call.
-    if num_captures == 0
-        && !receiver_present
-        && sam_desc == impl_desc
-        && sam_desc == inst_desc
-    {
+    if num_captures == 0 && !receiver_present && sam_desc == impl_desc && sam_desc == inst_desc {
         return Ok(());
     }
 
@@ -1228,7 +1230,11 @@ thread_local! {
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
-pub(super) fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32) -> Option<f64> {
+pub(super) fn try_tdigest_lambda_double_get(
+    shared: &SharedVm,
+    proxy: ObjectRef,
+    index: i32,
+) -> Option<f64> {
     let proxy_class_id = shared.mem.heap.class_id_of(proxy);
     let call_site = shared
         .classes
@@ -1578,7 +1584,9 @@ pub(crate) fn lambda_jit_site(
     match build_lambda_jit_site(shared, proxy_class_id) {
         SiteVerdict::Eligible(site) => {
             LAMBDA_JIT_SITE_CACHE.with(|cache| {
-                cache.borrow_mut().insert(key, Some(std::rc::Rc::clone(&site)));
+                cache
+                    .borrow_mut()
+                    .insert(key, Some(std::rc::Rc::clone(&site)));
             });
             site.serves(method_name, descriptor).then_some(site)
         }
@@ -1933,7 +1941,6 @@ pub(crate) mod lambda_site_prof {
     }
 }
 
-
 /// The lambda tier-up engagement counters, for tests that must prove they
 /// EXERCISE the fast path rather than merely agreeing with HotSpot while it
 /// never ran.
@@ -2093,66 +2100,66 @@ pub(crate) fn build_lambda_impl_cached(
     method_name: &str,
     descriptor: &str,
 ) -> Option<(Arc<CachedBytecodeMethod>, RedefineGate)> {
-        let cm = shared.classes.class_manager.read();
-        let store = cm.class_store();
-        let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
-            receiver_class_id,
-            method_name,
-            descriptor,
-            store,
-        ) else {
-            return None;
-        };
-        let Some(class) = store.get(declaring_id) else {
-            return None;
-        };
-        // Cached bytecode bypasses native dispatch, which must retain precedence.
-        if shared
-            .natives
-            .native_methods
-            .find(&class.name, method_name, descriptor)
-            .is_some()
-        {
-            return None;
-        }
-        // `synchronized` needs the monitor enter/exit this frame builder does
-        // not do, and `native` has no bytecode to cache. `static` used to be
-        // refused here too, which excluded the single most common lambda
-        // shape in Java: javac compiles a NON-capturing lambda body to a
-        // private *static* synthetic method, so every `() -> ...` that
-        // captures nothing missed this fast path and took the generic
-        // by-name invoke on every single call. Statics are cacheable — the
-        // frame builder is receiver-agnostic (`init_locals_pooled` copies
-        // `args` into locals from slot 0, which is already how both shapes
-        // arrive) — provided the class is initialised, which the caller
-        // guarantees by only reaching here after a full dispatch has run.
-        if method.is_synchronized() || method.is_native() {
-            return None;
-        }
-        let Some(code_attr) = method.code() else {
-            return None;
-        };
-        let is_static = method.is_static();
-        let c = Arc::new(CachedBytecodeMethod {
-            declaring_class_id: declaring_id,
-            class_name: Arc::clone(&class.name),
-            method_name: Arc::from(method_name),
-            method_descriptor: Arc::from(descriptor),
-            source_file: class.source_file.as_deref().map(Arc::from),
-            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
-            exception_table: Arc::from(code_attr.exception_table.as_slice()),
-            max_stack: code_attr.max_stack,
-            max_locals: code_attr.max_locals,
-            num_params: count_method_params(descriptor) as u16,
-            is_synchronized: false,
-            is_static,
-            force_native_cache: std::sync::OnceLock::new(),
+    let cm = shared.classes.class_manager.read();
+    let store = cm.class_store();
+    let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+        receiver_class_id,
+        method_name,
+        descriptor,
+        store,
+    ) else {
+        return None;
+    };
+    let Some(class) = store.get(declaring_id) else {
+        return None;
+    };
+    // Cached bytecode bypasses native dispatch, which must retain precedence.
+    if shared
+        .natives
+        .native_methods
+        .find(&class.name, method_name, descriptor)
+        .is_some()
+    {
+        return None;
+    }
+    // `synchronized` needs the monitor enter/exit this frame builder does
+    // not do, and `native` has no bytecode to cache. `static` used to be
+    // refused here too, which excluded the single most common lambda
+    // shape in Java: javac compiles a NON-capturing lambda body to a
+    // private *static* synthetic method, so every `() -> ...` that
+    // captures nothing missed this fast path and took the generic
+    // by-name invoke on every single call. Statics are cacheable — the
+    // frame builder is receiver-agnostic (`init_locals_pooled` copies
+    // `args` into locals from slot 0, which is already how both shapes
+    // arrive) — provided the class is initialised, which the caller
+    // guarantees by only reaching here after a full dispatch has run.
+    if method.is_synchronized() || method.is_native() {
+        return None;
+    }
+    let Some(code_attr) = method.code() else {
+        return None;
+    };
+    let is_static = method.is_static();
+    let c = Arc::new(CachedBytecodeMethod {
+        declaring_class_id: declaring_id,
+        class_name: Arc::clone(&class.name),
+        method_name: Arc::from(method_name),
+        method_descriptor: Arc::from(descriptor),
+        source_file: class.source_file.as_deref().map(Arc::from),
+        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+        max_stack: code_attr.max_stack,
+        max_locals: code_attr.max_locals,
+        num_params: count_method_params(descriptor) as u16,
+        is_synchronized: false,
+        is_static,
+        force_native_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
-            native_callback_cache: std::sync::OnceLock::new(),
-            invoc_key: std::sync::OnceLock::new(),
-            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
-            quickened: std::sync::OnceLock::new(),
-        });
+        native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
+    });
     let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
     Some((c, gate))
 }
@@ -3674,7 +3681,13 @@ pub(crate) fn const_probe_note_opaque() {
 /// so that is what decides a MISMATCH; a correct low half carried in a word
 /// with junk above it is counted separately, because a caller that reads the
 /// register at the wrong width would see the junk and not the value.
-pub(crate) fn const_probe_screen(expected: i32, raw: i64, impl_class: &str, impl_name: &str, arm: &str) {
+pub(crate) fn const_probe_screen(
+    expected: i32,
+    raw: i64,
+    impl_class: &str,
+    impl_name: &str,
+    arm: &str,
+) {
     CONST_SCREENED.fetch_add(1, Ordering::Relaxed);
     let observed = raw as i32;
     if observed != expected {
@@ -3728,7 +3741,10 @@ mod const_return_decode_tests {
     fn pushed_literals_decode_with_their_sign() {
         assert_eq!(const_int_return_of(&[0x10, 0xFF, 0xAC], false), Some(-1));
         assert_eq!(const_int_return_of(&[0x10, 0x7F, 0xAC], false), Some(127));
-        assert_eq!(const_int_return_of(&[0x11, 0xFF, 0x00, 0xAC], false), Some(-256));
+        assert_eq!(
+            const_int_return_of(&[0x11, 0xFF, 0x00, 0xAC], false),
+            Some(-256)
+        );
     }
 
     /// The regression that made the first version of this probe screen NOTHING:
@@ -3737,8 +3753,14 @@ mod const_return_decode_tests {
     /// exists for. `site_const_screened=0` was the only thing that showed it.
     #[test]
     fn trailing_padding_does_not_hide_a_constant_body() {
-        assert_eq!(const_int_return_of(&[0x04, 0xAC, 0x00, 0x00], false), Some(1));
-        assert_eq!(const_int_return_of(&[0x10, 0x2A, 0xAC, 0x00], false), Some(42));
+        assert_eq!(
+            const_int_return_of(&[0x04, 0xAC, 0x00, 0x00], false),
+            Some(1)
+        );
+        assert_eq!(
+            const_int_return_of(&[0x10, 0x2A, 0xAC, 0x00], false),
+            Some(42)
+        );
     }
 
     /// With a handler in the table, a bci past the `ireturn` is reachable, so
@@ -3777,7 +3799,8 @@ pub(crate) fn screen_const_return_value(
     if !crate::runtime::env_cache::jit_lambda_const_probe() {
         return;
     }
-    let Some(expected) = const_int_return_of(&cached.code, !cached.exception_table.is_empty()) else {
+    let Some(expected) = const_int_return_of(&cached.code, !cached.exception_table.is_empty())
+    else {
         return;
     };
     let raw = match value {
@@ -3787,11 +3810,5 @@ pub(crate) fn screen_const_return_value(
         // answer it is instead of silently agreeing.
         _ => i64::from(expected) ^ 1,
     };
-    const_probe_screen(
-        expected,
-        raw,
-        &cached.class_name,
-        &cached.method_name,
-        arm,
-    );
+    const_probe_screen(expected, raw, &cached.class_name, &cached.method_name, arm);
 }

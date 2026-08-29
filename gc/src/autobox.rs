@@ -318,9 +318,11 @@ mod tests {
             "an address the heap cannot validate must come back untouched",
         );
         assert_eq!(
-            unbox_reference_slot(Value::Object(None), |_| Some(AUTOBOX_CLASS_ID), |_| {
-                Value::Int(42)
-            }),
+            unbox_reference_slot(
+                Value::Object(None),
+                |_| Some(AUTOBOX_CLASS_ID),
+                |_| { Value::Int(42) }
+            ),
             Value::Object(None),
             "null is not a wrapper",
         );

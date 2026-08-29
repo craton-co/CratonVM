@@ -8,11 +8,11 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::obj_arg;
 use crate::service_loader::impl_jars_load_class;
 use crate::util_concurrent_ext::try_alloc_concurrent_synthetic;
-use crate::obj_arg;
-use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 use cratonvm_types::{ObjectRef, Value};
@@ -258,8 +258,7 @@ pub fn reset_loader_singletons() {
     // L1: the per-loader bookkeeping is keyed by heap address, so carrying it
     // into a fresh VM would hand a brand-new loader an old one's loader type
     // and namespace id the moment an address is reused.
-    loader_meta_store().lock()
-        .clear();
+    loader_meta_store().lock().clear();
     // NOT cleared here any more either, for exactly the reason just above —
     // these four were the same mistake, sixteen lines below the note that
     // explains it:
@@ -507,24 +506,20 @@ pub fn gc_reconcile_defining_loaders(
         let table = loader_meta_store().lock();
         table.iter().map(|(o, _)| o.as_ptr() as usize).collect()
     };
-    let dead: std::collections::HashSet<usize> = addrs
-        .into_iter()
-        .filter(|addr| !is_marked(*addr))
-        .collect();
-    loader_meta_store()
-        .lock()
-        .retain_mut(|(obj_ref, _)| {
-            let old_addr = obj_ref.as_ptr() as usize;
-            if dead.contains(&old_addr) {
-                return false;
-            }
-            // `pointer_map` is a plain `HashMap` owned by the caller — no lock.
-            if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-            }
-            true
-        });
+    let dead: std::collections::HashSet<usize> =
+        addrs.into_iter().filter(|addr| !is_marked(*addr)).collect();
+    loader_meta_store().lock().retain_mut(|(obj_ref, _)| {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if dead.contains(&old_addr) {
+            return false;
+        }
+        // `pointer_map` is a plain `HashMap` owned by the caller — no lock.
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+        true
+    });
 
     dead_class_ids.sort_unstable();
     dead_class_ids.dedup();
@@ -821,7 +816,9 @@ pub fn get_class_data(mirror: ObjectRef) -> Value {
 }
 
 /// Get or create the singleton platform class loader.
-pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn get_or_create_platform_loader(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if let Some(obj) = platform_loader_of(vm) {
         return Ok(obj);
@@ -905,7 +902,9 @@ pub(crate) fn latest_user_defined_loader_class(
 }
 
 /// Get or create the singleton application (system) class loader.
-pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub fn get_or_create_app_loader(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if let Some(obj) = app_loader_of(vm) {
         // The singleton is a Rust-side cache.  If a moving collection ever
@@ -1117,7 +1116,8 @@ pub(crate) fn loader_meta_put(loader: ObjectRef, meta: LoaderMeta) {
 
 /// Read `loader`'s recorded bookkeeping, if this VM has any.
 pub(crate) fn loader_meta_get(loader: ObjectRef) -> Option<LoaderMeta> {
-    loader_meta_store().lock()
+    loader_meta_store()
+        .lock()
         .iter()
         .find(|(l, _)| l.as_ptr() == loader.as_ptr())
         .map(|&(_, m)| m)
@@ -1207,7 +1207,10 @@ fn loader_classes_loaded_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Optio
 }
 
 /// `CL_IS_PARALLEL_CAPABLE`.
-pub(crate) fn loader_parallel_capable_of(ctx: &dyn NativeContext, loader: ObjectRef) -> Option<i32> {
+pub(crate) fn loader_parallel_capable_of(
+    ctx: &dyn NativeContext,
+    loader: ObjectRef,
+) -> Option<i32> {
     if let Some(p) = loader_meta_get(loader).and_then(|m| m.parallel_capable) {
         return Some(i32::from(p));
     }
@@ -1334,7 +1337,9 @@ const CS_CLASS: &str = "java/security/CodeSource";
 /// to null. The `CodeSource` itself is non-null, so `getCodeSource()` returns
 /// a real object that `getCertificates()` / `getLocation()` can be called on
 /// without NPE.
-fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_default_protection_domain(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     let mut cs = try_alloc_concurrent_synthetic(ctx, CS_CLASS, CS_FIELD_COUNT)?;
     let cs_pin = ctx.pin_native_root(cs);
     ctx.set_field(cs, CS_LOCATION_REF, Value::Object(None));
@@ -1367,7 +1372,10 @@ fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> Result<Object
     Ok(pd)
 }
 
-pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn alloc_classloader(
+    ctx: &mut dyn NativeContext,
+    loader_type: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     // WP1.5: built-in loaders must report the real JDK type name via
     // reflection. `jdk.internal.loader.ClassLoaders$PlatformClassLoader` for
     // the platform loader, `...$AppClassLoader` for the system loader, and
@@ -1681,8 +1689,7 @@ fn lk_modes_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 /// for the modes of `MethodHandles.lookup()` — that value additionally carries
 /// `ORIGINAL`. `Lookup.in` and `Lookup.dropLookupMode` both mask against the
 /// JDK's 0x1F, so the two must not be confused.
-const LK_FULL_POWER_MODES: i32 =
-    LK_PUBLIC | LK_PRIVATE | LK_PROTECTED | LK_PACKAGE | LK_MODULE;
+const LK_FULL_POWER_MODES: i32 = LK_PUBLIC | LK_PRIVATE | LK_PROTECTED | LK_PACKAGE | LK_MODULE;
 
 /// `Lookup.in(requestedLookupClass)` mode arithmetic, JDK 25.
 ///
@@ -5051,7 +5058,9 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             1,
             "ClassLoader.getSystemResource name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc?,
+        ));
     }
     if args.len() >= 2 && !matches!(args.get(1), Some(Value::Object(Some(_)))) {
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
@@ -5479,7 +5488,10 @@ fn lazy_enumeration_from_url_strings(
     out
 }
 
-fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> Result<ObjectRef, MethodCallFailed> {
+fn enumeration_from_url_strings(
+    ctx: &mut dyn NativeContext,
+    urls: &[String],
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
     // GC-triggering); `arr` is written into again via `set_array_element`
@@ -5501,7 +5513,10 @@ fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) ->
 /// forms.  Custom URLStreamHandler instances are object state, so rebuilding a
 /// URL from its String (as the flat-classpath path does) makes in-memory
 /// archives such as ShrinkWrap's `archive:` resources unreadable.
-fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> Result<ObjectRef, MethodCallFailed> {
+fn enumeration_from_rooted_urls(
+    ctx: &mut dyn NativeContext,
+    urls: &[RootedUrl],
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, rooted) in urls.iter().copied().enumerate() {
@@ -6380,7 +6395,10 @@ fn enum_impl_peek_lazy(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(
 }
 
 fn enum_impl_is_lazy(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) == ENUM_ELEMENTS_LAZY_SCAN
+    ctx.get_field(this, 3)
+        .as_int()
+        .unwrap_or(ENUM_ELEMENTS_AS_IS)
+        == ENUM_ELEMENTS_LAZY_SCAN
 }
 
 fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6405,7 +6423,12 @@ fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let elem = ctx.get_array_element(arr, idx);
     ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-    if ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) != ENUM_ELEMENTS_URL_SPECS {
+    if ctx
+        .get_field(this, 3)
+        .as_int()
+        .unwrap_or(ENUM_ELEMENTS_AS_IS)
+        != ENUM_ELEMENTS_URL_SPECS
+    {
         return Ok(Some(elem));
     }
     let Value::Object(Some(spec_obj)) = elem else {
@@ -6443,7 +6466,12 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(enm, "nextElement", "()Ljava/lang/Object;", enum_impl_next_element);
+    r.register(
+        enm,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        enum_impl_next_element,
+    );
     r.register(enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if enum_impl_is_lazy(ctx, this) {
@@ -7867,8 +7895,9 @@ pub(crate) fn package_class_files_visible_to_loader(
 fn builtin_loader_segment(loader_class: Option<&str>) -> Option<u8> {
     match loader_class? {
         // The application loader owns `-cp` and nothing else.
-        "jdk/internal/loader/ClassLoaders$AppClassLoader"
-        | "sun/misc/Launcher$AppClassLoader" => Some(2),
+        "jdk/internal/loader/ClassLoaders$AppClassLoader" | "sun/misc/Launcher$AppClassLoader" => {
+            Some(2)
+        }
         // The platform loader owns the extension segment. NOTE: this VM does
         // not model the JDK's platform MODULE set, so a genuinely
         // platform-defined package (`java.sql`) answers `null` here where
@@ -8046,8 +8075,8 @@ pub(crate) fn ucl_try_define_local_class(
             let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *in_progress = false;
             self.cvar.notify_all();
-    ()
-}
+            ()
+        }
     }
     let _define_in_progress_guard = DefineInProgressGuard {
         mutex: define_lock_mutex,
@@ -8861,28 +8890,34 @@ fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             // `Class.toString()` of a primitive is bare — "int", "void" — so the
             // JDK's message has no "class " prefix.
             let name = target_name.unwrap_or_else(|| "?".to_string());
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("{name} is a primitive class"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("{name} is a primitive class"),
+                }
+                .into(),
+            );
         }
         // (4) `targetClass.isArray()`. Array mirrors are the ones whose name
         //     starts with '['; `Class.toString()` of an array IS prefixed and
         //     prints the binary name ("class [I", "class [Lp.Mate;").
         if let Some(name) = target_name {
             if name.starts_with('[') {
-                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("class {} is an array class", name.replace('/', ".")),
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: format!("class {} is an array class", name.replace('/', ".")),
+                    }
+                    .into(),
+                );
             }
         }
         // (5) the mode gate, with the `modes == 0` valve documented above.
         if modes != 0 && (modes & (LK_PRIVATE | LK_MODULE)) != (LK_PRIVATE | LK_MODULE) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
+                }
+                .into(),
+            );
         }
     }
 
@@ -9640,11 +9675,7 @@ fn lk_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// package" for a mirror we simply could not name would silently demote a
 /// legitimate lookup to PUBLIC and turn every subsequent non-public
 /// `find*` into a spurious `IllegalAccessException`.
-pub(crate) fn lk_class_relation(
-    ctx: &dyn NativeContext,
-    a: Value,
-    b: Value,
-) -> (bool, bool, bool) {
+pub(crate) fn lk_class_relation(ctx: &dyn NativeContext, a: Value, b: Value) -> (bool, bool, bool) {
     let name_of = |v: Value| match v {
         Value::Object(Some(m)) => crate::lang_class::mirror_class_name(ctx, m),
         _ => None,
@@ -9766,10 +9797,12 @@ fn lk_drop_lookup_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(m) => m,
         // Measured on JDK 25: the message is exactly this.
         None => {
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("{drop_mode} is not a valid mode to drop"),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("{drop_mode} is not a valid mode to drop"),
+                }
+                .into(),
+            );
         }
     };
     let new_lk = alloc_lookup(ctx, new_modes)?;
@@ -11115,10 +11148,7 @@ mod classloader_tests {
         let flat_name = ctx.create_string(SPI);
         let flat = cl_get_resources_impl(
             &mut ctx,
-            &[
-                Value::Object(Some(loader)),
-                Value::Object(Some(flat_name)),
-            ],
+            &[Value::Object(Some(loader)), Value::Object(Some(flat_name))],
             false,
         )
         .expect("flat scan")
@@ -11517,14 +11547,19 @@ mod classloader_tests {
     /// already removes by id.
     fn forget_loader_meta(loaders: &[ObjectRef]) {
         let mine: Vec<usize> = loaders.iter().map(|l| l.as_ptr() as usize).collect();
-        loader_meta_store().lock()
+        loader_meta_store()
+            .lock()
             .retain(|(l, _)| !mine.contains(&(l.as_ptr() as usize)));
     }
 
     /// Declare `names` as instance fields of `cid`, so
     /// `resolve_field_index_by_class_id` finds them — the mock's resolver
     /// consults `declared_fields`.
-    fn declare_instance_fields(ctx: &MockNativeContext, cid: cratonvm_types::ClassId, names: &[&str]) {
+    fn declare_instance_fields(
+        ctx: &MockNativeContext,
+        cid: cratonvm_types::ClassId,
+        names: &[&str],
+    ) {
         let fields = names
             .iter()
             .enumerate()
@@ -11543,11 +11578,7 @@ mod classloader_tests {
     /// Build a `ClassLoader` subclass and an instance of it. `real_layout`
     /// declares the JDK's own private fields, which is what tells the two
     /// layouts apart.
-    fn make_loader(
-        ctx: &mut MockNativeContext,
-        class_name: &str,
-        real_layout: bool,
-    ) -> ObjectRef {
+    fn make_loader(ctx: &mut MockNativeContext, class_name: &str, real_layout: bool) -> ObjectRef {
         let class_loader = ctx
             .ensure_class_initialized("java/lang/ClassLoader")
             .expect("ClassLoader class");
@@ -12855,7 +12886,8 @@ mod classloader_tests {
             &mut ctx,
             "java/lang/invoke/MethodHandles$Lookup$ClassOption",
             1,
-        ).unwrap();
+        )
+        .unwrap();
         ctx.set_field(option, 0, Value::Int(0)); // NESTMATE ordinal
         let options_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(options_arr, 0, Value::Object(Some(option)));
@@ -13043,7 +13075,10 @@ mod classloader_tests {
     #[test]
     fn test_drop_lookup_mode_rejects_non_modes() {
         assert_eq!(lk_drop_modes(LK_FULL_POWER, 0), None);
-        assert_eq!(lk_drop_modes(LK_FULL_POWER, LK_PRIVATE | LK_PROTECTED), None);
+        assert_eq!(
+            lk_drop_modes(LK_FULL_POWER, LK_PRIVATE | LK_PROTECTED),
+            None
+        );
         assert_eq!(lk_drop_modes(LK_FULL_POWER, 0x80), None);
     }
 
@@ -13094,9 +13129,15 @@ mod classloader_tests {
     #[test]
     fn test_in_modes_nestmate_beats_bare_package_match() {
         // Package-mates that are NOT nestmates lose PRIVATE|PROTECTED …
-        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false, true) & LK_PRIVATE, 0);
+        assert_eq!(
+            lk_in_modes(LK_FULL_POWER, false, true, false, true) & LK_PRIVATE,
+            0
+        );
         // … while nestmates keep them.
-        assert_ne!(lk_in_modes(LK_FULL_POWER, false, true, true, true) & LK_PRIVATE, 0);
+        assert_ne!(
+            lk_in_modes(LK_FULL_POWER, false, true, true, true) & LK_PRIVATE,
+            0
+        );
     }
 
     /// `lk_modes_of` must read the SYNTHETIC slot when the receiver's class
@@ -13304,7 +13345,6 @@ mod classloader_tests {
     // W7-62-ratchets-and-dead-code.md
     // -----------------------------------------------------------------------
 
-
     /// `MockNativeContext::resolve_field_index_by_class_id` now falls back to
     /// `ClassManager::synthetic_stub_fields`, the same table the VM resolves a
     /// name against for a class with no real bytes.
@@ -13348,7 +13388,10 @@ mod classloader_tests {
             ctx.resolve_field_index_by_class_id(cid, "parallelLockMap"),
             None
         );
-        assert_eq!(ctx.resolve_field_index_by_class_id(cid, "nosuchfield"), None);
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(cid, "nosuchfield"),
+            None
+        );
     }
 
     /// The fallback is the TAIL of the chain, not the head.

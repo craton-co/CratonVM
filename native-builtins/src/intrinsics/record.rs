@@ -76,10 +76,7 @@ use cratonvm_types::{ObjectRef, Value};
 /// Intrinsic for a record's generated `hashCode ()I` (virtual).
 ///
 /// `args == [receiver]`.
-pub fn intrinsic_record_hash_code(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub fn intrinsic_record_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         // A null receiver never reaches a virtual call site (the interpreter
@@ -308,7 +305,12 @@ fn components_equal(
         // `x == y` check above already failed.
         return Ok(false);
     }
-    match ctx.invoke_virtual(x, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(y))])? {
+    match ctx.invoke_virtual(
+        x,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(y))],
+    )? {
         Some(Value::Int(result)) => Ok(result != 0),
         _ => Ok(false),
     }
@@ -373,7 +375,10 @@ fn array_list_hash(
         let element = ctx.get_array_element(current, index);
         match component_hash(ctx, &element, depth + 1) {
             Ok(element_hash) => {
-                hash = Ok(hash.unwrap_or(1).wrapping_mul(31).wrapping_add(element_hash));
+                hash = Ok(hash
+                    .unwrap_or(1)
+                    .wrapping_mul(31)
+                    .wrapping_add(element_hash));
             }
             Err(failure) => {
                 hash = Err(failure);
@@ -643,10 +648,7 @@ mod tests {
             &Value::Double(f64::NAN)
         ));
         assert!(!primitives_equal(&Value::Double(0.0), &Value::Double(-0.0)));
-        assert!(primitives_equal(
-            &Value::Object(None),
-            &Value::Object(None)
-        ));
+        assert!(primitives_equal(&Value::Object(None), &Value::Object(None)));
         assert!(!primitives_equal(&Value::Int(1), &Value::Long(1)));
     }
 

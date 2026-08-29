@@ -388,8 +388,10 @@ impl NativeCallSite {
             Some(id) => id.as_u32().saturating_add(1),
             None => 0,
         };
-        self.memo
-            .store(((generation as u64) << 32) | encoded as u64, Ordering::Relaxed);
+        self.memo.store(
+            ((generation as u64) << 32) | encoded as u64,
+            Ordering::Relaxed,
+        );
     }
 
     #[inline]
@@ -467,9 +469,13 @@ mod tests {
         let site = NativeCallSite::new();
 
         assert!(!site.is_warm(&registry));
-        let first = site.callback(&registry, "a/A", "m", "()V").expect("cold hit");
+        let first = site
+            .callback(&registry, "a/A", "m", "()V")
+            .expect("cold hit");
         assert!(site.is_warm(&registry));
-        let second = site.callback(&registry, "a/A", "m", "()V").expect("warm hit");
+        let second = site
+            .callback(&registry, "a/A", "m", "()V")
+            .expect("warm hit");
         assert_eq!(addr(first), addr(second));
         assert_eq!(
             addr(first),
@@ -613,7 +619,9 @@ mod tests {
         // `static NativeCallSite` cells at the constant-triple call sites: each
         // such site must have its own static, never a shared one.
         let other_site = NativeCallSite::new();
-        assert!(other_site.callback(&second, "z/Z", "other", "()V").is_some());
+        assert!(other_site
+            .callback(&second, "z/Z", "other", "()V")
+            .is_some());
         // And that second site is likewise not warm for the first registry.
         assert!(!other_site.is_warm(&first));
     }
@@ -639,7 +647,10 @@ mod tests {
     #[cfg(debug_assertions)]
     fn witness_rejects_a_second_triple_on_the_same_cell() {
         let site = NativeCallSite::new();
-        assert!(site.witness_triple("a/A", "m", "()V"), "first query sets it");
+        assert!(
+            site.witness_triple("a/A", "m", "()V"),
+            "first query sets it"
+        );
         assert!(
             !site.witness_triple("a/A", "m", "()I"),
             "a differing descriptor alone must be caught"

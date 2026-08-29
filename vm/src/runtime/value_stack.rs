@@ -29,7 +29,11 @@ static DIAG_INIT: std::sync::Once = std::sync::Once::new();
 #[inline(always)]
 fn stack_diag_enabled() -> bool {
     DIAG_INIT.call_once(|| {
-        if cratonvm_types::flags::runtime_var("CRATONVM_DEBUG_STACK_TAG").ok().as_deref() == Some("1") {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DEBUG_STACK_TAG")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             DIAG_ENABLED.store(true, Ordering::Relaxed);
         }
     });
@@ -3127,8 +3131,7 @@ mod tests {
             stack.push_long(v).expect("push_long");
             let got = stack.pop_long().expect("pop_long");
             assert_eq!(
-                got as u64,
-                v as u64,
+                got as u64, v as u64,
                 "push_long/pop_long lost bits for 0x{:016x}",
                 v as u64
             );
@@ -3144,8 +3147,7 @@ mod tests {
             stack.push(Value::Long(v)).expect("push");
             match stack.pop().expect("pop") {
                 Value::Long(got) => assert_eq!(
-                    got as u64,
-                    v as u64,
+                    got as u64, v as u64,
                     "Value::Long round trip lost bits for 0x{:016x}",
                     v as u64
                 ),

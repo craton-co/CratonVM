@@ -93,7 +93,6 @@ fn disable_udp_connreset(socket: &std::net::UdpSocket) {
 #[cfg(not(target_os = "windows"))]
 fn disable_udp_connreset(_socket: &std::net::UdpSocket) {}
 
-
 /// Open a **dual-stack** UDP socket: AF_INET6 with `IPV6_V6ONLY` off, so one
 /// socket reaches both address families.
 ///
@@ -3198,7 +3197,9 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_multicast_if_v4(interface_addr),
+            FileEntry::UdpSocket(s) => {
+                socket2::SockRef::from(s).set_multicast_if_v4(interface_addr)
+            }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -4202,7 +4203,10 @@ mod tests {
             // No IPv6 on this host — the documented fallback. Nothing to assert.
             return;
         }
-        assert!(local.ip().is_unspecified(), "expected the wildcard, got {local}");
+        assert!(
+            local.ip().is_unspecified(),
+            "expected the wildcard, got {local}"
+        );
         let port = local.port();
 
         for host in ["127.0.0.1", "::1"] {

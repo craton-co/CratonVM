@@ -935,13 +935,16 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
-                class_name: Arc::from(class_name.as_str()),
-                method_name: Arc::from(method_name.as_str()),
-                method_descriptor: Arc::from(method_descriptor.as_str()),
-                source_file: source_file.map(|s| Arc::from(s.as_str())),
-                exception_table: Arc::from(exception_table.into_boxed_slice()),
-            }))},
+            inner: {
+                count_frame_kind(true);
+                FrameInner::Owned(Box::new(OwnedFrameMeta {
+                    class_name: Arc::from(class_name.as_str()),
+                    method_name: Arc::from(method_name.as_str()),
+                    method_descriptor: Arc::from(method_descriptor.as_str()),
+                    source_file: source_file.map(|s| Arc::from(s.as_str())),
+                    exception_table: Arc::from(exception_table.into_boxed_slice()),
+                }))
+            },
             // The caller passes loose parts, not a resolved method; use
             // `set_method_index` where the slot is known.
             method_index: None,
@@ -1009,13 +1012,16 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
-                class_name,
-                method_name,
-                method_descriptor,
-                source_file,
-                exception_table,
-            }))},
+            inner: {
+                count_frame_kind(true);
+                FrameInner::Owned(Box::new(OwnedFrameMeta {
+                    class_name,
+                    method_name,
+                    method_descriptor,
+                    source_file,
+                    exception_table,
+                }))
+            },
             // Same as `Frame::new`: loose Arcs, no resolved method slot.
             method_index: None,
             backward_count: 0,
@@ -1060,13 +1066,16 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
-                class_name,
-                method_name,
-                method_descriptor,
-                source_file,
-                exception_table,
-            }))},
+            inner: {
+                count_frame_kind(true);
+                FrameInner::Owned(Box::new(OwnedFrameMeta {
+                    class_name,
+                    method_name,
+                    method_descriptor,
+                    source_file,
+                    exception_table,
+                }))
+            },
             // Same as `Frame::new`: loose Arcs, no resolved method slot.
             method_index: None,
             backward_count: 0,
@@ -1107,7 +1116,10 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: { count_frame_kind(false); FrameInner::Cached(cached) },
+            inner: {
+                count_frame_kind(false);
+                FrameInner::Cached(cached)
+            },
             // CR-CLO-2 cached half: `CachedBytecodeMethod` does not yet carry a
             // method slot (see the field doc — its 38 struct literals live in
             // four crates and none has a `..` tail, so the field cannot be
@@ -1814,13 +1826,16 @@ impl Frame {
             code,
             max_stack,
             max_locals,
-            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
-                class_name: Arc::from(frozen.class_name.as_str()),
-                method_name: Arc::from(frozen.method_name.as_str()),
-                method_descriptor: Arc::from(frozen.descriptor.as_str()),
-                source_file: frozen.source_file.map(|s| Arc::from(s.as_str())),
-                exception_table,
-            }))},
+            inner: {
+                count_frame_kind(true);
+                FrameInner::Owned(Box::new(OwnedFrameMeta {
+                    class_name: Arc::from(frozen.class_name.as_str()),
+                    method_name: Arc::from(frozen.method_name.as_str()),
+                    method_descriptor: Arc::from(frozen.descriptor.as_str()),
+                    source_file: frozen.source_file.map(|s| Arc::from(s.as_str())),
+                    exception_table,
+                }))
+            },
             // CR-CLO-2 — explicit, not incidental. `FrozenFrame` carries no
             // method slot (it round-trips names and a descriptor, and lives in
             // `threading/virtual_threads.rs`), so a thawed frame has no
@@ -1962,15 +1977,18 @@ impl Frame {
                 {
                     if cv.is_object() {
                         if let Some(ptr) = cv.as_object_ptr() {
-                            cratonvm_gc::gc_quiescence::note_liveness_filtered(ptr as usize, || {
-                                format!(
-                                    "{}.{} pc={} local[{}]",
-                                    self.class_name(),
-                                    self.method_name(),
-                                    self.pc,
-                                    i
-                                )
-                            });
+                            cratonvm_gc::gc_quiescence::note_liveness_filtered(
+                                ptr as usize,
+                                || {
+                                    format!(
+                                        "{}.{} pc={} local[{}]",
+                                        self.class_name(),
+                                        self.method_name(),
+                                        self.pc,
+                                        i
+                                    )
+                                },
+                            );
                         }
                     }
                 }
@@ -3963,8 +3981,7 @@ mod tests {
 
         for (i, &expected) in addrs.iter().enumerate() {
             assert_eq!(
-                &frames[i] as *const Frame,
-                expected,
+                &frames[i] as *const Frame, expected,
                 "frame {i} moved during a reserved push sequence"
             );
         }
@@ -3975,8 +3992,7 @@ mod tests {
         }
         for (i, &expected) in addrs.iter().enumerate().take(DEPTH / 2) {
             assert_eq!(
-                &frames[i] as *const Frame,
-                expected,
+                &frames[i] as *const Frame, expected,
                 "frame {i} moved during pops"
             );
         }
@@ -4009,7 +4025,11 @@ mod tests {
 
         assert_eq!(frames.frame_ptr(0), bottom, "bottom frame moved");
         // SAFETY: same conditions as above.
-        assert_eq!(unsafe { (*bottom).pc }, 0x1234, "bottom frame was clobbered");
+        assert_eq!(
+            unsafe { (*bottom).pc },
+            0x1234,
+            "bottom frame was clobbered"
+        );
 
         // Out of range yields null rather than panicking.
         assert!(frames.frame_ptr(1).is_null());
@@ -4321,9 +4341,18 @@ mod frame_size_probe {
     #[test]
     fn report_frame_size() {
         eprintln!("size_of::<Frame>()      = {}", std::mem::size_of::<Frame>());
-        eprintln!("size_of::<FrameInner>() = {}", std::mem::size_of::<FrameInner>());
-        eprintln!("size_of::<ValueStack>() = {}", std::mem::size_of::<ValueStack>());
-        eprintln!("align_of::<Frame>()     = {}", std::mem::align_of::<Frame>());
+        eprintln!(
+            "size_of::<FrameInner>() = {}",
+            std::mem::size_of::<FrameInner>()
+        );
+        eprintln!(
+            "size_of::<ValueStack>() = {}",
+            std::mem::size_of::<ValueStack>()
+        );
+        eprintln!(
+            "align_of::<Frame>()     = {}",
+            std::mem::align_of::<Frame>()
+        );
     }
 }
 
@@ -4331,9 +4360,18 @@ mod frame_size_probe {
 mod value_size_probe {
     #[test]
     fn report_value_size() {
-        eprintln!("size_of::<Value>()        = {}", std::mem::size_of::<cratonvm_types::Value>());
-        eprintln!("16-slot args_buf bytes    = {}", 16 * std::mem::size_of::<cratonvm_types::Value>());
-        eprintln!("size_of::<CompactValue>() = {}", std::mem::size_of::<cratonvm_types::CompactValue>());
+        eprintln!(
+            "size_of::<Value>()        = {}",
+            std::mem::size_of::<cratonvm_types::Value>()
+        );
+        eprintln!(
+            "16-slot args_buf bytes    = {}",
+            16 * std::mem::size_of::<cratonvm_types::Value>()
+        );
+        eprintln!(
+            "size_of::<CompactValue>() = {}",
+            std::mem::size_of::<cratonvm_types::CompactValue>()
+        );
     }
 }
 
@@ -4366,19 +4404,41 @@ mod frame_layout_probe {
     #[test]
     fn report_frame_layout() {
         eprintln!("Frame                 = {}", std::mem::size_of::<Frame>());
-        eprintln!("  FrameInner          = {}", std::mem::size_of::<FrameInner>());
-        eprintln!("  ValueStack          = {}", std::mem::size_of::<ValueStack>());
-        eprintln!("  Vec<CompactValue>   = {}", std::mem::size_of::<Vec<CompactValue>>());
+        eprintln!(
+            "  FrameInner          = {}",
+            std::mem::size_of::<FrameInner>()
+        );
+        eprintln!(
+            "  ValueStack          = {}",
+            std::mem::size_of::<ValueStack>()
+        );
+        eprintln!(
+            "  Vec<CompactValue>   = {}",
+            std::mem::size_of::<Vec<CompactValue>>()
+        );
         eprintln!("  Vec<u8>             = {}", std::mem::size_of::<Vec<u8>>());
-        eprintln!("  Vec<(usize,u32)>    = {}", std::mem::size_of::<Vec<(usize, u32)>>());
-        eprintln!("  Arc<[u8]>           = {}", std::mem::size_of::<Arc<[u8]>>());
-        eprintln!("  Option<ObjectRef>   = {}", std::mem::size_of::<Option<ObjectRef>>());
+        eprintln!(
+            "  Vec<(usize,u32)>    = {}",
+            std::mem::size_of::<Vec<(usize, u32)>>()
+        );
+        eprintln!(
+            "  Arc<[u8]>           = {}",
+            std::mem::size_of::<Arc<[u8]>>()
+        );
+        eprintln!(
+            "  Option<ObjectRef>   = {}",
+            std::mem::size_of::<Option<ObjectRef>>()
+        );
         eprintln!("--- FrameInner variants ---");
-        eprintln!("  Arc<CachedBytecodeMethod> (Cached payload) = {}",
-            std::mem::size_of::<Arc<CachedBytecodeMethod>>());
-        eprintln!("  Owned payload (5 fat ptrs)                 = {}",
+        eprintln!(
+            "  Arc<CachedBytecodeMethod> (Cached payload) = {}",
+            std::mem::size_of::<Arc<CachedBytecodeMethod>>()
+        );
+        eprintln!(
+            "  Owned payload (5 fat ptrs)                 = {}",
             std::mem::size_of::<Arc<str>>() * 3
                 + std::mem::size_of::<Option<Arc<str>>>()
-                + std::mem::size_of::<Arc<[ExceptionTableEntry]>>());
+                + std::mem::size_of::<Arc<[ExceptionTableEntry]>>()
+        );
     }
 }

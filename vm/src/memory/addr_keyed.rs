@@ -337,7 +337,10 @@ mod tests {
                 continue;
             }
             total_declarations += count;
-            match super::census::AUDITED.iter().find(|a| rel.ends_with(a.path)) {
+            match super::census::AUDITED
+                .iter()
+                .find(|a| rel.ends_with(a.path))
+            {
                 None => findings.push(format!(
                     "{rel}: {count} address-keyed declaration(s), NOT in the census"
                 )),
@@ -491,7 +494,11 @@ mod tests {
     fn empty_table_is_a_no_op() {
         let mut t: FxHashMap<ObjectRef, u32> = FxHashMap::default();
 
-        let stats = remap_and_sweep(&mut t, &cratonvm_types::PointerMap::from_iter([(A, B)]), &|_| true);
+        let stats = remap_and_sweep(
+            &mut t,
+            &cratonvm_types::PointerMap::from_iter([(A, B)]),
+            &|_| true,
+        );
 
         assert_eq!(stats, SweepStats::default());
         assert!(t.is_empty());

@@ -147,7 +147,8 @@ fn ensure_probe_compiled() -> bool {
             // missing-toolchain condition rather than a broken probe.
             if !o.status.success() {
                 let stderr_probe = String::from_utf8_lossy(&o.stderr);
-                if stderr_probe.contains("release version") && stderr_probe.contains("not supported")
+                if stderr_probe.contains("release version")
+                    && stderr_probe.contains("not supported")
                 {
                     eprintln!(
                         "[wave3-c] javac cannot target --release 21 ({}); skipping. Point \

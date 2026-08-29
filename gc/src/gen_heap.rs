@@ -40,8 +40,8 @@ use crate::concurrent_mark::ConcurrentGcState;
 use crate::gc::GcResult;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, read_prim_element,
-    write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    REF_ELEMENT_SIZE, SLOT_SIZE,
+    write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
 // Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
@@ -119,10 +119,13 @@ fn young_arena_needs_defragmentation(used: usize, capacity: usize, largest_free:
     if capacity == 0 {
         return false;
     }
-    let bump_exhausted = used >= capacity.saturating_sub(capacity / DEFRAG_BUMP_EXHAUSTED_RECIPROCAL);
+    let bump_exhausted =
+        used >= capacity.saturating_sub(capacity / DEFRAG_BUMP_EXHAUSTED_RECIPROCAL);
     // A tiny arena (the unit tests') can have a capacity below the floor; there
     // "no 64 KiB block" is not a defect, so require the floor to be meaningful.
-    bump_exhausted && capacity > DEFRAG_LARGEST_FREE_FLOOR && largest_free < DEFRAG_LARGEST_FREE_FLOOR
+    bump_exhausted
+        && capacity > DEFRAG_LARGEST_FREE_FLOOR
+        && largest_free < DEFRAG_LARGEST_FREE_FLOOR
 }
 
 /// Selective-promotion census for the non-moving young sweep.
@@ -196,9 +199,17 @@ fn sweep_anchor_stride() -> usize {
 /// DBG (`CRATONVM_DBG_YOUNG_TRIGGER=1`): print every 4096th young-GC trigger
 /// evaluation so a wedged run can be told apart from a genuinely full heap —
 /// `live` is `cursor - free_list`, the metric the trigger actually uses.
-fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: usize, non_moving: bool) {
+fn young_trigger_debug(
+    used: usize,
+    free_list: usize,
+    live: usize,
+    threshold: usize,
+    non_moving: bool,
+) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()) {
+    if !*ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNG_TRIGGER").is_some()
+    }) {
         return;
     }
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -298,8 +309,7 @@ const fn next_young_gc_is_guaranteed_non_moving(
 ) -> bool {
     !force_moving
         && (jit_active || unregistered_jit_frame || jit_allocation_frame)
-        && (!moving_young_requested
-            || !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT)
+        && (!moving_young_requested || !cratonvm_types::flags::JIT_PUBLISHES_RELOCATION_CONTRACT)
 }
 
 /// "Humongous" object threshold as a percentage of the young semi-space
@@ -921,10 +931,7 @@ const XT_CAPTURED: u64 = 1 << 48;
 /// already far past "a few threads".
 #[inline]
 fn pack_xt_coverage(passes: u64, taken: u64, unclassified: u64) -> u64 {
-    XT_CAPTURED
-        | (passes.min(0xFFFF) << 32)
-        | (taken.min(0xFFFF) << 16)
-        | unclassified.min(0xFFFF)
+    XT_CAPTURED | (passes.min(0xFFFF) << 32) | (taken.min(0xFFFF) << 16) | unclassified.min(0xFFFF)
 }
 
 /// `(passes, taken_over, unclassified)`, or `None` if nothing was captured.
@@ -2096,7 +2103,6 @@ pub struct GenerationalHeap {
 unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
-
 // ---------------------------------------------------------------------------
 // Per-cycle copy tally.
 //
@@ -2192,7 +2198,8 @@ impl GenerationalHeap {
 
     /// This heap's compact-layout domain.
     pub fn layout_domain(&self) -> u32 {
-        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+        self.layout_domain
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Create a new generational heap with default sizes.
@@ -2250,9 +2257,7 @@ impl GenerationalHeap {
         };
 
         let heap = Self {
-            layout_domain: std::sync::atomic::AtomicU32::new(
-                cratonvm_types::FIRST_LAYOUT_DOMAIN,
-            ),
+            layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
@@ -2469,8 +2474,8 @@ impl GenerationalHeap {
         // `plan_object_alloc` also picks the compact reference-field layout when
         // enabled (smaller `total_size`, `array_length` = body bytes,
         // `GC_FLAG_COMPACT`).
-        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
-            .unwrap_or_else(|| {
+        let (total_size, array_len, compact_flag) =
+            plan_object_alloc(self.layout_domain(), class_id, num_fields).unwrap_or_else(|| {
                 eprintln!(
                     "FATAL: object size overflow in gen_heap alloc_object \
                      (num_fields={})",
@@ -2551,7 +2556,8 @@ impl GenerationalHeap {
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) =
+            plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
@@ -2867,7 +2873,13 @@ impl GenerationalHeap {
         let (old_used, old_cap, old_free, old_largest, old_blocks) = {
             let og = self.old_gen.lock();
             let (free, largest) = og.free_bytes_and_largest();
-            (og.used(), og.capacity(), free, largest, og.free_block_count())
+            (
+                og.used(),
+                og.capacity(),
+                free,
+                largest,
+                og.free_block_count(),
+            )
         };
         tracing::warn!(
             target: "cratonvm::gc::guard",
@@ -2891,7 +2903,8 @@ impl GenerationalHeap {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
         // near-`usize::MAX` field count can't wrap past the checked multiply.
         // `plan_object_alloc` also selects the compact reference-field layout.
-        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) =
+            plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let num_slots_u32 = u32::try_from(num_fields).ok()?;
         let init = |ptr: *mut u8| {
             let mut header = ObjectHeader::new(
@@ -3111,7 +3124,8 @@ impl GenerationalHeap {
         class_id: ClassId,
         num_fields: usize,
     ) -> Option<ObjectRef> {
-        let (total_size, array_len, compact_flag) = plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
+        let (total_size, array_len, compact_flag) =
+            plan_object_alloc(self.layout_domain(), class_id, num_fields)?;
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
@@ -3153,7 +3167,8 @@ impl GenerationalHeap {
         // spill: arm the boundary-GC pressure flag (advisability-gated; one
         // extra old-gen lock per 2048-object batch, not per allocation).
         self.note_young_spill_pressure();
-        let Some((total_size, array_len, compact_flag)) = plan_object_alloc(self.layout_domain(), class_id, num_fields)
+        let Some((total_size, array_len, compact_flag)) =
+            plan_object_alloc(self.layout_domain(), class_id, num_fields)
         else {
             return Vec::new();
         };
@@ -3272,7 +3287,12 @@ impl GenerationalHeap {
                         // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
                         (
                             fwd_header.class_id.as_u32(),
-                            format!("0x{:02x}", ObjectHeader::kind_tag(fwd_header.mark_word.load(Ordering::Relaxed))),
+                            format!(
+                                "0x{:02x}",
+                                ObjectHeader::kind_tag(
+                                    fwd_header.mark_word.load(Ordering::Relaxed)
+                                )
+                            ),
                         )
                     }
                     None => (
@@ -4420,16 +4440,12 @@ impl GenerationalHeap {
                 // three used to drop the write to null instead, so which
                 // answer a program got depended on the collector flag
                 // (W7-84-primitive-in-reference-store.md).
-                let value = crate::autobox::box_for_reference_slot(
-                    value,
-                    header.class_id,
-                    index,
-                    |v| {
+                let value =
+                    crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, v);
                         wrapper
-                    },
-                );
+                    });
                 // Recompute the slot pointer AFTER the boxing closure: it may
                 // have allocated, and this is a copying heap. `obj_ref` itself
                 // is the caller's handle and is out of our hands either way,
@@ -5299,7 +5315,11 @@ impl GenerationalHeap {
             let cap = from.capacity();
             if addr >= base && addr < base + cap {
                 if addr >= base + used {
-                    return Some(("young from-space, past the allocation frontier", base + used, 0));
+                    return Some((
+                        "young from-space, past the allocation frontier",
+                        base + used,
+                        0,
+                    ));
                 }
                 let off = addr - base;
                 let blocks = from.free_blocks_sorted();
@@ -5454,7 +5474,13 @@ impl GenerationalHeap {
             non_moving_young,
             young_pause_goal_ms() > 0,
         );
-        young_trigger_debug(used, from.free_list_bytes(), live, threshold, non_moving_young);
+        young_trigger_debug(
+            used,
+            from.free_list_bytes(),
+            live,
+            threshold,
+            non_moving_young,
+        );
         // Anti-livelock floor. Sample `live` once per completed collection (the
         // first `needs_gc` after `minor_gc_count` moves): if a collection just
         // ran and left the live set AT OR ABOVE the trigger, collecting again
@@ -7398,14 +7424,8 @@ impl GenerationalHeap {
         // either in old_gen (promoted) or in young_to-space (copied).
         // Walking the map once avoids an expensive counter plumbed
         // through `forward_object`'s 12 call sites.
-        let [
-            bytes_promoted_cycle,
-            objects_promoted_cycle,
-            bytes_copied_young_cycle,
-            objects_copied_young_cycle,
-            fwd_reencounters_cycle,
-            fwd_copies_cycle,
-        ] = copy_tally_take();
+        let [bytes_promoted_cycle, objects_promoted_cycle, bytes_copied_young_cycle, objects_copied_young_cycle, fwd_reencounters_cycle, fwd_copies_cycle] =
+            copy_tally_take();
         if mv_phase_on {
             // How many `forward_object` calls were pure lookups on an already
             // forwarded object. Each one is a hash probe of a map with as many
@@ -7675,8 +7695,7 @@ impl GenerationalHeap {
                 let base = young_from.base_ptr() as usize;
                 self.jit_tlab_skip_offsets(base, base + young_from.used())
             };
-            let compact_map =
-                Self::major_gc(roots, &young_from, &mut old_gen, &young_skips);
+            let compact_map = Self::major_gc(roots, &young_from, &mut old_gen, &young_skips);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
             // Compose `pointer_map` with `compact_map` BEFORE merging. If a
@@ -8086,7 +8105,11 @@ impl GenerationalHeap {
         if used_bytes > 0 {
             grid_anchors.push(0);
             grid_anchors.extend(young_from.take_alloc_anchors());
-            grid_anchors.extend(exact_skips.iter().filter_map(|&(off, sz)| off.checked_add(sz)));
+            grid_anchors.extend(
+                exact_skips
+                    .iter()
+                    .filter_map(|&(off, sz)| off.checked_add(sz)),
+            );
             grid_anchors.retain(|&o| o < used_bytes);
             grid_anchors.sort_unstable();
             grid_anchors.dedup();
@@ -8259,8 +8282,7 @@ impl GenerationalHeap {
                 young_object_ranges.truncate(ranges_before);
             }
             // Every candidate below `hi` has been resolved one way or the other.
-            while ci < conservative_candidates.len()
-                && conservative_candidates[ci] - from_base < hi
+            while ci < conservative_candidates.len() && conservative_candidates[ci] - from_base < hi
             {
                 ci += 1;
             }
@@ -10362,7 +10384,12 @@ impl GenerationalHeap {
                     // it may cover a live object's interior. Unwind them
                     // (they have not been zeroed or published yet;
                     // over-retention is always safe under this sweep).
-                    { mw_unwinds += 1; mw_site[0] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
+                    {
+                        mw_unwinds += 1;
+                        mw_site[0] += 1;
+                        mw_unwound_entries += dead_regions.len() - dead_watermark;
+                        dead_regions.truncate(dead_watermark);
+                    }
                 }
                 if resynced {
                     // A free block's end is ground truth — a fresh anchor.
@@ -10495,7 +10522,12 @@ impl GenerationalHeap {
                     // Reclaim decisions taken since the last anchor were taken
                     // on a grid this span calls into question -- drop them. That
                     // half was always right.
-                    { mw_unwinds += 1; mw_site[1] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
+                    {
+                        mw_unwinds += 1;
+                        mw_site[1] += 1;
+                        mw_unwound_entries += dead_regions.len() - dead_watermark;
+                        dead_regions.truncate(dead_watermark);
+                    }
                     // What was wrong is the RESUME. Re-anchoring at the next
                     // FREE BLOCK abandons everything in between, and when the
                     // free list is empty there is no anchor at all, so the
@@ -10513,10 +10545,7 @@ impl GenerationalHeap {
                     if let Some(a) = next_grid_anchor(&grid_anchors, cursor) {
                         if a > cursor && a < used {
                             // Keep the free-block cursor in step with the jump.
-                            while free_iter
-                                .peek()
-                                .is_some_and(|&&(off, sz)| off + sz <= a)
-                            {
+                            while free_iter.peek().is_some_and(|&&(off, sz)| off + sz <= a) {
                                 free_iter.next();
                             }
                             cursor = a;
@@ -10741,7 +10770,12 @@ impl GenerationalHeap {
                 // decisions made since the last anchor — they may cover a
                 // live object's interior. They have not been zeroed or
                 // published yet (deferred to the publication loop).
-                { mw_unwinds += 1; mw_site[2] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
+                {
+                    mw_unwinds += 1;
+                    mw_site[2] += 1;
+                    mw_unwound_entries += dead_regions.len() - dead_watermark;
+                    dead_regions.truncate(dead_watermark);
+                }
                 if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                     tracing::warn!(
                         "non-moving sweep: re-anchored at next free block (offset {}); \
@@ -10785,7 +10819,12 @@ impl GenerationalHeap {
                     // decisions since the last anchor are suspect — unwind
                     // them (over-retention safe) before re-anchoring at the
                     // hole, where the skip loop takes over.
-                    { mw_unwinds += 1; mw_site[3] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
+                    {
+                        mw_unwinds += 1;
+                        mw_site[3] += 1;
+                        mw_unwound_entries += dead_regions.len() - dead_watermark;
+                        dead_regions.truncate(dead_watermark);
+                    }
                     cursor = foff;
                     continue;
                 }
@@ -11066,7 +11105,9 @@ impl GenerationalHeap {
                                     cursor,
                                     total_size,
                                     header.class_id.as_u32(),
-                                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                                    ObjectHeader::kind_tag(
+                                        header.mark_word.load(Ordering::Relaxed),
+                                    ),
                                     1,
                                 ));
                             }
@@ -12402,8 +12443,7 @@ impl GenerationalHeap {
         // refuted that on the first H2 run. See the downgrade below.
         let no_interior_pins =
             cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_OLD_INTERIOR_PINS").is_some();
-        let mut interior_pins: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut interior_pins: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for root in roots.iter() {
             if let Some((base, extent)) =
                 old_gen_interior_root_base(root.as_ptr(), &walked_bases, &walked_objects)
@@ -12561,7 +12601,11 @@ impl GenerationalHeap {
             // header here is already validated (this object is marked), so
             // pass its class id and let the provider reject a stale entry.
             // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
-            let owner_class = Some(unsafe { &*(obj_ptr as *const ObjectHeader) }.class_id.as_u32());
+            let owner_class = Some(
+                unsafe { &*(obj_ptr as *const ObjectHeader) }
+                    .class_id
+                    .as_u32(),
+            );
             for overlay_ref in
                 crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
             {
@@ -12660,7 +12704,8 @@ impl GenerationalHeap {
             // from "the address is inside old gen". Emit an identity entry for
             // each watched survivor, mirroring what `OldGen::compact` already
             // does for watched objects that happen not to move.
-            let mut watched_survivors: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
+            let mut watched_survivors: cratonvm_types::PointerMap =
+                cratonvm_types::PointerMap::default();
             // GCAUD-8: the grid derived before the mark. Nothing since then has
             // allocated or freed in old gen, so re-walking would return the
             // same slice; the mark oracle above and the free loop below now
@@ -12749,7 +12794,8 @@ impl GenerationalHeap {
                         doomed.len(),
                         if sweep_rescue { " (rescuing)" } else { "" },
                     );
-                    for (victim, (referrer, referrer_cid, slot)) in referenced_doomed.iter().take(12)
+                    for (victim, (referrer, referrer_cid, slot)) in
+                        referenced_doomed.iter().take(12)
                     {
                         // SAFETY: `victim` is a base `walk_objects` yielded.
                         let vh = unsafe { &*(*victim as *const ObjectHeader) };
@@ -13301,7 +13347,8 @@ impl GenerationalHeap {
         // requirement beyond in-bounds-and-readable.
         let kind_tag = unsafe { cratonvm_types::kind_tag_at(obj_ptr) };
         let elem_tag = unsafe { cratonvm_types::element_type_tag_at(obj_ptr) };
-        if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
+        if object_kind_from_tag(kind_tag).is_none()
+            || array_element_type_from_tag(elem_tag).is_none()
         {
             OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
             return;
@@ -13346,13 +13393,7 @@ impl GenerationalHeap {
         // SAFETY: `obj_ptr`/`header` are a valid live object.
         unsafe {
             for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                mark_and_push_old_gen(
-                    ref_ptr,
-                    old_gen,
-                    walked_bases,
-                    worklist,
-                    "old-gen ref slot",
-                );
+                mark_and_push_old_gen(ref_ptr, old_gen, walked_bases, worklist, "old-gen ref slot");
             });
         }
     }
@@ -14027,7 +14068,8 @@ impl GenerationalHeap {
         // has no validity requirement beyond in-bounds-and-readable.
         let kind_tag = unsafe { cratonvm_types::kind_tag_at(old_ptr) };
         let elem_tag = unsafe { cratonvm_types::element_type_tag_at(old_ptr) };
-        if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
+        if object_kind_from_tag(kind_tag).is_none()
+            || array_element_type_from_tag(elem_tag).is_none()
         {
             tracing::debug!(
                 target: "cratonvm::gc::guard",
@@ -14672,7 +14714,8 @@ impl GenerationalHeap {
                     let elems = (header.array_length() as usize).min(max_elems);
                     for i in 0..elems {
                         // SAFETY: `i` < capped element count; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
+                        let s_ptr =
+                            unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
@@ -15647,10 +15690,7 @@ fn report_doomed_referrers(
                                 // which `walk_objects` sized, so the whole
                                 // 16-byte cell is in bounds.
                                 let (c0, c1) = unsafe {
-                                    (
-                                        *(cell_at as *const u64),
-                                        *((cell_at + 8) as *const u64),
-                                    )
+                                    (*(cell_at as *const u64), *((cell_at + 8) as *const u64))
                                 };
                                 eprintln!(
                                     "[{label}-referrers] stale-padding: {owner:#x} \
@@ -16217,7 +16257,13 @@ fn scan_young_object(
             obj_addr,
             Some(header.class_id.as_u32()),
         ) {
-            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist, "overlay-owner");
+            mark_edge_precise(
+                overlay_ref.as_ptr() as usize,
+                ctx,
+                bits,
+                worklist,
+                "overlay-owner",
+            );
         }
     }
     // HIB-CV-24: also mark this object's defining ClassLoader so a live
@@ -16872,7 +16918,9 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // arm that used to bypass it. Retained because it is the one the
         // paragraphs above are written against, and because a future edit that
         // reorders the dispatch should not silently lose it twice.
-        if ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)) != ObjectKind::Object as u8 {
+        if ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed))
+            != ObjectKind::Object as u8
+        {
             warn_non_object_kind_in_object_arm(header);
             return 0;
         }
@@ -17250,7 +17298,9 @@ fn skip_free_blocks(
 /// filtered out. Anchors are TLAB-granular (256 KiB - 1 MiB), so resuming here
 /// retains at most one TLAB rather than the rest of the arena.
 fn next_grid_anchor(anchors: &[usize], after: usize) -> Option<usize> {
-    anchors.get(anchors.partition_point(|&a| a <= after)).copied()
+    anchors
+        .get(anchors.partition_point(|&a| a <= after))
+        .copied()
 }
 
 /// Is the all-zero run `[cursor, run_end)` a run of EMPTY objects rather than
@@ -17353,11 +17403,8 @@ pub static EVAC_UNWIND_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 /// `1` `fixup_young_old_refs`, `2` `walk_young_objects`. Separate from the
 /// entry counts because "ran and did not see the shape" and "never ran" are
 /// different answers and both are worth being able to prove.
-pub static LATE_WALK_ZERO_RUNS: [AtomicU64; 3] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+pub static LATE_WALK_ZERO_RUNS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
     AtomicU64::new(0),
@@ -18233,7 +18280,10 @@ mod tests {
         );
         // The invariant the walkers rely on, restated as a check.
         for w in spans.windows(2) {
-            assert!(w[0].0 + w[0].1 <= w[1].0, "spans must be disjoint: {spans:?}");
+            assert!(
+                w[0].0 + w[0].1 <= w[1].0,
+                "spans must be disjoint: {spans:?}"
+            );
         }
         assert!(spans.iter().all(|&(_, sz)| sz > 0));
     }
@@ -18557,7 +18607,11 @@ mod tests {
         let a = heap.alloc_object(ClassId::new(1), 4);
         let b = heap.alloc_object(ClassId::new(2), 2);
         let c = heap.alloc_object(ClassId::new(3), 1);
-        let (a, b, c) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_ptr() as usize);
+        let (a, b, c) = (
+            a.as_ptr() as usize,
+            b.as_ptr() as usize,
+            c.as_ptr() as usize,
+        );
 
         let from_base = heap.young_from.lock().base_ptr() as usize;
         let used = heap.young_from.lock().used();
@@ -18568,8 +18622,7 @@ mod tests {
         let mut cands = vec![a, a + HEADER_SIZE + SLOT_SIZE, b + HEADER_SIZE, c];
         cands.sort_unstable();
 
-        let (bases, unreachable, interior) =
-            resolve_candidate_bases(from_base, used, &[], &cands);
+        let (bases, unreachable, interior) = resolve_candidate_bases(from_base, used, &[], &cands);
 
         assert!(
             unreachable.is_empty(),
@@ -19432,7 +19485,10 @@ mod tests {
         // live allocation; writing a raw `u8` there does not require the
         // resulting value to be a valid `ObjectKind`.
         unsafe {
-            std::ptr::write(obj.as_ptr().add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
+            std::ptr::write(
+                obj.as_ptr().add(cratonvm_types::KIND_TAGS_BYTE_OFFSET),
+                0xFFu8,
+            );
         }
 
         let mut roots = vec![obj];
@@ -20083,7 +20139,8 @@ mod tests {
         // Keep the first half; the second half's storage is one adjacent run.
         let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
         let blocks_before = heap.old_gen_lock().free_block_count();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
+        let (reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(reclaimed > 0, "the dropped half must be reclaimed");
 
         let og = heap.old_gen_lock();
@@ -20129,7 +20186,8 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &cratonvm_types::PointerMap::default());
+        let (reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&[live_old], &cratonvm_types::PointerMap::default());
 
         assert!(
             reclaimed > 0,
@@ -20175,7 +20233,8 @@ mod tests {
         // Both addresses are watched — exactly what the VM publishes for every
         // address the reference processor holds.
         crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
-        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &cratonvm_types::PointerMap::default());
+        let (reclaimed, survivors) =
+            heap.sweep_old_gen_non_moving(&[roots[0]], &cratonvm_types::PointerMap::default());
         crate::gc_quiescence::set_watched_referents(&[]);
 
         assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
@@ -21049,7 +21108,8 @@ mod tests {
         let doomed_addr = roots[1].as_ptr() as usize;
 
         let live = vec![keep];
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
+        let (reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(
             reclaimed > 0,
             "the sweep must actually have reclaimed the dropped object in place",
@@ -21106,7 +21166,8 @@ mod tests {
         // Only the holder is rooted; the victim must survive via the holder's
         // ref slot, which is precisely the edge the detector inspects.
         let live = vec![holder];
-        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
+        let (_reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
 
         let vm = crate::vm_heap::VmHeap::Generational(heap);
         assert!(
@@ -21234,8 +21295,13 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let mut major_roots = vec![holder, victim];
-            let _ =
-                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false, &[]);
+            let _ = GenerationalHeap::old_gen_gc(
+                &mut major_roots,
+                &young_from,
+                &mut old_gen,
+                false,
+                &[],
+            );
         }
         let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
 
@@ -21498,7 +21564,8 @@ mod tests {
         // Only A is rooted. B is reachable ONLY through A's reference slot —
         // exactly the edge the screen used to drop.
         let (b_addr, c_addr) = (b.as_ptr() as usize, c.as_ptr() as usize);
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &cratonvm_types::PointerMap::default());
+        let (reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&[a], &cratonvm_types::PointerMap::default());
 
         let bases: Vec<usize> = heap
             .old_gen_lock()
@@ -21758,7 +21825,8 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let old_used_before = old_gen.used();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             let old_used_after = old_gen.used();
             assert!(
                 old_used_after < old_used_before,
@@ -21845,7 +21913,8 @@ mod tests {
 
         // Sweep old gen in place with NO root naming the payload — the young
         // referrer is the only path to it.
-        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &cratonvm_types::PointerMap::default());
+        let (_freed, _survivors) =
+            heap.sweep_old_gen_non_moving(&[], &cratonvm_types::PointerMap::default());
 
         assert_eq!(
             heap.get_field(payload, 0).as_int(),
@@ -22246,7 +22315,8 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Only 3 live objects (A, B, C) — garbage should be freed
             assert_eq!(
@@ -22418,7 +22488,8 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             assert!(
                 compact_map.is_empty(),
                 "No objects should move when they are already contiguous"
@@ -22452,7 +22523,8 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Verify no forwarding pointers remain set
             for (obj_ptr, _) in old_gen.walk_objects() {
@@ -23412,7 +23484,9 @@ mod conservative_narrow_scan_tests {
         let wide = scan(&buf, None);
         assert_eq!(wide.len(), 1, "one 8-byte word");
         assert!(
-            !wide.iter().any(|&(_, _, v)| v == a as usize || v == b as usize),
+            !wide
+                .iter()
+                .any(|&(_, _, v)| v == a as usize || v == b as usize),
             "THE BUG: the 8-byte word spans both references and equals neither: {:#x}",
             wide[0].2
         );
@@ -23436,7 +23510,8 @@ mod conservative_narrow_scan_tests {
         let buf = vec![raw];
         let got = scan(&buf, GEOM);
         assert!(
-            got.iter().any(|&(off, w, v)| off == 0 && w == 8 && v == raw as usize),
+            got.iter()
+                .any(|&(off, w, v)| off == 0 && w == 8 && v == raw as usize),
             "the full-width word must still be visited: {:x?}",
             got
         );

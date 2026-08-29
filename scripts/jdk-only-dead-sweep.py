@@ -46,7 +46,7 @@ WHAT THIS TOOL WILL NOT DO ANY MORE, AND WHY
 reported, and it is written to the *gated* section, next to the synthetic
 stubs. Three measurements, 2026-08-10:
 
-  * `probes/DeadSweepReachProbe.java` — one workload written against the
+  * `apps/probes/DeadSweepReachProbe.java` — one workload written against the
     committed list rather than against JDK surface — dispatched **30 of its
     791 rows**, every one a VM-minted class wearing a JDK name. Eight classes
     ended up split down the middle: `AtomicIntegerFieldUpdater$RustJvmImpl` had

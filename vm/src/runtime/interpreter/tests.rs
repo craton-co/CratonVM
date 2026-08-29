@@ -40,14 +40,19 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
     use cratonvm_reader::class_access_flags::ClassAccessFlags;
     use cratonvm_types::ArrayElementType;
 
-    let shared =
-        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+    let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
 
     let (alpha, beta, iface, proxy) = {
         let mut cm = shared.classes.class_manager.write();
-        let alpha = cm.try_ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let beta = cm.try_ensure_synthetic_class("cratonvm/test/AastoreBeta", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let iface = cm.try_ensure_synthetic_class("cratonvm/test/AastoreIface", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let alpha = cm
+            .try_ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let beta = cm
+            .try_ensure_synthetic_class("cratonvm/test/AastoreBeta", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let iface = cm
+            .try_ensure_synthetic_class("cratonvm/test/AastoreIface", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store
             .get_mut(iface)
             .expect("just fabricated")
@@ -55,7 +60,9 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
         // The name is the whole point: the predicate's proxy arm tests
         // `contains("$Proxy")`, which is what admits `jdk/proxy3/$Proxy27` in
         // the `AotIntegrationTests` case without consulting any interface list.
-        let proxy = cm.try_ensure_synthetic_class("jdk/proxy3/$Proxy27", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let proxy = cm
+            .try_ensure_synthetic_class("jdk/proxy3/$Proxy27", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         (alpha, beta, iface, proxy)
     };
 
@@ -163,19 +170,22 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
 fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
     use cratonvm_types::ArrayElementType;
 
-    let shared =
-        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+    let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
 
     const COMPONENT: &str = "cratonvm/test/SplitAlpha";
 
     let (alpha, forked, child) = {
         let mut cm = shared.classes.class_manager.write();
         // The parent loader's copy — what the array was created with.
-        let alpha = cm.try_ensure_synthetic_class(COMPONENT, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let alpha = cm
+            .try_ensure_synthetic_class(COMPONENT, 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // The forked loader's copy: fabricated under its own name, then renamed
         // so the store holds two distinct ids for one name.
-        let forked = cm.try_ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let forked = cm
+            .try_ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store
             .get_mut(forked)
             .expect("just fabricated")
@@ -184,7 +194,9 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
         // A subclass of the FORKED copy, for arm 2. `set_superclass` rather than
         // writing the field: the store maintains a subclass adjacency index that
         // a raw field write would desynchronise.
-        let child = cm.try_ensure_synthetic_class("cratonvm/test/SplitChild", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let child = cm
+            .try_ensure_synthetic_class("cratonvm/test/SplitChild", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store.set_superclass(child, Some(forked));
 
         (alpha, forked, child)
@@ -235,7 +247,8 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
     // degenerated to `true`.
     let unrelated = {
         let mut cm = shared.classes.class_manager.write();
-        cm.try_ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
+        cm.try_ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
     };
     let unrelated_obj = shared.mem.heap.alloc_object(unrelated, 0);
     assert!(
@@ -401,7 +414,9 @@ fn only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery() {
     // interface-typed use, both still admitted (assignability is then checked
     // against the recovered mirror's real class).
     assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Thread"));
-    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Runnable"));
+    assert!(call_site_type_can_hold_a_thread_mirror(
+        "java/lang/Runnable"
+    ));
     assert!(call_site_type_can_hold_a_thread_mirror(
         "jdk/internal/misc/InnocuousThread"
     ));
@@ -601,8 +616,7 @@ fn stw_takeover_scan_cadence_backs_off() {
 /// losing RRWL read-lock hold counters and WeakHashMap entries.
 #[test]
 fn weakref_pre_gc_watch_includes_reference_objects() {
-    let shared =
-        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+    let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
     let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
     let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
     shared.mem.ref_processor.lock().discover_reference(
@@ -875,8 +889,7 @@ fn ffm_arena_force_native_covers_lifecycle() {
 
 #[test]
 fn ffm_memory_layout_force_native_covers_varhandle() {
-    let descriptor =
-        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;";
+    let descriptor = "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;";
     assert!(is_ffm_memory_layout_native_override(
         "java/lang/foreign/MemoryLayout",
         "varHandle",
@@ -1078,11 +1091,7 @@ fn method_handles_varhandle_factories_force_native() {
         ),
     ] {
         assert!(
-            is_method_handles_varhandle_factory_native_override(
-                method_handles,
-                name,
-                descriptor
-            ),
+            is_method_handles_varhandle_factory_native_override(method_handles, name, descriptor),
             "{name}{descriptor} must route to the registered native factory"
         );
         assert!(
@@ -1997,11 +2006,7 @@ fn bc_crypto_math_force_native_covers_longarray_helpers() {
             "{point}.twice must not fall through to interpreted SecT point bytecode"
         );
         assert!(
-            redefine_immune_forced_native(
-                point,
-                "twice",
-                "()Lorg/bouncycastle/math/ec/ECPoint;"
-            ),
+            redefine_immune_forced_native(point, "twice", "()Lorg/bouncycastle/math/ec/ECPoint;"),
             "{point}.twice must stay native after unrelated redefinition"
         );
     }
@@ -2045,11 +2050,7 @@ fn xerces_cmstateset_force_native_covers_hash_and_equals_hotspots() {
 #[test]
 fn object_clone_force_native_covers_super_clone() {
     assert!(
-        force_native_over_real_jdk_bytecode(
-            "java/lang/Object",
-            "clone",
-            "()Ljava/lang/Object;"
-        ),
+        force_native_over_real_jdk_bytecode("java/lang/Object", "clone", "()Ljava/lang/Object;"),
         "Object.clone must route to the registered shallow-clone native"
     );
 }
@@ -2417,27 +2418,50 @@ fn reflection_factory_force_native_covers_serialization_surface() {
         "jdk/internal/reflect/ReflectionFactory",
     ] {
         for (name, descriptor) in [
-            ("newConstructorForSerialization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+            (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
             (
                 "newConstructorForSerialization",
                 "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
             ),
-            ("newConstructorForExternalization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
-            ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+            (
+                "newConstructorForExternalization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            ),
             (
                 "readObjectNoDataForSerialization",
                 "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
             ),
-            ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
-            ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
-            ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
-            ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z"),
+            (
+                "writeObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            ),
+            (
+                "readResolveForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            ),
+            (
+                "writeReplaceForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            ),
+            (
+                "hasStaticInitializerForSerialization",
+                "(Ljava/lang/Class;)Z",
+            ),
         ] {
             assert!(
                 is_reflection_factory_serialization_native_override(class_name, name, descriptor),
                 "{class_name}.{name}{descriptor} must route to the registered native"
             );
-            assert!(force_native_over_real_jdk_bytecode(class_name, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(
+                class_name, name, descriptor
+            ));
         }
     }
     assert!(!is_reflection_factory_serialization_native_override(
@@ -2557,16 +2581,15 @@ fn an_unsupported_caller_local_refuses_where_the_in_place_transfer_tolerates_it(
     use super::deopt_resume::caller_frame_values;
     use cratonvm_jit::deopt::FrameValue;
 
-    let scope = |locals: Vec<FrameValue>, stack: Vec<FrameValue>| {
-        cratonvm_jit::deopt::ReconstructedFrame {
+    let scope =
+        |locals: Vec<FrameValue>, stack: Vec<FrameValue>| cratonvm_jit::deopt::ReconstructedFrame {
             method_key: "p/C.m:()V".to_string(),
             bci: 4,
             locals,
             stack,
             monitors: Vec::new(),
             caller_frames: Vec::new(),
-        }
-    };
+        };
 
     // The describable case is accepted, so the refusals below cannot be passing
     // for some unrelated reason.
@@ -2810,8 +2833,7 @@ fn tco_suppressed_when_invoke_pc_lies_inside_handler_range() {
 /// Returns `(production_hits, scanned_lines)`. The test fails if
 /// `production_hits` is not zero.
 fn scan_production_section(path: &str, needles: &[&str]) -> (usize, usize) {
-    let src =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
 
     let mut hits = 0usize;
     let mut scanned = 0usize;
@@ -3081,8 +3103,8 @@ fn hot_files_have_no_production_panics() {
         // utility with thorough tests legitimately fails:
         // `jit/src/x64/disp.rs` is 327 production lines and 406 test
         // lines, so the scan was exactly right and the gate still fired.
-        let src = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let src =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
         let total = src.lines().count();
         // Same "is this a real attribute, not a comment mentioning one"
         // test `scan_production_section` applies.
@@ -3851,8 +3873,7 @@ fn alloc_multi_array_partial_dims_leaves_inner_as_references() {
 
     // sizes.len()=3, total_array_depth=4, leaf_et=Char
     let sizes = vec![5, 30, 6];
-    let outer =
-        alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
+    let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
     assert_eq!(vm.shared.mem.heap.array_length(outer), 5);
 
     // Walk to the inner (3rd) dim and verify it's a reference array of
@@ -4154,9 +4175,7 @@ fn t10_shared_resolution_read_hit_round_trip() {
     // Wire check: inserting a promoted target via SharedResolutionState
     // on a live SharedVm and reading it back via get_promoted_invoke
     // yields the same target without touching class_manager.
-    use crate::classloading::resolution::{
-        CachedBytecodeMethod, CachedInvokeTarget, RedefineGate,
-    };
+    use crate::classloading::resolution::{CachedBytecodeMethod, CachedInvokeTarget, RedefineGate};
     use crate::config::VmConfig;
     use crate::runtime::lockfree_resolve::PromotedInvokeKey;
     use crate::vm::Vm;
@@ -4179,7 +4198,7 @@ fn t10_shared_resolution_read_hit_round_trip() {
         is_synchronized: false,
         is_static: false,
         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4657,8 +4676,8 @@ fn t18_k3_putstatic_long_round_trip() {
     let mut stack = crate::runtime::ValueStack::new(16);
     let sentinel: i64 = -0x0F0E_0D0C_0B0A_0908_i64;
     stack.push_compact(crate::types::CompactValue::long(sentinel));
-    let v = pop_static_field_value(&mut stack, Some(b'J'))
-        .expect("pop for J-descriptor must succeed");
+    let v =
+        pop_static_field_value(&mut stack, Some(b'J')).expect("pop for J-descriptor must succeed");
     assert_eq!(v, Value::Long(sentinel));
     assert_eq!(stack.len(), 0);
 }
@@ -4694,8 +4713,8 @@ fn t18_k3_putstatic_double_round_trip() {
     let mut stack = crate::runtime::ValueStack::new(16);
     let sentinel: f64 = -std::f64::consts::E;
     stack.push_compact(crate::types::CompactValue::double(sentinel));
-    let v = pop_static_field_value(&mut stack, Some(b'D'))
-        .expect("pop for D-descriptor must succeed");
+    let v =
+        pop_static_field_value(&mut stack, Some(b'D')).expect("pop for D-descriptor must succeed");
     match v {
         Value::Double(x) => assert_eq!(x, sentinel),
         other => panic!("expected Value::Double, got {other:?}"),
@@ -5175,11 +5194,10 @@ fn ldc_class_format_error_is_catchable_or_falls_back() {
     use crate::vm::Vm;
 
     let mut vm = Vm::new(VmConfig::new());
-    let err =
-        MethodCallFailed::InternalError(VmError::Linkage(LinkageError::ClassFormatError {
-            class_name: "Demo".to_string(),
-            message: "ldc: invalid constant pool index 99".to_string(),
-        }));
+    let err = MethodCallFailed::InternalError(VmError::Linkage(LinkageError::ClassFormatError {
+        class_name: "Demo".to_string(),
+        message: "ldc: invalid constant pool index 99".to_string(),
+    }));
     let out = convert_ldc_class_format_error(&vm.shared, &mut vm.main_thread, err);
     // Either a real Java exception (rt.jar available) or the original
     // error preserved (rt.jar absent in the test harness). It must

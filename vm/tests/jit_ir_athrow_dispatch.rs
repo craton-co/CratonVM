@@ -190,7 +190,10 @@ fn run_probe(bin: &Path, jdk: &Path, classes: &Path) -> (String, String) {
         // caller. Without this the defect fires about once per run (only while
         // the callee is compiled and the caller is not yet), which is real but
         // far too rare to assert on.
-        .env("CRATONVM_JIT_DENY", "IrAthrowDispatchProbe.throwAsUnchecked")
+        .env(
+            "CRATONVM_JIT_DENY",
+            "IrAthrowDispatchProbe.throwAsUnchecked",
+        )
         // Surfaces "[ir] optimizing backend produced a body for ..." so the
         // test can prove `throwAs` actually took the IR pipeline instead of
         // passing vacuously off the single-pass fallback.

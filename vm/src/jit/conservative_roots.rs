@@ -527,8 +527,8 @@ pub fn moving_young_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         // `x64::moving_young_enabled` is itself a `OnceLock`, and `flags()`
         // latches on first use, so this resolves once for the process.
-        let on = cratonvm_jit::x64::moving_young_enabled()
-            && cratonvm_types::flags().gc.moving_young;
+        let on =
+            cratonvm_jit::x64::moving_young_enabled() && cratonvm_types::flags().gc.moving_young;
         // Hand the collector the same answer. Before this publish the GC uses
         // `gc_flags().moving_young` on its own, which is only reachable in a
         // process with no JIT at all — where there are no JIT frames and moving
@@ -556,7 +556,8 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     if !moving_young_enabled() {
         return false;
     }
-    let debug_shadow_disabled = cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NOPUSH").is_some()
+    let debug_shadow_disabled = cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NOPUSH")
+        .is_some()
         || cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NORELOAD").is_some();
     JIT_ENTRY_CHAIN.with(|c| {
         let mut chain = c.borrow_mut();
@@ -1798,7 +1799,9 @@ fn unreg_memo_hiwater_enabled() -> bool {
 
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some()
+    })
 }
 
 /// A5 fix — scan this thread's native stack band `[lo, hi)` for any word that is
@@ -2178,7 +2181,9 @@ fn unreg_jit_accept_residue() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some()
+    })
 }
 
 /// Read the safepoint id a live compiled frame published into
@@ -2425,7 +2430,8 @@ fn direct_call_callee(
     let caller_entry =
         unsafe { (*(caller_cm as *const cratonvm_jit::CompiledMethod)).entry_ptr() } as usize;
     let target = direct_call_target(ret_addr, caller_entry)?;
-    let callee = cratonvm_jit::lookup_jit_code_range(target)? as *const cratonvm_jit::CompiledMethod;
+    let callee =
+        cratonvm_jit::lookup_jit_code_range(target)? as *const cratonvm_jit::CompiledMethod;
     // Exactness: only the registered entry point runs the prologue that
     // establishes the slot offsets every caller is about to read.
     // SAFETY: as above — `target` is a live code address, so its owner is
@@ -2944,9 +2950,13 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 unverified = true;
                 continue;
             }
-            let Some(innermost_cm) =
-                innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method)
-            else {
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
                 // Nothing describes the frame now standing at `exact_rbp` — the
                 // inline MIC/PIC cascade or the hashed megamorphic stub reached
                 // it through an indirect call, so its method cannot be recovered
@@ -3035,7 +3045,9 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
 /// guessed at. Latched once; the scan runs on every collection.
 fn band_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some()
+    })
 }
 
 /// The safepoint id the frame at `rbp` is standing on, or `None` when the
@@ -3141,7 +3153,9 @@ fn bounds_guard_enabled() -> bool {
 
 fn band_verify_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some()
+    })
 }
 
 /// `CRATONVM_MOVING_YOUNG_NO_JIT` — re-arm the process-wide JIT relocation
@@ -3156,7 +3170,9 @@ fn band_verify_disabled() -> bool {
 /// a workload ever exposes an obligation the verifier does not model.
 fn moving_young_no_jit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_JIT").is_some())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_JIT").is_some()
+    })
 }
 
 /// Scan one compiled frame's band `[rbp - frame_size, rbp)` for a word that
@@ -3405,7 +3421,6 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     // the blanket for a bisect or an emergency — the same fail-closed
     // direction, no longer the only available setting.
     if moving_young_no_jit() && cratonvm_jit::jit_code_range_count() != 0 {
-
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
             cratonvm_gc::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
         );
@@ -3663,21 +3678,20 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 // filter accepted. "Some word somewhere looked like compiled
                 // code" is not something the next reader can act on, and this
                 // probe's whole cost is that it can be wrong.
-                let (body, off, tail) =
-                    match cratonvm_jit::pin_jit_code_range_owner(word) {
-                        Some(cm) => {
-                            let entry = cm.entry_ptr() as usize;
-                            let back = word.saturating_sub(entry).min(8);
-                            let mut bytes = String::new();
-                            for i in 0..back {
-                                // SAFETY: inside the buffer `cm` holds alive.
-                                let b = unsafe { ((word - back + i) as *const u8).read() };
-                                bytes.push_str(&format!("{b:02x} "));
-                            }
-                            (entry, word - entry, bytes)
+                let (body, off, tail) = match cratonvm_jit::pin_jit_code_range_owner(word) {
+                    Some(cm) => {
+                        let entry = cm.entry_ptr() as usize;
+                        let back = word.saturating_sub(entry).min(8);
+                        let mut bytes = String::new();
+                        for i in 0..back {
+                            // SAFETY: inside the buffer `cm` holds alive.
+                            let b = unsafe { ((word - back + i) as *const u8).read() };
+                            bytes.push_str(&format!("{b:02x} "));
                         }
-                        None => (0, 0, "<body reclaimed>".to_string()),
-                    };
+                        (entry, word - entry, bytes)
+                    }
+                    None => (0, 0, "<body reclaimed>".to_string()),
+                };
                 eprintln!(
                     "[moving-young-coverage] incomplete: unregistered JIT frame on native stack \
                      (stack slot 0x{slot:x} holds 0x{word:x} = body 0x{body:x}+0x{off:x}, \
@@ -4750,7 +4764,7 @@ fn flush_top_rbp_cache_to_chain(v: &mut [JitFrameChainEntry]) {
     if let Some(top) = v.last_mut() {
         if let Some(info) = top.precise.as_mut() {
             info.exact_rbp = top_rbp_get();
-                info.exact_cm_id = published_compile_id();
+            info.exact_cm_id = published_compile_id();
         }
     }
 }
@@ -5178,7 +5192,9 @@ fn report_remap_residue(
 fn verify_oop_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some())
+    *E.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some()
+    })
 }
 
 /// `CRATONVM_PRECISE_COVERAGE_PIN` — when set, surface
@@ -5192,7 +5208,9 @@ fn verify_oop_maps_enabled() -> bool {
 fn coverage_pin_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
+    *E.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some()
+    })
 }
 
 /// Set once the completeness oracle has REFUTED some frame's
@@ -5290,16 +5308,14 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     // it almost never has a true guard to fire on. The moving path spends
     // `fully_shadow_covered`, so an unmapped live oop under THAT claim is the
     // refutation that matters.
-    let before_shadow =
-        oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed);
+    let before_shadow = oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed);
     scan_active_jit_frames(heap, roots);
     if oracle_force_refute() {
         note_coverage_oracle_refutation();
         return true;
     }
     oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
-        || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed)
-            > before_shadow
+        || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed) > before_shadow
 }
 
 /// Whether the pre-suppression verification should run: only when the oracle is
@@ -5412,9 +5428,8 @@ pub mod oop_map_audit {
     /// re-walks the same parent frames, and a workload takes many collections
     /// at the same stack shape. What the question needs is "which METHOD has
     /// which unmapped SLOT", which is what this records.
-    pub static SITES: std::sync::Mutex<
-        Option<std::collections::BTreeMap<(usize, i32), SiteInfo>>,
-    > = std::sync::Mutex::new(None);
+    pub static SITES: std::sync::Mutex<Option<std::collections::BTreeMap<(usize, i32), SiteInfo>>> =
+        std::sync::Mutex::new(None);
 
     /// What a never-mapped site needs to be ACTED on rather than counted.
     ///
@@ -5479,11 +5494,7 @@ pub mod oop_map_audit {
                     eprintln!(
                         "[cratonvm] oop-map audit:   code={ptr:#x} rbp-{off:#x} {} \
                          sp_id={} oop_cov={} shadow_cov={} {}",
-                        info.class,
-                        info.sp_id,
-                        info.oop_covered,
-                        info.shadow_covered,
-                        info.method
+                        info.class, info.sp_id, info.oop_covered, info.shadow_covered, info.method
                     );
                 }
             }
@@ -5617,9 +5628,13 @@ fn verify_precise_covers_conservative(
         audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
         return;
     }
-    let Some(innermost) =
-        innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method)
-    else {
+    let Some(innermost) = innermost_frame_method(
+        rbp,
+        info.exact_cm_id,
+        entry_sp,
+        scanner_sp,
+        info.compiled_method,
+    ) else {
         // Nothing describes the frame at `exact_rbp`; every offset would be
         // read against the wrong method. Same fail-closed stance as the band
         // verifier.
@@ -5717,8 +5732,7 @@ fn verify_precise_covers_conservative(
                             frame_cm.fully_shadow_covered,
                         );
                         if frame_cm.fully_shadow_covered {
-                            audit::NEVER_MAPPED_WHILE_SHADOW_COVERED
-                                .fetch_add(1, AOrd::Relaxed);
+                            audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.fetch_add(1, AOrd::Relaxed);
                         }
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
@@ -5942,7 +5956,13 @@ fn scan_compiled_frame_bands(
     // scanner's own SP instead: the collector runs beneath that frame, so
     // `[scanner_sp, rbp)` covers all of it and nothing above it. Parent frames
     // are identified through the child frame's return address either way.
-    let innermost = innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method);
+    let innermost = innermost_frame_method(
+        rbp,
+        info.exact_cm_id,
+        entry_sp,
+        scanner_sp,
+        info.compiled_method,
+    );
     let mut innermost_is_foreign = innermost.is_none();
     // SAFETY: the chain entry's pointer is Arc-owned by the JIT cache while any
     // of its frames is live; a resolved callee is kept alive by the live frame
@@ -6816,7 +6836,10 @@ mod tests {
         let mut m = UnregMemo::new();
 
         // First check at depth 1000 must scan everything.
-        assert_eq!(m.observe(1000, ranges, true), UnregScan::Detect { hi: None });
+        assert_eq!(
+            m.observe(1000, ranges, true),
+            UnregScan::Detect { hi: None }
+        );
         m.mark_clean(1000, ranges);
 
         // Still nested below 1000 and deeper: only the new band is unscanned.
@@ -6949,7 +6972,10 @@ mod tests {
     fn scan_cache_still_rejects_a_stale_generation_or_collection() {
         let c = filled_scan_cache(0x1000);
         assert!(!c.matches(8, 3, 0x1000, 0), "boundary crossing invalidates");
-        assert!(!c.matches(7, 4, 0x1000, 0), "chain depth change invalidates");
+        assert!(
+            !c.matches(7, 4, 0x1000, 0),
+            "chain depth change invalidates"
+        );
         assert!(!c.matches(7, 3, 0x1000, 1), "a collection invalidates");
     }
 
@@ -7227,7 +7253,10 @@ mod tests {
         top_rbp_set(live_rbp);
 
         let pruned = prune_returned_jit_entries(current_stack_pointer());
-        assert_eq!(pruned, 0, "the entry is above the scanner SP, so nothing returned");
+        assert_eq!(
+            pruned, 0,
+            "the entry is above the scanner SP, so nothing returned"
+        );
         assert_eq!(
             top_rbp_get(),
             live_rbp,
@@ -7241,7 +7270,9 @@ mod tests {
             let mut v = c.borrow_mut();
             flush_top_rbp_cache_to_chain(v.as_mut_slice());
             assert_eq!(
-                v.last().and_then(|e| e.precise.as_ref()).map(|i| i.exact_rbp),
+                v.last()
+                    .and_then(|e| e.precise.as_ref())
+                    .map(|i| i.exact_rbp),
                 Some(live_rbp),
             );
         });
@@ -7264,7 +7295,10 @@ mod tests {
             "depth this thread's chain cannot account for means a peer is in JIT, \
              and a peer's registers/frame slots are not rewritable by this cycle",
         );
-        assert!(peer_jit_frames_present(1, 0), "a peer while we are quiescent");
+        assert!(
+            peer_jit_frames_present(1, 0),
+            "a peer while we are quiescent"
+        );
     }
 
     /// The cross-thread handshake's arithmetic. The whole soundness argument is
@@ -7381,7 +7415,11 @@ mod tests {
         // zeroing only the RBP leaves `ID_A` naming the frame BELOW.
         let inner_cm = dummy_compiled_method();
         let inner = JitEntryGuard::enter_with_compiled(&inner_cm);
-        assert_eq!(top_rbp_mirror_read(), 0, "incoming entry must start with no rbp");
+        assert_eq!(
+            top_rbp_mirror_read(),
+            0,
+            "incoming entry must start with no rbp"
+        );
         assert_eq!(
             top_cm_id_mirror_read(),
             0,
@@ -7627,7 +7665,14 @@ mod tests {
         // Cursor at 32 => band[1] (off 32, the stale word) is reclaimed,
         // band[2] (off 24, the live word) is not.
         assert!(
-            band_has_unpublished_word_with(hi, hi - lo, &layout, Some(32), &published, &relocatable),
+            band_has_unpublished_word_with(
+                hi,
+                hi - lo,
+                &layout,
+                Some(32),
+                &published,
+                &relocatable
+            ),
             "a LIVE unpublished spill slot must still divert the cycle",
         );
         let mut published = published;
@@ -7963,8 +8008,8 @@ mod tests {
     fn shadow_window_rejects_a_window_wider_than_the_backing_buffer() {
         let mut f = fake_shadow_thread(&[0x1111], false);
         let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, TOP_OFFSET = 0
-        f._thread[ss] = f._thread[ss + 2]
-            + (cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS + 1) * 8;
+        f._thread[ss] =
+            f._thread[ss + 2] + (cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS + 1) * 8;
         assert!(
             shadow_window_from_frame(f.rbp, &f.cm).is_none(),
             "a window wider than the buffer is not a shadow window",
@@ -8157,8 +8202,8 @@ mod tests {
     fn shadow_window_rejects_a_buffer_of_the_wrong_size() {
         let mut f = fake_shadow_thread(&[0x1111, 0x2222], false);
         let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, END_OFFSET = 8
-        // Shrink `end` to just past `top`: ordered, aligned, `top` in range —
-        // and the exact shape the old fixture built by accident.
+                         // Shrink `end` to just past `top`: ordered, aligned, `top` in range —
+                         // and the exact shape the old fixture built by accident.
         f._thread[ss + 1] = f._thread[ss];
         assert!(
             shadow_window_from_frame(f.rbp, &f.cm).is_none(),
@@ -8576,7 +8621,10 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn indirect_near_call_return_addresses_are_accepted() {
-        assert!(call_encoding_precedes(&[0x90, 0x90, 0xFF, 0xD0]), "callq *%rax");
+        assert!(
+            call_encoding_precedes(&[0x90, 0x90, 0xFF, 0xD0]),
+            "callq *%rax"
+        );
         assert!(
             call_encoding_precedes(&[0x90, 0x41, 0xFF, 0xD3]),
             "callq *%r11 (REX.B)",

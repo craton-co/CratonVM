@@ -57,7 +57,11 @@ use std::path::{Path, PathBuf};
 /// One fixture: a stable id, the candidate paths (repo-relative, first match
 /// wins — several tests accept a `probes/` copy as well as the `apps/` one),
 /// and the `vm/tests/*.rs` files that drive it.
-type Fixture = (&'static str, &'static [&'static str], &'static [&'static str]);
+type Fixture = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 /// Every Java probe fixture referenced from `vm/tests/*.rs`.
 ///
@@ -215,31 +219,19 @@ const MISSING_BASELINE: &[(&str, &str)] = &[
         "not rebuilt in W7-51 — AQS handoff timing; the vector is a latency shape, and a \
          rebuilt one that does not reproduce the historical contention would be green-forever",
     ),
-    (
-        "bc_probe",
-        "not rebuilt in W7-51",
-    ),
+    ("bc_probe", "not rebuilt in W7-51"),
     (
         "bytebuddy_probe",
         "NOT RECONSTRUCTIBLE HERE: needs the Byte Buddy jar, a third-party artefact this \
          repository does not carry",
     ),
-    (
-        "cleaner_probe",
-        "not rebuilt in W7-51",
-    ),
-    (
-        "collection_tostring_probe",
-        "not rebuilt in W7-51",
-    ),
+    ("cleaner_probe", "not rebuilt in W7-51"),
+    ("collection_tostring_probe", "not rebuilt in W7-51"),
     (
         "constructor_probe",
         "not rebuilt in W7-51 — 11 nested types across two harnesses",
     ),
-    (
-        "findspecial_probe",
-        "not rebuilt in W7-51",
-    ),
+    ("findspecial_probe", "not rebuilt in W7-51"),
     (
         "h2",
         "NOT RECONSTRUCTIBLE HERE: needs the H2 database jar, a third-party artefact this \
@@ -259,18 +251,9 @@ const MISSING_BASELINE: &[(&str, &str)] = &[
          source — likely OK\". It does not: `ensure_scanner_probe_compiled` reads \
          `ScannerProbe.java` off disk and skips when it is absent.",
     ),
-    (
-        "string_decode_probe/DeepListProbe",
-        "not rebuilt in W7-51",
-    ),
-    (
-        "string_decode_probe/IntListProbe",
-        "not rebuilt in W7-51",
-    ),
-    (
-        "string_indexof_probe",
-        "not rebuilt in W7-51",
-    ),
+    ("string_decode_probe/DeepListProbe", "not rebuilt in W7-51"),
+    ("string_decode_probe/IntListProbe", "not rebuilt in W7-51"),
+    ("string_indexof_probe", "not rebuilt in W7-51"),
     (
         "xml_probe",
         "not rebuilt in W7-51. NOTE: W6-5 §3.2 recorded this one as \"self-generates its \
@@ -298,10 +281,7 @@ const NOT_A_FIXTURE: &[(&str, &str)] = &[
         "wildfly_jboss_module_service_leak.rs",
         "apps/wildfly-dist/wildfly-32.0.1.Final — a third-party server distribution",
     ),
-    (
-        "probe_fixture_census.rs",
-        "this census itself",
-    ),
+    ("probe_fixture_census.rs", "this census itself"),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -442,7 +422,11 @@ fn the_census_covers_every_test_that_reaches_into_apps() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let src = std::fs::read_to_string(&path)

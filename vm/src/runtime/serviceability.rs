@@ -176,10 +176,8 @@ impl AttachListener {
         // users on the host.
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
 
         // Poll rather than block in `accept()`, so `stop_listening` can
@@ -381,10 +379,7 @@ fn handle_attach_connection(
             let mut parts = arg1.splitn(2, ' ');
             let name = parts.next().unwrap_or("").to_string();
             let rest = parts.next().unwrap_or("");
-            (
-                name,
-                rest.split_whitespace().map(String::from).collect(),
-            )
+            (name, rest.split_whitespace().map(String::from).collect())
         }
         // `jstack <pid>`.
         "threaddump" => ("Thread.print".to_string(), Vec::new()),
@@ -408,8 +403,10 @@ fn handle_attach_connection(
             let _ = write_attach_response(
                 &mut conn,
                 1,
-                &format!("Unrecognized attach operation: {other}
-"),
+                &format!(
+                    "Unrecognized attach operation: {other}
+"
+                ),
             );
             return;
         }
@@ -422,13 +419,17 @@ fn handle_attach_connection(
         .map(|c| c.execute(&args));
     let write_result = match result {
         Some(r) if r.success => write_attach_response(&mut conn, 0, &r.output),
-        Some(r) => write_attach_response(
+        Some(r) => {
+            write_attach_response(&mut conn, 1, r.error.as_deref().unwrap_or("command failed"))
+        }
+        None => write_attach_response(
             &mut conn,
             1,
-            r.error.as_deref().unwrap_or("command failed"),
+            &format!(
+                "Unknown command: {name}
+"
+            ),
         ),
-        None => write_attach_response(&mut conn, 1, &format!("Unknown command: {name}
-")),
     };
     let _ = write_result;
     let _ = arg2; // consumed above for dumpheap's "-all"/"-live"; unused otherwise
@@ -587,7 +588,8 @@ pub struct JcmdProcessor {
 /// socket, and this file's own test suite constructs `JcmdProcessor::new()`
 /// upwards of a dozen times, often running in parallel (`cargo test`'s
 /// default) — a shared path would make those binds race each other.
-static TEST_JCMD_SOCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEST_JCMD_SOCKET_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl JcmdProcessor {
     pub fn new() -> Self {

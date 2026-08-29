@@ -45,8 +45,8 @@ use crate::lang_class::{
 };
 use crate::obj_arg;
 
-use std::sync::OnceLock;
 use cratonvm_types::error::MethodCallFailed;
+use std::sync::OnceLock;
 
 /// Cached `CRATONVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
 /// defensive-box wrap-up runs on every reflective call (and ByteBuddy /
@@ -289,7 +289,12 @@ fn can_access_member(
 ) -> Result<bool, MethodCallFailed> {
     // Field and Method only — `Constructor.canAccess` has its own entry point,
     // because its rule is not derivable from `Modifier.isStatic`.
-    check_can_access_receiver(ctx, member, obj_arg, receiver_must_be_null(is_static, false))?;
+    check_can_access_receiver(
+        ctx,
+        member,
+        obj_arg,
+        receiver_must_be_null(is_static, false),
+    )?;
 
     // Static member: receiver is null, validated just above.
     if is_static {
@@ -921,7 +926,8 @@ pub(crate) fn native_method_get_default_value(
     // the `processors()` default through identity-sensitive Class equality;
     // resolving this default globally made the two otherwise identical
     // `SimpleReflectiveProcessor.class` mirrors come from different forks.
-    let container_loader = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32());
+    let container_loader =
+        crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32());
     Ok(Some(crate::lang_class::annotation_element_to_java_typed(
         ctx,
         &default,
@@ -1921,8 +1927,12 @@ fn type_value_equals(
             if x == y {
                 return Ok(true);
             }
-            let r =
-                ctx.invoke_virtual(x, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(y))])?;
+            let r = ctx.invoke_virtual(
+                x,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(y))],
+            )?;
             Ok(matches!(r, Some(Value::Int(v)) if v != 0))
         }
         _ => Ok(false),
@@ -3270,7 +3280,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             if a == b {
                 return Ok(Some(Value::Int(1)));
             }
-            let eq = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])?;
+            let eq = ctx.invoke_virtual(
+                a,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(b))],
+            )?;
             Ok(Some(Value::Int(i32::from(
                 matches!(eq, Some(Value::Int(v)) if v != 0),
             ))))
@@ -3427,9 +3442,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Smoke: registry exposes the WP2.1 surface without panicking and
     /// without duplicate-method warnings.

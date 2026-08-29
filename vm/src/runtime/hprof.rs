@@ -160,15 +160,18 @@ struct DumpSafepoint<'a> {
 
 impl<'a> DumpSafepoint<'a> {
     fn request(vm: &'a SharedVm, initiator: ThreadId) -> Self {
-        let acquired = vm.mem.gc_barrier.request_stw_counted_with_live_blocked(initiator, || {
-            let (alive, blocked, _os_tids, blocked_tids) =
-                vm.threads.thread_registry.alive_count_blocked_and_os_tids();
-            (
-                u32::try_from(alive).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+        let acquired = vm
+            .mem
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(initiator, || {
+                let (alive, blocked, _os_tids, blocked_tids) =
+                    vm.threads.thread_registry.alive_count_blocked_and_os_tids();
+                (
+                    u32::try_from(alive).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
         if acquired {
             vm.mem.gc_barrier.wait_for_all();
         }
@@ -183,7 +186,10 @@ impl Drop for DumpSafepoint<'_> {
             // the exact and complete answer for a non-moving pause. See
             // `vm/src/native/jni.rs`'s `gc_barrier.complete_gc(cratonvm_types::PointerMap::default())`
             // test usage for the same pattern.
-            self.vm.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
+            self.vm
+                .mem
+                .gc_barrier
+                .complete_gc(cratonvm_types::PointerMap::default());
         }
     }
 }
@@ -1485,8 +1491,7 @@ mod tests {
 
         let tmp = std::env::temp_dir().join("cratonvm_s42_test.hprof");
         let path = tmp.to_str().unwrap();
-        let size =
-            dump_heap(&vm, path, ThreadId(0)).expect("dump_heap should succeed");
+        let size = dump_heap(&vm, path, ThreadId(0)).expect("dump_heap should succeed");
         assert!(size > 0, "Dump file should be non-empty");
 
         // Verify the file starts with HPROF magic

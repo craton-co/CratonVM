@@ -11,12 +11,12 @@ HotSpot, `cratonvm --jdk-only`, and `cratonvm` in the default mode — diffed on
 
 | probe | rows | covers |
 | --- | ---: | --- |
-| `probes/L4FileSweep.java` | 486 | the 50 `java/io/File` triples |
-| `probes/L4FilesSweep.java` | 395 | `java/nio/file/Files` 31, `Path` 9, `Paths` 1 |
-| `probes/L4ByteBufferSweep.java` | 404 | `ByteBuffer` 11, `DirectByteBuffer` 9, `HeapByteBuffer` 4 |
-| `probes/L4PrintStreamSweep.java` | 123 | `PrintStream` 25, `PrintWriter` 1 |
-| `probes/L4StreamTailSweep.java` | 208 | the `java.io` stream tail and the `java.nio` tail |
-| `probes/L4Reach.java` | — | NOT a differential probe; it exists only to make the census |
+| `apps/probes/L4FileSweep.java` | 486 | the 50 `java/io/File` triples |
+| `apps/probes/L4FilesSweep.java` | 395 | `java/nio/file/Files` 31, `Path` 9, `Paths` 1 |
+| `apps/probes/L4ByteBufferSweep.java` | 404 | `ByteBuffer` 11, `DirectByteBuffer` 9, `HeapByteBuffer` 4 |
+| `apps/probes/L4PrintStreamSweep.java` | 123 | `PrintStream` 25, `PrintWriter` 1 |
+| `apps/probes/L4StreamTailSweep.java` | 208 | the `java.io` stream tail and the `java.nio` tail |
+| `apps/probes/L4Reach.java` | — | NOT a differential probe; it exists only to make the census |
 
 **1616 differential rows, 1615 identical in both modes.** The one residual is
 §4, and it is not a missing fix — it is a resolution finding no registrar edit
@@ -652,11 +652,11 @@ subrange refusal; and the whole `java.util.Formatter` surface including all six
 # the census
 cratonvm --java-home "$JDK" --jdk-only --explain-jdk-only \
     --jdk-only-report rep.json --dump-native-registry reg.json \
-    -cp probes/out L4Reach
+    -cp apps/probes/out L4Reach
 
 # the five differential probes, three arms each -- plus the four EXISTING
 # java.io probes, which is where §3.8 came from
-bash probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
+bash apps/probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
                      L4PrintStreamSweep L4StreamTailSweep \
                      TailFamilySweep IoSystemSweep FilesSweep FilePathSweep
 ```
@@ -712,7 +712,7 @@ way `invocations_complete` says.
 
 ## P2.2 `CharBuffer.get(int)` was position-relative — the wrong characters, with every number right
 
-`probes/L4TypedBufferSweep.java` is new: **501 rows**, six typed buffers
+`apps/probes/L4TypedBufferSweep.java` is new: **501 rows**, six typed buffers
 (`Int`, `Long`, `Short`, `Float`, `Double`, `Char`) × three backings, covering
 ~50 census rows no probe in the tree had ever reached. One row differed.
 

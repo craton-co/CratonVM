@@ -1738,7 +1738,11 @@ mod tests {
         let large = tlab.allocate(40_000, 8, &pages, &hooks).unwrap();
 
         assert_eq!(tlab.stats().large_allocations, 2);
-        assert_eq!(tlab.remaining(), remaining_before, "the buffer is untouched");
+        assert_eq!(
+            tlab.remaining(),
+            remaining_before,
+            "the buffer is untouched"
+        );
         assert_eq!(tlab.stats().refills, refills_before);
         assert!(pages.table().contains(small));
         assert!(pages.table().contains(large));
@@ -1883,7 +1887,10 @@ mod tests {
         let after_second = cell.stats();
         assert_eq!(after_first.retires, after_second.retires);
         assert_eq!(after_first.waste_bytes, after_second.waste_bytes);
-        assert_eq!(after_first.registered_objects, after_second.registered_objects);
+        assert_eq!(
+            after_first.registered_objects,
+            after_second.registered_objects
+        );
         assert!(cell.lock().is_retired());
     }
 
@@ -2092,7 +2099,11 @@ mod tests {
             );
         }
         for &addr in all.iter() {
-            assert_eq!(read_cid(addr), TEST_CID, "object at {addr:#x} was clobbered");
+            assert_eq!(
+                read_cid(addr),
+                TEST_CID,
+                "object at {addr:#x} was clobbered"
+            );
             assert!(pages.table().contains(addr));
         }
 

@@ -175,14 +175,7 @@ fn new19_direct_allow_cross_module_with_add_opens_unqualified() {
     // and the token reaches `add_opens` verbatim: `""` here would be a
     // genuinely *unqualified* open, which grants every module and would let
     // this test pass without the ALL-UNNAMED path working at all.
-    setup_modules(
-        &mut vm,
-        &[(
-            "test.named",
-            "cratonvm",
-            ALL_UNNAMED_TARGET,
-        )],
-    );
+    setup_modules(&mut vm, &[("test.named", "cratonvm", ALL_UNNAMED_TARGET)]);
 
     let accessor_mod = module_name_of(&vm, "cratonvm/TckModule");
     let target_mod = module_name_of(&vm, "cratonvm/ModuleTarget");

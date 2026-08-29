@@ -21,8 +21,6 @@ impl Compiler {
     //
     // Moved to `x64/arith.rs`.
 
-
-
     /// Emit a vectorized int-array sum loop.
     /// Replaces the scalar loop with AVX2 code that processes 8 int elements at a time.
     /// Assumes: RCX = array base ptr, R10D = start index, R11D = bound (exclusive count).
@@ -178,8 +176,7 @@ impl Compiler {
         index_delta: i32,
         advance_iv: bool,
     ) {
-        let b_disp = HEADER_SIZE as i32
-            + index_delta * if narrow_oops_enabled() { 4 } else { 8 };
+        let b_disp = HEADER_SIZE as i32 + index_delta * if narrow_oops_enabled() { 4 } else { 8 };
         let a_disp = HEADER_SIZE as i32 + index_delta * 4;
         // Both displacements are baked under a hard-coded `mod=01` ModRM byte
         // AND grow with the unroll index — the only computed disp8s left in
@@ -225,8 +222,7 @@ impl Compiler {
         // Each B row is independently mutable in Java, so its column check
         // remains per element. A failure restarts the exact scalar body, which
         // raises NPE/AIOOBE at the original bytecode.
-        self.buf
-            .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+        self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
         self.buf.emit(&[0x41, 0x39, 0xD6]); // CMP R14D, EDX
         scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
 
@@ -237,14 +233,8 @@ impl Compiler {
             0x94,
             a_disp8 as u8, // Cast: range-checked disp8 above, reinterpreted signed
         ]); // MOV EDX,[R12+R10*4+H]
-        self.buf.emit(&[
-            0x42,
-            0x0F,
-            0xAF,
-            0x54,
-            0xB0,
-            HEADER_SIZE as u8,
-        ]); // IMUL EDX,[RAX+R14*4+H]
+        self.buf
+            .emit(&[0x42, 0x0F, 0xAF, 0x54, 0xB0, HEADER_SIZE as u8]); // IMUL EDX,[RAX+R14*4+H]
         self.buf.emit(&[0x41, 0x01, 0xD1]); // ADD R9D, EDX (Java int wrap)
         if advance_iv {
             self.buf.emit(&[0x41, 0xFF, 0xC2]); // INC R10D
@@ -319,8 +309,7 @@ impl Compiler {
             }
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
             scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-            self.buf
-                .emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
+            self.buf.emit(&[0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[RAX+len]
             self.buf.emit(&[0x39, 0xD1]); // CMP ECX, EDX
             scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x83)); // JAE
             self.emit_ref_aload_regs();
@@ -345,13 +334,8 @@ impl Compiler {
 
         // A's selected row and the outer B array must both cover the complete
         // counted range.  JA (not JAE): length == bound is valid.
-        self.buf.emit(&[
-            0x41,
-            0x8B,
-            0x54,
-            0x24,
-            ARRAY_LENGTH_OFFSET as u8,
-        ]); // MOV EDX,[R12+len]
+        self.buf
+            .emit(&[0x41, 0x8B, 0x54, 0x24, ARRAY_LENGTH_OFFSET as u8]); // MOV EDX,[R12+len]
         self.buf.emit(&[0x41, 0x39, 0xD7]); // CMP R15D, EDX
         scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x87)); // JA
         self.buf
@@ -625,7 +609,6 @@ impl Compiler {
             "detector rejects non-unary branches (0x99..=0x9E)"
         );
     }
-
 
     /// Emit a vectorized int-array element-wise loop:
     ///

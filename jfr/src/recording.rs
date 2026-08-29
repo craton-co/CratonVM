@@ -149,7 +149,8 @@ fn admits(registry: &EventTypeRegistry, rec: &Recording, event: &EventInstance) 
     if !rec.passes_filter(event) {
         return false;
     }
-    if rec.settings.enabled_event_names.is_none() && rec.settings.event_thresholds_by_name.is_empty()
+    if rec.settings.enabled_event_names.is_none()
+        && rec.settings.event_thresholds_by_name.is_empty()
     {
         // Fast path for every recording that has no name filter at all, which
         // is all of CratonVM's own: skip the registry lookup entirely.
@@ -1280,7 +1281,11 @@ mod tests {
             ours.len(),
             1,
             "the event committed before stop() must be in the dump, got {:?}",
-            chunk.events.iter().map(|e| &e.type_name).collect::<Vec<_>>()
+            chunk
+                .events
+                .iter()
+                .map(|e| &e.type_name)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             ours[0].fields,

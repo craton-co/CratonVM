@@ -1405,7 +1405,10 @@ fn synthetic_by_file() -> Vec<(String, usize)> {
         }
         let at = r.registered_by.as_deref().unwrap_or("<unknown>");
         let file = at.replace('\\', "/");
-        let file = file.rsplit_once(':').map_or(file.as_str(), |(f, _)| f).to_string();
+        let file = file
+            .rsplit_once(':')
+            .map_or(file.as_str(), |(f, _)| f)
+            .to_string();
         *per_file.entry(file).or_default() += 1;
     }
     let mut out: Vec<_> = per_file.into_iter().collect();
@@ -1523,7 +1526,10 @@ fn intrinsic_by_file() -> Vec<(String, usize)> {
         }
         let at = r.registered_by.as_deref().unwrap_or("<unknown>");
         let file = at.replace('\\', "/");
-        let file = file.rsplit_once(':').map_or(file.as_str(), |(f, _)| f).to_string();
+        let file = file
+            .rsplit_once(':')
+            .map_or(file.as_str(), |(f, _)| f)
+            .to_string();
         *per_file.entry(file).or_default() += 1;
     }
     let mut out: Vec<_> = per_file.into_iter().collect();
@@ -1729,8 +1735,14 @@ fn synthetic_stub_count_does_not_regress() {
             .into_iter()
             .filter(|r| r.kind == NativeKind::SyntheticStub)
             .map(|r| {
-                let at = r.registered_by.as_deref().unwrap_or("<unknown>").replace('\\', "/");
-                let file = at.rsplit_once(':').map_or(at.clone(), |(f, _)| f.to_string());
+                let at = r
+                    .registered_by
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+                    .replace('\\', "/");
+                let file = at
+                    .rsplit_once(':')
+                    .map_or(at.clone(), |(f, _)| f.to_string());
                 format!("{}|{}{}|{}", file, r.class, r.name, r.descriptor)
             })
             .collect();

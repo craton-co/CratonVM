@@ -1760,7 +1760,10 @@ mod historical_name_tests {
             .iter()
             .filter(|(canon, want)| historical_charset_name(canon) != *want)
             .map(|(canon, want)| {
-                format!("  {canon}: got {:?}, JDK says {want:?}", historical_charset_name(canon))
+                format!(
+                    "  {canon}: got {:?}, JDK says {want:?}",
+                    historical_charset_name(canon)
+                )
             })
             .collect();
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -1781,7 +1784,10 @@ mod historical_name_tests {
 
     #[test]
     fn an_unlisted_name_is_returned_unchanged() {
-        assert_eq!(historical_charset_name("x-craton-nonesuch"), "x-craton-nonesuch");
+        assert_eq!(
+            historical_charset_name("x-craton-nonesuch"),
+            "x-craton-nonesuch"
+        );
     }
 
     /// The table's keys must be canonical names, or a lookup can never hit.

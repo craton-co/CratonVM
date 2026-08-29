@@ -66,7 +66,10 @@ fn test_lambda_one_shot_actually_engages() {
     // route declines bodies the worker admits. Determinism bought by
     // suppressing the thing under test is not determinism.
     cratonvm_types::flags::with_process_overrides(
-        &[("CRATONVM_DBG_LAMBDA_JIT", Some("1")), ("CRATONVM_JIT_LAMBDA_SITE", Some("0"))],
+        &[
+            ("CRATONVM_DBG_LAMBDA_JIT", Some("1")),
+            ("CRATONVM_JIT_LAMBDA_SITE", Some("0")),
+        ],
         || run_fixture(),
     );
 }

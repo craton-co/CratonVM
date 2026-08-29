@@ -258,9 +258,7 @@ fn throw_constructed(
             }
             .into()
         }
-        "java/lang/ArrayIndexOutOfBoundsException" => {
-            RuntimeError::aioobe_index_only(index).into()
-        }
+        "java/lang/ArrayIndexOutOfBoundsException" => RuntimeError::aioobe_index_only(index).into(),
         _ => RuntimeError::ioobe(message).into(),
     }
 }

@@ -1155,12 +1155,7 @@ pub(crate) fn secure_random_fill(_key: i32, buf: &mut [u8]) {
 /// 8439 §2.3 caps a single (key, nonce) message at 256 GiB, which this
 /// function does not enforce; no caller in this tree comes near it, and the
 /// only present caller is `secure_random_fill`'s one-shot fallback.
-pub(crate) fn chacha20_xor(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    initial_counter: u32,
-    buf: &mut [u8],
-) {
+pub(crate) fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], initial_counter: u32, buf: &mut [u8]) {
     #[inline]
     fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
         s[a] = s[a].wrapping_add(s[b]);
@@ -2896,9 +2891,7 @@ impl RsaCipherError {
     /// The detail text.
     pub fn message(&self) -> &str {
         match self {
-            RsaCipherError::BlockSize(m)
-            | RsaCipherError::Padding(m)
-            | RsaCipherError::Key(m) => m,
+            RsaCipherError::BlockSize(m) | RsaCipherError::Padding(m) | RsaCipherError::Key(m) => m,
         }
     }
 }
@@ -4627,7 +4620,11 @@ impl X509Cert {
                 // SHA-384 signature is overwhelmingly made by a P-384 key,
                 // and that is precisely the case the P-256 parser refused.
                 if let Some(pub_key) = parse_named_ec_public_key(issuer_spki) {
-                    verify_named_ecdsa(&pub_key, &Sha384::digest(&self.tbs_bytes), &self.signature_bytes)
+                    verify_named_ecdsa(
+                        &pub_key,
+                        &Sha384::digest(&self.tbs_bytes),
+                        &self.signature_bytes,
+                    )
                 } else {
                     false
                 }
@@ -5155,7 +5152,10 @@ fn hex_to_biguint(h: &str) -> BigUint {
         .collect();
     // An odd digit count would silently shift every byte; the constants are
     // written in whole bytes, so treat it as the editing mistake it is.
-    assert!(digits.len() % 2 == 0, "curve parameter has an odd hex digit count");
+    assert!(
+        digits.len() % 2 == 0,
+        "curve parameter has an odd hex digit count"
+    );
     for pair in digits.chunks(2) {
         bytes.push((pair[0] << 4) | pair[1]);
     }
@@ -5178,10 +5178,16 @@ impl NistCurve {
         // cannot span a re-entry into the VM by construction — the body under
         // it is `hex_to_biguint` and a `Box::leak`, both pure.
         static CACHE: std::sync::OnceLock<
-            cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<&'static str, &'static CurveParams>>,
+            cratonvm_types::lock_order::OrderedPlMutex<
+                std::collections::HashMap<&'static str, &'static CurveParams>,
+            >,
         > = std::sync::OnceLock::new();
-        let cache =
-            CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch));
+        let cache = CACHE.get_or_init(|| {
+            cratonvm_types::lock_order::OrderedPlMutex::new(
+                std::collections::HashMap::new(),
+                cratonvm_types::lock_order::LockLevel::Scratch,
+            )
+        });
         let mut guard = cache.lock();
         if let Some(found) = guard.get(self.name) {
             return found;
@@ -5554,7 +5560,12 @@ mod named_curve_param_tests {
             let params = curve.params();
             assert_eq!(params.p.bit_length(), bits, "{} p", curve.name);
             assert_eq!(params.n.bit_length(), bits, "{} n", curve.name);
-            assert_eq!(curve.field_bytes, bits.div_ceil(8), "{} field_bytes", curve.name);
+            assert_eq!(
+                curve.field_bytes,
+                bits.div_ceil(8),
+                "{} field_bytes",
+                curve.name
+            );
         }
     }
 
@@ -5566,9 +5577,18 @@ mod named_curve_param_tests {
     fn an_unsupported_curve_oid_parses_to_none() {
         // secp256k1 (1.3.132.0.10): a real curve, deliberately not implemented.
         assert!(nist_curve_for_oid(&[0x2b, 0x81, 0x04, 0x00, 0x0a]).is_none());
-        assert_eq!(nist_curve_for_oid(OID_EC_P256).map(|c| c.name), Some("P-256"));
-        assert_eq!(nist_curve_for_oid(OID_EC_P384).map(|c| c.name), Some("P-384"));
-        assert_eq!(nist_curve_for_oid(OID_EC_P521).map(|c| c.name), Some("P-521"));
+        assert_eq!(
+            nist_curve_for_oid(OID_EC_P256).map(|c| c.name),
+            Some("P-256")
+        );
+        assert_eq!(
+            nist_curve_for_oid(OID_EC_P384).map(|c| c.name),
+            Some("P-384")
+        );
+        assert_eq!(
+            nist_curve_for_oid(OID_EC_P521).map(|c| c.name),
+            Some("P-521")
+        );
     }
 
     /// A key that is not ON the curve must be refused before the group law
@@ -5637,7 +5657,11 @@ mod named_curve_openssl_tests {
             "{expect}: a signature OpenSSL made was rejected"
         );
         assert!(
-            !verify_named_ecdsa(&parsed, &hash(b"cratonvm named-curve verification vecto!"), &sig),
+            !verify_named_ecdsa(
+                &parsed,
+                &hash(b"cratonvm named-curve verification vecto!"),
+                &sig
+            ),
             "{expect}: the same signature was accepted over a DIFFERENT message"
         );
     }
@@ -6498,7 +6522,10 @@ mod tests {
         }
         assert_eq!(
             mine,
-            vec!["nextBytes([B)V".to_string(), "generateSeed(I)[B".to_string()],
+            vec![
+                "nextBytes([B)V".to_string(),
+                "generateSeed(I)[B".to_string()
+            ],
             "crypto_impl must own only the two OS-CSPRNG output triples; \
              re-registering setSeed or <init>([B)V here shadows securerandom.rs \
              in synthetic mode and undoes SHA1PRNG reseeding — L8"
@@ -7699,7 +7726,10 @@ mod tests {
     #[test]
     fn biguint_div_rem_extreme_limb_values() {
         let cases: &[(&[u32], &[u32])] = &[
-            (&[0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0xFFFF_FFFF]),
+            (
+                &[0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+                &[0xFFFF_FFFF, 0xFFFF_FFFF],
+            ),
             (&[0, 0, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0x8000_0000]),
             (&[0xFFFF_FFFF, 0, 0x8000_0000], &[0, 0x8000_0000]),
             (&[1, 0xFFFF_FFFF, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0xFFFF_FFFF]),
@@ -8281,8 +8311,14 @@ mod tests {
                 // Degenerate bases and exponents.
                 let zero = BigUint::zero();
                 assert_eq!(base.modpow(&zero, &m).limbs, vec![1], "x^0 == 1");
-                assert_eq!(zero.modpow(&BigUint::from_u64(5), &m).limbs, Vec::<u32>::new());
-                assert_eq!(base.modpow(&BigUint::one(), &m).limbs, base.modulo(&m).limbs);
+                assert_eq!(
+                    zero.modpow(&BigUint::from_u64(5), &m).limbs,
+                    Vec::<u32>::new()
+                );
+                assert_eq!(
+                    base.modpow(&BigUint::one(), &m).limbs,
+                    base.modulo(&m).limbs
+                );
                 // An even modulus must still take the dividing arm and agree
                 // with itself.
                 let m_even = m.add(&BigUint::one());
@@ -8384,7 +8420,10 @@ mod tests {
         );
         let msg = b"imported key, no CRT tail";
         let sig = Rsa::sign_sha256(&stripped, msg);
-        assert!(Rsa::verify_sha256(&pk, msg, &sig), "stripped key still signs");
+        assert!(
+            Rsa::verify_sha256(&pk, msg, &sig),
+            "stripped key still signs"
+        );
 
         // Partial parameters are not usable parameters: any missing member
         // sends it back to the fallback rather than half-computing.
@@ -8573,8 +8612,8 @@ mod tests {
                 private_key: other_sk,
             },
         );
-        let ct = rsa_cipher_encrypt(&n, &e, RsaCipherPadding::Pkcs1, b"crt payload")
-            .expect("encrypt");
+        let ct =
+            rsa_cipher_encrypt(&n, &e, RsaCipherPadding::Pkcs1, b"crt payload").expect("encrypt");
         assert!(
             rsa_cipher_decrypt_by_id(other_id, &n, RsaCipherPadding::Pkcs1, &ct).is_none(),
             "a handle naming a different key must decline"
@@ -8705,12 +8744,11 @@ mod tests {
         // instead would retire the oracle regression it exists for.
         let (a_pk, a_sk) = Rsa::generate_keypair(2048);
         let (b_pk, b_sk) = Rsa::generate_keypair(2048);
-        let ((pk, sk), (other_pk, other_sk)) =
-            if a_pk.n.cmp(&b_pk.n) == std::cmp::Ordering::Less {
-                ((a_pk, a_sk), (b_pk, b_sk))
-            } else {
-                ((b_pk, b_sk), (a_pk, a_sk))
-            };
+        let ((pk, sk), (other_pk, other_sk)) = if a_pk.n.cmp(&b_pk.n) == std::cmp::Ordering::Less {
+            ((a_pk, a_sk), (b_pk, b_sk))
+        } else {
+            ((b_pk, b_sk), (a_pk, a_sk))
+        };
         let n = pk.n.to_bytes_be();
         let e = pk.e.to_bytes_be();
         let d = sk.d.to_bytes_be();
@@ -9267,4 +9305,3 @@ mod tests {
         assert!(Rsa::try_verify_sha256(&refused, msg, &sig).is_err());
     }
 }
-

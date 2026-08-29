@@ -365,7 +365,11 @@ pub(super) enum LocalKind {
 /// there and the cat-2 locals collapse stays aligned). `Ambiguous` and
 /// interior-`Unknown` slots make the snapshot fall back to the safe whole-method
 /// re-run — never a guess.
-pub(super) fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<LocalKind> {
+pub(super) fn classify_local_kinds(
+    code: &[u8],
+    code_len: usize,
+    num_locals: usize,
+) -> Vec<LocalKind> {
     let mut kinds = vec![LocalKind::Unknown; num_locals];
     fn vote(kinds: &mut [LocalKind], slot: usize, k: LocalKind) {
         if slot >= kinds.len() {
@@ -409,7 +413,11 @@ pub(super) fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usi
 /// per-bci refinement ([`refine_ambiguous_local_kinds`]) so the two can never
 /// disagree about what an opcode does — a divergence there would silently make
 /// the refinement unsound rather than merely imprecise.
-pub(super) fn local_access_at(code: &[u8], code_len: usize, pc: usize) -> Option<(LocalKind, usize)> {
+pub(super) fn local_access_at(
+    code: &[u8],
+    code_len: usize,
+    pc: usize,
+) -> Option<(LocalKind, usize)> {
     let op = code[pc];
     match op {
         // Widening: u8 operand/opcode-relative index -> usize (value fits).
@@ -743,7 +751,11 @@ pub(super) fn code_uses_long_float_double(code: &[u8], code_len: usize) -> bool 
     false
 }
 
-pub(super) fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
+pub(super) fn find_induction_variable(
+    code: &[u8],
+    header: usize,
+    back_edge_end: usize,
+) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
                                     // Track iadd+istore pattern: iload X; ...; iadd; istore X
@@ -2205,7 +2217,8 @@ impl RangeState {
             }
         }
         let before = self.lt_len.len();
-        self.lt_len.retain(|f| other.lt_len.binary_search(f).is_ok());
+        self.lt_len
+            .retain(|f| other.lt_len.binary_search(f).is_ok());
         if self.lt_len.len() != before {
             changed = true;
         }
@@ -2761,7 +2774,15 @@ pub(super) fn range_safe_pcs(
     // reset — so it starts from the state that proves nothing, and everything
     // downstream of it inherits that until a real guard re-establishes a fact.
     let top = RangeState::top(n_locals);
-    range_push_to(&t, code_len, &mut visits, &mut state, &mut work, 0, top.clone());
+    range_push_to(
+        &t,
+        code_len,
+        &mut visits,
+        &mut state,
+        &mut work,
+        0,
+        top.clone(),
+    );
     for &(_start, _end, handler_pc) in handlers {
         range_push_to(
             &t,
@@ -2863,7 +2884,13 @@ pub(super) fn range_safe_pcs(
             0xa7 => {
                 if let Some(target) = branch_target {
                     range_push_to(
-                        &t, code_len, &mut visits, &mut state, &mut work, target, out,
+                        &t,
+                        code_len,
+                        &mut visits,
+                        &mut state,
+                        &mut work,
+                        target,
+                        out,
                     );
                 }
             }
@@ -2878,11 +2905,23 @@ pub(super) fn range_safe_pcs(
                 }
                 if let Some(target) = branch_target {
                     range_push_to(
-                        &t, code_len, &mut visits, &mut state, &mut work, target, taken,
+                        &t,
+                        code_len,
+                        &mut visits,
+                        &mut state,
+                        &mut work,
+                        target,
+                        taken,
                     );
                 }
                 range_push_to(
-                    &t, code_len, &mut visits, &mut state, &mut work, fall, not_taken,
+                    &t,
+                    code_len,
+                    &mut visits,
+                    &mut state,
+                    &mut work,
+                    fall,
+                    not_taken,
                 );
             }
             _ => range_push_to(&t, code_len, &mut visits, &mut state, &mut work, fall, out),
@@ -2946,8 +2985,8 @@ mod ambiguous_local_cfg_exactness_tests {
         ];
         // The same method with the trailing `return` replaced by `jsr; return`.
         let jsr_code: &[u8] = &[
-            0x03, 0x99, 0x00, 0x08, 0x04, 0x3b, 0xa7, 0x00, 0x05, 0x0e, 0x47, 0xa8, 0x00,
-            0x03, 0xb1,
+            0x03, 0x99, 0x00, 0x08, 0x04, 0x3b, 0xa7, 0x00, 0x05, 0x0e, 0x47, 0xa8, 0x00, 0x03,
+            0xb1,
         ];
         let kinds = classify_local_kinds(code, code.len(), 4);
         assert!(
@@ -3250,7 +3289,8 @@ mod range_analysis_bce_tests {
         let loops = super::super::detect_loops(&code, code.len());
 
         __set_range_bce_override(Some(true));
-        let (on, _) = analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
+        let (on, _) =
+            analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
         __set_range_bce_override(Some(false));
         let (off, _) =
             analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
@@ -3342,7 +3382,10 @@ mod range_analysis_bce_tests {
         let top = Range::top(IntWidth::W32);
         // Widening: the i32 endpoints into the i64 interval domain.
         let (min, max) = (i32::MIN as i64, i32::MAX as i64);
-        assert_eq!(narrow_by(top, Rel::Ge, 0), Range::exact(IntWidth::W32, 0, max));
+        assert_eq!(
+            narrow_by(top, Rel::Ge, 0),
+            Range::exact(IntWidth::W32, 0, max)
+        );
         assert_eq!(
             narrow_by(top, Rel::Lt, 10),
             Range::exact(IntWidth::W32, min, 9)
@@ -3429,7 +3472,11 @@ mod range_bce_tests {
         let (code, code_len) = inline_length_loop();
         assert_eq!(detect_loops(&code, code_len)[0], (2, 15));
         let (safe, guards) = run(&code, code_len);
-        assert_eq!(safe, vec![10], "a[i] under `i < a.length` is statically safe");
+        assert_eq!(
+            safe,
+            vec![10],
+            "a[i] under `i < a.length` is statically safe"
+        );
         assert!(
             guards.is_empty(),
             "the limit IS this array's length — nothing left to guard, got {guards:?}"
@@ -3454,7 +3501,10 @@ mod range_bce_tests {
         let code_len = code.len();
         assert_eq!(detect_loops(&code, code_len)[0], (2, 14));
         let (safe, guards) = run(&code, code_len);
-        assert!(safe.is_empty(), "decreasing loop must keep its check, got {safe:?}");
+        assert!(
+            safe.is_empty(),
+            "decreasing loop must keep its check, got {safe:?}"
+        );
         assert!(guards.is_empty());
     }
 
@@ -3629,7 +3679,10 @@ mod range_bce_tests {
             addend: -1,
             step_local: None,
         };
-        let incl = GuardShape { addend: 0, ..excl_clone(&excl) };
+        let incl = GuardShape {
+            addend: 0,
+            ..excl_clone(&excl)
+        };
         let need = |k: i32| {
             PreheaderGuard::LengthAtLeast(SymBound {
                 base: BoundTerm::Bound(BoundSource::Local(2)),
@@ -3675,15 +3728,9 @@ mod range_bce_tests {
         let sym = |base: BoundTerm, addend: i32| SymBound { base, addend };
 
         // Covered: the `iv >= 0` header test.
-        assert!(shape.covers(&PreheaderGuard::NonNegative(sym(
-            BoundTerm::IvEntry(0),
-            0
-        ))));
+        assert!(shape.covers(&PreheaderGuard::NonNegative(sym(BoundTerm::IvEntry(0), 0))));
         // Not covered: non-negativity of anything else.
-        assert!(!shape.covers(&PreheaderGuard::NonNegative(sym(
-            BoundTerm::IvEntry(1),
-            0
-        ))));
+        assert!(!shape.covers(&PreheaderGuard::NonNegative(sym(BoundTerm::IvEntry(1), 0))));
         assert!(!shape.covers(&PreheaderGuard::NonNegative(sym(
             BoundTerm::Bound(BoundSource::Local(2)),
             1
@@ -3770,4 +3817,3 @@ mod range_bce_tests {
         assert!(guards2.is_empty());
     }
 }
-

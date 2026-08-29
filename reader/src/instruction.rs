@@ -179,10 +179,7 @@ pub enum Instruction {
     Lor,
     Ixor,
     Lxor,
-    Iinc {
-        index: u16,
-        constant: i16,
-    },
+    Iinc { index: u16, constant: i16 },
 
     // Conversions
     I2l,
@@ -243,10 +240,7 @@ pub enum Instruction {
     Invokevirtual(u16),
     Invokespecial(u16),
     Invokestatic(u16),
-    Invokeinterface {
-        index: u16,
-        count: u8,
-    },
+    Invokeinterface { index: u16, count: u8 },
     Invokedynamic(u16),
     New(u16),
     Newarray(u8),
@@ -260,10 +254,7 @@ pub enum Instruction {
 
     // Extended
     Wide, // Handled as a prefix during decoding — should not appear as a standalone instruction
-    Multianewarray {
-        index: u16,
-        dimensions: u8,
-    },
+    Multianewarray { index: u16, dimensions: u8 },
     Ifnull(i16),
     Ifnonnull(i16),
     GotoW(i32),
@@ -643,10 +634,7 @@ impl Instruction {
                     let offset = Self::read_i32(code, &mut next)?;
                     pairs.push((key, offset));
                 }
-                Instruction::Lookupswitch(std::sync::Arc::new(LookupSwitch {
-                    default,
-                    pairs,
-                }))
+                Instruction::Lookupswitch(std::sync::Arc::new(LookupSwitch { default, pairs }))
             }
             0xac => Instruction::Ireturn,
             0xad => Instruction::Lreturn,

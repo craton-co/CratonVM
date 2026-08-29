@@ -226,7 +226,10 @@ fn normalise(s: &str) -> String {
         "THREW <IOOBE>",
     )
     .replace("THREW java.lang.IndexOutOfBoundsException", "THREW <IOOBE>")
-    .replace("THREW java.util.NoSuchElementException", "THREW <NoSuchElement>")
+    .replace(
+        "THREW java.util.NoSuchElementException",
+        "THREW <NoSuchElement>",
+    )
 }
 
 #[test]

@@ -535,8 +535,7 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .ok()
             .flatten();
         channel = ctx.read_native_pin(channel_pin, channel);
-        if let (Some(Value::Object(Some(cleaner_obj))), Some(runnable)) =
-            (cleaner, closer_runnable)
+        if let (Some(Value::Object(Some(cleaner_obj))), Some(runnable)) = (cleaner, closer_runnable)
         {
             closer = ctx
                 .invoke_virtual(
@@ -1457,10 +1456,7 @@ fn file_identity_pair(ctx: &mut dyn NativeContext, fd: FdId) -> (i64, i64) {
 /// on a nonexistent `p` is `true` rather than an error, which is the reflexivity
 /// the javadoc requires ("It is reflexive: for Path f, isSameFile(f,f) should
 /// return true").
-pub fn paths_name_the_same_file(
-    a: &std::path::Path,
-    b: &std::path::Path,
-) -> std::io::Result<bool> {
+pub fn paths_name_the_same_file(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
     // The JDK's own fast path, and the only branch that must not touch the disk.
     if a == b {
         return Ok(true);
@@ -1530,8 +1526,9 @@ fn win_file_identity(path: &std::path::Path) -> std::io::Result<(u32, u32, u32)>
     let mut info: win_fileid::ByHandleFileInformation = unsafe { std::mem::zeroed() };
     // SAFETY: `file` keeps the raw handle live for the duration of the call and
     // `info` is writable storage for exactly this Win32 structure.
-    let ok =
-        unsafe { win_fileid::GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+    let ok = unsafe {
+        win_fileid::GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info)
+    };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1604,10 +1601,13 @@ fn native_fc_map0_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::fd_table::FileDescriptorTable;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::Write;
 
     /// Round-trip: mmap a real file RW, mutate via the mapping,
@@ -1994,9 +1994,9 @@ mod tests {
             "sun/nio/ch/UnixFileDispatcherImpl",
             "sun/nio/ch/WindowsFileDispatcherImpl",
         ] {
-            let cb = r.find(cls, "maxDirectTransferSize0", "()I").unwrap_or_else(|| {
-                panic!("{cls}.maxDirectTransferSize0()I must be registered")
-            });
+            let cb = r
+                .find(cls, "maxDirectTransferSize0", "()I")
+                .unwrap_or_else(|| panic!("{cls}.maxDirectTransferSize0()I must be registered"));
 
             let mut ctx = crate::test_support::MockNativeContext::new();
             // The JDK calls this with no arguments and uses the result as a

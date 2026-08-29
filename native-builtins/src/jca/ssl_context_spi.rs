@@ -392,7 +392,6 @@ pub(crate) mod fixtures {
         ctx.set_field(obj, 1, Value::Int(0));
         obj
     }
-
 }
 
 #[cfg(test)]
@@ -406,8 +405,11 @@ mod owner_tests {
     #[test]
     fn a_third_party_spi_makes_the_context_foreign() {
         let mut ctx = MockNativeContext::new();
-        let (obj, spi) =
-            make_real_context(&mut ctx, "org/bouncycastle/jsse/provider/ProvSSLContextSpi", "TLSv1.3");
+        let (obj, spi) = make_real_context(
+            &mut ctx,
+            "org/bouncycastle/jsse/provider/ProvSSLContextSpi",
+            "TLSv1.3",
+        );
         assert_eq!(context_owner(&ctx, obj), SslContextOwner::Foreign(spi));
         assert_eq!(foreign_spi(&ctx, &[Value::Object(Some(obj))]), Some(spi));
     }
@@ -418,8 +420,7 @@ mod owner_tests {
     #[test]
     fn a_sun_security_ssl_spi_stays_ours() {
         let mut ctx = MockNativeContext::new();
-        let (obj, spi) =
-            make_real_context(&mut ctx, "sun/security/ssl/SSLContextImpl", "TLSv1.3");
+        let (obj, spi) = make_real_context(&mut ctx, "sun/security/ssl/SSLContextImpl", "TLSv1.3");
         assert_eq!(context_owner(&ctx, obj), SslContextOwner::Adopted(spi));
         assert_eq!(foreign_spi(&ctx, &[Value::Object(Some(obj))]), None);
     }
@@ -585,7 +586,10 @@ mod registrar_tests {
                 "phases_late::ssl_security::register_p68_ssl",
                 crate::phases_late::ssl_security::register_p68_ssl,
             ),
-            ("tls::register_tls_natives", crate::tls::register_tls_natives),
+            (
+                "tls::register_tls_natives",
+                crate::tls::register_tls_natives,
+            ),
         ] {
             let mut r = NativeMethodRegistry::new();
             f(&mut r);

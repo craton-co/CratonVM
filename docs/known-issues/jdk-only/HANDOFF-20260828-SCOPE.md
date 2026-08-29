@@ -4,7 +4,13 @@
 rules that keep seven workers from colliding, and the traps that have each cost
 a build cycle today.
 
-Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
+Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`. A
+finished lane's brief moves to `internal/jdk-only/` with a retirement banner —
+L4's and L7's have. **Both came BACK into this directory when the briefs were
+first landed on `dev`, after their lanes had already retired them**, so a
+duplicate here is a merge artefact rather than a live brief: check
+`internal/jdk-only/` for a retired twin before working from one. Both have since
+been removed again.
 
 ---
 
@@ -15,9 +21,10 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
+| **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
-| L3, L7 | unclaimed | your own worktree | your own branch |
+| **L3 `java.util` collections** | unclaimed — the last one | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
 L1, L4 and L6 are DONE. Everything else is unclaimed.
@@ -61,7 +68,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | **Phase 1** — fabricated receiver kills its caller | **5 of 9 lanes closed.** No `NoClassDefFoundError` in 80 probe rows. A/B/D/G/I clear. |
 | **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
-| **Phase 4** — the evidence base | instrument built and consumed (`difftest/src/census.rs`); the three DoD workloads are **not checked out on this host**. That is L7. |
+| **Phase 4** — the evidence base | **CLOSED 2026-08-28 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. |
 
 ### The finding that reframes the work
 

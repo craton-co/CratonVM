@@ -2091,7 +2091,11 @@ mod tests {
                 0b00,
                 "FP LDUR/STUR variant {i} must be unscaled/non-writeback"
             );
-            assert_eq!((inst >> 26) & 1, 1, "variant {i} must set the V (SIMD&FP) bit");
+            assert_eq!(
+                (inst >> 26) & 1,
+                1,
+                "variant {i} must set the V (SIMD&FP) bit"
+            );
             assert_eq!((inst >> 24) & 1, 0, "variant {i} is not the scaled form");
         }
     }

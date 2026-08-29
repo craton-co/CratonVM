@@ -1923,11 +1923,7 @@ fn p56_double_stats_store(
         // real `getSum()` subtracts must be zero, not left at whatever the
         // allocation defaulted to.
         ctx.set_field(stats, REAL_DSS_FIELD_SUM, Value::Double(sum));
-        ctx.set_field(
-            stats,
-            REAL_DSS_FIELD_SUM_COMPENSATION,
-            Value::Double(0.0),
-        );
+        ctx.set_field(stats, REAL_DSS_FIELD_SUM_COMPENSATION, Value::Double(0.0));
         ctx.set_field(stats, REAL_DSS_FIELD_SIMPLE_SUM, Value::Double(simple_sum));
         ctx.set_field(stats, REAL_DSS_FIELD_MIN, Value::Double(min));
         ctx.set_field(stats, REAL_DSS_FIELD_MAX, Value::Double(max));
@@ -2814,8 +2810,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/function/UnaryOperator;",
         |ctx, _args| {
             // Create a lambda proxy that returns its argument
-            let proxy =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0)?;
+            let proxy = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/function/UnaryOperator$Identity",
+                0,
+            )?;
             Ok(Some(Value::Object(Some(proxy))))
         },
         cratonvm_native_api::NativeKind::SyntheticStub,

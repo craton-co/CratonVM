@@ -766,7 +766,10 @@ impl std::fmt::Display for SelError {
             SelError::Constraint {
                 pattern,
                 constraint,
-            } => write!(f, "pattern `{pattern}` rejects the operands: {constraint:?}"),
+            } => write!(
+                f,
+                "pattern `{pattern}` rejects the operands: {constraint:?}"
+            ),
             SelError::Disp(e) => write!(f, "{e}"),
             SelError::Immediate {
                 pattern,
@@ -2595,7 +2598,8 @@ impl Decoded {
 
     /// The full 0..=15 register number in the ModRM `reg` field.
     pub fn reg(&self) -> Option<u8> {
-        self.modrm.map(|m| (self.rex_bit(0x04) << 3) | ((m >> 3) & 7))
+        self.modrm
+            .map(|m| (self.rex_bit(0x04) << 3) | ((m >> 3) & 7))
     }
 
     /// The full 0..=15 register number in the ModRM `r/m` field, for
@@ -2841,9 +2845,10 @@ pub fn render(p: &Pattern, d: &Decoded) -> String {
 // `docs/jit/instruction-selection.md` for what the production wiring has to do
 // and what is still unvalidated.
 
+use crate::ir::{
+    is_memory_token_slot, CmpOp, Graph, IrType, NodeId, Op as IrOp, Reorder, ReorderBlock,
+};
 use crate::ir_schedule::Schedule;
-use crate::ir::{is_memory_token_slot, CmpOp, Graph, IrType, NodeId, Op as IrOp, Reorder,
-    ReorderBlock};
 
 /// Largest number of IR nodes [`match_address`] will walk before giving up.
 ///
@@ -3278,10 +3283,7 @@ fn absorb_constant(ctx: &SelCtx, acc: &mut AddrAcc, a: NodeId, b: NodeId, value:
 /// rewrite: an interior node with a second consumer stays where it is and
 /// becomes the address's base, so nothing is ever computed twice.
 pub fn match_address(ctx: &SelCtx, root: NodeId) -> Result<AddrMatch, AddrRefusal> {
-    let rootn = ctx
-        .graph
-        .node_opt(root)
-        .ok_or(AddrRefusal::Unknown(root))?;
+    let rootn = ctx.graph.node_opt(root).ok_or(AddrRefusal::Unknown(root))?;
     if !matches!(rootn.op, IrOp::Add | IrOp::Shl | IrOp::Mul) {
         return Err(AddrRefusal::NotAnAddress(root));
     }
@@ -3365,24 +3367,22 @@ pub fn match_address(ctx: &SelCtx, root: NodeId) -> Result<AddrMatch, AddrRefusa
                 work.push(b);
                 work.push(a);
             }
-            IrOp::Shl if may_absorb && !is_root => {
-                match (node.input_opt(0), node.input_opt(1)) {
-                    (Some(x), Some(k)) => match ctx.const_of(k) {
-                        Some(sh @ (0 | 1 | 2 | 3)) => {
-                            acc.absorbed.push(id);
-                            absorb_constant(ctx, &mut acc, x, k, x);
-                            match sh {
-                                0 => acc.plain(x)?,
-                                1 => acc.scaled(x, 2)?,
-                                2 => acc.scaled(x, 4)?,
-                                _ => acc.scaled(x, 8)?,
-                            }
+            IrOp::Shl if may_absorb && !is_root => match (node.input_opt(0), node.input_opt(1)) {
+                (Some(x), Some(k)) => match ctx.const_of(k) {
+                    Some(sh @ (0 | 1 | 2 | 3)) => {
+                        acc.absorbed.push(id);
+                        absorb_constant(ctx, &mut acc, x, k, x);
+                        match sh {
+                            0 => acc.plain(x)?,
+                            1 => acc.scaled(x, 2)?,
+                            2 => acc.scaled(x, 4)?,
+                            _ => acc.scaled(x, 8)?,
                         }
-                        _ => acc.plain(id)?,
-                    },
+                    }
                     _ => acc.plain(id)?,
-                }
-            }
+                },
+                _ => acc.plain(id)?,
+            },
             IrOp::Mul if may_absorb && !is_root => {
                 let folded = match (node.input_opt(0), node.input_opt(1)) {
                     (Some(x), Some(y)) => match (ctx.const_of(y), ctx.const_of(x)) {
@@ -3488,12 +3488,8 @@ pub enum FoldRefusal {
 ///
 /// Total: never panics, and every refusal names the node responsible.
 pub fn may_fold_load(ctx: &SelCtx, load: NodeId, user: NodeId) -> Result<(), FoldRefusal> {
-    let lp = ctx
-        .position(load)
-        .ok_or(FoldRefusal::NotInBlock(load))?;
-    let up = ctx
-        .position(user)
-        .ok_or(FoldRefusal::NotInBlock(user))?;
+    let lp = ctx.position(load).ok_or(FoldRefusal::NotInBlock(load))?;
+    let up = ctx.position(user).ok_or(FoldRefusal::NotInBlock(user))?;
     if lp >= up {
         return Err(FoldRefusal::NotBefore { load, user });
     }
@@ -3637,7 +3633,9 @@ impl MInst {
     /// and what each needs.
     pub fn pattern_name(&self) -> Option<&'static str> {
         match *self {
-            MInst::Imm { ty: Ty::I64, imm, .. } => Some(match imm {
+            MInst::Imm {
+                ty: Ty::I64, imm, ..
+            } => Some(match imm {
                 0 => "mov_r64_imm0_xor",
                 v if i32::try_from(v).is_ok() => "mov_r64_imm32",
                 _ => "mov_r64_imm64",
@@ -3660,7 +3658,12 @@ impl MInst {
                 (Op::Imul, Ty::I32) => Some("imul_r32_r32"),
                 _ => None,
             },
-            MInst::AluRI { op, ty: Ty::I64, form, .. } => match (op, form) {
+            MInst::AluRI {
+                op,
+                ty: Ty::I64,
+                form,
+                ..
+            } => match (op, form) {
                 (Op::Add, ImmForm::Imm8) => Some("add_r64_imm8"),
                 (Op::Add, ImmForm::Imm32) => Some("add_r64_imm32"),
                 (Op::Sub, ImmForm::Imm8) => Some("sub_r64_imm8"),
@@ -3673,7 +3676,12 @@ impl MInst {
             // fired zero times on 850 Spring Boot compiles until these existed:
             // the rows were missing AND this mapping was, and either alone is
             // enough to make `require_encodable` discard the tile.
-            MInst::AluRI { op, ty: Ty::I32, form, .. } => match (op, form) {
+            MInst::AluRI {
+                op,
+                ty: Ty::I32,
+                form,
+                ..
+            } => match (op, form) {
                 (Op::Add, ImmForm::Imm8) => Some("add_r32_imm8"),
                 (Op::Add, ImmForm::Imm32) => Some("add_r32_imm32"),
                 (Op::Sub, ImmForm::Imm8) => Some("sub_r32_imm8"),
@@ -3724,7 +3732,8 @@ impl MInst {
         match *self {
             MInst::Imm { imm, .. } => a.imm = imm,
             MInst::Move { .. } => {}
-            MInst::Lea { addr, .. } | MInst::AluRM {
+            MInst::Lea { addr, .. }
+            | MInst::AluRM {
                 addr: AddrSource::Expr(addr),
                 ..
             } => {
@@ -3873,7 +3882,6 @@ const FRAME_LOAD_COST: SeqCost = SeqCost {
     uops: 1,
     latency: 4,
 };
-
 
 impl Tile {
     fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
@@ -4078,7 +4086,11 @@ pub enum Note {
     /// A load fold was rejected.
     Fold { user: NodeId, why: FoldRefusal },
     /// A tile was rejected because the table cannot encode it.
-    Unencodable { root: NodeId, rule: Rule, why: SelError },
+    Unencodable {
+        root: NodeId,
+        rule: Rule,
+        why: SelError,
+    },
     /// A constant did not fit any immediate field.
     WideImmediate { root: NodeId, value: i64 },
 }
@@ -4659,7 +4671,6 @@ fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Shadow selection — increment 0 of
 // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
@@ -5194,7 +5205,12 @@ mod tests {
     fn plus_reg_opcodes_have_room_for_the_register() {
         for p in PATTERNS {
             if let Opcode::PlusReg(b) = p.enc.opcode {
-                assert_eq!(b & 7, 0, "`{}`: opcode {b:#04X} has no register room", p.name);
+                assert_eq!(
+                    b & 7,
+                    0,
+                    "`{}`: opcode {b:#04X} has no register room",
+                    p.name
+                );
                 for r in 0u8..8 {
                     assert_eq!(b | r, b + r, "`{}`: fold must be an OR", p.name);
                 }
@@ -5216,7 +5232,10 @@ mod tests {
             let e = match p.encode(&a) {
                 Ok(e) => e,
                 Err(err) => {
-                    panic!("`{}` could not encode its canonical operands: {err}", p.name)
+                    panic!(
+                        "`{}` could not encode its canonical operands: {err}",
+                        p.name
+                    )
                 }
             };
             assert!(
@@ -5391,9 +5410,8 @@ mod tests {
         let mut r = Reference::new();
         for &reg in REGS.iter() {
             for disp in [0i32, 8, 32, 127, 128, 4096, -8] {
-                let want = r.emit(|c: &mut super::super::Compiler| {
-                    c.emit_mov_rsp_disp_from_reg(disp, reg)
-                });
+                let want = r
+                    .emit(|c: &mut super::super::Compiler| c.emit_mov_rsp_disp_from_reg(disp, reg));
                 let mem = Mem::base_disp(RSP, i64::from(disp));
                 let got = sel(&Req::new(
                     Op::Mov,
@@ -5416,9 +5434,8 @@ mod tests {
             for &base in non_sib_regs().iter() {
                 for &disp in disps.iter() {
                     let mem = Mem::base_disp32(base, i64::from(disp));
-                    let rm = |op: Op, ty: Ty| {
-                        Req::new(op, ty, Operand::Gpr(dst), Operand::Mem(mem))
-                    };
+                    let rm =
+                        |op: Op, ty: Ty| Req::new(op, ty, Operand::Gpr(dst), Operand::Mem(mem));
 
                     let want = r.emit(|c: &mut super::super::Compiler| {
                         c.emit_mov_r64_mem_disp32(dst, base, disp)
@@ -5593,8 +5610,8 @@ mod tests {
                     let want = r.emit(|c: &mut super::super::Compiler| {
                         c.emit_alu_r32_r32(opcode, dst, src)
                     });
-                    let got = sel(&gpr(Op::Alu, Ty::I32, dst, src)
-                        .with_extra(Operand::OpByte(opcode)));
+                    let got =
+                        sel(&gpr(Op::Alu, Ty::I32, dst, src).with_extra(Operand::OpByte(opcode)));
                     assert_eq!(got, want, "ALU {opcode:#04X} r32");
                 }
 
@@ -5602,8 +5619,7 @@ mod tests {
                     let want = r.emit(|c: &mut super::super::Compiler| {
                         c.emit_cmov_cc_reg_reg(cc, dst, src)
                     });
-                    let got =
-                        sel(&gpr(Op::Cmov, Ty::I64, dst, src).with_extra(Operand::Cc(cc)));
+                    let got = sel(&gpr(Op::Cmov, Ty::I64, dst, src).with_extra(Operand::Cc(cc)));
                     assert_eq!(got, want, "CMOV{cc:#04X}");
                 }
             }
@@ -5614,16 +5630,14 @@ mod tests {
             assert_eq!(sel(&gpr(Op::Test, Ty::I32, dst, dst)), want, "TEST r32");
 
             for imm in [0i8, 1, -1, 7, -8, i8::MAX, i8::MIN] {
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_add_r64_imm8(dst, imm));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_add_r64_imm8(dst, imm));
                 assert_eq!(
                     sel(&gpr_imm(Op::Add, Ty::I64, dst, i64::from(imm))),
                     want,
                     "ADD r{dst}, {imm}"
                 );
 
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_and_r64_imm8(dst, imm));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_and_r64_imm8(dst, imm));
                 assert_eq!(
                     sel(&gpr_imm(Op::And, Ty::I64, dst, i64::from(imm))),
                     want,
@@ -5639,8 +5653,7 @@ mod tests {
             }
 
             for imm in [0i32, 1, -1, 0x8000_0000u32 as i32, i32::MAX] {
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_test_r64_imm32(dst, imm));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_test_r64_imm32(dst, imm));
                 assert_eq!(
                     sel(&gpr_imm(Op::Test, Ty::I64, dst, i64::from(imm))),
                     want,
@@ -5649,8 +5662,7 @@ mod tests {
             }
 
             for shift in [0u8, 1, 3, 32, 63] {
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_shr_r64_imm8(dst, shift));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_shr_r64_imm8(dst, shift));
                 assert_eq!(
                     sel(&gpr_imm(Op::Shr, Ty::I64, dst, i64::from(shift))),
                     want,
@@ -5810,8 +5822,7 @@ mod tests {
                 assert_eq!(got, want, "MOVQ r{gp}, xmm{xmm}");
             }
             for &src in REGS.iter() {
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_movsd_xmm_xmm(xmm, src));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_movsd_xmm_xmm(xmm, src));
                 let got = sel(&Req::new(
                     Op::Movsd,
                     Ty::F64,
@@ -5820,8 +5831,7 @@ mod tests {
                 ));
                 assert_eq!(got, want, "MOVSD xmm{xmm}, xmm{src}");
 
-                let want =
-                    r.emit(|c: &mut super::super::Compiler| c.emit_movss_xmm_xmm(xmm, src));
+                let want = r.emit(|c: &mut super::super::Compiler| c.emit_movss_xmm_xmm(xmm, src));
                 let got = sel(&Req::new(
                     Op::Movss,
                     Ty::F32,
@@ -5882,15 +5892,30 @@ mod tests {
     fn inline_byte_literal_rows_reproduce_those_literals() {
         // SHL/SAR/SHR EAX, CL — the `ishl`/`ishr`/`iushr` arithmetic steps.
         assert_eq!(
-            sel(&Req::new(Op::Shl, Ty::I32, Operand::Gpr(RAX), Operand::None)),
+            sel(&Req::new(
+                Op::Shl,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::None
+            )),
             vec![0xD3, 0xE0]
         );
         assert_eq!(
-            sel(&Req::new(Op::Sar, Ty::I32, Operand::Gpr(RAX), Operand::None)),
+            sel(&Req::new(
+                Op::Sar,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::None
+            )),
             vec![0xD3, 0xF8]
         );
         assert_eq!(
-            sel(&Req::new(Op::Shr, Ty::I32, Operand::Gpr(RAX), Operand::None)),
+            sel(&Req::new(
+                Op::Shr,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::None
+            )),
             vec![0xD3, 0xE8]
         );
         // IMUL EAX, ECX and the MOVSXD RAX, EAX that follows it.
@@ -5918,7 +5943,12 @@ mod tests {
             vec![0x48, 0x99]
         );
         assert_eq!(
-            sel(&Req::new(Op::Idiv, Ty::I64, Operand::Gpr(RCX), Operand::None)),
+            sel(&Req::new(
+                Op::Idiv,
+                Ty::I64,
+                Operand::Gpr(RCX),
+                Operand::None
+            )),
             vec![0x48, 0xF7, 0xF9]
         );
         assert_eq!(
@@ -5931,7 +5961,12 @@ mod tests {
             vec![0x99]
         );
         assert_eq!(
-            sel(&Req::new(Op::Idiv, Ty::I32, Operand::Gpr(RCX), Operand::None)),
+            sel(&Req::new(
+                Op::Idiv,
+                Ty::I32,
+                Operand::Gpr(RCX),
+                Operand::None
+            )),
             vec![0xF7, 0xF9]
         );
     }
@@ -5944,7 +5979,18 @@ mod tests {
     #[test]
     fn displacement_forms_round_trip_through_disp() {
         let values: [i64; 13] = [
-            0, 1, -1, 8, 127, -128, 128, -129, 1024, -1024, 65_536, i64::from(i32::MAX),
+            0,
+            1,
+            -1,
+            8,
+            127,
+            -128,
+            128,
+            -129,
+            1024,
+            -1024,
+            65_536,
+            i64::from(i32::MAX),
             i64::from(i32::MIN),
         ];
         for p in PATTERNS {
@@ -5984,12 +6030,7 @@ mod tests {
                         "`{}` base={base}: the CPU would read {} where {v} was asked for",
                         p.name, d.disp
                     );
-                    assert_eq!(
-                        d.base(),
-                        Some(base),
-                        "`{}` lost the base register",
-                        p.name
-                    );
+                    assert_eq!(d.base(), Some(base), "`{}` lost the base register", p.name);
                     // `mod` and the emitted width must never disagree.
                     let expect_len = match d.mod_bits() {
                         Some(0b00) => 0,
@@ -6193,7 +6234,15 @@ mod tests {
                 .name,
             "mov_r64_imm0_xor"
         );
-        for v in [1i64, -1, 127, -128, 128, i64::from(i32::MAX), i64::from(i32::MIN)] {
+        for v in [
+            1i64,
+            -1,
+            127,
+            -128,
+            128,
+            i64::from(i32::MAX),
+            i64::from(i32::MIN),
+        ] {
             assert_eq!(
                 select(&gpr_imm(Op::Mov, Ty::I64, RAX, v))
                     .expect("i32 range")
@@ -6515,18 +6564,33 @@ mod tests {
     #[test]
     fn the_new_alu_rows_reproduce_the_ir_lower_byte_literals() {
         // `ir_lower::lower_data_node`, Op::Add / Sub / Mul / And / Or / Xor.
-        assert_eq!(sel(&gpr(Op::Add, Ty::I64, RAX, RCX)), vec![0x48, 0x01, 0xC8]);
+        assert_eq!(
+            sel(&gpr(Op::Add, Ty::I64, RAX, RCX)),
+            vec![0x48, 0x01, 0xC8]
+        );
         assert_eq!(sel(&gpr(Op::Add, Ty::I32, RAX, RCX)), vec![0x01, 0xC8]);
-        assert_eq!(sel(&gpr(Op::Sub, Ty::I64, RAX, RCX)), vec![0x48, 0x29, 0xC8]);
+        assert_eq!(
+            sel(&gpr(Op::Sub, Ty::I64, RAX, RCX)),
+            vec![0x48, 0x29, 0xC8]
+        );
         assert_eq!(sel(&gpr(Op::Sub, Ty::I32, RAX, RCX)), vec![0x29, 0xC8]);
-        assert_eq!(sel(&gpr(Op::And, Ty::I64, RAX, RCX)), vec![0x48, 0x21, 0xC8]);
+        assert_eq!(
+            sel(&gpr(Op::And, Ty::I64, RAX, RCX)),
+            vec![0x48, 0x21, 0xC8]
+        );
         assert_eq!(sel(&gpr(Op::Or, Ty::I64, RAX, RCX)), vec![0x48, 0x09, 0xC8]);
-        assert_eq!(sel(&gpr(Op::Xor, Ty::I64, RAX, RCX)), vec![0x48, 0x31, 0xC8]);
+        assert_eq!(
+            sel(&gpr(Op::Xor, Ty::I64, RAX, RCX)),
+            vec![0x48, 0x31, 0xC8]
+        );
         assert_eq!(
             sel(&gpr(Op::Imul, Ty::I64, RAX, RCX)),
             vec![0x48, 0x0F, 0xAF, 0xC1]
         );
-        assert_eq!(sel(&gpr(Op::Imul, Ty::I32, RAX, RCX)), vec![0x0F, 0xAF, 0xC1]);
+        assert_eq!(
+            sel(&gpr(Op::Imul, Ty::I32, RAX, RCX)),
+            vec![0x0F, 0xAF, 0xC1]
+        );
     }
 
     /// The zeroing idiom and a real `XOR` share an opcode; they must not share
@@ -6761,7 +6825,10 @@ mod tests {
         let mul = bin(&mut graph, IrOp::Mul, x, k);
         let block = vec![k, mul];
         let ctx = ctx_of(&graph, &block);
-        assert_eq!(match_address(&ctx, mul), Err(AddrRefusal::NotAnAddress(mul)));
+        assert_eq!(
+            match_address(&ctx, mul),
+            Err(AddrRefusal::NotAnAddress(mul))
+        );
         // And the type itself refuses a base-less operand outright.
         let bare = IrAddr {
             base: None,
@@ -7032,7 +7099,10 @@ mod tests {
         assert!(t.covered.contains(&cmp));
         assert!(matches!(
             t.insts.as_slice(),
-            [MInst::TestRR { ty: Ty::I32, .. }, MInst::Jcc { cc: CmpOp::Ne, .. }]
+            [
+                MInst::TestRR { ty: Ty::I32, .. },
+                MInst::Jcc { cc: CmpOp::Ne, .. }
+            ]
         ));
         // `TEST r32, r32` is two bytes where `CMP r32, imm8` is three.
         assert_eq!(
@@ -7373,7 +7443,12 @@ mod tests {
         let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
         let mem = graph.add(IrOp::Proj(1), IrType::Memory, vec![start], None);
         let obj = graph.add(IrOp::Param(0), IrType::Ref, vec![], None);
-        let enter = graph.add(IrOp::MonitorEnter, IrType::Memory, vec![ctrl, mem, obj], None);
+        let enter = graph.add(
+            IrOp::MonitorEnter,
+            IrType::Memory,
+            vec![ctrl, mem, obj],
+            None,
+        );
         let exit = graph.add(
             IrOp::MonitorExit,
             IrType::Memory,
@@ -7524,20 +7599,38 @@ mod tests {
     fn the_32bit_immediate_rows_reproduce_the_x64_byte_literals() {
         // `x64.rs` constant-folding fast path, EAX destination — which is why
         // no REX prefix appears in any of these.
-        assert_eq!(sel(&gpr_imm(Op::Add, Ty::I32, RAX, 7)), vec![0x83, 0xC0, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Add, Ty::I32, RAX, 7)),
+            vec![0x83, 0xC0, 0x07]
+        );
         assert_eq!(
             sel(&gpr_imm(Op::Add, Ty::I32, RAX, 100_000)),
             vec![0x81, 0xC0, 0xA0, 0x86, 0x01, 0x00]
         );
-        assert_eq!(sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 7)), vec![0x83, 0xE8, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 7)),
+            vec![0x83, 0xE8, 0x07]
+        );
         assert_eq!(
             sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 100_000)),
             vec![0x81, 0xE8, 0xA0, 0x86, 0x01, 0x00]
         );
-        assert_eq!(sel(&gpr_imm(Op::And, Ty::I32, RAX, 7)), vec![0x83, 0xE0, 0x07]);
-        assert_eq!(sel(&gpr_imm(Op::Or, Ty::I32, RAX, 7)), vec![0x83, 0xC8, 0x07]);
-        assert_eq!(sel(&gpr_imm(Op::Xor, Ty::I32, RAX, 7)), vec![0x83, 0xF0, 0x07]);
-        assert_eq!(sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)), vec![0x83, 0xF8, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::And, Ty::I32, RAX, 7)),
+            vec![0x83, 0xE0, 0x07]
+        );
+        assert_eq!(
+            sel(&gpr_imm(Op::Or, Ty::I32, RAX, 7)),
+            vec![0x83, 0xC8, 0x07]
+        );
+        assert_eq!(
+            sel(&gpr_imm(Op::Xor, Ty::I32, RAX, 7)),
+            vec![0x83, 0xF0, 0x07]
+        );
+        assert_eq!(
+            sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)),
+            vec![0x83, 0xF8, 0x07]
+        );
     }
 
     /// `lea_r32_m` reproduces the three byte literals `emit_imul_const` emits.

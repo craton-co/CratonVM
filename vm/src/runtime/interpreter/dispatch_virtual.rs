@@ -31,15 +31,12 @@ use super::*;
 // redefinition, and the intrinsic substitution point:
 // `interpreter/dispatch_static.rs`.
 
-
-
 // ---------------------------------------------------------------------------
 // The JIT bridge
 // ---------------------------------------------------------------------------
 //
 // Compile requests, OSR, entering and leaving compiled code, and the probes
 // that decide what a compile may assume: `interpreter/jit_bridge.rs`.
-
 
 /// T10.9.A — VtableManager fast-path for invokevirtual / invokeinterface.
 ///
@@ -1658,7 +1655,10 @@ pub(super) fn execute_invokevirtual_cached(
     // above, right before the dispatch match.
     if is_special && crate::jit::profile::is_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, site_pc);
+        shared
+            .jit
+            .profile_store
+            .record_call_site_borrowed(cid, mn, md, site_pc);
     }
 
     match target {
@@ -1805,9 +1805,9 @@ pub(super) fn execute_invokevirtual_cached(
 
                     let param_tags = ParamTags::of(&cached.method_descriptor);
 
-                    let arg_desc_byte =
-
-                        |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
+                    let arg_desc_byte = |i: usize| -> u8 {
+                        param_tags.get_with_receiver(&cached.method_descriptor, i)
+                    };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                     let mut args_vec: Vec<Value> = Vec::new();
                     let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -2594,7 +2594,6 @@ pub(super) fn execute_invokevirtual_cached(
             let param_tags = ParamTags::of(&cached.method_descriptor);
 
             let arg_desc_byte =
-
                 |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
@@ -2852,8 +2851,7 @@ pub(super) fn execute_invokevirtual_cached(
             ) {
                 return Ok(CachedCallResult::CacheMiss);
             }
-            let Some(callback) =
-                revalidate_cached_native(shared, native_id, callback, native_kind)
+            let Some(callback) = revalidate_cached_native(shared, native_id, callback, native_kind)
             else {
                 thread
                     .invoke_cache
@@ -3353,11 +3351,12 @@ pub(super) fn populate_virtual_invoke_cache(
                     if parent.find_method(&method_name, &descriptor).is_some() {
                         if let Some((callback, native_id, native_kind)) =
                             resolve_cached_native_registration(
-                            shared,
-                            &parent_name,
-                            &method_name,
-                            &descriptor,
-                        ) {
+                                shared,
+                                &parent_name,
+                                &method_name,
+                                &descriptor,
+                            )
+                        {
                             let gate = RedefineGate::snapshot(
                                 cm.class_redefine_generation_handle(receiver_class_id),
                             );
@@ -3446,12 +3445,8 @@ pub(super) fn populate_virtual_invoke_cache(
 
     if method.is_native() {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
-            shared,
-            declaring_name,
-            &method_name,
-            &descriptor,
-        )
+        if let Some((callback, native_id, native_kind)) =
+            resolve_cached_native_registration(shared, declaring_name, &method_name, &descriptor)
         {
             // WP2.4-F1: gate bound to the declaring class.
             let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
@@ -3510,17 +3505,17 @@ pub(super) fn populate_virtual_invoke_cache(
         // cluster of its own -- so the dial has to be consulted here too or
         // arming it still measures the gate. `Off::covers()` is `false`, so an
         // unarmed run is unchanged.
-        let dial_retires =
-            crate::runtime::env_cache::enforce_shadow_scope().covers(declaring_name);
+        let dial_retires = crate::runtime::env_cache::enforce_shadow_scope().covers(declaring_name);
         let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
             || (!dial_retires
                 && matches!(
-                declaring_name,
-                "java/util/HashMap"
-                    | "java/util/LinkedHashMap"
-                    | "java/util/Hashtable"
-                    | "java/util/concurrent/ConcurrentHashMap"
-            ) && matches!(
+                    declaring_name,
+                    "java/util/HashMap"
+                        | "java/util/LinkedHashMap"
+                        | "java/util/Hashtable"
+                        | "java/util/concurrent/ConcurrentHashMap"
+                )
+                && matches!(
                     &*method_name,
                     "computeIfAbsent" | "compute" | "computeIfPresent"
             | "merge" | "putIfAbsent" | "replace"
@@ -3538,16 +3533,14 @@ pub(super) fn populate_virtual_invoke_cache(
             // store data in a side-store, so the JDK bytecode sees an empty
             // table. See companion entry in `force_native_over_real_jdk_bytecode`.
             | "keys" | "elements"
-            ));
+                ));
         if force {
-            if let Some((callback, native_id, native_kind)) =
-                resolve_cached_native_registration(
-                    shared,
-                    declaring_name,
-                    &method_name,
-                    &descriptor,
-                )
-            {
+            if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+                shared,
+                declaring_name,
+                &method_name,
+                &descriptor,
+            ) {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
                 drop(cm);
@@ -3736,7 +3729,7 @@ pub(super) fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3778,7 +3771,8 @@ pub(super) fn populate_virtual_invoke_cache(
 /// time [`resolve_method_metadata`] resolves such an entry, so the guard costs
 /// one relaxed atomic load per invoke instead of a full method-ref resolution
 /// in every process that has never loaded Spring.
-pub(super) static ADAPT_ISIN_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(super) static ADAPT_ISIN_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The class whose `isIn` call sites [`ADAPT_ISIN_SEEN`] arms for.
 pub(super) const SPRING_MERGED_ANNOTATION_ADAPT: &str =

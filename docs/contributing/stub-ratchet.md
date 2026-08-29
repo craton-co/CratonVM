@@ -25,10 +25,11 @@ There are TWO ways to push this number up and they want opposite responses:
 
 (2) is a fake being labelled honestly, so `--jdk-only` drops the row and the
 JDK's own bytecode runs. It is the opposite of a regression and it still raises
-the count. On 2026-08-19 the gate was red at +31 and **30 of the 33 added rows
-were (2)** — the `retired_shadow` table's `ArrayList` family, `Runtime.exec`,
-the `java.util.function` default methods, and the `SharedSecrets` legacy alias.
-Treating them as (1) means un-doing the improvement.
+the count — for example, a gate red at +31 rows can have the bulk of that
+delta be (2): the `retired_shadow` table's `ArrayList` family, `Runtime.exec`,
+the `java.util.function` default methods, and the `SharedSecrets` legacy alias
+have all landed as this shape before. Treating rows like that as (1) means
+un-doing the improvement.
 
 So the first step on a failure is never "find what to implement". It is
 **find out which rows moved**:

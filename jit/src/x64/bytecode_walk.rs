@@ -402,7 +402,9 @@ impl Compiler {
             .collect();
         for &handler_pc in &local_handler_pcs {
             branch_targets[handler_pc] = true;
-            self.branch_target_stack_depth.entry(handler_pc).or_insert(1);
+            self.branch_target_stack_depth
+                .entry(handler_pc)
+                .or_insert(1);
             self.branch_target_stack_oop_marks
                 .entry(handler_pc)
                 .or_insert_with(|| vec![true]);
@@ -2469,12 +2471,12 @@ impl Compiler {
                         let before = self.stack.len();
                         self.load_slot_to_reg(RAX, a_slot);
                         self.push_from_rax(); // […, b, a, aC]
-                        // `push_from_rax` is silent when `push_stack` cannot
-                        // reserve a spill slot: it emits nothing and does NOT
-                        // grow the model. The rotate below indexes `n - 3`, so
-                        // a missed push rotates the WRONG three entries and
-                        // leaves the operand stack one short — silent wrong
-                        // code rather than a bail.
+                                              // `push_from_rax` is silent when `push_stack` cannot
+                                              // reserve a spill slot: it emits nothing and does NOT
+                                              // grow the model. The rotate below indexes `n - 3`, so
+                                              // a missed push rotates the WRONG three entries and
+                                              // leaves the operand stack one short — silent wrong
+                                              // code rather than a bail.
                         if self.stack.len() != before + 1 {
                             self.fail("singlepass-codegen/dup_x1-copy-not-pushed");
                             pc += 1;
@@ -2590,14 +2592,14 @@ impl Compiler {
                             let before = self.stack.len();
                             self.load_slot_to_reg(RAX, a_slot);
                             self.push_from_rax(); // […, c, b, a, aC]
-                            // `push_from_rax` is SILENT when it cannot reserve a
-                            // spill slot: it emits nothing and does NOT grow the
-                            // model, and the rotate below would then reorder the
-                            // WRONG entries and leave the operand stack one
-                            // short — silent wrong code rather than a bail. The
-                            // same guard has been in `dup_x1`/`dup2_x1`/
-                            // `dup2_x2` since they were written; this arm was
-                            // the one missing it.
+                                                  // `push_from_rax` is SILENT when it cannot reserve a
+                                                  // spill slot: it emits nothing and does NOT grow the
+                                                  // model, and the rotate below would then reorder the
+                                                  // WRONG entries and leave the operand stack one
+                                                  // short — silent wrong code rather than a bail. The
+                                                  // same guard has been in `dup_x1`/`dup2_x1`/
+                                                  // `dup2_x2` since they were written; this arm was
+                                                  // the one missing it.
                             if self.stack.len() != before + 1 {
                                 self.fail("singlepass-codegen/dup_x2-copy-not-pushed");
                                 pc += 1;
@@ -4453,8 +4455,8 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    let any_backward = def_target <= base_pc
-                        || pairs.iter().any(|&(_, target)| target <= base_pc);
+                    let any_backward =
+                        def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc);
                     // Same canonicalization the `tableswitch` arm above performs,
                     // and for the same reason — see the note there. The two
                     // switch arms are the only branch shapes in this walk that
@@ -4834,19 +4836,16 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = match self
-                            .field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.field_info[i])
-                        {
-                            Some(v) => v,
-                            None => {
-                                if !substitute_unresolved_field_sites() {
-                                    return unresolved_field_site(pc, 0xb4);
+                        let (_, field_index, type_tag) =
+                            match self.field_info_idx.get(&pc).map(|&i| self.field_info[i]) {
+                                Some(v) => v,
+                                None => {
+                                    if !substitute_unresolved_field_sites() {
+                                        return unresolved_field_site(pc, 0xb4);
+                                    }
+                                    (pc, 0, b'I')
                                 }
-                                (pc, 0, b'I')
-                            }
-                        };
+                            };
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
                         let field_off =
@@ -4900,19 +4899,16 @@ impl Compiler {
                         // {tag,partial-pointer} word that SIGSEGVs when later
                         // dereferenced/called. For a legacy receiver we take the
                         // uniform `index * SLOT_SIZE` 16-byte-cell path inline.
-                        let (_, field_index, type_tag) = match self
-                            .field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.field_info[i])
-                        {
-                            Some(v) => v,
-                            None => {
-                                if !substitute_unresolved_field_sites() {
-                                    return unresolved_field_site(pc, 0xb4);
+                        let (_, field_index, type_tag) =
+                            match self.field_info_idx.get(&pc).map(|&i| self.field_info[i]) {
+                                Some(v) => v,
+                                None => {
+                                    if !substitute_unresolved_field_sites() {
+                                        return unresolved_field_site(pc, 0xb4);
+                                    }
+                                    (pc, 0, b'I')
                                 }
-                                (pc, 0, b'I')
-                            }
-                        };
+                            };
                         let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: x86-64 disp32
                         let legacy_cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
                                                                                               // GUARDED (default) vs RAW (CRATONVM_JIT_INLINE_GETFIELD):
@@ -4944,10 +4940,8 @@ impl Compiler {
                         // verdict, not a cause, and the three clauses want
                         // completely different fixes.
                         if !receiver_is_trusted_oop
-                            && cratonvm_types::flags::runtime_var_os(
-                                "CRATONVM_DBG_COMPACT_INLINE",
-                            )
-                            .is_some()
+                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
+                                .is_some()
                         {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} NOT-trusted-oop                                  have_key={trusted_have_key} marks_exact={trusted_marks_exact}                                  top_is_oop={trusted_top_is_oop} depth={} method={}",
@@ -5355,26 +5349,17 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced putfield: store value directly to frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, _type_tag) = match self
-                            .field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.field_info[i])
-                        {
-                            Some(v) => v,
-                            None => {
-                                if !substitute_unresolved_field_sites() {
-                                    return unresolved_field_site(pc, 0xb5);
+                        let (_, field_index, _type_tag) =
+                            match self.field_info_idx.get(&pc).map(|&i| self.field_info[i]) {
+                                Some(v) => v,
+                                None => {
+                                    if !substitute_unresolved_field_sites() {
+                                        return unresolved_field_site(pc, 0xb5);
+                                    }
+                                    (pc, 0, b'I')
                                 }
-                                (pc, 0, b'I')
-                            }
-                        };
-                        note_field_site(
-                            &self.method_key,
-                            "putfield/scalar",
-                            pc,
-                            field_index,
-                            b'?',
-                        );
+                            };
+                        note_field_site(&self.method_key, "putfield/scalar", pc, field_index, b'?');
                         let val_slot = self.pop_stack();
                         let _obj_slot = self.pop_stack(); // dummy objectref
                         let sr_obj = &self.scalar_replaced[&new_pc];
@@ -5392,19 +5377,16 @@ impl Compiler {
                     } else {
                         self.flush_scratch_registers();
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, type_tag) = match self
-                            .field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.field_info[i])
-                        {
-                            Some(v) => v,
-                            None => {
-                                if !substitute_unresolved_field_sites() {
-                                    return unresolved_field_site(pc, 0xb5);
+                        let (_, field_index, type_tag) =
+                            match self.field_info_idx.get(&pc).map(|&i| self.field_info[i]) {
+                                Some(v) => v,
+                                None => {
+                                    if !substitute_unresolved_field_sites() {
+                                        return unresolved_field_site(pc, 0xb5);
+                                    }
+                                    (pc, 0, b'I')
                                 }
-                                (pc, 0, b'I')
-                            }
-                        };
+                            };
                         note_field_site(&self.method_key, "putfield", pc, field_index, type_tag);
                         let receiver_mark_index = self.stack_oop_marks.len().checked_sub(2);
                         let receiver_is_trusted_oop = !self.method_key.is_empty()
@@ -5512,9 +5494,7 @@ impl Compiler {
                                 // always non-zero). See `region_bounds_are_live`.
                                 bail.extend(
                                     if receiver_is_trusted_oop
-                                        && region_bounds_are_live(
-                                            self.helpers.region_bounds_addr,
-                                        )
+                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
                                     {
                                         self.emit_trusted_oop_receiver_check()
                                     } else {
@@ -5612,9 +5592,7 @@ impl Compiler {
                                 // the bounds table actually holding live bounds.
                                 bail.extend(
                                     if receiver_is_trusted_oop
-                                        && region_bounds_are_live(
-                                            self.helpers.region_bounds_addr,
-                                        )
+                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
                                     {
                                         self.emit_trusted_oop_receiver_check()
                                     } else {
@@ -5797,10 +5775,7 @@ impl Compiler {
                         if *entry != crate::JitIntrinsic::StringIndexOfChar.as_entry() {
                             return true;
                         }
-                        matches!(
-                            prev_insn_int_const(code, code_len, pc),
-                            Some(0..=0xFFFF)
-                        )
+                        matches!(prev_insn_int_const(code, code_len, pc), Some(0..=0xFFFF))
                     });
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
@@ -6263,17 +6238,14 @@ impl Compiler {
                                 _ => self.load_slot_to_reg(RAX, arg),
                             }
                             self.push_from_rax();
-                        } else if callee_entry
-                            == crate::JitIntrinsic::LongBitsToDouble.as_entry()
-                        {
+                        } else if callee_entry == crate::JitIntrinsic::LongBitsToDouble.as_entry() {
                             // Double.longBitsToDouble(bits): the mirror.
                             let arg = self.pop_stack();
                             self.flush_xmm0_slots();
                             self.load_slot_to_reg(RAX, arg);
                             self.emit_movq_xmm_from_rax(0);
                             self.stack_push(StackSlot::Xmm(0), false);
-                        }
-                        else if callee_entry == crate::JitIntrinsic::IntBitCount.as_entry() {
+                        } else if callee_entry == crate::JitIntrinsic::IntBitCount.as_entry() {
                             // Integer.bitCount(i): POPCNT EAX, EAX. The
                             // matcher only registers this when has_popcnt()
                             // is true, so the instruction is always valid.
@@ -7797,8 +7769,10 @@ impl Compiler {
                                 // sit above the argument slots `pop_stack` just handed
                                 // back, or the copy below reverses the arguments into
                                 // themselves and the callee gets arg0 in every slot.
-                                let base = self
-                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
+                                let base = self.reserve_direct_call_service_slots(
+                                    args_frame_top,
+                                    &arg_slots,
+                                )?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -7843,7 +7817,11 @@ impl Compiler {
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
-                                self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                                self.emit_inline_callee_deopt_check(
+                                    info as *const crate::JitInvokeInfo,
+                                    arg_slots.len(),
+                                    args_base,
+                                );
                             } else {
                                 self.dbg_unserviced_direct_call(
                                     "invokestatic",
@@ -7977,15 +7955,15 @@ impl Compiler {
                             self.emit_xor_reg_self(ARG_REGS[2]);
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
-                        // Round-8 wave-3: defensive callee-saved spill before any
-                        // GC-triggering CALL -- unless the caller frame is
-                        // provably oop-clean here. Every argument of this site,
-                        // reference or not, was just stored into the helper's
-                        // args buffer at `args_base_offset`, and each oop among
-                        // them was pushed to `pending_staged_arg_oops` so the map
-                        // below NAMES it: `args_frame_resident` is
-                        // unconditionally true here, which is a stronger
-                        // guarantee than the direct sites' service slots.
+                                                                       // Round-8 wave-3: defensive callee-saved spill before any
+                                                                       // GC-triggering CALL -- unless the caller frame is
+                                                                       // provably oop-clean here. Every argument of this site,
+                                                                       // reference or not, was just stored into the helper's
+                                                                       // args buffer at `args_base_offset`, and each oop among
+                                                                       // them was pushed to `pending_staged_arg_oops` so the map
+                                                                       // below NAMES it: `args_frame_resident` is
+                                                                       // unconditionally true here, which is a stronger
+                                                                       // guarantee than the direct sites' service slots.
                         if self.can_elide_direct_call_register_spill(&arg_oops, true, 2) {
                             self.emit_safepoint_metadata_only();
                         } else {
@@ -8758,8 +8736,12 @@ impl Compiler {
                                     // compile's `_jit_invoke_infos` arena and
                                     // outlives the code being emitted.
                                     let ret_tag = unsafe { (*info).return_type };
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
-                                        eprintln!("[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}");
+                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
+                                        .is_some()
+                                    {
+                                        eprintln!(
+                                            "[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}"
+                                        );
                                     }
                                     self.flush_scratch_registers();
                                     // Operands, deepest first: receiver, layout,
@@ -8808,9 +8790,7 @@ impl Compiler {
                                         (Some(out), _) => {
                                             self.emit_lea_frame_slot(ARG_REGS[3], out)
                                         }
-                                        (None, Some(v)) => {
-                                            self.load_slot_to_reg(ARG_REGS[3], v)
-                                        }
+                                        (None, Some(v)) => self.load_slot_to_reg(ARG_REGS[3], v),
                                         (None, None) => {
                                             self.fail(
                                                 "singlepass-codegen/ffm-missing-arg3-operand",
@@ -8920,7 +8900,9 @@ impl Compiler {
                                 // compile, which drops the method to the
                                 // interpreter and is always safe.
                                 _ => {
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
+                                        .is_some()
+                                    {
                                         eprintln!(
                                             "[ffm] UNHANDLED pc={pc} info={} kind={:?} helper={}",
                                             info_ptr.is_some(),
@@ -9022,8 +9004,11 @@ impl Compiler {
                                     let mut bail: Vec<usize> = Vec::new();
                                     // Operands: delta (if any) is shallower,
                                     // the receiver is deepest.
-                                    let delta_slot =
-                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let delta_slot = if delta_is_arg {
+                                        Some(self.pop_stack())
+                                    } else {
+                                        None
+                                    };
                                     let recv_slot = self.pop_stack();
 
                                     // RAX = receiver; null → deopt.
@@ -9177,8 +9162,11 @@ impl Compiler {
                                     let mut bail: Vec<usize> = Vec::new();
                                     // Operands: delta (if any) is shallower,
                                     // the receiver is deepest.
-                                    let delta_slot =
-                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let delta_slot = if delta_is_arg {
+                                        Some(self.pop_stack())
+                                    } else {
+                                        None
+                                    };
                                     let recv_slot = self.pop_stack();
 
                                     // RAX = receiver; null -> deopt.
@@ -10498,15 +10486,15 @@ impl Compiler {
                             // Direct call: pop receiver + params, call compiled entry
                             // invokespecial has a receiver, so total args = callee_params + 1
                             let n = callee_params + 1; // receiver + params
-                            // `pop_stack` rewinds `next_spill_offset` when it pops a
-                            // top-of-stack `Frame` slot, but it still HANDS THE SLOT
-                            // BACK, and every `arg_slots` entry stays live until
-                            // `emit_stack_arg_setup` marshals it into the entry ABI far
-                            // below. Anything that reserves spill space in between is
-                            // therefore handed the argument slots themselves. Remember
-                            // the pre-pop top so such a reservation can be placed above
-                            // them. See
-                            // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
+                                                       // `pop_stack` rewinds `next_spill_offset` when it pops a
+                                                       // top-of-stack `Frame` slot, but it still HANDS THE SLOT
+                                                       // BACK, and every `arg_slots` entry stays live until
+                                                       // `emit_stack_arg_setup` marshals it into the entry ABI far
+                                                       // below. Anything that reserves spill space in between is
+                                                       // therefore handed the argument slots themselves. Remember
+                                                       // the pre-pop top so such a reservation can be placed above
+                                                       // them. See
+                                                       // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
                             let (arg_slots, arg_oops) = self.pop_invoke_args(n);
                             // A reference staged into an area no oop map can name (the
@@ -10530,8 +10518,10 @@ impl Compiler {
                                 // sit above the argument slots `pop_stack` just handed
                                 // back, or the copy below reverses the arguments into
                                 // themselves and the callee gets arg0 in every slot.
-                                let base = self
-                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
+                                let base = self.reserve_direct_call_service_slots(
+                                    args_frame_top,
+                                    &arg_slots,
+                                )?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -10579,7 +10569,11 @@ impl Compiler {
                             }
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
-                                self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                                self.emit_inline_callee_deopt_check(
+                                    info as *const crate::JitInvokeInfo,
+                                    arg_slots.len(),
+                                    args_base,
+                                );
                             } else {
                                 self.dbg_unserviced_direct_call(
                                     "invokespecial/virtual",
@@ -10896,8 +10890,8 @@ impl Compiler {
                             // whose handler reads locals must take the dispatch path,
                             // where `emit_post_invoke_exception_check` records that
                             // complete caller state before entering its handler.
-                            let protected_precise_handler_call = self.precise_exception_frames
-                                && self.pc_is_protected(pc);
+                            let protected_precise_handler_call =
+                                self.precise_exception_frames && self.pc_is_protected(pc);
                             // Per-site bisect levers (`CRATONVM_JIT_SP_IC_ONLY`
                             // / `_DENY`). Inert unless one is set: the whole
                             // cascade is a program-wide switch otherwise, which
@@ -11349,11 +11343,7 @@ impl Compiler {
                                     // for the Rust-side analogue of the same
                                     // contract.
                                     self.emit_post_call_rbp_republish();
-                                    self.emit_inline_callee_deopt_check(
-                                        info,
-                                        n,
-                                        args_base_offset,
-                                    );
+                                    self.emit_inline_callee_deopt_check(info, n, args_base_offset);
 
                                     // JMP rel32 → .done. Use rel32 because
                                     // for slots 0 and 1 the skip distance
@@ -11570,11 +11560,7 @@ impl Compiler {
                                 // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                 self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                 self.emit_post_call_rbp_republish();
-                                self.emit_inline_callee_deopt_check(
-                                    info,
-                                    n,
-                                    args_base_offset,
-                                );
+                                self.emit_inline_callee_deopt_check(info, n, args_base_offset);
 
                                 // JMP rel32 → .done. The root-frame
                                 // republish above makes the distance exceed
@@ -11837,8 +11823,7 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags, bridge_site)) = info
-                    else {
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, bridge_site)) = info else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
                         // exactly like every other CP-resolved metadata miss
@@ -11877,10 +11862,7 @@ impl Compiler {
                         crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
                     if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-                            eprintln!(
-                                "[cratonvm-jitc] indy bridge pc={} args={}",
-                                pc, arg_slots
-                            );
+                            eprintln!("[cratonvm-jitc] indy bridge pc={} args={}", pc, arg_slots);
                         }
                         let pre_pop_spill = self.next_spill_offset;
                         // `pop_invoke_args`, not a bare `pop_stack` loop: it
@@ -12035,9 +12017,7 @@ impl Compiler {
                     let unresumable_trap = self
                         .deopt_points
                         .last()
-                        .is_some_and(|p| {
-                            !crate::deopt::frame_state_is_resumable(&p.frame_state)
-                        });
+                        .is_some_and(|p| !crate::deopt::frame_state_is_resumable(&p.frame_state));
                     if unresumable_trap {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                             eprintln!(
@@ -12540,8 +12520,7 @@ impl Compiler {
                     // reading the class id at offset 0 asks nothing new of them.
                     let trusted_have_key = !self.method_key.is_empty();
                     let trusted_marks_exact = self.stack_oop_marks_exact;
-                    let trusted_top_is_oop =
-                        self.stack_oop_marks.last().copied().unwrap_or(false);
+                    let trusted_top_is_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                     let operand_is_trusted_oop =
                         trusted_have_key && trusted_marks_exact && trusted_top_is_oop;
 
@@ -12553,17 +12532,14 @@ impl Compiler {
                     // class id is 0 and could never have matched.
                     // SAFETY: `name_ptr`/`name_len` are an `intern_typecheck_target`
                     // pair, leaked for the life of the process.
-                    let prim_array_tag = unsafe {
-                        crate::typecheck_site_name(name_ptr, name_len)
-                    }
-                    .and_then(cratonvm_types::primitive_array_kind_tags_byte)
-                    .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
-                    let inline_target = target_class_id
-                        .filter(|_| {
-                            checkcast_inline_enabled()
-                                && operand_is_trusted_oop
-                                && prim_array_tag.is_none()
-                        });
+                    let prim_array_tag = unsafe { crate::typecheck_site_name(name_ptr, name_len) }
+                        .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                        .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
+                    let inline_target = target_class_id.filter(|_| {
+                        checkcast_inline_enabled()
+                            && operand_is_trusted_oop
+                            && prim_array_tag.is_none()
+                    });
                     if checkcast_inline_enabled() {
                         use std::sync::atomic::Ordering::Relaxed;
                         // Name the refusal per CAUSE. "Not inlined" is a
@@ -12650,10 +12626,10 @@ impl Compiler {
                             0x00,
                         ]);
                         slow.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
-                        // CMP DWORD [RAX+class_id_off], target_class_id.
-                        // 81 /7 id with ModRM 0xB8 = mod10 (disp32) /7 rm=RAX —
-                        // the disp32 twin of the `0x81, 0x78` (disp8) form the
-                        // guarded-virtual inline arm emits.
+                                                                    // CMP DWORD [RAX+class_id_off], target_class_id.
+                                                                    // 81 /7 id with ModRM 0xB8 = mod10 (disp32) /7 rm=RAX —
+                                                                    // the disp32 twin of the `0x81, 0x78` (disp8) form the
+                                                                    // guarded-virtual inline arm emits.
                         let cid_off = self.helpers.class_id_offset_in_obj as i32; // Cast: x86-64 disp32
                         let cid_off_bytes = cid_off.to_le_bytes();
                         let target_bytes = target_class_id.to_le_bytes();
@@ -12766,10 +12742,7 @@ impl Compiler {
                     // cannot be compiled correctly at all now (there is no
                     // "default" array class), so bail rather than emit a call
                     // that would allocate the wrong type.
-                    let Some(&(_, site)) = self
-                        .multianewarray_info
-                        .iter()
-                        .find(|(p, _)| *p == pc)
+                    let Some(&(_, site)) = self.multianewarray_info.iter().find(|(p, _)| *p == pc)
                     else {
                         return false;
                     };
@@ -12929,11 +12902,9 @@ impl Compiler {
                     // could elide a lock on an unrelated escaping receiver.
                     // Only the exact per-PC proof above may remove the lock.
                     let helper = if op == 0xC2 {
-                        crate::MONITOR_ENTER_DIRECT_FN
-                            .load(std::sync::atomic::Ordering::Acquire)
+                        crate::MONITOR_ENTER_DIRECT_FN.load(std::sync::atomic::Ordering::Acquire)
                     } else {
-                        crate::MONITOR_EXIT_DIRECT_FN
-                            .load(std::sync::atomic::Ordering::Acquire)
+                        crate::MONITOR_EXIT_DIRECT_FN.load(std::sync::atomic::Ordering::Acquire)
                     };
                     if helper == 0 || !self.needs_heap {
                         return false;
