@@ -242,6 +242,7 @@ fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Opt
 /// `elasticsearch.yml` this way). Routing through the same construction that
 /// `new BufferedReader(reader)` uses makes readLine()/read()/lines() all work
 /// via the already-functioning machinery, with no special-casing.
+#[allow(dead_code)]
 fn files_make_buffered_reader_over_string(
     ctx: &mut dyn NativeContext,
     content: &str,
@@ -404,6 +405,7 @@ pub(crate) fn unsafe_wp1_2_natives(registry: &mut NativeMethodRegistry) {
 /// `phases_late/nio_file.rs`), so the read is gated to the `synthetic-jdk`
 /// build, where slot 0 belongs to the fabricated model and the question is the
 /// right one to ask.
+#[allow(dead_code)]
 fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     #[cfg(feature = "synthetic-jdk")]
     if let Value::Int(_) = ctx.get_field(this, 0) {
