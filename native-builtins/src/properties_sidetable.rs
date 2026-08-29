@@ -2453,21 +2453,37 @@ fn remove_from_properties_backend(
 /// — which is how this defect was found — instead of silently reading an empty
 /// map and returning a wrong answer.
 fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
+    let Some(Value::Object(Some(mut this))) = args.first().copied() else {
         // A null receiver is `Object.clone`'s NPE to raise, not ours.
         return crate::native_object_clone(ctx, args);
     };
-    // Snapshot before anything allocates: this side-table IS the store.
-    // `snapshot_kv`, not the public `snapshot_sidetable`: the latter renders
-    // each entry `to_lossy()`, and a clone must not quietly mangle a key or
-    // value whose text this VM stores faithfully but cannot render.
-    let entries = snapshot_kv(ctx, this);
+    // Snapshot the store this clone is built from.
+    //
+    // `ordered_snapshot_kv`, not the bare `snapshot_kv`: the entries go
+    // straight into the clone's new CHM below, so the order they are inserted
+    // in IS the order the clone will later enumerate through `keys()` /
+    // `stringPropertyNames()` — the gh-11892 surface. The real body is
+    // `clone.map = new ConcurrentHashMap<>(map)`, which walks the SOURCE map in
+    // the source map's own order, so borrowing that order here is what matches
+    // it. A receiver whose `map` is null — the very shape this override exists
+    // for — takes `ordered_snapshot_kv`'s early exit and is unaffected.
+    //
+    // Not the public `snapshot_sidetable`: that renders each entry
+    // `to_lossy()`, and a clone must not quietly mangle a key or value whose
+    // text this VM stores faithfully but cannot render.
+    //
+    // This is a GC POINT where the bare read it replaced was not:
+    // `ordered_snapshot_kv` re-enters Java to ask the CHM for its key order. It
+    // refreshes `this` through its own pin, but `args` still holds the
+    // PRE-COLLECTION receiver, so the `cloneHashtable()` step below is handed
+    // the refreshed reference rather than `args`.
+    let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
     // shallow-copies the heap fields, `defaults` included, and already knows to
     // replicate a Properties' side-table onto the clone's new identity.
-    let cloned = crate::native_object_clone(ctx, args)?;
+    let cloned = crate::native_object_clone(ctx, &[Value::Object(Some(this))])?;
     let Some(Value::Object(Some(clone_ref))) = cloned else {
         return Ok(cloned);
     };
@@ -2523,7 +2539,7 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// view. Re-deriving any of those is how the side-table-vs-backing asymmetry
 /// that `native_properties_clear` documents gets reintroduced.
 fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -2534,12 +2550,27 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // Snapshot first: the function is free to call back into this Properties,
     // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
-    let entries = snapshot_kv(ctx, this);
+    //
+    // `ordered_snapshot_kv`, not the bare `snapshot_kv`: this loop hands the
+    // order to Java directly, as the sequence of `apply(k, v)` calls the user's
+    // BiFunction observes. The real body is `map.replaceAll(function)`, which
+    // walks the CHM in the CHM's order, so anything else is a visible
+    // divergence in a callback the caller wrote.
+    //
+    // It is also a GC POINT where the bare read was not — it re-enters Java to
+    // ask the CHM for its key order. `func` was read out of `args` above and
+    // nothing was holding it, so it is pinned BEFORE the walk and re-read
+    // after; `this` is refreshed by `ordered_snapshot_kv` itself. `func_pin`
+    // therefore sits BELOW `this_pin`, and since unpinning pops every pin above
+    // it, releasing `func_pin` at the end releases both.
+    let func_pin = ctx.pin_native_root(func);
+    let entries = ordered_snapshot_kv(ctx, &mut this);
+    let func = ctx.read_native_pin(func_pin, func);
     if entries.is_empty() {
+        ctx.unpin_native_roots(func_pin);
         return Ok(None);
     }
     let this_pin = ctx.pin_native_root(this);
-    let func_pin = ctx.pin_native_root(func);
     for (k, v) in entries {
         // Every step below can allocate and therefore relocate; re-read each
         // reference from its pin immediately before use.
@@ -2560,7 +2591,9 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
             // removing the entry; match that instead of inventing a third
             // behaviour.
             _ => {
-                ctx.unpin_native_roots(this_pin);
+                // `func_pin`, not `this_pin`: it is the lower of the two, and
+                // unpinning it pops `this_pin` with it.
+                ctx.unpin_native_roots(func_pin);
                 return Err(props_null_put_npe());
             }
         };
@@ -2578,7 +2611,7 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // `k_pin` and survive.
         ctx.unpin_native_roots(k_pin);
     }
-    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(func_pin);
     Ok(None)
 }
 
