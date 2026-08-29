@@ -83,7 +83,7 @@ with open(out, "w", encoding="utf-8") as fh:
 print("undecl rows: %d" % n)
 EOF
 
-"$JDK/bin/javac" -d "$WORK" "$ROOT/probes/InheritedDeclProbe.java"
+"$JDK/bin/javac" -d "$WORK" "$ROOT/apps/probes/InheritedDeclProbe.java"
 "$JDK/bin/java" -cp "$WORK" InheritedDeclProbe "$TRIPLES" "$OUT"
 
 "$PY" - "$OUT" <<'EOF'

@@ -11,8 +11,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU32;
 
 use super::ir::{
-    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot, MAX_INLINE_SCOPE_DEPTH,
-    NO_NODE,
+    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot,
+    MAX_INLINE_SCOPE_DEPTH, NO_NODE,
 };
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
@@ -1403,7 +1403,13 @@ impl<'a> Lowerer<'a> {
     /// repeating the arithmetic. Every refusal below is the allocating path's
     /// refusal, unchanged; only the three mutations live in the caller.
     fn planned_slot_off(&self, id: NodeId) -> CompileResult<i32> {
-        let color = match self.slot_plan.node_color.get(id as usize).copied().flatten() {
+        let color = match self
+            .slot_plan
+            .node_color
+            .get(id as usize)
+            .copied()
+            .flatten()
+        {
             Some(color) => color,
             None => {
                 return Err(Bailout::with_context(
@@ -1515,21 +1521,21 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
-/// side entirely (safepoint-id stores, shadow push/reload, the prologue thread
-/// fetch), leaving the frame layout alone.
-///
-/// Exists so the cost of that emission can be A/B'd on ONE binary against a
-/// deterministic probe. Three attempts inferred it from a single run of a suite
-/// class that later turned out to be bimodal; a lever plus repeats is what that
-/// should have been. Default on, so this changes nothing unless asked.
-fn reloc_emit_enabled() -> bool {
-    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RELOC_EMIT") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+    /// side entirely (safepoint-id stores, shadow push/reload, the prologue thread
+    /// fetch), leaving the frame layout alone.
+    ///
+    /// Exists so the cost of that emission can be A/B'd on ONE binary against a
+    /// deterministic probe. Three attempts inferred it from a single run of a suite
+    /// class that later turned out to be bimodal; a lever plus repeats is what that
+    /// should have been. Default on, so this changes nothing unless asked.
+    fn reloc_emit_enabled() -> bool {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RELOC_EMIT") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     }
-}
 
-// ── Moving-young relocation contract ─────────────────────────────────
+    // ── Moving-young relocation contract ─────────────────────────────────
     //
     // What `conservative_roots` demands of a compiled frame before a young
     // collection may RELOCATE while that frame is live:
@@ -1658,7 +1664,6 @@ fn reloc_emit_enabled() -> bool {
             live_frame_hi: live_hi,
         });
     }
-
 
     // ── Phi resolution (BUG FIX [jit-irlower #2]) ────────────────────────
     //
@@ -2060,7 +2065,8 @@ fn reloc_emit_enabled() -> bool {
     /// both must write the SAME slot, since `inline_rbp_tls_disp()` is the one
     /// source of truth the VM-side mirror accessor reads back.
     fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
-        self.buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf
+            .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0x48); // REX.W
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
@@ -2079,11 +2085,13 @@ fn reloc_emit_enabled() -> bool {
         if self.inline_cm_tls_disp == 0 {
             return;
         }
-        self.buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf
+            .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0xC7); // MOV r/m32, imm32
         self.buf.emit_byte(0x04); // ModRM: /0, r/m=SIB
         self.buf.emit_byte(0x25); // SIB: [disp32] absolute
-        self.buf.emit(&(self.inline_cm_tls_disp as u32).to_le_bytes());
+        self.buf
+            .emit(&(self.inline_cm_tls_disp as u32).to_le_bytes());
         self.buf.emit(&self.compile_id.to_le_bytes());
     }
 
@@ -2124,7 +2132,8 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x4D, 0x8B, 0x9A]);
             self.buf.emit(&ss_top.to_le_bytes());
             self.buf.emit(&[0x4C, 0x89, 0x9D]);
-            self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+            self.buf
+                .emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
             self.patch_rel32_to_here(skip);
         }
         self.thread_fetch_span = Some((start, self.buf.pos()));
@@ -2174,7 +2183,10 @@ fn reloc_emit_enabled() -> bool {
                 self.branch_patches
                     .iter()
                     .all(|&(pos, _)| pos < start || pos >= end)
-                    && self.self_call_patches.iter().all(|&pos| pos < start || pos >= end),
+                    && self
+                        .self_call_patches
+                        .iter()
+                        .all(|&pos| pos < start || pos >= end),
                 "a patch site landed inside the erased thread-fetch span {start}..{end}; \
                  jumping over it would corrupt that patch (or its target)"
             );
@@ -2241,7 +2253,8 @@ fn reloc_emit_enabled() -> bool {
         };
         // MOV [rbp - savebase], R11    (base of THIS push)
         self.buf.emit(&[0x4C, 0x89, 0x9D]);
-        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf
+            .emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
         for &off in offsets {
             // MOV RCX, [rbp - off] ; MOV [R11], RCX ; LEA R11, [R11 + 8]
             self.buf.emit(&[0x48, 0x8B, 0x8D]);
@@ -2264,7 +2277,8 @@ fn reloc_emit_enabled() -> bool {
             // puts `top` back.
             self.buf.emit(&[0x49, 0x83, 0xCB, 0x01]); // OR R11, 1
             self.buf.emit(&[0x4C, 0x89, 0x9D]); // MOV [rbp - savebase], R11
-            self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+            self.buf
+                .emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
             self.emit_shadow_overflow_note();
             self.patch_rel32_to_here(done);
         }
@@ -2340,7 +2354,8 @@ fn reloc_emit_enabled() -> bool {
         if !wide && !is_float && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
             return false;
         }
-        let Some(base_cell) = crate::x64::resolve_static_base(class_id, field_index as usize) else {
+        let Some(base_cell) = crate::x64::resolve_static_base(class_id, field_index as usize)
+        else {
             return false;
         };
         // Cell byte offset within the class's statics block, plus the payload
@@ -2624,8 +2639,9 @@ fn reloc_emit_enabled() -> bool {
             // reference path; the compact arm above is untouched, and it is the
             // one this whole inline sequence was written for.
             self.buf.emit(&[0x83, 0xB8]); // CMP DWORD [RAX + disp32], imm8
-            self.buf
-                .emit(&(legacy_cell_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
+            self.buf.emit(
+                &(legacy_cell_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes(),
+            );
             self.buf
                 .emit_byte(cratonvm_types::FIELD_CELL_TAG_OBJECT as u8);
             slow.push(self.emit_jcc_rel32(0x85)); // JNE → the checked helper
@@ -2640,24 +2656,27 @@ fn reloc_emit_enabled() -> bool {
             match type_tag {
                 b'J' | b'D' => {
                     self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, qword
-                    self.buf
-                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+                    self.buf.emit(
+                        &(legacy_cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes(),
+                    );
                 }
                 // `float` is stored as a 32-bit payload and the helper
                 // ZERO-extends it (`f.to_bits() as i64`), so a 32-bit MOV;
                 // MOVSXD would corrupt every float with bit 31 set.
                 b'F' => {
                     self.buf.emit(&[0x8B, 0x80]); // MOV EAX, dword (zero-extends)
-                    self.buf
-                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                    self.buf.emit(
+                        &(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes(),
+                    );
                 }
                 // Every int-category descriptor: the cell holds a `Value::Int`
                 // payload already narrowed on store, so sign-extending it is
                 // what the helper returns.
                 _ => {
                     self.buf.emit(&[0x48, 0x63, 0x80]); // MOVSXD RAX, dword
-                    self.buf
-                        .emit(&(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes());
+                    self.buf.emit(
+                        &(legacy_cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32).to_le_bytes(),
+                    );
                 }
             }
         }
@@ -2704,11 +2723,8 @@ fn reloc_emit_enabled() -> bool {
         // declared `[C`, read back as `Int(1)`, and the `arraylength` that
         // followed faulted at `addr=0x5`.
         let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
-        let arg2 = cratonvm_jit_api::getfield_index_arg(
-            field_index as u32,
-            ref_node,
-            base_is_proven_oop,
-        );
+        let arg2 =
+            cratonvm_jit_api::getfield_index_arg(field_index as u32, ref_node, base_is_proven_oop);
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
@@ -2762,7 +2778,8 @@ fn reloc_emit_enabled() -> bool {
         // MOV R11, [rbp - savebase]    (restore from THIS push's base, not the
         // live `top`, so an unbalanced intervening push cannot drift it)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
-        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf
+            .emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
         // Overflow bail protocol (see `emit_shadow_push`): a tagged base means
         // the push stored nothing, so the restore below would read slots that
         // were never written. Skip to the tail, which only retracts `top`.
@@ -2782,15 +2799,14 @@ fn reloc_emit_enabled() -> bool {
         // MOV R11, [rbp - savebase] ; AND R11, ~1 ; MOV [R10 + ss_top], R11
         // (retract top; the mask is a no-op unless the push bailed)
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
-        self.buf.emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
+        self.buf
+            .emit(&(-self.shadow_savebase_slot_off).to_le_bytes());
         self.buf.emit(&[0x49, 0x83, 0xE3, 0xFE]);
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
         self.shadow_reloads += 1;
     }
-
-
 
     /// Zero the frame slot of every `Ref`-typed phi, and mark those slots
     /// publishable.
@@ -2812,8 +2828,7 @@ fn reloc_emit_enabled() -> bool {
     fn zero_ref_phi_slots(&mut self) {
         let refs: Vec<(usize, i32)> = (0..self.graph.nodes.len())
             .filter(|&id| {
-                matches!(self.graph.nodes[id].op, Op::Phi)
-                    && self.graph.nodes[id].ty == IrType::Ref
+                matches!(self.graph.nodes[id].op, Op::Phi) && self.graph.nodes[id].ty == IrType::Ref
             })
             // A phi with no location cannot be zeroed and must not be
             // published; `prealloc_phi_slots` gives every phi one, so this
@@ -2927,7 +2942,8 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0, 0, 0, 0]);
         // MOV R11, [rbp - savetop] ; MOV [R10 + ss_top], R11
         self.buf.emit(&[0x4C, 0x8B, 0x9D]);
-        self.buf.emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
+        self.buf
+            .emit(&(-self.shadow_savetop_slot_off).to_le_bytes());
         self.buf.emit(&[0x4D, 0x89, 0x9A]);
         self.buf.emit(&ss_top.to_le_bytes());
         self.patch_rel32_to_here(skip);
@@ -3102,7 +3118,8 @@ fn reloc_emit_enabled() -> bool {
             // the single-pass backend's identical `as u8` patches did not
             // survive.
             let rel = |target: usize, patch: usize| (target as i64) - (patch as i64) - 1;
-            self.buf.patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
+            self.buf
+                .patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
             self.buf.emit(&[0x31, 0xC0]);
             // .done:
             let done_off = self.buf.pos();
@@ -3151,7 +3168,8 @@ fn reloc_emit_enabled() -> bool {
             let nan_off = self.buf.pos();
             // Range-checked, not truncated — see the `!is_long` arm above.
             let rel = |target: usize, patch: usize| (target as i64) - (patch as i64) - 1;
-            self.buf.patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
+            self.buf
+                .patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
             self.buf.emit(&[0x48, 0x31, 0xC0]);
             // .done:
             let done_off = self.buf.pos();
@@ -3578,31 +3596,31 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
         }
         self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
-        // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
-        // compile id) into the innermost-frame mirror and nothing on the return
-        // path of a raw JIT->JIT call restores this frame's. Both inline-cache
-        // arms in this tier went without it until 2026-08-24, so after any
-        // monomorphic or polymorphic hit the mirror named a frame that had
-        // already returned -- measured on H2 `TestMVStoreTool`, where ONE rbp
-        // with ONE saved return address inside `TestMVStoreTool.testCompact`
-        // was claimed across collections by four different methods, one of them
-        // `RootReference.isLocked` with `maps=0`, which emits no safepoint and
-        // therefore cannot be the frame at a collection at all.
-        //
-        // `moving_young_frame_coverage_complete` then reads
-        // `[stale_rbp - stale_method.sp_id_slot_off]`, finds a word matching no
-        // map, and refuses the whole cycle (`ACTIVE_FRAME_MAP`,
-        // `frame_cov=(no_map=N incomplete=0)`), which is what kept ZGC from
-        // compacting on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`.
-        // The single-pass backend republishes at both of its equivalent arms,
-        // and the shared hashed/vtable stub below is handed `self.frame_record`
-        // for exactly this -- these two arms were the gap.
-        //
-        // It lives INSIDE this helper rather than at the two call sites so a
-        // third arm cannot be added without it. RAX (the callee's Java return
-        // value) is preserved by both forms of the republish, and the security
-        // invariant above is about the MOV/CALL pair, which nothing here comes
-        // between.
+                                            // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
+                                            // compile id) into the innermost-frame mirror and nothing on the return
+                                            // path of a raw JIT->JIT call restores this frame's. Both inline-cache
+                                            // arms in this tier went without it until 2026-08-24, so after any
+                                            // monomorphic or polymorphic hit the mirror named a frame that had
+                                            // already returned -- measured on H2 `TestMVStoreTool`, where ONE rbp
+                                            // with ONE saved return address inside `TestMVStoreTool.testCompact`
+                                            // was claimed across collections by four different methods, one of them
+                                            // `RootReference.isLocked` with `maps=0`, which emits no safepoint and
+                                            // therefore cannot be the frame at a collection at all.
+                                            //
+                                            // `moving_young_frame_coverage_complete` then reads
+                                            // `[stale_rbp - stale_method.sp_id_slot_off]`, finds a word matching no
+                                            // map, and refuses the whole cycle (`ACTIVE_FRAME_MAP`,
+                                            // `frame_cov=(no_map=N incomplete=0)`), which is what kept ZGC from
+                                            // compacting on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`.
+                                            // The single-pass backend republishes at both of its equivalent arms,
+                                            // and the shared hashed/vtable stub below is handed `self.frame_record`
+                                            // for exactly this -- these two arms were the gap.
+                                            //
+                                            // It lives INSIDE this helper rather than at the two call sites so a
+                                            // third arm cannot be added without it. RAX (the callee's Java return
+                                            // value) is preserved by both forms of the republish, and the security
+                                            // invariant above is about the MOV/CALL pair, which nothing here comes
+                                            // between.
         if !ic_frame_republish_disabled() {
             self.emit_post_call_frame_record();
             IC_FRAME_REPUBLISH_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3720,12 +3738,12 @@ fn reloc_emit_enabled() -> bool {
         self.load_to_rax(self.slot_of(inputs[2]));
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
-        // Array-receiver guard — `ObjectHeader.class_id` (offset 0) holds a
-        // reference array's COMPONENT class id, so `Foo[]` and `Foo` share the
-        // guard word every cached entry below is compared against. Without the
-        // `kind` check a `Foo[]` receiver is dispatched into `Foo`'s method
-        // body. See the matching guard in `x64.rs`'s single-pass cascade.
-        //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
+                                                      // Array-receiver guard — `ObjectHeader.class_id` (offset 0) holds a
+                                                      // reference array's COMPONENT class id, so `Foo[]` and `Foo` share the
+                                                      // guard word every cached entry below is compared against. Without the
+                                                      // `kind` check a `Foo[]` receiver is dispatched into `Foo`'s method
+                                                      // body. See the matching guard in `x64.rs`'s single-pass cascade.
+                                                      //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
         self.buf.emit(&[
             0x80,
             0x78,
@@ -3946,9 +3964,9 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
         self.buf.emit(&[0xFF, 0xD0]);
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX — ZF=1 ⇒ no signal
-        // Restore the sentinel/value before branching: the shared bail stub
-        // returns RAX unchanged, and the keep path needs the genuine value.
-        // `MOV` does not disturb ZF.
+                                            // Restore the sentinel/value before branching: the shared bail stub
+                                            // returns RAX unchanged, and the keep path needs the genuine value.
+                                            // `MOV` does not disturb ZF.
         self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
         self.buf.emit(&[0x0F, 0x85]); // JNE bail_stub
         let patch = self.buf.pos();
@@ -4207,13 +4225,8 @@ fn reloc_emit_enabled() -> bool {
                     // Level 3. `select` refuses rather than inventing an
                     // encoding, and every row it can answer with names the
                     // hand-written emitter it reproduces byte for byte.
-                    let sel = select(&Req::new(
-                        op,
-                        ty,
-                        Operand::Gpr(RAX),
-                        Operand::Gpr(RCX),
-                    ))
-                    .ok()?;
+                    let sel =
+                        select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Gpr(RCX))).ok()?;
                     out.push_bytes(&sel.encoded.bytes)?;
                     let mut acc = FrameAccess::new();
                     enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
@@ -4243,7 +4256,8 @@ fn reloc_emit_enabled() -> bool {
                         enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
                         out.push(&acc)?;
                     }
-                    let sel = select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
+                    let sel =
+                        select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
                     out.push_bytes(&sel.encoded.bytes)?;
                     let mut acc = FrameAccess::new();
                     enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
@@ -5387,7 +5401,9 @@ fn reloc_emit_enabled() -> bool {
                 // disable the MIC/PIC prefix while leaving the megamorphic
                 // raw-call stub reachable.
                 if crate::direct_jit_callee_calls_enabled() {
-                    if let Some(&(mic, pic)) = node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc)) {
+                    if let Some(&(mic, pic)) =
+                        node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc))
+                    {
                         if mic != 0
                             && pic != 0
                             && self.invoke_virtual_mic != 0
@@ -5583,11 +5599,10 @@ fn reloc_emit_enabled() -> bool {
                 // primitive array's header class id is 0.
                 // SAFETY: an `intern_typecheck_target` pair, leaked for the
                 // life of the process.
-                let prim_array_tag = unsafe {
-                    crate::typecheck_site_name(name_ptr as *const u8, name_len)
-                }
-                .and_then(cratonvm_types::primitive_array_kind_tags_byte)
-                .filter(|_| crate::x64::checkcast_inline_enabled());
+                let prim_array_tag =
+                    unsafe { crate::typecheck_site_name(name_ptr as *const u8, name_len) }
+                        .and_then(cratonvm_types::primitive_array_kind_tags_byte)
+                        .filter(|_| crate::x64::checkcast_inline_enabled());
                 let mut hit_patch: Option<usize> = None;
                 if let Some(tag) = prim_array_tag {
                     crate::CHECKCAST_INLINE_SITES_PRIM_ARRAY
@@ -5595,7 +5610,7 @@ fn reloc_emit_enabled() -> bool {
                     self.load_reg_from_frame(RAX, self.slot_of(obj));
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
-                    // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag (80 /7 ib).
+                                                               // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag (80 /7 ib).
                     self.buf.emit(&[
                         0x80,
                         0x78,
@@ -5613,17 +5628,17 @@ fn reloc_emit_enabled() -> bool {
                     self.load_reg_from_frame(RAX, self.slot_of(obj));
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
-                    // ARRAY RECEIVERS MUST NOT REACH THE COMPARE — see the
-                    // twin of this guard in the single-pass `0xc0` arm, and
-                    // `regression-suite` `RJitArrayTypecheck`, which caught
-                    // this fix's first version. An array's header holds its
-                    // COMPONENT class id (or 0, for a primitive array), never
-                    // its own, so `checkcast java/lang/String` on a `String[]`
-                    // would match the baked target and accept a cast that must
-                    // throw. A plain object's KIND_TAGS byte is zero, pinned by
-                    // `const _: () = assert!` in `heap_types.rs` so that JIT
-                    // guards can use exactly this one instruction.
-                    // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 (80 /7 ib).
+                                                               // ARRAY RECEIVERS MUST NOT REACH THE COMPARE — see the
+                                                               // twin of this guard in the single-pass `0xc0` arm, and
+                                                               // `regression-suite` `RJitArrayTypecheck`, which caught
+                                                               // this fix's first version. An array's header holds its
+                                                               // COMPONENT class id (or 0, for a primitive array), never
+                                                               // its own, so `checkcast java/lang/String` on a `String[]`
+                                                               // would match the baked target and accept a cast that must
+                                                               // throw. A plain object's KIND_TAGS byte is zero, pinned by
+                                                               // `const _: () = assert!` in `heap_types.rs` so that JIT
+                                                               // guards can use exactly this one instruction.
+                                                               // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], 0 (80 /7 ib).
                     self.buf.emit(&[
                         0x80,
                         0x78,
@@ -5631,21 +5646,21 @@ fn reloc_emit_enabled() -> bool {
                         0x00,
                     ]);
                     let kind_slow = self.emit_jcc_rel32(0x85); // JNE → helper
-                    // CMP DWORD [RAX+0], cid. `ObjectHeader.class_id` is a
-                    // plain `u32` at offset 0 by contract — its own doc comment
-                    // says "JIT-emitted type guards are `CMP DWORD [recv+0],
-                    // imm`" and `class_id_remains_at_offset_zero` enforces it —
-                    // and this is byte-for-byte the encoding the guarded-virtual
-                    // inline arm already emits (81 /7 id, ModRM 0x78 = mod01
-                    // disp8 /7 rm=RAX).
+                                                               // CMP DWORD [RAX+0], cid. `ObjectHeader.class_id` is a
+                                                               // plain `u32` at offset 0 by contract — its own doc comment
+                                                               // says "JIT-emitted type guards are `CMP DWORD [recv+0],
+                                                               // imm`" and `class_id_remains_at_offset_zero` enforces it —
+                                                               // and this is byte-for-byte the encoding the guarded-virtual
+                                                               // inline arm already emits (81 /7 id, ModRM 0x78 = mod01
+                                                               // disp8 /7 rm=RAX).
                     self.buf.emit(&[0x81, 0x78, 0x00]);
                     self.buf.emit(&cid.to_le_bytes());
                     let miss_slow = self.emit_jcc_rel32(0x85); // JNE → helper
-                    // Hit: the receiver IS the target class, so the cast
-                    // succeeds and its result is the reference already in RAX —
-                    // the same value the helper would have returned. No
-                    // safepoint map, no frame-record republish and no
-                    // sentinel drain, because this path makes no call.
+                                                               // Hit: the receiver IS the target class, so the cast
+                                                               // succeeds and its result is the reference already in RAX —
+                                                               // the same value the helper would have returned. No
+                                                               // safepoint map, no frame-record republish and no
+                                                               // sentinel drain, because this path makes no call.
                     self.store_rax(slot);
                     hit_patch = Some(self.emit_jmp_rel32());
                     self.patch_rel32_to_here(null_slow);
@@ -5693,10 +5708,10 @@ fn reloc_emit_enabled() -> bool {
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
                 self.emit_mov_reg_imm64(RAX, self.instanceof_check as u64);
                 self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                // Same post-call obligation as `Op::ConstString`: the helper
-                // crossed the JIT boundary and may have run a collection, so
-                // this frame's mirror and any relocated published value must
-                // be restored before anything else reads the frame.
+                                              // Same post-call obligation as `Op::ConstString`: the helper
+                                              // crossed the JIT boundary and may have run a collection, so
+                                              // this frame's mirror and any relocated published value must
+                                              // be restored before anything else reads the frame.
                 self.emit_post_call_frame_record();
                 self.emit_shadow_reload();
                 self.store_rax(slot);
@@ -5886,7 +5901,13 @@ fn reloc_emit_enabled() -> bool {
             // `Op::Return`/`Op::If`, handled by `lower_terminator`; it never
             // reaches this function from a real schedule (`Op::is_control()`
             // routes it away from ordinary data-node placement).
-            Op::Start | Op::Return | Op::Throw | Op::If | Op::Merge | Op::Region | Op::Proj(_)
+            Op::Start
+            | Op::Return
+            | Op::Throw
+            | Op::If
+            | Op::Merge
+            | Op::Region
+            | Op::Proj(_)
             | Op::Dead => {}
             // No lowering arm. REFUSE the compile; do NOT fall through.
             //
@@ -6222,12 +6243,9 @@ fn reloc_emit_enabled() -> bool {
                     // access: neither answer reads `[rbp - 0]`. That is why a
                     // missing location is tolerated here and refused in
                     // `slot_of`.
-                    None if matches!(node.op, Op::Dead) => {
-                        FrameValue::MaterializationRequired(EliminatedValue::new(
-                            node_id,
-                            EliminationCause::Unclassified,
-                        ))
-                    }
+                    None if matches!(node.op, Op::Dead) => FrameValue::MaterializationRequired(
+                        EliminatedValue::new(node_id, EliminationCause::Unclassified),
+                    ),
                     None => FrameValue::Undefined,
                 }
             }
@@ -6559,15 +6577,14 @@ fn reloc_emit_enabled() -> bool {
         // R10), then CMP ECX, R10D. An UNSIGNED `index < length` (JB, CF=1)
         // continues; otherwise (index >= length, OR a negative index whose
         // unsigned value is huge) deopt → AIOOBE.
-        self.buf
-            .emit(&[
-                0x44,
-                0x8B,
-                0x50,
-                // Compile-time checked: a layout constant past 127 would encode a
-                // NEGATIVE disp8 and read before the object.
-                crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
-            ]); // MOV R10D,[RAX+12]
+        self.buf.emit(&[
+            0x44,
+            0x8B,
+            0x50,
+            // Compile-time checked: a layout constant past 127 would encode a
+            // NEGATIVE disp8 and read before the object.
+            crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
+        ]); // MOV R10D,[RAX+12]
         self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
         self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
     }
@@ -7156,8 +7173,7 @@ fn reloc_emit_enabled() -> bool {
                     // turns that refusal into a refusal of the enclosing
                     // object. Fail-closed, one level at a time.
                     if sr.objects.contains_key(&vnode) {
-                        let nested =
-                            self.frame_value_for_object(vnode, deopt_block, sr, emitted);
+                        let nested = self.frame_value_for_object(vnode, deopt_block, sr, emitted);
                         if matches!(
                             nested,
                             FrameValue::Undefined
@@ -7910,7 +7926,8 @@ fn bits_insert(bits: &mut [u64], i: usize) {
 /// Is bit `i` set?
 #[inline]
 fn bits_contains(bits: &[u64], i: usize) -> bool {
-    bits.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+    bits.get(i / 64)
+        .is_some_and(|w| w & (1u64 << (i % 64)) != 0)
 }
 
 /// Visit every set bit, in increasing order.
@@ -8008,7 +8025,10 @@ fn plan_slots(
         if node.ty == IrType::Ref
             && matches!(
                 node.op,
-                Op::Call { .. } | Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. }
+                Op::Call { .. }
+                    | Op::ConstString { .. }
+                    | Op::ConstClass { .. }
+                    | Op::LoadStatic { .. }
             )
         {
             fresh_only[id] = true;
@@ -8337,11 +8357,7 @@ fn plan_slots(
 ///   4. a colour is never shared across [`SlotClass`]es, so a slot an oop map
 ///      names can never hold a primitive, and a pinned value never shares at
 ///      all.
-fn verify_slot_colouring(
-    graph: &Graph,
-    schedule: &Schedule,
-    plan: &SlotPlan,
-) -> CompileResult<()> {
+fn verify_slot_colouring(graph: &Graph, schedule: &Schedule, plan: &SlotPlan) -> CompileResult<()> {
     let color_of = |id: usize| plan.node_color.get(id).copied().flatten();
 
     // (1) Coverage — the same two sources `plan_slots` enumerates.
@@ -8406,7 +8422,10 @@ fn verify_slot_colouring(
             if plan.class.get(id).copied().flatten() == Some(SlotClass::Pinned) {
                 return Err(Bailout::with_context(
                     BailoutReason::Internal("ir_lower: a pinned value shares its frame slot"),
-                    format!("slot {color} is shared by {} values, one pinned", bucket.len()),
+                    format!(
+                        "slot {color} is shared by {} values, one pinned",
+                        bucket.len()
+                    ),
                 ));
             }
         }
@@ -8999,7 +9018,7 @@ fn verify_mir_allocation(
     mir: &MirPlan,
 ) -> CompileResult<MirAllocVerdict> {
     use crate::regalloc::{
-        build_live_model, verify_allocation, Allocation, RegFile, Segment, RegSpec,
+        build_live_model, verify_allocation, Allocation, RegFile, RegSpec, Segment,
     };
 
     let live = build_live_model(graph, schedule);
@@ -9058,9 +9077,7 @@ fn verify_mir_allocation(
         .tile_of
         .iter()
         .enumerate()
-        .filter(|(id, cell)| {
-            cell.is_some() && segments.get(*id).is_none_or(|s| s.is_empty())
-        })
+        .filter(|(id, cell)| cell.is_some() && segments.get(*id).is_none_or(|s| s.is_empty()))
         .count();
 
     let alloc = Allocation {
@@ -9908,15 +9925,19 @@ pub(crate) fn lower_inner_with_scopes(
     // array (`element_type != 0`) needs `helpers.newarray` wired; a
     // REFERENCE array (`element_type == 0`) needs `helpers.anewarray_object`.
     // Only a synthetic unit-test table leaves either at 0.
-    if graph.nodes.iter().any(|node| {
-        matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0)
-    }) && helpers.newarray == 0
+    if graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0))
+        && helpers.newarray == 0
     {
         return None;
     }
-    if graph.nodes.iter().any(|node| {
-        matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0)
-    }) && helpers.anewarray_object == 0
+    if graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0))
+        && helpers.anewarray_object == 0
     {
         return None;
     }
@@ -9995,8 +10016,8 @@ pub(crate) fn lower_inner_with_scopes(
     // states the actual constraint: it is a property of one lowering, not of
     // the opcode.
     if cratonvm_types::compact_ref_fields_enabled() {
-        let needs_getfield_helper = helpers.getfield == 0
-            && graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        let needs_getfield_helper =
+            helpers.getfield == 0 && graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
         // Only an INT store has an inline lowering to fall back to, so only an
         // int store is what this compact-layout clause is about. Every other
         // `MemKind` is helper-only in both layouts and is refused
@@ -10642,11 +10663,8 @@ pub(crate) fn lower_inner_with_scopes(
     // and deliberately differ on the fast tier, where `fully_oop_covered` is
     // the frame-slot subset test; the OSR fallback reads `fully_shadow_covered`
     // so it gets the same question from both.
-    cm.fully_shadow_covered = !cm.oop_maps.is_empty()
-        && cm
-            .oop_maps
-            .iter()
-            .all(|m| m.moving_young_coverage_complete);
+    cm.fully_shadow_covered =
+        !cm.oop_maps.is_empty() && cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
     cm.osr_frame_size = frame_size;
     // OSR and the save area, stated where the artifact is published.
     //
@@ -10705,7 +10723,11 @@ pub(crate) fn lower_inner_with_scopes(
         // outgoing argument is the one that gets misread during a crash triage.
         // `hi == lo == 0` when nothing was reserved, which `is_register_image`
         // already reads as "absent".
-        xmm_saved_lo: if saved_xmm_bytes > 0 { spill_cap_off } else { 0 },
+        xmm_saved_lo: if saved_xmm_bytes > 0 {
+            spill_cap_off
+        } else {
+            0
+        },
         xmm_saved_hi: if saved_xmm_bytes > 0 {
             spill_cap_off + saved_xmm_bytes
         } else {
@@ -10805,8 +10827,7 @@ mod tests {
             .enumerate()
             .filter(|(_, l)| {
                 let t = l.trim_start();
-                (t.starts_with(".expect(") || t.starts_with(".unwrap("))
-                    && l.contains("patch")
+                (t.starts_with(".expect(") || t.starts_with(".unwrap(")) && l.contains("patch")
             })
             .map(|(i, l)| (i + 1, l.trim()))
             .collect();
@@ -10844,12 +10865,7 @@ mod tests {
             vec![ctrl, mem],
             Some(0),
         );
-        graph.exit = graph.add(
-            Op::Return,
-            IrType::Void,
-            vec![ctrl, allocation],
-            Some(3),
-        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
 
         let schedule = ir_schedule::schedule(&graph);
         let mut helpers = no_helpers();
@@ -10893,12 +10909,7 @@ mod tests {
             vec![ctrl, mem],
             Some(0),
         );
-        graph.exit = graph.add(
-            Op::Return,
-            IrType::Void,
-            vec![ctrl, allocation],
-            Some(3),
-        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
 
         let schedule = ir_schedule::schedule(&graph);
         let mut helpers = no_helpers();
@@ -11206,7 +11217,11 @@ mod tests {
         let num_params = cap;
         let reg_count = num_params.min(ENTRY_ABI_REGS.len().saturating_sub(base));
         assert_eq!(reg_count, cap - 1);
-        assert_eq!(num_params - reg_count, 1, "exactly one argument on the stack");
+        assert_eq!(
+            num_params - reg_count,
+            1,
+            "exactly one argument on the stack"
+        );
     }
 
     fn compile_via_ir(
@@ -11237,12 +11252,11 @@ mod tests {
         // aload_0; monitorenter; aload_0; monitorexit; return
         let code = [0x2a, 0xc2, 0x2a, 0xc3, 0xb1, 0, 0];
         let builder = IrBuilder::new(1, 1);
-        let graph = builder.build(&code, 5).expect("builder must accept monitors");
+        let graph = builder
+            .build(&code, 5)
+            .expect("builder must accept monitors");
         assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|n| matches!(n.op, Op::MonitorEnter)),
+            graph.nodes.iter().any(|n| matches!(n.op, Op::MonitorEnter)),
             "the builder must emit a MonitorEnter node"
         );
         let schedule = ir_schedule::schedule(&graph);
@@ -11265,11 +11279,11 @@ mod tests {
             .expect("a monitor graph with a helper must compile");
         let target = (fake_monitor as *const () as usize).to_le_bytes();
         let bytes = cm.code_bytes();
-        let calls = bytes
-            .windows(8)
-            .filter(|w| *w == target)
-            .count();
-        assert_eq!(calls, 2, "monitorenter and monitorexit must each call the helper");
+        let calls = bytes.windows(8).filter(|w| *w == target).count();
+        assert_eq!(
+            calls, 2,
+            "monitorenter and monitorexit must each call the helper"
+        );
     }
     /// COV-03 — build the one-line `void set(Corpus o, X v) { o.f = v; }` graph
     /// for field descriptor `tag`, with both wide-field gates on.
@@ -11419,8 +11433,7 @@ mod tests {
             0
         }
         assert_ne!(
-            fake_getfield as *const () as usize,
-            fake_dispatch_threw as *const () as usize,
+            fake_getfield as *const () as usize, fake_dispatch_threw as *const () as usize,
             "the two stubs were folded to one address (MSVC /OPT:ICF or an LTO \
              equivalent), so searching the emitted code for `dispatch_threw` \
              cannot distinguish it from `getfield` and this test's control arm \
@@ -11528,8 +11541,7 @@ mod tests {
         // in both backends through `getfield_index_arg`, plus the control that
         // disables that encoder and turns this red.
         assert!(
-            contains_seq(cm.code_bytes(), &proven)
-                || contains_seq(cm.code_bytes(), &unproven),
+            contains_seq(cm.code_bytes(), &proven) || contains_seq(cm.code_bytes(), &unproven),
             "no getfield argument in the emitted code carries \
              GETFIELD_EXPECT_REFERENCE, so the helper will hand this \
              dereferencing arm whatever primitive the slot happens to hold"
@@ -11548,8 +11560,7 @@ mod tests {
         let schedule = ir_schedule::schedule(&graph);
         let cm = lower(&graph, &schedule, 1, 1, &helpers).expect("must compile");
         assert!(
-            !contains_seq(cm.code_bytes(), &proven)
-                && !contains_seq(cm.code_bytes(), &unproven),
+            !contains_seq(cm.code_bytes(), &proven) && !contains_seq(cm.code_bytes(), &unproven),
             "an int field must not claim GETFIELD_EXPECT_REFERENCE"
         );
     }
@@ -11780,12 +11791,11 @@ mod tests {
         let mut builder = IrBuilder::new(0, 1);
         builder.set_param_types(&[]);
         let mut invoke_info = HashMap::new();
-        invoke_info.insert(
-            invoke_pc,
-            (info as *const JitInvokeInfo as usize, n, b'I'),
-        );
+        invoke_info.insert(invoke_pc, (info as *const JitInvokeInfo as usize, n, b'I'));
         builder.set_invoke_info(invoke_info);
-        let graph = builder.build(&code, code_len).expect("IR build of wide call");
+        let graph = builder
+            .build(&code, code_len)
+            .expect("IR build of wide call");
         let schedule = ir_schedule::schedule(&graph);
 
         let mut helpers = no_helpers();
@@ -11948,9 +11958,14 @@ mod tests {
         let mut builder = IrBuilder::new(2, 2);
         builder.set_param_types(&[IrType::Ref, IrType::Int]);
         let mut invoke_info = HashMap::new();
-        invoke_info.insert(2usize, (info as *const JitInvokeInfo as usize, 2usize, b'I'));
+        invoke_info.insert(
+            2usize,
+            (info as *const JitInvokeInfo as usize, 2usize, b'I'),
+        );
         builder.set_invoke_info(invoke_info);
-        let graph = builder.build(&code, 6).expect("IR build of self-recursive call");
+        let graph = builder
+            .build(&code, 6)
+            .expect("IR build of self-recursive call");
         let schedule = ir_schedule::schedule(&graph);
 
         // The shadow machinery is live only when the thread helper is wired,
@@ -12575,7 +12590,8 @@ mod tests {
         let mut objects = HashMap::new();
         objects.insert(
             newo,
-            VirtualObjectInfo { array_element_type: None,
+            VirtualObjectInfo {
+                array_element_type: None,
                 class_id: 7,
                 num_fields: 1,
                 field_values: vec![Some(v7)],
@@ -13021,16 +13037,16 @@ mod tests {
         let verifier = DeoptVerifier::new().with_oop_map(0x40, OopCoverage::complete([40]));
         assert!(
             verifier
-                .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
-                    -40
-                )])))
+                .verify(std::slice::from_ref(&point(vec![
+                    FrameValue::StackSlotRef(-40)
+                ])))
                 .is_ok(),
             "a covered reference slot must pass"
         );
         let err = verifier
-            .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
-                -48,
-            )])))
+            .verify(std::slice::from_ref(&point(vec![
+                FrameValue::StackSlotRef(-48),
+            ])))
             .expect_err("an uncovered reference slot must bail the install");
         assert!(
             err.to_string().contains("oop map"),
@@ -13053,7 +13069,8 @@ mod tests {
             frame_state: FrameState {
                 method_key: String::new(),
                 bci: 1,
-                locals: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+                locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                    array_element_type: None,
                     id: 12,
                     class_id: 3,
                     num_fields: 1,
@@ -13737,7 +13754,11 @@ mod tests {
         assert!(lowerer.node_slot.iter().all(|slot| slot.is_none()));
 
         let off = lowerer.alloc_slot_checked(a).expect("first spill slot");
-        assert!(off >= lowerer.first_spill, "{off} < {}", lowerer.first_spill);
+        assert!(
+            off >= lowerer.first_spill,
+            "{off} < {}",
+            lowerer.first_spill
+        );
         assert_ne!(off, 0);
         assert_eq!(lowerer.slot_of_checked(a).expect("allocated"), off);
         // Non-zero by type, not by convention: every occupied entry is a
@@ -13754,7 +13775,10 @@ mod tests {
         assert_ne!(poison, 0, "the façade must never emit [rbp - 0]");
         assert!(lowerer.unallocated_slot_use.get());
         let latched = lowerer.take_latched_bailout().expect("a latched reason");
-        assert_eq!(latched.reason, BailoutReason::UnallocatedValue { node: sum });
+        assert_eq!(
+            latched.reason,
+            BailoutReason::UnallocatedValue { node: sum }
+        );
         // An out-of-range id is an error too — it used to index-panic.
         assert!(lowerer.slot_of_checked(NO_NODE).is_err());
     }
@@ -14653,10 +14677,7 @@ mod tests {
     fn a_register_location_is_refused_rather_than_emitted_as_an_offset() {
         let err = frame_word_off(ValueLoc::Reg(crate::regalloc::PhysReg::gp(3)))
             .expect_err("a register is not a frame word");
-        assert!(
-            matches!(err.reason, BailoutReason::Internal(_)),
-            "{err:?}",
-        );
+        assert!(matches!(err.reason, BailoutReason::Internal(_)), "{err:?}",);
         // …and offset 0 (`[rbp - 0]` is the saved caller RBP) is not a location.
         assert!(frame_word_loc(0).is_err());
         assert!(frame_word_loc(-8).is_err());
@@ -15062,7 +15083,10 @@ mod tests {
         // (bci 2 and bci 4), the same fixture `test_deopt_points_resolve_*` uses.
         let code = [0x08, 0x06, 0x60, 0x05, 0x68, 0xac, 0, 0];
         let cm = compile_via_ir_no_opt(&code, 6, 0, 0);
-        assert!(!cm.deopt_points.is_empty(), "fixture must emit deopt points");
+        assert!(
+            !cm.deopt_points.is_empty(),
+            "fixture must emit deopt points"
+        );
         for p in &cm.deopt_points {
             assert_eq!(
                 p.semantics,
@@ -15117,7 +15141,12 @@ mod tests {
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
         let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
         let sq = graph.add(Op::Mul, IrType::Double, vec![a, a], Some(1));
-        let two = graph.add(Op::ConstF(2.0f64.to_bits()), IrType::Double, vec![], Some(2));
+        let two = graph.add(
+            Op::ConstF(2.0f64.to_bits()),
+            IrType::Double,
+            vec![],
+            Some(2),
+        );
         let scaled = graph.add(Op::Mul, IrType::Double, vec![sq, two], Some(3));
         let sum = graph.add(Op::Add, IrType::Double, vec![scaled, a], Some(4));
         graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(5));
@@ -15305,7 +15334,10 @@ mod tests {
 
         let off = bytes(false);
         let on = bytes(true);
-        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert!(
+            !off.is_empty(),
+            "precondition: the method compiled to bytes"
+        );
         assert_eq!(
             off.len(),
             on.len(),
@@ -15336,7 +15368,10 @@ mod tests {
         let (methods, stats) = crate::x64::isel::shadow_totals();
         assert_eq!(methods, 1, "exactly one method should have been shadowed");
         assert!(stats.blocks > 0, "no blocks were selected");
-        assert!(stats.nodes > 0, "no data nodes were offered to the selector");
+        assert!(
+            stats.nodes > 0,
+            "no data nodes were offered to the selector"
+        );
         assert!(stats.tiles >= stats.blocks, "every block yields >= 1 tile");
         assert_eq!(
             stats.coverage_failures, 0,
@@ -15438,9 +15473,7 @@ mod tests {
         let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
         // SAFETY: the artifact is alive for the duration of this borrow, and
         // `code_len` is what the emitter wrote.
-        unsafe {
-            std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()).to_vec()
-        }
+        unsafe { std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()).to_vec() }
     }
 
     /// The level-2 encoder reproduces the per-opcode arms **byte for byte**.
@@ -15461,13 +15494,19 @@ mod tests {
 
         let off = mir_emitted_bytes(None);
         let emit = mir_emitted_bytes(Some(MirMode::Emit));
-        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert!(
+            !off.is_empty(),
+            "precondition: the method compiled to bytes"
+        );
         assert_eq!(off, emit, "the level-2 encoder changed the emitted bytes");
 
         // Not vacuous: tiles were actually taken. A path that declined every
         // tile would satisfy the equality above trivially.
         let (methods, tiles, mismatches) = mir_totals::read();
-        assert_eq!(methods, 1, "exactly one method went through the machine list");
+        assert_eq!(
+            methods, 1,
+            "exactly one method went through the machine list"
+        );
         assert!(
             tiles >= 2,
             "`(a + b) * a` has two AluReg roots; the encoder took {tiles}"
@@ -15808,7 +15847,13 @@ mod tests {
         match op {
             // Control and terminator nodes: an arm exists and does nothing,
             // because `lower_terminator` owns them.
-            Op::Start | Op::Return | Op::Throw | Op::If | Op::Merge | Op::Region | Op::Proj(_)
+            Op::Start
+            | Op::Return
+            | Op::Throw
+            | Op::If
+            | Op::Merge
+            | Op::Region
+            | Op::Proj(_)
             | Op::Dead => LoweredEffect,
             // Values.
             Op::Const(_)
@@ -16243,10 +16288,7 @@ mod tests {
 
         let schedule = ir_schedule::schedule(&graph);
         assert!(
-            schedule
-                .blocks
-                .iter()
-                .any(|b| b.nodes.contains(&_narrowed)),
+            schedule.blocks.iter().any(|b| b.nodes.contains(&_narrowed)),
             "precondition: the unlowerable node must actually be scheduled, or \
              this test passes without exercising the catch-all"
         );
@@ -16272,7 +16314,12 @@ mod tests {
         graph.entry = start;
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
         let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
-        let m = graph.add(Op::ConstF(3.0f64.to_bits()), IrType::Double, vec![], Some(1));
+        let m = graph.add(
+            Op::ConstF(3.0f64.to_bits()),
+            IrType::Double,
+            vec![],
+            Some(1),
+        );
         // `jit_drem` — a call that returns into the body.
         let r = graph.add(Op::Rem, IrType::Double, vec![a, m], Some(2));
         // `a` is read again AFTER the call, so its range spans it.
@@ -16281,8 +16328,8 @@ mod tests {
         let schedule = ir_schedule::schedule(&graph);
 
         let plan = plan_slots(&graph, &schedule, None);
-        let residency = plan_register_residency(&graph, &schedule, &plan)
-            .expect("the allocation verifies");
+        let residency =
+            plan_register_residency(&graph, &schedule, &plan).expect("the allocation verifies");
         let reg_of_a = residency
             .as_ref()
             .and_then(|res| res.reg_of.get(a as usize).copied().flatten());
@@ -16477,7 +16524,10 @@ mod tests {
         // cached body emits at least as many as the uncached one.
         let home_store = [0xF2u8, 0x0F, 0x11, 0x85];
         let off_stores = count_seq(&off_code, &home_store);
-        assert!(off_stores > 0, "the fixture must store FP results to memory");
+        assert!(
+            off_stores > 0,
+            "the fixture must store FP results to memory"
+        );
         assert!(
             count_seq(&on_code, &home_store) >= off_stores,
             "a home store disappeared: the frame image is no longer complete \
@@ -16512,8 +16562,7 @@ mod tests {
         let schedule: &'static Schedule = Box::leak(Box::new(schedule));
         let plan: &'static SlotPlan = Box::leak(Box::new(plan_slots(graph, schedule, None)));
         let empty: &'static HashMap<usize, bool> = Box::leak(Box::new(HashMap::new()));
-        let no_direct: &'static HashMap<usize, (usize, bool)> =
-            Box::leak(Box::new(HashMap::new()));
+        let no_direct: &'static HashMap<usize, (usize, bool)> = Box::leak(Box::new(HashMap::new()));
         let no_ic: &'static HashMap<usize, (usize, usize)> = Box::leak(Box::new(HashMap::new()));
         let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
         let no_scopes: &'static InlineScopeTable = Box::leak(Box::new(InlineScopeTable::new()));
@@ -16549,7 +16598,11 @@ mod tests {
     /// `MOVUPS [rbp - disp32], xmm` and its load counterpart, for `reg < 8`.
     #[cfg(test)]
     fn movups_frame_needle(reg: u8, store: bool) -> [u8; 3] {
-        [0x0F, if store { 0x11 } else { 0x10 }, 0x85 | ((reg & 7) << 3)]
+        [
+            0x0F,
+            if store { 0x11 } else { 0x10 },
+            0x85 | ((reg & 7) << 3),
+        ]
     }
 
     /// **The** invariant: every exit restores exactly what the prologue saved.

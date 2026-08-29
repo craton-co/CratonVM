@@ -360,8 +360,6 @@ impl MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
-
-
     // --- JPMS module-access checks: classpath-only mock, permissive ---
     fn is_package_exported_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
         true
@@ -510,8 +508,6 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
-
-
     fn invoke_virtual(
         &mut self,
         _receiver: ObjectRef,
@@ -589,7 +585,6 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
-
     // --- minimal heap primitives used by the native under test ---
     fn new_array(&mut self, et: ArrayElementType, length: usize) -> ObjectRef {
         // W7-83: `et` used to be `_et`. The mock allocated every array as a
@@ -836,7 +831,6 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
-
     fn thread_id(&self) -> u64 {
         1
     }
@@ -892,7 +886,6 @@ impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
-
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
@@ -901,12 +894,9 @@ impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
     }
 }
 
-impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
-
-}
+impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {}
 
 impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
-
     fn record_printed_value(&mut self, _v: Value) {}
     fn record_printed_line(&mut self, _t: String) {}
     fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
@@ -993,9 +983,6 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
         None
     }
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Cross-module test serialization for `set_path_confine_to_cwd`.

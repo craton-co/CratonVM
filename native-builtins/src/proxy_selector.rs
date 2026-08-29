@@ -417,7 +417,11 @@ fn default_port_for(scheme: &str) -> u16 {
 // Java-side allocation helpers
 // ---------------------------------------------------------------------------
 
-fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_inet_socket_address(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: u16,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Wave 3-B² (RE.4): mirror real-JDK layout — slot 0 of the
     // InetSocketAddress holds an `InetSocketAddressHolder`, and the holder
     // stores hostname/addr/port at slots 0/1/2. Without the inner holder,
@@ -426,8 +430,11 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16)
     // and trip `java/lang/String.getPort()` NoSuchMethodError. See the
     // matching helper in `net_phase_e.rs`.
     let isa = try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2)?;
-    let holder =
-        try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
+    let holder = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    )?;
     let h = ctx.create_string(host);
     ctx.set_field(holder, 0, Value::Object(Some(h)));
     ctx.set_field(holder, 1, Value::Object(None));
@@ -470,13 +477,16 @@ fn proxy_type_constant(ctx: &mut dyn NativeContext, kind: i32) -> Option<ObjectR
 /// has generated placeholders and does not.
 fn has_synthetic_proxy_layout(ctx: &mut dyn NativeContext, p: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(p);
-    !ctx
-        .declared_fields(class_id)
+    !ctx.declared_fields(class_id)
         .iter()
         .any(|f| !f.is_static && f.name == "type")
 }
 
-fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_proxy(
+    ctx: &mut dyn NativeContext,
+    kind: i32,
+    addr: Option<ObjectRef>,
+) -> Result<ObjectRef, MethodCallFailed> {
     let p = try_alloc_concurrent_synthetic(ctx, "java/net/Proxy", 2)?;
     let addr_val = match addr {
         Some(a) => Value::Object(Some(a)),
@@ -506,8 +516,7 @@ fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) 
 /// `elementData`; a fabricated stub has `_fN` placeholders and does not.
 fn has_synthetic_list_layout(ctx: &mut dyn NativeContext, list: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(list);
-    !ctx
-        .declared_fields(class_id)
+    !ctx.declared_fields(class_id)
         .iter()
         .any(|f| !f.is_static && f.name == "elementData")
 }
@@ -523,7 +532,10 @@ fn has_synthetic_list_layout(ctx: &mut dyn NativeContext, list: ObjectRef) -> bo
 /// returned an EMPTY list where HotSpot returns `[DIRECT]`, and the caller's
 /// `get(0)` threw `IndexOutOfBoundsException`. There was no fault and no log
 /// line — the list was perfectly well-formed, it just had no elements.
-fn alloc_proxy_list(ctx: &mut dyn NativeContext, proxies: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_proxy_list(
+    ctx: &mut dyn NativeContext,
+    proxies: &[ObjectRef],
+) -> Result<ObjectRef, MethodCallFailed> {
     let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     // Pin across the backing-array allocation: a moving young GC there would
     // relocate the fresh list and leave this raw ref stale.
@@ -847,10 +859,13 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// `read_settings` reads process-global environment variables, so the
     /// tests that mutate them must not run concurrently with each other.

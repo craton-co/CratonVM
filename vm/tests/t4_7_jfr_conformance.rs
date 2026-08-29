@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use cratonvm_jfr::create_flight_recorder;
 use cratonvm_jfr::dump::JFR_MAGIC;
-use cratonvm_jfr::jdk_chunk::{JDK_HEADER_SIZE, JDK_MAJOR, JDK_MINOR};
 use cratonvm_jfr::event::{EventInstance, EventTypeId, EventValue};
+use cratonvm_jfr::jdk_chunk::{JDK_HEADER_SIZE, JDK_MAJOR, JDK_MINOR};
 use cratonvm_jfr::recording::{FlightRecorder, RecordingSettings, RecordingState};
 use cratonvm_jfr::stream::EventStream;
 

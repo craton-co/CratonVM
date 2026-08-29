@@ -54,6 +54,14 @@ scripts/baselines/jdk25-*.tsv text eol=lf
 # those tests at once, and every failure message points at registration
 # bookkeeping rather than at line endings.
 *.rs text eol=lf
+# CUDA sources and the PTX generated from them. nvcc emits CRLF on Windows,
+# and vm/src/runtime/kernels/mod.rs reads BOTH files back as text to check
+# they have not drifted apart (entry points, target arch, the TILE constant).
+# Left unpinned, a checkout on another platform changes their bytes and those
+# tests start failing for a reason that has nothing to do with the kernels --
+# which is exactly what the *.rs pin above already exists to prevent.
+*.cu  text eol=lf
+*.ptx text eol=lf
 
 # The same reasoning for the other tracked text the toolchain parses rather
 # than merely compiles.

@@ -697,7 +697,11 @@ impl GcBarrier {
     /// wrapper's doc). `mode = None` decides from `excluded_blocked`,
     /// read under the same lock `request_stw_counted_locked` populated it
     /// under, which is race-free by construction.
-    fn arrive_and_wait_inner(&self, tid: ThreadId, mode: Option<bool>) -> cratonvm_types::PointerMap {
+    fn arrive_and_wait_inner(
+        &self,
+        tid: ThreadId,
+        mode: Option<bool>,
+    ) -> cratonvm_types::PointerMap {
         // P1 shadow record: always self-called for the caller's own `tid`
         // (see the initiator short-circuit below), so this is the primary
         // binding point for the recorder.

@@ -794,7 +794,9 @@ fn lz4_write(
 
 fn lz4_bad_buffer(which: &str) -> MethodCallFailed {
     RuntimeError::IOException {
-        message: format!("lz4: {which} buffer is neither a byte[] nor a readable direct ByteBuffer"),
+        message: format!(
+            "lz4: {which} buffer is neither a byte[] nor a readable direct ByteBuffer"
+        ),
     }
     .into()
 }
@@ -1004,7 +1006,13 @@ fn lz4_decompress_safe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Some((_consumed, produced)) = lz4_block_decode(&input, &mut out) else {
         return Ok(Some(Value::Int(-1)));
     };
-    if !lz4_write(ctx, arg_obj(args, 4), arg_obj(args, 5), dst_off, &out[..produced]) {
+    if !lz4_write(
+        ctx,
+        arg_obj(args, 4),
+        arg_obj(args, 5),
+        dst_off,
+        &out[..produced],
+    ) {
         return Err(lz4_bad_buffer("decompress destination"));
     }
     Ok(Some(Value::Int(produced as i32)))
@@ -1499,9 +1507,12 @@ fn register_err_const(r: &mut NativeMethodRegistry, class: &str, name: &str) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Shapes chosen to reach every branch of the block grammar: an empty
     /// block, one shorter than the 15-byte literal-length escape, one long

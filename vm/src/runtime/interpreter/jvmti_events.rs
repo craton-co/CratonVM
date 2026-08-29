@@ -186,7 +186,12 @@ pub(super) fn fire_jvmti_frame_pop_if_requested(
 /// Cost when no agent is subscribed: a single `AtomicBool::Acquire` load
 /// (the per-event flag) plus one predicted branch.  No work otherwise.
 #[inline]
-pub(super) fn fire_jvmti_single_step(vm: usize, thread: &JvmThread, frame: &Frame, saved_pc: usize) {
+pub(super) fn fire_jvmti_single_step(
+    vm: usize,
+    thread: &JvmThread,
+    frame: &Frame,
+    saved_pc: usize,
+) {
     if !crate::runtime::jvmti::any_single_step_listener_active() {
         return;
     }

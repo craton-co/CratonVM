@@ -128,7 +128,9 @@ mod tests {
     /// Serialise the tests that read or drive the process-wide level.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Lower the global back to the floor for a test that needs headroom.
@@ -278,7 +280,11 @@ mod tests {
         // satisfy every assertion above.
         reset_to_floor();
         set_init_level(2);
-        assert_eq!(get_init_level(), 2, "set_init_level must store the level it is given");
+        assert_eq!(
+            get_init_level(),
+            2,
+            "set_init_level must store the level it is given"
+        );
 
         // Leave the global where the rest of this module expects it.
         set_init_level(4);

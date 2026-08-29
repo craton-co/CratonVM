@@ -211,11 +211,13 @@ pub fn parse_violations(report: &Value) -> Vec<ViolationTally> {
     for row in rows {
         let kind = violation_kind(row);
         let sample = violation_sample(row);
-        let tally = by_kind.entry(kind.clone()).or_insert_with(|| ViolationTally {
-            kind,
-            count: 0,
-            sample: None,
-        });
+        let tally = by_kind
+            .entry(kind.clone())
+            .or_insert_with(|| ViolationTally {
+                kind,
+                count: 0,
+                sample: None,
+            });
         tally.count += 1;
         if tally.sample.is_none() {
             tally.sample = sample;
@@ -363,7 +365,9 @@ mod tests {
 
     #[test]
     fn externally_tagged_violations_are_not_dropped() {
-        let report = json(r#"{"violations":[{"MissingNative":{"class":"a/B","method":"c","descriptor":"()V"}}]}"#);
+        let report = json(
+            r#"{"violations":[{"MissingNative":{"class":"a/B","method":"c","descriptor":"()V"}}]}"#,
+        );
         let tallies = parse_violations(&report);
         assert_eq!(tallies.len(), 1);
         assert_eq!(tallies[0].kind, "MissingNative");

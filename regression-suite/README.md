@@ -41,7 +41,7 @@ The script exits non-zero if any class fails, so it is CI-ready.
 A second class list, `SUITE=jdk-only`, drives the strict-mode corpus described
 in [`docs/feature-designs/jdk-only-mode.md`](../docs/feature-designs/jdk-only-mode.md).
 The vector-to-blocker mapping (against
-[`docs/jdk-only-runtime-services.md`](../docs/jdk-only-runtime-services.md)),
+[`docs/known-issues/jdk-only/runtime-services-blocker-inventory.md`](../docs/known-issues/jdk-only/runtime-services-blocker-inventory.md)),
 the determinism rules and the corpus's own known limitations live in
 [`jdk-only-coverage.txt`](jdk-only-coverage.txt).
 

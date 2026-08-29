@@ -18,9 +18,8 @@ use std::sync::OnceLock;
 
 use crate::arena::Arena;
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    HEADER_SIZE, REF_ELEMENT_SIZE,
-    SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE,
+    REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 use cratonvm_types::{ObjectRef, Value};
@@ -904,7 +903,8 @@ pub fn collect_with_finalizers(
             if header.kind() == ObjectKind::Array {
                 if header.element_type() == ArrayElementType::Reference {
                     for i in 0..header.array_length() as usize {
-                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
+                        let s_ptr =
+                            unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;

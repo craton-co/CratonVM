@@ -454,9 +454,17 @@ pub(crate) fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: Object
 /// Keying by identity hash and holding the list as a global GC root
 /// sidesteps field layout entirely -- correct for both real and synthetic
 /// loggers, and immune to future real-JDK field-order changes.
-fn jul_logger_handlers_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
-    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
-        OnceLock::new();
+fn jul_logger_handlers_table(
+    vm: usize,
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>,
+            >,
+        >,
+    > = OnceLock::new();
     crate::logmanager::per_vm_table(&T, vm)
 }
 
@@ -505,9 +513,17 @@ pub(crate) fn jul_logger_handlers_set(
 /// `Handler.setErrorManager` and `StreamHandler.flush`/`close` all run real
 /// bytecode there, over the real `errorManager` field.
 /// W7-64-printstream-trouble-and-errormanager.md
-fn jul_handler_error_manager_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
-    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
-        OnceLock::new();
+fn jul_handler_error_manager_table(
+    vm: usize,
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>,
+            >,
+        >,
+    > = OnceLock::new();
     crate::logmanager::per_vm_table(&T, vm)
 }
 
@@ -517,7 +533,10 @@ pub(crate) fn jul_handler_error_manager_get(
 ) -> Option<ObjectRef> {
     let vm = ctx.vm_identity();
     let key = ctx.identity_hash_code(handler);
-    let handle = *jul_handler_error_manager_table(vm).lock().unwrap().get(&key)?;
+    let handle = *jul_handler_error_manager_table(vm)
+        .lock()
+        .unwrap()
+        .get(&key)?;
     ctx.resolve_global_root(handle)
 }
 
@@ -558,9 +577,17 @@ pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: Obj
 /// `Logger$ConfigurationData` (reachable from slot 0 / `config`), while the
 /// flat synthetic loggers our `getLogger` natives mint hold their name there,
 /// so no raw slot index is safe for both shapes.
-fn jul_logger_parents_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
-    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
-        OnceLock::new();
+fn jul_logger_parents_table(
+    vm: usize,
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>,
+            >,
+        >,
+    > = OnceLock::new();
     crate::logmanager::per_vm_table(&T, vm)
 }
 
@@ -606,15 +633,31 @@ pub(crate) fn jul_logger_parent_set(
 /// GC-safe side table for Logger filters. Real JDK loggers keep a Filter in
 /// `Logger$ConfigurationData`, while our compact loggers do not have that
 /// shape; sharing neither raw layout is safe.
-fn jul_logger_filters_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
-    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
-        OnceLock::new();
+fn jul_logger_filters_table(
+    vm: usize,
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>,
+            >,
+        >,
+    > = OnceLock::new();
     crate::logmanager::per_vm_table(&T, vm)
 }
 
-fn jul_logger_filter_names_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
-    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<String, usize>>>>> =
-        OnceLock::new();
+fn jul_logger_filter_names_table(
+    vm: usize,
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static T: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                &'static std::sync::Mutex<std::collections::HashMap<String, usize>>,
+            >,
+        >,
+    > = OnceLock::new();
     crate::logmanager::per_vm_table(&T, vm)
 }
 
@@ -674,7 +717,11 @@ pub(crate) fn jul_logger_filter_set(
         ctx.remove_global_root(handle);
     }
     if let Some(name) = &name {
-        if let Some(handle) = jul_logger_filter_names_table(vm).lock().unwrap().remove(name) {
+        if let Some(handle) = jul_logger_filter_names_table(vm)
+            .lock()
+            .unwrap()
+            .remove(name)
+        {
             ctx.remove_global_root(handle);
         }
     }
@@ -727,7 +774,10 @@ fn jul_file_handler_state_table(
     crate::logmanager::per_vm_table(&T, vm)
 }
 
-pub(crate) fn jul_file_handler_filename(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+pub(crate) fn jul_file_handler_filename(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<String> {
     let vm = ctx.vm_identity();
     let key = ctx.identity_hash_code(this);
     jul_file_handler_state_table(vm)
@@ -761,7 +811,11 @@ pub(crate) fn jul_file_handler_is_closed(ctx: &mut dyn NativeContext, this: Obje
         .unwrap_or(false)
 }
 
-pub(crate) fn jul_file_handler_set_closed(ctx: &mut dyn NativeContext, this: ObjectRef, closed: bool) {
+pub(crate) fn jul_file_handler_set_closed(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    closed: bool,
+) {
     let vm = ctx.vm_identity();
     let key = ctx.identity_hash_code(this);
     let mut table = jul_file_handler_state_table(vm)
@@ -971,12 +1025,10 @@ fn printstream_value_of(
         Some(Value::Object(Some(obj))) => {
             match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])? {
                 Some(Value::Object(Some(s))) => Ok(ctx.read_string(s).unwrap_or_default()),
-                Some(Value::Object(None)) => {
-                    Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                        message: None,
-                    }
-                    .into())
-                }
+                Some(Value::Object(None)) => Err(
+                    cratonvm_types::error::RuntimeError::NullPointerException { message: None }
+                        .into(),
+                ),
                 _ => Ok(invoke_to_string(ctx, *obj)?),
             }
         }
@@ -1035,10 +1087,9 @@ fn native_printstream_init_outputstream(
     // never reports, because there is no sink to fail.
     let out_val = args.get(1).cloned().unwrap_or(Value::Object(None));
     if matches!(out_val, Value::Object(None)) {
-        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: None,
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
     }
     ctx.set_field(this, 0, out_val.clone());
     ctx.set_field_by_name(this, "out", out_val);
@@ -1382,10 +1433,9 @@ pub(crate) fn native_printstream_write(
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         Some(Value::Object(None)) => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
         _ => return Ok(None),
     };
@@ -1650,8 +1700,7 @@ fn native_printwriter_write_string(
             // create_string allocates, potentially triggering a compacting GC that moves
             // `out_obj` before it is passed to invoke_virtual).
             let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let written =
-                ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            let written = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
             // RECORDED since W7-64 — see the sibling range overload below.
             //
             // ROUTED since W7-81. This native resolves `out` itself and never
@@ -1664,10 +1713,9 @@ fn native_printwriter_write_string(
             // `IOException` still returns here, because HotSpot wrote the
             // characters nowhere and re-sending them would be a double write.
             // W7-81-write-route-three-way.md
-            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
-                ctx, this, written,
-            )
-            .routed();
+            let routed =
+                cratonvm_native_api::print_error_state::classify_write_failure(ctx, this, written)
+                    .routed();
             if routed {
                 return Ok(None);
             }
@@ -1704,10 +1752,9 @@ fn native_printwriter_write_string_range(
             // ROUTED since W7-81 — see the sibling `write(String)` overload
             // above for why this native needs the three-way answer of its own.
             // W7-81-write-route-three-way.md
-            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
-                ctx, this, written,
-            )
-            .routed();
+            let routed =
+                cratonvm_native_api::print_error_state::classify_write_failure(ctx, this, written)
+                    .routed();
             if routed {
                 return Ok(None);
             }
@@ -2047,7 +2094,7 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             // `LOGGER_FIELD_LEVEL = 1`, which is `manager: LogManager`.
             let stored = ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL);
             let current = jul_level_int(ctx, Some(stored)).unwrap_or(800); // default INFO
-            // A message is loggable if its level >= logger's current level
+                                                                           // A message is loggable if its level >= logger's current level
             Ok(Some(Value::Int(if arg_val >= current { 1 } else { 0 })))
         },
     );
@@ -2248,8 +2295,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             if let Ok(this) = obj_arg(args, 0) {
                 let cid = ctx.class_id_of_object(this);
-                if ctx.class_declares_method(cid, "getMDCAdapterClassStr", "()Ljava/lang/String;")
-                {
+                if ctx.class_declares_method(cid, "getMDCAdapterClassStr", "()Ljava/lang/String;") {
                     if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
                         this,
                         "getMDCAdapterClassStr",
@@ -2337,8 +2383,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             // correct backend and must not be second-guessed here.
             if let Ok(this) = obj_arg(args, 0) {
                 let cid = ctx.class_id_of_object(this);
-                if ctx.class_declares_method(cid, "getLoggerFactory", "()Lorg/slf4j/ILoggerFactory;")
-                {
+                if ctx.class_declares_method(
+                    cid,
+                    "getLoggerFactory",
+                    "()Lorg/slf4j/ILoggerFactory;",
+                ) {
                     if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
                         this,
                         "getLoggerFactory",
@@ -3304,10 +3353,12 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             // layouts the VM produces. On the 13-field `logmanager` Logger that
             // `Logger.getLogger(name)` actually returns, slot 0 is not the name
             // and in the synthetic-JDK build is not even an object.
-            Ok(Some(match crate::logmanager::jul_logger_name_object(&*ctx, this) {
-                Some(name) => Value::Object(Some(name)),
-                None => Value::Object(Some(ctx.create_string(""))),
-            }))
+            Ok(Some(
+                match crate::logmanager::jul_logger_name_object(&*ctx, this) {
+                    Some(name) => Value::Object(Some(name)),
+                    None => Value::Object(Some(ctx.create_string(""))),
+                },
+            ))
         },
     );
     registry.register(
@@ -3703,7 +3754,8 @@ fn mdc_set_context_map_at(
         };
     // Convert set to array via toArray (HashSet has 1-field backing array structure).
     // Iterate the set's backing storage instead by getting size first.
-    let size_val = cratonvm_native_collections::native_map_size_pub(ctx, &[Value::Object(Some(map))]);
+    let size_val =
+        cratonvm_native_collections::native_map_size_pub(ctx, &[Value::Object(Some(map))]);
     let size = match size_val {
         Ok(Some(Value::Int(n))) => n,
         _ => 0,
@@ -3741,9 +3793,12 @@ fn mdc_set_context_map_at(
 
 #[cfg(test)]
 mod logback_construction_registration_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn logback_context_construction_and_state_are_not_native_overridden() {

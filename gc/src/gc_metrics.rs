@@ -343,7 +343,8 @@ pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
     with_counters(|c| {
         c.cset_verify_objects.fetch_add(objects, Ordering::Relaxed);
         c.cset_verify_pauses.fetch_add(1, Ordering::Relaxed);
-        c.cset_verify_dangling.fetch_add(dangling, Ordering::Relaxed);
+        c.cset_verify_dangling
+            .fetch_add(dangling, Ordering::Relaxed);
         if truncated {
             c.cset_verify_truncated.fetch_add(1, Ordering::Relaxed);
         }
@@ -385,7 +386,8 @@ pub fn record_refinement(nanos: u64) {
 /// again by the end-of-run summary so a report taken outside a pause is current.
 pub fn record_heap_occupancy(allocated_objects: u64, allocated_bytes: u64, live_bytes: u64) {
     with_counters(|c| {
-        c.allocated_objects.store(allocated_objects, Ordering::Relaxed);
+        c.allocated_objects
+            .store(allocated_objects, Ordering::Relaxed);
         c.allocated_bytes.store(allocated_bytes, Ordering::Relaxed);
         c.live_bytes.store(live_bytes, Ordering::Relaxed);
     });
@@ -1162,7 +1164,10 @@ pub mod g1_degraded {
                 "evacuation-failure-drain-wedged",
             ),
             (MARK_WORKLIST_OVERFLOW, "mark-worklist-overflow-rescan"),
-            (MARK_IMPLAUSIBLE_HEADER, "mark-implausible-header-retain-all"),
+            (
+                MARK_IMPLAUSIBLE_HEADER,
+                "mark-implausible-header-retain-all",
+            ),
             (
                 CLEANUP_CLOSURE_INCOMPLETE,
                 "cleanup-closure-incomplete-retain-all",
@@ -1171,7 +1176,10 @@ pub mod g1_degraded {
             (JIT_PINNED_REGIONS_EXCLUDED, "jit-pinned-regions-excluded"),
             (PARALLEL_EVACUATOR, "parallel-evacuator"),
             (EMPTY_COLLECTION_SET, "empty-collection-set"),
-            (ROOT_COVERAGE_INCOMPLETE, "root-coverage-incomplete-no-evacuation"),
+            (
+                ROOT_COVERAGE_INCOMPLETE,
+                "root-coverage-incomplete-no-evacuation",
+            ),
             (JIT_PUBLICATION_EMPTY, "jit-publication-empty-no-evacuation"),
         ];
         TABLE
@@ -1579,7 +1587,10 @@ mod tests {
         assert_eq!(d.sequence, 1);
         assert_eq!(d.backend, "generational");
         assert!(!d.young_moving, "a coverage fallback is a NON-moving cycle");
-        assert_eq!(d.incomplete_reason, incomplete_reason::UNPUBLISHED_FRAME_OOP);
+        assert_eq!(
+            d.incomplete_reason,
+            incomplete_reason::UNPUBLISHED_FRAME_OOP
+        );
 
         let text = collector_decision_report();
         assert!(text.contains("NON-MOVING"), "{text}");

@@ -251,8 +251,7 @@ pub const Z_REMAPPED: u64 = 1u64 << (Z_METADATA_SHIFT + 2); // bit 44
 pub const Z_FINALIZABLE: u64 = 1u64 << (Z_METADATA_SHIFT + 3); // bit 45
 
 /// Mask selecting the whole 4-bit metadata field (bits 45-42).
-pub const Z_METADATA_MASK: u64 =
-    ((1u64 << Z_METADATA_BITS) - 1) << Z_METADATA_SHIFT;
+pub const Z_METADATA_MASK: u64 = ((1u64 << Z_METADATA_BITS) - 1) << Z_METADATA_SHIFT;
 
 /// CratonVM-specific: bit 63, set on every non-null colored word.
 ///
@@ -270,8 +269,7 @@ pub const Z_COLORED_TAG: u64 = 1u64 << 63;
 /// into a canonical user-space virtual address if CratonVM ever adopts real
 /// OS multi-mapping (see the module docs). That requires everything at bit 46
 /// and above to be zero.
-pub const Z_RESERVED_MBZ_MASK: u64 =
-    !(Z_OFFSET_MASK | Z_METADATA_MASK | Z_COLORED_TAG);
+pub const Z_RESERVED_MBZ_MASK: u64 = !(Z_OFFSET_MASK | Z_METADATA_MASK | Z_COLORED_TAG);
 
 /// The null colored word. Carries no tag and no metadata: it is the all-zero
 /// word an untouched heap slot already holds, so a zeroed page is a page full
@@ -1223,7 +1221,9 @@ mod tests {
         // Untagged: an ordinary machine pointer.
         assert!(!is_well_formed(0x7F00_0000_1000));
         // Tagged but two metadata bits.
-        assert!(!is_well_formed(Z_COLORED_TAG | Z_MARKED0 | Z_REMAPPED | 0x40));
+        assert!(!is_well_formed(
+            Z_COLORED_TAG | Z_MARKED0 | Z_REMAPPED | 0x40
+        ));
         // Tagged but no metadata bit.
         assert!(!is_well_formed(Z_COLORED_TAG | 0x40));
         // Tagged with a reserved bit set.
@@ -1265,7 +1265,10 @@ mod tests {
     #[test]
     fn null_is_bad_free_but_not_good() {
         let mask = ZGoodMask::new();
-        assert!(!mask.is_bad(Z_NULL), "null must pass the bad-mask fast path");
+        assert!(
+            !mask.is_bad(Z_NULL),
+            "null must pass the bad-mask fast path"
+        );
         assert!(
             !mask.is_good(Z_NULL),
             "null cannot pass the good-mask fast path without a null check"
@@ -1335,8 +1338,8 @@ mod tests {
     fn weak_bad_tolerates_remapped_and_finalizable() {
         let mask = ZGoodMask::new();
         mask.flip_to_mark(); // good = Marked0
-        // A strong load through a merely-Remapped or Finalizable pointer must
-        // take the slow path...
+                             // A strong load through a merely-Remapped or Finalizable pointer must
+                             // take the slow path...
         assert!(mask.is_bad(color(32, ZColor::Remapped)));
         assert!(mask.is_bad(color(32, ZColor::Finalizable)));
         // ...but a weak load must not, or Reference.get would resurrect.

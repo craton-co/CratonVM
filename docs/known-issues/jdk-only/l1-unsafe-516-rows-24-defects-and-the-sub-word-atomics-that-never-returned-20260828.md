@@ -699,3 +699,38 @@ corpus gives 58 errors, because the vectors depend on a named module the suite
 assembles first. Every counter read zero because no vector ran. **A zero from a
 run that did not happen is not a zero** — the count now reuses `run.sh`'s own
 build and prints how many vectors it actually executed.
+
+---
+
+## 10. The probes are no longer in the tree — where they went, 2026-08-29
+
+`3b2901531` *"major doc consistency update before the realeas"* (the repo
+owner, pre-release) **removed the whole `probes/` directory: 867 files,
+110,716 lines.** That took this lane's four probes with it, along with every
+other lane's.
+
+This section exists so the next reader does not conclude the measurements were
+never made, or go looking for a directory that was deliberately retired.
+
+| probe | what it measures |
+| --- | --- |
+| `UnsafeShadowSweep.java` | the 457-row differential sweep, both modes |
+| `UnsafeNullArgProbe.java` | 33 null / out-of-bounds rows, one call per process |
+| `UnsafeSubwordProbe.java` | 26 sub-word atomic rows, behind a timeout |
+| `AllocBoundary.java` | the `allocateMemory` IAE/OOME boundary, 17 sizes |
+| `UnsafeImageCensus.java` | the multi-image declaration census of §9.1 |
+| `unsafe-l1-residual-counts.sh` | the §9.2 / §9.3 counters over the corpus |
+
+They are recoverable from git history — `git show 0d6033a86 -- probes/` for the
+first four, `git show 8087d63aa -- probes/` for the last two — and the working
+copies are on the Linux build host under `/data/l1u-probes/`.
+
+The instruments that stayed are the ones in the VM itself:
+`note_unsafe_side_store_offset` in `native-builtins/src/unsafe_natives_ext.rs`
+is still wired to all 21 null-base fallback sites, so §9.3's open question can
+be answered by anyone who runs a workload — no probe needed, just stderr.
+
+Re-adding the probe sources was **not** the resolution taken here. The removal
+is a deliberate release decision by the repo owner, and a merge that quietly
+resurrects three files of a directory somebody just retired is the wrong kind
+of conflict resolution.

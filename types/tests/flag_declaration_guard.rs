@@ -419,9 +419,13 @@ fn the_scanner_only_matches_whole_string_literals() {
         vec!["CRATONVM_REAL_AQS", "CRATONVM_SYNTHETIC_AQS"]
     );
     // Prose is skipped before it ever reaches the matcher.
-    assert!(is_comment_line(r#"/// `"CRATONVM_DBG_A2"` prints the A2 trace."#));
+    assert!(is_comment_line(
+        r#"/// `"CRATONVM_DBG_A2"` prints the A2 trace."#
+    ));
     assert!(is_comment_line(r#"     * `"CRATONVM_DBG_A2"` again."#));
-    assert!(!is_comment_line(r#"    let x = var("CRATONVM_DBG_A2"); // note"#));
+    assert!(!is_comment_line(
+        r#"    let x = var("CRATONVM_DBG_A2"); // note"#
+    ));
     // The regression this file's `is_comment_line` docs describe: a deref at
     // the start of a line is not a block-comment continuation.
     assert!(!is_comment_line(

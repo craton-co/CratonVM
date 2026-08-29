@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use crate::try_alloc_concurrent_synthetic;
-use crate::try_alloc_with_appended_slots;
 use crate::lang_math::alloc_wrapper;
 use crate::obj_arg;
+use crate::try_alloc_concurrent_synthetic;
+use crate::try_alloc_with_appended_slots;
 
 // ---------------------------------------------------------------------------
 // Cached `CRATONVM_DBG_BB` env-var lookup
@@ -97,12 +97,7 @@ fn cache_get(cache: &ClassNameCache, vm: usize, class_id: ClassId) -> Option<Arc
 }
 
 #[inline]
-fn cache_insert(
-    cache: &ClassNameCache,
-    vm: usize,
-    class_id: ClassId,
-    value: Arc<str>,
-) -> Arc<str> {
+fn cache_insert(cache: &ClassNameCache, vm: usize, class_id: ClassId, value: Arc<str>) -> Arc<str> {
     let map = cache_get_or_init(cache);
     map.write()
         .insert((vm, class_id.as_u32()), Arc::clone(&value));
@@ -339,9 +334,12 @@ fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &st
         // Taking the `$`-split tail instead returned the compiler's ordinal
         // ("1"), which regression-suite `RReflect` catches as
         // "anonymous getSimpleName empty".
-        Some((_outer, inner_name)) => {
-            cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, Arc::from(inner_name))
-        }
+        Some((_outer, inner_name)) => cache_insert(
+            &SIMPLE_CLASS_NAME_CACHE,
+            ctx.vm_identity(),
+            class_id,
+            Arc::from(inner_name),
+        ),
         None => simple_class_name(ctx.vm_identity(), class_id, name),
     }
 }
@@ -402,7 +400,12 @@ pub(crate) fn canonical_class_name(
     } else {
         Arc::from(slashed.replace('/', "."))
     };
-    cache_insert(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, canonical)
+    cache_insert(
+        &CANONICAL_CLASS_NAME_CACHE,
+        ctx.vm_identity(),
+        class_id,
+        canonical,
+    )
 }
 
 /// Package name (dotted) for a class. For `java/lang/Object` returns
@@ -1911,7 +1914,8 @@ pub(crate) fn native_class_get_name(
                         return Ok(Some(Value::Object(Some(name_obj))));
                     }
                 }
-                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
+                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id)
+                {
                     let name_obj = ctx.create_string(&arc);
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
@@ -2485,11 +2489,10 @@ pub(crate) fn native_class_get_resource_as_stream(
                         let cls = ctx
                             .class_name_of_id(ctx.class_id_of_object(stream))
                             .unwrap_or_default();
-                        let avail =
-                            match ctx.invoke_virtual(stream, "available", "()I", &[]) {
-                                Ok(Some(Value::Int(n))) => n.to_string(),
-                                other => format!("{other:?}"),
-                            };
+                        let avail = match ctx.invoke_virtual(stream, "available", "()I", &[]) {
+                            Ok(Some(Value::Int(n))) => n.to_string(),
+                            other => format!("{other:?}"),
+                        };
                         eprintln!("[CLASS-RES]   delegated -> stream {cls} available={avail}");
                     }
                     Ok(_) => eprintln!("[CLASS-RES]   delegated -> NULL"),
@@ -3053,7 +3056,7 @@ pub(crate) fn native_class_for_name(
                 // HotSpot's is a bare NPE with no message.
                 message: None,
             }
-            .into())
+            .into());
         }
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
@@ -3089,35 +3092,37 @@ pub(crate) fn native_class_for_name(
         // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
         //
         // MEASURED on JDK 25, and asserted by two vectors that were already in
-        // the tree before this branch existed:
+        // the tree before this arm existed:
         //
         //   Class.forName("[Lp.X;")   ->  CNFE msg="p.X"   cause=null
         //   Class.forName("[[Lp.X;")  ->  CNFE msg="p.X"   cause=null
         //
         // `regression-suite/src/RExceptions.java:382` and
         // `RJdkFailure.java:168` both check exactly this, and both turned red
-        // when this branch was added with `&dotted_name` -- the descriptor --
-        // as the message. HotSpot resolves the descriptor down to the element
+        // when this arm was added with `&dotted_name` -- the descriptor -- as
+        // the message. HotSpot resolves the descriptor down to the element
         // class and reports the resolution that actually failed, which is the
         // name a caller can act on: `[Lp.X;` is not a name anything can be
         // asked for again.
-        let element = {
-            let mut e = dotted_name.trim_start_matches('[');
-            if e.starts_with('L') && e.ends_with(';') {
-                e = &e[1..e.len() - 1];
-            }
-            // A descriptor whose element is not a reference type (`[I`, or a
-            // malformed spelling) has no element NAME to report; keep what the
-            // caller passed rather than inventing one.
-            if e.is_empty() { dotted_name.clone() } else { e.to_string() }
-        };
+        //
+        // Through `for_name_cnfe_name`, which is exactly this rule and is what
+        // the two loader arms further down already call. Two lanes fixed this
+        // on the same day and the other one re-derived the extraction inline;
+        // a third copy of a rule that already has a named home is how the
+        // multi-dimension case (`[[Lp.X;`) ends up handled in two places and
+        // then in one. The helper delegates to
+        // `cratonvm_classloading::array_descriptor_element_class`, which strips
+        // every dimension and returns `None` -- so the caller's own name
+        // survives -- for `[I` and for malformed spellings.
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &element,
+            &for_name_cnfe_name(&dotted_name),
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc?,
+        ));
     }
 
     // BUG-06 вЂ” mark this thread as inside a reflective class-existence probe for
@@ -3361,7 +3366,8 @@ pub(crate) fn native_class_for_name(
                 );
                 if s111_dbg_enabled()
                     && (dotted_name.contains("ConditionalOnMissingBean")
-                        || dotted_name.contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
+                        || dotted_name
+                            .contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
                 {
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         let cid = ctx.class_id_from_mirror(mirror_ref);
@@ -4506,8 +4512,7 @@ pub(crate) fn mirror_is_array(ctx: &dyn NativeContext, mirror: ObjectRef) -> boo
 /// surface has had already leaned.
 pub(crate) fn mirror_is_public(ctx: &dyn NativeContext, mirror: ObjectRef) -> bool {
     const ACC_PUBLIC: u16 = 0x0001;
-    mirror_class_id(ctx, mirror)
-        .is_some_and(|cid| ctx.class_access_flags(cid) & ACC_PUBLIC != 0)
+    mirror_class_id(ctx, mirror).is_some_and(|cid| ctx.class_access_flags(cid) & ACC_PUBLIC != 0)
 }
 
 /// Instance-field index of `java/lang/Class.primitive` (a `boolean`),
@@ -4900,9 +4905,10 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     declaring_class_id: ClassId,
 ) -> cratonvm_types::ObjectRef {
     let loader_faithful = crate::classloader::loader_aware_resolution()
-        || crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()).is_some_and(
-            |loader| crate::classloader::url_classloader_isolated_from_app(ctx, loader),
-        );
+        || crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
+            .is_some_and(|loader| {
+                crate::classloader::url_classloader_isolated_from_app(ctx, loader)
+            });
     // Arrays inherit the defining loader of their reference component
     // (JVMS 5.3.3). ClassManager currently interns array ClassIds globally, so
     // its canonical array mirror would lose a child loader's component identity.
@@ -4925,9 +4931,10 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
                     .class_id_defined_by_loader_exact(inner, loader_id as u32)
                     .is_some()
             {
-                if let Some(loader) =
-                    crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
-                {
+                if let Some(loader) = crate::classloader::defining_loader_for(
+                    ctx.vm_identity(),
+                    declaring_class_id.as_u32(),
+                ) {
                     let loader_pin = ctx.pin_native_root(loader);
                     let mirror = synthetic_class_mirror(ctx, desc);
                     let loader = ctx.read_native_pin(loader_pin, loader);
@@ -4954,9 +4961,10 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             // defining-loader side table is authoritative for that case. Use
             // it for an exact already-loaded lookup first, then initiate the
             // descriptor through that loader if necessary.
-            if let Some(loader) =
-                crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
-            {
+            if let Some(loader) = crate::classloader::defining_loader_for(
+                ctx.vm_identity(),
+                declaring_class_id.as_u32(),
+            ) {
                 if let Some(mirror) =
                     crate::classloader::find_loaded_class_for_loader(ctx, loader, inner)
                 {
@@ -5065,7 +5073,8 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
                 .class_id_by_name(inner)
                 .is_some_and(|cid| ctx.loader_id_of_class(cid) >= 3);
             if foreign_copy_would_win {
-                if let Ok(cid) = ctx.class_id_by_name_via_referencing_class(declaring_class_id, inner)
+                if let Ok(cid) =
+                    ctx.class_id_by_name_via_referencing_class(declaring_class_id, inner)
                 {
                     return ctx.get_class_mirror(cid);
                 }
@@ -5663,8 +5672,7 @@ pub(crate) fn coerce_arg_strict_msg(
                     // appends this verbatim ("вЂ¦due to: argument type mismatch"), so
                     // a descriptive message would diverge from HotSpot.
                     let _ = src;
-                    widen_primitive_value(value, src, expected_desc)
-                        .ok_or_else(|| mismatch())
+                    widen_primitive_value(value, src, expected_desc).ok_or_else(|| mismatch())
                 }
                 Value::Object(Some(obj)) => {
                     let wrapper_cid = ctx.class_id_of_object(obj);
@@ -5689,8 +5697,7 @@ pub(crate) fn coerce_arg_strict_msg(
                         Value::Object(None) => by_slot0,
                         v => v,
                     };
-                    widen_primitive_value(raw, src_prim, expected_desc)
-                        .ok_or_else(|| mismatch())
+                    widen_primitive_value(raw, src_prim, expected_desc).ok_or_else(|| mismatch())
                 }
                 Value::Object(None) => Err(mismatch()),
                 _ => Err(illegal_arg_exc(format!(
@@ -5938,9 +5945,9 @@ pub(crate) fn wrap_as_invocation_target_exception(
         MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(re)) => {
             let Some((class_name, message)) = re.as_java_throwable() else {
                 // `NotImplemented` -- a VM gap, not something the callee threw.
-                return MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Runtime(re),
-                );
+                return MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                    re,
+                ));
             };
             // Own the message so `re` is free again for the failure path below.
             // `into_owned` covers both halves of the `Cow`: a borrowed message
@@ -6202,7 +6209,10 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
     // `Spr15042Tests` 0/1. They are kept as a fallback for the one input the
     // delegation cannot take: a mirror with no resolvable `ClassId`.
     if let Some(target_cid) = mirror_class_id(ctx, declaring) {
-        if ctx.check_deep_reflection_access(accessor_cid, target_cid).is_ok() {
+        if ctx
+            .check_deep_reflection_access(accessor_cid, target_cid)
+            .is_ok()
+        {
             if trace {
                 eprintln!("[setacc] allowed: java.base opens java.lang to the accessor");
             }
@@ -6380,12 +6390,9 @@ pub(crate) fn enforce_set_accessible_gate(
     // JEP 403: setAccessible(true) is where the check is paid, so
     // `accessible_override` is false even though the caller is trying to
     // *become* accessible.
-    let Err(msg) = check_reflection_module_access_with_target_id(
-        ctx,
-        &target_class_name,
-        target_cid,
-        false,
-    ) else {
+    let Err(msg) =
+        check_reflection_module_access_with_target_id(ctx, &target_class_name, target_cid, false)
+    else {
         return Ok(());
     };
     if target_cid.is_some_and(|cid| set_accessible_export_carve_out(ctx, this, cid)) {
@@ -7258,9 +7265,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     } else {
         let recv =
             receiver.ok_or_else(
-                || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: None,
-                },
+                || cratonvm_types::error::RuntimeError::NullPointerException { message: None },
             )?;
         reject_array_field_receiver(ctx, recv, "Field.get")?;
         ctx.get_field(recv, slot)
@@ -7462,9 +7467,7 @@ declaring={} (cid={class_id:?}, loader={})",
     } else {
         let recv =
             receiver.ok_or_else(
-                || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: None,
-                },
+                || cratonvm_types::error::RuntimeError::NullPointerException { message: None },
             )?;
         reject_array_field_receiver(ctx, recv, "Field.set")?;
         ctx.set_field(recv, slot, coerced);
@@ -7681,9 +7684,7 @@ fn field_get_raw(
     } else {
         let recv =
             receiver.ok_or_else(
-                || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: None,
-                },
+                || cratonvm_types::error::RuntimeError::NullPointerException { message: None },
             )?;
         reject_array_field_receiver(ctx, recv, "Field typed getter")?;
         Ok(ctx.get_field(recv, slot))
@@ -7914,9 +7915,7 @@ fn field_set_raw(
     } else {
         let recv =
             receiver.ok_or_else(
-                || cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: None,
-                },
+                || cratonvm_types::error::RuntimeError::NullPointerException { message: None },
             )?;
         ctx.set_field(recv, slot, coerced);
     }
@@ -8715,7 +8714,11 @@ pub(crate) fn create_method_object(
     let class_comp = class_component_id(ctx);
     let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        Ok(descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], decl_cid))
+        Ok(descriptor_to_class_mirror_via_loader(
+            ctx,
+            &param_descs[i],
+            decl_cid,
+        ))
     })?;
     let param_arr_pin = ctx.pin_native_root(param_arr);
 
@@ -8834,7 +8837,8 @@ pub(crate) fn create_method_object(
         eprintln!(
             "METHOD-NAMED-WRITE-MISSED class={} name={} — real layout present but \
              clazz/name did not read back; leaving the JDK fields alone",
-            ctx.class_name_of_id(meta.declaring_class_id).unwrap_or_default(),
+            ctx.class_name_of_id(meta.declaring_class_id)
+                .unwrap_or_default(),
             meta.name
         );
     }
@@ -9728,12 +9732,12 @@ pub(crate) fn native_method_invoke(
             _ => false,
         };
         if !caller_entitled {
-        // NOTE: dev landed a NARROWER fix for the same defect while this was
-        // in flight — a same-class-only carve-out, motivated by HikariConfig's
-        // private-final AtomicReference and measured on Temurin 25 as legal for
-        // both private (0x0002) and package-private (0x0008). This rule SUBSUMES
-        // it: `caller_may_access_member`'s first arm is the declaring class
-        // itself. Kept the wider rule; dev's evidence recorded here.
+            // NOTE: dev landed a NARROWER fix for the same defect while this was
+            // in flight — a same-class-only carve-out, motivated by HikariConfig's
+            // private-final AtomicReference and measured on Temurin 25 as legal for
+            // both private (0x0002) and package-private (0x0008). This rule SUBSUMES
+            // it: `caller_may_access_member`'s first arm is the declaring class
+            // itself. Kept the wider rule; dev's evidence recorded here.
             check_access(
                 modifiers,
                 false,
@@ -9807,12 +9811,9 @@ pub(crate) fn native_method_invoke(
                 .into(),
             );
         }
-    } else if let Err(msg) = check_reflection_export_access_with_target_id(
-        ctx,
-        &class_name,
-        declaring_cid,
-        accessible,
-    ) {
+    } else if let Err(msg) =
+        check_reflection_export_access_with_target_id(ctx, &class_name, declaring_cid, accessible)
+    {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalAccessException {
                 message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
@@ -9849,8 +9850,7 @@ pub(crate) fn native_method_invoke(
             receiver.ok_or_else(
                 || cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some(
-                        "Cannot invoke \"Object.getClass()\" because \"obj\" is null"
-                            .to_string(),
+                        "Cannot invoke \"Object.getClass()\" because \"obj\" is null".to_string(),
                     ),
                 },
             )?;
@@ -10905,7 +10905,9 @@ fn link_isolated_method_signatures(
     declaring_class_id: ClassId,
     methods: &[&MethodMetadata],
 ) -> Result<(), MethodCallFailed> {
-    let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()) else {
+    let Some(loader) =
+        crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
+    else {
         return Ok(());
     };
     if !crate::classloader::url_classloader_isolated_from_app(ctx, loader) {
@@ -10989,7 +10991,10 @@ fn link_isolated_method_signatures(
     Ok(())
 }
 
-fn isolated_loader_class_not_found(ctx: &mut dyn NativeContext, name: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn isolated_loader_class_not_found(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     let exception = crate::jboss_module_loader::alloc_single_message_exception(
         ctx,
         "java/lang/NoClassDefFoundError",
@@ -11111,7 +11116,7 @@ pub(crate) fn native_class_get_declared_methods(
             // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
             // answers differently on CratonVM for
             // `AbstractStringBuilder.substring(int)` on a mocked
-            // `StringBuilder` (see 
+            // `StringBuilder` (see
             // CRATONVM-SPRING-GENUINE-BUGLIST's MockitoBeanByTypeLookup
             // entry). Landing this alone does NOT flip that specific
             // `isOverridden` answer -- confirmed by direct A/B: calling
@@ -11445,7 +11450,9 @@ pub(crate) fn native_class_get_declared_method(
     // class file's own method table вЂ” which is still empty for the synthetic
     // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
     // can invoke it (the invoke is intercepted natively elsewhere).
-    if let Ok(Some(method_obj)) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
+    if let Ok(Some(method_obj)) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -11735,7 +11742,11 @@ pub(crate) fn create_constructor_object(
     let class_comp = class_component_id(ctx);
     let ctor_decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        Ok(descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], ctor_decl_cid))
+        Ok(descriptor_to_class_mirror_via_loader(
+            ctx,
+            &param_descs[i],
+            ctor_decl_cid,
+        ))
     })?;
     let param_arr_pin = ctx.pin_native_root(param_arr);
     let desc_str = ctx.create_string(&meta.descriptor);
@@ -12251,12 +12262,9 @@ pub(crate) fn native_constructor_new_instance(
                 .into(),
             );
         }
-    } else if let Err(msg) = check_reflection_export_access_with_target_id(
-        ctx,
-        &class_name,
-        declaring_cid,
-        accessible,
-    ) {
+    } else if let Err(msg) =
+        check_reflection_export_access_with_target_id(ctx, &class_name, declaring_cid, accessible)
+    {
         // JEP 261: `exports`, not `opens`. A public ctor previously got NO
         // module check at all -- the comment above got the exports/opens
         // distinction right and the code then implemented "needs nothing".
@@ -12372,11 +12380,9 @@ pub(crate) fn native_constructor_new_instance(
             //
             // Spring's `beanDefinitionWithAbstractClass` depends on the TYPE
             // (see the note above), which is unchanged.
-            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-                "java/lang/InstantiationException",
-                "()V",
-                &[],
-            ) {
+            if let Ok(Some(Value::Object(Some(exc)))) =
+                ctx.new_object_initialized("java/lang/InstantiationException", "()V", &[])
+            {
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                     exc,
                 ));
@@ -12657,9 +12663,12 @@ fn collect_public_fields(
         }
     }
     let field_component = reflection_component_id(ctx, "java/lang/reflect/Field");
-    Ok(build_mirror_array_comp(ctx, field_component, metas.len(), |ctx, i| {
-        Ok(create_field_object(ctx, &metas[i]))
-    })?)
+    Ok(build_mirror_array_comp(
+        ctx,
+        field_component,
+        metas.len(),
+        |ctx, i| Ok(create_field_object(ctx, &metas[i])),
+    )?)
 }
 
 /// Collect all public methods from the class hierarchy.
@@ -12831,9 +12840,12 @@ fn collect_public_methods(
     // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
     // same fix, same residual-gap doc reference.
     let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
-    Ok(build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
-        Ok(create_method_object(ctx, &metas[i])?)
-    })?)
+    Ok(build_mirror_array_comp(
+        ctx,
+        method_component,
+        metas.len(),
+        |ctx, i| Ok(create_method_object(ctx, &metas[i])?),
+    )?)
 }
 
 pub(crate) fn native_class_get_fields(
@@ -13184,7 +13196,9 @@ pub(crate) fn native_class_get_method(
     // launcher path occasionally hits `getMethod` instead of
     // `getDeclaredMethod`; both must produce a usable Method mirror for the
     // boot to continue.
-    if let Ok(Some(method_obj)) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
+    if let Ok(Some(method_obj)) =
+        wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
+    {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -13751,7 +13765,9 @@ pub fn set_proxy_last_interfaces(vm_identity: usize, arr: ObjectRef) {
 /// CURRENT (post-relocation) `ObjectRef` because the cell is remapped by
 /// [`gc_update_annotation_proxy_refs`].
 pub fn proxy_last_interfaces(vm_identity: usize) -> Option<ObjectRef> {
-    PROXY_LAST_INTERFACES.peek(vm_identity, |cell| *cell).flatten()
+    PROXY_LAST_INTERFACES
+        .peek(vm_identity, |cell| *cell)
+        .flatten()
 }
 
 /// Build-or-fetch the cached annotation proxy for `ann` as seen on
@@ -13764,20 +13780,35 @@ pub fn proxy_last_interfaces(vm_identity: usize) -> Option<ObjectRef> {
 /// declaring class.  Real-JDK class-definition hooks can omit a direct object
 /// record for generated Ehcache JAXB model classes; their sibling `ConfigType`
 /// in the same namespace retains the authoritative loader identity.
-fn annotation_container_loader(ctx: &mut dyn NativeContext, holder_class_id: ClassId) -> Option<ObjectRef> {
+fn annotation_container_loader(
+    ctx: &mut dyn NativeContext,
+    holder_class_id: ClassId,
+) -> Option<ObjectRef> {
     let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
-    crate::classloader::defining_loader_for(ctx.vm_identity(), holder_class_id.as_u32()).or_else(|| {
-        holder_name.starts_with("org/ehcache/xml/model/").then(|| {
-            ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
-                .and_then(|sibling| crate::classloader::defining_loader_for(ctx.vm_identity(), sibling.as_u32()))
-                .or_else(|| {
-                    let id = ctx.loader_id_of_class(holder_class_id);
-                    (id >= 3)
-                        .then(|| crate::classloader::loader_object_for_namespace_id(id as u32))
-                        .flatten()
+    crate::classloader::defining_loader_for(ctx.vm_identity(), holder_class_id.as_u32()).or_else(
+        || {
+            holder_name
+                .starts_with("org/ehcache/xml/model/")
+                .then(|| {
+                    ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
+                        .and_then(|sibling| {
+                            crate::classloader::defining_loader_for(
+                                ctx.vm_identity(),
+                                sibling.as_u32(),
+                            )
+                        })
+                        .or_else(|| {
+                            let id = ctx.loader_id_of_class(holder_class_id);
+                            (id >= 3)
+                                .then(|| {
+                                    crate::classloader::loader_object_for_namespace_id(id as u32)
+                                })
+                                .flatten()
+                        })
                 })
-        }).flatten()
-    })
+                .flatten()
+        },
+    )
 }
 
 fn cached_annotation_proxy_for_key(
@@ -13841,9 +13872,7 @@ fn cached_annotation_proxy_resolving(
     // user-defined loader, and `getAnnotation(X)` is hot enough that paying
     // that on every hit would be a real cost — the point of this cache is that
     // a repeat lookup touches nothing.
-    if let Some(cached) =
-        peek_annotation_proxy_cache(ctx, queried_class_id, &ann.type_descriptor)
-    {
+    if let Some(cached) = peek_annotation_proxy_cache(ctx, queried_class_id, &ann.type_descriptor) {
         return Ok(Some(cached));
     }
     let Some(ann_class_id) = resolve_annotation_type_near(ctx, ann, Some(queried_class_id)) else {
@@ -13865,7 +13894,9 @@ fn peek_annotation_proxy_cache(
     let vm = ctx.vm_identity();
     ANNOTATION_PROXY_CACHE
         .peek(vm, |table| {
-            table.get(&(holder_class_id.as_u32(), key.to_string())).copied()
+            table
+                .get(&(holder_class_id.as_u32(), key.to_string()))
+                .copied()
         })
         .flatten()
 }
@@ -14021,8 +14052,7 @@ fn wrap_annotation_in_real_proxy(
             Ok(Some(Value::Object(Some(loader_obj)))) => Some(loader_obj),
             _ => None,
         };
-    let annotation_loader_pin =
-        annotation_loader.map(|loader_obj| ctx.pin_native_root(loader_obj));
+    let annotation_loader_pin = annotation_loader.map(|loader_obj| ctx.pin_native_root(loader_obj));
     let loader_namespace: u32 = annotation_loader
         .zip(annotation_loader_pin)
         .map(|(loader_obj, pin)| {
@@ -14058,7 +14088,11 @@ fn wrap_annotation_in_real_proxy(
     if let (Some(loader_obj), Some(pin)) = (annotation_loader, annotation_loader_pin) {
         let loader_cur = ctx.read_native_pin(pin, loader_obj);
         if crate::classloader::is_user_defined_loader(ctx, loader_cur) {
-            crate::classloader::register_defining_loader(ctx.vm_identity(), proxy_cid.as_u32(), loader_cur);
+            crate::classloader::register_defining_loader(
+                ctx.vm_identity(),
+                proxy_cid.as_u32(),
+                loader_cur,
+            );
         }
     }
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
@@ -14072,11 +14106,7 @@ fn wrap_annotation_in_real_proxy(
     let iface_arr_pin = ctx.pin_native_root(iface_arr);
     let iface_arr_cur = ctx.read_native_pin(iface_arr_pin, iface_arr);
     let type_mirror_cur = ctx.read_native_pin(ann_mirror_pin, type_mirror);
-    ctx.set_array_element(
-        iface_arr_cur,
-        0,
-        Value::Object(Some(type_mirror_cur)),
-    );
+    ctx.set_array_element(iface_arr_cur, 0, Value::Object(Some(type_mirror_cur)));
     let real_cur = ctx.read_native_pin(real_pin, real);
     let iface_arr_cur = ctx.read_native_pin(iface_arr_pin, iface_arr);
     ctx.set_field(real_cur, 1, Value::Object(Some(iface_arr_cur)));
@@ -14181,7 +14211,10 @@ fn ctx_annotation_proxy_elements(
     Ok(out)
 }
 
-fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> Result<i32, MethodCallFailed> {
+fn ctx_annotation_value_hash(
+    ctx: &mut dyn NativeContext,
+    val: Value,
+) -> Result<i32, MethodCallFailed> {
     match val {
         Value::Int(i) => Ok(i),
         Value::Long(l) => Ok((l ^ (l >> 32)) as i32),
@@ -14218,7 +14251,10 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> Result<
     }
 }
 
-fn ctx_annotation_array_hash(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Result<i32, MethodCallFailed> {
+fn ctx_annotation_array_hash(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
     let n = ctx.array_length(arr);
     let mut h: i32 = 1;
     for i in 0..n {
@@ -14240,7 +14276,10 @@ fn ctx_annotation_member_hash(
 }
 
 /// Mirrors `annotation_proxy_hash_code` in vm_exec.rs.
-pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> Result<i32, MethodCallFailed> {
+pub(crate) fn ctx_annotation_proxy_hash_code(
+    ctx: &mut dyn NativeContext,
+    proxy: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
     let elems = ctx_annotation_proxy_elements(ctx, proxy)?;
     let mut h: i32 = 0;
     for (name, val) in elems {
@@ -14249,7 +14288,11 @@ pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy:
     Ok(h)
 }
 
-fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) -> Result<bool, MethodCallFailed> {
+fn ctx_annotation_values_equal(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, MethodCallFailed> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x == y),
         (Value::Long(x), Value::Long(y)) => Ok(x == y),
@@ -14412,7 +14455,10 @@ fn ctx_java_string_escape(s: &str) -> String {
     out
 }
 
-fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Result<String, MethodCallFailed> {
+fn ctx_format_annotation_value(
+    ctx: &mut dyn NativeContext,
+    val: Value,
+) -> Result<String, MethodCallFailed> {
     match val {
         Value::Object(None) => Ok("null".to_string()),
         Value::Int(i) => Ok(i.to_string()),
@@ -14482,7 +14528,10 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
     }
 }
 
-fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Result<String, MethodCallFailed> {
+fn ctx_format_annotation_array(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+) -> Result<String, MethodCallFailed> {
     let n = ctx.array_length(arr);
     let mut s = String::from("[");
     for i in 0..n {
@@ -14864,8 +14913,10 @@ fn resolve_annotation_type_class_id(
             // through the declaring member's INITIATING loader. A bare global
             // lookup can miss an application dependency that is visible to
             // that member and can lose identity under an isolated loader.
-            container_class_id
-                .and_then(|h| ctx.class_id_by_name_via_referencing_class(h, class_name).ok())
+            container_class_id.and_then(|h| {
+                ctx.class_id_by_name_via_referencing_class(h, class_name)
+                    .ok()
+            })
         })?;
     // "Resolved" has to mean "resolved to an ANNOTATION TYPE".
     //
@@ -14908,9 +14959,9 @@ fn is_annotation_type(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
     if ctx.class_access_flags(class_id) & ACC_ANNOTATION != 0 {
         return true;
     }
-    ctx.class_interfaces(class_id).into_iter().any(|i| {
-        ctx.class_name_arc_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
-    })
+    ctx.class_interfaces(class_id)
+        .into_iter()
+        .any(|i| ctx.class_name_arc_of_id(i).as_deref() == Some("java/lang/annotation/Annotation"))
 }
 
 /// The IDENTITY half: the declaring class's ("container's") own loader, as
@@ -14991,8 +15042,7 @@ fn create_annotation_proxy_with_type(
 ) -> Result<ObjectRef, MethodCallFailed> {
     // Allocating the proxy itself can relocate a user-defined declaring
     // loader before the first loader-aware annotation-type lookup.
-    let container_loader_pin =
-        container_loader.map(|loader| ctx.pin_native_root(loader));
+    let container_loader_pin = container_loader.map(|loader| ctx.pin_native_root(loader));
     // W7-12/W7-17 — `ensure_vm_internal_class`, not the compatibility door.
     //
     // `java/lang/annotation/AnnotationProxy` is a name NO JDK declares
@@ -15069,9 +15119,7 @@ fn create_annotation_proxy_with_type(
         };
         annotation_desc_to_class_name(&ann.type_descriptor)
             .map(|n| n.to_string())
-            .and_then(|name| {
-                resolve_annotation_type_via_container_loader(ctx, &name, loader_cur)
-            })
+            .and_then(|name| resolve_annotation_type_via_container_loader(ctx, &name, loader_cur))
             .unwrap_or(ann_class_id)
     };
     let ann_class_id_opt = Some(ann_class_id);
@@ -15158,19 +15206,17 @@ fn create_annotation_proxy_with_type(
     if ann.type_descriptor == "Lorg/springframework/aot/hint/annotation/Reflective;" {
         let has_explicit_value = ann.elements.iter().any(|(name, _)| name == "value");
         let has_explicit_processors = ann.elements.iter().any(|(name, _)| name == "processors");
-        let value_index = all_elements.iter().position(|(name, _, _, _)| name == "value");
+        let value_index = all_elements
+            .iter()
+            .position(|(name, _, _, _)| name == "value");
         let processors_index = all_elements
             .iter()
             .position(|(name, _, _, _)| name == "processors");
         match (value_index, processors_index) {
-            (Some(value), Some(processors))
-                if has_explicit_value && !has_explicit_processors =>
-            {
+            (Some(value), Some(processors)) if has_explicit_value && !has_explicit_processors => {
                 all_elements[processors].1 = all_elements[value].1.clone();
             }
-            (Some(value), Some(processors))
-                if has_explicit_processors && !has_explicit_value =>
-            {
+            (Some(value), Some(processors)) if has_explicit_processors && !has_explicit_value => {
                 all_elements[value].1 = all_elements[processors].1.clone();
             }
             _ => {}
@@ -15278,11 +15324,7 @@ fn create_annotation_proxy_with_type(
     names_arr = ctx.read_native_pin(names_pin, names_arr);
     values_arr = ctx.read_native_pin(values_pin, values_arr);
     proxy = ctx.read_native_pin(proxy_pin, proxy);
-    ctx.set_field(
-        proxy,
-        ANN_PROXY_ELEM_NAMES,
-        Value::Object(Some(names_arr)),
-    );
+    ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     proxy = ctx.read_native_pin(proxy_pin, proxy);
     values_arr = ctx.read_native_pin(values_pin, values_arr);
     ctx.set_field(
@@ -15335,7 +15377,9 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Result<Value, MethodCallFailed> {
-    Ok(annotation_element_to_java_typed(ctx, val, None, None, None, None)?)
+    Ok(annotation_element_to_java_typed(
+        ctx, val, None, None, None, None,
+    )?)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -15414,512 +15458,528 @@ pub(crate) fn annotation_element_to_java_typed(
     annotation_class_id: Option<ClassId>,
 ) -> Result<Value, MethodCallFailed> {
     use cratonvm_native_api::AnnotationElementValue;
-    let container_loader_pin =
-        container_loader.map(|loader| ctx.pin_native_root(loader));
+    let container_loader_pin = container_loader.map(|loader| ctx.pin_native_root(loader));
     let result = (|| -> Result<Value, MethodCallFailed> {
         match val {
-        AnnotationElementValue::Int(v) => {
-            // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
-            // boolean/byte/char/short/int (the `.class` AnnotationDefault
-            // attribute encodes Z/B/C/S/I tags as int constants in the CP).
-            // When the caller knows the annotation method's return-type
-            // descriptor we must box into the matching wrapper, else
-            // Spring's `TypeMappedAnnotation.adapt` rejects e.g.
-            // `proxyBeanMethods` (declared `boolean`) when given an Integer
-            // (`should be compatible with java.lang.Boolean but a
-            // java.lang.Integer value was returned`), causing
-            // `ConfigurationClassParser.processImports` to silently drop the
-            // `@Import(AutoConfigurationImportSelector.class)` directive on
-            // `@SpringBootApplication` and ultimately surfacing as
-            // `MissingWebServerFactoryBeanException`.
-            let (wrapper, value) = match return_type_desc {
-                Some("Z") => ("java/lang/Boolean", Value::Int(if *v != 0 { 1 } else { 0 })),
-                Some("B") => ("java/lang/Byte", Value::Int(*v as i8 as i32)),
-                Some("C") => ("java/lang/Character", Value::Int(*v & 0xFFFF)),
-                Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
-                _ => ("java/lang/Integer", Value::Int(*v)),
-            };
-            boxed_annotation_primitive(ctx, wrapper, value)
-        }
-        AnnotationElementValue::Long(v) => {
-            boxed_annotation_primitive(ctx, "java/lang/Long", Value::Long(*v))
-        }
-        AnnotationElementValue::Float(v) => {
-            boxed_annotation_primitive(ctx, "java/lang/Float", Value::Float(*v))
-        }
-        AnnotationElementValue::Double(v) => {
-            boxed_annotation_primitive(ctx, "java/lang/Double", Value::Double(*v))
-        }
-        AnnotationElementValue::StringVal(s) => {
-            let str_obj = ctx.create_string(s);
-            Ok(Value::Object(Some(str_obj)))
-        }
-        AnnotationElementValue::Enum(type_desc, const_name) => {
-            // Resolve the enum class from the type descriptor and create the constant.
-            // type_desc is like "Ljava/lang/annotation/RetentionPolicy;" вЂ” strip L and ;
-            let class_name = type_desc
-                .strip_prefix('L')
-                .and_then(|s| s.strip_suffix(';'))
-                .unwrap_or(type_desc);
-            // S111r19 вЂ” load the enum class on demand if not yet loaded.
-            // Annotation proxies are materialised eagerly during the
-            // declaring class's load, but the enum class referenced by the
-            // annotation's element values (e.g. `FilterType` in
-            // `@ComponentScan.Filter.type`) often is **not** yet loaded.
-            // Previously we fell straight through to the synthetic fallback
-            // which writes ordinal=0 вЂ” collapsing `FilterType.CUSTOM`
-            // (real ordinal 4) onto `ANNOTATION` (ordinal 0) and sending
-            // Spring's `ComponentScanAnnotationParser.typeFiltersFor` into
-            // the wrong switch case, surfacing as `IllegalArgumentException`
-            // wrapped at `ConfigurationClassParser.parse:181`.  Load the
-            // class on demand, mirroring the sibling `Class` arm (C29).
-            //
-            // Loader-faithful resolution (found via
-            // `SpringBootContextLoaderAotTests`, `@CompileWithForkedClassLoader`):
-            // `ctx.class_id_by_name` is a GLOBAL "one class per name" lookup.
-            // Under a forked/isolating classloader, the annotation's declaring
-            // class (and the bytecode that later compares this default value
-            // via `==`, e.g. `useMainMethod == UseMainMethod.NEVER` in
-            // `SpringBootContextLoader.getMainMethod`) is loaded by the FORKED
-            // loader, but the global table can still resolve `class_name` to
-            // the outer/app loader's copy of the enum class — producing a
-            // same-named but reference-UNEQUAL enum constant (default
-            // `UseMainMethod.NEVER` from the wrong loader), so the `==` check
-            // silently fails and `useMainMethod` behaves as if it were
-            // `ALWAYS` (ordinal 0). Mirror the `Class`-valued arm above: when
-            // `container_loader` is present, resolve the enum type through it
-            // first via `loadClass`, so the SAME loader's copy backs both the
-            // default value and the bytecode's own reference to the constant.
-            let iae_trace = crate::nbflags().iae_trace_ok;
-            let loader_cur = match (container_loader, container_loader_pin) {
-                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
-                _ => None,
-            };
-            let via_loader = loader_cur.and_then(|loader| {
-                match resolve_annotation_class_via_loader(ctx, loader, class_name) {
-                    Ok(mirror) => ctx.class_id_from_mirror(mirror),
-                    Err(_) => None,
-                }
-            });
-            let annotation_scope = annotation_class_id.and_then(|annotation_class| {
-                ctx.class_id_by_name_near(class_name, annotation_class)
-            });
-            // An application-loaded annotation can lack an ObjectRef for its
-            // defining loader while its ClassId still carries the correct
-            // namespace. Prefer that scoped lookup to the global table.
-            let via_container_scope = container_class_id
-                .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-            let enum_cid_opt = annotation_scope.or(via_loader).or(via_container_scope).or_else(|| {
-                // Resolve an annotation enum reference through the declaring
-                // member's initiating loader. A bare global lookup can miss an
-                // application dependency that is visible to that member (for
-                // example Mockito's `Mock$Strictness`) and can also lose the
-                // correct identity under an isolated loader.
-                container_class_id.and_then(|holder| {
-                    ctx.class_id_by_name_via_referencing_class(holder, class_name)
-                        .ok()
-                })
-            }).or_else(|| {
-                ctx.class_id_by_name(class_name).or_else(|| {
-                    let _ = ctx.load_class(class_name);
-                    ctx.class_id_by_name(class_name)
-                })
-            });
-            if let Some(enum_cid) = enum_cid_opt {
-                // GC-safety (2026-07-16): this is the "enum builder" residual
-                // gap flagged (but never swept) in
-                // fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
-                // — `class_mirror` is held in a Rust local across the
-                // allocating `create_string` call (and the `Enum.valueOf`
-                // invocation itself, which can allocate/classload) before
-                // being used as an invoke argument. Pin it and re-read the
-                // forwarded reference right before use.
-                let class_mirror = ctx.get_class_mirror(enum_cid);
-                let class_mirror_pin = ctx.pin_native_root(class_mirror);
-                let name_str = ctx.create_string(const_name);
-                let name_pin = ctx.pin_native_root(name_str);
-                let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
-                let name_str = ctx.read_native_pin(name_pin, name_str);
-                let invoke_res = ctx.invoke(
-                    "java/lang/Enum",
-                    "valueOf",
-                    "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
-                    &[
-                        Value::Object(Some(class_mirror)),
-                        Value::Object(Some(name_str)),
-                    ],
-                );
-                ctx.unpin_native_roots(class_mirror_pin);
-                if iae_trace {
-                    eprintln!(
-                        "ANN-ENUM class={class_name} const={const_name} ok={}",
-                        invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
-                    );
-                }
-                if let Ok(Some(val)) = invoke_res {
-                    return Ok(val);
-                }
-            } else if iae_trace {
-                eprintln!("ANN-ENUM class={class_name} const={const_name} CLASS-NOT-FOUND");
+            AnnotationElementValue::Int(v) => {
+                // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
+                // boolean/byte/char/short/int (the `.class` AnnotationDefault
+                // attribute encodes Z/B/C/S/I tags as int constants in the CP).
+                // When the caller knows the annotation method's return-type
+                // descriptor we must box into the matching wrapper, else
+                // Spring's `TypeMappedAnnotation.adapt` rejects e.g.
+                // `proxyBeanMethods` (declared `boolean`) when given an Integer
+                // (`should be compatible with java.lang.Boolean but a
+                // java.lang.Integer value was returned`), causing
+                // `ConfigurationClassParser.processImports` to silently drop the
+                // `@Import(AutoConfigurationImportSelector.class)` directive on
+                // `@SpringBootApplication` and ultimately surfacing as
+                // `MissingWebServerFactoryBeanException`.
+                let (wrapper, value) = match return_type_desc {
+                    Some("Z") => ("java/lang/Boolean", Value::Int(if *v != 0 { 1 } else { 0 })),
+                    Some("B") => ("java/lang/Byte", Value::Int(*v as i8 as i32)),
+                    Some("C") => ("java/lang/Character", Value::Int(*v & 0xFFFF)),
+                    Some("S") => ("java/lang/Short", Value::Int(*v as i16 as i32)),
+                    _ => ("java/lang/Integer", Value::Int(*v)),
+                };
+                boxed_annotation_primitive(ctx, wrapper, value)
             }
-            // Fallback: allocate a synthetic enum instance with the name and ordinal
-            if iae_trace {
-                eprintln!("ANN-ENUM FALLBACK class={class_name} const={const_name} ordinal=0");
+            AnnotationElementValue::Long(v) => {
+                boxed_annotation_primitive(ctx, "java/lang/Long", Value::Long(*v))
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
-            let obj_pin = ctx.pin_native_root(obj);
-            let name_str = ctx.create_string(const_name);
-            let name_pin = ctx.pin_native_root(name_str);
-            let obj_cur = ctx.read_native_pin(obj_pin, obj);
-            let name_cur = ctx.read_native_pin(name_pin, name_str);
-            ctx.set_field(obj_cur, 0, Value::Object(Some(name_cur)));
-            let obj_cur = ctx.read_native_pin(obj_pin, obj);
-            ctx.set_field(obj_cur, 1, Value::Int(0)); // ordinal
-            let obj_cur = ctx.read_native_pin(obj_pin, obj);
-            ctx.unpin_native_roots(obj_pin);
-            Ok(Value::Object(Some(obj_cur)))
-        }
-        AnnotationElementValue::Class(desc) => {
-            // Return Class mirror. If the target class is not yet loaded
-            // (common for annotation defaults that reference sibling classes
-            // like picocli's NoOpModelTransformer), load it on demand. A null
-            // return here causes downstream NullPointerExceptions (C29).
-            let iae_trace_cls = crate::nbflags().iae_trace_ok;
-            if let Some(class_name) = annotation_desc_to_class_name(desc) {
-                // Classloader-isolation: when the declaring class was loaded by a
-                // user-defined loader, resolve the Class member THROUGH that loader
-                // (HotSpot's `AnnotationParser.parseClassValue(sig, container)`). A
-                // `ClassNotFoundException` becomes a deferred `TypeNotPresentException`
-                // (stored as the member value, thrown at access). This honors a
-                // FilteringClassLoader that rejects the referenced type; without it
-                // the global resolve below would silently return the app-loaded
-                // class and the filter would be bypassed.
+            AnnotationElementValue::Float(v) => {
+                boxed_annotation_primitive(ctx, "java/lang/Float", Value::Float(*v))
+            }
+            AnnotationElementValue::Double(v) => {
+                boxed_annotation_primitive(ctx, "java/lang/Double", Value::Double(*v))
+            }
+            AnnotationElementValue::StringVal(s) => {
+                let str_obj = ctx.create_string(s);
+                Ok(Value::Object(Some(str_obj)))
+            }
+            AnnotationElementValue::Enum(type_desc, const_name) => {
+                // Resolve the enum class from the type descriptor and create the constant.
+                // type_desc is like "Ljava/lang/annotation/RetentionPolicy;" вЂ” strip L and ;
+                let class_name = type_desc
+                    .strip_prefix('L')
+                    .and_then(|s| s.strip_suffix(';'))
+                    .unwrap_or(type_desc);
+                // S111r19 вЂ” load the enum class on demand if not yet loaded.
+                // Annotation proxies are materialised eagerly during the
+                // declaring class's load, but the enum class referenced by the
+                // annotation's element values (e.g. `FilterType` in
+                // `@ComponentScan.Filter.type`) often is **not** yet loaded.
+                // Previously we fell straight through to the synthetic fallback
+                // which writes ordinal=0 вЂ” collapsing `FilterType.CUSTOM`
+                // (real ordinal 4) onto `ANNOTATION` (ordinal 0) and sending
+                // Spring's `ComponentScanAnnotationParser.typeFiltersFor` into
+                // the wrong switch case, surfacing as `IllegalArgumentException`
+                // wrapped at `ConfigurationClassParser.parse:181`.  Load the
+                // class on demand, mirroring the sibling `Class` arm (C29).
+                //
+                // Loader-faithful resolution (found via
+                // `SpringBootContextLoaderAotTests`, `@CompileWithForkedClassLoader`):
+                // `ctx.class_id_by_name` is a GLOBAL "one class per name" lookup.
+                // Under a forked/isolating classloader, the annotation's declaring
+                // class (and the bytecode that later compares this default value
+                // via `==`, e.g. `useMainMethod == UseMainMethod.NEVER` in
+                // `SpringBootContextLoader.getMainMethod`) is loaded by the FORKED
+                // loader, but the global table can still resolve `class_name` to
+                // the outer/app loader's copy of the enum class — producing a
+                // same-named but reference-UNEQUAL enum constant (default
+                // `UseMainMethod.NEVER` from the wrong loader), so the `==` check
+                // silently fails and `useMainMethod` behaves as if it were
+                // `ALWAYS` (ordinal 0). Mirror the `Class`-valued arm above: when
+                // `container_loader` is present, resolve the enum type through it
+                // first via `loadClass`, so the SAME loader's copy backs both the
+                // default value and the bytecode's own reference to the constant.
+                let iae_trace = crate::nbflags().iae_trace_ok;
                 let loader_cur = match (container_loader, container_loader_pin) {
                     (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                     _ => None,
                 };
-                if let Some(loader) = loader_cur {
-                    let owned = class_name.to_string();
-                    match resolve_annotation_class_via_loader(ctx, loader, &owned) {
-                        Ok(mirror) => {
-                            if iae_trace_cls {
-                                eprintln!(
+                let via_loader = loader_cur.and_then(|loader| {
+                    match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                        Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                        Err(_) => None,
+                    }
+                });
+                let annotation_scope = annotation_class_id.and_then(|annotation_class| {
+                    ctx.class_id_by_name_near(class_name, annotation_class)
+                });
+                // An application-loaded annotation can lack an ObjectRef for its
+                // defining loader while its ClassId still carries the correct
+                // namespace. Prefer that scoped lookup to the global table.
+                let via_container_scope = container_class_id
+                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+                let enum_cid_opt = annotation_scope
+                    .or(via_loader)
+                    .or(via_container_scope)
+                    .or_else(|| {
+                        // Resolve an annotation enum reference through the declaring
+                        // member's initiating loader. A bare global lookup can miss an
+                        // application dependency that is visible to that member (for
+                        // example Mockito's `Mock$Strictness`) and can also lose the
+                        // correct identity under an isolated loader.
+                        container_class_id.and_then(|holder| {
+                            ctx.class_id_by_name_via_referencing_class(holder, class_name)
+                                .ok()
+                        })
+                    })
+                    .or_else(|| {
+                        ctx.class_id_by_name(class_name).or_else(|| {
+                            let _ = ctx.load_class(class_name);
+                            ctx.class_id_by_name(class_name)
+                        })
+                    });
+                if let Some(enum_cid) = enum_cid_opt {
+                    // GC-safety (2026-07-16): this is the "enum builder" residual
+                    // gap flagged (but never swept) in
+                    // fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+                    // — `class_mirror` is held in a Rust local across the
+                    // allocating `create_string` call (and the `Enum.valueOf`
+                    // invocation itself, which can allocate/classload) before
+                    // being used as an invoke argument. Pin it and re-read the
+                    // forwarded reference right before use.
+                    let class_mirror = ctx.get_class_mirror(enum_cid);
+                    let class_mirror_pin = ctx.pin_native_root(class_mirror);
+                    let name_str = ctx.create_string(const_name);
+                    let name_pin = ctx.pin_native_root(name_str);
+                    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
+                    let name_str = ctx.read_native_pin(name_pin, name_str);
+                    let invoke_res = ctx.invoke(
+                        "java/lang/Enum",
+                        "valueOf",
+                        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+                        &[
+                            Value::Object(Some(class_mirror)),
+                            Value::Object(Some(name_str)),
+                        ],
+                    );
+                    ctx.unpin_native_roots(class_mirror_pin);
+                    if iae_trace {
+                        eprintln!(
+                            "ANN-ENUM class={class_name} const={const_name} ok={}",
+                            invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
+                        );
+                    }
+                    if let Ok(Some(val)) = invoke_res {
+                        return Ok(val);
+                    }
+                } else if iae_trace {
+                    eprintln!("ANN-ENUM class={class_name} const={const_name} CLASS-NOT-FOUND");
+                }
+                // Fallback: allocate a synthetic enum instance with the name and ordinal
+                if iae_trace {
+                    eprintln!("ANN-ENUM FALLBACK class={class_name} const={const_name} ordinal=0");
+                }
+                let obj = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
+                let obj_pin = ctx.pin_native_root(obj);
+                let name_str = ctx.create_string(const_name);
+                let name_pin = ctx.pin_native_root(name_str);
+                let obj_cur = ctx.read_native_pin(obj_pin, obj);
+                let name_cur = ctx.read_native_pin(name_pin, name_str);
+                ctx.set_field(obj_cur, 0, Value::Object(Some(name_cur)));
+                let obj_cur = ctx.read_native_pin(obj_pin, obj);
+                ctx.set_field(obj_cur, 1, Value::Int(0)); // ordinal
+                let obj_cur = ctx.read_native_pin(obj_pin, obj);
+                ctx.unpin_native_roots(obj_pin);
+                Ok(Value::Object(Some(obj_cur)))
+            }
+            AnnotationElementValue::Class(desc) => {
+                // Return Class mirror. If the target class is not yet loaded
+                // (common for annotation defaults that reference sibling classes
+                // like picocli's NoOpModelTransformer), load it on demand. A null
+                // return here causes downstream NullPointerExceptions (C29).
+                let iae_trace_cls = crate::nbflags().iae_trace_ok;
+                if let Some(class_name) = annotation_desc_to_class_name(desc) {
+                    // Classloader-isolation: when the declaring class was loaded by a
+                    // user-defined loader, resolve the Class member THROUGH that loader
+                    // (HotSpot's `AnnotationParser.parseClassValue(sig, container)`). A
+                    // `ClassNotFoundException` becomes a deferred `TypeNotPresentException`
+                    // (stored as the member value, thrown at access). This honors a
+                    // FilteringClassLoader that rejects the referenced type; without it
+                    // the global resolve below would silently return the app-loaded
+                    // class and the filter would be bypassed.
+                    let loader_cur = match (container_loader, container_loader_pin) {
+                        (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                        _ => None,
+                    };
+                    if let Some(loader) = loader_cur {
+                        let owned = class_name.to_string();
+                        match resolve_annotation_class_via_loader(ctx, loader, &owned) {
+                            Ok(mirror) => {
+                                if iae_trace_cls {
+                                    eprintln!(
                                     "ANN-CLASS desc={desc} class={owned} via-container-loader ok"
                                 );
+                                }
+                                return Ok(Value::Object(Some(mirror)));
                             }
-                            return Ok(Value::Object(Some(mirror)));
-                        }
-                        Err(Some(cnfe)) => {
-                            if iae_trace_cls {
-                                eprintln!("ANN-CLASS desc={desc} class={owned} container-loader CNFE -> TypeNotPresentException");
+                            Err(Some(cnfe)) => {
+                                if iae_trace_cls {
+                                    eprintln!("ANN-CLASS desc={desc} class={owned} container-loader CNFE -> TypeNotPresentException");
+                                }
+                                if let Some(tnpe) = make_type_not_present_exception(
+                                    ctx,
+                                    &owned.replace('/', "."),
+                                    Some(cnfe),
+                                    true,
+                                ) {
+                                    return Ok(Value::Object(Some(tnpe)));
+                                }
+                                // Could not build the sentinel вЂ” fall through to global.
                             }
-                            if let Some(tnpe) = make_type_not_present_exception(
-                                ctx,
-                                &owned.replace('/', "."),
-                                Some(cnfe),
-                                true,
-                            ) {
-                                return Ok(Value::Object(Some(tnpe)));
+                            Err(None) => {
+                                // Loader returned null / internal error вЂ” fall through
+                                // to the global resolution below (best-effort).
                             }
-                            // Could not build the sentinel вЂ” fall through to global.
-                        }
-                        Err(None) => {
-                            // Loader returned null / internal error вЂ” fall through
-                            // to the global resolution below (best-effort).
                         }
                     }
-                }
-                let scoped = container_class_id
-                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-                // A `Class`-valued member names a type the CONTAINER refers to,
-                // so it resolves with the container's initiating loader
-                // (HotSpot: `parseClassValue` -> `Class.forName(n, false,
-                // container.getClassLoader())`). `class_id_by_name_near` covers
-                // that loader's own namespace and the built-in delegation chain
-                // it inherits, but only for names ALREADY resolved there;
-                // driving the container's loader covers the first use too. The
-                // sibling `Enum` arm has taken that step since the
-                // `SpringBootContextLoaderAotTests` fix — this arm had not, and
-                // fell straight through to the loader-BLIND `class_id_by_name`
-                // instead.
-                //
-                // That fallback answers with whatever single loader happens to
-                // have the name, which under `@CompileWithForkedClassLoader` is
-                // the FORK: an Application-loaded log4j `@PluginAttribute`
-                // (loader 2) was handed the fork's (loader 3)
-                // `PluginAttributeVisitor`, and every class reached from there
-                // — `AbstractPluginVisitor`, `TypeConverters`,
-                // `TypeConverterRegistry` — was forked too, so an app-world
-                // `ConfigurationStrSubstitutor` could not be cast to the
-                // visitor's fork-world `StrSubstitutor`. log4j then dropped
-                // every `<Logger>` element of its configuration.
-                let driven = scoped.is_none().then(|| {
-                    container_class_id.and_then(|holder| {
-                        ctx.class_id_by_name_via_referencing_class(holder, class_name).ok()
-                    })
-                }).flatten();
-                if let Some(cid) = scoped.or(driven).or_else(|| ctx.class_id_by_name(class_name)) {
-                    let mirror = ctx.get_class_mirror(cid);
+                    let scoped = container_class_id
+                        .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+                    // A `Class`-valued member names a type the CONTAINER refers to,
+                    // so it resolves with the container's initiating loader
+                    // (HotSpot: `parseClassValue` -> `Class.forName(n, false,
+                    // container.getClassLoader())`). `class_id_by_name_near` covers
+                    // that loader's own namespace and the built-in delegation chain
+                    // it inherits, but only for names ALREADY resolved there;
+                    // driving the container's loader covers the first use too. The
+                    // sibling `Enum` arm has taken that step since the
+                    // `SpringBootContextLoaderAotTests` fix — this arm had not, and
+                    // fell straight through to the loader-BLIND `class_id_by_name`
+                    // instead.
+                    //
+                    // That fallback answers with whatever single loader happens to
+                    // have the name, which under `@CompileWithForkedClassLoader` is
+                    // the FORK: an Application-loaded log4j `@PluginAttribute`
+                    // (loader 2) was handed the fork's (loader 3)
+                    // `PluginAttributeVisitor`, and every class reached from there
+                    // — `AbstractPluginVisitor`, `TypeConverters`,
+                    // `TypeConverterRegistry` — was forked too, so an app-world
+                    // `ConfigurationStrSubstitutor` could not be cast to the
+                    // visitor's fork-world `StrSubstitutor`. log4j then dropped
+                    // every `<Logger>` element of its configuration.
+                    let driven = scoped
+                        .is_none()
+                        .then(|| {
+                            container_class_id.and_then(|holder| {
+                                ctx.class_id_by_name_via_referencing_class(holder, class_name)
+                                    .ok()
+                            })
+                        })
+                        .flatten();
+                    if let Some(cid) = scoped
+                        .or(driven)
+                        .or_else(|| ctx.class_id_by_name(class_name))
+                    {
+                        let mirror = ctx.get_class_mirror(cid);
+                        if iae_trace_cls {
+                            eprintln!(
+                                "ANN-CLASS desc={desc} class={class_name} already-loaded ok \
+                             holder={:?}/L{:?} via={} answer=L{}",
+                                container_class_id.map(|h| h.as_u32()),
+                                container_class_id.map(|h| ctx.loader_id_of_class(h)),
+                                if scoped.is_some() {
+                                    "scoped"
+                                } else if driven.is_some() {
+                                    "container-loader"
+                                } else {
+                                    "GLOBAL"
+                                },
+                                ctx.loader_id_of_class(cid),
+                            );
+                        }
+                        return Ok(Value::Object(Some(mirror)));
+                    }
+                    let load_res = ctx.load_class(class_name);
                     if iae_trace_cls {
                         eprintln!(
-                            "ANN-CLASS desc={desc} class={class_name} already-loaded ok \
-                             holder={:?}/L{:?} via={} answer=L{}",
-                            container_class_id.map(|h| h.as_u32()),
-                            container_class_id.map(|h| ctx.loader_id_of_class(h)),
-                            if scoped.is_some() {
-                                "scoped"
-                            } else if driven.is_some() {
-                                "container-loader"
-                            } else {
-                                "GLOBAL"
-                            },
-                            ctx.loader_id_of_class(cid),
+                            "ANN-CLASS desc={desc} class={class_name} load-ok={}",
+                            load_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
                         );
                     }
-                    return Ok(Value::Object(Some(mirror)));
-                }
-                let load_res = ctx.load_class(class_name);
-                if iae_trace_cls {
-                    eprintln!(
-                        "ANN-CLASS desc={desc} class={class_name} load-ok={}",
-                        load_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
-                    );
-                }
-                if let Ok(Some(val)) = load_res {
-                    return Ok(val);
-                }
-                // Genuinely unresolvable (no container_loader took the CNFE
-                // branch above, e.g. plain app/bootstrap-loaded classes, which
-                // is the overwhelmingly common case for `@ConditionalOnClass`
-                // referencing an optional dependency). Mirror HotSpot's
-                // `AnnotationParser.parseClassValue`: a ClassNotFoundException
-                // here becomes a deferred `TypeNotPresentException` sentinel
-                // (thrown on member ACCESS by `annotation_proxy_dispatch_impl`),
-                // never a bare Java `null`. Handing back `null` let Spring's
-                // `TypeMappedAnnotation`/`MergedAnnotation` `classValuesAsString`
-                // conversion (`Class.getName()` on the null element) raise an
-                // unexpected `NullPointerException` that Spring's
-                // `TypeNotPresentException`-aware handling for exactly this
-                // optional-dependency pattern doesn't recognize — surfacing as
-                // `OnClassCondition.addAll`'s "NullPointerException cannot be
-                // cast to String[]" across every `@ConditionalOnClass`-gated
-                // autoconfiguration whose referenced class is absent.
-                if let Some(tnpe) = shared_unresolvable_class_sentinel(ctx) {
-                    if iae_trace_cls {
-                        eprintln!(
+                    if let Ok(Some(val)) = load_res {
+                        return Ok(val);
+                    }
+                    // Genuinely unresolvable (no container_loader took the CNFE
+                    // branch above, e.g. plain app/bootstrap-loaded classes, which
+                    // is the overwhelmingly common case for `@ConditionalOnClass`
+                    // referencing an optional dependency). Mirror HotSpot's
+                    // `AnnotationParser.parseClassValue`: a ClassNotFoundException
+                    // here becomes a deferred `TypeNotPresentException` sentinel
+                    // (thrown on member ACCESS by `annotation_proxy_dispatch_impl`),
+                    // never a bare Java `null`. Handing back `null` let Spring's
+                    // `TypeMappedAnnotation`/`MergedAnnotation` `classValuesAsString`
+                    // conversion (`Class.getName()` on the null element) raise an
+                    // unexpected `NullPointerException` that Spring's
+                    // `TypeNotPresentException`-aware handling for exactly this
+                    // optional-dependency pattern doesn't recognize — surfacing as
+                    // `OnClassCondition.addAll`'s "NullPointerException cannot be
+                    // cast to String[]" across every `@ConditionalOnClass`-gated
+                    // autoconfiguration whose referenced class is absent.
+                    if let Some(tnpe) = shared_unresolvable_class_sentinel(ctx) {
+                        if iae_trace_cls {
+                            eprintln!(
                             "ANN-CLASS desc={desc} class={class_name} unresolved -> TypeNotPresentException (shared)"
                         );
+                        }
+                        return Ok(Value::Object(Some(tnpe)));
                     }
-                    return Ok(Value::Object(Some(tnpe)));
+                    if iae_trace_cls {
+                        eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
+                    }
+                    // Could not even build the sentinel (e.g. TypeNotPresentException
+                    // itself isn't loadable) вЂ” preserve the prior best-effort null.
+                    return Ok(Value::Object(None));
                 }
+                // `annotation_desc_to_class_name` returned None: the descriptor is
+                // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) вЂ”
+                // most notably `default void.class`, used by ByteBuddy's
+                // `@Advice.FieldValue.declaringType()`. Returning null here made the
+                // annotation member read back as null, so ByteBuddy's
+                // `declaringType.represents(void.class)` NPE'd (`getName()` on a
+                // null TypeDescription) inside Hibernate's BytecodeProvider init.
+                // `descriptor_to_class_mirror` maps `V` -> the `void` primitive
+                // Class mirror, `[I` -> the canonical `int[]` mirror, etc.
                 if iae_trace_cls {
-                    eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
+                    eprintln!(
+                        "ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"
+                    );
                 }
-                // Could not even build the sentinel (e.g. TypeNotPresentException
-                // itself isn't loadable) вЂ” preserve the prior best-effort null.
-                return Ok(Value::Object(None));
+                Ok(Value::Object(Some(descriptor_to_class_mirror(ctx, desc))))
             }
-            // `annotation_desc_to_class_name` returned None: the descriptor is
-            // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) вЂ”
-            // most notably `default void.class`, used by ByteBuddy's
-            // `@Advice.FieldValue.declaringType()`. Returning null here made the
-            // annotation member read back as null, so ByteBuddy's
-            // `declaringType.represents(void.class)` NPE'd (`getName()` on a
-            // null TypeDescription) inside Hibernate's BytecodeProvider init.
-            // `descriptor_to_class_mirror` maps `V` -> the `void` primitive
-            // Class mirror, `[I` -> the canonical `int[]` mirror, etc.
-            if iae_trace_cls {
-                eprintln!(
-                    "ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"
-                );
-            }
-            Ok(Value::Object(Some(descriptor_to_class_mirror(ctx, desc))))
-        }
-        AnnotationElementValue::Annotation(nested) => {
-            let loader_cur = match (container_loader, container_loader_pin) {
-                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
-                _ => None,
-            };
-            Ok(match create_annotation_proxy(ctx, nested, container_class_id, loader_cur)? {
-                Some(proxy) => normalize_single_annotation_array(
-                    ctx,
-                    Value::Object(Some(proxy)),
-                    return_type_desc,
-                ),
-                // The nested annotation's own type is unresolvable. This arm
-                // used to hand back a proxy with a null `annotationType()` —
-                // unlike the top-level array builders, it never consulted the
-                // loadability filter. Store the deferred sentinel the
-                // Class-valued arm already uses: the member THROWS on access
-                // (HotSpot fails harder still — `getDeclaredAnnotations()`
-                // itself raises NoClassDefFoundError for the unresolvable
-                // element type), and no null-typed annotation escapes.
-                None => match unresolvable_nested_annotation_sentinel(ctx, nested) {
-                    Some(sentinel) => Value::Object(Some(sentinel)),
-                    None => Value::Object(None),
-                },
-            })
-        }
-        AnnotationElementValue::Array(elems) => {
-            // Pick a component class for the array based on the element kind so
-            // downstream `instanceof "[Lfoo;"` checks correctly distinguish
-            // between e.g. `String[]` and `Annotation[]`. Spring's
-            // `AnnotationUtils.adaptValue` runs an `instanceof
-            // "[Ljava/lang/annotation/Annotation;"` chain вЂ” if the array's
-            // component class is bare `Object` (cid=0), the lenient
-            // assignability fallback in `array_is_assignable_to`
-            // (interpreter.rs `if src_comp == "java/lang/Object" { return
-            // true; }`) green-lights the cast and a `String[]` flows into the
-            // `Annotation[]` branch, eventually surfacing as
-            // `String.annotationType()` NSME inside
-            // `retrieveAnnotationAttributes`.
-            //
-            // Pick by inspecting the first element variant вЂ” annotation
-            // attribute arrays are homogeneous per JLS В§9.6.1.
-            //
-            // S111r18 вЂ” for nested-annotation arrays, use the annotation
-            // interface type (e.g. `F4` for `@CScan(excludeFilters=@F4...)`)
-            // as the component class, NOT the bare `AnnotationProxy` synthetic.
-            // Spring's `MergedAnnotation.adaptForAttribute` walks
-            // `returnType.componentType().isAnnotation()` вЂ” when our array
-            // reports its component as `AnnotationProxy` (which is
-            // `isAnnotation()=false`), the adapt-array branch is taken on
-            // returnType but the receiving array allocation in the same
-            // method later fails its checkcast / isInstance check, and the
-            // built `MergedAnnotation[]` collapses into a single-element
-            // value path that surfaces in `AnnotationAttributes` as
-            // `[null]`. Routing the component class to the actual annotation
-            // interface (F4) makes the array's `componentType()` report
-            // `F4.class`, which `isAnnotation()` returns `true` for, and the
-            // synthesize loop then runs as expected.
-            use cratonvm_native_api::AnnotationElementValue as AEV;
-            // SB-02b вЂ” primitive annotation arrays (`int[] mv()`, `boolean[]`,
-            // `long[]`, вЂ¦) must materialise as REAL primitive arrays, not boxed
-            // wrapper arrays. The canonical tripwire is `@kotlin.Metadata.mv()`
-            // (the metadata version, declared `int[]`): kotlin-reflect reads it
-            // as a primitive `int[]` (`iaload`), so a boxed `Integer[]` reads
-            // back as all-zeros в†’ version parses as `(0,0,0)` в†’ kotlin-reflect
-            // treats the class metadata as invalid/legacy and falls back to
-            // Java-reflection platform types. That silently corrupts every
-            // Kotlin reflective query (return-type nullability, `isSuspend`,
-            // value-parameter default-value flags, continuation-parameter
-            // hiding), breaking all Spring Kotlin metadata tests while HotSpot
-            // passes. When the method return type is a single-dimension
-            // primitive array, allocate the matching primitive array and store
-            // unboxed values; the boxed-wrapper path below is for reference
-            // (`String[]`, `Class[]`, `Annotation[]`, enum) arrays only.
-            if let Some(comp) = return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
-                use cratonvm_types::ArrayElementType as AET;
-                let prim = match comp {
-                    "Z" => Some(AET::Boolean),
-                    "B" => Some(AET::Byte),
-                    "C" => Some(AET::Char),
-                    "S" => Some(AET::Short),
-                    "I" => Some(AET::Int),
-                    "J" => Some(AET::Long),
-                    "F" => Some(AET::Float),
-                    "D" => Some(AET::Double),
+            AnnotationElementValue::Annotation(nested) => {
+                let loader_cur = match (container_loader, container_loader_pin) {
+                    (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                     _ => None,
                 };
-                if let Some(et) = prim {
-                    let arr = ctx.new_array(et, elems.len());
-                    let arr_pin = ctx.pin_native_root(arr);
-                    for (i, elem) in elems.iter().enumerate() {
-                        // `AnnotationElementValue::Int` is overloaded for
-                        // Z/B/C/S/I (the CP encodes them all as int constants),
-                        // so narrow per the descriptor; J/F/D carry their own
-                        // variants. A kind mismatch yields a typed zero so the
-                        // array stays machine-well-formed.
-                        let pv = match (comp, elem) {
-                            ("Z", AEV::Int(v)) => Value::Int(if *v != 0 { 1 } else { 0 }),
-                            ("B", AEV::Int(v)) => Value::Int(*v as i8 as i32),
-                            ("C", AEV::Int(v)) => Value::Int(*v & 0xFFFF),
-                            ("S", AEV::Int(v)) => Value::Int(*v as i16 as i32),
-                            ("I", AEV::Int(v)) => Value::Int(*v),
-                            ("J", AEV::Long(v)) => Value::Long(*v),
-                            ("F", AEV::Float(v)) => Value::Float(*v),
-                            ("D", AEV::Double(v)) => Value::Double(*v),
-                            (_, _) => match et {
-                                AET::Long => Value::Long(0),
-                                AET::Float => Value::Float(0.0),
-                                AET::Double => Value::Double(0.0),
-                                _ => Value::Int(0),
-                            },
-                        };
-                        let arr_cur = ctx.read_native_pin(arr_pin, arr);
-                        ctx.set_array_element(arr_cur, i, pv);
-                    }
-                    let arr_cur = ctx.read_native_pin(arr_pin, arr);
-                    ctx.unpin_native_roots(arr_pin);
-                    return Ok(Value::Object(Some(arr_cur)));
-                }
+                Ok(
+                    match create_annotation_proxy(ctx, nested, container_class_id, loader_cur)? {
+                        Some(proxy) => normalize_single_annotation_array(
+                            ctx,
+                            Value::Object(Some(proxy)),
+                            return_type_desc,
+                        ),
+                        // The nested annotation's own type is unresolvable. This arm
+                        // used to hand back a proxy with a null `annotationType()` —
+                        // unlike the top-level array builders, it never consulted the
+                        // loadability filter. Store the deferred sentinel the
+                        // Class-valued arm already uses: the member THROWS on access
+                        // (HotSpot fails harder still — `getDeclaredAnnotations()`
+                        // itself raises NoClassDefFoundError for the unresolvable
+                        // element type), and no null-typed annotation escapes.
+                        None => match unresolvable_nested_annotation_sentinel(ctx, nested) {
+                            Some(sentinel) => Value::Object(Some(sentinel)),
+                            None => Value::Object(None),
+                        },
+                    },
+                )
             }
-            // S111r19 вЂ” when the array is **empty** (no first element to
-            // probe), fall back to the caller-provided method return-type
-            // descriptor.  This recovers the right component class for
-            // empty `String[]` / `Class[]` defaults like `@Filter.pattern()`
-            // = `{}`, which would otherwise become an `Object[]` and trip
-            // Spring's `AnnotationUtils.adaptValue` Annotation[]-detection
-            // (the lenient `Object` fallback in `array_is_assignable`).
-            let comp_name_owned: String = match elems.first() {
-                Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
-                Some(AEV::Class(_)) => "java/lang/Class".to_string(),
-                Some(AEV::Annotation(nested)) => {
-                    annotation_desc_to_class_name(&nested.type_descriptor)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string())
-                }
-                Some(AEV::Enum(type_desc, _)) => type_desc
-                    .strip_prefix('L')
-                    .and_then(|s| s.strip_suffix(';'))
-                    .unwrap_or("java/lang/Enum")
-                    .to_string(),
-                // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
-                // are still allocated as boxed wrapper arrays here per
-                // pre-existing behaviour вЂ” pick the wrapper class.
+            AnnotationElementValue::Array(elems) => {
+                // Pick a component class for the array based on the element kind so
+                // downstream `instanceof "[Lfoo;"` checks correctly distinguish
+                // between e.g. `String[]` and `Annotation[]`. Spring's
+                // `AnnotationUtils.adaptValue` runs an `instanceof
+                // "[Ljava/lang/annotation/Annotation;"` chain вЂ” if the array's
+                // component class is bare `Object` (cid=0), the lenient
+                // assignability fallback in `array_is_assignable_to`
+                // (interpreter.rs `if src_comp == "java/lang/Object" { return
+                // true; }`) green-lights the cast and a `String[]` flows into the
+                // `Annotation[]` branch, eventually surfacing as
+                // `String.annotationType()` NSME inside
+                // `retrieveAnnotationAttributes`.
                 //
-                // spring-bug-01: AEV::Int is overloaded for Z/B/C/S/I (the
-                // `.class` AnnotationDefault encodes them all as int constants).
-                // The element values below are already boxed into the correct
-                // wrapper via `elem_desc`, but the ARRAY's component class was
-                // hardcoded to Integer here вЂ” so a `char[]` default became an
-                // `Integer[]`-typed array holding Character values, and Spring's
-                // `AnnotationTypeMapping.adapt` rejected it ("should be compatible
-                // with char[] but a java.lang.Integer[] value was returned").
-                // Derive the component wrapper from the array's component
-                // descriptor so `[C`в†’Character[], `[Z`в†’Boolean[], etc. (which
-                // Spring then coerces to the primitive array).
-                Some(AEV::Int(_)) => match return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
-                    Some("Z") => "java/lang/Boolean".to_string(),
-                    Some("B") => "java/lang/Byte".to_string(),
-                    Some("C") => "java/lang/Character".to_string(),
-                    Some("S") => "java/lang/Short".to_string(),
-                    _ => "java/lang/Integer".to_string(),
-                },
-                Some(AEV::Long(_)) => "java/lang/Long".to_string(),
-                Some(AEV::Float(_)) => "java/lang/Float".to_string(),
-                Some(AEV::Double(_)) => "java/lang/Double".to_string(),
-                None => {
-                    // Empty array вЂ” derive component from method return type.
-                    if let Some(rd) = return_type_desc {
-                        if let Some(comp) = rd.strip_prefix('[') {
-                            if let Some(stripped) =
-                                comp.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                stripped.to_string()
-                            } else if comp.len() == 1 && "ZBCSIJFD".contains(&comp[..1]) {
-                                // Empty primitive array вЂ” boxed wrapper
-                                // (matches the non-empty primitive arms).
-                                match &comp[..1] {
-                                    "Z" => "java/lang/Boolean".to_string(),
-                                    "B" => "java/lang/Byte".to_string(),
-                                    "C" => "java/lang/Character".to_string(),
-                                    "S" => "java/lang/Short".to_string(),
-                                    "I" => "java/lang/Integer".to_string(),
-                                    "J" => "java/lang/Long".to_string(),
-                                    "F" => "java/lang/Float".to_string(),
-                                    "D" => "java/lang/Double".to_string(),
-                                    _ => "java/lang/Object".to_string(),
+                // Pick by inspecting the first element variant вЂ” annotation
+                // attribute arrays are homogeneous per JLS В§9.6.1.
+                //
+                // S111r18 вЂ” for nested-annotation arrays, use the annotation
+                // interface type (e.g. `F4` for `@CScan(excludeFilters=@F4...)`)
+                // as the component class, NOT the bare `AnnotationProxy` synthetic.
+                // Spring's `MergedAnnotation.adaptForAttribute` walks
+                // `returnType.componentType().isAnnotation()` вЂ” when our array
+                // reports its component as `AnnotationProxy` (which is
+                // `isAnnotation()=false`), the adapt-array branch is taken on
+                // returnType but the receiving array allocation in the same
+                // method later fails its checkcast / isInstance check, and the
+                // built `MergedAnnotation[]` collapses into a single-element
+                // value path that surfaces in `AnnotationAttributes` as
+                // `[null]`. Routing the component class to the actual annotation
+                // interface (F4) makes the array's `componentType()` report
+                // `F4.class`, which `isAnnotation()` returns `true` for, and the
+                // synthesize loop then runs as expected.
+                use cratonvm_native_api::AnnotationElementValue as AEV;
+                // SB-02b вЂ” primitive annotation arrays (`int[] mv()`, `boolean[]`,
+                // `long[]`, вЂ¦) must materialise as REAL primitive arrays, not boxed
+                // wrapper arrays. The canonical tripwire is `@kotlin.Metadata.mv()`
+                // (the metadata version, declared `int[]`): kotlin-reflect reads it
+                // as a primitive `int[]` (`iaload`), so a boxed `Integer[]` reads
+                // back as all-zeros в†’ version parses as `(0,0,0)` в†’ kotlin-reflect
+                // treats the class metadata as invalid/legacy and falls back to
+                // Java-reflection platform types. That silently corrupts every
+                // Kotlin reflective query (return-type nullability, `isSuspend`,
+                // value-parameter default-value flags, continuation-parameter
+                // hiding), breaking all Spring Kotlin metadata tests while HotSpot
+                // passes. When the method return type is a single-dimension
+                // primitive array, allocate the matching primitive array and store
+                // unboxed values; the boxed-wrapper path below is for reference
+                // (`String[]`, `Class[]`, `Annotation[]`, enum) arrays only.
+                if let Some(comp) = return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
+                    use cratonvm_types::ArrayElementType as AET;
+                    let prim = match comp {
+                        "Z" => Some(AET::Boolean),
+                        "B" => Some(AET::Byte),
+                        "C" => Some(AET::Char),
+                        "S" => Some(AET::Short),
+                        "I" => Some(AET::Int),
+                        "J" => Some(AET::Long),
+                        "F" => Some(AET::Float),
+                        "D" => Some(AET::Double),
+                        _ => None,
+                    };
+                    if let Some(et) = prim {
+                        let arr = ctx.new_array(et, elems.len());
+                        let arr_pin = ctx.pin_native_root(arr);
+                        for (i, elem) in elems.iter().enumerate() {
+                            // `AnnotationElementValue::Int` is overloaded for
+                            // Z/B/C/S/I (the CP encodes them all as int constants),
+                            // so narrow per the descriptor; J/F/D carry their own
+                            // variants. A kind mismatch yields a typed zero so the
+                            // array stays machine-well-formed.
+                            let pv = match (comp, elem) {
+                                ("Z", AEV::Int(v)) => Value::Int(if *v != 0 { 1 } else { 0 }),
+                                ("B", AEV::Int(v)) => Value::Int(*v as i8 as i32),
+                                ("C", AEV::Int(v)) => Value::Int(*v & 0xFFFF),
+                                ("S", AEV::Int(v)) => Value::Int(*v as i16 as i32),
+                                ("I", AEV::Int(v)) => Value::Int(*v),
+                                ("J", AEV::Long(v)) => Value::Long(*v),
+                                ("F", AEV::Float(v)) => Value::Float(*v),
+                                ("D", AEV::Double(v)) => Value::Double(*v),
+                                (_, _) => match et {
+                                    AET::Long => Value::Long(0),
+                                    AET::Float => Value::Float(0.0),
+                                    AET::Double => Value::Double(0.0),
+                                    _ => Value::Int(0),
+                                },
+                            };
+                            let arr_cur = ctx.read_native_pin(arr_pin, arr);
+                            ctx.set_array_element(arr_cur, i, pv);
+                        }
+                        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+                        ctx.unpin_native_roots(arr_pin);
+                        return Ok(Value::Object(Some(arr_cur)));
+                    }
+                }
+                // S111r19 вЂ” when the array is **empty** (no first element to
+                // probe), fall back to the caller-provided method return-type
+                // descriptor.  This recovers the right component class for
+                // empty `String[]` / `Class[]` defaults like `@Filter.pattern()`
+                // = `{}`, which would otherwise become an `Object[]` and trip
+                // Spring's `AnnotationUtils.adaptValue` Annotation[]-detection
+                // (the lenient `Object` fallback in `array_is_assignable`).
+                let comp_name_owned: String = match elems.first() {
+                    Some(AEV::StringVal(_)) => "java/lang/String".to_string(),
+                    Some(AEV::Class(_)) => "java/lang/Class".to_string(),
+                    Some(AEV::Annotation(nested)) => {
+                        annotation_desc_to_class_name(&nested.type_descriptor)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "java/lang/annotation/AnnotationProxy".to_string())
+                    }
+                    Some(AEV::Enum(type_desc, _)) => type_desc
+                        .strip_prefix('L')
+                        .and_then(|s| s.strip_suffix(';'))
+                        .unwrap_or("java/lang/Enum")
+                        .to_string(),
+                    // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
+                    // are still allocated as boxed wrapper arrays here per
+                    // pre-existing behaviour вЂ” pick the wrapper class.
+                    //
+                    // spring-bug-01: AEV::Int is overloaded for Z/B/C/S/I (the
+                    // `.class` AnnotationDefault encodes them all as int constants).
+                    // The element values below are already boxed into the correct
+                    // wrapper via `elem_desc`, but the ARRAY's component class was
+                    // hardcoded to Integer here вЂ” so a `char[]` default became an
+                    // `Integer[]`-typed array holding Character values, and Spring's
+                    // `AnnotationTypeMapping.adapt` rejected it ("should be compatible
+                    // with char[] but a java.lang.Integer[] value was returned").
+                    // Derive the component wrapper from the array's component
+                    // descriptor so `[C`в†’Character[], `[Z`в†’Boolean[], etc. (which
+                    // Spring then coerces to the primitive array).
+                    Some(AEV::Int(_)) => match return_type_desc.and_then(|rd| rd.strip_prefix('['))
+                    {
+                        Some("Z") => "java/lang/Boolean".to_string(),
+                        Some("B") => "java/lang/Byte".to_string(),
+                        Some("C") => "java/lang/Character".to_string(),
+                        Some("S") => "java/lang/Short".to_string(),
+                        _ => "java/lang/Integer".to_string(),
+                    },
+                    Some(AEV::Long(_)) => "java/lang/Long".to_string(),
+                    Some(AEV::Float(_)) => "java/lang/Float".to_string(),
+                    Some(AEV::Double(_)) => "java/lang/Double".to_string(),
+                    None => {
+                        // Empty array вЂ” derive component from method return type.
+                        if let Some(rd) = return_type_desc {
+                            if let Some(comp) = rd.strip_prefix('[') {
+                                if let Some(stripped) =
+                                    comp.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                                {
+                                    stripped.to_string()
+                                } else if comp.len() == 1 && "ZBCSIJFD".contains(&comp[..1]) {
+                                    // Empty primitive array вЂ” boxed wrapper
+                                    // (matches the non-empty primitive arms).
+                                    match &comp[..1] {
+                                        "Z" => "java/lang/Boolean".to_string(),
+                                        "B" => "java/lang/Byte".to_string(),
+                                        "C" => "java/lang/Character".to_string(),
+                                        "S" => "java/lang/Short".to_string(),
+                                        "I" => "java/lang/Integer".to_string(),
+                                        "J" => "java/lang/Long".to_string(),
+                                        "F" => "java/lang/Float".to_string(),
+                                        "D" => "java/lang/Double".to_string(),
+                                        _ => "java/lang/Object".to_string(),
+                                    }
+                                } else {
+                                    "java/lang/Object".to_string()
                                 }
                             } else {
                                 "java/lang/Object".to_string()
@@ -15927,162 +15987,162 @@ pub(crate) fn annotation_element_to_java_typed(
                         } else {
                             "java/lang/Object".to_string()
                         }
-                    } else {
-                        "java/lang/Object".to_string()
                     }
-                }
-                _ => "java/lang/Object".to_string(),
-            };
-            // Resolve the COMPONENT through the declaring class's loader first,
-            // exactly as the scalar `Enum` and `Class` arms above already do.
-            // `class_id_by_name` is the loader-blind global lookup, so under
-            // classloader isolation the array's component came from the app
-            // loader while the attribute's declared return type came from the
-            // fork -- and Spring's `AnnotationTypeMapping.adapt` rejected the
-            // value with the self-contradictory "should be compatible with
-            // RequestMethod[] but a RequestMethod[] value was returned"
-            // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
-            // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
-            let loader_cur = match (container_loader, container_loader_pin) {
-                (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
-                _ => None,
-            };
-            let comp_cid = loader_cur
-                .and_then(|loader| {
-                    match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
-                        Ok(mirror) => ctx.class_id_from_mirror(mirror),
-                        Err(_) => None,
-                    }
-                })
-                .or_else(|| {
-                    container_class_id
-                        .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
-                })
-                // Same step the scalar `Class` arm takes: `class_id_by_name_near`
-                // only sees names the container's loader has ALREADY resolved,
-                // so drive that loader before conceding to the loader-blind
-                // lookup below — otherwise a component this container has never
-                // touched is answered by whichever single loader happens to
-                // have it.
-                .or_else(|| {
-                    container_class_id.and_then(|holder| {
-                        ctx.class_id_by_name_via_referencing_class(holder, &comp_name_owned).ok()
-                    })
-                })
-                .or_else(|| ctx.class_id_by_name(&comp_name_owned))
-                .or_else(|| {
-                    let _ = ctx.load_class(&comp_name_owned);
-                    ctx.class_id_by_name(&comp_name_owned)
-                })
-                .unwrap_or(cratonvm_types::ClassId::new(0));
-            let arr = ctx.new_ref_array(comp_cid, elems.len());
-            // `arr` is allocated once, then held across a loop whose body
-            // (the recursive `annotation_element_to_java_typed` call below)
-            // can itself allocate — nested `String`/`Class`/nested-annotation
-            // elements always could, and an unresolvable `Class` element now
-            // can too (`shared_unresolvable_class_sentinel`, first call ever
-            // per process). Under the moving collector `arr` can relocate
-            // mid-loop, leaving this Rust-local copy stale; pin it across the
-            // whole loop and re-fetch on every iteration, matching the
-            // documented `pin_native_root`/`read_native_pin` contract.
-            let arr_pin = ctx.pin_native_root(arr);
-            // Round 18: derive the per-element return-type descriptor from
-            // the array descriptor (strip leading `[`) so primitive elements
-            // box into the correct wrapper (Z/B/C/S в†’ Boolean/Byte/Char/Short
-            // instead of always Integer).
-            let elem_desc: Option<String> = return_type_desc
-                .and_then(|rd| rd.strip_prefix('['))
-                .map(|s| s.to_string());
-            // `Class[]`-declared members (e.g. `@ConditionalOnClass`'s `value`)
-            // resolve each element independently; an unresolvable class yields
-            // a per-element `TypeNotPresentException` sentinel (see the
-            // `Class(desc)` arm above). HotSpot's own `AnnotationInvocationHandler
-            // .invoke` walks such a member's backing array and throws on the
-            // FIRST sentinel found for the WHOLE accessor call — it never hands
-            // the array itself back to the caller. Mirror that here at
-            // construction time (once per annotation instance) rather than on
-            // every subsequent access: collapse the whole member to the
-            // sentinel the moment one turns up, matching the existing scalar
-            // `Class`-member sentinel representation that
-            // `annotation_proxy_dispatch_impl` already knows how to throw.
-            // Without this, Spring's own `TypeNotPresentException`-aware
-            // attribute extraction (built specifically to catch this from a
-            // real `Method.invoke` and defer it for later `@ConditionalOnClass`
-            // handling) never sees it — it gets a plain array back, and a
-            // later `Class[]`→`String[]` conversion NPEs on the missing
-            // element instead.
-            //
-            // The same collapse now covers ANNOTATION-valued arrays, whose
-            // entries can carry the sentinel too when a contained annotation's
-            // own type is unresolvable — the `@Repeatable`-container shape that
-            // JUnit's `AnnotationUtils.findRepeatableAnnotations` walks
-            // (`candidateAnnotationType.equals(containerType)` on every entry).
-            // Detecting the sentinel by class rather than by declared component
-            // is unambiguous: JLS §9.6.1 admits only primitives, `String`,
-            // `Class`, enums, annotations and arrays of those as member values,
-            // so a `TypeNotPresentException` in this array is always one of ours.
-            // Record only the INDEX of a sentinel hit, not the `Value` itself
-            // — a later iteration's allocation could relocate it, so re-read
-            // it fresh from the (freshly re-pinned) array after the loop
-            // instead of carrying a Rust-local copy across further
-            // allocating calls.
-            let mut sentinel_index: Option<usize> = None;
-            let mut arr = arr;
-            for (i, elem) in elems.iter().enumerate() {
+                    _ => "java/lang/Object".to_string(),
+                };
+                // Resolve the COMPONENT through the declaring class's loader first,
+                // exactly as the scalar `Enum` and `Class` arms above already do.
+                // `class_id_by_name` is the loader-blind global lookup, so under
+                // classloader isolation the array's component came from the app
+                // loader while the attribute's declared return type came from the
+                // fork -- and Spring's `AnnotationTypeMapping.adapt` rejected the
+                // value with the self-contradictory "should be compatible with
+                // RequestMethod[] but a RequestMethod[] value was returned"
+                // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
+                // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
                 let loader_cur = match (container_loader, container_loader_pin) {
                     (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                     _ => None,
                 };
-                let v = annotation_element_to_java_typed(
-                    ctx,
-                    elem,
-                    elem_desc.as_deref(),
-                    container_class_id,
-                    loader_cur,
-                    annotation_class_id,
-                )?;
-                arr = ctx.read_native_pin(arr_pin, arr);
-                let value_pin = match v {
-                    Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
-                    _ => None,
-                };
-                let v_cur = match (v, value_pin) {
-                    (Value::Object(Some(object)), Some(pin)) => {
-                        Value::Object(Some(ctx.read_native_pin(pin, object)))
-                    }
-                    _ => v,
-                };
-                if sentinel_index.is_none() {
-                    if let Value::Object(Some(o)) = v_cur {
-                        if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
-                            == Some("java/lang/TypeNotPresentException")
-                        {
-                            sentinel_index = Some(i);
+                let comp_cid = loader_cur
+                    .and_then(|loader| {
+                        match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
+                            Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                            Err(_) => None,
+                        }
+                    })
+                    .or_else(|| {
+                        container_class_id
+                            .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
+                    })
+                    // Same step the scalar `Class` arm takes: `class_id_by_name_near`
+                    // only sees names the container's loader has ALREADY resolved,
+                    // so drive that loader before conceding to the loader-blind
+                    // lookup below — otherwise a component this container has never
+                    // touched is answered by whichever single loader happens to
+                    // have it.
+                    .or_else(|| {
+                        container_class_id.and_then(|holder| {
+                            ctx.class_id_by_name_via_referencing_class(holder, &comp_name_owned)
+                                .ok()
+                        })
+                    })
+                    .or_else(|| ctx.class_id_by_name(&comp_name_owned))
+                    .or_else(|| {
+                        let _ = ctx.load_class(&comp_name_owned);
+                        ctx.class_id_by_name(&comp_name_owned)
+                    })
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
+                let arr = ctx.new_ref_array(comp_cid, elems.len());
+                // `arr` is allocated once, then held across a loop whose body
+                // (the recursive `annotation_element_to_java_typed` call below)
+                // can itself allocate — nested `String`/`Class`/nested-annotation
+                // elements always could, and an unresolvable `Class` element now
+                // can too (`shared_unresolvable_class_sentinel`, first call ever
+                // per process). Under the moving collector `arr` can relocate
+                // mid-loop, leaving this Rust-local copy stale; pin it across the
+                // whole loop and re-fetch on every iteration, matching the
+                // documented `pin_native_root`/`read_native_pin` contract.
+                let arr_pin = ctx.pin_native_root(arr);
+                // Round 18: derive the per-element return-type descriptor from
+                // the array descriptor (strip leading `[`) so primitive elements
+                // box into the correct wrapper (Z/B/C/S в†’ Boolean/Byte/Char/Short
+                // instead of always Integer).
+                let elem_desc: Option<String> = return_type_desc
+                    .and_then(|rd| rd.strip_prefix('['))
+                    .map(|s| s.to_string());
+                // `Class[]`-declared members (e.g. `@ConditionalOnClass`'s `value`)
+                // resolve each element independently; an unresolvable class yields
+                // a per-element `TypeNotPresentException` sentinel (see the
+                // `Class(desc)` arm above). HotSpot's own `AnnotationInvocationHandler
+                // .invoke` walks such a member's backing array and throws on the
+                // FIRST sentinel found for the WHOLE accessor call — it never hands
+                // the array itself back to the caller. Mirror that here at
+                // construction time (once per annotation instance) rather than on
+                // every subsequent access: collapse the whole member to the
+                // sentinel the moment one turns up, matching the existing scalar
+                // `Class`-member sentinel representation that
+                // `annotation_proxy_dispatch_impl` already knows how to throw.
+                // Without this, Spring's own `TypeNotPresentException`-aware
+                // attribute extraction (built specifically to catch this from a
+                // real `Method.invoke` and defer it for later `@ConditionalOnClass`
+                // handling) never sees it — it gets a plain array back, and a
+                // later `Class[]`→`String[]` conversion NPEs on the missing
+                // element instead.
+                //
+                // The same collapse now covers ANNOTATION-valued arrays, whose
+                // entries can carry the sentinel too when a contained annotation's
+                // own type is unresolvable — the `@Repeatable`-container shape that
+                // JUnit's `AnnotationUtils.findRepeatableAnnotations` walks
+                // (`candidateAnnotationType.equals(containerType)` on every entry).
+                // Detecting the sentinel by class rather than by declared component
+                // is unambiguous: JLS §9.6.1 admits only primitives, `String`,
+                // `Class`, enums, annotations and arrays of those as member values,
+                // so a `TypeNotPresentException` in this array is always one of ours.
+                // Record only the INDEX of a sentinel hit, not the `Value` itself
+                // — a later iteration's allocation could relocate it, so re-read
+                // it fresh from the (freshly re-pinned) array after the loop
+                // instead of carrying a Rust-local copy across further
+                // allocating calls.
+                let mut sentinel_index: Option<usize> = None;
+                let mut arr = arr;
+                for (i, elem) in elems.iter().enumerate() {
+                    let loader_cur = match (container_loader, container_loader_pin) {
+                        (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
+                        _ => None,
+                    };
+                    let v = annotation_element_to_java_typed(
+                        ctx,
+                        elem,
+                        elem_desc.as_deref(),
+                        container_class_id,
+                        loader_cur,
+                        annotation_class_id,
+                    )?;
+                    arr = ctx.read_native_pin(arr_pin, arr);
+                    let value_pin = match v {
+                        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                        _ => None,
+                    };
+                    let v_cur = match (v, value_pin) {
+                        (Value::Object(Some(object)), Some(pin)) => {
+                            Value::Object(Some(ctx.read_native_pin(pin, object)))
+                        }
+                        _ => v,
+                    };
+                    if sentinel_index.is_none() {
+                        if let Value::Object(Some(o)) = v_cur {
+                            if ctx
+                                .class_name_arc_of_id(ctx.class_id_of_object(o))
+                                .as_deref()
+                                == Some("java/lang/TypeNotPresentException")
+                            {
+                                sentinel_index = Some(i);
+                            }
                         }
                     }
+                    // Always finish populating `arr` — matches the allocate-then-
+                    // immediately-fill invariant every other caller of
+                    // `new_ref_array` in this function relies on. An early return
+                    // here left `arr` allocated but only partially filled (some
+                    // trailing slots never touched by `set_array_element`) and
+                    // unreferenced by anything, which triggered heap corruption
+                    // (`gen_heap::get_field` "undersized object layout" errors on
+                    // unrelated `String` objects) under GC — the array is
+                    // discarded below when a sentinel was found, but only AFTER
+                    // it's fully built and briefly reachable in the normal way.
+                    ctx.set_array_element(arr, i, v_cur);
+                    if let Some(pin) = value_pin {
+                        ctx.unpin_native_roots(pin);
+                    }
                 }
-                // Always finish populating `arr` — matches the allocate-then-
-                // immediately-fill invariant every other caller of
-                // `new_ref_array` in this function relies on. An early return
-                // here left `arr` allocated but only partially filled (some
-                // trailing slots never touched by `set_array_element`) and
-                // unreferenced by anything, which triggered heap corruption
-                // (`gen_heap::get_field` "undersized object layout" errors on
-                // unrelated `String` objects) under GC — the array is
-                // discarded below when a sentinel was found, but only AFTER
-                // it's fully built and briefly reachable in the normal way.
-                ctx.set_array_element(arr, i, v_cur);
-                if let Some(pin) = value_pin {
-                    ctx.unpin_native_roots(pin);
+                arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
+                if let Some(idx) = sentinel_index {
+                    return Ok(ctx.get_array_element(arr, idx));
                 }
+                Ok(Value::Object(Some(arr)))
             }
-            arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.unpin_native_roots(arr_pin);
-            if let Some(idx) = sentinel_index {
-                return Ok(ctx.get_array_element(arr, idx));
-            }
-            Ok(Value::Object(Some(arr)))
-        }
         }
     })()?;
     if let Some(pin) = container_loader_pin {
@@ -16233,8 +16293,7 @@ fn build_annotation_array_for(
     let comp = annotation_component_class_id(ctx);
     let resolvable = resolvable_annotations(ctx, declaring_class_id, annotations);
     let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
-    let container_loader_pin =
-        container_loader.map(|loader| ctx.pin_native_root(loader));
+    let container_loader_pin = container_loader.map(|loader| ctx.pin_native_root(loader));
     // GC-safe: `create_annotation_proxy_with_type` allocates (see `build_mirror_array`).
     let array = build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         let loader_cur = match (container_loader, container_loader_pin) {
@@ -16242,7 +16301,13 @@ fn build_annotation_array_for(
             _ => None,
         };
         let (ann, ann_cid) = resolvable[i];
-        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)?)
+        Ok(create_annotation_proxy_with_type(
+            ctx,
+            ann,
+            ann_cid,
+            declaring_class_id,
+            loader_cur,
+        )?)
     })?;
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
@@ -16272,10 +16337,20 @@ fn build_class_annotation_array(
     // `NoSuchMethodError: java.lang.Object.annotationType()`.
     let comp = annotation_component_class_id(ctx);
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
-    Ok(build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        let (ann, ann_cid) = resolvable[i];
-        Ok(cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)?)
-    })?)
+    Ok(build_mirror_array_comp(
+        ctx,
+        comp,
+        resolvable.len(),
+        |ctx, i| {
+            let (ann, ann_cid) = resolvable[i];
+            Ok(cached_annotation_proxy(
+                ctx,
+                queried_class_id,
+                ann,
+                ann_cid,
+            )?)
+        },
+    )?)
 }
 
 /// Equivalent to [`build_class_annotation_array`] for Method and Constructor.
@@ -16290,17 +16365,22 @@ fn build_method_annotation_array(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let resolvable = resolvable_annotations(ctx, Some(declaring_class_id), annotations);
     let component = annotation_component_class_id(ctx);
-    Ok(build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
-        let (ann, ann_cid) = resolvable[i];
-        Ok(cached_method_annotation_proxy(
-            ctx,
-            declaring_class_id,
-            method_name,
-            method_desc,
-            ann,
-            ann_cid,
-        )?)
-    })?)
+    Ok(build_mirror_array_comp(
+        ctx,
+        component,
+        resolvable.len(),
+        |ctx, i| {
+            let (ann, ann_cid) = resolvable[i];
+            Ok(cached_method_annotation_proxy(
+                ctx,
+                declaring_class_id,
+                method_name,
+                method_desc,
+                ann,
+                ann_cid,
+            )?)
+        },
+    )?)
 }
 
 /// Class.getDeclaredAnnotations() вЂ” only this class's own annotations.
@@ -16762,7 +16842,13 @@ fn class_annotations_by_type_impl(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?)
+        Ok(create_annotation_proxy_with_type(
+            ctx,
+            ann,
+            ann_cid,
+            Some(class_id),
+            container_loader,
+        )?)
     })?;
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -16844,7 +16930,13 @@ pub(crate) fn native_method_get_annotations_by_type(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?)
+        Ok(create_annotation_proxy_with_type(
+            ctx,
+            ann,
+            ann_cid,
+            Some(class_id),
+            container_loader,
+        )?)
     })?;
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -17454,11 +17546,9 @@ pub(crate) fn native_class_get_type_parameters(
         } else {
             crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
         };
-        let tv = cached
-            .map(Ok)
-            .unwrap_or_else(|| {
-                crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
-            })?;
+        let tv = cached.map(Ok).unwrap_or_else(|| {
+            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+        })?;
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }
@@ -19583,7 +19673,9 @@ pub(crate) fn i2_classloader_get_packages_empty(
 /// classpath instead of the bootstrap loader, so package-level annotations
 /// (JSpecify `@NullMarked`, TestNG `@Ignore`, ...) are actually visible on a
 /// `Package` obtained through any path other than `Class.getPackage()`.
-pub(crate) fn canonical_unnamed_module(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn canonical_unnamed_module(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(cached) = ctx.get_cached_module_mirror(None) {
         return Ok(cached);
     }
@@ -19692,7 +19784,10 @@ pub(crate) fn unnamed_module_for_loader(
 /// set to the requested package name (dotted). Mirrors the layout used by
 /// `native_class_get_package` so callers that subsequently invoke
 /// `Package.getName()` see the right value.
-fn i2_alloc_synthetic_package(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn i2_alloc_synthetic_package(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pkg = try_alloc_concurrent_synthetic(ctx, "java/lang/Package", 12)?;
     let pkg_pin = ctx.pin_native_root(pkg);
     let name_str = ctx.create_string(name);
@@ -20647,7 +20742,9 @@ pub(crate) fn native_class_get_class_loader(
     // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
-    if let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32()) {
+    if let Some(loader) =
+        crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
+    {
         // This reverse relation is written only by successful defineClass paths
         // and reconciled across GC; it is the authoritative loader identity.
         return Ok(Some(Value::Object(Some(loader))));
@@ -20914,7 +21011,9 @@ fn declaring_class_loader_aware(
     // same-named-outer-class collision) and only pays for loader-driven
     // resolution when there's a genuine mismatch worth fixing.
     if let Some(existing) = ctx.declaring_class(class_id) {
-        if let Some(existing_loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), existing.as_u32()) {
+        if let Some(existing_loader) =
+            crate::classloader::defining_loader_for(ctx.vm_identity(), existing.as_u32())
+        {
             if existing_loader.as_ptr() == loader_obj.as_ptr() {
                 return None;
             }
@@ -21254,13 +21353,16 @@ pub(crate) fn native_class_get_declared_classes(
                 // hits: `getDeclaredClasses()` is called on a freshly
                 // isolated outer `Class` whose defining loader was never
                 // separately registered.
-                let loader_obj = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
-                    .or_else(|| {
-                        let ns_id = ctx.loader_id_of_class(class_id);
-                        (ns_id >= 3)
-                            .then(|| crate::classloader::loader_object_for_namespace_id(ns_id as u32))
-                            .flatten()
-                    });
+                let loader_obj =
+                    crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
+                        .or_else(|| {
+                            let ns_id = ctx.loader_id_of_class(class_id);
+                            (ns_id >= 3)
+                                .then(|| {
+                                    crate::classloader::loader_object_for_namespace_id(ns_id as u32)
+                                })
+                                .flatten()
+                        });
                 let driven = loader_obj.and_then(|loader_obj| {
                     let dotted = inner_class.replace('/', ".");
                     let name_obj = ctx.create_string(&dotted);
@@ -21276,15 +21378,17 @@ pub(crate) fn native_class_get_declared_classes(
                 });
                 match driven {
                     Some(id) => Some(id),
-                    None => ctx.class_id_by_name_near(inner_class, class_id).or_else(|| {
-                        ctx.load_class(inner_class)
-                            .ok()
-                            .flatten()
-                            .and_then(|value| match value {
-                                Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
-                                _ => None,
-                            })
-                    }),
+                    None => ctx
+                        .class_id_by_name_near(inner_class, class_id)
+                        .or_else(|| {
+                            ctx.load_class(inner_class)
+                                .ok()
+                                .flatten()
+                                .and_then(|value| match value {
+                                    Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+                                    _ => None,
+                                })
+                        }),
                 }
             }
         };
@@ -21512,7 +21616,10 @@ pub(crate) fn native_class_get_nest_members(
                 }
             }
         }
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, member_ids.len());
+        let arr = ctx.new_array(
+            cratonvm_types::ArrayElementType::Reference,
+            member_ids.len(),
+        );
         let arr_pin = ctx.pin_native_root(arr);
         for (i, member_id) in member_ids.iter().enumerate() {
             let mirror = ctx.get_class_mirror(*member_id);
@@ -22382,20 +22489,23 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     // LENGTH reference for the generic array below, so a swallowed exception
     // did not merely lose one type: it silently shortened
     // `getAnnotatedParameterTypes()` to zero elements.
-    let erased_type_mirrors: Vec<ObjectRef> =
-        match ladder_rung(ctx.invoke_virtual(this, "getParameterTypes", "()[Ljava/lang/Class;", &[]))?
-        {
-            Some(Value::Object(Some(arr))) => {
-                let n = ctx.array_length(arr);
-                (0..n)
-                    .map(|i| match ctx.get_array_element(arr, i) {
-                        Value::Object(Some(m)) => m,
-                        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+    let erased_type_mirrors: Vec<ObjectRef> = match ladder_rung(ctx.invoke_virtual(
+        this,
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+        &[],
+    ))? {
+        Some(Value::Object(Some(arr))) => {
+            let n = ctx.array_length(arr);
+            (0..n)
+                .map(|i| match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(m)) => m,
+                    _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     // W7-26 — see `ladder_rung`. The erased-mirror fallback below stays for
     // every non-throwing reason it already covered, including the deliberate
     // length-mismatch guard.
@@ -22716,7 +22826,9 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
 /// `java.security.Permissions@HASH ( )` for an app class with no policy
 /// grants. The constructor run is best-effort: even if it fails the object is
 /// still non-null, which is the contract callers (`getPermissions()`) rely on.
-pub(crate) fn build_empty_permissions(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn build_empty_permissions(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     let perms = crate::try_alloc_concurrent_synthetic(ctx, "java/security/Permissions", 2)?;
     let _ = ctx.invoke(
         "java/security/Permissions",
@@ -23104,11 +23216,14 @@ pub(crate) fn native_class_set_signers(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn string_constructor_reflection_order_matches_hotspot_for_spel_conversion() {
@@ -25729,11 +25844,17 @@ mod tests {
             other => panic!("expected CodeSource at pd.codesource, got {other:?}"),
         };
         assert!(
-            matches!(ctx.get_field_by_name(pd, "permissions"), Value::Object(Some(_))),
+            matches!(
+                ctx.get_field_by_name(pd, "permissions"),
+                Value::Object(Some(_))
+            ),
             "pd.permissions must be a non-null PermissionCollection"
         );
         assert!(
-            matches!(ctx.get_field_by_name(pd, "principals"), Value::Object(Some(_))),
+            matches!(
+                ctx.get_field_by_name(pd, "principals"),
+                Value::Object(Some(_))
+            ),
             "pd.principals must be a non-null (possibly empty) array"
         );
         // The model's ORDER — which is what the rotation broke — is asserted
@@ -25744,7 +25865,10 @@ mod tests {
         // (The synthetic String form the raw write used to leave here is gone;
         // `lookup_define` reads this by name and copes with either shape.)
         assert!(
-            matches!(ctx.get_field_by_name(cs, "location"), Value::Object(Some(_))),
+            matches!(
+                ctx.get_field_by_name(cs, "location"),
+                Value::Object(Some(_))
+            ),
             "CodeSource.location must be populated"
         );
         // CS.certs must be a 2-element Object[]
@@ -27928,7 +28052,10 @@ Implementation-Title: opensaml-core-api\r\n\
     fn g69_descriptor_get_name_is_getname_not_the_array_speller() {
         assert_eq!(descriptor_get_name("I"), "int");
         assert_eq!(descriptor_get_name("Z"), "boolean");
-        assert_eq!(descriptor_get_name("Ljava/lang/String;"), "java.lang.String");
+        assert_eq!(
+            descriptor_get_name("Ljava/lang/String;"),
+            "java.lang.String"
+        );
         // The two that matter: arrays keep the descriptor shape, with dots.
         assert_eq!(descriptor_get_name("[I"), "[I");
         assert_eq!(
@@ -28093,7 +28220,8 @@ mod protection_domain_layout_tests {
 
     #[test]
     fn the_model_is_the_real_declaration_order_not_the_constructor_order() {
-        let model = cratonvm_classloading::synthetic_stub_field_model("java/security/ProtectionDomain");
+        let model =
+            cratonvm_classloading::synthetic_stub_field_model("java/security/ProtectionDomain");
         let got: Vec<(String, String)> = model
             .iter()
             .filter(|f| !f.is_static())

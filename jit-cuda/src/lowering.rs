@@ -1027,7 +1027,11 @@ mod tests {
             "out[] is written but never read; marking it read would refuse \
              a chunked writeback that is in fact safe\nreads={reads:#b}"
         );
-        assert_ne!(writes & (1 << 3), 0, "out[] is written:\nwrites={writes:#b}");
+        assert_ne!(
+            writes & (1 << 3),
+            0,
+            "out[] is written:\nwrites={writes:#b}"
+        );
         // The set a chunked dispatch may stream out early.
         assert_eq!(
             writes & !reads,
@@ -1541,8 +1545,7 @@ mod tests {
     /// instruction.
     #[test]
     fn inline_arraylength_loop_bound_lowers_like_the_hoisted_form() {
-        let inline =
-            lower_fixture("EligibleInlineLengthBound", "scaleInline", "([I[I)V").render();
+        let inline = lower_fixture("EligibleInlineLengthBound", "scaleInline", "([I[I)V").render();
         let hoisted =
             lower_fixture("EligibleInlineLengthBound", "scaleHoisted", "([I[I)V").render();
 
@@ -1603,18 +1606,18 @@ mod tests {
     /// which the CP-free analyzer rejects with `Reason::LoadConstant`.
     #[test]
     fn inline_arraylength_loop_bound_works_for_a_float_array() {
-        let text = lower_fixture_with_pool(
-            "EligibleInlineLengthBound",
-            "scaleFloatInline",
-            "([F[F)V",
-        )
-        .render();
+        let text =
+            lower_fixture_with_pool("EligibleInlineLengthBound", "scaleFloatInline", "([F[F)V")
+                .render();
         assert!(
             text.contains(".visible .entry EligibleInlineLengthBound__scaleFloatInline_"),
             "float inline .length bound did not lower:\n{text}"
         );
         assert!(text.contains("[p1_len]"), "expected p1_len bound:\n{text}");
-        assert!(text.contains("mul.rn.f32"), "expected the float body:\n{text}");
+        assert!(
+            text.contains("mul.rn.f32"),
+            "expected the float body:\n{text}"
+        );
     }
 
     #[test]
@@ -1842,12 +1845,8 @@ mod tests {
             // asserts the gate itself instead.
         ];
         for (name, descriptor) in cases {
-            let m = lower_fixture_with_pool_and_hint(
-                "EligibleLlamaKernels",
-                name,
-                descriptor,
-                hint,
-            );
+            let m =
+                lower_fixture_with_pool_and_hint("EligibleLlamaKernels", name, descriptor, hint);
             let text = m.render();
             assert!(
                 text.contains(&format!(".visible .entry EligibleLlamaKernels__{name}_")),
@@ -1884,12 +1883,8 @@ mod tests {
             // asserts the gate itself instead.
         ];
         for (name, descriptor) in cases {
-            let m = lower_fixture_with_pool_and_hint(
-                "EligibleLlamaKernels",
-                name,
-                descriptor,
-                hint,
-            );
+            let m =
+                lower_fixture_with_pool_and_hint("EligibleLlamaKernels", name, descriptor, hint);
             ptxas_round_trip(&m.render(), &format!("llama_{name}"));
         }
     }
@@ -1906,15 +1901,9 @@ mod tests {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
-        for (name, descriptor) in [
-            ("softmaxRows", "([FII[F)V"),
-            ("siluMul", "([F[F[F)V"),
-        ] {
-            let (method, cp) = crate::analyzer::load_method_with_pool(
-                "EligibleLlamaKernels",
-                name,
-                descriptor,
-            );
+        for (name, descriptor) in [("softmaxRows", "([FII[F)V"), ("siluMul", "([F[F[F)V")] {
+            let (method, cp) =
+                crate::analyzer::load_method_with_pool("EligibleLlamaKernels", name, descriptor);
             let annotations = crate::annotations::MethodAnnotations {
                 gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
                     admit: hint,
@@ -1927,9 +1916,7 @@ mod tests {
             match (on, &verdict) {
                 (true, OffloadVerdict::Eligible(_)) => {}
                 (false, OffloadVerdict::Rejected(crate::analyzer::Reason::Invoke)) => {}
-                _ => panic!(
-                    "{name}: approx_math={on} but the analyzer said {verdict:?}"
-                ),
+                _ => panic!("{name}: approx_math={on} but the analyzer said {verdict:?}"),
             }
         }
     }
@@ -1950,13 +1937,19 @@ mod tests {
             crate::annotations::AdmissionHint::AllowIntrinsicCalls,
         );
         let text = m.render();
-        assert!(text.contains(".visible .entry EligibleSplitMatmul__matmulColSplit_"), "{text}");
+        assert!(
+            text.contains(".visible .entry EligibleSplitMatmul__matmulColSplit_"),
+            "{text}"
+        );
         assert!(text.contains("cvt.f32.f16"), "{text}");
         assert!(text.contains("bra L_body_"), "{text}");
 
         let m = lower_fixture("EligibleSplitMatmul", "reducePartials", "([FI[F)V");
         let text = m.render();
-        assert!(text.contains(".visible .entry EligibleSplitMatmul__reducePartials_"), "{text}");
+        assert!(
+            text.contains(".visible .entry EligibleSplitMatmul__reducePartials_"),
+            "{text}"
+        );
         assert!(text.contains("add.rn.f32"), "{text}");
     }
 
@@ -2009,7 +2002,6 @@ mod tests {
             other => panic!("expected the outer Counted loop, got {other:?}"),
         }
     }
-
 
     // ─── AUDIT 2026-07-11 (constant-start offset): EligibleOffsetLoop ─
     //
@@ -2612,7 +2604,10 @@ mod tests {
             !text.contains("sqrt.rn.f32"),
             "collapsing here would change the stored value\n{text}"
         );
-        assert!(text.contains("st.global.f64"), "expected a double store\n{text}");
+        assert!(
+            text.contains("st.global.f64"),
+            "expected a double store\n{text}"
+        );
     }
 
     #[test]

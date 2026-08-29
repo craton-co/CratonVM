@@ -1504,7 +1504,9 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
                 let row_cls = ctx.class_name_of_id(row_cid).unwrap_or_default();
                 eprintln!(
                     "[h2trace seq={}] EC.getValue FALLTHROUGH-ENTER column_id={} row_class={}",
-                    h2trace_seq(), column_id, row_cls,
+                    h2trace_seq(),
+                    column_id,
+                    row_cls,
                 );
             }
             // GC-safety: the probe call below re-enters Java and may move
@@ -1528,7 +1530,8 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
             if h2trace_enabled() {
                 eprintln!(
                     "[h2trace seq={}] EC.getValue FALLTHROUGH probe_hit={}",
-                    h2trace_seq(), probe.is_some(),
+                    h2trace_seq(),
+                    probe.is_some(),
                 );
             }
             if let Some(Value::Object(Some(value))) = probe {
@@ -2182,7 +2185,10 @@ fn h2_session_prepare_local_no_cache(
         let loader_id = ctx.loader_id_of_class(session_class_id);
         eprintln!(
             "[h2trace seq={}] Session.prepareLocal is_select={} loader_id={} sql={:?}",
-            h2trace_seq(), is_select, loader_id, prefix,
+            h2trace_seq(),
+            is_select,
+            loader_id,
+            prefix,
         );
     }
     if is_select {
@@ -2245,7 +2251,8 @@ fn h2_session_prepare_local_no_cache(
             if h2trace_enabled() {
                 eprintln!(
                     "[h2trace seq={}] Session.prepareLocal PLAIN-PATH session_loader={}",
-                    h2trace_seq(), loader_id,
+                    h2trace_seq(),
+                    loader_id,
                 );
             }
             None
@@ -2730,13 +2737,18 @@ fn h2_sql_fragment(
 #[inline]
 fn h2_parser_read_dbg_enabled() -> bool {
     static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DBG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_H2PARSERREAD").is_some())
+    *DBG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_H2PARSERREAD").is_some()
+    })
 }
 
 #[cfg(test)]
 mod h2_parser_read_dbg_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     #[test]
     fn h2_parser_read_dbg_flag_is_latched_and_matches_environment() {
         // The per-token parser step used to probe `env::var_os` on every call.
@@ -2884,9 +2896,18 @@ fn h2_parser_add_expected_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// shapes on H2's own `asIdentifier()` path, but avoid interpreted token and
 /// String dispatch for the normal parser branch.
 fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
-    let expected = match args.get(1) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
-    let token = match args.get(2) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    let this = match args.first() {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let expected = match args.get(1) {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let token = match args.get(2) {
+        Some(Value::Object(Some(value))) => *value,
+        _ => return Ok(Some(Value::Int(0))),
+    };
     if matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(value) if value != 0) {
         return Ok(Some(Value::Int(0)));
     }
@@ -2916,7 +2937,10 @@ fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             this = ctx.read_native_pin(this_pin, this);
             expected = ctx.read_native_pin(expected_pin, expected);
             ctx.unpin_native_roots(this_pin);
-            match result { Some(Value::Object(Some(value))) => value, _ => return Ok(Some(Value::Int(0))) }
+            match result {
+                Some(Value::Object(Some(value))) => value,
+                _ => return Ok(Some(Value::Int(0))),
+            }
         }
     };
     let identifier_pin = ctx.pin_native_root(identifier);
@@ -2925,7 +2949,10 @@ fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let identifier = ctx.read_native_pin(identifier_pin, identifier);
     let expected = ctx.read_native_pin(expected_pin, expected);
     ctx.unpin_native_roots(identifier_pin);
-    let args = [Value::Object(Some(expected)), Value::Object(Some(identifier))];
+    let args = [
+        Value::Object(Some(expected)),
+        Value::Object(Some(identifier)),
+    ];
     if upper {
         return crate::lang_string::native_string_equals(ctx, &args);
     }
@@ -3553,10 +3580,13 @@ fn table_filter_prepare_on(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn h2_test_object(ctx: &mut MockNativeContext, class_name: &str, fields: usize) -> ObjectRef {
         let cid = ctx
@@ -3807,23 +3837,62 @@ mod pin_audit_witness {
     /// the mover is used solely as the RECEIVER of a later `ctx` call, which
     /// `load_and_forward` repairs at the entry point.
     const JUSTIFIED_UNPINNED: &[(&str, &str)] = &[
-        ("register_apps_h2_overrides", "registration only; holds no ObjectRef"),
-        ("h2_internal_error", "the string it creates is the very next call's argument"),
-        ("h2_new_empty_hashmap", "the allocation IS the value; nothing is held across it"),
+        (
+            "register_apps_h2_overrides",
+            "registration only; holds no ObjectRef",
+        ),
+        (
+            "h2_internal_error",
+            "the string it creates is the very next call's argument",
+        ),
+        (
+            "h2_new_empty_hashmap",
+            "the allocation IS the value; nothing is held across it",
+        ),
         ("h2_read_string_hash", "receiver-only"),
-        ("h2_column_hash_code", "no mover between the field reads and their use"),
-        ("h2_expression_column_get_value_bytecode", "forwards `args` untouched"),
+        (
+            "h2_column_hash_code",
+            "no mover between the field reads and their use",
+        ),
+        (
+            "h2_expression_column_get_value_bytecode",
+            "forwards `args` untouched",
+        ),
         ("h2_row_get", "hands its argument straight to the callee"),
         ("h2_default_row_get_value", "no mover before the array read"),
-        ("h2_utils_get_resource", "the array it allocates is only ever its own store target"),
+        (
+            "h2_utils_get_resource",
+            "the array it allocates is only ever its own store target",
+        ),
         ("h2_boxed_long_value", "receiver-only"),
-        ("h2_parser_set_token_index", "hands its argument straight to the callee"),
-        ("h2_parser_advance_to", "receiver-only; the one value store is forwarded by set_field_by_name"),
-        ("h2_token_as_identifier_native", "hands its argument straight to the callee"),
-        ("h2_token_as_identifier_value", "the string it creates is returned immediately"),
-        ("h2_syntax_error", "hands its argument straight to the callee"),
-        ("table_filter_prepare", "hands its argument straight to the callee"),
-        ("h2_db_exception", "the array is re-read through a pin; see the body"),
+        (
+            "h2_parser_set_token_index",
+            "hands its argument straight to the callee",
+        ),
+        (
+            "h2_parser_advance_to",
+            "receiver-only; the one value store is forwarded by set_field_by_name",
+        ),
+        (
+            "h2_token_as_identifier_native",
+            "hands its argument straight to the callee",
+        ),
+        (
+            "h2_token_as_identifier_value",
+            "the string it creates is returned immediately",
+        ),
+        (
+            "h2_syntax_error",
+            "hands its argument straight to the callee",
+        ),
+        (
+            "table_filter_prepare",
+            "hands its argument straight to the callee",
+        ),
+        (
+            "h2_db_exception",
+            "the array is re-read through a pin; see the body",
+        ),
     ];
 
     /// Top-level functions only, keyed on column 0.

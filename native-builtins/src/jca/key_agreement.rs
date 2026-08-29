@@ -22,7 +22,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 const KA_CLASS: &str = "javax/crypto/KeyAgreement";
 const ECDH_SPI: &str = "sun/security/ec/ECDHKeyAgreement";
@@ -416,7 +416,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "()Ljava/security/Provider;",
         ka_get_provider,
     );
-    r.register(cls, "getAlgorithm", "()Ljava/lang/String;", ka_get_algorithm);
+    r.register(
+        cls,
+        "getAlgorithm",
+        "()Ljava/lang/String;",
+        ka_get_algorithm,
+    );
 }
 
 #[cfg(test)]

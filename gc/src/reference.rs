@@ -1188,7 +1188,8 @@ impl ReferenceProcessor {
     /// safe to test this way — a finalizable object is an arbitrary class and
     /// may legitimately declare fewer than two fields.
     pub fn retain_shaped_weak_phantom(&mut self, still_a_reference: &dyn Fn(usize) -> bool) {
-        self.weak_refs.retain(|e| still_a_reference(e.reference_obj));
+        self.weak_refs
+            .retain(|e| still_a_reference(e.reference_obj));
         self.phantom_refs
             .retain(|e| still_a_reference(e.reference_obj));
     }
@@ -2206,7 +2207,10 @@ mod tests {
         // old-gen-reclamation fix, so the collector emitted no survival proof
         // for them and the exact post-GC predicate could not be used.
         for a in [100, 200, 101, 201, 301, 102, 202, 103, 203, 104, 204] {
-            assert!(addrs.contains(&a), "address {a} must be published as watched");
+            assert!(
+                addrs.contains(&a),
+                "address {a} must be published as watched"
+            );
         }
     }
 
@@ -2511,14 +2515,17 @@ mod tests {
         proc.discover_reference(ReferenceType::Soft, 20, 200, None);
         proc.touch_soft_reference(10, 61_000);
         proc.touch_soft_reference(20, 61_000);
-        assert_eq!(
-            proc.condemn_all_soft_refs(),
-            vec![(10, 100), (20, 200)]
-        );
+        assert_eq!(proc.condemn_all_soft_refs(), vec![(10, 100), (20, 200)]);
         let live = [100usize];
         proc.process_references(&live_set(&live), 0, 61_000);
-        assert!(!proc.soft_refs[0].cleared, "referent 100 is strongly reachable");
-        assert!(proc.soft_refs[1].cleared, "referent 200 is only softly reachable");
+        assert!(
+            !proc.soft_refs[0].cleared,
+            "referent 100 is strongly reachable"
+        );
+        assert!(
+            proc.soft_refs[1].cleared,
+            "referent 200 is only softly reachable"
+        );
         assert_eq!(proc.soft_pre_nulled_active_pairs(), vec![(10, 100)]);
     }
 

@@ -166,8 +166,10 @@ fn t11_1_helpers_safety_comments() {
 
 #[test]
 fn t11_1_interpreter_safety_comments() {
-    let (total, documented) =
-        check_safety_comments_tree(&ws("vm/src/runtime/interpreter.rs"), "vm/src/runtime/interpreter");
+    let (total, documented) = check_safety_comments_tree(
+        &ws("vm/src/runtime/interpreter.rs"),
+        "vm/src/runtime/interpreter",
+    );
     let coverage = if total > 0 {
         documented * 100 / total
     } else {

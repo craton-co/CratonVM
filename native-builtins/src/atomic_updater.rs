@@ -311,7 +311,10 @@ fn ref_descriptor_to_internal_name(desc: &str) -> Option<String> {
 // Synthetic-impl allocation
 // ---------------------------------------------------------------------------
 
-fn alloc_impl(ctx: &mut dyn NativeContext, impl_class: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_impl(
+    ctx: &mut dyn NativeContext,
+    impl_class: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.ensure_class_initialized(impl_class) {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
@@ -379,7 +382,10 @@ fn build_updater(
             field = %field_name,
             "T19.H5: newUpdater field not found"
         );
-        new_updater_refusal(ctx, &format!("java.lang.NoSuchFieldException: {field_name}"))
+        new_updater_refusal(
+            ctx,
+            &format!("java.lang.NoSuchFieldException: {field_name}"),
+        )
     })?;
 
     // Reject static / final.  ACC_STATIC = 0x0008, ACC_FINAL = 0x0010.
@@ -552,13 +558,22 @@ fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // measured shape. The JDK reaches these through `getDeclaredField` inside
     // a `catch (Exception) -> RuntimeException`, so the NPE never escapes.
     let Some(tclass) = arg_obj(args, 0) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: tclass",
+        ));
     };
     let Some(vclass) = arg_obj(args, 1) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: vclass"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: vclass",
+        ));
     };
     let Some(name_obj) = arg_obj(args, 2) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: fieldName",
+        ));
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     tracing::info!(
@@ -584,10 +599,16 @@ fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // See `new_updater_refusal`.
     let Some(tclass) = arg_obj(args, 0) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: tclass",
+        ));
     };
     let Some(name_obj) = arg_obj(args, 1) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: fieldName",
+        ));
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     build_updater(
@@ -603,10 +624,16 @@ fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_alfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // See `new_updater_refusal`.
     let Some(tclass) = arg_obj(args, 0) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: tclass"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: tclass",
+        ));
     };
     let Some(name_obj) = arg_obj(args, 1) else {
-        return Err(new_updater_refusal(ctx, "java.lang.NullPointerException: fieldName"));
+        return Err(new_updater_refusal(
+            ctx,
+            "java.lang.NullPointerException: fieldName",
+        ));
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     build_updater(
@@ -1520,10 +1547,13 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Build a Class mirror in the mock and return both the mirror ref
@@ -1582,7 +1612,6 @@ mod tests {
 
     // Forward every NativeContext method to `inner` except declared_fields.
     impl cratonvm_native_api::NativeClassAccess for UpdaterMock {
-
         fn load_class(&mut self, name: &str) -> MethodCallResult {
             self.inner.load_class(name)
         }
@@ -1748,7 +1777,6 @@ mod tests {
     }
 
     impl cratonvm_native_api::NativeInvokeAccess for UpdaterMock {
-
         fn invoke(
             &mut self,
             class_name: &str,
@@ -1771,7 +1799,6 @@ mod tests {
     }
 
     impl cratonvm_native_api::NativeHeapAccess for UpdaterMock {
-
         fn new_object(&mut self, class_name: &str) -> MethodCallResult {
             self.inner.new_object(class_name)
         }
@@ -1871,7 +1898,6 @@ mod tests {
     }
 
     impl cratonvm_native_api::NativeThreadAccess for UpdaterMock {
-
         fn thread_id(&self) -> u64 {
             self.inner.thread_id()
         }
@@ -1935,7 +1961,6 @@ mod tests {
     }
 
     impl cratonvm_native_api::NativeExceptionAccess for UpdaterMock {
-
         fn capture_stack_trace(
             &mut self,
             throwable_hash: i32,
@@ -1950,12 +1975,9 @@ mod tests {
         }
     }
 
-    impl cratonvm_native_api::NativeGpuAccess for UpdaterMock {
-
-    }
+    impl cratonvm_native_api::NativeGpuAccess for UpdaterMock {}
 
     impl cratonvm_native_api::NativeSystemAccess for UpdaterMock {
-
         fn record_printed_value(&mut self, value: Value) {
             self.inner.record_printed_value(value)
         }
@@ -2011,9 +2033,6 @@ mod tests {
             self.inner.force_gc()
         }
     }
-
-
-
 
     fn make_class_mirror_um(um: &mut UpdaterMock, name: &str) -> (ObjectRef, ClassId) {
         make_class_mirror(&mut um.inner, name)

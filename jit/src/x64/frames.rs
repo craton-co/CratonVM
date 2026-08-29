@@ -23,7 +23,6 @@ impl Compiler {
     // Moved to `x64/operand_stack.rs`: the push/pop/dup/flush bookkeeping and
     // the local load/store helpers that read the same slot model.
 
-
     /// Reserve the direct-call argument-service range, ABOVE the argument slots.
     ///
     /// A baked direct call has no dispatch-helper frame, so the cold
@@ -67,7 +66,6 @@ impl Compiler {
         }
         Some(base)
     }
-
 
     /// Round-8 wave-3 HIGH fix (round-4 #15 / round-5 #9 / round-7 #5):
     /// defensive callee-saved register spill before a safepoint.

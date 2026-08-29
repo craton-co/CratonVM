@@ -15,7 +15,7 @@ use crate::lang_class::{
     create_constructor_object, create_method_object, read_constructor_descriptor,
 };
 use crate::lang_invoke::alloc_method_handle;
-use crate::{try_alloc_concurrent_synthetic, native_noop, obj_arg};
+use crate::{native_noop, obj_arg, try_alloc_concurrent_synthetic};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -2179,7 +2179,8 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         "putFields",
         "()Ljava/io/ObjectOutputStream$PutField;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2)?;
             ctx.set_field(obj, 0, Value::Int(0)); // field count
             ctx.set_field(obj, 1, Value::Int(0)); // written flag
             Ok(Some(Value::Object(Some(obj))))
@@ -3557,7 +3558,7 @@ fn build_object_stream_class(
         "(Ljava/io/ObjectOutputStream;)V",
     )
     .map(|m| create_method_object(ctx, &m))
-        .transpose()?;
+    .transpose()?;
     let ro = find_private_method(
         ctx,
         class_id,
@@ -3565,7 +3566,7 @@ fn build_object_stream_class(
         "(Ljava/io/ObjectInputStream;)V",
     )
     .map(|m| create_method_object(ctx, &m))
-        .transpose()?;
+    .transpose()?;
     let rond = find_private_method(ctx, class_id, "readObjectNoData", "()V")
         .map(|m| create_method_object(ctx, &m))
         .transpose()?;
@@ -4672,7 +4673,8 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
                 Value::Int(s) => s,
                 _ => 0,
             };
-            let status_obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1)?;
+            let status_obj =
+                try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1)?;
             ctx.set_field(status_obj, 0, Value::Int(status));
             Ok(Some(Value::Object(Some(status_obj))))
         },
@@ -5069,10 +5071,13 @@ pub(crate) fn register_byte_array_output_stream(_r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod serialization_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // --- Protocol constants ---
 
@@ -6991,11 +6996,14 @@ mod serialization_tests {
 
 #[cfg(test)]
 mod wp02_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::{FieldMetadata, MethodMetadata};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     const ACC_PUBLIC: u16 = 0x0001;
@@ -7376,11 +7384,14 @@ mod wp02_tests {
 
 #[cfg(test)]
 mod marshal_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     const ACC_PUBLIC: u16 = 0x0001;

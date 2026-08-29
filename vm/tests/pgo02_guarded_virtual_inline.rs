@@ -47,14 +47,24 @@ fn test_vm() -> Vm {
 }
 
 fn invoke_int(vm: &mut Vm, method: &str, args: &[Value]) -> i32 {
-    match vm.invoke("cratonvm/PgoGuardedVirtualInline", method, method_descriptor(method), args) {
+    match vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        method,
+        method_descriptor(method),
+        args,
+    ) {
         Ok(Some(Value::Int(n))) => n,
         other => panic!("{method} failed or returned a non-int: {other:?}"),
     }
 }
 
 fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
-    match vm.invoke("cratonvm/PgoGuardedVirtualInline", method, method_descriptor(method), args) {
+    match vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        method,
+        method_descriptor(method),
+        args,
+    ) {
         Ok(None) => {}
         other => panic!("{method} failed or returned a value: {other:?}"),
     }
@@ -184,7 +194,12 @@ fn check_metrics_harvest() -> Result<(), String> {
     if speculative == 0 {
         let measured = reports
             .iter()
-            .filter(|r| !matches!(r.inline_candidates, cratonvm_jit::metrics::Measured::NotMeasured))
+            .filter(|r| {
+                !matches!(
+                    r.inline_candidates,
+                    cratonvm_jit::metrics::Measured::NotMeasured
+                )
+            })
             .count();
         return Err(format!(
             "check_metrics_harvest: {} reports, {measured} carrying an inline tally, but none              reporting a speculative site — the guarded inlines the checks above proved              happened did not reach the metrics surface",
@@ -399,17 +414,16 @@ fn check_stack_trace_through_an_inlined_frame(vm: &mut Vm) -> Result<(), String>
             }
         };
         let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc) = err else {
-            return Err(format!("callDivider({x}) failed without a throwable: {err:?}"));
+            return Err(format!(
+                "callDivider({x}) failed without a throwable: {err:?}"
+            ));
         };
         let hash = vm.shared.mem.heap.identity_hash_code(exc);
         let trace = vm
             .shared
             .throwable_stack_trace(hash)
             .ok_or_else(|| "no stack trace was captured for the throwable".to_string())?;
-        Ok(trace
-            .iter()
-            .filter(|f| &*f.method_name == "tag")
-            .count())
+        Ok(trace.iter().filter(|f| &*f.method_name == "tag").count())
     }
 
     invoke_void(vm, "setDivisor", &[Value::Int(0)]);

@@ -1382,7 +1382,10 @@ impl ClassStore {
         CLASS_ORIGIN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Ids are monotonic, so appending keeps each child list sorted.
         if let Some(sid) = superclass {
-            self.subclasses.entry(sid.as_u32()).or_default().push(id.as_u32());
+            self.subclasses
+                .entry(sid.as_u32())
+                .or_default()
+                .push(id.as_u32());
         }
         // Compact reference-field layout: register this class's oop-map / offset
         // table so the heap + GC can place and scan its reference fields as
@@ -1400,7 +1403,10 @@ impl ClassStore {
     /// different one. Writing `class.superclass` through `get_mut` instead
     /// would silently desynchronise [`ClassStore::descendants_of`].
     pub fn set_superclass(&mut self, id: ClassId, new_super: Option<ClassId>) {
-        let Some(class) = self.classes.get_mut(id.as_u32() as usize).and_then(Option::as_mut)
+        let Some(class) = self
+            .classes
+            .get_mut(id.as_u32() as usize)
+            .and_then(Option::as_mut)
         else {
             return;
         };
@@ -1647,9 +1653,7 @@ impl ClassStore {
                     let pick = by_width
                         .iter()
                         .copied()
-                        .find(|&i| {
-                            !placed[i] && cursor % declared[i].alignment_runtime() == 0
-                        })
+                        .find(|&i| !placed[i] && cursor % declared[i].alignment_runtime() == 0)
                         .or_else(|| by_width.iter().copied().find(|&i| !placed[i]));
                     let Some(i) = pick else { break };
                     placed[i] = true;
@@ -2735,7 +2739,10 @@ mod tests {
 
         let packed = store.build_compact_layout_ordered(child, true).unwrap();
         let declared = store.build_compact_layout_ordered(child, false).unwrap();
-        assert_eq!(declared.body_size, 24, "declaration order is already 24 here");
+        assert_eq!(
+            declared.body_size, 24,
+            "declaration order is already 24 here"
+        );
         assert_eq!(
             packed.body_size, 24,
             "hole-first must match declaration order, not regress to 32"

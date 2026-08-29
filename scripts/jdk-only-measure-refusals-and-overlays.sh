@@ -34,7 +34,7 @@
 #   scripts/jdk-only-measure-refusals-and-overlays.sh
 #
 # PROBES must hold compiled JdkOnlyIcHotProbe, JdkOnlyCensusLoadProbe and
-# JdkOnlyBreadthProbe from probes/.
+# JdkOnlyBreadthProbe from apps/probes/.
 set -u
 
 : "${JAVA_HOME:?set JAVA_HOME to a REAL JDK image, not a synthetic one}"

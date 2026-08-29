@@ -166,8 +166,7 @@ impl OscCache {
     pub fn scan_roots(&self, vm_identity: usize, roots: &mut Vec<ObjectRef>) {
         for (&class_id, desc) in self.inner.read().iter() {
             if cratonvm_types::metadata_pin::metadata_weak_mode() {
-                if let Some(loader) =
-                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
                         vm_identity,

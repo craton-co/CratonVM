@@ -230,7 +230,12 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-fn run_probe(bin: &Path, jdk: &Path, classes: &Path, extra_env: &[(&str, &str)]) -> (String, String) {
+fn run_probe(
+    bin: &Path,
+    jdk: &Path,
+    classes: &Path,
+    extra_env: &[(&str, &str)],
+) -> (String, String) {
     let mut cmd = Command::new(bin);
     cmd.arg("--java-home")
         .arg(jdk)
@@ -427,12 +432,7 @@ fn every_backend_door_goes_through_the_admission_gate() {
     // What makes the assertion below reachable is the probe's `reflectedOnly`,
     // not this environment alone — see the module doc. A bytecode-driven
     // workload cannot take this door at any temperature.
-    let (stdout, stderr) = run_probe(
-        &bin,
-        &jdk,
-        &classes,
-        &[("CRATONVM_JIT", "bg-compile=0")],
-    );
+    let (stdout, stderr) = run_probe(&bin, &jdk, &classes, &[("CRATONVM_JIT", "bg-compile=0")]);
     check_probe_arithmetic(&stdout, &stderr);
     let fields = gate_line(&stderr);
     assert_eq!(

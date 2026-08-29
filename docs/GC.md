@@ -290,7 +290,7 @@ target at the ceiling is not a trigger — and an unproductive pause (nothing
 copied, nothing freed) resets it to the ceiling so it can never storm.
 
 It is **not** a default, and the reason is measured. On
-`probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
+`apps/probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
 of garbage, 200 ms goal), medians of 3 interleaved reps:
 
 | arm | wall | pauses | total pause | p50 | p99 |
@@ -313,7 +313,7 @@ own pause distribution.
 `[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
 `closure_us`, `fixup_us`, `free_us` — with `fixup_us` printed beside the
 `fixup_regions` / `fixup_bytes` it covered, because a slow walk and a large
-old generation are different problems. On `probes/G1ChurnPauseProbe 96 900`
+old generation are different problems. On `apps/probes/G1ChurnPauseProbe 96 900`
 at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
 walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
 collection set **42 %**. That last figure is why the phase breakdown exists

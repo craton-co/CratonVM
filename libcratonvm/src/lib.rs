@@ -2874,10 +2874,9 @@ mod tests {
     /// place. `JAVA_HOME` is *not* declared and keeps live-read semantics, so
     /// it still goes through `with_env`.
     fn with_java_home<R>(root: &str, f: impl FnOnce() -> R) -> R {
-        cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_JAVA_HOME", Some(root))],
-            || with_env("JAVA_HOME", None, f),
-        )
+        cratonvm_types::flags::with_thread_overrides(&[("CRATONVM_JAVA_HOME", Some(root))], || {
+            with_env("JAVA_HOME", None, f)
+        })
     }
 
     /// Run `f` with the process pointed at a synthesised real JDK.
@@ -3133,7 +3132,10 @@ mod tests {
         );
 
         for (abi, mode) in [
-            (CRATONVM_COMPATIBILITY_COMPATIBLE, CompatibilityMode::Compatible),
+            (
+                CRATONVM_COMPATIBILITY_COMPATIBLE,
+                CompatibilityMode::Compatible,
+            ),
             (CRATONVM_COMPATIBILITY_JDK_ONLY, CompatibilityMode::JdkOnly),
         ] {
             assert_eq!(compatibility_mode_from_abi(abi), Ok(mode));

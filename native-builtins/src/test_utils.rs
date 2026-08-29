@@ -1530,8 +1530,6 @@ impl MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
-
-
     fn load_class(&mut self, _name: &str) -> MethodCallResult {
         Ok(None)
     }
@@ -2019,8 +2017,6 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
-
-
     fn invoke(
         &mut self,
         class_name: &str,
@@ -2068,8 +2064,6 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
-
-
     fn new_object(&mut self, class_name: &str) -> MethodCallResult {
         let cid = self.ensure_class_initialized(class_name)?;
         let obj = self.alloc_entry(HeapEntry::Object {
@@ -2490,8 +2484,6 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
-
-
     fn thread_id(&self) -> u64 {
         1
     }
@@ -2573,8 +2565,6 @@ impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
-
-
     fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
@@ -2590,8 +2580,6 @@ impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
-
-
     /// 2026-07-11: honour any test-provided `gpu_future_take_result_override`;
     /// defaults to the trait's default (`None`, "no GPU offload") when no
     /// override is set for `handle`. See `set_gpu_future_take_result`.
@@ -2627,7 +2615,6 @@ impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
 }
 
 impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
-
     // Mirror the production NativeContext memory bridge, BOTH halves:
     // `vm_exec` routes a TAGGED `Unsafe.allocateMemory` handle to the arena
     // store and only falls through to a raw copy for an untagged address. This
@@ -2911,9 +2898,6 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
 
     fn force_gc(&mut self) {}
 }
-
-
-
 
 impl Drop for MockNativeContext {
     fn drop(&mut self) {

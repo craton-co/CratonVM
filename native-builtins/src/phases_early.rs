@@ -3,13 +3,13 @@
 
 //! Phase 50-54 native method registrations.
 
-use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ObjectRef, Value};
 use crate::util_concurrent_ext::{
     atomic_array_cas, atomic_array_index, atomic_array_new_length, atomic_array_raw_index,
     atomic_array_rmw,
 };
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 /// The deadline a `java/net/SocketInputStream` read must honour, derived from
 /// the socket's own `SO_RCVTIMEO`.
@@ -47,8 +47,8 @@ use crate::lang_string::{
     register_phase52_string_buffer,
 };
 use crate::{
-    try_alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop, native_return_false,
-    native_unsafe_ensure_class_initialized, obj_arg,
+    build_real_layout_string_hashset, native_noop, native_return_false,
+    native_unsafe_ensure_class_initialized, obj_arg, try_alloc_concurrent_synthetic,
 };
 use crate::{
     native_return_first_arg, native_synchronized_collection, native_synchronized_list,
@@ -63,7 +63,10 @@ fn object_array_element_hash_code(
         return Ok(ctx.identity_hash_code(obj));
     }
 
-    match ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() {
+    match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+    {
         Some("java/lang/String") => {
             match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
                 Some(Value::Int(v)) => Ok(v),
@@ -927,13 +930,17 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                     if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
                         return Ok(Some(v));
                     }
-                    let itr =
-                        try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
+                    let itr = try_alloc_concurrent_synthetic(
+                        ctx,
+                        "java/util/Collections$EmptyIterator",
+                        0,
+                    )?;
                     ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
                     return Ok(Some(Value::Object(Some(itr))));
                 }
             }
-            let iter = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
+            let iter =
+                try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
             Ok(Some(Value::Object(Some(iter))))
         },
     );
@@ -942,7 +949,8 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "emptyEnumeration",
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
-            let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+            let e =
+                try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
             Ok(Some(Value::Object(Some(e))))
         },
     );
@@ -2754,12 +2762,16 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register("java/lang/Double", "max", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(crate::lang_math::java_math_max_f64(a, b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_max_f64(
+            a, b,
+        ))))
     });
     r.register("java/lang/Double", "min", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(crate::lang_math::java_math_min_f64(a, b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_min_f64(
+            a, b,
+        ))))
     });
 
     // --- Charset ---
@@ -5070,7 +5082,11 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 const ES_FIELD_ELEMENTS: usize = 0;
 const ES_FIELD_TYPE: usize = 1;
 
-fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn enum_set_backing_list(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    size: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let backing = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr_value = Value::Object(Some(arr));
     ctx.set_field(backing, 0, arr_value);
@@ -8678,10 +8694,7 @@ thread_local! {
 /// Push `args[0]` as the pool this thread is now inside; returns the pin
 /// handle to hand back to [`fjp_pool_frame_leave`], or `None` when the
 /// receiver is not an object (a static call, or a dispatch defect).
-pub(crate) fn fjp_pool_frame_enter(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> Option<usize> {
+pub(crate) fn fjp_pool_frame_enter(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<usize> {
     let pool = match args.first().copied() {
         Some(Value::Object(Some(p))) => p,
         _ => return None,
@@ -9309,9 +9322,9 @@ fn fjt_is_unchecked_throwable(ctx: &mut dyn NativeContext, ex: ObjectRef) -> boo
         let Some(cid) = cur else { return false };
         match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/RuntimeException") | Some("java/lang/Error") => return true,
-            Some("java/lang/Exception") | Some("java/lang/Throwable") | Some("java/lang/Object") => {
-                return false
-            }
+            Some("java/lang/Exception")
+            | Some("java/lang/Throwable")
+            | Some("java/lang/Object") => return false,
             _ => {}
         }
         cur = ctx.superclass_of(cid);
@@ -11433,7 +11446,8 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
+            let sv =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             // Use the function's returned (possibly GC-relocated) object,
             // not `sv` directly -- see the BUG FIX comment on
             // `initialize_real_thread_pool_executor`'s return path.
@@ -11455,7 +11469,8 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
+            let sv =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -11478,7 +11493,8 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(f))) => Some(*f),
                 _ => None,
             };
-            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
+            let sv =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -11497,7 +11513,8 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
+            let sv =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -12071,7 +12088,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                             &name,
                         ),
                     }
-                    .into())
+                    .into());
                 }
             };
             let obj = month_alloc(ctx, val)?;
@@ -13097,10 +13114,12 @@ fn p52_hex_val(b: u8) -> Option<u8> {
 /// a bind through it then failed much later with an unrelated OS error.
 fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if !(0..=0xFFFF).contains(&port) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: format!("port out of range:{port}"),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("port out of range:{port}"),
+            }
+            .into(),
+        );
     }
     Ok(port)
 }
@@ -13150,7 +13169,13 @@ fn p52_isa_check_host(host: Value) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
-fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) -> Result<(), MethodCallFailed> {
+fn p52_isa_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    host: Value,
+    addr: Value,
+    port: i32,
+) -> Result<(), MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
     // (and on a cold VM also loads + initialises the holder class), so `this`,
     // `host` and `addr` can all relocate across it. Writing them back through
@@ -13436,11 +13461,9 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this_h = scope.root(this);
         let addr = match args.get(1) {
             Some(Value::Object(Some(addr))) => *addr,
-            _ => crate::net_phase_e::alloc_inet_address_external(
-                &mut *scope,
-                "0.0.0.0",
-                "0.0.0.0",
-            )?,
+            _ => {
+                crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0")?
+            }
         };
         let addr_h = scope.root(addr);
         let addr_cur = scope.get(&addr_h);
@@ -13614,7 +13637,9 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let key = match p52_isa_addr_value(ctx, this) {
             Value::Object(Some(addr)) => p52_isa_addr_ip(ctx, addr),
             _ => match p52_isa_host_value(ctx, this) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().to_ascii_lowercase(),
+                Value::Object(Some(s)) => {
+                    ctx.read_string(s).unwrap_or_default().to_ascii_lowercase()
+                }
                 _ => String::new(),
             },
         };
@@ -15238,7 +15263,10 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cipher = "javax/crypto/Cipher";
 
-    fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    fn cipher_alloc(
+        ctx: &mut dyn NativeContext,
+        algo: ObjectRef,
+    ) -> Result<ObjectRef, MethodCallFailed> {
         let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
         ctx.set_field(obj, CIPHER_ALGO, Value::Object(Some(algo)));
         ctx.set_field(obj, CIPHER_MODE, Value::Int(0));
@@ -15417,7 +15445,12 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         // The two accessors the real body cannot serve on a synthetic: both
         // read instance fields no constructor ever wrote, and `getProvider()`
         // additionally synchronizes on a null `lock`. See `skf_algo_table`.
-        r.register(skf, "getAlgorithm", "()Ljava/lang/String;", pbkdf2_get_algorithm);
+        r.register(
+            skf,
+            "getAlgorithm",
+            "()Ljava/lang/String;",
+            pbkdf2_get_algorithm,
+        );
         r.register(
             skf,
             "getProvider",
@@ -15609,7 +15642,12 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     // NPE on the real path).
     r.register(kg, "init", "(I)V", keygen_init_int);
     // KeyGenerator.init(I, SecureRandom)V — same validation, ignore SecureRandom
-    r.register(kg, "init", "(ILjava/security/SecureRandom;)V", keygen_init_int);
+    r.register(
+        kg,
+        "init",
+        "(ILjava/security/SecureRandom;)V",
+        keygen_init_int,
+    );
     // init(SecureRandom) — W2: this was a no-op, which is not the same thing as
     // "leave keySize at its default": after an earlier `init(256)` the field
     // still held 256, so `kg.init(256); kg.init(random); kg.generateKey()`
@@ -16402,8 +16440,7 @@ macro_rules! pbkdf2_derive_wide_impl {
             while out.len() < dklen {
                 let mut salt_i = salt.to_vec();
                 salt_i.extend_from_slice(&block_index.to_be_bytes());
-                let mut mac =
-                    HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                let mut mac = HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
                 mac.update(&salt_i);
                 let mut u = mac.finalize().into_bytes().to_vec();
                 let mut t = u.clone();
@@ -16728,10 +16765,17 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — five acquisition sites, every
 /// one a single statement over a `pbkdf2_key_for(ctx, ..)` computed before the
 /// guard: two `insert`s, two `get(..).cloned()`s and a `contains_key`.
-fn skf_algo_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>> {
-    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn skf_algo_table(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<usize, String>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// `SecretKeyFactory.getAlgorithm()` — the name `getInstance` was called with.
@@ -16768,10 +16812,7 @@ pub(crate) fn pbkdf2_get_algorithm(
 /// `SecretKeyFactory.getProvider()` — SunJCE for the factories this VM builds,
 /// which is where HotSpot resolves every `PBKDF2With*` and `PBEWith*` factory;
 /// the real object's own `provider` field for any other receiver.
-pub(crate) fn pbkdf2_get_provider(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+pub(crate) fn pbkdf2_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Ok(this) = obj_arg(args, 0) {
         if !skf_receiver_is_ours(ctx, this) {
             // Type-checked for the reason `pbkdf2_get_algorithm` documents: an
@@ -17401,7 +17442,11 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
     let sec = "java/security/Security";
 
     /// Create a provider synthetic with the given name + version.
-    fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> Result<ObjectRef, MethodCallFailed> {
+    fn make_provider(
+        ctx: &mut dyn NativeContext,
+        name: &str,
+        version: f64,
+    ) -> Result<ObjectRef, MethodCallFailed> {
         let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 2)?;
         let n = ctx.create_string(name);
         ctx.set_field(p, 0, Value::Object(Some(n)));
@@ -19924,7 +19969,8 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/security/cert/CertPathValidator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertPathValidator", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertPathValidator", 1)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -21228,7 +21274,10 @@ fn ara_backing_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectR
                 // Take a free slot, else evict slot 0. The policy does not need
                 // to be clever at this size, but the table must not be able to
                 // grow without bound.
-                let victim = memo.iter().position(|(cid, _)| *cid == u32::MAX).unwrap_or(0);
+                let victim = memo
+                    .iter()
+                    .position(|(cid, _)| *cid == u32::MAX)
+                    .unwrap_or(0);
                 // Cast: field counts are far below `u32::MAX`.
                 memo[victim] = (raw_cid, index as u32);
             });
@@ -21874,12 +21923,12 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // W7-43-formatmessage-substitution.md
     let fmt = "java/util/logging/Formatter";
     r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
-    // Two sessions fixed this row concurrently. The version kept is the one
-    // that reproduces `java.util.logging.Formatter.formatMessage` in full —
-    // ResourceBundle localization with the `MissingResourceException`
-    // drop-through, the null-message answer, and the JDK's own fenced
-    // `indexOf('{')`+digit scan — rather than the `{0`..`{3` sniff, which
-    // misses `{4` and above and skips localization entirely.
+        // Two sessions fixed this row concurrently. The version kept is the one
+        // that reproduces `java.util.logging.Formatter.formatMessage` in full —
+        // ResourceBundle localization with the `MissingResourceException`
+        // drop-through, the null-message answer, and the JDK's own fenced
+        // `indexOf('{')`+digit scan — rather than the `{0`..`{3` sniff, which
+        // misses `{4` and above and skips localization entirely.
         r.register(
             fmt,
             "formatMessage",
@@ -22096,8 +22145,12 @@ fn jul_formatter_format_message_body(
     //    through. Use record message as format"), so a failed lookup keeps the
     //    raw message rather than propagating.
     let rec = ctx.read_native_pin(rec_pin, record);
-    let catalog_val =
-        ctx.invoke_virtual(rec, "getResourceBundle", "()Ljava/util/ResourceBundle;", &[])?;
+    let catalog_val = ctx.invoke_virtual(
+        rec,
+        "getResourceBundle",
+        "()Ljava/util/ResourceBundle;",
+        &[],
+    )?;
     let catalog = match catalog_val {
         Some(Value::Object(o)) => o,
         _ => None,
@@ -23076,7 +23129,10 @@ fn p54_huc_set_chunked_streaming_mode(
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-fn p54_huc_do_request(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+fn p54_huc_do_request(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*this);
     let w5_out = p54_huc_do_request_body(ctx, *this);
     *this = ctx.read_native_pin(w5_pin, *this);
@@ -23937,7 +23993,10 @@ fn native_arrays_support_vectorized_hash_code(
         );
     let (start_slot, end_slot) = if char_pairs {
         let start = (from_index as usize).saturating_mul(2);
-        (start, start.saturating_add((length as usize).saturating_mul(2)))
+        (
+            start,
+            start.saturating_add((length as usize).saturating_mul(2)),
+        )
     } else {
         let start = from_index as usize;
         (start, start.saturating_add(length as usize))
@@ -24948,7 +25007,8 @@ mod t2_tests {
         input: &str,
         delims: &str,
     ) -> cratonvm_types::ObjectRef {
-        let st = crate::try_alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3).unwrap();
+        let st =
+            crate::try_alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3).unwrap();
         let input_s = ctx.create_string(input);
         let delim_s = ctx.create_string(delims);
         ctx.set_field(st, ST_FIELD_INPUT, Value::Object(Some(input_s)));
@@ -25706,7 +25766,8 @@ mod t2_tests {
         data: &[i32],
     ) -> cratonvm_types::ObjectRef {
         let arr = make_int_array(ctx, data);
-        let spl = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2).unwrap();
+        let spl =
+            crate::try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2).unwrap();
         ctx.set_field(spl, SPL_FIELD_DATA, Value::Object(Some(arr)));
         ctx.set_field(spl, SPL_FIELD_CURSOR, Value::Int(0));
         spl
@@ -25862,7 +25923,6 @@ mod t2_tests {
     // removed from this file; the live UTF-8 handling is `native-io`'s.
     // -----------------------------------------------------------------------
 
-
     #[test]
     fn mf_number_integer_groups_thousands() {
         assert_eq!(p52_format_number(1234567.0, Some("integer")), "1,234,567");
@@ -25979,11 +26039,17 @@ mod t2_tests {
     #[test]
     fn des_parity_matches_the_jdk_checker() {
         let mut key: Vec<u8> = (0..24u32).map(|i| (i * 7) as u8).collect();
-        assert_eq!(hex24(&key), "00070e151c232a31383f464d545b626970777e858c939aa1");
+        assert_eq!(
+            hex24(&key),
+            "00070e151c232a31383f464d545b626970777e858c939aa1"
+        );
         des_set_odd_parity(&mut key, 0);
         des_set_odd_parity(&mut key, 8);
         des_set_odd_parity(&mut key, 16);
-        assert_eq!(hex24(&key), "01070e151c232a31383e464c545b626870767f858c929ba1");
+        assert_eq!(
+            hex24(&key),
+            "01070e151c232a31383e464c545b626870767f858c929ba1"
+        );
         // …and the property the checker actually tests, stated independently of
         // the vector: every byte has odd population count.
         for (i, b) in key.iter().enumerate() {

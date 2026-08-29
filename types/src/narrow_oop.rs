@@ -293,9 +293,10 @@ static PROBE_MAX: AtomicU64 = AtomicU64::new(0);
 fn probe_enabled() -> bool {
     let v = PROBE_ON.load(Ordering::Relaxed);
     if v == usize::MAX {
-        let on =
-            matches!(crate::flags::runtime_var("CRATONVM_OOP_SPAN_PROBE").as_deref(), Ok("1"))
-                as usize;
+        let on = matches!(
+            crate::flags::runtime_var("CRATONVM_OOP_SPAN_PROBE").as_deref(),
+            Ok("1")
+        ) as usize;
         PROBE_ON.store(on, Ordering::Relaxed);
         return on == 1;
     }

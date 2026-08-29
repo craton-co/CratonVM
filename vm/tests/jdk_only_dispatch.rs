@@ -55,8 +55,11 @@ fn native_cb(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 /// `resolve_dispatch` reads the class for provenance and naming only, so the
 /// class need not literally declare the method under test.
 fn owner_class(mgr: &mut ClassManager) -> &Class {
-    let id = mgr.try_ensure_synthetic_class(OWNER, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-    mgr.get_class(id).expect("just-created class is in the store")
+    let id = mgr
+        .try_ensure_synthetic_class(OWNER, 0)
+        .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+    mgr.get_class(id)
+        .expect("just-created class is in the store")
 }
 
 /// An `ACC_NATIVE` method: no `Code` attribute, by definition.

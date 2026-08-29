@@ -1859,13 +1859,10 @@ fn props_null_key_npe() -> MethodCallFailed {
 
 fn props_null_map_npe() -> MethodCallFailed {
     RuntimeError::NullPointerException {
-        message: Some(
-            "Cannot invoke \"java.util.Map.size()\" because \"m\" is null".into(),
-        ),
+        message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".into()),
     }
     .into()
 }
-
 
 fn props_null_put_npe() -> MethodCallFailed {
     RuntimeError::NullPointerException { message: None }.into()
@@ -1901,7 +1898,6 @@ fn property_key_units(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> JavaTe
     }
     JavaText::from(crate::property_key_from_java_string(ctx, key_obj).as_str())
 }
-
 
 fn native_properties_get_property_1(
     ctx: &mut dyn NativeContext,
@@ -2493,7 +2489,6 @@ fn native_properties_get_or_default(
     }
 }
 
-
 fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2635,7 +2630,10 @@ fn build_string_collection(
 /// `native_hs_*` body. See `native_linkedhashset_remove` for the `PRESENT`
 /// sentinel mismatch that makes the difference, and the record at
 /// `fixed-suite-bugs/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
-fn native_linkedhashset_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_linkedhashset_retain_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
@@ -3686,10 +3684,7 @@ fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
     // The JDK names the PARAMETER here rather than using the helpful-NPE
     // dereference text, so the message cannot be derived -- it is transcribed.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
-        return Err(RuntimeError::NullPointerException {
-            message: None,
-        }
-        .into());
+        return Err(RuntimeError::NullPointerException { message: None }.into());
     }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -3744,10 +3739,7 @@ fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -
     // The JDK names the PARAMETER here rather than using the helpful-NPE
     // dereference text, so the message cannot be derived -- it is transcribed.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
-        return Err(RuntimeError::NullPointerException {
-            message: None,
-        }
-        .into());
+        return Err(RuntimeError::NullPointerException { message: None }.into());
     }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -3876,288 +3868,288 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
     // `Locale` early). Explicitly pin `Bridge` here so this function's
     // behavior no longer depends on the caller's ambient category.
     registry.with_category(cratonvm_native_api::NativeKind::Bridge, |registry| {
-    registry.register(
-        "java/util/Properties",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-        native_properties_equals,
-    );
-    // `Properties.store`/`save` run real JDK `store0` bytecode that iterates the
-    // internal `map` ConcurrentHashMap. Our synthetic Properties keep entries in
-    // the side-table, not that CHM, so the bytecode writes 0 bytes. Serialize
-    // from the side-table instead (symmetric with the native `load`). Both the
-    // OutputStream and Writer overloads, plus the deprecated `save` (which
-    // delegates to store0 in the JDK), are covered.
-    registry.register(
-        "java/util/Properties",
-        "store",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-        native_properties_store_stream,
-    );
-    registry.register(
-        "java/util/Properties",
-        "store",
-        "(Ljava/io/Writer;Ljava/lang/String;)V",
-        native_properties_store_writer,
-    );
-    registry.register(
-        "java/util/Properties",
-        "save",
-        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
-        native_properties_store_stream,
-    );
-    registry.register(
-        "java/util/Properties",
-        "load",
-        "(Ljava/io/InputStream;)V",
-        native_properties_load,
-    );
-    // RKC16N.1 — jboss-modules' Main.<clinit> reads version.properties
-    // through a BufferedReader and calls the Reader overload directly.
-    registry.register(
-        "java/util/Properties",
-        "load",
-        "(Ljava/io/Reader;)V",
-        native_properties_load_reader,
-    );
-    registry.register(
-        "java/util/Properties",
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        native_properties_get_property_1,
-    );
-    registry.register(
-        "java/util/Properties",
-        "getProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-        native_properties_get_property_2,
-    );
-    registry.register(
-        "java/util/Properties",
-        "setProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
-        native_properties_set_property,
-    );
-    registry.register(
-        "java/util/Properties",
-        "put",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        native_properties_put,
-    );
-    registry.register(
-        "java/util/Properties",
-        "containsKey",
-        "(Ljava/lang/Object;)Z",
-        native_properties_contains_key,
-    );
-    registry.register(
-        "java/util/Properties",
-        "getOrDefault",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        native_properties_get_or_default,
-    );
-    // S111r11 SB3 (formerly a no-op stub registered in lib.rs):
-    // ModuleBootstrap.<clinit> calls `getAndRemoveProperty(key)` which is
-    // `(String) System.getProperties().remove(key)`; H2's ConnectionInfo
-    // calls `prop.remove("USER")` to strip the JDBC USER setting before
-    // Engine.openSession iterates connection keys.  JDK 25's
-    // `Properties.remove(Object)` (Properties.java:1348) reads a private
-    // `ConcurrentHashMap<Object,Object> map` field that's null on our
-    // synthetic Properties, so the JDK bytecode NPEs.  Side-table-aware
-    // remove returns the previous value (or null if absent) — H2's
-    // ConnectionInfo.removeProperty now actually removes USER, and
-    // ModuleBootstrap's getAndRemoveProperty still gets null for keys
-    // that were never set.
-    registry.register(
-        "java/util/Properties",
-        "remove",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_properties_remove,
-    );
-    // clear() must empty the side-table too, not just the real `map` CHM the
-    // bytecode clears — otherwise getProperty/get/size keep reading stale
-    // side-table entries (asymmetric with put/setProperty/remove, which now
-    // keep both in sync).
-    registry.register(
-        "java/util/Properties",
-        "clear",
-        "()V",
-        native_properties_clear,
-    );
-    // Spring's PropertySourcesPropertyResolver reads through the
-    // Hashtable.get(Object) interface rather than getProperty(String),
-    // and the JDK 25 Properties.get override at Properties.java:1338
-    // dereferences a `ConcurrentHashMap<Object,Object> map` field that's
-    // null on our synthetic Properties.  Route the read through the
-    // side-table so MapPropertySource gets a sensible result.
-    registry.register(
-        "java/util/Properties",
-        "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_properties_get,
-    );
-    // Spring's `SpringConfigurationPropertySource.isFullEnumerable`
-    // calls `Map.size()` on the underlying property source.  When that
-    // source is our synthetic `System.getProperties()` Properties, the
-    // JDK 25 `Properties.size` (Properties.java:1302) reads a private
-    // `ConcurrentHashMap<Object,Object> map` field that's null, NPEing
-    // before Spring's `Binder.get` gets a chance to enumerate.  Route
-    // size/isEmpty/keySet/values/entrySet/keys/elements/contains
-    // through the side-table so the synthetic Properties behaves as a
-    // properly-empty (or populated) Map for real JDK callers.
-    registry.register(
-        "java/util/Properties",
-        "size",
-        "()I",
-        native_properties_size,
-    );
-    registry.register(
-        "java/util/Properties",
-        "isEmpty",
-        "()Z",
-        native_properties_is_empty,
-    );
-    registry.register(
-        "java/util/Properties",
-        "keySet",
-        "()Ljava/util/Set;",
-        native_properties_key_set,
-    );
-    // `Properties.keySet()` returns a disconnected snapshot
-    // (`native_properties_key_set`/`build_key_set`, now a `LinkedHashSet`
-    // specifically), not a real live view — mutating it otherwise silently
-    // never touched the source `Properties`. Gated on
-    // `properties_keyset_source`: an ordinary `LinkedHashSet` (anything not
-    // built by `build_key_set`) passes straight through to real bytecode
-    // via `invoke_virtual_bytecode_only`. Scoped to `LinkedHashSet` rather
-    // than the far more common `HashSet` specifically to keep this
-    // override's blast radius to objects this module itself creates.
-    registry.register(
-        "java/util/LinkedHashSet",
-        "retainAll",
-        "(Ljava/util/Collection;)Z",
-        native_linkedhashset_retain_all,
-    );
-    registry.register(
-        "java/util/LinkedHashSet",
-        "remove",
-        "(Ljava/lang/Object;)Z",
-        native_linkedhashset_remove,
-    );
-    registry.register(
-        "java/util/Properties",
-        "stringPropertyNames",
-        "()Ljava/util/Set;",
-        native_properties_string_property_names,
-    );
-    registry.register(
-        "java/util/Properties",
-        "values",
-        "()Ljava/util/Collection;",
-        native_properties_values,
-    );
-    registry.register(
-        "java/util/Properties",
-        "entrySet",
-        "()Ljava/util/Set;",
-        native_properties_entry_set,
-    );
-    registry.register(
-        "java/util/Properties",
-        "keys",
-        "()Ljava/util/Enumeration;",
-        native_properties_keys,
-    );
-    // `propertyNames()` differs from `keys()`: it also enumerates the
-    // `defaults` chain (JDK contract). Distinct native — keep `keys()` own-only.
-    registry.register(
-        "java/util/Properties",
-        "propertyNames",
-        "()Ljava/util/Enumeration;",
-        native_properties_property_names,
-    );
-    registry.register(
-        "java/util/Properties",
-        "elements",
-        "()Ljava/util/Enumeration;",
-        native_properties_elements,
-    );
-    registry.register(
-        "java/util/Properties",
-        "contains",
-        "(Ljava/lang/Object;)Z",
-        native_properties_contains,
-    );
-    registry.register(
-        "java/util/Properties",
-        "containsValue",
-        "(Ljava/lang/Object;)Z",
-        native_properties_contains_value,
-    );
-    // WildFly / log4j-api 2.23 StatusLogger$Config.<clinit> →
-    // PropertiesUtilsDouble.normalizeProperties calls
-    // `properties.forEach(BiConsumer)` on `System.getProperties()` (and
-    // a freshly-built env/file Properties).  JDK 25's Properties.forEach
-    // dereferences `map.forEach`; on our synthetic Properties `map` is
-    // null, so route forEach through the side-table directly.
-    registry.register(
-        "java/util/Properties",
-        "forEach",
-        "(Ljava/util/function/BiConsumer;)V",
-        native_properties_for_each,
-    );
-    // Spring Boot 4 `AutoConfigurationMetadataLoader.loadMetadata` aggregates
-    // `META-INF/spring-autoconfigure-metadata.properties` from every classpath
-    // jar by calling `aggregate.putAll(perJarProperties)` for each loaded
-    // file.  Because Properties stores its entries in the side-table (not in
-    // the inherited `HashMap` buckets), the generic `Map.putAll` walker in
-    // `native_map_put_all` finds zero entries on the source Properties and
-    // the aggregate stays empty.  Result: every `OnClassCondition`/
-    // `OnWebApplicationCondition` filter sees an empty
-    // `AutoConfigurationMetadata`, all `ConditionalOnClass`/`ConditionalOnWeb`
-    // lookups return null, and downstream auto-config classes (e.g.
-    // `TomcatServletWebServerAutoConfiguration`) get dropped — Spring then
-    // fails with `MissingWebServerFactoryBeanException`.
-    //
-    // Side-table-aware putAll: snapshot the source's side-table and store
-    // each (k,v) into `this`'s side-table directly.
-    registry.register(
-        "java/util/Properties",
-        "putAll",
-        "(Ljava/util/Map;)V",
-        native_properties_put_all,
-    );
-    // Quartz's `StdSchedulerFactory.initialize(Properties)` (invoked via
-    // Spring's `SchedulerFactoryBean.initSchedulerFactory`) does
-    // `props.putIfAbsent("org.quartz.jobStore.class",
-    // LocalDataSourceJobStore.class.getName())` when a DataSource is
-    // configured. Without a native here, `putIfAbsent` (inherited from
-    // `Hashtable`, never overridden by `Properties` itself) ran real
-    // bytecode against the REAL `map`/`table` backing fields, bypassing
-    // the side-table entirely. The subsequent read —
-    // `PropertiesParser.getStringProperty("org.quartz.jobStore.class",
-    // RAMJobStore.class.getName())`, which is our side-table-only
-    // `getProperty(String,String)` native — never saw the write and fell
-    // back to Quartz's own default, silently wiring up `RAMJobStore`
-    // instead of `LocalDataSourceJobStore` even though the
-    // `spring.quartz.job-store-type=jdbc` customizer ran successfully.
-    // See fixed-suite-bugs/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
-    registry.register(
-        "java/util/Properties",
-        "putIfAbsent",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        native_properties_put_if_absent,
-    );
-    // JDK 25's Properties.computeIfAbsent delegates directly to the private
-    // ConcurrentHashMap `map`. Synthetic Properties keep String entries in
-    // this side table, so route the functional update through the same get/put
-    // bridges. Spring's MapBinder uses exactly this path.
-    registry.register(
-        "java/util/Properties",
-        "computeIfAbsent",
-        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
-        native_properties_compute_if_absent,
-    );
+        registry.register(
+            "java/util/Properties",
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            native_properties_equals,
+        );
+        // `Properties.store`/`save` run real JDK `store0` bytecode that iterates the
+        // internal `map` ConcurrentHashMap. Our synthetic Properties keep entries in
+        // the side-table, not that CHM, so the bytecode writes 0 bytes. Serialize
+        // from the side-table instead (symmetric with the native `load`). Both the
+        // OutputStream and Writer overloads, plus the deprecated `save` (which
+        // delegates to store0 in the JDK), are covered.
+        registry.register(
+            "java/util/Properties",
+            "store",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+            native_properties_store_stream,
+        );
+        registry.register(
+            "java/util/Properties",
+            "store",
+            "(Ljava/io/Writer;Ljava/lang/String;)V",
+            native_properties_store_writer,
+        );
+        registry.register(
+            "java/util/Properties",
+            "save",
+            "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+            native_properties_store_stream,
+        );
+        registry.register(
+            "java/util/Properties",
+            "load",
+            "(Ljava/io/InputStream;)V",
+            native_properties_load,
+        );
+        // RKC16N.1 — jboss-modules' Main.<clinit> reads version.properties
+        // through a BufferedReader and calls the Reader overload directly.
+        registry.register(
+            "java/util/Properties",
+            "load",
+            "(Ljava/io/Reader;)V",
+            native_properties_load_reader,
+        );
+        registry.register(
+            "java/util/Properties",
+            "getProperty",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            native_properties_get_property_1,
+        );
+        registry.register(
+            "java/util/Properties",
+            "getProperty",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            native_properties_get_property_2,
+        );
+        registry.register(
+            "java/util/Properties",
+            "setProperty",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+            native_properties_set_property,
+        );
+        registry.register(
+            "java/util/Properties",
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_put,
+        );
+        registry.register(
+            "java/util/Properties",
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            native_properties_contains_key,
+        );
+        registry.register(
+            "java/util/Properties",
+            "getOrDefault",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_get_or_default,
+        );
+        // S111r11 SB3 (formerly a no-op stub registered in lib.rs):
+        // ModuleBootstrap.<clinit> calls `getAndRemoveProperty(key)` which is
+        // `(String) System.getProperties().remove(key)`; H2's ConnectionInfo
+        // calls `prop.remove("USER")` to strip the JDBC USER setting before
+        // Engine.openSession iterates connection keys.  JDK 25's
+        // `Properties.remove(Object)` (Properties.java:1348) reads a private
+        // `ConcurrentHashMap<Object,Object> map` field that's null on our
+        // synthetic Properties, so the JDK bytecode NPEs.  Side-table-aware
+        // remove returns the previous value (or null if absent) — H2's
+        // ConnectionInfo.removeProperty now actually removes USER, and
+        // ModuleBootstrap's getAndRemoveProperty still gets null for keys
+        // that were never set.
+        registry.register(
+            "java/util/Properties",
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_remove,
+        );
+        // clear() must empty the side-table too, not just the real `map` CHM the
+        // bytecode clears — otherwise getProperty/get/size keep reading stale
+        // side-table entries (asymmetric with put/setProperty/remove, which now
+        // keep both in sync).
+        registry.register(
+            "java/util/Properties",
+            "clear",
+            "()V",
+            native_properties_clear,
+        );
+        // Spring's PropertySourcesPropertyResolver reads through the
+        // Hashtable.get(Object) interface rather than getProperty(String),
+        // and the JDK 25 Properties.get override at Properties.java:1338
+        // dereferences a `ConcurrentHashMap<Object,Object> map` field that's
+        // null on our synthetic Properties.  Route the read through the
+        // side-table so MapPropertySource gets a sensible result.
+        registry.register(
+            "java/util/Properties",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_get,
+        );
+        // Spring's `SpringConfigurationPropertySource.isFullEnumerable`
+        // calls `Map.size()` on the underlying property source.  When that
+        // source is our synthetic `System.getProperties()` Properties, the
+        // JDK 25 `Properties.size` (Properties.java:1302) reads a private
+        // `ConcurrentHashMap<Object,Object> map` field that's null, NPEing
+        // before Spring's `Binder.get` gets a chance to enumerate.  Route
+        // size/isEmpty/keySet/values/entrySet/keys/elements/contains
+        // through the side-table so the synthetic Properties behaves as a
+        // properly-empty (or populated) Map for real JDK callers.
+        registry.register(
+            "java/util/Properties",
+            "size",
+            "()I",
+            native_properties_size,
+        );
+        registry.register(
+            "java/util/Properties",
+            "isEmpty",
+            "()Z",
+            native_properties_is_empty,
+        );
+        registry.register(
+            "java/util/Properties",
+            "keySet",
+            "()Ljava/util/Set;",
+            native_properties_key_set,
+        );
+        // `Properties.keySet()` returns a disconnected snapshot
+        // (`native_properties_key_set`/`build_key_set`, now a `LinkedHashSet`
+        // specifically), not a real live view — mutating it otherwise silently
+        // never touched the source `Properties`. Gated on
+        // `properties_keyset_source`: an ordinary `LinkedHashSet` (anything not
+        // built by `build_key_set`) passes straight through to real bytecode
+        // via `invoke_virtual_bytecode_only`. Scoped to `LinkedHashSet` rather
+        // than the far more common `HashSet` specifically to keep this
+        // override's blast radius to objects this module itself creates.
+        registry.register(
+            "java/util/LinkedHashSet",
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            native_linkedhashset_retain_all,
+        );
+        registry.register(
+            "java/util/LinkedHashSet",
+            "remove",
+            "(Ljava/lang/Object;)Z",
+            native_linkedhashset_remove,
+        );
+        registry.register(
+            "java/util/Properties",
+            "stringPropertyNames",
+            "()Ljava/util/Set;",
+            native_properties_string_property_names,
+        );
+        registry.register(
+            "java/util/Properties",
+            "values",
+            "()Ljava/util/Collection;",
+            native_properties_values,
+        );
+        registry.register(
+            "java/util/Properties",
+            "entrySet",
+            "()Ljava/util/Set;",
+            native_properties_entry_set,
+        );
+        registry.register(
+            "java/util/Properties",
+            "keys",
+            "()Ljava/util/Enumeration;",
+            native_properties_keys,
+        );
+        // `propertyNames()` differs from `keys()`: it also enumerates the
+        // `defaults` chain (JDK contract). Distinct native — keep `keys()` own-only.
+        registry.register(
+            "java/util/Properties",
+            "propertyNames",
+            "()Ljava/util/Enumeration;",
+            native_properties_property_names,
+        );
+        registry.register(
+            "java/util/Properties",
+            "elements",
+            "()Ljava/util/Enumeration;",
+            native_properties_elements,
+        );
+        registry.register(
+            "java/util/Properties",
+            "contains",
+            "(Ljava/lang/Object;)Z",
+            native_properties_contains,
+        );
+        registry.register(
+            "java/util/Properties",
+            "containsValue",
+            "(Ljava/lang/Object;)Z",
+            native_properties_contains_value,
+        );
+        // WildFly / log4j-api 2.23 StatusLogger$Config.<clinit> →
+        // PropertiesUtilsDouble.normalizeProperties calls
+        // `properties.forEach(BiConsumer)` on `System.getProperties()` (and
+        // a freshly-built env/file Properties).  JDK 25's Properties.forEach
+        // dereferences `map.forEach`; on our synthetic Properties `map` is
+        // null, so route forEach through the side-table directly.
+        registry.register(
+            "java/util/Properties",
+            "forEach",
+            "(Ljava/util/function/BiConsumer;)V",
+            native_properties_for_each,
+        );
+        // Spring Boot 4 `AutoConfigurationMetadataLoader.loadMetadata` aggregates
+        // `META-INF/spring-autoconfigure-metadata.properties` from every classpath
+        // jar by calling `aggregate.putAll(perJarProperties)` for each loaded
+        // file.  Because Properties stores its entries in the side-table (not in
+        // the inherited `HashMap` buckets), the generic `Map.putAll` walker in
+        // `native_map_put_all` finds zero entries on the source Properties and
+        // the aggregate stays empty.  Result: every `OnClassCondition`/
+        // `OnWebApplicationCondition` filter sees an empty
+        // `AutoConfigurationMetadata`, all `ConditionalOnClass`/`ConditionalOnWeb`
+        // lookups return null, and downstream auto-config classes (e.g.
+        // `TomcatServletWebServerAutoConfiguration`) get dropped — Spring then
+        // fails with `MissingWebServerFactoryBeanException`.
+        //
+        // Side-table-aware putAll: snapshot the source's side-table and store
+        // each (k,v) into `this`'s side-table directly.
+        registry.register(
+            "java/util/Properties",
+            "putAll",
+            "(Ljava/util/Map;)V",
+            native_properties_put_all,
+        );
+        // Quartz's `StdSchedulerFactory.initialize(Properties)` (invoked via
+        // Spring's `SchedulerFactoryBean.initSchedulerFactory`) does
+        // `props.putIfAbsent("org.quartz.jobStore.class",
+        // LocalDataSourceJobStore.class.getName())` when a DataSource is
+        // configured. Without a native here, `putIfAbsent` (inherited from
+        // `Hashtable`, never overridden by `Properties` itself) ran real
+        // bytecode against the REAL `map`/`table` backing fields, bypassing
+        // the side-table entirely. The subsequent read —
+        // `PropertiesParser.getStringProperty("org.quartz.jobStore.class",
+        // RAMJobStore.class.getName())`, which is our side-table-only
+        // `getProperty(String,String)` native — never saw the write and fell
+        // back to Quartz's own default, silently wiring up `RAMJobStore`
+        // instead of `LocalDataSourceJobStore` even though the
+        // `spring.quartz.job-store-type=jdbc` customizer ran successfully.
+        // See fixed-suite-bugs/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
+        registry.register(
+            "java/util/Properties",
+            "putIfAbsent",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_put_if_absent,
+        );
+        // JDK 25's Properties.computeIfAbsent delegates directly to the private
+        // ConcurrentHashMap `map`. Synthetic Properties keep String entries in
+        // this side table, so route the functional update through the same get/put
+        // bridges. Spring's MapBinder uses exactly this path.
+        registry.register(
+            "java/util/Properties",
+            "computeIfAbsent",
+            "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+            native_properties_compute_if_absent,
+        );
     });
 }
 
@@ -4360,7 +4352,10 @@ mod tests {
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::FieldMetadata;
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     // -----------------------------------------------------------------------

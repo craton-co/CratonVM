@@ -75,7 +75,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layouts
@@ -848,7 +848,10 @@ fn native_option_parse_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Natives: OptionMap
 // ---------------------------------------------------------------------------
 
-fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_option_map(
+    ctx: &mut dyn NativeContext,
+    inner: Arc<OptionMapInner>,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2)?;
     remember_option_map_inner(ctx, obj, inner);
     Ok(obj)
@@ -1676,7 +1679,10 @@ fn native_options_get_ssl_enabled(
 // Natives: IoFuture
 // ---------------------------------------------------------------------------
 
-fn alloc_io_future(ctx: &mut dyn NativeContext, inner: Arc<IoFutureInner>) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_io_future(
+    ctx: &mut dyn NativeContext,
+    inner: Arc<IoFutureInner>,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "org/xnio/IoFuture", 3)?;
     let h = register_future(inner.clone());
     ctx.set_field(
@@ -2368,10 +2374,13 @@ pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Helper: build an Option via the native (so the test exercises the
     /// same path that Java-side `Option.simple(...)` would).
@@ -2856,7 +2865,8 @@ mod tests {
         // Build a synthetic Notifier object. Our invoke() in MockNativeContext
         // always returns Ok(None) without dispatching, so we test the
         // wiring by observing the notifier list before/after completion.
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
+        let notifier =
+            try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         // addNotifier while still WAITING → should stash.
         native_iof_add_notifier(
             &mut ctx,
@@ -3081,7 +3091,8 @@ mod tests {
             Arc::new(OptionMapInner {
                 entries: Mutex::new(entries),
             }),
-        ).unwrap();
+        )
+        .unwrap();
 
         let got = native_option_map_get_bool(
             &mut ctx,
@@ -3112,7 +3123,8 @@ mod tests {
     fn t19_7_e_gc_scan_reports_pending_notifier_and_attachment() {
         let mut ctx = mock_ctx();
         let (_fr, fut) = new_future(&mut ctx);
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
+        let notifier =
+            try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         // addNotifier while WAITING stashes (notifier, attachment).
         native_iof_add_notifier(
@@ -3162,7 +3174,8 @@ mod tests {
     fn t19_7_e_gc_remap_repoints_notifier_attachment_and_result() {
         let mut ctx = mock_ctx();
         let (fr, fut) = new_future(&mut ctx);
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
+        let notifier =
+            try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         native_iof_add_notifier(
             &mut ctx,

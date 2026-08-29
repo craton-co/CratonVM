@@ -300,7 +300,11 @@ fn cov06_array_allocation_end_to_end() {
         );
         return;
     };
-    let javac = jdk.join(if cfg!(windows) { "bin/javac.exe" } else { "bin/javac" });
+    let javac = jdk.join(if cfg!(windows) {
+        "bin/javac.exe"
+    } else {
+        "bin/javac"
+    });
     let Some(classes) = compile_probe(&javac) else {
         return;
     };

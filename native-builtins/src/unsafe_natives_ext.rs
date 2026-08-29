@@ -143,7 +143,14 @@ pub(crate) fn native_unsafe_should_be_initialized(
         if name.starts_with('[')
             || matches!(
                 name.as_str(),
-                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
                     | "void"
             )
         {
@@ -1530,9 +1537,13 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // CratonVM's archive holds class bytes only — no archived
     // `ImmutableCollections` state — so pinning the salt would remove
     // iteration-order randomisation from an ordinary run and buy nothing.
-    r.register_with_kind(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    }, cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(
+        cds_cls,
+        "getRandomSeedForDumping",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(0))),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
     r.register_with_kind(
         cds_cls,
         "dumpClassList",
@@ -2215,7 +2226,10 @@ fn unsafe_receiver_is_sun_misc(ctx: &mut dyn NativeContext, args: &[Value]) -> b
 /// declaring class is recognised without a dedicated `is_record` accessor: a
 /// record class always has `java/lang/Record` on its superclass chain, and
 /// nothing else does.
-fn declaring_class_is_record(ctx: &mut dyn NativeContext, class_id: cratonvm_types::ClassId) -> bool {
+fn declaring_class_is_record(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> bool {
     let mut cur = ctx.superclass_of(class_id);
     let mut hops = 0;
     while let Some(c) = cur {
@@ -3633,19 +3647,26 @@ fn native_unsafe_allocate_instance(
         if let Some(name) = crate::lang_class::mirror_class_name(ctx, *class_obj) {
             let is_primitive = matches!(
                 name.as_str(),
-                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
                     | "void"
             );
             if is_primitive || name.starts_with('[') {
                 return unsafe_instantiation_exception(ctx);
             }
         }
-        if let Some(cid) = ctx
-            .class_id_from_mirror(*class_obj)
-            .or_else(|| match ctx.get_field(*class_obj, 0) {
-                Value::Int(c) if c >= 0 => Some(cratonvm_types::ClassId::new(c as u32)),
-                _ => None,
-            })
+        if let Some(cid) =
+            ctx.class_id_from_mirror(*class_obj)
+                .or_else(|| match ctx.get_field(*class_obj, 0) {
+                    Value::Int(c) if c >= 0 => Some(cratonvm_types::ClassId::new(c as u32)),
+                    _ => None,
+                })
         {
             let ACC_INTERFACE = cratonvm_types::access_flags::ACC_INTERFACE;
             let ACC_ABSTRACT = cratonvm_types::access_flags::ACC_ABSTRACT;
@@ -4826,7 +4847,10 @@ mod unsafe_arena {
             Self {
                 inner: RwLock::new(BTreeMap::new()),
                 next_addr: Mutex::new(ARENA_BASE),
-                translated: cratonvm_types::lock_order::OrderedPlMutex::new(BTreeMap::new(), cratonvm_types::lock_order::LockLevel::Scratch),
+                translated: cratonvm_types::lock_order::OrderedPlMutex::new(
+                    BTreeMap::new(),
+                    cratonvm_types::lock_order::LockLevel::Scratch,
+                ),
             }
         }
 
@@ -5880,11 +5904,14 @@ mod unsafe_arena_real_ptr_tests {
 
 #[cfg(test)]
 mod unsafe_static_field_offset_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn static_field_offset_uses_static_storage_not_class_mirror_slots() {

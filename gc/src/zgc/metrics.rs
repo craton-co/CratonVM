@@ -300,9 +300,7 @@ impl ZgcPhase {
             ZgcPhase::ConcurrentMark => "Concurrent Mark",
             ZgcPhase::ConcurrentMarkContinue => "Concurrent Mark Continue",
             ZgcPhase::PauseMarkEnd => "Pause Mark End",
-            ZgcPhase::ConcurrentProcessNonStrongRefs => {
-                "Concurrent Process Non-Strong References"
-            }
+            ZgcPhase::ConcurrentProcessNonStrongRefs => "Concurrent Process Non-Strong References",
             ZgcPhase::ConcurrentResetRelocationSet => "Concurrent Reset Relocation Set",
             ZgcPhase::ConcurrentSelectRelocationSet => "Concurrent Select Relocation Set",
             ZgcPhase::PauseRelocateStart => "Pause Relocate Start",
@@ -770,10 +768,7 @@ impl ZgcMetrics {
 
     /// Reduced statistics for every phase, in [`ZgcPhase::ALL`] order.
     pub fn all_phase_stats(&self) -> Vec<ZgcPhaseStats> {
-        ZgcPhase::ALL
-            .iter()
-            .map(|p| self.phase_stats(*p))
-            .collect()
+        ZgcPhase::ALL.iter().map(|p| self.phase_stats(*p)).collect()
     }
 
     /// Σ nanoseconds charged to stop-the-world phases, whole run.
@@ -885,7 +880,8 @@ impl ZgcMetrics {
             .store(bytes_in_use_after, Ordering::Relaxed);
         self.last_capacity_bytes
             .store(capacity_bytes, Ordering::Relaxed);
-        self.last_bytes_reclaimed.store(reclaimed, Ordering::Relaxed);
+        self.last_bytes_reclaimed
+            .store(reclaimed, Ordering::Relaxed);
         self.total_bytes_reclaimed
             .fetch_add(reclaimed, Ordering::Relaxed);
         self.last_cycle_stw_ns.store(cycle_stw, Ordering::Relaxed);
@@ -1299,11 +1295,7 @@ impl ZgcPhaseGuard<'_> {
 
 impl Drop for ZgcPhaseGuard<'_> {
     fn drop(&mut self) {
-        let nanos = self
-            .start
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let nanos = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.metrics.record_phase(self.phase, nanos);
     }
 }
@@ -1332,11 +1324,7 @@ impl ZgcStallGuard<'_> {
 
 impl Drop for ZgcStallGuard<'_> {
     fn drop(&mut self) {
-        let nanos = self
-            .start
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let nanos = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.metrics.record_allocation_stall(nanos);
     }
 }
@@ -1522,7 +1510,11 @@ mod tests {
         }
         // Eight simulation phases recorded 1_000 ns each; nothing else did.
         assert_eq!(m.total_stw_ns(), 8_000);
-        for unmapped in [ZgcPhase::ConcurrentMarkContinue, ZgcPhase::ConcurrentSelectRelocationSet, ZgcPhase::Sweep] {
+        for unmapped in [
+            ZgcPhase::ConcurrentMarkContinue,
+            ZgcPhase::ConcurrentSelectRelocationSet,
+            ZgcPhase::Sweep,
+        ] {
             assert_eq!(
                 m.phase_stats(unmapped).count,
                 0,
@@ -1539,7 +1531,10 @@ mod tests {
     /// so — which is the reading an absent column cannot give.
     #[test]
     fn the_remap_phase_is_concurrent_by_design_and_has_its_own_tsv_columns() {
-        assert_eq!(ZgcPhase::from_key("concurrent_remap"), Some(ZgcPhase::ConcurrentRemap));
+        assert_eq!(
+            ZgcPhase::from_key("concurrent_remap"),
+            Some(ZgcPhase::ConcurrentRemap)
+        );
         assert!(
             !ZgcPhase::ConcurrentRemap.is_stw(),
             "remap is driven by the load barrier alongside mutators; charging it \
@@ -1833,7 +1828,10 @@ mod tests {
         m.record_cycle(64 * 1024 * 1024, 8 * 1024 * 1024, 128 * 1024 * 1024);
         let line = m.format_cycle_line();
         assert!(line.starts_with("[GC] "), "{line}");
-        assert!(line.contains("Garbage Collection (Allocation Rate)"), "{line}");
+        assert!(
+            line.contains("Garbage Collection (Allocation Rate)"),
+            "{line}"
+        );
         // 64M of 128M = 50%, 8M of 128M = 6%.
         assert!(line.contains("64M(50%)->8M(6%)"), "{line}");
         assert!(line.contains("stalls="), "{line}");

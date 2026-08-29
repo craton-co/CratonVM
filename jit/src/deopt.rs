@@ -1022,7 +1022,8 @@ impl DeoptimizationLog {
     /// Release deoptimization history for methods owned by an unloaded class.
     pub fn clear_class(&mut self, class_name: &str) {
         let prefix = format!("{class_name}.");
-        self.history.retain(|method, _| !method.starts_with(&prefix));
+        self.history
+            .retain(|method, _| !method.starts_with(&prefix));
     }
 
     /// Recommend a deopt action based on current history and the triggering reason.
@@ -2266,7 +2267,8 @@ mod deopt_stash_root_tests {
     /// Interleaved with non-reference slots of every width, and with a null
     /// (`Object(0)`) slot, both of which must be left strictly alone.
     fn frame_with_one_object_per_container(base: u64) -> ReconstructedFrame {
-        let nested = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let nested = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 2,
             class_id: 9,
             num_fields: 1,
@@ -2285,7 +2287,8 @@ mod deopt_stash_root_tests {
             stack: vec![
                 FrameValue::Double(0x4059_0000_0000_0000),
                 FrameValue::Object(base + 0x2000),
-                FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+                FrameValue::VirtualObject(VirtualObjectState {
+                    array_element_type: None,
                     id: 1,
                     class_id: 8,
                     num_fields: 2,
@@ -4334,10 +4337,7 @@ impl fmt::Display for DeoptMetadataError {
                 "pc+0x{native_offset:x}: deopt point bci {point_bci} disagrees with its frame \
                  state bci {frame_bci}"
             ),
-            Self::MissingOopMap {
-                native_offset,
-                bci,
-            } => write!(
+            Self::MissingOopMap { native_offset, bci } => write!(
                 f,
                 "pc+0x{native_offset:x} bci {bci}: reference-typed deopt slots but no oop map — a \
                  moving collection cannot update them"
@@ -5342,7 +5342,11 @@ mod deopt_metadata_tests {
         assert!(
             matches!(
                 errs.first(),
-                Some(DeoptMetadataError::BciOutOfRange { bci: 99, code_len: 32, .. })
+                Some(DeoptMetadataError::BciOutOfRange {
+                    bci: 99,
+                    code_len: 32,
+                    ..
+                })
             ),
             "{}",
             rendered(&errs)
@@ -5456,12 +5460,17 @@ mod deopt_metadata_tests {
     #[test]
     fn reference_slots_without_any_oop_map_are_rejected_when_required() {
         let p = good_point();
-        let v = DeoptVerifier::new().with_method(limits()).requiring_oop_map(true);
+        let v = DeoptVerifier::new()
+            .with_method(limits())
+            .requiring_oop_map(true);
         let errs = v.violations(&[p]);
         assert!(
             matches!(
                 errs.first(),
-                Some(DeoptMetadataError::MissingOopMap { native_offset: 0x40, .. })
+                Some(DeoptMetadataError::MissingOopMap {
+                    native_offset: 0x40,
+                    ..
+                })
             ),
             "{}",
             rendered(&errs)
@@ -5473,7 +5482,8 @@ mod deopt_metadata_tests {
     #[test]
     fn slot_naming_a_removed_node_is_rejected() {
         let mut p = good_point();
-        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 17, // IR node 17
             class_id: 5,
             num_fields: 1,
@@ -5508,7 +5518,10 @@ mod deopt_metadata_tests {
         }];
         let errs = verifier().violations(&[p]);
         assert!(
-            matches!(errs.first(), Some(DeoptMetadataError::UnbalancedMonitor { .. })),
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::UnbalancedMonitor { .. })
+            ),
             "{}",
             rendered(&errs)
         );
@@ -5554,7 +5567,8 @@ mod deopt_metadata_tests {
     fn virtual_object_graph_integrity_is_checked() {
         // Field count disagreement.
         let mut p = good_point();
-        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 3,
             class_id: 1,
             num_fields: 2,
@@ -5591,7 +5605,8 @@ mod deopt_metadata_tests {
         // is legal — the materializer allocates every shell before wiring.
         let mut p3 = good_point();
         p3.frame_state.locals[0] = FrameValue::VirtualObjectRef(4);
-        p3.frame_state.stack[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        p3.frame_state.stack[0] = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -5601,7 +5616,8 @@ mod deopt_metadata_tests {
 
         // Defining the same object twice in one scope is not.
         let mut p4 = good_point();
-        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -5674,7 +5690,10 @@ mod deopt_metadata_tests {
         p.frame_state.locals[1] = FrameValue::Object(0x7f00_1234);
         let errs = verifier().violations(&[p]);
         assert!(
-            matches!(errs.first(), Some(DeoptMetadataError::BakedObjectAddress { .. })),
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::BakedObjectAddress { .. })
+            ),
             "{}",
             rendered(&errs)
         );
@@ -5711,7 +5730,10 @@ mod deopt_metadata_tests {
         p.bci = 13; // frame_state.bci is 12
         let errs = verifier().violations(&[p]);
         assert!(
-            matches!(errs.first(), Some(DeoptMetadataError::PointBciMismatch { .. })),
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::PointBciMismatch { .. })
+            ),
             "{}",
             rendered(&errs)
         );
@@ -5830,7 +5852,8 @@ mod deopt_metadata_tests {
         let fs = FrameState {
             method_key: M.to_string(),
             bci: 0,
-            locals: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+            locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 2,
@@ -5850,16 +5873,17 @@ mod deopt_metadata_tests {
         // The object itself is still a well-formed *description* — the verifier
         // reports no violation, because refusing to resume is the correct,
         // already-safe outcome. Only the resumability predicate rejects it.
-        assert!(DeoptVerifier::new().violations(&[DeoptimizationPoint {
-            native_offset: 0,
-            bci: 0,
-            reason: DeoptReason::UncommonTrap,
-            action: DeoptAction::Reinterpret,
-            speculation_id: 0,
-            frame_state: fs,
-            semantics: ResumeSemantics::REEXECUTE,
-        }])
-        .is_empty());
+        assert!(DeoptVerifier::new()
+            .violations(&[DeoptimizationPoint {
+                native_offset: 0,
+                bci: 0,
+                reason: DeoptReason::UncommonTrap,
+                action: DeoptAction::Reinterpret,
+                speculation_id: 0,
+                frame_state: fs,
+                semantics: ResumeSemantics::REEXECUTE,
+            }])
+            .is_empty());
     }
 
     /// `EliminationCause` reaches the report: the rendered marker names the
@@ -6172,10 +6196,8 @@ mod deopt_metadata_soundness_tests {
             }];
             let errs = scoped().violations(&[p]);
             assert!(
-                errs.iter().any(|e| matches!(
-                    e,
-                    DeoptMetadataError::MonitorObjectNotAReference { .. }
-                )),
+                errs.iter()
+                    .any(|e| matches!(e, DeoptMetadataError::MonitorObjectNotAReference { .. })),
                 "monitor on {bad:?} must be refused: {}",
                 rendered(&errs)
             );
@@ -6194,10 +6216,8 @@ mod deopt_metadata_soundness_tests {
         }];
         let errs = scoped().violations(&[p]);
         assert!(
-            errs.iter().any(|e| matches!(
-                e,
-                DeoptMetadataError::MonitorObjectNotAReference { .. }
-            )),
+            errs.iter()
+                .any(|e| matches!(e, DeoptMetadataError::MonitorObjectNotAReference { .. })),
             "{}",
             rendered(&errs)
         );
@@ -6215,7 +6235,8 @@ mod deopt_metadata_soundness_tests {
         ] {
             let mut p = plain_point();
             // A defining occurrence for the `VirtualObjectRef` case.
-            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+            p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+                array_element_type: None,
                 id: 9,
                 class_id: 3,
                 num_fields: 0,
@@ -6227,10 +6248,9 @@ mod deopt_metadata_soundness_tests {
             }];
             let errs = scoped().violations(&[p]);
             assert!(
-                !errs.iter().any(|e| matches!(
-                    e,
-                    DeoptMetadataError::MonitorObjectNotAReference { .. }
-                )),
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, DeoptMetadataError::MonitorObjectNotAReference { .. })),
                 "monitor on {good:?} must be accepted: {}",
                 rendered(&errs)
             );
@@ -6252,7 +6272,10 @@ mod deopt_metadata_soundness_tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                DeoptMetadataError::ReferenceNotInOopMap { frame_offset: 64, .. }
+                DeoptMetadataError::ReferenceNotInOopMap {
+                    frame_offset: 64,
+                    ..
+                }
             )),
             "{}",
             rendered(&errs)
@@ -6328,10 +6351,9 @@ mod deopt_metadata_soundness_tests {
             p.semantics = ResumeSemantics::for_reason(reason);
             let errs = scoped().violations(&[p]);
             assert!(
-                !errs.iter().any(|e| matches!(
-                    e,
-                    DeoptMetadataError::ResumeSemanticsMismatch { .. }
-                )),
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, DeoptMetadataError::ResumeSemanticsMismatch { .. })),
                 "{reason:?}: {}",
                 rendered(&errs)
             );
@@ -6412,7 +6434,9 @@ mod deopt_metadata_soundness_tests {
         let mut it = FrameStateInterner::new();
         let id = it.intern(&owned_chain(6));
         assert!(it.chain_is_resumable(id));
-        let back = it.materialize(id).expect("a chain within the cap materializes");
+        let back = it
+            .materialize(id)
+            .expect("a chain within the cap materializes");
         let mut depth = 0;
         let mut cursor = Some(&back);
         while let Some(fs) = cursor {
@@ -6489,7 +6513,11 @@ mod tests {
     fn frame_state_resumability_tracks_unsupported_slots() {
         assert!(frame_state_is_resumable(&fs(vec![], vec![])));
         assert!(frame_state_is_resumable(&fs(
-            vec![FrameValue::Object(0), FrameValue::Int(3), FrameValue::Undefined],
+            vec![
+                FrameValue::Object(0),
+                FrameValue::Int(3),
+                FrameValue::Undefined
+            ],
             vec![FrameValue::Object(0x1000), FrameValue::Long(7)],
         )));
         assert!(
@@ -7097,7 +7125,8 @@ mod tests {
 
     #[test]
     fn virtual_object_state_fields() {
-        let vo = VirtualObjectState { array_element_type: None,
+        let vo = VirtualObjectState {
+            array_element_type: None,
             id: 0,
             class_id: 42,
             num_fields: 2,
@@ -7120,7 +7149,8 @@ mod tests {
                               // Stand-in native frame: a StackSlot(off) reads *(rbp + off) as i64.
         let buf: [i64; 4] = [0, 111, 0xBEEFi64, 0];
         let rbp = buf.as_ptr() as u64;
-        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 9,
             class_id: 7,
             num_fields: 4,
@@ -7581,7 +7611,8 @@ mod tests {
             method_key: "M".to_string(),
             bci: 0,
             locals: vec![
-                FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+                FrameValue::VirtualObject(VirtualObjectState {
+                    array_element_type: None,
                     id: 0,
                     class_id: 1,
                     num_fields: 1,
@@ -7589,7 +7620,8 @@ mod tests {
                 }),
                 FrameValue::Int(5),
             ],
-            stack: vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+            stack: vec![FrameValue::VirtualObject(VirtualObjectState {
+                array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 0,
@@ -8124,7 +8156,11 @@ mod frame_state_interning_tests {
         assert!(
             matches!(
                 verifier().violations_interned(&it, &[bad_bci]).first(),
-                Some(DeoptMetadataError::BciOutOfRange { bci: 99, code_len: 32, .. })
+                Some(DeoptMetadataError::BciOutOfRange {
+                    bci: 99,
+                    code_len: 32,
+                    ..
+                })
             ),
             "{}",
             rendered(&verifier().violations_interned(&it, &[bad_bci]))
@@ -8151,7 +8187,10 @@ mod frame_state_interning_tests {
         assert!(
             matches!(
                 errs.first(),
-                Some(DeoptMetadataError::ReferenceNotInOopMap { frame_offset: 56, .. })
+                Some(DeoptMetadataError::ReferenceNotInOopMap {
+                    frame_offset: 56,
+                    ..
+                })
             ),
             "{}",
             rendered(&errs)
@@ -8169,7 +8208,8 @@ mod frame_state_interning_tests {
 
         // a duplicate virtual-object definition
         let mut p = good_point();
-        let vo = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 4,
             class_id: 1,
             num_fields: 0,
@@ -8268,12 +8308,19 @@ mod frame_state_interning_tests {
         assert!(
             matches!(
                 errs.first(),
-                Some(DeoptMetadataError::UnknownFrameStateHandle { native_offset: 0x40, .. })
+                Some(DeoptMetadataError::UnknownFrameStateHandle {
+                    native_offset: 0x40,
+                    ..
+                })
             ),
             "{}",
             rendered(&errs)
         );
-        assert!(rendered(&errs).contains("unreadable"), "{}", rendered(&errs));
+        assert!(
+            rendered(&errs).contains("unreadable"),
+            "{}",
+            rendered(&errs)
+        );
         assert!(verifier().verify_interned(&empty, &[point]).is_err());
     }
 
@@ -8360,7 +8407,11 @@ mod frame_state_interning_tests {
         assert_eq!(count_materialization_required(&back), 1);
 
         // Parity with the owned predicates on a resumable frame too.
-        let plain = owned(3, vec![FrameValue::Int(1), FrameValue::Undefined], Vec::new());
+        let plain = owned(
+            3,
+            vec![FrameValue::Int(1), FrameValue::Undefined],
+            Vec::new(),
+        );
         let plain_id = it.intern(&plain);
         assert!(it.is_resumable(plain_id));
         assert_eq!(
@@ -8372,7 +8423,8 @@ mod frame_state_interning_tests {
         // A poisoned virtual-object field poisons the slot, chunked or not.
         let poisoned = owned(
             0,
-            vec![FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+            vec![FrameValue::VirtualObject(VirtualObjectState {
+                array_element_type: None,
                 id: 1,
                 class_id: 2,
                 num_fields: 2,
@@ -8575,10 +8627,7 @@ mod frame_state_interning_tests {
         assert_eq!(it.with_stack_slot(foreign, 0, FrameValue::Int(1)), foreign);
         assert_eq!(it.with_bci(foreign, 3), foreign);
         assert_eq!(it.with_caller(foreign, Some(real)), foreign);
-        assert_eq!(
-            it.with_semantics(foreign, ResumeSemantics::RESUME),
-            foreign
-        );
+        assert_eq!(it.with_semantics(foreign, ResumeSemantics::RESUME), foreign);
 
         // …and the real handle is untouched by any of it.
         assert_eq!(it.locals_len(real), 4);
@@ -8607,7 +8656,10 @@ mod frame_state_interning_tests {
         with_stack.stack = vec![FrameValue::Int(3), FrameValue::Unsupported];
         let msg = first_unresumable_slot(&with_stack).expect("stack 1 blocks the resume");
         assert!(msg.starts_with("stack 1 "), "{msg}");
-        assert!(msg.ends_with(" of 2"), "depth belongs in the message: {msg}");
+        assert!(
+            msg.ends_with(" of 2"),
+            "depth belongs in the message: {msg}"
+        );
 
         let mut with_local = fs.clone();
         with_local.locals = vec![FrameValue::Int(1), FrameValue::Unsupported];
@@ -8660,8 +8712,7 @@ mod frame_state_interning_tests {
 
         let mut untypeable_local = base;
         untypeable_local.locals = vec![FrameValue::Int(1), FrameValue::Unsupported];
-        let msg =
-            first_unresumable_local(&untypeable_local).expect("a handler reads its locals");
+        let msg = first_unresumable_local(&untypeable_local).expect("a handler reads its locals");
         assert!(msg.starts_with("local 1 "), "{msg}");
     }
 

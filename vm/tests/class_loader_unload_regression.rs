@@ -44,7 +44,10 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(PathBuf::from)
-        .map(|home| home.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" }))
+        .map(|home| {
+            home.join("bin")
+                .join(if cfg!(windows) { "javac.exe" } else { "javac" })
+        })
         .filter(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from("javac"))
 }
@@ -69,7 +72,9 @@ fn compile_fixture(mode: &str) -> Option<(PathBuf, PathBuf)> {
         Ok(o) => o,
         // javac cannot be launched at all — the one legitimate skip.
         Err(e) => {
-            eprintln!("[class_loader_unload_regression] javac could not be executed: {e}; skipping");
+            eprintln!(
+                "[class_loader_unload_regression] javac could not be executed: {e}; skipping"
+            );
             return None;
         }
     };
@@ -101,9 +106,7 @@ fn compile_fixture(mode: &str) -> Option<(PathBuf, PathBuf)> {
          — fix the .java source. javac stderr:\n{}",
         String::from_utf8_lossy(&status.stderr)
     );
-    let payload = output
-        .join("unloadprobe")
-        .join("LoaderUnloadPayload.class");
+    let payload = output.join("unloadprobe").join("LoaderUnloadPayload.class");
     Some((output, payload))
 }
 

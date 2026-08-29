@@ -639,10 +639,9 @@ pub fn startup_load(config: AotPipelineConfig) -> StartupStats {
     // --- CDS archive ---
     if config.cds_enabled {
         let path = config.cds_archive_path();
-        let java_home = config
-            .java_home_override
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default()));
+        let java_home = config.java_home_override.clone().unwrap_or_else(|| {
+            PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default())
+        });
         let expected = read_jdk_build_id(&java_home);
         if let Some((_, classes)) =
             CdsArchiveWithBuildIdV2::try_load(&path.to_string_lossy(), &expected)
@@ -706,10 +705,9 @@ pub fn shutdown_flush() -> ShutdownStats {
     // --- CDS archive ---
     if config.cds_dump {
         let path = config.cds_archive_path();
-        let java_home = config
-            .java_home_override
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default()));
+        let java_home = config.java_home_override.clone().unwrap_or_else(|| {
+            PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default())
+        });
         let build_id = read_jdk_build_id(&java_home);
 
         let mut archive =
@@ -763,9 +761,12 @@ pub struct ShutdownStats {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn tmp_dir_with_suffix(tag: &str) -> PathBuf {
         let mut d = std::env::temp_dir();

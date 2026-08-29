@@ -1166,8 +1166,7 @@ mod windows_fault {
                         // IMAGE_FILE_HEADER.TimeDateStamp is at NT+4+4;
                         // IMAGE_OPTIONAL_HEADER64.SizeOfImage at NT+24+56.
                         let timestamp = core::ptr::read_unaligned((nt + 8) as *const u32);
-                        let size_of_image =
-                            core::ptr::read_unaligned((nt + 24 + 56) as *const u32);
+                        let size_of_image = core::ptr::read_unaligned((nt + 24 + 56) as *const u32);
                         let _ = writeln!(
                             report,
                             "#  exe build id: timestamp=0x{:08X} size_of_image=0x{:X} \
@@ -1492,7 +1491,8 @@ mod windows_fault {
     pub fn symbolize_rvas(rvas: &[usize]) -> Vec<(usize, Option<String>)> {
         let module_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
         let process = unsafe { GetCurrentProcess() };
-        let verbose = cratonvm_types::flags::runtime_var("CRATONVM_SYMBOLIZE_DBG").as_deref() == Ok("1");
+        let verbose =
+            cratonvm_types::flags::runtime_var("CRATONVM_SYMBOLIZE_DBG").as_deref() == Ok("1");
         // Build a search path = the exe's own directory, so dbghelp finds the
         // co-located cratonvm.pdb regardless of cwd / _NT_SYMBOL_PATH.
         let mut exe_path = [0u16; 1024];
@@ -2405,10 +2405,7 @@ not an address\n",
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
                 match cratonvm_jit::lookup_jit_method_name_detailed(addr as usize) {
                     cratonvm_jit::JitNameLookup::Found(name) => {
-                        async_signal_safe::write_all(
-                            async_signal_safe::STDERR_FD,
-                            name.as_bytes(),
-                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, name.as_bytes());
                     }
                     cratonvm_jit::JitNameLookup::NotFound => {
                         async_signal_safe::write_all(
@@ -2601,10 +2598,7 @@ not an address\n",
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
                 if NAME_JIT_FRAMES.load(Ordering::Relaxed) {
                     let ret = unsafe { std::ptr::read_unaligned(ptr as *const u64) };
-                    async_signal_safe::write_all(
-                        async_signal_safe::STDERR_FD,
-                        b"#  jit [rsp]: ",
-                    );
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  jit [rsp]: ");
                     match cratonvm_jit::lookup_jit_method_name_detailed(ret as usize) {
                         cratonvm_jit::JitNameLookup::Found(name) => {
                             async_signal_safe::write_all(
@@ -2658,10 +2652,7 @@ not an address\n",
                         let n = hex_into_buf(&mut rbuf, word);
                         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
                         async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" ");
-                        async_signal_safe::write_all(
-                            async_signal_safe::STDERR_FD,
-                            name.as_bytes(),
-                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, name.as_bytes());
                         async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
                         found = true;
                         break;
@@ -3434,7 +3425,10 @@ mod tests {
             "address 0x1 must NOT probe readable - this is the whole point"
         );
         assert!(!probe_readable(fds[1], 0, 8), "null is never readable");
-        assert!(!probe_readable(-1, live.as_ptr() as u64, 8), "no fd, no verdict");
+        assert!(
+            !probe_readable(-1, live.as_ptr() as u64, 8),
+            "no fd, no verdict"
+        );
 
         unsafe {
             libc::close(fds[0]);
@@ -3448,9 +3442,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn dev_null_reports_even_a_bad_address_as_readable() {
-        let fd = unsafe {
-            libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY)
-        };
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
         assert!(fd >= 0);
         assert!(
             probe_readable(fd, 1, 64),
@@ -3463,8 +3455,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn maps_range_parses_a_real_line() {
-        let (start, end) =
-            parse_maps_range(b"709281c12000-709281c14000 r-xp 00000000 00:00 0 ");
+        let (start, end) = parse_maps_range(b"709281c12000-709281c14000 r-xp 00000000 00:00 0 ");
         assert_eq!(start, 0x709281c12000);
         assert_eq!(end, 0x709281c14000);
     }
@@ -3823,11 +3814,9 @@ mod tests {
         );
         // And the collector line is not merely echoed back: an unpublished
         // collector must not be reported as a known one.
-        assert!(
-            gc_state_lines_for("<unpublished>")
-                .join("\n")
-                .contains("gc collector: <unpublished>")
-        );
+        assert!(gc_state_lines_for("<unpublished>")
+            .join("\n")
+            .contains("gc collector: <unpublished>"));
     }
 
     /// The counters behind `young-gen policy` / `young-gen actual` are
@@ -3840,7 +3829,10 @@ mod tests {
     fn gc_state_lines_omit_generational_only_counters_under_another_collector() {
         for collector in ["g1", "zgc", "<unpublished>"] {
             let joined = gc_state_lines_for(collector).join("\n");
-            assert!(joined.contains(&format!("gc collector: {collector}")), "{joined}");
+            assert!(
+                joined.contains(&format!("gc collector: {collector}")),
+                "{joined}"
+            );
             assert!(
                 !joined.contains("gc young-gen policy:"),
                 "{collector}: the generational policy line must not appear: {joined}"
@@ -4145,7 +4137,10 @@ mod tests {
         // The two Tomcat SIGSEGVs of 2026-08-22. Neither is an indexed load,
         // and that is the point: nothing may attach the hibernate family's
         // analysis to them.
-        for (addr, r10) in [(0xfusize, 0x708e_467f_6e48u64), (0x5, 0x8000_0000_0000_0000)] {
+        for (addr, r10) in [
+            (0xfusize, 0x708e_467f_6e48u64),
+            (0x5, 0x8000_0000_0000_0000),
+        ] {
             let regs = [("r10", r10), ("rax", 0)];
             assert_eq!(
                 for_each_indexed_load_match(&regs, addr, |_, _, _, _| {}),

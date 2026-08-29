@@ -1498,8 +1498,14 @@ const _: () = assert!(
 // (Int) and `4` (Object) as literals; the rest are pinned so a reorder that
 // would shift those two is caught even if the JIT's own literals are not
 // touched.
-const _: () = assert!(value_tag_word(&Value::Int(0)) == 0, "Value::Int tag must be 0");
-const _: () = assert!(value_tag_word(&Value::Long(0)) == 1, "Value::Long tag must be 1");
+const _: () = assert!(
+    value_tag_word(&Value::Int(0)) == 0,
+    "Value::Int tag must be 0"
+);
+const _: () = assert!(
+    value_tag_word(&Value::Long(0)) == 1,
+    "Value::Long tag must be 1"
+);
 const _: () = assert!(
     value_tag_word(&Value::Float(0.0)) == 2,
     "Value::Float tag must be 2"

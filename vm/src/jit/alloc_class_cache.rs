@@ -227,8 +227,8 @@ impl JitAllocClassCache {
             return false;
         }
         // SAFETY: published chunks live until cache Drop.
-        let entry =
-            unsafe { &(*chunk).entries[idx % CHUNK_LEN] }.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let entry = unsafe { &(*chunk).entries[idx % CHUNK_LEN] }
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if entry.is_null() {
             false
         } else {
@@ -288,7 +288,9 @@ impl Drop for JitAllocClassCache {
 #[inline]
 pub fn alloc_class_cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE").is_none())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE").is_none()
+    })
 }
 
 #[cfg(test)]
@@ -389,7 +391,10 @@ mod tests {
         );
         // Stand in for the frozen reader: take the borrow BEFORE invalidating.
         let borrowed = cache.get(9).expect("published");
-        assert!(cache.invalidate(9), "entry was published, so it unpublishes");
+        assert!(
+            cache.invalidate(9),
+            "entry was published, so it unpublishes"
+        );
         assert!(cache.get(9).is_none(), "invalidate must unpublish");
         assert!(borrowed.has_finalizer);
         assert_eq!(
@@ -410,7 +415,10 @@ mod tests {
             },
         );
         assert!(cache.invalidate(5));
-        assert!(!cache.invalidate(5), "second invalidate has nothing to take");
+        assert!(
+            !cache.invalidate(5),
+            "second invalidate has nothing to take"
+        );
         // The id is free again: a reloaded class with the same id must be able
         // to publish a fresh recipe rather than inherit the retired one.
         let fresh = cache
@@ -423,7 +431,10 @@ mod tests {
             )
             .expect("slot is empty again");
         assert!(fresh.has_finalizer);
-        assert_eq!(cache.get(5).unwrap().prim_inits.as_ref(), &[(2, PrimKind::Float)]);
+        assert_eq!(
+            cache.get(5).unwrap().prim_inits.as_ref(),
+            &[(2, PrimKind::Float)]
+        );
     }
 
     #[test]

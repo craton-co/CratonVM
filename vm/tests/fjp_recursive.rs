@@ -94,7 +94,10 @@ fn probe_source() -> PathBuf {
 /// Per-test-binary output directory under `target/`, so the two RFJP.1 harnesses
 /// never write the same class files concurrently.
 fn probe_classes_dir() -> PathBuf {
-    workspace_root().join("target").join("fjp-probe-classes").join(TAG)
+    workspace_root()
+        .join("target")
+        .join("fjp-probe-classes")
+        .join(TAG)
 }
 
 /// Prefer a JDK-relative `javac` over whatever is on `PATH`, so the probe is
@@ -203,7 +206,8 @@ fn ensure_probe_compiled() -> bool {
             // (see `probe_compile_guard.rs` for why that must never become a skip).
             if !o.status.success() {
                 let stderr_probe = String::from_utf8_lossy(&o.stderr);
-                if stderr_probe.contains("release version") && stderr_probe.contains("not supported")
+                if stderr_probe.contains("release version")
+                    && stderr_probe.contains("not supported")
                 {
                     if common::require_e2e() {
                         panic!(

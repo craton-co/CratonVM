@@ -420,7 +420,10 @@ fn cmd_gen_opcodes(args: &GenOpcodesArgs) -> ExitCode {
     let mut not_generated: Vec<(&str, &str)> = Vec::new();
     for p in &programs {
         let Some(source) = &p.source else {
-            not_generated.push((p.mnemonic, p.support.reason().unwrap_or("no reason recorded")));
+            not_generated.push((
+                p.mnemonic,
+                p.support.reason().unwrap_or("no reason recorded"),
+            ));
             continue;
         };
         let path = out.join(format!("{}.java", p.class_name));

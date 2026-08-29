@@ -1170,9 +1170,7 @@ impl<'a> MemberResolver<'a> {
                 // JVMS §5.4.3.2 — name AND descriptor. `descriptor: None` is
                 // the historical name-only key, kept for callers that own the
                 // name; see this function's doc.
-                if &*f.name == field_name
-                    && descriptor.is_none_or(|d| &*f.descriptor == d)
-                {
+                if &*f.name == field_name && descriptor.is_none_or(|d| &*f.descriptor == d) {
                     if name_only_here.is_some_and(|d| d != &*f.descriptor) {
                         FIELD_RESOLUTION_DESCRIPTOR_CORRECTIONS
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1406,7 +1404,8 @@ mod tests {
     /// introduce, and neither is visible from a single resolution.
     #[test]
     fn a_recorded_constant_reads_back_through_the_resolver() {
-        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+        let shared =
+            std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
         let resolver = MemberResolver::new(&shared);
         let owner = resolver.scope(ClassId::new(41));
         const CP: u16 = 13;
@@ -1437,7 +1436,8 @@ mod tests {
     /// the collector scans this store as roots of THIS heap.
     #[test]
     fn a_foreign_key_neither_reads_nor_writes_the_constant_record() {
-        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+        let shared =
+            std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
         let resolver = MemberResolver::new(&shared);
         const CP: u16 = 77;
 
@@ -1449,7 +1449,11 @@ mod tests {
             "a write under a foreign key must not land in this VM's record"
         );
 
-        resolver.record_constant(resolver.scope(ClassId::new(41)), CP, resolver.scope(Value::Int(2)));
+        resolver.record_constant(
+            resolver.scope(ClassId::new(41)),
+            CP,
+            resolver.scope(Value::Int(2)),
+        );
         let foreign = VmScoped::new(VmId::from_raw(0xDEAD), ClassId::new(41));
         assert!(
             !resolver.probe_constant(foreign, CP).is_hit(),

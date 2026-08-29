@@ -64,7 +64,9 @@ fn class_files_available() -> bool {
 macro_rules! require_class_files {
     () => {
         if !class_files_available() {
-            eprintln!("Skipping: JitInheritedCalleeCp$Sub.class not available (javac not on PATH?)");
+            eprintln!(
+                "Skipping: JitInheritedCalleeCp$Sub.class not available (javac not on PATH?)"
+            );
             return;
         }
     };
@@ -77,7 +79,12 @@ fn test_vm() -> Vm {
 
 /// Drive the fixture so both classes are loaded and the accessor has run.
 fn drive(vm: &mut Vm) {
-    let r = vm.invoke("cratonvm/JitInheritedCalleeCp", "drive", "(I)I", &[Value::Int(200)]);
+    let r = vm.invoke(
+        "cratonvm/JitInheritedCalleeCp",
+        "drive",
+        "(I)I",
+        &[Value::Int(200)],
+    );
     match r {
         // 200 iterations x "payload".length() == 7
         Ok(Some(Value::Int(1400))) => {}

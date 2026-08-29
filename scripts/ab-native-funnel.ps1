@@ -4,7 +4,7 @@
 # Interleaved A/B for the native-call funnel work
 # (native-call-funnel-per-call-floor-RETIRED-20260804.md).
 #
-# Runs `probes/NativeShapeProbe` alternately on two binaries in A-B-B-A order
+# Runs `apps/probes/NativeShapeProbe` alternately on two binaries in A-B-B-A order
 # and reports the MINIMUM last-pass ns/op per rung for each arm.
 #
 # Why this shape:

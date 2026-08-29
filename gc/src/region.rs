@@ -21,7 +21,8 @@ use std::collections::{HashMap, HashSet};
 use rustc_hash::FxHashMap;
 
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE, SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE,
+    SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 
@@ -167,12 +168,12 @@ pub struct RememberedSet {
 pub fn rset_source_cap() -> usize {
     use std::sync::OnceLock;
     static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_G1_RSET_SOURCE_CAP") {
+    *CAP.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_G1_RSET_SOURCE_CAP") {
             Ok(v) => v.trim().parse::<usize>().unwrap_or(512),
             Err(_) => 512,
-        }
-    })
+        },
+    )
 }
 
 impl RememberedSet {
@@ -1181,7 +1182,11 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
 }
 
 /// Update reference fields in an object using the forwarding map.
-fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &cratonvm_types::PointerMap) {
+fn update_object_refs(
+    obj_addr: usize,
+    header: &ObjectHeader,
+    forwarding: &cratonvm_types::PointerMap,
+) {
     let data_start = obj_addr + HEADER_SIZE;
 
     if header.kind() == ObjectKind::Array {
