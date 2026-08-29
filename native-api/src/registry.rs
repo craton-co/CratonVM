@@ -611,6 +611,68 @@ pub enum GpuFutureResult {
     ScalarF64(f64),
 }
 
+/// Why a GPU submission failed, recorded at the point of failure.
+///
+/// `craton.gpu` documents three `GpuException` subclasses for targeted
+/// `catch` clauses, and until this enum existed the only way to pick one
+/// was to match substrings against the driver's error string on the Java
+/// side — a heuristic that misfires on any wording nobody anticipated.
+/// Stamping the category where the failure actually happens makes the
+/// classification exact.
+///
+/// The discriminants are wire values: they are returned verbatim by
+/// `Native.futureErrorKind` and MUST stay in step with the
+/// `NativeBridge.ERROR_KIND_*` constants on the Java side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum GpuErrorKind {
+    /// Not classified, or a failure none of the categories below fit.
+    /// The Java side falls back to message matching on this value.
+    #[default]
+    Unknown = 0,
+    /// The kernel could not be produced or loaded: the class would not
+    /// resolve, the method was rejected by the analyzer, PTX would not
+    /// compile, or the module loaded without the expected entry point.
+    Compile = 1,
+    /// A device-side allocation failed.
+    OutOfMemory = 2,
+    /// The kernel was launched, or a device operation was attempted, and
+    /// the driver reported a failure.
+    Launch = 3,
+}
+
+impl GpuErrorKind {
+    /// The wire value handed to Java by `Native.futureErrorKind`.
+    #[must_use]
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// Recover a kind from its wire value; anything unrecognised
+    /// degrades to [`GpuErrorKind::Unknown`] rather than panicking, so a
+    /// newer Java side talking to an older VM still gets a usable answer.
+    #[must_use]
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::Compile,
+            2 => Self::OutOfMemory,
+            3 => Self::Launch,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// [`NativeContext::gpu_future_await`] result: this VM has no timed wait.
+///
+/// Zero, deliberately — it is the value a context that does not override
+/// the method returns, and it tells the caller to fall back to polling.
+/// Mirrors `NativeBridge.AWAIT_UNSUPPORTED` on the Java side.
+pub const GPU_AWAIT_UNSUPPORTED: i32 = 0;
+/// [`NativeContext::gpu_future_await`] result: the submission completed.
+pub const GPU_AWAIT_COMPLETED: i32 = 1;
+/// [`NativeContext::gpu_future_await`] result: the timeout elapsed first.
+pub const GPU_AWAIT_TIMED_OUT: i32 = 2;
+
 /// Opaque reference to a GC-updated slot owned by a [`NativeHandleScope`].
 ///
 /// The fallback is intentionally private. Lightweight mock contexts do not
@@ -4265,6 +4327,34 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
         None
     }
 
+    /// Why the submission at `handle` failed, as recorded at the point of
+    /// failure. Returns `None` when the handle is not in the real
+    /// registry or the submission did not fail.
+    ///
+    /// Backs `Native.futureErrorKind`. Without it the Java side can only
+    /// guess the `GpuException` subclass from the driver's message text.
+    ///
+    /// Default impl returns `None` (no GPU offload).
+    fn gpu_future_error_kind(&self, _handle: u64) -> Option<GpuErrorKind> {
+        None
+    }
+
+    /// Block until the submission at `handle` completes or
+    /// `timeout_nanos` elapses.
+    ///
+    /// Returns one of [`GPU_AWAIT_COMPLETED`], [`GPU_AWAIT_TIMED_OUT`], or
+    /// [`GPU_AWAIT_UNSUPPORTED`]. The default is `GPU_AWAIT_UNSUPPORTED`,
+    /// which tells the caller to fall back to the polling path it already
+    /// has — so a VM without this override behaves exactly as before.
+    ///
+    /// The point of implementing it here rather than in Java is that the
+    /// Java fallback costs one native crossing per poll and floors its
+    /// latency at the poll interval. A native implementation waits on the
+    /// device's own completion signal.
+    fn gpu_future_await(&self, _handle: u64, _timeout_nanos: u64) -> i32 {
+        GPU_AWAIT_UNSUPPORTED
+    }
+
     /// Phase 8 #1 — evict the device-side buffer cache entry for
     /// the given `GpuArray` handle. Called by
     /// `Native.releaseArray` so a long-running Java program that
@@ -7087,6 +7177,20 @@ impl NativeMethodRegistry {
                     | ("quietlyJoin", "(JLjava/util/concurrent/TimeUnit;)Z")
                     | ("quietlyJoinUninterruptibly", "(JLjava/util/concurrent/TimeUnit;)Z")
                     | ("quietlyJoinPoolInvokeAllTask", "(J)V")
+                    // The two STATIC accessors that answer "which pool am I
+                    // in". Registered by `phases_early.rs`, backed by
+                    // `FJP_POOL_STACK`; unregistered they run real bytecode
+                    // that asks `Thread.currentThread() instanceof
+                    // ForkJoinWorkerThread`, which is false on this VM even
+                    // inside `pool.invoke` because the pool runs its tasks
+                    // INLINE. Adding a registration without adding it to THIS
+                    // list is silent: the filter below drops any Bridge on
+                    // these three classes that the list does not name, so the
+                    // native is registered and then thrown away. Measured that
+                    // way first. Must stay in step with
+                    // `is_forkjoin_native_override`.
+                    | ("inForkJoinPool", "()Z")
+                    | ("getPool", "()Ljava/util/concurrent/ForkJoinPool;")
             );
         if real_forkjoinpool_enabled()
             && matches!(

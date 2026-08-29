@@ -19,7 +19,7 @@
 //! the reason to log a one-line trace when `--print-gpu-decisions` is
 //! on.
 
-use crate::annotations::{AdmissionHint, MethodAnnotations};
+use crate::annotations::{AdmissionHint, GridShape, MethodAnnotations};
 use crate::signature::KernelSignature;
 use cratonvm_reader::attribute::CodeAttribute;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -290,6 +290,31 @@ pub(crate) fn resolve_math_intrinsic(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reason {
+    /// The `@GpuKernel(grid = ...)` shape is not one the emitter
+    /// implements.
+    ///
+    /// AUDIT 2026-08-28: `GridShape` was parsed into `MethodAnnotations`
+    /// and then read by nothing. Every kernel lowered element-wise
+    /// regardless of what it asked for, so `grid = BLOCK_REDUCTION` — a
+    /// tree reduction across a thread block, per its Java documentation —
+    /// silently compiled to one thread per element with no reduction at
+    /// all, and produced wrong answers rather than an error. Rejecting
+    /// the shapes the emitter cannot express sends those methods back to
+    /// the CPU, where they are correct but slower, which is the only
+    /// honest option until the lowerings exist.
+    UnsupportedGridShape,
+    /// The kernel asks for a launch geometry the emitter cannot produce:
+    /// a Y or Z block extent, or dynamic shared memory.
+    ///
+    /// AUDIT 2026-08-28: like `grid`, these were parsed and discarded.
+    /// The emitter has exactly one shape — a 1-D grid of 1-D blocks with
+    /// no dynamic shared memory — so a kernel declaring `blockY = 8`
+    /// silently ran with `blockY = 1`, and one declaring `sharedBytes`
+    /// silently got none. For a kernel written to index by `threadIdx.y`
+    /// or to use a shared tile that is not a slower answer, it is a wrong
+    /// one. Rejecting sends the method to the CPU until the lowerings
+    /// exist.
+    UnsupportedLaunchGeometry,
     NonStatic,
     Synchronized,
     NativeOrAbstract,
@@ -594,6 +619,27 @@ fn analyze_with_annotations_and_pool_impl(
         .as_ref()
         .map(|k| k.admit)
         .unwrap_or(AdmissionHint::Strict);
+
+    // AUDIT 2026-08-28: honour the declared grid shape, or refuse.
+    //
+    // Only `Elementwise` has a lowering. `RowPerThread` and
+    // `BlockReduction` are parsed, and were then dropped on the floor:
+    // the emitter has one path and took it for every kernel. A user who
+    // asked for a block reduction got an element-wise kernel that
+    // produced wrong results silently — the worst failure mode available,
+    // since a rejection would merely have run the method on the CPU.
+    if let Some(k) = annotations.gpu_kernel.as_ref() {
+        if k.grid != GridShape::Elementwise {
+            return OffloadVerdict::Rejected(Reason::UnsupportedGridShape);
+        }
+        // `block_x` IS honoured — it seeds the occupancy memo in
+        // `OffloadCache::lookup_or_compile`. A Y/Z extent or a dynamic
+        // shared-memory request has nothing to apply to in a 1-D launch,
+        // so asking for one is rejected rather than quietly dropped.
+        if k.block_y > 1 || k.block_z > 1 || k.shared_bytes > 0 {
+            return OffloadVerdict::Rejected(Reason::UnsupportedLaunchGeometry);
+        }
+    }
 
     // AUDIT 2026-05-20: walk the bytecode BEFORE the signature-shape
     // checks (`ReductionNotImplemented` / `CountedLoopScalarReturn`).

@@ -23033,8 +23033,29 @@ fn alloc_afc_channel(
     path_str: &str,
     options: AfcOpenOptions,
 ) -> MethodCallResult {
-    let handle_id = afc_open_file(path_str, options).map_err(|e| RuntimeError::IOException {
-        message: format!("AsynchronousFileChannel.open: {e}"),
+    // A MISSING FILE is `NoSuchFileException`, not a bare `IOException`.
+    // MEASURED against HotSpot 25.0.4+7, both modes
+    // (`probes/AsyncChannelSweep.java`):
+    //
+    //   AsynchronousFileChannel.open(absent, READ)
+    //     HotSpot  java.nio.file.NoSuchFileException   CratonVM java.io.IOException
+    //
+    // `NoSuchFileException` extends `FileSystemException` extends `IOException`,
+    // so the bare parent satisfies every `catch (IOException)` and NONE of the
+    // `catch (NoSuchFileException)` that tell "the file is not there" from "the
+    // read failed" -- the distinction the whole `java.nio.file` exception
+    // hierarchy exists to draw. Its message is the PATH alone, which is what
+    // the variant already encodes.
+    let handle_id = afc_open_file(path_str, options).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            RuntimeError::NoSuchFileException {
+                path: path_str.to_string(),
+            }
+        } else {
+            RuntimeError::IOException {
+                message: format!("AsynchronousFileChannel.open: {e}"),
+            }
+        }
     })?;
 
     // FIXED 2026-08-21: the mint names the CONCRETE class (`AFC_IMPLS`), and
@@ -23083,8 +23104,80 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `read(dst, position)` REFUSES a read-only destination before it does
+    // anything else -- `if (dst.isReadOnly()) throw new
+    // IllegalArgumentException("Read-only buffer")`. MEASURED: this VM read
+    // into it happily, which is a write through a reference whose whole
+    // purpose is to promise it cannot be written.
+    if let Some(Value::Object(Some(dst))) = args.get(1).copied() {
+        if matches!(
+            ctx.invoke_virtual(dst, "isReadOnly", "()Z", &[]),
+            Ok(Some(Value::Int(v))) if v != 0
+        ) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Read-only buffer".into(),
+            }
+            .into());
+        }
+    }
+    // A CLOSED channel does NOT raise at the call. The JDK defers the check
+    // into the task it submits, so `read()` hands back a future and the
+    // `ClosedChannelException` arrives at `get()` wrapped in an
+    // `ExecutionException`. MEASURED: HotSpot's `ch.read(..)` on a closed
+    // channel is no-throw; this VM raised `IOException` from the call, which
+    // is both the wrong moment and the wrong class.
+    if let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) {
+        if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
+            return Ok(Some(afc_closed_channel_future(ctx, this)?));
+        }
+    }
+    let this = args.first().copied();
     let boxed = afc_read_boxed(ctx, args)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    Ok(Some(wrap_afc_future(ctx, this, boxed)?))
+}
+
+/// The future a closed channel's `read`/`write` hands back: already complete,
+/// carrying a `ClosedChannelException`, so the failure surfaces at `get()`
+/// exactly where the JDK puts it.
+///
+/// Falls back to raising when the exception class or `failedFuture` cannot be
+/// had — reporting the failure at the wrong MOMENT beats not reporting it.
+fn afc_closed_channel_future(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+) -> Result<Value, MethodCallFailed> {
+    let channel_pin = ctx.pin_native_root(channel);
+    let built = ctx.new_object_initialized("java/nio/channels/ClosedChannelException", "()V", &[]);
+    let out = match built {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            // Pinned across the `failedFuture` call: resolving and initialising
+            // `CompletableFuture` is arbitrary Java and can complete a moving
+            // collection before the argument is ever pushed.
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc_live = ctx.read_native_pin(exc_pin, exc);
+            let failed = ctx.invoke(
+                "java/util/concurrent/CompletableFuture",
+                "failedFuture",
+                "(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;",
+                &[Value::Object(Some(exc_live))],
+            );
+            ctx.unpin_native_roots(exc_pin);
+            match failed {
+                Ok(Some(f @ Value::Object(Some(_)))) => Some(f),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let _ = ctx.read_native_pin(channel_pin, channel);
+    ctx.unpin_native_roots(channel_pin);
+    match out {
+        Some(f) => Ok(f),
+        None => Err(afc_closed_channel_error(ctx)),
+    }
 }
 
 /// The whole of `AsynchronousFileChannel.read(ByteBuffer, long)` EXCEPT the
@@ -23230,8 +23323,19 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
 }
 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // See `native_afc_read` for the closed-channel contract; `write` defers
+    // the same check into the same task.
+    if let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) {
+        if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
+            return Ok(Some(afc_closed_channel_future(ctx, this)?));
+        }
+    }
+    let this = args.first().copied();
     let boxed = afc_write_boxed(ctx, args)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    Ok(Some(wrap_afc_future(ctx, this, boxed)?))
 }
 
 /// `AsynchronousFileChannel.write(ByteBuffer, long)` without the `Future`
@@ -23529,6 +23633,91 @@ pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// Laundering a policy refusal into a `NoClassDefFoundError` at the
 /// application's call site is the worst available outcome, so it is the last
 /// resort rather than the first.
+/// The completed `Future` an `AsynchronousFileChannel` read/write hands back.
+///
+/// HotSpot answers `sun.nio.ch.PendingFuture` and this VM answered
+/// `java.util.concurrent.CompletableFuture` — recorded OPEN in
+/// `the-roadmaps-phase-1-and-3-re-adjudicated-and-six-fixes-20260827` §6 with
+/// "every value agrees; the type does not". Every value does agree: 38 rows of
+/// `probes/AsyncChannelSweep.java` ask the Future contract, the
+/// `CompletionHandler` form, the argument refusals and the bytes on disk, and
+/// only the three unrelated gaps this patch also fixes differed.
+///
+/// The type is still worth closing, because the gap is an OVER-capability
+/// rather than a missing one: `CompletableFuture` is a `CompletionStage`, so a
+/// caller can `instanceof CompletableFuture` and hang `thenApply` off a future
+/// HotSpot never lets it reach — code that then fails only on HotSpot, which is
+/// the wrong way round for a compatibility VM.
+///
+/// **The result is VERIFIED, not assumed.** `PendingFuture` keeps its answer in
+/// `result` and its completion in a separate `haveResult` flag, so a minted one
+/// whose fields did not resolve is a future that blocks in `get()` FOREVER —
+/// strictly worse than the wrong class name. So the mint is followed by an
+/// `isDone()` call on the object itself, and anything other than a definite
+/// `true` falls back to the `CompletableFuture` this used to build. A runtime
+/// assertion, not a static layout claim.
+fn wrap_afc_future(
+    ctx: &mut dyn NativeContext,
+    channel: Option<Value>,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
+    if let Some(Value::Object(Some(ch))) = channel {
+        if let Some(pf) = try_wrap_pending_future(ctx, ch, value) {
+            return Ok(pf);
+        }
+    }
+    wrap_completed_future(ctx, value)
+}
+
+/// `Some(future)` only when a real `sun.nio.ch.PendingFuture` was minted AND it
+/// answers `isDone()`; see [`wrap_afc_future`].
+fn try_wrap_pending_future(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    value: Value,
+) -> Option<Value> {
+    // `ensure_class_initialized` fabricates a stand-in rather than failing, so
+    // an `Ok` from the mint is not evidence the image has the class. The two
+    // field lookups are, and they are also what the writes below need.
+    let result_slot = ctx.resolve_field_index("sun/nio/ch/PendingFuture", "result")?;
+    let have_slot = ctx.resolve_field_index("sun/nio/ch/PendingFuture", "haveResult")?;
+    let value_pin = match value {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let channel_pin = ctx.pin_native_root(channel);
+    let built = ctx.new_object_initialized(
+        "sun/nio/ch/PendingFuture",
+        "(Ljava/nio/channels/AsynchronousChannel;)V",
+        &[Value::Object(Some(ctx.read_native_pin(channel_pin, channel)))],
+    );
+    let answer = (|| {
+        let pf = match built {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let pf_pin = ctx.pin_native_root(pf);
+        let live_value = match value_pin {
+            Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+            None => value,
+        };
+        let pf = ctx.read_native_pin(pf_pin, pf);
+        ctx.set_field(pf, result_slot, live_value);
+        ctx.set_field(pf, have_slot, Value::Int(1));
+        // The runtime assertion. A `PendingFuture` that does not say it is done
+        // is one whose `get()` waits on a latch nothing will count down.
+        match ctx.invoke_virtual(pf, "isDone", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => Some(Value::Object(Some(pf))),
+            _ => None,
+        }
+    })();
+    ctx.unpin_native_roots(match value_pin {
+        Some((pin, _)) => pin,
+        None => channel_pin,
+    });
+    answer
+}
+
 fn wrap_completed_future(
     ctx: &mut dyn NativeContext,
     value: Value,
