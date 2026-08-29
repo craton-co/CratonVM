@@ -239,6 +239,36 @@ to `instantiable::observe_uninstantiable_receiver`, beside the
 one `insert`, and the `warn!` emitted with nothing held — the subscriber
 re-enters the VM.
 
+### The FFM half of this population now has its own record — and it agrees
+
+`ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`
+landed the same day and asked the segment surface 199 rows rather than one. It
+is the deeper treatment of the FFM half of what this census sees, and two of its
+findings matter here.
+
+It **fixed nine behavioural defects** on that surface — a native `asReadOnly()`
+view whose writes landed, `allocate(-1)` and `allocate(8, 0)` not throwing,
+`Arena.global().close()` not throwing — none of which is identity, and none of
+which either this census or the definition-of-done screen could see. That is a
+useful correction to the screen's reasoning, which had inferred from one row
+(`byteSize()` still answers 16) that the surface was identity-only. The
+inference was right about that row and wrong about the surface.
+
+And it **sized the residual instead of guessing**: 27 rows in compatible mode,
+47 under `--jdk-only`, one defect wearing five class names, with the damage
+bounded to identity — `isInstance`, `instanceof`, `isAssignableFrom` and a
+class-keyed `HashMap` round-trip all still answer correctly. Its reason for not
+fixing it is the one R4 gives above, reached independently: the accessors
+address this VM's six-slot carrier by raw slot index, so adopting the JDK's
+class names means adopting its layout.
+
+**Re-measured after those nine fixes landed** (2026-08-29, post-merge): this
+census still names the same seven classes, with only the line numbers moved.
+That is what their §4 predicts — they fixed behaviour, not identity — and it is
+the check worth doing rather than assuming, because a census whose population
+silently drops to zero after someone else's fix looks exactly like a census that
+broke.
+
 The move was verified by re-running the probe, not by re-running the ratchet.
 `#[track_caller]` propagating across a crate boundary is exactly what a move
 like this breaks, and a census that still compiles while reporting its own
