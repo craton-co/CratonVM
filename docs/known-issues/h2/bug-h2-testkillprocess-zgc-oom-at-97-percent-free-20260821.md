@@ -1624,6 +1624,10 @@ changed the balance is that the damage is no longer PERMANENT — item 2 packs a
 small survivor up there against the top with everything else, so it stops
 walling the region at the next relocating cycle.
 
+(Item numbering: item 2 is the vacated-span publication; the high-end compactor
+is item 3. The sentence above means both, because a small object up there is
+only re-packed by the high-end pass.)
+
 ### 6. `CRATONVM_ZGC_TARGETED_COMPACTION` records a window nothing consumes
 
 Measured with the flag ON, and it is a finding about that feature rather than
@@ -1641,101 +1645,82 @@ So the feature's own engagement number was never going to be non-zero on this
 family, for a reason unrelated to the one §"Follow-up 2026-08-28" gave. It stays
 default-OFF.
 
-## Still open
+### 7. `frame_cov=(… incomplete=N …)` did not need a new instrument
 
-Ordered by what a next session should pick up first.
+§"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the
+first time anywhere that a map refuses on its OWN claim rather than being
+unlocatable. Different obligation from `no_map`, never investigated."*
 
-> **2026-08-29: a third project hits the same class of symptom.** Spring
-> Framework's `org.springframework.http.client.SimpleClientHttpResponseTests`
-> (unrelated to H2/Hibernate, an HTTP-client test full of Mockito mocks) timed
-> out at 300s during a full-suite ZGC run, isolated and reran alone with a
-> 400s cap, still hangs. Its log carries the same
-> `zgc frag gauge: the arena is broken up` line this page's title names
-> (`95.8% free, largest servable block 0.0%`), and the guard's own
-> `occurrence` counter doubles on every subsequent firing
-> (32768 -> 1048576 -> ...) — the same exponential-retry shape as
-> `TestCachedQueryResults`'s livelock. Not integrated into this page's own
-> instrumentation or attributed to any of the specific obligations tracked
-> below (no `CRATONVM_DBG_*` census taken for this class) — recorded here
-> only as a third confirmed occurrence, so a future reader knows this defect
-> is not H2/Hibernate-specific. Repro: run that class alone with any timeout
-> above ~300s on this project's dev tip.
+The obligation is `OopMapEntry::moving_young_coverage_complete`: the JIT itself
+recorded, at compile time, that the shadow-stack publication for that safepoint
+was not complete enough for relocation. That is the HONEST refusal — the
+mechanism working, not failing — and **the reason is already censused, in eight
+buckets**, by `x64::safepoint::shadow_incomplete_cause` (gate off, mark-vector
+desync, inexact operand marks, an oop in a scratch or XMM slot, more than 64
+locals, the local-oop dataflow never reaching the pc, no push emitted, an
+unmapped inline scope). `CRATONVM_DBG_OOPCOV=1` prints it per method, beside
+the exact `bytecode_pc`s whose shadow claim is false.
 
-> **Reconciled 2026-08-28.** Three items were removed as answered by
-> measurements taken later in this page, not by anyone fixing them:
->
-> * *"a second, unidentified contributor to `ACTIVE_FRAME_MAP`"* — closed by
->   the mirror-pairing repair, §"Follow-up 2026-08-26": `no_map` is 0 in all
->   five `on` arms and the reason code tracks it exactly.
-> * *"`TestMVStoreTool`'s remaining blockers are the indy bridge and the
->   cross-thread helper window"* — the indy attribution was WITHDRAWN
->   (§"Follow-up 2026-08-26 (second)"; 30/28 vs 27/33 on an idle host) and
->   the real answer is the targeted-compaction item above.
-> * *"`while_covered` is nonzero on `dev`"* — superseded by
->   §"Follow-up 2026-08-27 (second)": the oracle cannot answer that question
->   at all, and its guard was near-vacuous when the reading was taken.
->
-> Listed because a stale Still-open entry is not neutral: the withdrawn indy
-> attribution alone sent one session down a two-build detour, and this page
-> is where that gets prevented.
+So the residual was "nobody has run the flag", not "there is no way to ask".
+Recorded here so the next reader spends a run rather than an instrument.
 
-* **The LARGE-OBJECT end is never compacted, and that is the whole of
-  `TestMVStoreTool`.** §"Follow-up 2026-08-28". Targeted compaction now
-  exists (`CRATONVM_ZGC_TARGETED_COMPACTION=1`, opt-in) and engages ZERO
-  times, because the window that fails begins 3.9 MB above
-  `used_low_for_compaction()` and `logical_pages` builds candidates over the
-  low region only. The failing request is 262 160 bytes, above
-  `ZGC_LARGE_OBJECT_MIN`, so it is served from an end with no logical pages,
-  no relocation candidates, and `relocate_large_pages: false` besides.
-  The blocking item is making that end relocatable — logical pages over the
-  high region, or a pass that understands a bump-down region. Target
-  selection is solved and waiting on it.
-* **There is no working backstop against a wrong oop map for java locals
-  and operand spill.** The band scan's was given up 2026-08-27, and the
-  map-completeness oracle CANNOT replace it: re-pointed at
-  `fully_shadow_covered` and measured, it reports 5–6 % of every in-band word
-  as never-mapped on every workload, including `TestMultiThread`, which
-  PASSES with 1.1 M of them. Dominated by its own declared false positive (a
-  primitive whose bits look like an object header) and by dead stale slots.
-  A real backstop needs liveness the map does not carry — the
-  `LocalVariableTable` scopes, a type-aware filter, or codegen clearing
-  reference locals as they die. See §"Follow-up 2026-08-27 (second)".
-* **`TestCachedQueryResults` shows `incomplete=5`** — the first time anywhere
-  that a map refuses on its OWN claim rather than being unlocatable. Different
-  obligation from `no_map`, never investigated, and it sits alongside 9 962
-  `OutOfMemoryError` over 4 991 collections.
-* **`TestOpenClose`: `Exception in thread "main" java/lang/Object`, no captured
-  frames.** Now the ONLY thing failing this class — the fragmentation OOM is
-  gone. Already confirmed pre-existing and unrelated by the kill-switch
-  differential on 2026-08-21, and it reproduces on the fixed binary with zero
-  `OutOfMemoryError` and four `arena allocation failed`, which is as clean a
-  separation as this defect will ever get. Its own page, and now cheap to
-  reproduce.
-* **`TestMVStoreCachePerformance`: `NoSuchMethodError: 'boolean
-  org.h2.mvstore.Page$PageReference.isPersistent()'`.** Also now the only thing
-  failing that class — no OOM and no arena failure at all. A method-resolution
-  defect with nothing to do with this page; filed here only because this page
-  is what was watching the class.
-* **`-XX:+UseG1GC` fails `TestKillProcessWhileWriting`**, identically before and
-  after this work (13 `OutOfMemoryError` and a 1500 s cap on the fixed binary,
-  2 `OutOfMemoryError` in 31–43 s when this page first measured it). The face
-  varies between runs, so reproduce it several times before believing any
-  single one. Not this defect: no `arena allocation failed` in either era.
-* **The two small objects in the large-object region.** The fragmentation report
-  placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`, where
-  `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live, and they
-  are what caps `high_max` below the request. The tripwire added to
-  `Arena::alloc` fired **zero** times across a full failing run, so the low-end
-  allocation paths are not the producer. Note its reach before trusting that
-  zero: it covers the three free-list exits of `Arena::alloc` and
-  `push_block_routed`, not the TLAB fast path (whose chunks are carved from the
-  low end) and not the bump path (which cannot cross `high_cursor`). It has
-  never been seen to fire, so it is an untriggered instrument, not evidence.
-  Less urgent than it was: the class this page is about no longer reaches the
-  wall at all.
-* **The cross-thread coverage handshake decides nothing yet.** It is built,
-  default-ON, and `xt_cov=(accepted=0 refused=0 deposits=0)` on this workload —
-  no peer was ever in compiled code at a collection here. It removes a blanket
-  refusal that a genuinely many-threaded workload would hit; that claim is
-  untested because this class does not produce the condition. The engagement
-  counter is on the `[jitroots]` line precisely so nobody reads a win into it.
+## What this page no longer tracks, and where it went
+
+Every row that was open on 2026-08-28 is accounted for here. Three were the
+defects §"Follow-up 2026-08-29" fixed; four were never this defect and now have
+their own pages; one was closed by a measurement rather than by anybody fixing
+it.
+
+### Fixed on 2026-08-29 — see §"Follow-up 2026-08-29"
+
+* **The LARGE-OBJECT end is never compacted.** `ZgcRealHeap::compact_high_region`
+  packs that end against `capacity` and merges its holes; measured at 99–198
+  free blocks into ONE, per cycle, on `TestMVStoreTool`.
+  `CRATONVM_ZGC_HIGH_COMPACTION=0` reverts it.
+* **The two small objects in the large-object region.** The tripwire that read
+  zero could not have fired: it was armed on three exits that return low
+  offsets by construction, and not on the one exit that can return a high one.
+  Armed, with a test. The damage is also no longer permanent, because the
+  high-end compactor packs such an object against the top with everything else.
+* **…and the two nobody had listed**, both found while measuring the two above:
+  the slide was discarding every byte it emptied whenever the cursor could not
+  follow it down (`CRATONVM_ZGC_PUBLISH_VACATED=0`), and the TLAB refill floor
+  was spending the large-object reserve on churn one notch above what the free
+  list could serve (`CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0`).
+
+### Closed by measurement, not by a fix
+
+* **There is no working backstop against a wrong oop map for java locals and
+  operand spill.** There is one now, and it is not the map-completeness oracle
+  this page withdrew on 2026-08-27 — that counter reads 5–6 % of every in-band
+  word on every workload and cannot be one. The oracle now classifies each
+  never-mapped word against the CLASS FILE's own verifier type maps
+  (`classloading::type_maps`, retained from the JVMS §4.10.1 StackMapTable
+  walk), which is an independent oracle and answers both declared false
+  positives at once: a primitive local is not an oop there, and an out-of-scope
+  local is `Top`. `verifier_oop` is the actionable number, `verifier_not_oop`
+  the subtracted false positives, and `verifier_unknown` every refusal to
+  answer — an inlined frame, a non-local slot, a pc with no row, a name the
+  index cannot resolve — counted rather than folded in, because a backstop
+  whose "no gap" silently includes "could not look" is the vacuous green this
+  page has been avoiding all along. Behind `CRATONVM_DBG_VERIFY_OOP_MAPS`.
+* **`CRATONVM_ZGC_TARGETED_COMPACTION` engages zero times**, and §"Follow-up
+  2026-08-29" §6 says why in a way §"Follow-up 2026-08-28" could not: the
+  target is recorded on the allocation failure, and on this family the
+  allocation failure is what ends the run. It stays default-OFF, superseded by
+  the two compactors rather than fixed.
+
+### Never this defect — split out with their own pages
+
+| row | page |
+|---|---|
+| `TestOpenClose`: `Exception in thread "main" java/lang/Object`, no frames | `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md` |
+| `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
+| `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` | `bug-h2-testkillprocesswhilewriting-g1-oom-20260829.md` |
+| the same fragmentation symptom in Spring Framework and Hibernate, never censused | `../gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md` |
+
+Each of those was already labelled "not this defect" here, with a measurement
+behind the label; splitting them out is what stops this page's Status line from
+being read as a verdict on them. The G1 one in particular has a five-arm
+interleaved A/B behind it and is identical before and after every repair on
+this page.
