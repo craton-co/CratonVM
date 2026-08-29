@@ -6762,6 +6762,35 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let mark = s2_bb_get_mark(ctx, this);
         if mark < 0 {
+            // THE TYPE, not a message that names the type. This raised
+            // `IllegalStateException` whose detail message was the STRING
+            // "InvalidMarkException" -- so `catch (InvalidMarkException)`, the
+            // only handler anyone writes for this, did not match.
+            //
+            // `InvalidMarkException extends IllegalStateException`, so the
+            // supertype handler still worked and nothing failed loudly. What
+            // made it visible was the DESCRIPTOR: this registration covers
+            // `()Ljava/nio/Buffer;` only, and javac emits that spelling solely
+            // when the reference is typed `Buffer`. Through a `ByteBuffer`
+            // reference the real bytecode runs and answers correctly, so the
+            // bridge and its target DISAGREED:
+            //
+            //   ByteBuffer bb = ...;  bb.reset()   InvalidMarkException
+            //   Buffer     b  = bb;   b.reset()    IllegalStateException
+            //
+            // MEASURED with `apps/probes/L4TailSweep2.java`, which types the
+            // reference as `Buffer` for exactly this reason.
+            if let Ok(Some(Value::Object(Some(exc)))) =
+                ctx.new_object("java/nio/InvalidMarkException")
+            {
+                let _ = ctx.invoke(
+                    "java/nio/InvalidMarkException",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(exc))],
+                );
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            }
             return Err(RuntimeError::IllegalStateException {
                 message: "InvalidMarkException".into(),
             }
