@@ -2637,6 +2637,31 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     if let Ok(v6) = host.parse::<Ipv6Addr>() {
         return Ok(IpAddr::V6(v6));
     }
+    // A SCOPED IPv6 literal — `fe80::1%14`, `fe80::1%eth0`,
+    // `fe80::1%{04C70698-…}` on Windows, where our interface names are the
+    // adapter GUIDs. `Ipv6Addr::from_str` rejects the suffix, so without this
+    // the whole text fell through to DNS and came back
+    // `UnknownHostException` — including for text this VM had just PRODUCED
+    // itself: `Inet6Address.getHostAddress()` renders `%<interface name>`, and
+    // anything that puts an address on the wire as text and parses it back
+    // (netty's SOCKS4 proxy handler, every `URI`-shaped config) round-trips
+    // through exactly this call.
+    //
+    // HotSpot's rule, which this follows: a numeric scope is taken as-is, and
+    // a NAMED scope has to name an interface that exists — an unknown name is
+    // an unknown host, not scope 0. Scanning the interfaces costs a syscall,
+    // and only a literal carrying a `%` ever reaches it.
+    if let Some((bare, scope)) = host.split_once('%') {
+        if !scope.is_empty() {
+            if let Ok(v6) = bare.parse::<Ipv6Addr>() {
+                let numeric = scope.bytes().all(|b| b.is_ascii_digit());
+                if numeric || re8_scan_host_ifaces().iter().any(|i| i.name == scope) {
+                    return Ok(IpAddr::V6(v6));
+                }
+                return Err(uhex(host.to_string()));
+            }
+        }
+    }
     let lookup = format!("{host}:0");
     let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str())
         .map_err(|e| uhex(format!("{host}: {e}")))?;
