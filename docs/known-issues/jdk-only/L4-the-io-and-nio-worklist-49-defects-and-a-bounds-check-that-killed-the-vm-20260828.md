@@ -789,6 +789,21 @@ registration so every door misses.
 
 ## P2.4 `dev`'s tip did not compile, and it was two `#[cfg]` lines
 
+> **CREDIT, added at the merge.** Both repairs in P2.4 and P2.7 were made
+> INDEPENDENTLY and landed on `dev` first — the `#[cfg]` restoration as
+> `43088b840`, and the array-CNFE element name in the same window. When this
+> lane merged, both of its copies conflicted with the ones already there and
+> were resolved to `dev`'s side and dropped. What is left here is the
+> DIAGNOSIS, which stands either way: the control build that proved the reds
+> were not this lane's, and the two general lessons — an attribute belongs to
+> the item that follows it, and a branch that bypasses a delegation inherits
+> every contract the delegation used to satisfy.
+>
+> Two sessions finding the same two defects within an hour is itself worth
+> noting: a red tip is expensive precisely because every lane pays to
+> rediscover it.
+
+
 `cargo check -p cratonvm-native-builtins` was **17 errors** on pristine
 `origin/dev` — `cannot find type Value`, `arg_long` inaccessible,
 `state::` unresolved, across `craton_gpu.rs`, `xnio_async.rs` and
