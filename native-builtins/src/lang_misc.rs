@@ -674,6 +674,82 @@ pub(crate) fn native_exc_init_message(
     Ok(None)
 }
 
+/// `ExceptionInInitializerError(Throwable)` -- `super(null, thrown)`.
+///
+/// See the class-specific row in [`throwable_ctor_native`] for the measured
+/// bytecode. The point of a separate body rather than the generic
+/// `(Ljava/lang/Throwable;)V` arm is the MESSAGE: `Throwable(Throwable)`
+/// derives `detailMessage` from `cause.toString()`, and this class passes an
+/// explicit null one.
+pub(crate) fn native_exception_in_initializer_init_thrown(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(v @ Value::Object(Some(_))) => *v,
+        _ => return Ok(None),
+    };
+    let thrown = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_exc_init_message_cause(ctx, &[this, Value::Object(None), thrown])
+}
+
+/// A no-arg constructor that leaves `cause` at a REAL null rather than at the
+/// JDK's `cause == this` sentinel -- so a later `initCause` on the instance is
+/// an `IllegalStateException` and not a success.
+///
+/// Three classes in [`THROWABLE_FAMILY_CLASSES`] do this, and the generic
+/// [`native_exc_init_noargs`] arm got all three wrong by writing the sentinel.
+/// Disassembled on the 25.0.4+7 image, all 62 classes in the list:
+///
+/// ```text
+///   ClassNotFoundException()        aconst_null; checkcast Throwable;
+///                                   invokespecial ReflectiveOperationException.<init>(Throwable)
+///   InvocationTargetException()     the same, then `target = null`
+///   ExceptionInInitializerError()   super(); aconst_null; invokevirtual initCause
+/// ```
+///
+/// Every other class either has no no-arg constructor or reaches
+/// `Throwable()`, which assigns `cause = this`. `Error()` and `Throwable()`
+/// contain an `aconst_null` of their own -- the `null` message argument to
+/// `ThrowableTracer.trace*` under the `jfrTracing` flag -- which is why the
+/// discriminator has to be the SUPER CALL and not the presence of a null.
+///
+/// MEASURED by `apps/probes/ThrowableFamilySweep.java`:
+/// `new ClassNotFoundException().initCause(new Error("later"))` is an
+/// `IllegalStateException` on HotSpot and was a silent success here.
+pub(crate) fn native_exc_init_noargs_null_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_exc_init_noargs(ctx, args)?;
+    if let Some(Value::Object(Some(this))) = args.first() {
+        write_throwable_cause(ctx, *this, Value::Object(None));
+    }
+    Ok(None)
+}
+
+/// The `(Ljava/lang/String;)V` sibling of
+/// [`native_exc_init_noargs_null_cause`]: sets the message and leaves `cause`
+/// at a real null.
+///
+/// `ClassNotFoundException(String)` and `ExceptionInInitializerError(String)`
+/// are both `aload_1; aconst_null; invokespecial super.<init>(String,Throwable)`
+/// on the 25.0.4+7 image, so they own the same refusal as their no-arg forms:
+/// `new ClassNotFoundException("c").initCause(x)` is an `IllegalStateException`
+/// on HotSpot and was a silent success here. MEASURED by
+/// `apps/probes/ThrowableFamilySweep.java`.
+pub(crate) fn native_exc_init_message_null_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(v @ Value::Object(Some(_))) => *v,
+        _ => return Ok(None),
+    };
+    let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_exc_init_message_cause(ctx, &[this, msg, Value::Object(None)])
+}
+
 /// Exception <init>(Ljava/lang/String;Ljava/lang/Throwable;)V
 pub(crate) fn native_exc_init_message_cause(
     ctx: &mut dyn NativeContext,
@@ -1751,10 +1827,43 @@ fn throwable_to_string_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> (Objec
     (current, text)
 }
 
-/// Read the cause field, returning None if missing or self-referential
-/// (the JDK `cause = this` "uninitialized" sentinel).
+/// The cause of `t` as `printStackTrace` sees it: the result of the VIRTUAL
+/// `getCause()`, with the JDK `cause = this` "uninitialized" sentinel and a
+/// self-reference both reported as `None`.
+///
+/// **Dispatching rather than reading the field is the point.** `Throwable`'s
+/// own `printStackTrace` calls `getCause()`, and several subclasses override it
+/// to answer a field of their own -- `InvocationTargetException.getCause()`
+/// returns `target`, and this VM's registrar has an entry saying exactly that
+/// a few hundred lines from here. A raw `cause` read misses every one of them,
+/// so a wrapped exception printed its header and nothing else:
+///
+/// ```text
+///   new InvocationTargetException(new IOException("io"), "wrapped")
+///     HotSpot   java.lang.reflect.InvocationTargetException: wrapped
+///               Caused by: java.io.IOException: io
+///     was       java.lang.reflect.InvocationTargetException: wrapped
+/// ```
+///
+/// MEASURED by `apps/probes/ThrowableFamilySweep.java`. This is the same
+/// correction [`throwable_to_string_text`] already carries for the message half
+/// -- it dispatches `getLocalizedMessage()` for the same reason -- so the two
+/// halves of a printed header now agree about whose implementation decides.
+/// The field read stays as the fallback for a receiver whose `getCause` cannot
+/// be dispatched (a partially-built VM-minted throwable on the boot path).
 fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRef> {
-    let by_name = throwable_field_get(ctx, t, "cause");
+    let pin = ctx.pin_native_root(t);
+    let receiver = ctx.read_native_pin(pin, t);
+    let dispatched = ctx.invoke_virtual(receiver, "getCause", "()Ljava/lang/Throwable;", &[]);
+    let t = ctx.read_native_pin(pin, receiver);
+    ctx.unpin_native_roots(pin);
+    let by_name = match dispatched {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        Ok(Some(Value::Object(None))) | Ok(None) => Value::Object(None),
+        // Dispatch failed outright, or answered a non-reference: fall back to
+        // the raw field, which is what this function did before it dispatched.
+        Err(_) | Ok(Some(_)) => throwable_field_get(ctx, t, "cause"),
+    };
     if let Value::Object(Some(c)) = by_name {
         if c == t {
             return None;
@@ -1817,22 +1926,19 @@ fn throwable_frame_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String
         .collect()
 }
 
-/// Return the real suppressed-throwable elements. The JDK sentinel is a List,
-/// while CratonVM's native `addSuppressed` replaces it with a Throwable array;
-/// only the latter represents user-visible suppressed exceptions.
+/// Return the real suppressed-throwable elements.
+///
+/// This used to say "the JDK sentinel is a List, while CratonVM's native
+/// `addSuppressed` replaces it with a Throwable array; only the latter
+/// represents user-visible suppressed exceptions". That array was the D7 defect
+/// -- see [`store_suppressed`] -- and `addSuppressed` now writes the declared
+/// `java.util.List` wherever one exists.
 fn throwable_suppressed(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<ObjectRef> {
-    let Value::Object(Some(array)) = throwable_field_get(ctx, t, "suppressedExceptions") else {
-        return Vec::new();
-    };
-    if ctx.heap_kind_of(array) != cratonvm_types::ObjectKind::Array {
-        return Vec::new();
-    }
-    (0..ctx.array_length(array))
-        .filter_map(|index| match ctx.get_array_element(array, index) {
-            Value::Object(Some(throwable)) => Some(throwable),
-            _ => None,
-        })
-        .collect()
+    // BOTH shapes, through the one reader. This body accepted the array shape
+    // only and answered "none" for anything else, so once `addSuppressed`
+    // started storing the declared `java.util.List` a printed trace would have
+    // lost every `Suppressed:` line. See [`suppressed_elements`].
+    suppressed_elements(ctx, t)
 }
 
 /// Emit a single line: record it for in-VM consumers and write it to the
@@ -2093,6 +2199,131 @@ fn print_throwable_chain_to_stream_obj(
 /// bytecode runs. VM-*minted* throwables are the case that had to be closed
 /// alongside this, or the new rule would drop suppressions on them — see
 /// `mirror_throwable_field_initialisers` in `vm/src/runtime/exceptions.rs`.
+/// The suppressed throwables of `t`, in whichever of the two shapes the field
+/// holds.
+///
+/// `Throwable.suppressedExceptions` is declared `java.util.List<Throwable>`, and
+/// on an image with the real class library that is what it holds: the
+/// `SUPPRESSED_SENTINEL` empty list to begin with, and a list of its own once
+/// something has been suppressed. A synthetic image has no usable `List`, so
+/// [`store_suppressed`] falls back to the `Object[]` these natives have always
+/// written. Reading BOTH is what lets the writer choose per image rather than
+/// per build -- the same self-checking shape `sb_view` uses for the two
+/// `StringBuilder` layouts.
+///
+/// The empty sentinel needs no case of its own: its `size()` is zero.
+fn suppressed_elements(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<ObjectRef> {
+    let Value::Object(Some(stored)) = read_throwable_field(ctx, t, "suppressedExceptions") else {
+        return Vec::new();
+    };
+    if ctx.heap_kind_of(stored) == cratonvm_types::ObjectKind::Array {
+        return (0..ctx.array_length(stored))
+            .filter_map(|i| match ctx.get_array_element(stored, i) {
+                Value::Object(Some(e)) => Some(e),
+                _ => None,
+            })
+            .collect();
+    }
+    // A List. `size()` and `get(int)` are ordinary bytecode and may allocate, so
+    // the list reference is pinned and re-read across every call.
+    let pin = ctx.pin_native_root(stored);
+    let list = ctx.read_native_pin(pin, stored);
+    let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) if n > 0 => n,
+        _ => {
+            ctx.unpin_native_roots(pin);
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(size as usize);
+    for i in 0..size {
+        let list = ctx.read_native_pin(pin, stored);
+        match ctx.invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
+            Ok(Some(Value::Object(Some(e)))) => out.push(e),
+            _ => break,
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    out
+}
+
+/// Store `elements` into `t.suppressedExceptions` in the shape this image can
+/// hold: a real `java.util.ArrayList` when one is available, the legacy
+/// `Object[]` otherwise.
+///
+/// **The List shape is not cosmetic.** The field's declared type is
+/// `Ljava/util/List;`, and `java.io.ObjectInputStream` type-checks a
+/// deserialized field value against that descriptor. With an array in there,
+/// every throwable carrying a suppressed exception failed its round trip:
+///
+/// ```text
+///   ClassCastException: cannot assign instance of [Ljava.lang.Object; to
+///   field java.lang.Throwable.suppressedExceptions of type java.util.List
+///   in instance of java.lang.IllegalStateException
+/// ```
+///
+/// which is the shape of defect that stays invisible until real bytecode reads
+/// what a native wrote. MEASURED by `apps/probes/ThrowableFamilySweep.java`.
+///
+/// **GC discipline.** The elements are staged into a plain `Object[]` FIRST:
+/// filling it runs no bytecode, so nothing can move while it is built, and one
+/// pinned array then keeps every element reachable across the `add` calls --
+/// which do run bytecode and may collect. That array is also the fallback
+/// value, so the failure path costs nothing extra.
+fn store_suppressed(ctx: &mut dyn NativeContext, this: ObjectRef, elements: &[ObjectRef]) {
+    use cratonvm_types::ClassId;
+    let staged = ctx.new_ref_array(ClassId::new(0), elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        ctx.set_array_element(staged, i, Value::Object(Some(*e)));
+    }
+    let base = ctx.pin_native_root(this);
+    let staged_pin = ctx.pin_native_root(staged);
+
+    if ctx.class_id_by_name("java/util/ArrayList").is_some() {
+        if let Ok(Some(Value::Object(Some(list)))) =
+            ctx.new_object_initialized("java/util/ArrayList", "()V", &[])
+        {
+            let list_pin = ctx.pin_native_root(list);
+            let mut ok = true;
+            for i in 0..elements.len() {
+                let staged_now = ctx.read_native_pin(staged_pin, staged);
+                let elem = ctx.get_array_element(staged_now, i);
+                let list_now = ctx.read_native_pin(list_pin, list);
+                if ctx
+                    .invoke_virtual(list_now, "add", "(Ljava/lang/Object;)Z", &[elem])
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let list_now = ctx.read_native_pin(list_pin, list);
+                let this_now = ctx.read_native_pin(base, this);
+                write_throwable_field(
+                    ctx,
+                    this_now,
+                    "suppressedExceptions",
+                    Value::Object(Some(list_now)),
+                );
+                ctx.unpin_native_roots(base);
+                return;
+            }
+        }
+    }
+    // No usable `ArrayList` (a synthetic-JDK image), or the construction failed:
+    // keep the pre-2026-08-29 array shape rather than lose the suppression.
+    let this_now = ctx.read_native_pin(base, this);
+    let staged_now = ctx.read_native_pin(staged_pin, staged);
+    write_throwable_field(
+        ctx,
+        this_now,
+        "suppressedExceptions",
+        Value::Object(Some(staged_now)),
+    );
+    ctx.unpin_native_roots(base);
+}
+
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2131,38 +2362,13 @@ pub(crate) fn native_throwable_add_suppressed(
     if suppression_disabled(ctx, this) {
         return Ok(None);
     }
-    // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
-    let existing = read_throwable_field(ctx, this, "suppressedExceptions");
-    match existing {
-        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array => {
-            // Grow the array: copy old elements + append new one
-            let old_len = ctx.array_length(arr);
-            let new_arr = ctx.new_ref_array(ClassId::new(0), old_len + 1);
-            for i in 0..old_len {
-                let elem = ctx.get_array_element(arr, i);
-                ctx.set_array_element(new_arr, i, elem);
-            }
-            ctx.set_array_element(new_arr, old_len, Value::Object(Some(suppressed)));
-            write_throwable_field(
-                ctx,
-                this,
-                "suppressedExceptions",
-                Value::Object(Some(new_arr)),
-            );
-        }
-        _ => {
-            // No existing array (null, or still the SUPPRESSED_SENTINEL list)
-            // — create one with a single element.
-            let new_arr = ctx.new_ref_array(ClassId::new(0), 1);
-            ctx.set_array_element(new_arr, 0, Value::Object(Some(suppressed)));
-            write_throwable_field(
-                ctx,
-                this,
-                "suppressedExceptions",
-                Value::Object(Some(new_arr)),
-            );
-        }
-    }
+    // Read what is there, append, write the whole thing back in whichever shape
+    // this image can hold. `suppressed_elements` reads the empty
+    // SUPPRESSED_SENTINEL as zero elements, so the first suppression needs no
+    // branch of its own.
+    let mut elements = suppressed_elements(ctx, this);
+    elements.push(suppressed);
+    store_suppressed(ctx, this, &elements);
     Ok(None)
 }
 
@@ -2190,14 +2396,27 @@ pub(crate) fn native_throwable_get_suppressed(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    if let Value::Object(Some(arr)) = read_throwable_field(ctx, this, "suppressedExceptions") {
-        if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array {
-            return Ok(Some(Value::Object(Some(arr))));
-        }
+    // A FRESH array every time. The JDK's body is
+    // `suppressedExceptions.toArray(EMPTY_THROWABLE_ARRAY)`, which allocates;
+    // this used to hand back the stored array itself, so a caller that wrote
+    // into the array it was given edited the throwable:
+    //
+    //   t.addSuppressed(x); a = t.getSuppressed(); a[0] = null;
+    //     t.getSuppressed()[0]   HotSpot  java.lang.IllegalStateException
+    //                            was      null
+    //
+    // MEASURED by `apps/probes/ThrowableFamilySweep.java`. The empty case is
+    // the one place a shared array WOULD be faithful -- HotSpot returns its
+    // `EMPTY_THROWABLE_ARRAY` constant -- but nothing observable depends on
+    // that identity, so one allocation path is enough.
+    let elements = suppressed_elements(ctx, this);
+    let element_class = ctx
+        .class_id_by_name("java/lang/Throwable")
+        .unwrap_or(ClassId::new(0));
+    let arr = ctx.new_ref_array(element_class, elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
     }
-    // No suppressed exceptions stored (null, or still SUPPRESSED_SENTINEL) —
-    // return an empty array.
-    let arr = ctx.new_ref_array(ClassId::new(0), 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -2329,12 +2548,64 @@ pub(crate) fn native_throwable_set_stack_trace(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let stack = args.get(1).copied().unwrap_or(Value::Object(None));
-    throwable_field_set(ctx, this, "stackTrace", stack);
+    // MEASURED -- `javap -c java.lang.Throwable`. The first instructions of
+    // `setStackTrace` are `aload_1; invokevirtual clone; checkcast`, then a
+    // scan that throws `NullPointerException("stackTrace[" + i + "]")`. Both
+    // happen BEFORE the monitor and before the store, so both refusals are
+    // owed even by a throwable whose stack trace is not writable.
+    //
+    // This body stored the caller's array reference verbatim and checked
+    // nothing, so all three rows were wrong at once:
+    //
+    //   t.setStackTrace(null)                       HotSpot NPE   was a no-op
+    //   t.setStackTrace(new StackTraceElement[]{null})
+    //                                               HotSpot NPE   was a no-op
+    //   a = {..}; t.setStackTrace(a); a[0] = other;
+    //     t.getStackTrace()[0]                      HotSpot the ORIGINAL
+    //                                               was `other`
+    //
+    // MEASURED by `apps/probes/ThrowableFamilySweep.java`.
+    let Some(Value::Object(Some(src))) = args.get(1).copied() else {
+        // `stackTrace.clone()` on a null argument: the implicit NPE from the
+        // `invokevirtual`, carrying HotSpot's helpful message. This is a
+        // site-specific LITERAL, not an implementation of helpful NPEs -- both
+        // halves of the text are fixed by `setStackTrace`'s own signature (the
+        // receiver expression is its parameter `stackTrace`, the method is
+        // `[Ljava/lang/StackTraceElement;.clone()`), so there is nothing here
+        // for a general mechanism to compute. MEASURED on HotSpot 25.0.4+7 by
+        // `apps/probes/ThrowableFamilySweep.java`.
+        return Err(throwable_refusal(
+            ctx,
+            "java/lang/NullPointerException",
+            "Cannot invoke \"[Ljava.lang.StackTraceElement;.clone()\" because \"stackTrace\" is null",
+            None,
+        ));
+    };
+    let len = ctx.array_length(src);
+    for i in 0..len {
+        if !matches!(ctx.get_array_element(src, i), Value::Object(Some(_))) {
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/NullPointerException",
+                &format!("stackTrace[{i}]"),
+                None,
+            ));
+        }
+    }
+    let element_class = ctx
+        .class_id_by_name("java/lang/StackTraceElement")
+        .unwrap_or(ClassId::new(0));
+    let copy = ctx.new_ref_array(element_class, len);
+    for i in 0..len {
+        let elem = ctx.get_array_element(src, i);
+        ctx.set_array_element(copy, i, elem);
+    }
+    throwable_field_set(ctx, this, "stackTrace", Value::Object(Some(copy)));
     Ok(None)
 }
 
@@ -3065,6 +3336,47 @@ fn throwable_ctor_native(cls: &str, descriptor: &str) -> Option<NativeCallback> 
             "java/util/MissingResourceException",
             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         ) => return Some(native_missing_resource_init),
+        // `ExceptionInInitializerError` is NOT the generic cause-only shape.
+        // MEASURED — `javap -c java.lang.ExceptionInInitializerError` on the
+        // 25.0.4+7 image this VM runs against:
+        //
+        //   ExceptionInInitializerError(Throwable)
+        //     aconst_null; aload_1; invokespecial LinkageError.<init>(String,Throwable)
+        //   ExceptionInInitializerError()
+        //     invokespecial LinkageError.<init>(); aload_0; aconst_null;
+        //     invokevirtual initCause
+        //
+        // So the message is an explicit NULL, not `cause.toString()`, and the
+        // no-arg form calls `initCause(null)` -- which leaves `cause` at a real
+        // null rather than the `cause == this` sentinel, and therefore REFUSES
+        // a later `initCause` with `IllegalStateException`. Routing it through
+        // the generic arms got both wrong:
+        //
+        //   new ExceptionInInitializerError(new IllegalStateException("seed"))
+        //     HotSpot  toString  java.lang.ExceptionInInitializerError
+        //     was                java.lang.ExceptionInInitializerError: java.lang.IllegalStateException: seed
+        //
+        // MEASURED by `apps/probes/ThrowableFamilySweep.java`. There is no
+        // `exception` FIELD to write on a modern image: `getException()` is
+        // `return super.getCause()`, which the registered `getCause` already
+        // answers, and `readObject` maps the serialized `exception` name onto
+        // the cause. This is only about which super constructor runs.
+        ("java/lang/ExceptionInInitializerError", "(Ljava/lang/Throwable;)V") => {
+            return Some(native_exception_in_initializer_init_thrown)
+        }
+        // The three no-arg constructors that null the cause rather than write
+        // the sentinel -- see [`native_exc_init_noargs_null_cause`] for the
+        // disassembly of all 62 and why these are the only three.
+        (
+            "java/lang/ExceptionInInitializerError"
+            | "java/lang/ClassNotFoundException"
+            | "java/lang/reflect/InvocationTargetException",
+            "()V",
+        ) => return Some(native_exc_init_noargs_null_cause),
+        (
+            "java/lang/ExceptionInInitializerError" | "java/lang/ClassNotFoundException",
+            "(Ljava/lang/String;)V",
+        ) => return Some(native_exc_init_message_null_cause),
         // `InvocationTargetException` keeps the wrapped throwable in its own
         // `target` field, not in `Throwable.cause` — see those bodies.
         ("java/lang/reflect/InvocationTargetException", "(Ljava/lang/Throwable;)V") => {
