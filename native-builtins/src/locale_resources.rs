@@ -972,6 +972,73 @@ pub(crate) fn cldr_currency_symbol(
     }
 }
 
+/// The display NAME for an ISO 4217 code in a locale — `cldr_currency_symbol`'s
+/// twin, and deliberately written against the same table so the two cannot
+/// drift apart the way the curated copies did.
+///
+/// CLDR keys `CurrencyNames` with the UPPERCASE code for the SYMBOL and the
+/// lowercase code for the display NAME. That convention is already recorded on
+/// `cldr_currency_symbol`; this is the other half of it, and until now nothing
+/// read it — `Currency.getDisplayName` ran real bytecode, which reaches the
+/// name through `LocaleServiceProviderPool` + `CurrencyNameProvider`, an SPI
+/// this VM does not serve. The pool answered null and the JDK's documented last
+/// resort took over, so every currency answered its own CODE.
+///
+/// MEASURED against HotSpot 25.0.4+7 (`apps/probes/CurrencyNameProbe`):
+///
+/// ```text
+/// Currency.getInstance("USD").getDisplayName(Locale.ENGLISH)
+///   HotSpot   US Dollar
+///   was       USD
+/// ```
+///
+/// The synthetic bundle already HELD the answer — `getString("usd")` returns
+/// "US Dollar" on this VM today — which is what makes this a plumbing gap
+/// rather than a data one, and what makes the bridge cheap.
+///
+/// DEBT, and worth naming as such: the right end state is the provider pool
+/// working, so `Currency` needs no bridge at all. This adds a shadow while the
+/// campaign is retiring them. It is the same trade `getSymbol(Locale)` and the
+/// whole `Locale.getDisplay*` family already made in this file, and it buys a
+/// right answer where real bytecode gives a wrong one. Whoever makes
+/// `LocaleServiceProviderPool` serve `CurrencyNameProvider` should delete both
+/// halves together.
+///
+/// The curated fallback is measured, not guessed — the eight entries are
+/// HotSpot's own answers for `Locale.ENGLISH`, and they are what an image
+/// shipped without `jdk.localedata` falls back to. The last resort is the JDK's
+/// own: the currency code.
+pub(crate) fn cldr_currency_display_name(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+    lang: &str,
+    country: &str,
+) -> String {
+    if !code.is_empty() {
+        if let Some(table) =
+            load_cldr_table(ctx, "sun.util.resources.cldr.CurrencyNames", lang, country)
+        {
+            if let Some(CldrValue::Str(name)) = table.get(&code.to_lowercase()) {
+                if !name.is_empty() {
+                    return name.clone();
+                }
+            }
+        }
+    }
+    match code {
+        "USD" => "US Dollar",
+        "EUR" => "Euro",
+        "GBP" => "British Pound",
+        "JPY" => "Japanese Yen",
+        "CNY" => "Chinese Yuan",
+        "CHF" => "Swiss Franc",
+        "CAD" => "Canadian Dollar",
+        "AUD" => "Australian Dollar",
+        _ => code,
+    }
+    .to_string()
+}
+
 /// `Currency.getSymbol()`'s locale: the real no-arg body is
 /// `getSymbol(Locale.getDefault(Locale.Category.DISPLAY))`, so the symbol a
 /// bare `getSymbol()` returns is a function of the host locale — `RUB` renders
@@ -1004,6 +1071,32 @@ pub(crate) fn currency_symbol_for_default_locale(
         None => (String::new(), String::new()),
     };
     cldr_currency_symbol(ctx, code, &lang, &country)
+}
+
+/// `Currency.getDisplayName()`'s locale, on the same reasoning (and the same
+/// `getDefault()`-not-`getDefault(DISPLAY)` shortcut) as
+/// [`currency_symbol_for_default_locale`], which see.
+pub(crate) fn currency_display_name_for_default_locale(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+) -> String {
+    let display = match ctx.invoke(
+        "java/util/Locale",
+        "getDefault",
+        "()Ljava/util/Locale;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(loc)))) => Some(loc),
+        _ => None,
+    };
+    let (lang, country) = match display {
+        Some(loc) => {
+            let (lang, country, _variant) = decompose_locale(ctx, loc);
+            (lang, country)
+        }
+        None => (String::new(), String::new()),
+    };
+    cldr_currency_display_name(ctx, code, &lang, &country)
 }
 
 /// Overlay the JDK image's own CLDR data for `(lang, country)` onto a synthetic
@@ -2896,6 +2989,32 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             let (lang, country) = arg_locale(ctx, args.get(1));
             let sym = cldr_currency_symbol(ctx, &code, &lang, &country);
             let s = ctx.create_string(&sym);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
+    // `Currency.getDisplayName(Locale)` — see `cldr_currency_display_name` for
+    // why real bytecode cannot answer this and why the bridge is debt.
+    // `getDisplayName()` (no-arg) delegates to
+    // `getDisplayName(Locale.getDefault(DISPLAY))` in real bytecode, so
+    // overriding only the 1-arg overload fixes both call forms — the same
+    // property `getSymbol` above relies on.
+    registry.register(
+        "java/util/Currency",
+        "getDisplayName",
+        "(Ljava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let code = match ctx.get_field_by_name(this, "currencyCode") {
+                Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let (lang, country) = arg_locale(ctx, args.get(1));
+            let name = cldr_currency_display_name(ctx, &code, &lang, &country);
+            let s = ctx.create_string(&name);
             Ok(Some(Value::Object(Some(s))))
         },
     );
