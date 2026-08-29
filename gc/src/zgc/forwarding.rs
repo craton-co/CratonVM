@@ -753,13 +753,12 @@ pub const ZFWD_MAX_CAPACITY: usize = 1 << 23;
 /// because they are owned by different modules and this derivation must stay
 /// conservative if they ever diverge: a *smaller* minimum means *more* objects,
 /// which is the direction that could overrun [`ZFWD_MAX_CAPACITY`].
-const ZFWD_SMALLEST_OBJECT_BYTES: usize = if cratonvm_types::HEADER_SIZE
-    < crate::zgc::page::ZPAGE_MIN_ALLOC
-{
-    cratonvm_types::HEADER_SIZE
-} else {
-    crate::zgc::page::ZPAGE_MIN_ALLOC
-};
+const ZFWD_SMALLEST_OBJECT_BYTES: usize =
+    if cratonvm_types::HEADER_SIZE < crate::zgc::page::ZPAGE_MIN_ALLOC {
+        cratonvm_types::HEADER_SIZE
+    } else {
+        crate::zgc::page::ZPAGE_MIN_ALLOC
+    };
 
 /// Slots [`zfwd_capacity_for`] would request for a **fully live** medium page —
 /// the worst case a legal page can produce, and the number
@@ -1175,10 +1174,7 @@ impl ZForwardingTable {
         for slot in self.entries.iter() {
             let e = slot.load(Ordering::Acquire);
             if ZgcForwardingEntry::is_occupied(e) {
-                out.push((
-                    ZgcForwardingEntry::from(e),
-                    ZgcForwardingEntry::payload(e),
-                ));
+                out.push((ZgcForwardingEntry::from(e), ZgcForwardingEntry::payload(e)));
             }
         }
         out
@@ -1953,7 +1949,10 @@ mod tests {
         // so the reasoning trail survives: at 24 B the worst case was ~1.4 Mi
         // objects, which rounds to the same 4 Mi capacity. The clamp held then
         // too — for a different reason than the one written down.
-        assert_eq!(zfwd_capacity_for(page::ZPAGE_DEFAULT_MEDIUM / 24), 4 * 1024 * 1024);
+        assert_eq!(
+            zfwd_capacity_for(page::ZPAGE_DEFAULT_MEDIUM / 24),
+            4 * 1024 * 1024
+        );
     }
 
     /// # 2026-08-07: this test's `from` was address-shaped, not offset-shaped
@@ -1976,7 +1975,10 @@ mod tests {
         // 0x0123_4560 = 18.2 MiB: inside a medium page, and wide enough that a
         // shift error in either field would move it.
         const FROM: u64 = 0x0123_4567 & !7;
-        assert!(FROM <= ZFWD_MAX_FROM_OFFSET, "the key must be a legal offset");
+        assert!(
+            FROM <= ZFWD_MAX_FROM_OFFSET,
+            "the key must be a legal offset"
+        );
 
         let e = ZgcForwardingEntry::pack(FROM, p(0x7FFF_FFF8)).unwrap();
         assert!(ZgcForwardingEntry::is_occupied(e));
@@ -1987,8 +1989,7 @@ mod tests {
         // three fields tile the word with no bleed. `from` reads back without
         // the payload's low bits, the payload reads back without the tag, and
         // the word is exactly all-ones.
-        let full =
-            ZgcForwardingEntry::pack(ZFWD_MAX_FROM_OFFSET, p(ZFWD_MAX_PAYLOAD)).unwrap();
+        let full = ZgcForwardingEntry::pack(ZFWD_MAX_FROM_OFFSET, p(ZFWD_MAX_PAYLOAD)).unwrap();
         assert_eq!(full, u64::MAX);
         assert!(ZgcForwardingEntry::is_occupied(full));
         assert_eq!(ZgcForwardingEntry::from(full), ZFWD_MAX_FROM_OFFSET);
@@ -2412,17 +2413,23 @@ mod tests {
         };
         let set = ZRelocationSet::select(&pages, &policy);
         assert!(set.contains(7), "the targeted page is in");
-        assert!(!set.contains(5), "page 5 is outside the window and stays out");
-        assert!(!set.contains(9), "page 9 is outside the window and stays out");
+        assert!(
+            !set.contains(5),
+            "page 5 is outside the window and stays out"
+        );
+        assert!(
+            !set.contains(9),
+            "page 9 is outside the window and stays out"
+        );
     }
 
     #[test]
     fn select_orders_by_garbage_ratio_descending() {
         let mb = 1024 * 1024;
         let pages = vec![
-            small(1, mb / 2),  // 25% live
-            small(2, mb / 8),  // 6.25% live  <- most garbage
-            small(3, mb / 4),  // 12.5% live
+            small(1, mb / 2), // 25% live
+            small(2, mb / 8), // 6.25% live  <- most garbage
+            small(3, mb / 4), // 12.5% live
         ];
         let policy = ZRelocationPolicy {
             max_live_occupancy: 0.5,
@@ -2481,9 +2488,9 @@ mod tests {
     fn select_skips_pages_at_or_above_the_occupancy_cutoff() {
         let mb = 1024 * 1024;
         let pages = vec![
-            small(1, mb / 16),      // 3.1% live -> selected
-            small(2, mb),           // 50% live  -> above 0.25 cutoff
-            small(3, 2 * mb),       // 100% live -> zero garbage AND above cutoff
+            small(1, mb / 16), // 3.1% live -> selected
+            small(2, mb),      // 50% live  -> above 0.25 cutoff
+            small(3, 2 * mb),  // 100% live -> zero garbage AND above cutoff
         ];
         let set = ZRelocationSet::select(&pages, &ZRelocationPolicy::default());
         assert_eq!(set.page_ids(), vec![1]);

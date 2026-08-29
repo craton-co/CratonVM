@@ -1339,7 +1339,9 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         if nonblocking {
             // One attempt, no parking: the JDK owns the wait (`Net.poll`) and
             // the deadline. Nothing here can block, so no blocking region.
-            listener.set_nonblocking(true).map_err(|e| net_err("accept", e))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| net_err("accept", e))?;
             match listener.accept() {
                 Ok(pair) => Some(pair),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -2191,8 +2193,8 @@ fn net_poll_stream_close_aware(
         return net_poll_stream(stream, events, 0);
     }
     // poll(2) convention: negative waits forever, positive is a bound.
-    let deadline = (timeout > 0)
-        .then(|| std::time::Instant::now() + Duration::from_millis(timeout as u64));
+    let deadline =
+        (timeout > 0).then(|| std::time::Instant::now() + Duration::from_millis(timeout as u64));
     loop {
         if !net_stream_still_registered(fd) {
             return Ok(true);
@@ -2447,10 +2449,7 @@ fn net_poll_raw(_raw: NetRawHandle, _events: i32, timeout: i32) -> std::io::Resu
 /// collapse** — deleting the duplicate arms is an edit to `net_phase_e.rs`, and
 /// is recorded, not applied, in that record. Until it is applied this crate has
 /// one exported primitive and that file still has its own copy.
-pub fn poll_stream_readable(
-    stream: &TcpStream,
-    timeout_ms: i32,
-) -> Option<std::io::Result<bool>> {
+pub fn poll_stream_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
     #[cfg(any(windows, unix))]
     {
         Some(net_poll_stream(stream, NET_POLLIN, timeout_ms))
@@ -2509,10 +2508,7 @@ const NET_POLLCONN: i32 = NET_POLLOUT;
 /// Exporting only the readable one would have left that file no choice but to
 /// keep its own copy for the write direction, which is how a four-site idiom
 /// grows back.
-pub fn poll_stream_writable(
-    stream: &TcpStream,
-    timeout_ms: i32,
-) -> Option<std::io::Result<bool>> {
+pub fn poll_stream_writable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
     #[cfg(any(windows, unix))]
     {
         Some(net_poll_stream(stream, NET_POLLOUT, timeout_ms))
@@ -2852,7 +2848,8 @@ mod sockopt_sys {
     // fine, but disagreeing signatures would trip `clashing_extern_declarations`.
     #[link(name = "ws2_32")]
     extern "system" {
-        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32)
+            -> i32;
         fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
         fn WSAGetLastError() -> i32;
     }
@@ -3349,10 +3346,7 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// rules, so this defers to it instead of duplicating them in a crate that
 /// cannot reach `native-builtins`. The freshly created String is pinned across
 /// the re-entrant call, which runs Java and can therefore collect.
-fn net_inet_address_from_literal(
-    ctx: &mut dyn NativeContext,
-    addr_text: &str,
-) -> MethodCallResult {
+fn net_inet_address_from_literal(ctx: &mut dyn NativeContext, addr_text: &str) -> MethodCallResult {
     let text = ctx.create_string(addr_text);
     let pin = ctx.pin_native_root(text);
     let text = ctx.read_native_pin(pin, text);
@@ -3693,7 +3687,8 @@ mod ext_opt_sys {
 
     #[link(name = "ws2_32")]
     unsafe extern "system" {
-        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32)
+            -> i32;
         fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
         fn socket(af: i32, kind: i32, protocol: i32) -> usize;
         fn closesocket(s: usize) -> i32;
@@ -3717,7 +3712,9 @@ mod ext_opt_sys {
         use crate::socket_channel::TcpHandle;
         match crate::socket_channel::tcp_registry().read().get(&id) {
             Some(TcpHandle::Stream(stream)) => Some(stream.as_raw_socket() as usize),
-            Some(TcpHandle::Bound(stream)) | Some(TcpHandle::Connecting(stream)) => Some(stream.as_raw_socket() as usize),
+            Some(TcpHandle::Bound(stream)) | Some(TcpHandle::Connecting(stream)) => {
+                Some(stream.as_raw_socket() as usize)
+            }
             _ => None,
         }
     }
@@ -3732,29 +3729,49 @@ mod ext_opt_sys {
             Ok(value)
         } else {
             // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
-            Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+            Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }))
         }
     }
 
     pub(super) fn set_int(fd: usize, level: i32, name: i32, value: i32) -> std::io::Result<()> {
         // SAFETY: `fd` is a live socket borrowed from a registry, and `value`
         // is readable for the exact byte count supplied to Winsock.
-        let rc = unsafe { setsockopt(fd, level, name, (&value as *const i32).cast(), std::mem::size_of::<i32>() as i32) };
+        let rc = unsafe {
+            setsockopt(
+                fd,
+                level,
+                name,
+                (&value as *const i32).cast(),
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
         if rc == 0 {
             Ok(())
         } else {
             // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
-            Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+            Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }))
         }
     }
 
     pub(super) fn probe(opt: ExtOpt, writable: bool) -> bool {
-        let Some((level, name)) = level_and_name(opt) else { return false; };
+        let Some((level, name)) = level_and_name(opt) else {
+            return false;
+        };
         // SAFETY: constants request an ordinary IPv4 TCP socket and no raw
         // pointers cross the FFI boundary.
         let fd = unsafe { socket(2, 1, IPPROTO_TCP) };
-        if fd == usize::MAX { return false; }
-        let supported = if writable { set_int(fd, level, name, 1).is_ok() } else { get_int(fd, level, name).is_ok() };
+        if fd == usize::MAX {
+            return false;
+        }
+        let supported = if writable {
+            set_int(fd, level, name, 1).is_ok()
+        } else {
+            get_int(fd, level, name).is_ok()
+        };
         // SAFETY: `fd` was returned successfully by `socket` above and is
         // closed exactly once before leaving this probe.
         unsafe { closesocket(fd) };
@@ -3836,14 +3853,24 @@ fn ext_opt_set(_args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
 /// one of the two live-stream registries; DatagramSocket ids resolve through
 /// FileDescriptorTable, which owns the corresponding UdpSocket.
 #[cfg(target_os = "windows")]
-fn win_ext_opt_get(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
-    let (Some(id), _) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
-    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
+fn win_ext_opt_get(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    opt: ExtOpt,
+) -> Result<i32, MethodCallFailed> {
+    let (Some(id), _) = ext_opt_int_args(args) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
     if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::get_int(raw, level, name).map_err(|e| net_err(opt.label(), e));
     }
     let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
-    ctx.fd_table().udp_get_socket_option_i32(fd, level, name).map_err(|e| net_err(opt.label(), e))
+    ctx.fd_table()
+        .udp_get_socket_option_i32(fd, level, name)
+        .map_err(|e| net_err(opt.label(), e))
 }
 
 /// The raw `SOCKET` behind ANY extended-option handle id.
@@ -3869,9 +3896,17 @@ fn win_ext_opt_any_socket(ctx: &dyn NativeContext, id: i32) -> Option<usize> {
 }
 
 #[cfg(target_os = "windows")]
-fn win_ext_opt_set(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
-    let (Some(id), Some(value)) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
-    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
+fn win_ext_opt_set(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    opt: ExtOpt,
+) -> Result<(), MethodCallFailed> {
+    let (Some(id), Some(value)) = ext_opt_int_args(args) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
+    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else {
+        return Err(ext_opt_unsupported(opt.label()));
+    };
     if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::set_int(raw, level, name, value).map_err(|e| net_err(opt.label(), e));
     }
@@ -3889,39 +3924,84 @@ fn win_ext_opt_set(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Resu
 
 fn windows_keepalive_get_probes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveProbes)?))); }
+    {
+        return Ok(Some(Value::Int(win_ext_opt_get(
+            ctx,
+            args,
+            ExtOpt::KeepAliveProbes,
+        )?)));
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 fn windows_keepalive_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveTime)?))); }
+    {
+        return Ok(Some(Value::Int(win_ext_opt_get(
+            ctx,
+            args,
+            ExtOpt::KeepAliveTime,
+        )?)));
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 fn windows_keepalive_get_intvl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveIntvl)?))); }
+    {
+        return Ok(Some(Value::Int(win_ext_opt_get(
+            ctx,
+            args,
+            ExtOpt::KeepAliveIntvl,
+        )?)));
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 fn windows_keepalive_set_probes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveProbes)?; return Ok(None); }
+    {
+        win_ext_opt_set(ctx, args, ExtOpt::KeepAliveProbes)?;
+        return Ok(None);
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 fn windows_keepalive_set_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveTime)?; return Ok(None); }
+    {
+        win_ext_opt_set(ctx, args, ExtOpt::KeepAliveTime)?;
+        return Ok(None);
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 fn windows_keepalive_set_intvl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "windows")]
-    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveIntvl)?; return Ok(None); }
+    {
+        win_ext_opt_set(ctx, args, ExtOpt::KeepAliveIntvl)?;
+        return Ok(None);
+    }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+    {
+        let _ = (ctx, args);
+        Err(ext_opt_unsupported("TCP keepalive options"))
+    }
 }
 
 /// The `int` arguments of an extended-option native, in order.
@@ -4260,7 +4340,13 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     );
 
     // Capability flags
-    r.register_with_kind(net, "isIPv6Available0", "()Z", net_is_ipv6_available, NativeKind::Bridge);
+    r.register_with_kind(
+        net,
+        "isIPv6Available0",
+        "()Z",
+        net_is_ipv6_available,
+        NativeKind::Bridge,
+    );
     r.register_with_kind(
         net,
         "isReusePortAvailable0",
@@ -4318,25 +4404,54 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // registries and FileDescriptorTable-owned DatagramSockets, keeping
         // the capability probe and each getter/setter aligned with the actual
         // socket on which Java requested the option.
-        r.register_with_kind(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
-        }, NativeKind::Bridge);
+        r.register_with_kind(
+            wso,
+            "keepAliveOptionsSupported0",
+            "()Z",
+            |_c, _a| Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported())))),
+            NativeKind::Bridge,
+        );
         // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
         // is plain Java returning true — so unlike the keepalive family below these
         // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
         // They used to accept the request and drop it on the floor.
-        r.register_with_kind(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
-            #[cfg(target_os = "windows")]
-            { return Ok(Some(Value::Int(i32::from(win_ext_opt_get(ctx, args, ExtOpt::DontFragment)? != 0)))); }
-            #[cfg(not(target_os = "windows"))]
-            { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        }, NativeKind::Bridge);
-        r.register_with_kind(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
-            #[cfg(target_os = "windows")]
-            { win_ext_opt_set(ctx, args, ExtOpt::DontFragment)?; return Ok(None); }
-            #[cfg(not(target_os = "windows"))]
-            { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
-        }, NativeKind::Bridge);
+        r.register_with_kind(
+            wso,
+            "getIpDontFragment0",
+            "(IZ)Z",
+            |ctx, args| {
+                #[cfg(target_os = "windows")]
+                {
+                    return Ok(Some(Value::Int(i32::from(
+                        win_ext_opt_get(ctx, args, ExtOpt::DontFragment)? != 0,
+                    ))));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = (ctx, args);
+                    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+                }
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            wso,
+            "setIpDontFragment0",
+            "(IZZ)V",
+            |ctx, args| {
+                #[cfg(target_os = "windows")]
+                {
+                    win_ext_opt_set(ctx, args, ExtOpt::DontFragment)?;
+                    return Ok(None);
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = (ctx, args);
+                    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+                }
+            },
+            NativeKind::Bridge,
+        );
         r.register_with_kind(
             wso,
             "getTcpKeepAliveProbes0",
@@ -4406,21 +4521,37 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // so this is the only registration of the family.
     {
         let lso = "jdk/net/LinuxSocketOptions";
-        r.register_with_kind(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "quickAckSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_supported(
-                ExtOpt::QuickAck,
-                true,
-            )))))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_supported(
-                ExtOpt::IncomingNapiId,
-                false,
-            )))))
-        }, NativeKind::Bridge);
+        r.register_with_kind(
+            lso,
+            "keepAliveOptionsSupported0",
+            "()Z",
+            |_c, _a| Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported())))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "quickAckSupported0",
+            "()Z",
+            |_c, _a| {
+                Ok(Some(Value::Int(i32::from(ext_opt_supported(
+                    ExtOpt::QuickAck,
+                    true,
+                )))))
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "incomingNapiIdSupported0",
+            "()Z",
+            |_c, _a| {
+                Ok(Some(Value::Int(i32::from(ext_opt_supported(
+                    ExtOpt::IncomingNapiId,
+                    false,
+                )))))
+            },
+            NativeKind::Bridge,
+        );
         // IP_DONTFRAGMENT is NOT gated by a native probe
         // (`ipDontFragmentSupported()` is plain Java returning true), so these
         // two are genuinely reachable — and they are now IMPLEMENTED rather than
@@ -4431,22 +4562,44 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // `IP_MTU_DISCOVER` (v4) / `IPV6_MTU_DISCOVER` (v6) is selectable —
         // which is exactly what `LinuxSocketOptions.c` does. The Windows twin
         // above has had a real implementation since the same round.
-        r.register_with_kind(lso, "getIpDontFragment0", "(IZ)Z", |_c, a| {
-            Ok(Some(Value::Int(i32::from(linux_dont_fragment_get(a)?))))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "setIpDontFragment0", "(IZZ)V", |_c, a| {
-            linux_dont_fragment_set(a)?;
-            Ok(None)
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "getQuickAck0", "(I)Z", |_c, a| {
-            Ok(Some(Value::Int(i32::from(
-                ext_opt_get(a, ExtOpt::QuickAck)? != 0,
-            ))))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "setQuickAck0", "(IZ)V", |_c, a| {
-            ext_opt_set(a, ExtOpt::QuickAck)?;
-            Ok(None)
-        }, NativeKind::Bridge);
+        r.register_with_kind(
+            lso,
+            "getIpDontFragment0",
+            "(IZ)Z",
+            |_c, a| Ok(Some(Value::Int(i32::from(linux_dont_fragment_get(a)?)))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "setIpDontFragment0",
+            "(IZZ)V",
+            |_c, a| {
+                linux_dont_fragment_set(a)?;
+                Ok(None)
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "getQuickAck0",
+            "(I)Z",
+            |_c, a| {
+                Ok(Some(Value::Int(i32::from(
+                    ext_opt_get(a, ExtOpt::QuickAck)? != 0,
+                ))))
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "setQuickAck0",
+            "(IZ)V",
+            |_c, a| {
+                ext_opt_set(a, ExtOpt::QuickAck)?;
+                Ok(None)
+            },
+            NativeKind::Bridge,
+        );
         // `-1` stays the answer for a socket with no peer credentials, because
         // it is this native's OWN documented failure sentinel, not a
         // placeholder: `ExtendedSocketOptions.getSoPeerCred` decodes the long as
@@ -4454,33 +4607,71 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // domain socket")` — which is exactly right for the TCP sockets that
         // make up almost every caller. What changed is that a real AF_UNIX
         // socket now gets its real SO_PEERCRED instead of the sentinel.
-        r.register_with_kind(lso, "getSoPeerCred0", "(I)J", |_c, a| {
-            Ok(Some(Value::Long(ext_opt_peer_cred(a))))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "getIncomingNapiId0", "(I)I", |_c, a| {
-            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::IncomingNapiId)?)))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "getTcpKeepAliveProbes0", "(I)I", |_c, a| {
-            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveProbes)?)))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "getTcpKeepAliveTime0", "(I)I", |_c, a| {
-            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveTime)?)))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "getTcpKeepAliveIntvl0", "(I)I", |_c, a| {
-            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveIntvl)?)))
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "setTcpKeepAliveProbes0", "(II)V", |_c, a| {
-            ext_opt_set(a, ExtOpt::KeepAliveProbes)?;
-            Ok(None)
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "setTcpKeepAliveTime0", "(II)V", |_c, a| {
-            ext_opt_set(a, ExtOpt::KeepAliveTime)?;
-            Ok(None)
-        }, NativeKind::Bridge);
-        r.register_with_kind(lso, "setTcpKeepAliveIntvl0", "(II)V", |_c, a| {
-            ext_opt_set(a, ExtOpt::KeepAliveIntvl)?;
-            Ok(None)
-        }, NativeKind::Bridge);
+        r.register_with_kind(
+            lso,
+            "getSoPeerCred0",
+            "(I)J",
+            |_c, a| Ok(Some(Value::Long(ext_opt_peer_cred(a)))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "getIncomingNapiId0",
+            "(I)I",
+            |_c, a| Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::IncomingNapiId)?))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "getTcpKeepAliveProbes0",
+            "(I)I",
+            |_c, a| Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveProbes)?))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "getTcpKeepAliveTime0",
+            "(I)I",
+            |_c, a| Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveTime)?))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "getTcpKeepAliveIntvl0",
+            "(I)I",
+            |_c, a| Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveIntvl)?))),
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "setTcpKeepAliveProbes0",
+            "(II)V",
+            |_c, a| {
+                ext_opt_set(a, ExtOpt::KeepAliveProbes)?;
+                Ok(None)
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "setTcpKeepAliveTime0",
+            "(II)V",
+            |_c, a| {
+                ext_opt_set(a, ExtOpt::KeepAliveTime)?;
+                Ok(None)
+            },
+            NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            lso,
+            "setTcpKeepAliveIntvl0",
+            "(II)V",
+            |_c, a| {
+                ext_opt_set(a, ExtOpt::KeepAliveIntvl)?;
+                Ok(None)
+            },
+            NativeKind::Bridge,
+        );
     }
 
     // NIO-SERVER-SOCKET: `IOUtil.newFD(int)` calls `setfdVal(fd, value)` to
@@ -4506,24 +4697,48 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // JNI implementations return exactly these compile-time values too. A
     // constant here is the whole method, not a placeholder; `NET_POLL*` are the
     // platform-correct values `net_poll` itself compares against.
-    r.register_with_kind(net, "pollinValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLIN)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(net, "polloutValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLOUT)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(net, "pollerrValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLERR)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(net, "pollhupValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLHUP)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(net, "pollnvalValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLNVAL)))
-    }, NativeKind::Bridge);
-    r.register_with_kind(net, "pollconnValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(NET_POLLCONN)))
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        net,
+        "pollinValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLIN))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        net,
+        "polloutValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLOUT))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        net,
+        "pollerrValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLERR))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        net,
+        "pollhupValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLHUP))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        net,
+        "pollnvalValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLNVAL))),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        net,
+        "pollconnValue",
+        "()S",
+        |_c, _a| Ok(Some(Value::Int(NET_POLLCONN))),
+        NativeKind::Bridge,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -4567,10 +4782,13 @@ pub fn parse_socket_addr(text: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 #[allow(non_snake_case)] // Test names intentionally mirror JDK method names.
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::{Read as _, Write as _};
     use std::thread;
 
@@ -4605,9 +4823,7 @@ mod tests {
     #[test]
     fn a_listener_poll_does_not_hold_the_registry_lock() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        listener
-            .set_nonblocking(false)
-            .expect("blocking listener");
+        listener.set_nonblocking(false).expect("blocking listener");
         let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
         // Poll for a connection that never comes, on another thread, THROUGH
         // `net_poll` — the entry point that held the guard. Calling
@@ -4630,7 +4846,11 @@ mod tests {
             let t0 = std::time::Instant::now();
             let r = net_poll(
                 &mut ctx,
-                &[Value::Object(Some(fd_obj)), Value::Int(POLLIN), Value::Long(1_500)],
+                &[
+                    Value::Object(Some(fd_obj)),
+                    Value::Int(POLLIN),
+                    Value::Long(1_500),
+                ],
             );
             (r.is_ok(), t0.elapsed())
         });
@@ -4699,10 +4919,7 @@ mod tests {
             let fd_obj = ctx.alloc_object(4);
             ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
             let t0 = std::time::Instant::now();
-            let r = net_configure_blocking(
-                &mut ctx,
-                &[Value::Object(Some(fd_obj)), Value::Int(0)],
-            );
+            let r = net_configure_blocking(&mut ctx, &[Value::Object(Some(fd_obj)), Value::Int(0)]);
             (r.is_ok(), t0.elapsed())
         });
 
@@ -5308,8 +5525,8 @@ mod tests {
             client.try_clone().unwrap(),
         )));
         let start = std::time::Instant::now();
-        let ready = net_poll_stream_close_aware(fd, &client, NET_POLLIN, -1)
-            .expect("poll must succeed");
+        let ready =
+            net_poll_stream_close_aware(fd, &client, NET_POLLIN, -1).expect("poll must succeed");
         let elapsed = start.elapsed();
         assert!(ready, "the stream became readable, the poll must say so");
         assert!(
@@ -5370,8 +5587,8 @@ mod tests {
             client.try_clone().unwrap(),
         )));
         let start = std::time::Instant::now();
-        let ready = net_poll_stream_close_aware(fd, &client, NET_POLLIN, 300)
-            .expect("poll must succeed");
+        let ready =
+            net_poll_stream_close_aware(fd, &client, NET_POLLIN, 300).expect("poll must succeed");
         let elapsed = start.elapsed();
         assert!(!ready, "a silent socket is not readable");
         assert!(

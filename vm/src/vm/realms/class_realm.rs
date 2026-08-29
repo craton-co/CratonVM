@@ -966,8 +966,9 @@ mod statics_index_tests {
         );
         // And what compiled code loads through it is the NEW block.
         // SAFETY: `cell` is the address of this index's `AtomicPtr` slot.
-        let observed =
-            unsafe { (*(cell as *const std::sync::atomic::AtomicPtr<Value>)).load(Ordering::Acquire) };
+        let observed = unsafe {
+            (*(cell as *const std::sync::atomic::AtomicPtr<Value>)).load(Ordering::Acquire)
+        };
         assert_eq!(observed, second.base_ptr());
     }
 

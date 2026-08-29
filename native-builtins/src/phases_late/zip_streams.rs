@@ -795,7 +795,8 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         // The per-stream state drop runs either way (our own bookkeeping,
         // keyed by a recyclable address), then the failure is reported.
         let closed = if let Some(underlying) = dos_underlying(ctx, this) {
-            ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+            ctx.invoke_virtual(underlying, "close", "()V", &[])
+                .map(|_| ())
         } else {
             Ok(())
         };
@@ -929,10 +930,10 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // side tables are dropped — those are our own bookkeeping and
             // leaving an entry on a recyclable address is its own defect.
             // W7-57-close-flush-swallow-sweep.md
-            let closed = if let Value::Object(Some(underlying)) =
-                ctx.get_field_by_name(this, "in")
+            let closed = if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in")
             {
-                ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+                ctx.invoke_virtual(underlying, "close", "()V", &[])
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -2501,7 +2502,10 @@ fn zo_write_compact_zip(entries: Vec<ZoCompactEntry>) -> Vec<u8> {
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-pub(crate) fn zo_write_zip(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn zo_write_zip(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*this);
     let w5_out = zo_write_zip_body(ctx, *this);
     *this = ctx.read_native_pin(w5_pin, *this);
@@ -3054,7 +3058,8 @@ pub(crate) fn dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // is around `finish()`, and it rethrows). The delegated failure
     // PROPAGATES. W7-57-close-flush-swallow-sweep.md
     let closed = if let Some(underlying) = dos_underlying(ctx, this) {
-        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+        ctx.invoke_virtual(underlying, "close", "()V", &[])
+            .map(|_| ())
     } else {
         Ok(())
     };
@@ -3091,9 +3096,8 @@ pub(crate) fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
     }
     let mut z = vec![0u8; bound];
     let mut z_len = bound as libz_sys::uLong;
-    let rc = unsafe {
-        libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6)
-    };
+    let rc =
+        unsafe { libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
     if rc != 0 || z_len < 6 {
         return None;
     }
@@ -3218,7 +3222,8 @@ pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // the close is reported here too. (We do not reproduce the `addSuppressed`
     // link — recorded as a residual in W7-57-close-flush-swallow-sweep.md.)
     let closed = if let Some(underlying) = dos_underlying(ctx, this) {
-        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+        ctx.invoke_virtual(underlying, "close", "()V", &[])
+            .map(|_| ())
     } else {
         Ok(())
     };

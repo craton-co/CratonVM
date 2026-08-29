@@ -145,7 +145,11 @@ fn rel8_patch_out_of_range_bails_instead_of_truncating() {
     // and it accepts 128..=255 — which the CPU reads back as -128..=-1, a
     // backward branch, i.e. the exact failure this helper exists to stop.
     Compiler::patch_rel8_or_bail(&mut buf, patch, -128);
-    assert_eq!(buf.as_slice()[patch], 0x80, "an in-range negative rel8 fits");
+    assert_eq!(
+        buf.as_slice()[patch],
+        0x80,
+        "an in-range negative rel8 fits"
+    );
     let mut buf2 = ExecutableBuffer::new(4096).expect("test buffer");
     buf2.emit(&[0x75, 0x00]);
     let p2 = buf2.pos() - 1;
@@ -201,7 +205,10 @@ fn rel8_displacement_patches_all_go_through_the_range_checked_helper() {
     for (name, src) in sources {
         let (calls, bad) = casting_try_patch_byte_calls(src);
         scanned += calls;
-        offenders.extend(bad.into_iter().map(|(line, text)| format!("{name}:{line}: {text}")));
+        offenders.extend(
+            bad.into_iter()
+                .map(|(line, text)| format!("{name}:{line}: {text}")),
+        );
     }
     // A source scan that matches nothing passes exactly as happily as one that
     // matches everything. If the walker stops finding calls, the needle or the
@@ -372,8 +379,7 @@ fn optimizing_tier_is_not_disabled_while_relocation_is_vetoed() {
 fn shadow_stack_maps_enabled_does_not_depend_on_the_young_collector() {
     assert_eq!(
         shadow_stack_maps_enabled(),
-        cratonvm_types::flags().jit.shadow_stack
-            || shadow_emission_moving_implication_enabled(),
+        cratonvm_types::flags().jit.shadow_stack || shadow_emission_moving_implication_enabled(),
         "shadow-stack codegen must be gated on the shared flag plus its own opt-out \
          (CRATONVM_JIT_MY_SHADOW_EMISSION), NOT on the young collector: root \
          publication is not a property of which collector runs. \
@@ -484,9 +490,7 @@ fn the_inline_allocator_writes_the_mark_word_unconditionally() {
     let mut found = false;
     for line in body.lines() {
         let code = line.split("//").next().unwrap_or("");
-        if code.contains("emit_mov_dword_mem_disp32_imm32")
-            && code.contains("MARK_WORD_OFFSET")
-        {
+        if code.contains("emit_mov_dword_mem_disp32_imm32") && code.contains("MARK_WORD_OFFSET") {
             assert!(
                 !stack.iter().any(|gated| *gated),
                 "the mark-word store sits inside an `if !zero_elision` block.                  That flag is default-ON, so the store would not run for any                  inline allocation and the object would publish whatever the                  TLAB slot held as its kind, element_type, gc_age and                  gc_flags. That is the 2026-08-07 Spring Boot regression                  (`read_slot: corrupt Value cell` in 178 of 184 classes); the                  store must stay unconditional."
@@ -625,14 +629,22 @@ fn fib_shaped_kernel_has_no_reference_locals_in_registers() {
     // 10: invokestatic  13: iload_0     14: iconst_2   15: isub
     // 16: invokestatic  19: iadd        20: ireturn
     let code: Vec<u8> = vec![
-        0x1a, 0x05, 0xa2, 0x00, 0x05, 0x1a, 0xac, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x01, 0x1a,
-        0x05, 0x64, 0xb8, 0x00, 0x01, 0x60, 0xac,
+        0x1a, 0x05, 0xa2, 0x00, 0x05, 0x1a, 0xac, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x01, 0x1a, 0x05,
+        0x64, 0xb8, 0x00, 0x01, 0x60, 0xac,
     ];
     let code_len = code.len();
     // Both locals register-homed, as the allocator would do for a hot kernel.
     let assignments = vec![Some(R12), Some(R13)];
-    let plan =
-        crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
+    let plan = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code_len,
+        2,
+        1,
+        &[],
+        &assignments,
+        0,
+        &[],
+    );
     assert_eq!(
         plan.reference_locals, 0,
         "an int-only kernel has no reference locals"
@@ -656,8 +668,16 @@ fn register_homed_reference_local_still_forces_the_spill() {
     let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
     let code_len = code.len();
     let assignments = vec![None, Some(R12)];
-    let plan =
-        crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &[], &assignments, 0, &[]);
+    let plan = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code_len,
+        2,
+        0,
+        &[],
+        &assignments,
+        0,
+        &[],
+    );
     assert_eq!(
         plan.reference_locals & 0b10,
         0b10,
@@ -688,14 +708,30 @@ fn param_oop_mask_covers_a_never_loaded_reference_parameter() {
     let code: Vec<u8> = vec![0x04, 0xac]; // iconst_1; ireturn
     let code_len = code.len();
     let assignments = vec![Some(R12)];
-    let without =
-        crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0, &[]);
+    let without = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code_len,
+        1,
+        1,
+        &[],
+        &assignments,
+        0,
+        &[],
+    );
     assert!(
         without.no_reference_in_registers(),
         "the bytecode scan alone cannot see an unloaded reference parameter"
     );
-    let with = crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0b1, // param_oop_mask: local 0 is a reference parameter
-        &[]);
+    let with = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code_len,
+        1,
+        1,
+        &[],
+        &assignments,
+        0b1, // param_oop_mask: local 0 is a reference parameter
+        &[],
+    );
     assert!(
         !with.no_reference_in_registers(),
         "param_oop_mask must make the never-loaded reference parameter visible; \
@@ -727,8 +763,16 @@ fn cost_gate_skipping_the_plan_is_behaviour_identical_without_register_homes() {
     // aconst_null; astore_1; aload_1; areturn — reference locals present.
     let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
     let no_homes = vec![None, None];
-    let plan =
-        crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &[], &no_homes, 0, &[]);
+    let plan = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code.len(),
+        2,
+        0,
+        &[],
+        &no_homes,
+        0,
+        &[],
+    );
     assert_eq!(
         reference_local_in_register(Some(&plan), &no_homes),
         reference_local_in_register(None, &no_homes),
@@ -754,7 +798,16 @@ fn locals_past_the_bitset_never_receive_a_register_home() {
          can_elide_self_call_register_spill's soundness argument breaks"
     );
     // Feeding the allocator's own output back through the plan must agree.
-    let plan = crate::regalloc::plan_safepoint_publication(&code, code.len(), 80, 0, &[], &alloc.assignments, 0, &[]);
+    let plan = crate::regalloc::plan_safepoint_publication(
+        &code,
+        code.len(),
+        80,
+        0,
+        &[],
+        &alloc.assignments,
+        0,
+        &[],
+    );
     assert!(plan.no_reference_in_registers());
 }
 

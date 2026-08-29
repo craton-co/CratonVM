@@ -53,9 +53,10 @@ primitives under `CompletableFuture`, `AbstractQueuedSynchronizer`,
 > `VarHandle.get` and *then* the CAS, so "`VarHandle.compareAndSet` reference
 > 231 ns" is a 77 ns read plus a ~154 ns CAS. HotSpot's rows compose the same
 > way, so the RATIO is sound; the attribution is not, and a profile taken
-> against these rows measures two operations. `probes/VhCasProbe.java` carries
-> the expected value in a Java local and times the CAS alone — use that one to
-> attribute, and this one for continuity with the numbers above.
+> against these rows measures two operations. `VhCasProbe` (with the rest under
+> `apps/probes/`) carries the expected value in a Java local and times the CAS
+> alone — use that one to attribute, and this one for continuity with the
+> numbers above.
 
 `HibfixVarHandleProbe`, `-Dprobe.iters=2000000`, single-threaded, idle host
 (load 0.06), six runs of each VM **interleaved**. Medians, with min and max so

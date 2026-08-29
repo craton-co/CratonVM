@@ -73,7 +73,9 @@ fn compile_probe(jdk: &Path) -> Option<tempfile::TempDir> {
         Ok(o) => o,
         // javac cannot be launched at all — the one legitimate skip.
         Err(e) => {
-            eprintln!("[string_format_throwing_tostring] javac could not be executed: {e}; skipping");
+            eprintln!(
+                "[string_format_throwing_tostring] javac could not be executed: {e}; skipping"
+            );
             return None;
         }
     };

@@ -25,13 +25,13 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use cratonvm_native_api::VmId;
 use cratonvm_reader::attribute::{force_decode_all, Attribute};
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use cratonvm_reader::field::ClassFileField;
 use cratonvm_reader::method::ClassFileMethod;
-use cratonvm_native_api::VmId;
 use tracing::debug;
 
 use crate::class::{
@@ -41,12 +41,12 @@ use crate::class::{
 use crate::class_origin::{ClassOrigin, ClassOriginEntry};
 use crate::class_path::ClassPath;
 use crate::loader_flags;
-use crate::metadata_handle::{
-    ClassHandle, FieldHandle, MetadataKind, MetadataRealm, MethodHandle, StaleMetadata,
-};
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
     BUILTIN_LOADER_DELEGATION_CHAIN,
+};
+use crate::metadata_handle::{
+    ClassHandle, FieldHandle, MetadataKind, MetadataRealm, MethodHandle, StaleMetadata,
 };
 use crate::module::{
     descriptor_from_module_attribute, is_platform_module_name, package_of,
@@ -55,7 +55,9 @@ use crate::module::{
 use crate::vtype::ClassHierarchy;
 use cratonvm_reader::SharedBytes;
 use cratonvm_types::compat::CompatibilityMode;
-use cratonvm_types::error::{ClassFileError, JdkOnlyViolation, LinkageError, RuntimeError, VmError};
+use cratonvm_types::error::{
+    ClassFileError, JdkOnlyViolation, LinkageError, RuntimeError, VmError,
+};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -262,14 +264,13 @@ fn loaded_class_for_requesting_loader(
             // `ClassCastException` between two genuinely different classes.
             // `None` (parent unrecorded, or the chain did not bottom out) is
             // the permissive default: probe every built-in loader, as before.
-            let reachable: &[ClassLoaderId] =
-                match crate::loaders::user_loader_builtin_parent(ns) {
-                    Some(terminal) => {
-                        let end = (terminal as usize + 1).min(BUILTIN_LOADER_DELEGATION_CHAIN.len());
-                        &BUILTIN_LOADER_DELEGATION_CHAIN[..end]
-                    }
-                    None => BUILTIN_LOADER_DELEGATION_CHAIN,
-                };
+            let reachable: &[ClassLoaderId] = match crate::loaders::user_loader_builtin_parent(ns) {
+                Some(terminal) => {
+                    let end = (terminal as usize + 1).min(BUILTIN_LOADER_DELEGATION_CHAIN.len());
+                    &BUILTIN_LOADER_DELEGATION_CHAIN[..end]
+                }
+                None => BUILTIN_LOADER_DELEGATION_CHAIN,
+            };
             for loader_id in reachable {
                 if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
                     return Some(id);
@@ -5258,7 +5259,8 @@ impl ClassManager {
                 // Not declared here. Ask the hierarchy, in the order both JVMS
                 // §5.4.3.3 and CratonVM's dispatch use: superclass chain, then
                 // superinterfaces.
-                let inherited = self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
+                let inherited =
+                    self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
                 match inherited {
                     Some((declarer, acc_native, has_code)) => ImageMethodVerdict {
                         image_has_class: true,
@@ -5299,25 +5301,28 @@ impl ClassManager {
         let entry = match parsed.entry(class.to_string()) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => {
-                let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
-                    match cratonvm_reader::class_reader::read_class(&bytes) {
-                        Ok(cf) => ImageClassShape {
-                            methods: cf
-                                .methods
-                                .iter()
-                                .map(|m| {
-                                    (
-                                        (m.name.clone(), m.descriptor.clone()),
-                                        (m.is_native(), !m.is_native() && !m.is_abstract()),
-                                    )
-                                })
-                                .collect(),
-                            super_class: cf.super_class.clone(),
-                            interfaces: cf.interfaces.clone(),
+                let decoded = self
+                    .find_class_bytes_delegated(class)
+                    .ok()
+                    .map(
+                        |(bytes, _)| match cratonvm_reader::class_reader::read_class(&bytes) {
+                            Ok(cf) => ImageClassShape {
+                                methods: cf
+                                    .methods
+                                    .iter()
+                                    .map(|m| {
+                                        (
+                                            (m.name.clone(), m.descriptor.clone()),
+                                            (m.is_native(), !m.is_native() && !m.is_abstract()),
+                                        )
+                                    })
+                                    .collect(),
+                                super_class: cf.super_class.clone(),
+                                interfaces: cf.interfaces.clone(),
+                            },
+                            Err(_) => ImageClassShape::default(),
                         },
-                        Err(_) => ImageClassShape::default(),
-                    }
-                });
+                    );
                 v.insert(decoded)
             }
         };
@@ -5742,14 +5747,31 @@ impl ClassManager {
                 );
             }
             if dup.is_some() {
-                return Err(VmError::Linkage(
-                    LinkageError::IncompatibleClassChangeError {
-                        message: format!(
-                            "class {} already defined by {} loader",
-                            stored_name_preview, loader_id
-                        ),
-                    },
-                ));
+                // `DuplicateClassDefinition`, NOT `IncompatibleClassChangeError`.
+                //
+                // HotSpot throws `java.lang.LinkageError` ITSELF for a duplicate
+                // definition, and the variant beside it in `LinkageError`
+                // already exists for exactly this, mapping to
+                // `java/lang/LinkageError` with HotSpot's own wording (see
+                // `vm/src/runtime/exceptions.rs`, whose comment names Tomcat's
+                // loader lifecycle and ByteBuddy's injection strategies as the
+                // callers that catch the base type).
+                //
+                // MEASURED in BOTH modes (`probes/ClassLoaderShadowSweep.java`):
+                // defining the same bytes twice in one loader gave
+                // `IncompatibleClassChangeError` against HotSpot's
+                // `LinkageError`. ICCE *is* a LinkageError subclass, so
+                // `catch (LinkageError)` was unaffected -- but code that
+                // catches ICCE specifically caught ours and would not catch
+                // HotSpot's, which is a recovery path running here that never
+                // runs on the reference VM.
+                //
+                // The right variant was already present and simply not used
+                // here; nothing needed to be added to the enum.
+                return Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                    class_name: stored_name_preview.to_string(),
+                    loader: format!("{loader_id:?}"),
+                }));
             }
 
             // A synthetic stub for this exact name may already exist under a
@@ -5847,9 +5869,22 @@ impl ClassManager {
                 }
             }
             match this.load_class(internal) {
-                Err(VmError::Linkage(LinkageError::IncompatibleClassChangeError { message }))
-                    if message.contains("already defined by") =>
-                {
+                // MATCHES THE VARIANT, not a message substring. The duplicate
+                // raise site above used to build an
+                // `IncompatibleClassChangeError` whose text contained "already
+                // defined by", and this arm keyed on that text. Correcting the
+                // raise site to `DuplicateClassDefinition` (HotSpot throws
+                // `java.lang.LinkageError` itself) would have silently stopped
+                // this arm from matching, turning a RECOVERED concurrent-
+                // definition race into a hard failure -- so the two move
+                // together. Keying on the variant instead of the wording is
+                // also why the next wording change cannot break it.
+                Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                    class_name,
+                    loader,
+                })) => {
+                    let message =
+                        format!("duplicate class definition for {class_name} by {loader}");
                     // Benign concurrent-definition race: this recursive
                     // supertype/interface resolution (superclass or
                     // interfaces of the class currently being defined) lost
@@ -5872,9 +5907,13 @@ impl ClassManager {
                     // this class's own definition outright.
                     match loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
                         Some(id) => Ok(id),
-                        None => Err(VmError::Linkage(
-                            LinkageError::IncompatibleClassChangeError { message },
-                        )),
+                        None => {
+                            let _ = &message;
+                            Err(VmError::Linkage(LinkageError::DuplicateClassDefinition {
+                                class_name,
+                                loader,
+                            }))
+                        }
                     }
                 }
                 other => other,
@@ -5920,8 +5959,7 @@ impl ClassManager {
         // while field offsets and vtable indices are read against the wrong
         // layout at run time. Recorded, not thrown: see
         // `loader_constraints`'s module doc.
-        if let (Some(sup_name), Some(sup_id)) = (class_file.super_class.as_ref(), superclass_id)
-        {
+        if let (Some(sup_name), Some(sup_id)) = (class_file.super_class.as_ref(), superclass_id) {
             let sup_loader = self.get_class(sup_id).map(|c| c.loader_id);
             if let Some(sup_loader) = sup_loader {
                 let _ = self.loader_constraints.pin(
@@ -7117,7 +7155,10 @@ impl ClassManager {
     /// into one. Both are invisible in the value's type tag and both are visible
     /// here. See [`crate::shadow_layout`].
     #[must_use]
-    pub fn shadow_layout_diff(&self, id: ClassId) -> Option<crate::shadow_layout::ShadowLayoutDiff> {
+    pub fn shadow_layout_diff(
+        &self,
+        id: ClassId,
+    ) -> Option<crate::shadow_layout::ShadowLayoutDiff> {
         let name = self.class_store.get(id).map(|c| Arc::clone(&c.name))?;
         let model = synthetic_stub_fields(&name);
         crate::shadow_layout::diff_against_model(&self.class_store, id, &model)
@@ -7137,9 +7178,9 @@ impl ClassManager {
         // Latched once: this runs on every class definition, and the default
         // path must not pay an env lookup per class.
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some()
-        }) {
+        if !*ON
+            .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some())
+        {
             return;
         }
         let Some(diff) = self.shadow_layout_diff(id) else {
@@ -9182,7 +9223,9 @@ impl ClassManager {
             if !filter.is_empty() && key.1.contains(filter.as_str()) {
                 eprintln!(
                     "[DBG_DEFINE] insert name={} loader={:?} id={}",
-                    key.1, key.0, id.as_u32()
+                    key.1,
+                    key.0,
+                    id.as_u32()
                 );
                 if matches!(key.0, ClassLoaderId::Application) {
                     eprintln!(
@@ -9930,8 +9973,7 @@ impl ClassManager {
         // `ArrayInfo` inputs: total `[` count and the innermost non-array type.
         let array_dimension = name.bytes().take_while(|&b| b == b'[').count();
         let leaf_descriptor = &name[array_dimension..];
-        let leaf_is_reference =
-            leaf_descriptor.starts_with('L') && leaf_descriptor.ends_with(';');
+        let leaf_is_reference = leaf_descriptor.starts_with('L') && leaf_descriptor.ends_with(';');
         let leaf_component_name = if leaf_is_reference {
             cratonvm_types::intern_arc(&leaf_descriptor[1..leaf_descriptor.len() - 1])
         } else {
@@ -15945,12 +15987,8 @@ pub fn throwable_ctor_descriptors(name: &str) -> &'static [&'static str] {
 
         // -- the index families: an `int`/`long` overload nobody registered --
         "java/lang/ArrayIndexOutOfBoundsException"
-        | "java/lang/StringIndexOutOfBoundsException" => {
-            &["()V", "(Ljava/lang/String;)V", "(I)V"]
-        }
-        "java/lang/IndexOutOfBoundsException" => {
-            &["()V", "(Ljava/lang/String;)V", "(I)V", "(J)V"]
-        }
+        | "java/lang/StringIndexOutOfBoundsException" => &["()V", "(Ljava/lang/String;)V", "(I)V"],
+        "java/lang/IndexOutOfBoundsException" => &["()V", "(Ljava/lang/String;)V", "(I)V", "(J)V"],
 
         // -- `AssertionError`: the headline. `(String)V` is PRIVATE and
         //    `(Throwable)V` does not exist; `(Object)V` is what
@@ -17809,7 +17847,10 @@ mod tests {
     fn jca_exception_hierarchy_matches_hotspot() {
         // (child, immediate superclass) — every pair MEASURED, not inferred.
         let direct = [
-            ("java/security/GeneralSecurityException", "java/lang/Exception"),
+            (
+                "java/security/GeneralSecurityException",
+                "java/lang/Exception",
+            ),
             (
                 "javax/crypto/BadPaddingException",
                 "java/security/GeneralSecurityException",
@@ -17830,7 +17871,10 @@ mod tests {
                 "javax/crypto/ShortBufferException",
                 "java/security/GeneralSecurityException",
             ),
-            ("java/security/InvalidKeyException", "java/security/KeyException"),
+            (
+                "java/security/InvalidKeyException",
+                "java/security/KeyException",
+            ),
             (
                 "java/security/UnrecoverableKeyException",
                 "java/security/UnrecoverableEntryException",
@@ -18167,14 +18211,18 @@ mod tests {
 
         // Object must be loaded before any synthetic object is allocated;
         // mirror that ordering here.
-        let object_id = cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let object_id = cm
+            .try_ensure_synthetic_class("java/lang/Object", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(
             cm.get_class(object_id).and_then(|c| c.superclass),
             None,
             "java/lang/Object must not have a superclass"
         );
 
-        let anon_id = cm.try_ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let anon_id = cm
+            .try_ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_ne!(anon_id, object_id, "AnonymousObject is a distinct class");
         assert_eq!(
             cm.get_class(anon_id).and_then(|c| c.superclass),
@@ -18189,8 +18237,12 @@ mod tests {
     #[test]
     fn exact_user_class_unload_preserves_live_siblings_in_the_same_namespace() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let dead = cm.try_ensure_synthetic_class("test/proxy/Dead", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let live = cm.try_ensure_synthetic_class("test/proxy/Live", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let dead = cm
+            .try_ensure_synthetic_class("test/proxy/Dead", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let live = cm
+            .try_ensure_synthetic_class("test/proxy/Live", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let namespace = ClassLoaderId::UserDefined(77);
         cm.class_store.get_mut(dead).unwrap().loader_id = namespace;
         cm.class_store.get_mut(live).unwrap().loader_id = namespace;
@@ -18213,8 +18265,11 @@ mod tests {
     fn synthetic_array_stub_has_no_superclass() {
         // Array synthetic stubs are special-cased and keep `superclass = None`.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let arr_id = cm.try_ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/lang/Object", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let arr_id = cm
+            .try_ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
     }
 
@@ -18280,10 +18335,16 @@ mod tests {
     #[test]
     fn synthetic_function_identity_implements_function() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let function_id = cm.try_ensure_synthetic_class("java/util/function/Function", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        cm.try_ensure_synthetic_class("java/util/function/UnaryOperator", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        let identity_id = cm.try_ensure_synthetic_class("java/util/function/Function$Identity", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/lang/Object", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let function_id = cm
+            .try_ensure_synthetic_class("java/util/function/Function", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/util/function/UnaryOperator", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let identity_id = cm
+            .try_ensure_synthetic_class("java/util/function/Function$Identity", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         let identity = cm
             .get_class(identity_id)
@@ -18953,8 +19014,14 @@ mod tests {
         // with respect to any one stub.
         for i in 0..CLASSES {
             let id = mgr.class_store.next_id();
-            mgr.class_store
-                .add(layout_fixture_class(id, &format!("Other{i}"), None, 1, 0, 1));
+            mgr.class_store.add(layout_fixture_class(
+                id,
+                &format!("Other{i}"),
+                None,
+                1,
+                0,
+                1,
+            ));
         }
 
         let indexed = std::time::Instant::now();
@@ -19055,13 +19122,18 @@ mod tests {
 
         // Parents before children: `Leaf` must not precede `MidA`.
         let pos = |c: ClassId| bfs_order.iter().position(|&x| x == c.as_u32()).unwrap();
-        assert!(pos(mid_a) < pos(leaf), "order {bfs_order:?} is not topological");
+        assert!(
+            pos(mid_a) < pos(leaf),
+            "order {bfs_order:?} is not topological"
+        );
     }
 
     #[test]
     fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
         let mut manager = ClassManager::new(&[], &[], &[]);
-        let class_id = manager.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let class_id = manager
+            .try_ensure_synthetic_class("Foo", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         manager.set_class_init_state(class_id, CLASS_INIT_INITIALIZED);
 
         manager
@@ -19100,7 +19172,9 @@ mod tests {
     #[test]
     fn a_user_loader_upgrading_a_bootstrap_stub_takes_the_map_key_with_it() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id = mgr
+            .try_ensure_synthetic_class("Foo", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // Precondition: the stub really is bootstrap-keyed.
         assert_eq!(
@@ -19122,7 +19196,9 @@ mod tests {
 
         // The `ClassStore` records the new defining loader ...
         assert_eq!(
-            mgr.get_class(id).expect("class survives the upgrade").loader_id,
+            mgr.get_class(id)
+                .expect("class survives the upgrade")
+                .loader_id,
             user,
         );
         // ... and so must `loaded_classes`, which is keyed on it.
@@ -19170,7 +19246,9 @@ mod tests {
         let first = ClassLoaderId::UserDefined(0x5EED_0002);
         let second = ClassLoaderId::UserDefined(0x5EED_0003);
 
-        let id_a = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id_a = mgr
+            .try_ensure_synthetic_class("Foo", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         mgr.upgrade_synthetic_class(id_a, "Foo", v1.clone().into(), first)
             .expect("first loader upgrades the stub");
 
@@ -19294,7 +19372,10 @@ mod tests {
         );
         let rendered = refused.to_string();
         assert!(rendered.contains("Foo"), "{rendered}");
-        assert!(rendered.contains('2'), "the count is diagnostic: {rendered}");
+        assert!(
+            rendered.contains('2'),
+            "the count is diagnostic: {rendered}"
+        );
 
         // Nothing was minted, nothing was re-homed: both real classes still
         // resolve from their own loader and the name is still ambiguous.
@@ -19473,7 +19554,9 @@ mod tests {
         let wider = mgr.ambiguity_stand_in("Foo", 9);
         assert_ne!(wider, stand_in);
         assert_eq!(
-            mgr.get_class(wider).expect("wider stand-in").num_total_fields,
+            mgr.get_class(wider)
+                .expect("wider stand-in")
+                .num_total_fields,
             9,
         );
     }
@@ -19486,13 +19569,19 @@ mod tests {
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
         // Absent → fabricate, filed under the bootstrap loader, memoized.
-        let id = mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id = mgr
+            .try_ensure_synthetic_class("p/Absent", 2)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(&*mgr.get_class(id).expect("minted").name, "p/Absent");
         assert_eq!(
             loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "p/Absent"),
             Some(id),
         );
-        assert_eq!(mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only"), id);
+        assert_eq!(
+            mgr.try_ensure_synthetic_class("p/Absent", 2)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only"),
+            id
+        );
         assert_eq!(
             mgr.classify_loaded_name("p/Absent"),
             NameResolution::Unique(id),
@@ -19768,7 +19857,9 @@ mod tests {
 
         // Legacy state: the array is synthesised while its component is still
         // a bootstrap-keyed synthetic stub.
-        let component = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let component = mgr
+            .try_ensure_synthetic_class("Foo", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let array = mgr
             .load_class("[LFoo;")
             .expect("array synthesis without I/O");
@@ -20207,10 +20298,11 @@ mod tests {
         // Asserted as an exact set, not a `contains` sweep, because the failure
         // mode is an omission and a `contains` loop over five names cannot see a
         // sixth going missing. Mirrors `RJdkStrict.processHandleInfo`.
-        let mut info_methods: Vec<String> = synthetic_stub_ctor_methods("java/lang/ProcessHandle$Info")
-            .iter()
-            .map(|m| m.name.to_string())
-            .collect();
+        let mut info_methods: Vec<String> =
+            synthetic_stub_ctor_methods("java/lang/ProcessHandle$Info")
+                .iter()
+                .map(|m| m.name.to_string())
+                .collect();
         info_methods.sort();
         assert_eq!(
             info_methods,
@@ -20270,7 +20362,9 @@ mod tests {
         // generated proxy — carries the ctor in its method table, so the
         // super-ctor resolution that previously failed now succeeds.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let super_id = cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let super_id = cm
+            .try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let registered = cm
             .get_class(super_id)
             .expect("synthetic Proxy$Instance must be registered");
@@ -21159,7 +21253,9 @@ mod tests {
     #[test]
     fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.try_ensure_synthetic_class("java/lang/Throwable", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id = mgr
+            .try_ensure_synthetic_class("java/lang/Throwable", 2)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         assert!(
             mgr.class_store

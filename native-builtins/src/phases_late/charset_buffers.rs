@@ -541,7 +541,8 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
             let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
-            let mut enc_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6)?;
+            let mut enc_obj =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6)?;
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
             ctx.set_field(enc_obj, 1, Value::Float(avg));
             ctx.set_field(enc_obj, 2, Value::Float(max));
@@ -561,7 +562,8 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
             let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
-            let mut dec_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6)?;
+            let mut dec_obj =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6)?;
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
             ctx.set_field(dec_obj, 1, Value::Float(avg));
             ctx.set_field(dec_obj, 2, Value::Float(max));
@@ -855,11 +857,7 @@ pub(crate) fn cb_write_hb(
 #[inline]
 pub(crate) fn cb_write_heap_address(ctx: &mut dyn NativeContext, buf: ObjectRef, offset: i32) {
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-    ctx.set_field_by_name(
-        buf,
-        "address",
-        Value::Long(16 + (offset as i64) * 2),
-    );
+    ctx.set_field_by_name(buf, "address", Value::Long(16 + (offset as i64) * 2));
 }
 
 /// Write `mark` on a CharBuffer without destroying `address`.
@@ -1031,12 +1029,7 @@ pub(crate) fn cb_native_order(_ctx: &dyn NativeContext, _buf: ObjectRef) -> i32 
 /// `StringCharBuffer` / `HeapCharBuffer` the JDK's own factory built. Reading
 /// (or writing) the indexed slot on a real one lands wherever that index
 /// happens to fall — for `StringCharBuffer` that is not `position` at all.
-fn cb_read_int_field(
-    ctx: &dyn NativeContext,
-    buf: ObjectRef,
-    name: &str,
-    slot: usize,
-) -> i32 {
+fn cb_read_int_field(ctx: &dyn NativeContext, buf: ObjectRef, name: &str, slot: usize) -> i32 {
     match ctx.get_field_by_name(buf, name) {
         Value::Int(v) => v,
         _ => match ctx.get_field(buf, slot) {
@@ -1590,11 +1583,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         let args2 = if is_string_cb {
             // Absolute: JDK `StringCharBuffer.toString(start, end)` is
             // `str.subSequence(start + offset, end + offset)`.
-            [
-                Value::Object(Some(this)),
-                Value::Int(pos),
-                Value::Int(lim),
-            ]
+            [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)]
         } else {
             [
                 Value::Object(Some(this)),
@@ -1998,7 +1987,10 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     ()
 }
 
-pub(crate) fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p62_alloc_char_buffer(
+    ctx: &mut dyn NativeContext,
+    cap: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
     // Use HeapCharBuffer (concrete) not CharBuffer (abstract) so real-JDK
     // bytecode methods like compact() dispatch correctly.
@@ -2079,7 +2071,10 @@ mod cb_layout_tests {
     #[test]
     fn charbuffer_natives_use_the_shared_jdk_three_way_table() {
         // HeapCharBuffer — `CharBuffer.allocate(4)`.
-        assert_eq!(buffer_array_access(true, false), BufferArrayAccess::Accessible);
+        assert_eq!(
+            buffer_array_access(true, false),
+            BufferArrayAccess::Accessible
+        );
         // HeapCharBufferR — `.asReadOnlyBuffer()`. HotSpot: hasArray() == false,
         // array() throws ReadOnlyBufferException.
         assert_eq!(buffer_array_access(true, true), BufferArrayAccess::ReadOnly);

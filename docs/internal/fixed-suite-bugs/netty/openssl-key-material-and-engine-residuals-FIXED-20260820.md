@@ -542,7 +542,7 @@ has two halves and only the first is obvious:
 `apps/netty-suite-runner/gen-openssl-args.sh` derives that argfile from
 `common.args` itself, so it cannot drift from the reactor, and refuses rather
 than producing a quiet dud when the boringssl artifact is missing OR is a stub
-— the `2.0.78` copy in this host's local repo has an EMPTY `META-INF/native/`,
+— the `2.0.78` copy in this host's local repo has an EMPTY `../../../../apps/META-INF/native/`,
 which loads and then finds no library, i.e. it fails in the exact shape of the
 problem the script exists to route around.
 

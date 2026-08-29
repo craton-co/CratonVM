@@ -36,7 +36,10 @@ pub(super) fn execute_invokestatic(
     // definitely executing by this point).
     if crate::jit::profile::is_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
+        shared
+            .jit
+            .profile_store
+            .record_call_site_borrowed(cid, mn, md, pc);
     }
 
     // Skip class init if this is a registered native method (avoids initialization hangs).
@@ -543,7 +546,8 @@ pub(super) fn execute_invokestatic(
 /// Process-wide count of intrinsic fast-path dispatches. Incremented on every
 /// `CachedInvokeTarget::Intrinsic` hit (static and virtual). Exposed for the
 /// differential-test harness and profiling/acceptance counters.
-pub(super) static INTRINSIC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) static INTRINSIC_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Number of interpreter intrinsic fast-path dispatches since process start.
 pub fn intrinsic_hit_count() -> u64 {
@@ -1021,12 +1025,9 @@ pub(super) fn populate_invoke_cache(
     // invoking one, and counting it here would inflate every counter by one per
     // call site regardless of whether the site ever ran.
     if let Some(callback) = native_for_cache {
-        let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
-            shared,
-            &class_name,
-            &method_name,
-            &descriptor,
-        ) else {
+        let Some((callback, native_id, native_kind)) =
+            resolve_cached_native_registration(shared, &class_name, &method_name, &descriptor)
+        else {
             return;
         };
         let cm = shared.classes.class_manager.read();
@@ -1173,14 +1174,12 @@ pub(super) fn populate_invoke_cache(
                 && !method.is_native()
                 && method.code().is_some();
         if !stub_yields {
-            if let Some((callback, native_id, native_kind)) =
-                resolve_cached_native_registration(
-                    shared,
-                    declaring_name,
-                    &method_name,
-                    &descriptor,
-                )
-            {
+            if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+                shared,
+                declaring_name,
+                &method_name,
+                &descriptor,
+            ) {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
                 drop(cm);
@@ -1207,12 +1206,8 @@ pub(super) fn populate_invoke_cache(
     if method.is_native() {
         // Already handled above, but the method might be native in a superclass
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
-            shared,
-            declaring_name,
-            &method_name,
-            &descriptor,
-        )
+        if let Some((callback, native_id, native_kind)) =
+            resolve_cached_native_registration(shared, declaring_name, &method_name, &descriptor)
         {
             // WP2.4-F1: gate bound to the *declaring* class — that's the
             // class whose method body could be replaced via redefine.
@@ -1257,7 +1252,7 @@ pub(super) fn populate_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1368,7 +1363,10 @@ pub(super) fn execute_invokestatic_cached(
     // fired," not "we merely consulted the cache."
     if crate::jit::profile::is_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
+        shared
+            .jit
+            .profile_store
+            .record_call_site_borrowed(cid, mn, md, pc);
     }
 
     match target {
@@ -1379,8 +1377,7 @@ pub(super) fn execute_invokestatic_cached(
             num_params,
             gate: _,
         } => {
-            let Some(callback) =
-                revalidate_cached_native(shared, native_id, callback, native_kind)
+            let Some(callback) = revalidate_cached_native(shared, native_id, callback, native_kind)
             else {
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
@@ -1941,7 +1938,9 @@ pub(super) fn execute_invokestatic_cached(
 /// intrinsics bail to normal native dispatch. Returns `None` (all String
 /// intrinsics bail to dispatch) when String is not yet loaded or lacks the
 /// mandatory `value` / `hash` fields. Cheap enough to call once per compilation.
-pub(super) fn resolve_string_field_layout(shared: &SharedVm) -> Option<cratonvm_jit::StringFieldLayout> {
+pub(super) fn resolve_string_field_layout(
+    shared: &SharedVm,
+) -> Option<cratonvm_jit::StringFieldLayout> {
     let cm = shared.classes.class_manager.read();
     let string_id = cm.find_bootstrap_class_by_name("java/lang/String")?;
     let class = cm.get_class(string_id)?;

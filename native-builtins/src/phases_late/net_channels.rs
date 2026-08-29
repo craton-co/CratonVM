@@ -97,7 +97,8 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-            let mut sc_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4)?;
+            let mut sc_obj =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4)?;
             match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(sc_obj, 0, Value::Int(1));
@@ -297,7 +298,8 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/ServerSocketChannel;",
         |ctx, _args| {
-            let ssc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4)?;
+            let ssc =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 4)?;
             ctx.set_field(ssc, 0, Value::Int(1));
             ctx.set_field(ssc, 1, Value::Int(0));
             ctx.set_field(ssc, 2, Value::Int(-1));
@@ -509,7 +511,8 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             ctx.end_blocking_region();
             match accept_result {
                 Ok((stream_fd, addr)) => {
-                    let sc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4)?;
+                    let sc =
+                        try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4)?;
                     // Pin across the create_string below — a moving young GC
                     // there would relocate the fresh channel (native
                     // stale-local family).
@@ -1270,9 +1273,12 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
     r.register(hcv, "<clinit>", "()V", |ctx, _args| {
         http_enum_clinit(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS)
     });
-    r.register(hcv, "values", "()[Ljava/net/http/HttpClient$Version;", |ctx, _args| {
-        http_enum_values(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS)
-    });
+    r.register(
+        hcv,
+        "values",
+        "()[Ljava/net/http/HttpClient$Version;",
+        |ctx, _args| http_enum_values(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS),
+    );
     r.register(
         hcv,
         "valueOf",
@@ -1402,7 +1408,8 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1412,7 +1419,8 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1436,7 +1444,8 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             ctx.set_field(obj, 0, Value::Int(0)); // tag=0: string handler
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1446,7 +1455,8 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
         "discarding",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
             ctx.set_field(obj, 0, Value::Int(1)); // tag=1: discard
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1883,8 +1893,11 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/AsynchronousSocketChannel;",
         |ctx, _args| {
-            let ch =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousSocketChannel", 4)?;
+            let ch = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/nio/channels/AsynchronousSocketChannel",
+                4,
+            )?;
             ctx.set_field(ch, 0, Value::Int(0)); // not connected
             ctx.set_field(ch, 1, Value::Int(1)); // open
             ctx.set_field(ch, 2, Value::Int(-1)); // no fd
@@ -1920,47 +1933,47 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     // Typed as `NativeCallback` (a plain `fn` pointer) so the non-capturing
     // closure coerces once and can be handed to `register` per class.
     let connect_body: cratonvm_native_api::registry::NativeCallback = |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Extract host:port from the SocketAddress. The argument is a real
-            // `InetSocketAddress` (state behind a private `holder`), NOT a flat
-            // synthetic — reading slot 0/1 directly yielded a bogus host/port and
-            // the connect failed with WSAEADDRNOTAVAIL (os error 10049). Use the
-            // holder-aware reader shared with java.net.Socket.connect.
-            let addr_str = if let Some(Value::Object(Some(sa))) = args.get(1) {
-                let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, *sa)?;
-                format!("{}:{}", host, port)
-            } else {
-                "127.0.0.1:80".into()
-            };
-            // Blocking TCP connect
-            let fd_id = crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str)
-                .map_err(|e| {
-                    crate::capability_gate::translate_open_failure(e, |io| {
-                        format!("connect failed: {io}")
-                    })
-                })?;
-            // FIXED 2026-08-21 (WORKER 4). These three lines used to write
-            // slots 0/2/3 BY INDEX, under the map documented above -- a map
-            // that disagrees with the OWNER's on slots 0 and 1 and on what
-            // kind of integer slot 2 holds. The receiver is always an object
-            // `native-io`'s `aio_asc_open` allocated (that crate wins every
-            // other triple on this class), and since 2026-08-21 its private
-            // map is APPENDED above the concrete `sun.nio.ch.*Impl` layout,
-            // so an absolute index here is now wrong twice over.
-            //
-            // One writer, one map: this calls the owner's own setter. The
-            // repair W7-49 said "belongs to a lane that owns native-io" --
-            // that lane also owns this line, so both halves move together, as
-            // that record required.
-            let remote = args.get(1).copied().unwrap_or(Value::Object(None));
-            cratonvm_native_io::async_socket::async_socket_note_connected(
-                ctx,
-                this,
-                fd_id as i32,
-                remote,
-            );
-            // DF07: completed Future<Void> via real CompletableFuture (see helper).
-            aio_completed_future(ctx, Value::Object(None))
+        let this = obj_arg(args, 0)?;
+        // Extract host:port from the SocketAddress. The argument is a real
+        // `InetSocketAddress` (state behind a private `holder`), NOT a flat
+        // synthetic — reading slot 0/1 directly yielded a bogus host/port and
+        // the connect failed with WSAEADDRNOTAVAIL (os error 10049). Use the
+        // holder-aware reader shared with java.net.Socket.connect.
+        let addr_str = if let Some(Value::Object(Some(sa))) = args.get(1) {
+            let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, *sa)?;
+            format!("{}:{}", host, port)
+        } else {
+            "127.0.0.1:80".into()
+        };
+        // Blocking TCP connect
+        let fd_id =
+            crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str).map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| {
+                    format!("connect failed: {io}")
+                })
+            })?;
+        // FIXED 2026-08-21 (WORKER 4). These three lines used to write
+        // slots 0/2/3 BY INDEX, under the map documented above -- a map
+        // that disagrees with the OWNER's on slots 0 and 1 and on what
+        // kind of integer slot 2 holds. The receiver is always an object
+        // `native-io`'s `aio_asc_open` allocated (that crate wins every
+        // other triple on this class), and since 2026-08-21 its private
+        // map is APPENDED above the concrete `sun.nio.ch.*Impl` layout,
+        // so an absolute index here is now wrong twice over.
+        //
+        // One writer, one map: this calls the owner's own setter. The
+        // repair W7-49 said "belongs to a lane that owns native-io" --
+        // that lane also owns this line, so both halves move together, as
+        // that record required.
+        let remote = args.get(1).copied().unwrap_or(Value::Object(None));
+        cratonvm_native_io::async_socket::async_socket_note_connected(
+            ctx,
+            this,
+            fd_id as i32,
+            remote,
+        );
+        // DF07: completed Future<Void> via real CompletableFuture (see helper).
+        aio_completed_future(ctx, Value::Object(None))
     };
     for cls in std::iter::once(asc)
         .chain(cratonvm_native_io::async_socket::ASC_IMPLS.iter().copied())
@@ -2200,8 +2213,11 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "withThreadPool",
         "(Ljava/util/concurrent/ExecutorService;)Ljava/nio/channels/AsynchronousChannelGroup;",
         |ctx, _args| {
-            let obj =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousChannelGroup", 1)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/nio/channels/AsynchronousChannelGroup",
+                1,
+            )?;
             ctx.set_field(obj, 0, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2211,8 +2227,11 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "withFixedThreadPool",
         "(ILjava/util/concurrent/ThreadFactory;)Ljava/nio/channels/AsynchronousChannelGroup;",
         |ctx, _args| {
-            let obj =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousChannelGroup", 1)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/nio/channels/AsynchronousChannelGroup",
+                1,
+            )?;
             ctx.set_field(obj, 0, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2317,7 +2336,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     r.register(pipe, "open", "()Ljava/nio/channels/Pipe;", |ctx, _args| {
         let (read_fd, write_fd) = ctx.fd_table().open_pipe();
 
-        let source = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/Pipe$SourceChannel", 3)?;
+        let source =
+            try_alloc_concurrent_synthetic(ctx, "java/nio/channels/Pipe$SourceChannel", 3)?;
         ctx.set_field(source, 0, Value::Int(1)); // open
         ctx.set_field(source, 1, Value::Int(read_fd as i32));
         ctx.set_field(source, 2, Value::Int(1)); // blocking
@@ -3228,29 +3248,17 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     // now covers the whole class in both builds. `DatagramPacket` and
     // `DatagramChannel` below are unaffected — RE7 does not register those.
 
-    
-    
-    
     // send(DatagramPacket) — real UDP send via fd_table
-    
+
     // receive(DatagramPacket) — real UDP receive via fd_table
-    
-    
-    
-    
-    
-    
-    
-    
+
     // setReuseAddress / getReuseAddress were a discard-then-lie pair: the setter
     // threw the flag away and the getter always answered `false`, so
     // `s.setReuseAddress(true); s.getReuseAddress()` returned false. Both halves
     // now go to the real socket — `fd_table` already exposes the setter, and the
     // getter reads SO_REUSEADDR back through socket2 on a dup of the fd (dup'ing
     // shares the option state; dropping the dup closes only the duplicate).
-    
-    
-    
+
     // The escalated primitive landed: `FdTable::udp_disconnect(FdId)`
     // (native-api/src/fd_table.rs) issues the POSIX `connect(AF_UNSPEC)` that
     // dissolves the association, treating the `EAFNOSUPPORT`/`WSAEAFNOSUPPORT`
@@ -3286,22 +3294,21 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     // `"java/net/DatagramSocket" => instance_fields(4)` there, or better, move
     // this set onto the RE.7 side table); the call below is correct the moment
     // the fd is actually stored, and no worse than the old no-op until then.
-    
-    
+
     // `setBroadcast` above really does set SO_BROADCAST on the fd, so a constant
     // `false` getter contradicted the setter that had just run. Read the option
     // back off the socket (via a dup, which shares option state).
-    
 
     // MulticastSocket = 5-field (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
     let ms = "java/net/MulticastSocket";
     r.register(ms, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
-            crate::capability_gate::translate_open_failure(e, |io| {
-                format!("MulticastSocket bind failed: {io}")
-            })
-        })?;
+        let fd_id =
+            crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| {
+                    format!("MulticastSocket bind failed: {io}")
+                })
+            })?;
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -3316,11 +3323,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let bind_addr = format!("0.0.0.0:{}", port);
-        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some(&bind_addr)).map_err(|e| {
-            crate::capability_gate::translate_open_failure(e, |io| {
-                format!("MulticastSocket bind failed: {io}")
-            })
-        })?;
+        let fd_id =
+            crate::capability_gate::open_udp_gated(&*ctx, Some(&bind_addr)).map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| {
+                    format!("MulticastSocket bind failed: {io}")
+                })
+            })?;
         ctx.set_field(this, 0, Value::Int(port));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -3515,8 +3523,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             } else {
                 (src_str.as_str(), 0)
             };
-            let src_addr =
-                crate::net_phase_e::alloc_inet_address_unnamed(ctx, src_ip_str)?;
+            let src_addr = crate::net_phase_e::alloc_inet_address_unnamed(ctx, src_ip_str)?;
             ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
             ctx.set_field(pkt, 4, Value::Int(src_port));
             Ok(None)
@@ -3633,13 +3640,20 @@ fn dc_box_option(ctx: &mut dyn NativeContext, name: &str, raw: i32) -> MethodCal
 /// Every intermediate reference is pinned across the allocation that follows
 /// it — four allocations happen here and a moving young GC at any of them
 /// relocates the ones already built (native stale-local family).
-fn p72_alloc_inet_socket_address(ctx: &mut dyn NativeContext, ip: &str, port: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn p72_alloc_inet_socket_address(
+    ctx: &mut dyn NativeContext,
+    ip: &str,
+    port: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let host0 = ctx.create_string(ip);
     let host_pin = ctx.pin_native_root(host0);
     let addr0 = crate::net_phase_e::alloc_inet_address_unnamed(ctx, ip)?;
     let addr_pin = ctx.pin_native_root(addr0);
-    let holder0 =
-        try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
+    let holder0 = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/net/InetSocketAddress$InetSocketAddressHolder",
+        3,
+    )?;
     let holder_pin = ctx.pin_native_root(holder0);
     let isa = try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3)?;
     let host = ctx.read_native_pin(host_pin, host0);
@@ -4621,7 +4635,11 @@ fn http_link_get(ctx: &dyn NativeContext, kind: u8, owner: ObjectRef) -> Option<
 /// (and `HttpExchange` is allocated by `net_phase_e`, whose slots this file
 /// does not own), so they live in the same global-root-backed side table as
 /// the executor / owning-server links above.
-fn http_attribute_map(ctx: &mut dyn NativeContext, kind: u8, owner: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn http_attribute_map(
+    ctx: &mut dyn NativeContext,
+    kind: u8,
+    owner: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(existing) = http_link_get(ctx, kind, owner) {
         return Ok(existing);
     }
@@ -4677,11 +4695,8 @@ fn http_exchange_set_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         cratonvm_native_collections::native_map_remove_pub(ctx, &[Value::Object(Some(map?)), key])
             .map(|_| ())
     } else {
-        cratonvm_native_collections::native_map_put_pub(
-            ctx,
-            &[Value::Object(Some(map?)), key, val],
-        )
-        .map(|_| ())
+        cratonvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map?)), key, val])
+            .map(|_| ())
     };
     if let Some((handle, _)) = key_pin {
         ctx.unpin_native_roots(handle);
@@ -4760,7 +4775,8 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 // would relocate it (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
                 let path_pin = pinned_object_value(ctx, path);
-                let hctx = try_alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2)?;
+                let hctx =
+                    try_alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2)?;
                 let path = read_pinned_object_value(ctx, path_pin, path);
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(hctx, 0, path);

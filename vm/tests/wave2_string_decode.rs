@@ -108,8 +108,7 @@ fn ensure_probe_compiled(name: &str) -> bool {
         );
         return false;
     }
-    let compile = Command::new("javac").arg("-d").arg(&dir).arg(&src)
-        .output();
+    let compile = Command::new("javac").arg("-d").arg(&dir).arg(&src).output();
     match compile {
         // javac cannot be launched at all — the one legitimate skip.
         Err(_) => false,

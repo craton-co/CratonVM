@@ -183,7 +183,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -549,6 +549,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: bash scripts/gc-flake-gate.sh
+
+      # RJ.4 in Cargo.toml: `cargo doc --workspace --no-deps` is the roadmap
+      # success criterion for zero rustdoc warnings; nothing built it until
+      # this step existed.
+      - name: Build documentation
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --workspace --no-deps
 
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but

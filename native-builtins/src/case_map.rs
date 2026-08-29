@@ -205,7 +205,10 @@ pub(crate) fn push_jdk_lower(out: &mut String, c: char) {
 /// character by character here is exactly `str::to_uppercase` with the skew arm
 /// spliced in. Its lowercase twin below is NOT in that position — see there.
 pub(crate) fn jdk_to_uppercase(s: &str) -> String {
-    if !s.chars().any(|c| is_jdk_unmapped_case_code_point(u32::from(c))) {
+    if !s
+        .chars()
+        .any(|c| is_jdk_unmapped_case_code_point(u32::from(c)))
+    {
         return s.to_uppercase();
     }
     let mut out = String::with_capacity(s.len());
@@ -244,7 +247,10 @@ pub(crate) fn jdk_to_uppercase(s: &str) -> String {
 /// every string without a skewed code point in it, so this change moves no row
 /// that was previously right.
 pub(crate) fn jdk_to_lowercase(s: &str) -> String {
-    if !s.chars().any(|c| is_jdk_unmapped_case_code_point(u32::from(c))) {
+    if !s
+        .chars()
+        .any(|c| is_jdk_unmapped_case_code_point(u32::from(c)))
+    {
         return s.to_lowercase();
     }
     let chars: Vec<char> = s.chars().collect();
@@ -295,33 +301,135 @@ struct Entry {
 static ENTRIES: &[Entry] = &[
     // ---- Conditional mappings (language-independent) ----
     // GREEK CAPITAL LETTER SIGMA
-    Entry { cp: '\u{03A3}', lower: &['\u{03C2}'], upper: &['\u{03A3}'], lang: None, cond: Cond::FinalCased },
+    Entry {
+        cp: '\u{03A3}',
+        lower: &['\u{03C2}'],
+        upper: &['\u{03A3}'],
+        lang: None,
+        cond: Cond::FinalCased,
+    },
     // LATIN CAPITAL LETTER I WITH DOT ABOVE
-    Entry { cp: '\u{0130}', lower: &['\u{0069}', '\u{0307}'], upper: &['\u{0130}'], lang: None, cond: Cond::Always },
+    Entry {
+        cp: '\u{0130}',
+        lower: &['\u{0069}', '\u{0307}'],
+        upper: &['\u{0130}'],
+        lang: None,
+        cond: Cond::Always,
+    },
     // ---- Lithuanian ----
     // COMBINING DOT ABOVE
-    Entry { cp: '\u{0307}', lower: &['\u{0307}'], upper: &[], lang: Some("lt"), cond: Cond::AfterSoftDotted },
+    Entry {
+        cp: '\u{0307}',
+        lower: &['\u{0307}'],
+        upper: &[],
+        lang: Some("lt"),
+        cond: Cond::AfterSoftDotted,
+    },
     // LATIN CAPITAL LETTER I
-    Entry { cp: '\u{0049}', lower: &['\u{0069}', '\u{0307}'], upper: &['\u{0049}'], lang: Some("lt"), cond: Cond::MoreAbove },
+    Entry {
+        cp: '\u{0049}',
+        lower: &['\u{0069}', '\u{0307}'],
+        upper: &['\u{0049}'],
+        lang: Some("lt"),
+        cond: Cond::MoreAbove,
+    },
     // LATIN CAPITAL LETTER J
-    Entry { cp: '\u{004A}', lower: &['\u{006A}', '\u{0307}'], upper: &['\u{004A}'], lang: Some("lt"), cond: Cond::MoreAbove },
+    Entry {
+        cp: '\u{004A}',
+        lower: &['\u{006A}', '\u{0307}'],
+        upper: &['\u{004A}'],
+        lang: Some("lt"),
+        cond: Cond::MoreAbove,
+    },
     // LATIN CAPITAL LETTER I WITH OGONEK
-    Entry { cp: '\u{012E}', lower: &['\u{012F}', '\u{0307}'], upper: &['\u{012E}'], lang: Some("lt"), cond: Cond::MoreAbove },
+    Entry {
+        cp: '\u{012E}',
+        lower: &['\u{012F}', '\u{0307}'],
+        upper: &['\u{012E}'],
+        lang: Some("lt"),
+        cond: Cond::MoreAbove,
+    },
     // LATIN CAPITAL LETTER I WITH GRAVE
-    Entry { cp: '\u{00CC}', lower: &['\u{0069}', '\u{0307}', '\u{0300}'], upper: &['\u{00CC}'], lang: Some("lt"), cond: Cond::Always },
+    Entry {
+        cp: '\u{00CC}',
+        lower: &['\u{0069}', '\u{0307}', '\u{0300}'],
+        upper: &['\u{00CC}'],
+        lang: Some("lt"),
+        cond: Cond::Always,
+    },
     // LATIN CAPITAL LETTER I WITH ACUTE
-    Entry { cp: '\u{00CD}', lower: &['\u{0069}', '\u{0307}', '\u{0301}'], upper: &['\u{00CD}'], lang: Some("lt"), cond: Cond::Always },
+    Entry {
+        cp: '\u{00CD}',
+        lower: &['\u{0069}', '\u{0307}', '\u{0301}'],
+        upper: &['\u{00CD}'],
+        lang: Some("lt"),
+        cond: Cond::Always,
+    },
     // LATIN CAPITAL LETTER I WITH TILDE
-    Entry { cp: '\u{0128}', lower: &['\u{0069}', '\u{0307}', '\u{0303}'], upper: &['\u{0128}'], lang: Some("lt"), cond: Cond::Always },
+    Entry {
+        cp: '\u{0128}',
+        lower: &['\u{0069}', '\u{0307}', '\u{0303}'],
+        upper: &['\u{0128}'],
+        lang: Some("lt"),
+        cond: Cond::Always,
+    },
     // ---- Turkish and Azeri ----
-    Entry { cp: '\u{0130}', lower: &['\u{0069}'], upper: &['\u{0130}'], lang: Some("tr"), cond: Cond::Always },
-    Entry { cp: '\u{0130}', lower: &['\u{0069}'], upper: &['\u{0130}'], lang: Some("az"), cond: Cond::Always },
-    Entry { cp: '\u{0307}', lower: &[], upper: &['\u{0307}'], lang: Some("tr"), cond: Cond::AfterI },
-    Entry { cp: '\u{0307}', lower: &[], upper: &['\u{0307}'], lang: Some("az"), cond: Cond::AfterI },
-    Entry { cp: '\u{0049}', lower: &['\u{0131}'], upper: &['\u{0049}'], lang: Some("tr"), cond: Cond::NotBeforeDot },
-    Entry { cp: '\u{0049}', lower: &['\u{0131}'], upper: &['\u{0049}'], lang: Some("az"), cond: Cond::NotBeforeDot },
-    Entry { cp: '\u{0069}', lower: &['\u{0069}'], upper: &['\u{0130}'], lang: Some("tr"), cond: Cond::Always },
-    Entry { cp: '\u{0069}', lower: &['\u{0069}'], upper: &['\u{0130}'], lang: Some("az"), cond: Cond::Always },
+    Entry {
+        cp: '\u{0130}',
+        lower: &['\u{0069}'],
+        upper: &['\u{0130}'],
+        lang: Some("tr"),
+        cond: Cond::Always,
+    },
+    Entry {
+        cp: '\u{0130}',
+        lower: &['\u{0069}'],
+        upper: &['\u{0130}'],
+        lang: Some("az"),
+        cond: Cond::Always,
+    },
+    Entry {
+        cp: '\u{0307}',
+        lower: &[],
+        upper: &['\u{0307}'],
+        lang: Some("tr"),
+        cond: Cond::AfterI,
+    },
+    Entry {
+        cp: '\u{0307}',
+        lower: &[],
+        upper: &['\u{0307}'],
+        lang: Some("az"),
+        cond: Cond::AfterI,
+    },
+    Entry {
+        cp: '\u{0049}',
+        lower: &['\u{0131}'],
+        upper: &['\u{0049}'],
+        lang: Some("tr"),
+        cond: Cond::NotBeforeDot,
+    },
+    Entry {
+        cp: '\u{0049}',
+        lower: &['\u{0131}'],
+        upper: &['\u{0049}'],
+        lang: Some("az"),
+        cond: Cond::NotBeforeDot,
+    },
+    Entry {
+        cp: '\u{0069}',
+        lower: &['\u{0069}'],
+        upper: &['\u{0130}'],
+        lang: Some("tr"),
+        cond: Cond::Always,
+    },
+    Entry {
+        cp: '\u{0069}',
+        lower: &['\u{0069}'],
+        upper: &['\u{0130}'],
+        lang: Some("az"),
+        cond: Cond::Always,
+    },
 ];
 
 /// Whether `lang` selects HotSpot's locale-dependent case-mapping path.
@@ -385,12 +493,7 @@ fn map_locale_dependent(s: &str, lang: &str, lowercasing: bool) -> String {
 /// `ConditionalSpecialCasing.lookUpTable`: the matching **language-specific**
 /// row wins (the JDK `break`s on one); otherwise a matching language-independent
 /// row applies; otherwise `None` → the caller uses the unconditional mapping.
-fn lookup(
-    chars: &[char],
-    index: usize,
-    lang: &str,
-    lowercasing: bool,
-) -> Option<&'static [char]> {
+fn lookup(chars: &[char], index: usize, lang: &str, lowercasing: bool) -> Option<&'static [char]> {
     let cp = chars[index];
     let mut fallback: Option<&'static [char]> = None;
     for entry in ENTRIES {
@@ -404,7 +507,11 @@ fn lookup(
         if !condition_met(chars, index, entry.cond) {
             continue;
         }
-        let mapped = if lowercasing { entry.lower } else { entry.upper };
+        let mapped = if lowercasing {
+            entry.lower
+        } else {
+            entry.upper
+        };
         if entry.lang.is_some() {
             return Some(mapped);
         }
@@ -541,9 +648,7 @@ fn is_cased(c: char) -> bool {
     if c.is_uppercase() || c.is_lowercase() {
         return true;
     }
-    c.is_alphabetic()
-        && c.to_uppercase().next() != Some(c)
-        && c.to_lowercase().next() != Some(c)
+    c.is_alphabetic() && c.to_uppercase().next() != Some(c) && c.to_lowercase().next() != Some(c)
 }
 
 /// Whether `c` has the Unicode `Soft_Dotted` property, per the JDK's own list.
@@ -669,13 +774,27 @@ mod tests {
                 let c = char::from_u32(cp).expect("scalar value");
                 let s = c.to_string();
                 for lang in ["tr", "az", "lt", "en", "el", ""] {
-                    assert_eq!(to_upper_case(&s, lang), s, "toUpperCase(U+{cp:04X}, {lang})");
-                    assert_eq!(to_lower_case(&s, lang), s, "toLowerCase(U+{cp:04X}, {lang})");
+                    assert_eq!(
+                        to_upper_case(&s, lang),
+                        s,
+                        "toUpperCase(U+{cp:04X}, {lang})"
+                    );
+                    assert_eq!(
+                        to_lower_case(&s, lang),
+                        s,
+                        "toLowerCase(U+{cp:04X}, {lang})"
+                    );
                 }
                 // ... and embedded in a string the locale path actually rewrites.
                 for lang in ["tr", "az"] {
-                    assert_eq!(to_upper_case(&format!("i{c}i"), lang), format!("\u{0130}{c}\u{0130}"));
-                    assert_eq!(to_lower_case(&format!("I{c}I"), lang), format!("\u{0131}{c}\u{0131}"));
+                    assert_eq!(
+                        to_upper_case(&format!("i{c}i"), lang),
+                        format!("\u{0130}{c}\u{0130}")
+                    );
+                    assert_eq!(
+                        to_lower_case(&format!("I{c}I"), lang),
+                        format!("\u{0131}{c}\u{0131}")
+                    );
                 }
             }
         }
@@ -773,7 +892,10 @@ mod tests {
             // Controls at both ends.
             assert_eq!(to_lower_case(&format!("A\u{03A3}a"), lang), "a\u{03C3}a");
             assert_eq!(to_lower_case(&format!("A\u{03A3}."), lang), "a\u{03C2}.");
-            assert_eq!(to_lower_case(&format!("A\u{03A3}\u{A7D1}"), lang), "a\u{03C3}\u{A7D1}");
+            assert_eq!(
+                to_lower_case(&format!("A\u{03A3}\u{A7D1}"), lang),
+                "a\u{03C3}\u{A7D1}"
+            );
         }
     }
 

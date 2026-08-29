@@ -1800,7 +1800,7 @@ mod tests {
                 is_synchronized: false,
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+                intercept_shape_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2003,7 +2003,10 @@ mod tests {
             cp_index,
             ResolvedCallSite::StringConcat {
                 recipe: Arc::from(
-                    "Hello, \u{0001}!".encode_utf16().collect::<Vec<u16>>().as_slice(),
+                    "Hello, \u{0001}!"
+                        .encode_utf16()
+                        .collect::<Vec<u16>>()
+                        .as_slice(),
                 ),
                 constant_args: vec![],
                 target_descriptor: Arc::from("(Ljava/lang/String;)Ljava/lang/String;"),

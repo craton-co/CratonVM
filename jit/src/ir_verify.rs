@@ -407,8 +407,8 @@ pub fn verify_graph(graph: &Graph, phase: &str, opts: VerifyOptions) -> CompileR
     // A genuinely severed terminator is still caught: `check_control` reports
     // "no Op::Return is reachable from the entry" whenever a `Return` exists but
     // cannot be reached, and that case does not land here.
-    let unbuilt = graph.exit == crate::ir::NO_NODE
-        && !graph.nodes.iter().any(|n| matches!(n.op, Op::Return));
+    let unbuilt =
+        graph.exit == crate::ir::NO_NODE && !graph.nodes.iter().any(|n| matches!(n.op, Op::Return));
     if unbuilt {
         return Ok(());
     }
@@ -1954,8 +1954,9 @@ mod tests {
             None,
         );
         g.kill(st1);
-        assert!(message(&verify_graph(&g, "test", chain_only).unwrap_err())
-            .contains("memory token"));
+        assert!(
+            message(&verify_graph(&g, "test", chain_only).unwrap_err()).contains("memory token")
+        );
         let arena_msg = message(&verify_graph(&g, "test", arena_only).unwrap_err());
         assert!(arena_msg.contains("defined after its use"), "{arena_msg}");
         assert!(!arena_msg.contains("memory token"), "{arena_msg}");

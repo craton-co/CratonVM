@@ -126,6 +126,47 @@ pub fn native_unsafe_copy_swap_memory(
         return Ok(None);
     }
 
+    // A null base is an OFF-HEAP address, and returning quietly meant an
+    // endian-converting copy between two `allocateMemory` blocks wrote nothing
+    // at all. MEASURED, HotSpot 25.0.4+7: elemSize 2 over [1..8] gives
+    // [2,1,4,3,6,5,8,7]; CratonVM left the destination as eight zeros -- a
+    // silent no-op, which is the failure mode that reads as success.
+    //
+    // `bytes` here is a real byte count, so the arena's own bounds-checked
+    // copy_out/copy_in are the right primitives; anything the arena does not
+    // recognise is refused rather than dereferenced.
+    if src_obj.is_none() && dest_obj.is_none() {
+        let mut buf = vec![0u8; bytes];
+        if !crate::unsafe_arena_copy_out(src_offset as i64, &mut buf) {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.copySwapMemory: source 0x{:x} is not in any live arena",
+                        src_offset
+                    ),
+                }
+                .into(),
+            );
+        }
+        if elem_size >= 2 {
+            for chunk in buf.chunks_mut(elem_size) {
+                chunk.reverse();
+            }
+        }
+        if !crate::unsafe_arena_copy_in(dest_offset as i64, &buf) {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.copySwapMemory: destination 0x{:x} is not in any live arena",
+                        dest_offset
+                    ),
+                }
+                .into(),
+            );
+        }
+        return Ok(None);
+    }
+
     let src = match src_obj {
         Some(s) => s,
         None => return Ok(None),
@@ -252,8 +293,6 @@ pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use crate::{
@@ -262,6 +301,11 @@ mod tests {
         native_unsafe_fence, native_unsafe_get_int, native_unsafe_get_int_volatile,
         native_unsafe_get_long, native_unsafe_put_int, native_unsafe_put_int_volatile,
         native_unsafe_put_long,
+    };
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
     use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -480,9 +524,22 @@ mod tests {
         assert_eq!(array_index_scale_for_name("[Ljava/lang/Object;"), 8);
         assert_eq!(array_index_scale_for_name("[Ljava/lang/String;"), 8);
         assert_eq!(array_index_scale_for_name("[[I"), 8);
-        // Non-array or unknown → defensive default of 1.
-        assert_eq!(array_index_scale_for_name("java/lang/Object"), 1);
-        assert_eq!(array_index_scale_for_name(""), 1);
+        // Non-array or unknown → 0, which is what
+        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
+        // callers guard on with `if (scale == 0) throw`.
+        //
+        // This assertion said 1 until 2026-08-29 and called it a "defensive
+        // default". It was not defensive: 1 is a plausible element width, so a
+        // caller computing `base + i * scale` over a class that has no
+        // elements got a plausible address instead of a refusal -- the
+        // dangerous direction in this family. The value was left alone by an
+        // earlier session because its blast radius was unmeasured; measured
+        // over the whole 117-vector corpus in both modes,
+        // `array_index_scale_for_name` is asked 161/175 times in every vector
+        // and NOT ONCE with a non-array, so taking the specified answer costs
+        // nothing. See the L1 record, section 9.2.
+        assert_eq!(array_index_scale_for_name("java/lang/Object"), 0);
+        assert_eq!(array_index_scale_for_name(""), 0);
 
         // End-to-end: synthesise a Class mirror with `name` at slot 1 and
         // invoke the native. The native should read the name and derive
@@ -518,9 +575,21 @@ mod tests {
         assert_eq!(int_scale, Some(Value::Int(4)));
 
         // byte[] → 1.
+        //
+        // Field 0 was the never-registered placeholder `0` here, which is the
+        // class-id-0 name shadow the comment above this block warns about: the
+        // name in slot 1 is never read, the derivation returns its non-array
+        // answer, and that answer USED TO BE 1 -- the same value `[B` derives.
+        // So this case asserted the catch-all and would have passed for a
+        // mirror naming anything at all. It only surfaced when the non-array
+        // answer became 0 (the javadoc's), which is what a default that
+        // collides with a real value costs: it hides the case it stands in for.
+        // Registered properly, as the `[Ljava/lang/Object;` and `[I` cases
+        // above already were.
+        let byte_cid = ctx.ensure_class_initialized("[B").unwrap();
         let byte_name = ctx.create_string("[B");
         let byte_mirror = ctx.alloc_object(ClassId::new(0), 2);
-        ctx.set_field(byte_mirror, 0, Value::Int(0));
+        ctx.set_field(byte_mirror, 0, Value::Int(byte_cid.as_u32() as i32));
         ctx.set_field(byte_mirror, 1, Value::Object(Some(byte_name)));
         let byte_scale = native_unsafe_array_index_scale(
             &mut ctx,
@@ -606,27 +675,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: copySwapMemory with None src is a no-op
+    // Test 8: copySwapMemory with a NULL base and an address the arena does not
+    // know is REFUSED -- it used to be a silent no-op, and this test pinned
+    // that.
+    //
+    // A null base means an OFF-HEAP address. Returning `Ok(None)` meant an
+    // endian-converting copy between two `allocateMemory` blocks wrote nothing
+    // at all, and the destination was already zero, so the failure read as
+    // success. MEASURED against HotSpot 25.0.4+7 (`probes/UnsafeShadowSweep`,
+    // off-heap section): elemSize 2 over [1..8] gives [2,1,4,3,6,5,8,7];
+    // CratonVM produced eight zeros.
+    //
+    // This assertion is the one that has to change with the fix. It was
+    // written from the implementation rather than from the contract -- the
+    // name said "is a noop", which is a description of the code, not of what
+    // `Unsafe.copySwapMemory` promises. Address 0 is in no live arena, so the
+    // contract-correct outcome is the same IllegalArgumentException the
+    // arena's other accessors already produce for an unknown address.
     // -----------------------------------------------------------------------
     #[test]
-    fn t12_copy_swap_memory_no_src_is_noop() {
+    fn t12_copy_swap_memory_null_base_unknown_address_is_refused() {
         let mut ctx = MockNativeContext::new();
 
-        // Call with None src — should return Ok(None) without panic
         let result = native_unsafe_copy_swap_memory(
             &mut ctx,
             &[
                 dummy_this(),
-                Value::Object(None), // no src
-                Value::Long(0),
-                Value::Object(None), // no dst
+                Value::Object(None), // off-heap source
+                Value::Long(0),      // ... at an address no arena owns
+                Value::Object(None), // off-heap destination
                 Value::Long(0),
                 Value::Long(16),
                 Value::Long(4),
             ],
-        )
-        .unwrap();
-        assert_eq!(result, None);
+        );
+        match result {
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException { .. },
+                ),
+            )) => {}
+            other => panic!(
+                "expected IllegalArgumentException for an off-heap copySwapMemory at an                  address no arena owns, got {other:?}"
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------

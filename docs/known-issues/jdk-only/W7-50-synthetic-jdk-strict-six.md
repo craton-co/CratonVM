@@ -342,7 +342,7 @@ I/O attempted and nothing thrown.**
   socket, and it binds explicitly to loopback rather than the wildcard.
 * `RJdkServices` reaches the same `readLine` from **real**
   `ServiceLoader$LazyClassPathLookupIterator.parse`, which is how a
-  `META-INF/services` descriptor is read. Zero provider names parsed, no
+  `../../../apps/META-INF/services` descriptor is read. Zero provider names parsed, no
   `ServiceConfigurationError`, empty list — the fabricated-success shape, but
   produced by a genuine read returning nothing rather than by a stub.
 

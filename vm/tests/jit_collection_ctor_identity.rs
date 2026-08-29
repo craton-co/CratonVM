@@ -279,7 +279,9 @@ fn jit_allocated_collections_iterate_like_interpreted_ones() {
         interp.stdout,
     );
     assert!(
-        interp_obs.iter().any(|l| *l == "r: roundTripEqualOrder=true"),
+        interp_obs
+            .iter()
+            .any(|l| *l == "r: roundTripEqualOrder=true"),
         "the interpreter oracle itself disagreed on round-trip order:\n{}",
         interp.stdout,
     );

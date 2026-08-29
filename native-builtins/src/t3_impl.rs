@@ -13,12 +13,12 @@
 //! - T3.1.15 Flow reactive streams (in lib.rs)
 //! - T3.1.16-T3.1.18 Virtual threads extras
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 use cratonvm_native_api::NativeContext;
 use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
-use cratonvm_types::error::MethodCallFailed;
 
 // =============================================================================
 // T3.8 — javax.naming / JNDI
@@ -524,7 +524,8 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/stream/XMLInputFactory;",
         |ctx, _args| {
-            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
+            let factory =
+                try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0)); // configuration flags
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -534,7 +535,8 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newFactory",
         "()Ljavax/xml/stream/XMLInputFactory;",
         |ctx, _args| {
-            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
+            let factory =
+                try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -764,7 +766,8 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newInstance",
         "(Ljava/lang/String;)Ljavax/xml/validation/SchemaFactory;",
         |ctx, _args| {
-            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1)?;
+            let factory =
+                try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -1097,7 +1100,8 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
             {
                 let engine = try_alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2)?;
                 // Fields: 0=bindings_map, 1=engine_name
-                let bindings = try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
+                let bindings =
+                    try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
                 let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -1124,7 +1128,8 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
             };
             if ext == "js" {
                 let engine = try_alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2)?;
-                let bindings = try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
+                let bindings =
+                    try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
                 let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -2249,9 +2254,12 @@ fn try_ternary(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn test_eval_simple_expression() {

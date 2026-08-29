@@ -404,7 +404,10 @@ mod tests {
 
         // The one pair whose verdict depends on the switch. `A69p` at 69.65535:
         // refused with no flag, runs with `--enable-preview`.
-        assert_eq!(v(max, prv).verify(false), Err(VersionRejection::PreviewNotEnabled));
+        assert_eq!(
+            v(max, prv).verify(false),
+            Err(VersionRejection::PreviewNotEnabled)
+        );
         assert_eq!(v(max, prv).verify(true), Ok(()));
 
         // Rule 2, and note it does NOT depend on the switch: `A68p` and `B56p`
@@ -438,7 +441,10 @@ mod tests {
 
         // The range ends. `D70` at 70.65535 reported too-new, not preview —
         // the major bound outranks every preview rule.
-        assert_eq!(v(max + 1, prv).verify(true), Err(VersionRejection::MajorTooNew));
+        assert_eq!(
+            v(max + 1, prv).verify(true),
+            Err(VersionRejection::MajorTooNew)
+        );
         assert_eq!(v(44, 0).verify(true), Err(VersionRejection::MajorTooOld));
 
         // The JDK's own class files, and every class file in every existing
@@ -458,14 +464,12 @@ mod tests {
         let prv = ClassFileVersion::PREVIEW_MINOR;
 
         assert_eq!(
-            VersionRejection::PreviewNotEnabled
-                .message(ClassFileVersion::new(max, prv), "pk/C"),
+            VersionRejection::PreviewNotEnabled.message(ClassFileVersion::new(max, prv), "pk/C"),
             "Preview features are not enabled for pk/C (class file version 69.65535). \
              Try running with '--enable-preview'"
         );
         assert_eq!(
-            VersionRejection::PreviewMajorMismatch
-                .message(ClassFileVersion::new(68, prv), "pk/D"),
+            VersionRejection::PreviewMajorMismatch.message(ClassFileVersion::new(68, prv), "pk/D"),
             "pk/D (class file version 68.65535) was compiled with preview features that are \
              unsupported. This version of the Java Runtime only recognizes preview features \
              for class file version 69.65535"

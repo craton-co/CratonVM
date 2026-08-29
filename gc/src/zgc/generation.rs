@@ -1192,12 +1192,12 @@ impl ZOldGeneration {
             // One object per page, exactly as `alloc_object` does for Large:
             // close the page immediately so nothing lands in the rounding tail.
             let page = self.allocator.alloc_page(class, bytes)?;
-            let address =
-                page.alloc(bytes, align)
-                    .ok_or(ZPageError::AllocationRefused {
-                        bytes,
-                        page_size: page.size(),
-                    })?;
+            let address = page
+                .alloc(bytes, align)
+                .ok_or(ZPageError::AllocationRefused {
+                    bytes,
+                    page_size: page.size(),
+                })?;
             page.set_state(ZPageState::Relocatable);
             let page_id = page.id();
             state.pages.insert(page_id, page);
@@ -2255,7 +2255,10 @@ mod tests {
             "the minor cycle exposed old pages {:?} to the marker",
             visited.intersection(&old_ids).collect::<Vec<_>>(),
         );
-        assert_eq!(visited, young_ids, "the scope must be exactly the young set");
+        assert_eq!(
+            visited, young_ids,
+            "the scope must be exactly the young set"
+        );
 
         // Every probe of a real old address was refused.
         assert_eq!(
@@ -2326,7 +2329,11 @@ mod tests {
             heap.allocate_young(OBJ, 8).expect("young allocation");
         }
         let young_before: FxHashSet<u64> = heap.young().snapshot().iter().map(|p| p.id()).collect();
-        assert_eq!(young_before.len(), 2, "20 x 512 B fills 1 page and starts a 2nd");
+        assert_eq!(
+            young_before.len(),
+            2,
+            "20 x 512 B fills 1 page and starts a 2nd"
+        );
 
         // Cycle 1: everything survives, age 0 -> 1, nothing promoted.
         let first = heap.collect_young(&[], &ZEmptyRememberedSet, &MarkAllInScope);
@@ -2553,7 +2560,10 @@ mod tests {
         let scope = ZGenerationScope::from_pages(ZGeneration::Young, 1, &young_pages, false);
 
         assert!(scope.admits(a.address));
-        assert!(!scope.admits(old.address), "an old address must never be admitted");
+        assert!(
+            !scope.admits(old.address),
+            "an old address must never be admitted"
+        );
         assert!(scope.contains_page(a.page_id));
         assert!(!scope.contains_page(old.page_id));
 

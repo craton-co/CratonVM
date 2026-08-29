@@ -22,7 +22,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
+use crate::{normalize_charset_name, try_alloc_concurrent_synthetic, CHARSET_FIELD_NAME};
 
 /// Layout constants for the synthetic ByteBuffer / CharBuffer.  Keep in
 /// sync with `native-io/src/lib.rs::BB_FIELD_*` — the two modules both
@@ -167,7 +167,10 @@ fn write_char_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, chars: 
 
 /// Allocate a fresh ByteBuffer (synthetic 5-field layout) wrapping a
 /// newly-allocated byte[] containing `bytes`.
-pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn alloc_byte_buffer(
+    ctx: &mut dyn NativeContext,
+    bytes: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
     let cap = bytes.len();
     // Allocate the CONCRETE `HeapByteBuffer`, not the abstract `ByteBuffer`:
     // the abstract base leaves `isDirect()`/`isReadOnly()`/`base()` unbound
@@ -228,7 +231,10 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Re
 /// fallback slots so any caller assuming the synthetic 5-field overlay
 /// (e.g. older `register_p62_char_buffer` natives compiled only in
 /// synthetic mode) continues to see consistent state.
-pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn alloc_char_buffer(
+    ctx: &mut dyn NativeContext,
+    chars: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
     let cap = chars.len();
     // Concrete `HeapCharBuffer` (not abstract `CharBuffer`) — see alloc_byte_buffer.
     let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", BUF_NUM_FIELDS)?;
@@ -274,7 +280,10 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> R
 }
 
 /// Allocate a CoderResult with the given tag.
-fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_coder_result(
+    ctx: &mut dyn NativeContext,
+    tag: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let cr = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
     ctx.set_field(cr, 0, Value::Int(tag));
     Ok(cr)
@@ -692,12 +701,7 @@ fn byte_sink(ctx: &dyn NativeContext, bb: ObjectRef) -> Option<(ByteSink, i32, i
 }
 
 /// Write `bytes` at absolute byte offset `at`, returning how many landed.
-fn sink_write(
-    ctx: &mut dyn NativeContext,
-    sink: &ByteSink,
-    at: usize,
-    bytes: &[u8],
-) -> usize {
+fn sink_write(ctx: &mut dyn NativeContext, sink: &ByteSink, at: usize, bytes: &[u8]) -> usize {
     match sink {
         ByteSink::Heap(arr) => write_byte_array(ctx, *arr, at, bytes),
         // Arena-aware write: direct-buffer addresses can be tagged handles, so
@@ -802,25 +806,27 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // REPORT-action error or an incomplete trailing surrogate.
         let (atom_units, atom_bytes): (usize, Vec<u8>) = if is_high_surrogate(c) {
             match chars.get(i + 1).copied() {
-                Some(lo) if is_low_surrogate(lo) => match engine::encode_chars(effective_name, &[c, lo]) {
-                    Ok(b) => (2, b),
-                    Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
-                        if unmappable_replace {
-                            (2, replacement.clone())
-                        } else {
-                            tag = CR_UNMAPPABLE;
-                            break;
+                Some(lo) if is_low_surrogate(lo) => {
+                    match engine::encode_chars(effective_name, &[c, lo]) {
+                        Ok(b) => (2, b),
+                        Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
+                            if unmappable_replace {
+                                (2, replacement.clone())
+                            } else {
+                                tag = CR_UNMAPPABLE;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            if malformed_replace {
+                                (2, replacement.clone())
+                            } else {
+                                tag = CR_MALFORMED;
+                                break;
+                            }
                         }
                     }
-                    Err(_) => {
-                        if malformed_replace {
-                            (2, replacement.clone())
-                        } else {
-                            tag = CR_MALFORMED;
-                            break;
-                        }
-                    }
-                },
+                }
                 None if !end_of_input => {
                     // Incomplete trailing high surrogate: leave it buffered and
                     // report UNDERFLOW (tag stays CR_UNDERFLOW).
@@ -916,7 +922,12 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
 
     let name = enc_name(ctx, this);
-    let bytes = read_byte_array(ctx, barr, (boff + bpos) as usize, (blim - bpos).max(0) as usize);
+    let bytes = read_byte_array(
+        ctx,
+        barr,
+        (boff + bpos) as usize,
+        (blim - bpos).max(0) as usize,
+    );
     if bytes.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
         return Ok(Some(Value::Object(Some(r?))));
@@ -1207,111 +1218,111 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
     // array. These are genuine required bridges, not droppable
     // approximations -- pin them regardless of ambient/call-site state.
     registry.with_category(cratonvm_native_api::NativeKind::Bridge, |registry| {
-    let enc = "java/nio/charset/CharsetEncoder";
-    registry.register(
-        enc,
-        "encode",
-        "(Ljava/nio/CharBuffer;Ljava/nio/ByteBuffer;Z)Ljava/nio/charset/CoderResult;",
-        native_encoder_encode,
-    );
-    // Charset.encode(CharBuffer) / encode(String) one-shots (Java public API).
-    registry.register(
-        enc,
-        "encode",
-        "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;",
-        native_charset_encode_charbuf_via_encoder,
-    );
-    // Overrides `register_p58_charset_coder`'s no-op `reset()` stub: a "UTF-16"
-    // encoder must re-arm its BOM state (see `clear_bom_state`) so the NEXT
-    // encoding session — not just the next `encode()` call — gets its own
-    // leading BOM again (`AppendableByteArrayTests.writeUsingCache` reuses a
-    // single cached encoder instance across independent messages).
-    registry.register(
-        enc,
-        "reset",
-        "()Ljava/nio/charset/CharsetEncoder;",
-        |ctx, args| {
-            let this = arg_obj(args, 0)?;
-            clear_bom_state(ctx, this);
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
+        let enc = "java/nio/charset/CharsetEncoder";
+        registry.register(
+            enc,
+            "encode",
+            "(Ljava/nio/CharBuffer;Ljava/nio/ByteBuffer;Z)Ljava/nio/charset/CoderResult;",
+            native_encoder_encode,
+        );
+        // Charset.encode(CharBuffer) / encode(String) one-shots (Java public API).
+        registry.register(
+            enc,
+            "encode",
+            "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;",
+            native_charset_encode_charbuf_via_encoder,
+        );
+        // Overrides `register_p58_charset_coder`'s no-op `reset()` stub: a "UTF-16"
+        // encoder must re-arm its BOM state (see `clear_bom_state`) so the NEXT
+        // encoding session — not just the next `encode()` call — gets its own
+        // leading BOM again (`AppendableByteArrayTests.writeUsingCache` reuses a
+        // single cached encoder instance across independent messages).
+        registry.register(
+            enc,
+            "reset",
+            "()Ljava/nio/charset/CharsetEncoder;",
+            |ctx, args| {
+                let this = arg_obj(args, 0)?;
+                clear_bom_state(ctx, this);
+                Ok(Some(Value::Object(Some(this))))
+            },
+        );
 
-    let dec = "java/nio/charset/CharsetDecoder";
-    registry.register(
-        dec,
-        "decode",
-        "(Ljava/nio/ByteBuffer;Ljava/nio/CharBuffer;Z)Ljava/nio/charset/CoderResult;",
-        native_decoder_decode,
-    );
-    registry.register(
-        dec,
-        "decode",
-        "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;",
-        native_charset_decode_bytebuf_via_decoder,
-    );
+        let dec = "java/nio/charset/CharsetDecoder";
+        registry.register(
+            dec,
+            "decode",
+            "(Ljava/nio/ByteBuffer;Ljava/nio/CharBuffer;Z)Ljava/nio/charset/CoderResult;",
+            native_decoder_decode,
+        );
+        registry.register(
+            dec,
+            "decode",
+            "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;",
+            native_charset_decode_bytebuf_via_decoder,
+        );
 
-    let cs = "java/nio/charset/Charset";
-    registry.register(
-        cs,
-        "encode",
-        "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
-        native_charset_encode_string,
-    );
-    registry.register(
-        cs,
-        "encode",
-        "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;",
-        native_charset_encode_charbuf,
-    );
-    registry.register(
-        cs,
-        "decode",
-        "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;",
-        native_charset_decode_bytebuf,
-    );
+        let cs = "java/nio/charset/Charset";
+        registry.register(
+            cs,
+            "encode",
+            "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
+            native_charset_encode_string,
+        );
+        registry.register(
+            cs,
+            "encode",
+            "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;",
+            native_charset_encode_charbuf,
+        );
+        registry.register(
+            cs,
+            "decode",
+            "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;",
+            native_charset_decode_bytebuf,
+        );
 
-    // Fix the String side: honour the charset instead of always UTF-8.
-    let s = "java/lang/String";
-    registry.register(
-        s,
-        "getBytes",
-        "(Ljava/nio/charset/Charset;)[B",
-        native_string_get_bytes_charset,
-    );
-    registry.register(
-        s,
-        "getBytes",
-        "(Ljava/lang/String;)[B",
-        native_string_get_bytes_named,
-    );
-    // Round 24 — `String.getBytes()` (no-arg, default charset). The JDK
-    // bytecode for this method calls `Charset.defaultCharset()` and then
-    // dispatches via `String.encode(Charset, byte coder, byte[] value)`.
-    // That path goes through `CharsetEncoder.encode(CharBuffer, ByteBuffer, Z)`
-    // with a real-JDK HeapCharBuffer/HeapByteBuffer whose field layout
-    // does not match our synthetic 5-field Buffer overlay used by the
-    // encoder native — so the encode loop reads zero chars and returns
-    // an empty byte array. Keycloak / WildFly's
-    // `ProcessEnvironment.obtainProcessUUID` then writes a 0-byte
-    // process.uuid file and the subsequent `Files.readAllBytes` returns
-    // empty / triggers the IOException-Cannot-find-file cascade.
-    //
-    // Override with a direct UTF-8 encode (matches the platform default
-    // charset we report from `Charset.defaultCharset`).
-    registry.register(s, "getBytes", "()[B", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let text = ctx.read_string(this).unwrap_or_default();
-        let bytes = text.as_bytes();
-        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-        for (i, &b) in bytes.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
+        // Fix the String side: honour the charset instead of always UTF-8.
+        let s = "java/lang/String";
+        registry.register(
+            s,
+            "getBytes",
+            "(Ljava/nio/charset/Charset;)[B",
+            native_string_get_bytes_charset,
+        );
+        registry.register(
+            s,
+            "getBytes",
+            "(Ljava/lang/String;)[B",
+            native_string_get_bytes_named,
+        );
+        // Round 24 — `String.getBytes()` (no-arg, default charset). The JDK
+        // bytecode for this method calls `Charset.defaultCharset()` and then
+        // dispatches via `String.encode(Charset, byte coder, byte[] value)`.
+        // That path goes through `CharsetEncoder.encode(CharBuffer, ByteBuffer, Z)`
+        // with a real-JDK HeapCharBuffer/HeapByteBuffer whose field layout
+        // does not match our synthetic 5-field Buffer overlay used by the
+        // encoder native — so the encode loop reads zero chars and returns
+        // an empty byte array. Keycloak / WildFly's
+        // `ProcessEnvironment.obtainProcessUUID` then writes a 0-byte
+        // process.uuid file and the subsequent `Files.readAllBytes` returns
+        // empty / triggers the IOException-Cannot-find-file cascade.
+        //
+        // Override with a direct UTF-8 encode (matches the platform default
+        // charset we report from `Charset.defaultCharset`).
+        registry.register(s, "getBytes", "()[B", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let text = ctx.read_string(this).unwrap_or_default();
+            let bytes = text.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        });
     });
 }
 
@@ -1491,10 +1502,13 @@ fn native_charset_decode_bytebuf_via_decoder(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_charset(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         let cs = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1).unwrap();
@@ -1636,7 +1650,8 @@ mod tests {
     /// Build a synthetic `CharsetEncoder` whose charset (slot 0) is `name`.
     fn make_encoder(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         let cs = make_charset(ctx, name);
-        let enc = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3).unwrap();
+        let enc =
+            try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3).unwrap();
         ctx.set_field(enc, 0, Value::Object(Some(cs)));
         enc
     }

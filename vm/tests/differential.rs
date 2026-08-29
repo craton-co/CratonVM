@@ -203,10 +203,8 @@ fn format_value(value: &Value, descriptor: &str, vm: &Vm) -> String {
         Value::Float(f) => cratonvm_types::java_float_to_string(*f),
         Value::Double(d) => cratonvm_types::java_double_to_string(*d),
         Value::Object(None) => "null".to_string(),
-        Value::Object(Some(obj)) => {
-            cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, *obj)
-                .unwrap_or_else(|| "object".to_string())
-        }
+        Value::Object(Some(obj)) => cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, *obj)
+            .unwrap_or_else(|| "object".to_string()),
         _ => format!("{value:?}"),
     }
 }
@@ -278,11 +276,13 @@ fn run_hotspot(class: &str, method: &str, descriptor: &str) -> Outcome {
     // each call compiles the wrapper and then deletes it, so a neighbour's
     // `java` invocation can find the class gone and produce empty stdout, which
     // reads as a divergence against a VM that was right all along.
-    let temp_dir = std::env::temp_dir().join("cratonvm_diff_test").join(format!(
-        "{}-{}",
-        std::process::id(),
-        WRAPPER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let temp_dir = std::env::temp_dir()
+        .join("cratonvm_diff_test")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            WRAPPER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
     std::fs::create_dir_all(&temp_dir).ok();
 
     let wrapper_java = temp_dir.join("DiffWrapper__.java");
@@ -587,7 +587,6 @@ fn diff_string_operations() {
         report.total_tested,
         report.divergences.len()
     );
-
 }
 
 // ---------------------------------------------------------------------------

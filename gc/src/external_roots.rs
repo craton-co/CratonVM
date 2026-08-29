@@ -72,7 +72,12 @@ pub fn provider_gate_stats() -> Vec<(&'static str, u64, u64, bool)> {
     PROVIDERS
         .read_recursive()
         .iter()
-        .filter_map(|p| p.gate_stats.map(|f| { let (h, m, d) = f(); (p.name, h, m, d) }))
+        .filter_map(|p| {
+            p.gate_stats.map(|f| {
+                let (h, m, d) = f();
+                (p.name, h, m, d)
+            })
+        })
         .collect()
 }
 

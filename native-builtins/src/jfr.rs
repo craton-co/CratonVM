@@ -130,9 +130,16 @@ fn class_name_for_mirror(
 /// sites: `type_id_from_class_mirror` inserts and drops, and the settings
 /// walk reads a name out with `.get(..).cloned()`. Neither touches `ctx` under
 /// the guard, so it is never held across a re-entry into the VM.
-fn type_id_event_names() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>> {
-    static NAMES: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>>> = OnceLock::new();
-    NAMES.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn type_id_event_names() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>>
+{
+    static NAMES: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<i64, String>>> =
+        OnceLock::new();
+    NAMES.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn type_id_from_class_mirror(ctx: &mut dyn NativeContext, args: &[Value]) -> i64 {
@@ -330,17 +337,8 @@ fn host_memory_totals() -> Option<(i64, i64)> {
 /// The most common casualty is a `Class`-typed field (netty's
 /// `AbstractAllocatorEvent.allocatorType`); on HotSpot that is a constant-pool
 /// reference, which needs a checkpoint event this writer does not emit.
-const JFR_FIELD_DESCRIPTORS: [&str; 9] = [
-    "Z",
-    "B",
-    "C",
-    "S",
-    "I",
-    "J",
-    "F",
-    "D",
-    "Ljava/lang/String;",
-];
+const JFR_FIELD_DESCRIPTORS: [&str; 9] =
+    ["Z", "B", "C", "S", "I", "J", "F", "D", "Ljava/lang/String;"];
 
 /// Per-event-class JFR facts — `(@Name value, @Enabled default)` — keyed by the
 /// event class's internal name.
@@ -354,9 +352,17 @@ const JFR_FIELD_DESCRIPTORS: [&str; 9] = [
 /// sites in `event_type_facts`: the lookup's `if let` body is a bare `return`,
 /// and the store is a temporary-guard `.insert(..)`. `ctx.class_annotations`
 /// runs between them, after the read guard has been dropped.
-fn event_types() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>> {
-    static TYPES: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>>> = OnceLock::new();
-    TYPES.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn event_types(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>> {
+    static TYPES: OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<HashMap<String, (String, bool)>>,
+    > = OnceLock::new();
+    TYPES.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The JFR name of an event class: its `@Name` value when it declares one,
@@ -447,7 +453,6 @@ fn jfr_event_type_facts(ctx: &mut dyn NativeContext, class_id: ClassId) -> (Stri
     facts
 }
 
-
 /// The event's field values as `(name, descriptor, value)`, superclass fields
 /// first — the order JFR itself declares inherited fields in.
 ///
@@ -470,8 +475,10 @@ fn capture_event_fields(
     // names. A payload field with either name would be shadowed by the implicit
     // one at every consumer, so it is dropped here rather than written into a
     // record where it can never be read back.
-    let mut seen: HashSet<String> =
-        ["startTime", "duration"].iter().map(|s| (*s).to_owned()).collect();
+    let mut seen: HashSet<String> = ["startTime", "duration"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
     // Collected most-derived first so shadowing resolves the Java way, then
     // reversed for JFR's superclass-first declaration order.
     let mut derived_first: Vec<(String, String, Value)> = Vec::new();
@@ -518,9 +525,17 @@ fn capture_event_fields(
 /// acquisition sites (`Event.begin`, `Event.end`, `commit`): each computes its
 /// `(vm, thread)` key BEFORE taking the guard, then does one `insert`,
 /// `get_mut` or `remove` under it. No `ctx` call happens under the guard.
-fn event_timing() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
-    static TIMING: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>>> = OnceLock::new();
-    TIMING.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn event_timing(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>> {
+    static TIMING: OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<HashMap<(usize, u64), (u64, Option<u64>)>>,
+    > = OnceLock::new();
+    TIMING.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +589,17 @@ fn java_recordings() -> &'static Mutex<Vec<JavaRecording>> {
 ///
 /// It IS acquired while `java_recordings`' guard is held, which is legal only
 /// because `java_recordings` is deliberately NOT ordered — see its own comment.
-fn java_events_known_disabled() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
-    static DENIED: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
-    DENIED.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn java_events_known_disabled(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
+    static DENIED: OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>,
+    > = OnceLock::new();
+    DENIED.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Per-VM set of Java event names this bridge has decided to record.
@@ -603,9 +626,17 @@ fn java_events_known_disabled() -> &'static cratonvm_types::lock_order::OrderedM
 ///
 /// Same nesting note as [`java_events_known_disabled`]: taken under
 /// `java_recordings`' unordered guard, which is why that one stays unordered.
-fn java_events_admitted() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
-    static ADMITTED: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>> = OnceLock::new();
-    ADMITTED.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn java_events_admitted(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>> {
+    static ADMITTED: OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<HashMap<usize, HashSet<String>>>,
+    > = OnceLock::new();
+    ADMITTED.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Parse a JFR timespan setting value into nanoseconds.
@@ -787,9 +818,9 @@ fn refresh_java_recording_settings(ctx: &mut dyn NativeContext, recording: Objec
         let mut table = java_recordings()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let slot = table
-            .iter()
-            .position(|entry| entry.vm == vm && ctx.resolve_global_root(entry.recording) == Some(recording));
+        let slot = table.iter().position(|entry| {
+            entry.vm == vm && ctx.resolve_global_root(entry.recording) == Some(recording)
+        });
         match (slot, read) {
             (Some(slot), Some((enabled, disabled, thresholds))) => {
                 table[slot].enabled = enabled;
@@ -1090,9 +1121,9 @@ fn java_stream_slot(
     stream: ObjectRef,
 ) -> Option<usize> {
     let vm = ctx.vm_identity();
-    table.iter().position(|entry| {
-        entry.vm == vm && ctx.resolve_global_root(entry.stream) == Some(stream)
-    })
+    table
+        .iter()
+        .position(|entry| entry.vm == vm && ctx.resolve_global_root(entry.stream) == Some(stream))
 }
 
 /// Find `stream`'s entry, creating it if this is the first call for it.
@@ -1174,7 +1205,9 @@ fn value_descriptor(
 /// accessors still work.
 fn identity_time_converter(scope: &mut NativeHandleScope<'_>) -> Option<ObjectRef> {
     let utc = {
-        let class_id = scope.ensure_class_initialized("java/time/ZoneOffset").ok()?;
+        let class_id = scope
+            .ensure_class_initialized("java/time/ZoneOffset")
+            .ok()?;
         let index = scope.static_field_index_by_name(class_id, "UTC")?;
         match scope.get_static_field(class_id, index) {
             Value::Object(Some(utc)) => utc,
@@ -1315,7 +1348,9 @@ fn recorded_event_for(
         // A `@Name` the JDK rejects as a class name reaches `Type`'s
         // constructor as an `InternalError`. Keep delivering the event with no
         // event type rather than dropping it.
-        _ => return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns),
+        _ => {
+            return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns)
+        }
     };
     let platform_type = scope.root(platform_type);
     let platform_type = scope.get(&platform_type);
@@ -1325,7 +1360,9 @@ fn recorded_event_for(
         &[Value::Object(Some(platform_type))],
     ) {
         Ok(Some(Value::Object(Some(event_type)))) => event_type,
-        _ => return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns),
+        _ => {
+            return recorded_event_without_type(&mut scope, &descriptors, &values, start_ns, end_ns)
+        }
     };
     let event_type = scope.root(event_type);
 
@@ -1565,20 +1602,42 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ("unregisterStackFilter", "(J)V"),
         ("setMiscellaneous", "(JJ)V"),
     ] {
-        registry.register_with_kind(JVM, name, descriptor, |_ctx, _args| Ok(None), NativeKind::Bridge);
+        registry.register_with_kind(
+            JVM,
+            name,
+            descriptor,
+            |_ctx, _args| Ok(None),
+            NativeKind::Bridge,
+        );
     }
 
-    registry.register_with_kind(JVM, "beginRecording", "()V", |ctx, _args| {
-        ctx.jfr_begin_java_recording();
-        Ok(None)
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "endRecording", "()V", |ctx, _args| {
-        ctx.jfr_end_java_recording();
-        Ok(None)
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "isRecording", "()Z", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "beginRecording",
+        "()V",
+        |ctx, _args| {
+            ctx.jfr_begin_java_recording();
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "endRecording",
+        "()V",
+        |ctx, _args| {
+            ctx.jfr_end_java_recording();
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "isRecording",
+        "()Z",
+        |ctx, _args| Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32))),
+        NativeKind::Bridge,
+    );
     // `begin()`/`end()` are no longer no-ops: they are the only place the
     // event's own start time and duration exist. See `event_timing`.
     registry.register("jdk/jfr/Event", "begin", "()V", |ctx, _args| {
@@ -1691,14 +1750,20 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // is specified to come back `false` (`jdk/jfr/internal/JVMSupport.java`).
     // Ignoring the argument made that call claim success. Track the same
     // created/not-created state HotSpot does and honour the flag.
-    registry.register_with_kind(JVM, "setOutput", "(Ljava/lang/String;)V", |ctx, args| {
-        if let Some(Value::Object(Some(path))) = args.first() {
-            if let Some(path) = ctx.read_string(*path) {
-                ctx.jfr_set_java_output(&path);
+    registry.register_with_kind(
+        JVM,
+        "setOutput",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            if let Some(Value::Object(Some(path))) = args.first() {
+                if let Some(path) = ctx.read_string(*path) {
+                    ctx.jfr_set_java_output(&path);
+                }
             }
-        }
-        Ok(None)
-    }, NativeKind::Bridge);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     registry.register("jdk/jfr/Recording", "start", "()V", |ctx, args| {
         ctx.jfr_begin_java_recording();
@@ -1735,27 +1800,39 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    registry.register_with_kind(JVM, "createJFR", "(Z)Z", |_ctx, args| {
-        if CREATED.load(Ordering::Acquire) {
-            return Ok(Some(Value::Int(1)));
-        }
-        let simulate_failure = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
-        if simulate_failure {
-            return Ok(Some(Value::Int(0)));
-        }
-        CREATED.store(true, Ordering::Release);
-        Ok(Some(Value::Int(1)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "createJFR",
+        "(Z)Z",
+        |_ctx, args| {
+            if CREATED.load(Ordering::Acquire) {
+                return Ok(Some(Value::Int(1)));
+            }
+            let simulate_failure = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
+            if simulate_failure {
+                return Ok(Some(Value::Int(0)));
+            }
+            CREATED.store(true, Ordering::Release);
+            Ok(Some(Value::Int(1)))
+        },
+        NativeKind::Bridge,
+    );
     // `destroyJFR` is documented as returning "if an instance was actually
     // destroyed" and as ignoring the call when nothing was created
     // (`jdk/jfr/internal/JVM.java`), so a bare `true` was wrong on the
     // never-created path. `JVMSupport.destroyJFR` feeds the answer straight
     // into `nativeOK = !result`, i.e. into `hasJFR()`.
-    registry.register_with_kind(JVM, "destroyJFR", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(i32::from(
-            CREATED.swap(false, Ordering::AcqRel),
-        ))))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "destroyJFR",
+        "()Z",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                CREATED.swap(false, Ordering::AcqRel),
+            ))))
+        },
+        NativeKind::Bridge,
+    );
     // KEEP, and the real JDK behaviour it matches is now cited rather than
     // assumed. HotSpot's `jfr_is_available` is `!Jfr::is_disabled()`, i.e. a
     // read of the `-XX:-FlightRecorder` kill switch and nothing else; CratonVM
@@ -1776,22 +1853,42 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // `emitEvent`/`isInstrumented`/`getAllowedToDoEventRetransforms` answer
     // `false`, `getEventWriter` answers `null` (the JDK's own "not recording
     // on this thread" reply, see below) and `newEventWriter` throws by name.
-    registry.register_with_kind(JVM, "isAvailable", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "isAvailable",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+        NativeKind::Bridge,
+    );
 
-    registry.register_with_kind(JVM, "counterTime", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(counter_time())))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "nanosNow", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(epoch_nanos())))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getChunkStartNanos", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(epoch_nanos())))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getTicksFrequency", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(TICKS_PER_SECOND)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "counterTime",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(counter_time()))),
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "nanosNow",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(epoch_nanos()))),
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getChunkStartNanos",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(epoch_nanos()))),
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getTicksFrequency",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(TICKS_PER_SECOND))),
+        NativeKind::Bridge,
+    );
     // Derived, not a literal. OpenJDK uses this factor as
     // `nanosToTicks(nanos) = (long)(nanos * factor)`
     // (`JVMSupport.nanosToTicks`), so it is exactly ticks-per-nanosecond —
@@ -1799,16 +1896,28 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // constant `getTicksFrequency()` and `counterTime()` use means changing the
     // tick rate can no longer leave a stale `1.0` behind rescaling every
     // recorded timestamp.
-    registry.register_with_kind(JVM, "getTimeConversionFactor", "()D", |_ctx, _args| {
-        Ok(Some(Value::Double(
-            TICKS_PER_SECOND as f64 / NANOS_PER_SECOND as f64,
-        )))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getPid", "()Ljava/lang/String;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(
-            ctx.create_string(&std::process::id().to_string()),
-        ))))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "getTimeConversionFactor",
+        "()D",
+        |_ctx, _args| {
+            Ok(Some(Value::Double(
+                TICKS_PER_SECOND as f64 / NANOS_PER_SECOND as f64,
+            )))
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getPid",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(
+                ctx.create_string(&std::process::id().to_string()),
+            ))))
+        },
+        NativeKind::Bridge,
+    );
 
     // `emitEvent(long eventTypeId, long timestamp, long when)` — IMPLEMENTED
     // (was a flat `false`, i.e. "nothing was emitted"). It goes through the SAME
@@ -1819,21 +1928,27 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // The three longs the JDK passes ARE this entry point's whole payload — it
     // is the periodic-event door, not the EventWriter one, which still has no
     // chunk writer behind it (see `newEventWriter`).
-    registry.register_with_kind(JVM, "emitEvent", "(JJJ)Z", |ctx, args| {
-        let longs: Vec<i64> = args
-            .iter()
-            .filter_map(|v| match v {
-                Value::Long(l) => Some(*l),
-                _ => None,
-            })
-            .collect();
-        if !ctx.jfr_java_recording_active() {
-            return Ok(Some(Value::Int(0)));
-        }
-        let timestamp = longs.get(1).copied().unwrap_or(0).max(0) as u64;
-        ctx.jfr_emit_java_event("jdk.PeriodicEvent", &[], timestamp, 0);
-        Ok(Some(Value::Int(1)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "emitEvent",
+        "(JJJ)Z",
+        |ctx, args| {
+            let longs: Vec<i64> = args
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Long(l) => Some(*l),
+                    _ => None,
+                })
+                .collect();
+            if !ctx.jfr_java_recording_active() {
+                return Ok(Some(Value::Int(0)));
+            }
+            let timestamp = longs.get(1).copied().unwrap_or(0).max(0) as u64;
+            ctx.jfr_emit_java_event("jdk.PeriodicEvent", &[], timestamp, 0);
+            Ok(Some(Value::Int(1)))
+        },
+        NativeKind::Bridge,
+    );
 
     // Constant `false` answers that are STATEMENTS OF FACT about this VM, not
     // placeholders — each names the CratonVM property that makes it true:
@@ -1855,7 +1970,13 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ("shouldRotateDisk", "()Z"),
         ("isContainerized", "()Z"),
     ] {
-        registry.register_with_kind(JVM, name, descriptor, |_ctx, _args| Ok(Some(Value::Int(0))), NativeKind::Bridge);
+        registry.register_with_kind(
+            JVM,
+            name,
+            descriptor,
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+            NativeKind::Bridge,
+        );
     }
     // Constant `true` = "the request was accepted". `addStringConstant`,
     // `setCutoff` and `setThrottle` tune a recorder whose settings this bridge
@@ -1869,7 +1990,13 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ("setThrottle", "(JJJ)Z"),
         ("isProduct", "()Z"),
     ] {
-        registry.register_with_kind(JVM, name, descriptor, |_ctx, _args| Ok(Some(Value::Int(1))), NativeKind::Bridge);
+        registry.register_with_kind(
+            JVM,
+            name,
+            descriptor,
+            |_ctx, _args| Ok(Some(Value::Int(1))),
+            NativeKind::Bridge,
+        );
     }
 
     // Zero here means "no such id / nothing recorded", which is what a Java
@@ -1888,9 +2015,8 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // `0` remains the answer when there is no walkable stack, which is the
     // JDK's own "no such trace".
     fn jfr_stack_trace_id(ctx: &mut dyn NativeContext, skip: i32) -> i64 {
-        static IDS: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, i64>>,
-        > = std::sync::OnceLock::new();
+        static IDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+            std::sync::OnceLock::new();
         let frames = ctx.capture_stack_trace(0);
         let skip = skip.max(0) as usize;
         if frames.len() <= skip {
@@ -1938,9 +2064,13 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             "([Ljava/lang/String;[Ljava/lang/String;)J",
         ),
     ] {
-        registry.register_with_kind(JVM, name, descriptor, |_ctx, _args| {
-            Ok(Some(Value::Long(0)))
-        }, NativeKind::Bridge);
+        registry.register_with_kind(
+            JVM,
+            name,
+            descriptor,
+            |_ctx, _args| Ok(Some(Value::Long(0))),
+            NativeKind::Bridge,
+        );
     }
 
     // These two used to sit in the `0` group above on the grounds that CratonVM
@@ -1950,86 +2080,138 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // properties of the HOST, which is why `JVM.java` documents them as
     // reported "whether or not this JVM runs in a container". Probe the host;
     // fall back to the JDK's `0` sentinel only where the platform has no probe.
-    registry.register_with_kind(JVM, "hostTotalMemory", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(
-            host_memory_totals().map(|(total, _)| total).unwrap_or(0),
-        )))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "hostTotalSwapMemory", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(
-            host_memory_totals().map(|(_, swap)| swap).unwrap_or(0),
-        )))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "hostTotalMemory",
+        "()J",
+        |_ctx, _args| {
+            Ok(Some(Value::Long(
+                host_memory_totals().map(|(total, _)| total).unwrap_or(0),
+            )))
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "hostTotalSwapMemory",
+        "()J",
+        |_ctx, _args| {
+            Ok(Some(Value::Long(
+                host_memory_totals().map(|(_, swap)| swap).unwrap_or(0),
+            )))
+        },
+        NativeKind::Bridge,
+    );
 
     // `exclude`/`include` are the JFR thread filter and `isExcluded` is the
     // guard that reads it. As a no-op/no-op/constant-false trio the guard
     // contradicted the mutators outright: a caller could exclude a thread and
     // then be told by the JVM that the same thread was still being recorded.
     // Track the exclusions and answer the guard from the same table.
-    registry.register_with_kind(JVM, "exclude", "(Ljava/lang/Thread;)V", |ctx, args| {
-        if let Some(key) = jfr_thread_key(ctx, args) {
-            excluded_threads()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .insert(key);
-        }
-        Ok(None)
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "include", "(Ljava/lang/Thread;)V", |ctx, args| {
-        if let Some(key) = jfr_thread_key(ctx, args) {
-            excluded_threads()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .remove(&key);
-        }
-        Ok(None)
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "isExcluded", "(Ljava/lang/Thread;)Z", |ctx, args| {
-        let excluded = match jfr_thread_key(ctx, args) {
-            Some(key) => excluded_threads()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .contains(&key),
-            None => false,
-        };
-        Ok(Some(Value::Int(i32::from(excluded))))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "exclude",
+        "(Ljava/lang/Thread;)V",
+        |ctx, args| {
+            if let Some(key) = jfr_thread_key(ctx, args) {
+                excluded_threads()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(key);
+            }
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "include",
+        "(Ljava/lang/Thread;)V",
+        |ctx, args| {
+            if let Some(key) = jfr_thread_key(ctx, args) {
+                excluded_threads()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&key);
+            }
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "isExcluded",
+        "(Ljava/lang/Thread;)Z",
+        |ctx, args| {
+            let excluded = match jfr_thread_key(ctx, args) {
+                Some(key) => excluded_threads()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .contains(&key),
+                None => false,
+            };
+            Ok(Some(Value::Int(i32::from(excluded))))
+        },
+        NativeKind::Bridge,
+    );
 
     // Every thread reported the same id (0), so any JFR consumer that groups
     // or joins records by thread collapsed the whole process onto one thread.
     // Report the receiver's own id, exactly as `java/lang/Thread.getId` does
     // (`tid` field, falling back to the executing VM thread).
-    registry.register_with_kind(JVM, "getThreadId", "(Ljava/lang/Thread;)J", |ctx, args| {
-        let receiver_tid = match args.first() {
-            Some(Value::Object(Some(thread))) => match ctx.get_field_by_name(*thread, "tid") {
-                Value::Long(tid) if tid > 0 => Some(tid),
-                Value::Int(tid) if tid > 0 => Some(tid as i64),
+    registry.register_with_kind(
+        JVM,
+        "getThreadId",
+        "(Ljava/lang/Thread;)J",
+        |ctx, args| {
+            let receiver_tid = match args.first() {
+                Some(Value::Object(Some(thread))) => match ctx.get_field_by_name(*thread, "tid") {
+                    Value::Long(tid) if tid > 0 => Some(tid),
+                    Value::Int(tid) if tid > 0 => Some(tid as i64),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        };
-        Ok(Some(Value::Long(
-            receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
-        )))
-    }, NativeKind::Bridge);
+            };
+            Ok(Some(Value::Long(
+                receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
+            )))
+        },
+        NativeKind::Bridge,
+    );
 
     // OpenJDK's Type table uses these IDs as map-key identity.  Returning the
     // same placeholder for every type silently collapses the table and makes
     // standard values such as java.lang.String appear unsupported.
-    registry.register_with_kind(JVM, "getTypeId", "(Ljava/lang/Class;)J", |ctx, args| {
-        Ok(Some(Value::Long(type_id_from_class_mirror(ctx, args))))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getTypeId", "(Ljava/lang/String;)J", |ctx, args| {
-        let id = match args.first() {
-            Some(Value::Object(Some(name))) => ctx.read_string(*name).map(|name| type_id(&name)),
-            _ => None,
-        }
-        .unwrap_or_default();
-        Ok(Some(Value::Long(id)))
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getClassId", "(Ljava/lang/Class;)J", |ctx, args| {
-        Ok(Some(Value::Long(type_id_from_class_mirror(ctx, args))))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "getTypeId",
+        "(Ljava/lang/Class;)J",
+        |ctx, args| Ok(Some(Value::Long(type_id_from_class_mirror(ctx, args)))),
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getTypeId",
+        "(Ljava/lang/String;)J",
+        |ctx, args| {
+            let id = match args.first() {
+                Some(Value::Object(Some(name))) => {
+                    ctx.read_string(*name).map(|name| type_id(&name))
+                }
+                _ => None,
+            }
+            .unwrap_or_default();
+            Ok(Some(Value::Long(id)))
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getClassId",
+        "(Ljava/lang/Class;)J",
+        |ctx, args| Ok(Some(Value::Long(type_id_from_class_mirror(ctx, args)))),
+        NativeKind::Bridge,
+    );
 
     registry.register_with_kind(
         JVM,
@@ -2146,19 +2328,29 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         },
         NativeKind::Bridge,
     );
-    registry.register_with_kind(JVM, "setDumpPath", "(Ljava/lang/String;)V", |ctx, args| {
-        let value = match args.first() {
-            Some(Value::Object(Some(path))) => ctx.read_string(*path),
-            _ => None,
-        };
-        *dump_path()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = value;
-        Ok(None)
-    }, NativeKind::Bridge);
-    registry.register_with_kind(JVM, "getDumpPath", "()Ljava/lang/String;", |ctx, _args| {
-        Ok(Some(saved_dump_path(ctx)))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "setDumpPath",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let value = match args.first() {
+                Some(Value::Object(Some(path))) => ctx.read_string(*path),
+                _ => None,
+            };
+            *dump_path()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = value;
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        JVM,
+        "getDumpPath",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(saved_dump_path(ctx))),
+        NativeKind::Bridge,
+    );
     // OpenJDK's JFR bootstrap uses Class.equals() to look up the small set of
     // built-in value types.  A class mirror may have been materialised through
     // a different bootstrap path by then; resolve by the VM's canonical class
@@ -2565,11 +2757,17 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         },
         NativeKind::Bridge,
     );
-    registry.register_with_kind(JVM, "drainStaleMethodTracerIds", "()[J", |ctx, _args| {
-        Ok(Some(Value::Object(Some(
-            ctx.new_array(ArrayElementType::Long, 0),
-        ))))
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        JVM,
+        "drainStaleMethodTracerIds",
+        "()[J",
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(
+                ctx.new_array(ArrayElementType::Long, 0),
+            ))))
+        },
+        NativeKind::Bridge,
+    );
 }
 
 #[cfg(test)]

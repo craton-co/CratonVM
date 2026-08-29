@@ -141,15 +141,12 @@ CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 cratonvm -cp /app Main
   `-XX:-UseContainerSupport` was given; its memory limit feeds the heap sizer and
   its CPU count feeds `config.container_effective_processors`, which is what
   `Runtime.availableProcessors()` and the JMX OS bean report.
-* **One heap sizer, not two.** Until 2026-08-10 there were two, and they
-  disagreed. `vm-cli::ergonomic_default_max_heap` sized off
-  `min(physical RAM, cgroup limit)`, capped at 4 GiB, floored at 256 MB;
-  `SharedVm::new`'s `suggested_default_max_heap` sized off the cgroup limit
-  alone, capped at 8 GiB, floored at 16 MiB, with none of the env knobs. The same
-  container therefore got two different default heaps depending on which entry
-  point started the VM. Both now clamp through
-  `vm::runtime::container::clamp_ergonomic_heap`, and a test asserts they agree
-  across six container sizes.
+* **One heap sizer, not two.** Both the launcher's
+  `vm-cli::ergonomic_default_max_heap` and the embedding entry point's
+  `SharedVm::new` (`suggested_default_max_heap`) clamp through the same
+  `vm::runtime::container::clamp_ergonomic_heap`, so a container gets the same
+  default heap regardless of which entry point started the VM; a test asserts
+  they agree across six container sizes.
 * **The remaining launcher/embedder difference is deliberate.** An *uncontained*
   embedder still gets the fixed 256 MB library default rather than a quarter of
   host RAM. The launcher owns the process it sizes; an embedded VM shares an

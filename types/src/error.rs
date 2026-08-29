@@ -761,12 +761,7 @@ impl JdkOnlyViolation {
                 // Emitted for every row of this kind, never conditionally — an
                 // absent `outcome` would be indistinguishable from
                 // `bytecode-won`, which is the direction that hides a violation.
-                json_field(
-                    &mut out,
-                    &mut first,
-                    "outcome",
-                    self.shadow_outcome(),
-                );
+                json_field(&mut out, &mut first, "outcome", self.shadow_outcome());
             }
             JdkOnlyViolation::MissingBootClass {
                 class,
@@ -1213,6 +1208,38 @@ pub enum RuntimeError {
 
     #[error("IllegalThreadStateException: {message}")]
     IllegalThreadStateException { message: String },
+
+    /// `java.util.concurrent.CancellationException` — what `Future.get()`,
+    /// `ForkJoinTask.join()` and `ForkJoinTask.invoke()` raise for a task that
+    /// was cancelled.
+    ///
+    /// It exists because the alternative was a PROXY: `fjp_state_get_checked`
+    /// raised `IllegalStateException` with the string
+    /// `"java.util.concurrent.CancellationException: task was cancelled"` in
+    /// its message, and a proxy is exactly as good as the message and no
+    /// better — `catch (CancellationException)`, which is the ONLY way a
+    /// caller distinguishes "cancelled" from "failed", does not fire on it.
+    /// MEASURED against HotSpot 25.0.4+7 in both modes
+    /// (`probes/ForkJoinShadowSweep.java`): three rows, `join`, `get` and
+    /// `invoke` on a cancelled task, all `IllegalStateException` here and
+    /// `CancellationException` there.
+    ///
+    /// An EMPTY message is NO message, like `IllegalThreadStateException`
+    /// above: HotSpot reaches `new CancellationException()` on every one of
+    /// those three paths.
+    #[error("CancellationException: {message}")]
+    CancellationException { message: String },
+
+    /// `java.util.concurrent.RejectedExecutionException` — what an executor
+    /// raises for work submitted after `shutdown()`.
+    ///
+    /// Same empty-means-none convention. Added with
+    /// [`RuntimeError::CancellationException`] because the ForkJoinPool
+    /// submission natives run their task INLINE and so never consulted the
+    /// pool's shutdown state at all: `submit`, `execute` and `invoke` each
+    /// ran a task on a pool the caller had already shut down.
+    #[error("RejectedExecutionException: {message}")]
+    RejectedExecutionException { message: String },
 
     /// Thrown when a method is invoked by an unauthorized caller. Used by the
     /// Panama native-access gate when `--enable-native-access` has not been
@@ -1779,6 +1806,22 @@ impl RuntimeError {
                     Some(message.as_str())
                 },
             ),
+            RuntimeError::CancellationException { message } => (
+                "java/util/concurrent/CancellationException",
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
+            RuntimeError::RejectedExecutionException { message } => (
+                "java/util/concurrent/RejectedExecutionException",
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             RuntimeError::IllegalCallerException { message } => {
                 // Task #57: route the new variant to `java.lang.IllegalCallerException`
                 // so the Panama native-access gate raises the JDK-conventional class
@@ -1927,7 +1970,10 @@ mod tests {
             message: String::new(),
         };
         let (_, msg) = iae.as_java_throwable().unwrap();
-        assert!(msg.is_none(), "an empty IAE message means getMessage() == null");
+        assert!(
+            msg.is_none(),
+            "an empty IAE message means getMessage() == null"
+        );
 
         let iae = RuntimeError::IllegalArgumentException {
             message: "argument type mismatch".to_string(),

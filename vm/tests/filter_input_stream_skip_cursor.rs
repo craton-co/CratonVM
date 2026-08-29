@@ -80,7 +80,9 @@ fn compile_probe(java_home: Option<&str>) -> Option<PathBuf> {
         Ok(o) => o,
         // javac cannot be launched at all — the one legitimate skip.
         Err(e) => {
-            eprintln!("[filter_input_stream_skip_cursor] javac could not be executed: {e}; skipping");
+            eprintln!(
+                "[filter_input_stream_skip_cursor] javac could not be executed: {e}; skipping"
+            );
             return None;
         }
     };

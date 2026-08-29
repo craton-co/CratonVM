@@ -374,8 +374,7 @@ fn synthetic_arc_opted_in_value(runtime_value: Option<&str>) -> bool {
 }
 
 fn synthetic_arc_opted_in() -> bool {
-    let runtime_value =
-        cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
+    let runtime_value = cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
     synthetic_arc_opted_in_value(runtime_value.as_deref())
 }
 
@@ -1256,11 +1255,14 @@ fn native_injectable_bean_get_bean_class(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Test fixture - tests that touch the container singleton serialize
     /// on this mutex so one test's state doesn't leak into another.

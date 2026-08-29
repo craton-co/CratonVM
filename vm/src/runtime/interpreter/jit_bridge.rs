@@ -421,8 +421,8 @@ pub(super) fn compile_osr_artifact(
                     // look at.
                     osr_stage("jit-scan-refused");
                     if crate::runtime::env_cache::dbg_jitc() {
-                        let (site, pc, op) = cratonvm_jit::take_jit_bail_site()
-                            .unwrap_or(("<unrecorded>", 0, 0));
+                        let (site, pc, op) =
+                            cratonvm_jit::take_jit_bail_site().unwrap_or(("<unrecorded>", 0, 0));
                         eprintln!(
                             "[cratonvm-jitc] osr-DENY (jit_scan refused: {site} @pc={pc} op=0x{op:02x}) {}.{}{}",
                             class_name, method_name, method_descriptor,
@@ -690,7 +690,10 @@ pub(super) fn compile_osr_artifact(
                 for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
                     // A malformed CP entry is still a whole-compile refusal.
                     let _ = class.constant_pool.get_class_name(cp_idx)?;
-                    mna_info.push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
+                    mna_info.push((
+                        pc,
+                        crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx),
+                    ));
                 }
             }
 
@@ -702,10 +705,36 @@ pub(super) fn compile_osr_artifact(
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.typecheck_ops {
                     let cn = class.constant_pool.get_class_name(cp_idx)?;
-                    let boxed: Box<str> = cn.to_string().into_boxed_str();
-                    let ptr = boxed.as_ptr();
-                    let len = boxed.len();
-                    owned_jit_strings2.push(boxed);
+                    // THE THIRD DOOR, and the last one still handing the
+                    // runtime helper a bare name. The other two — the ordinary
+                    // tiering door in `jit::try_compile_inner` and the eager
+                    // first-call door in `interpreter.rs` — both resolve the
+                    // site's `CONSTANT_Class` through THIS class's own defining
+                    // loader and intern the name under that `ClassId`, so that
+                    // `jit_checkcast` can compare ids instead of re-resolving a
+                    // name against a `(ClassLoaderId, name)`-keyed dictionary,
+                    // and so the JIT can compare them INLINE.
+                    //
+                    // This door did neither: it boxed a per-compilation copy of
+                    // the name, which recorded no id and, being a fresh address
+                    // every compile, could not even share the helper's
+                    // `(ptr, len)` memo with the other two doors' copies of the
+                    // same site.
+                    //
+                    // Measured: `CcProbe2`, a 20-million-iteration loop whose
+                    // body is one `(Node) o` cast, reported
+                    // `checkcast inline sites: single-pass=0 optimizing=0
+                    // refused-no-target-id=2` and 63,989,000 membership walks —
+                    // the inline compare could not fire ANYWHERE in it. A loop
+                    // is exactly what reaches this door, so "the hot case" and
+                    // "the door with no target id" were the same set. Third
+                    // time this shape has been recorded (the thin native binds,
+                    // the `String` call-site intrinsics): a bind at one compile
+                    // door is not a bind.
+                    let target_id = cm_lock
+                        .find_class_by_name_for_class(cn, class_id)
+                        .map(|id| id.as_u32());
+                    let (ptr, len) = cratonvm_jit::intern_typecheck_target(cn, target_id);
                     typecheck_info.push((pc, ptr, len));
                 }
             }
@@ -796,10 +825,8 @@ pub(super) fn compile_osr_artifact(
                             // a field-dense run. Naming the declaring class and
                             // index is what separates "no layout registered for
                             // this class" from "index outside the layout it has".
-                            let declaring = declaring_class_name_for_diag(
-                                shared,
-                                field.declaring_class_id,
-                            );
+                            let declaring =
+                                declaring_class_name_for_diag(shared, field.declaring_class_id);
                             eprintln!(
                                 "[compact-inline] MISS osr pc={pc} declaring={declaring} class_id={} field_index={} -> guarded-uniform arm (helper on every compact receiver)",
                                 field.declaring_class_id.as_u32(),
@@ -1026,9 +1053,7 @@ pub(super) fn compile_osr_artifact(
                             // hardly ever a `String` must not get one. See
                             // `cratonvm_jit::receiver_profile_rejects_guard`.
                             .filter(|&(_, _, _, guard_class_id)| {
-                                if guard_class_id == 0
-                                    || !cratonvm_jit::receiver_despec_enabled()
-                                {
+                                if guard_class_id == 0 || !cratonvm_jit::receiver_despec_enabled() {
                                     return true;
                                 }
                                 let supported = cratonvm_jit::receiver_profile_supports_guard(
@@ -1379,8 +1404,8 @@ pub(super) fn compile_osr_artifact(
                         && mn == "reachabilityFence"
                         && desc == "(Ljava/lang/Object;)V"
                     {
-                        let entry = crate::jit::helpers::jit_reachability_fence_direct
-                            as *const () as usize;
+                        let entry = crate::jit::helpers::jit_reachability_fence_direct as *const ()
+                            as usize;
                         cratonvm_jit::REACHABILITY_FENCE_SITES
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         direct_calls2.push((
@@ -1527,8 +1552,8 @@ pub(super) fn compile_osr_artifact(
                             .read()
                             .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
                             .map(|id| id.as_u32());
-                        if let Some((entry, num_params, ret, guard_class_id)) =
-                            atomic_long_cid.and_then(|cid| {
+                        if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_cid
+                            .and_then(|cid| {
                                 cratonvm_jit::try_resolve_atomic_long_intrinsic(
                                     &target_class,
                                     &mn,
@@ -1892,9 +1917,9 @@ pub(super) fn compile_osr_artifact(
             // anywhere in a method denied OSR to every loop in it, for the life
             // of the process.
             if indy_info.len() != scan.indy_ops.len()
-                || indy_info.iter().any(|(_, _, ret_type, _, bridge_site)| {
-                    *bridge_site == 0 || *ret_type == b'V'
-                })
+                || indy_info
+                    .iter()
+                    .any(|(_, _, ret_type, _, bridge_site)| *bridge_site == 0 || *ret_type == b'V')
             {
                 if crate::runtime::env_cache::dbg_jitc() && !scan.indy_ops.is_empty() {
                     eprintln!(
@@ -2220,7 +2245,6 @@ pub(super) fn compile_osr_artifact(
                 owned_jit_invoke_infos2.push(info);
                 invoke_info.push((ipc, info_ptr));
             }
-
 
             // Resolve ldc/ldc_w constants. String constants are wired the
             // same way as `jit::try_compile`'s cp_ldc_resolver (boxed text
@@ -3145,11 +3169,10 @@ pub(super) fn try_osr(
     let _qd0 = cratonvm_gc::gc_quiescence::depth();
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = {
-        let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
-                &*compiled,
-                Some(thread.frames.len()),
-            );
+        let _jit_root_guard = crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+            &*compiled,
+            Some(thread.frames.len()),
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
             // was validated; `plan` is the proof, obtained from
@@ -4040,7 +4063,6 @@ pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
 /// A relaxation that widens what the JIT will compile is not free of risk, and
 /// this one has no measurement to pay for it.
 pub(super) fn jit_invoke_targets_native_shadow(
-
     shared: &SharedVm,
     caller_class_id: ClassId,
     cp_idx: u16,
@@ -4302,7 +4324,11 @@ pub(super) fn jit_method_calls_forced_class_generic_metadata(
 /// `field_resolver` precedent (resolve-with-load BEFORE taking the inner `cm`
 /// read), so no VM read lock is alive across the load. MUST NOT be called with
 /// a `class_manager` lock already held.
-pub(super) fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_idx: u16) -> bool {
+pub(super) fn resolve_jit_elidable_init_loading(
+    shared: &SharedVm,
+    holder_cid: ClassId,
+    cp_idx: u16,
+) -> bool {
     // 1. Extract the target class name + confirm a no-arg `<init>()V` ref
     //    (brief `cm` read, dropped before the load).
     let target_name = {
@@ -4388,7 +4414,6 @@ pub(super) fn try_jit_upgrade(
     );
     try_jit_upgrade_with_gate(shared, cached, gate)
 }
-
 
 /// How many compiled field sites were refused because the field the resolver
 /// FOUND does not have the descriptor the constant pool NAMED.
@@ -4517,13 +4542,12 @@ fn jit_ldc_constant_for(
         {
             // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
             // `(class, cp index)`.
-            class
-                .constant_pool
-                .get_utf8(*string_index)
-                .map(|_| cratonvm_jit::JitLdcConstant::String {
+            class.constant_pool.get_utf8(*string_index).map(|_| {
+                cratonvm_jit::JitLdcConstant::String {
                     holder_class_id: holder.as_u32(),
                     cp_idx,
-                })
+                }
+            })
         }
         // `ldc <Class>`: the mirror is a heap object and the target class may
         // not be loaded yet, so report the SITE and let `helpers.ldc_class_cp`
@@ -5083,687 +5107,680 @@ pub(super) fn try_jit_upgrade_with_gate(
 
     // Callee compiler: given (class_name, method_name, descriptor), try to JIT-compile
     // the callee and return (entry_ptr, needs_context). Used for cross-method direct calls.
-    let callee_compiler =
-        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
-            // RFJP.1 (RETIRED, lever-only) — refuse a callee on a class
-            // transitively extending `java/util/concurrent/ForkJoinTask`.
-            // Inert unless `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`; matches
-            // `try_jit_compile_callee`.
-            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
-                cratonvm_jit::note_direct_callee_bind_refusal(
-                    cratonvm_jit::DirectBindRefusal::FjpBlocklist,
-                );
-                return None;
-            }
-            // S111r15 — refuse to compile a callee that has a Rust native
-            // shadow. Mirrors the gate in `try_jit_compile_callee` /
-            // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
-            // this check, the recursive callee-compile path direct-called
-            // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
-            // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
-            // and the resulting machine code returned 0 for most inputs
-            // after warm-up. Result: Spring's
-            // `BeanPropertyName.toDashedForm` produced
-            // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
-            // `InvalidConfigurationPropertyNameException` in SportMe.
-            if shared
-                .natives
-                .native_methods
-                .find(callee_class, callee_method, callee_desc)
-                .is_some()
+    let callee_compiler = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<(usize, bool)> {
+        // RFJP.1 (RETIRED, lever-only) — refuse a callee on a class
+        // transitively extending `java/util/concurrent/ForkJoinTask`.
+        // Inert unless `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`; matches
+        // `try_jit_compile_callee`.
+        if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+            cratonvm_jit::note_direct_callee_bind_refusal(
+                cratonvm_jit::DirectBindRefusal::FjpBlocklist,
+            );
+            return None;
+        }
+        // S111r15 — refuse to compile a callee that has a Rust native
+        // shadow. Mirrors the gate in `try_jit_compile_callee` /
+        // `try_jit_upgrade_with_gate` / first-call JIT / OSR. Without
+        // this check, the recursive callee-compile path direct-called
+        // `Character.toLowerCase(C)C`'s JDK bytecode (which delegates
+        // to `(I)I` → `CharacterData.of/toLowerCase` virtual chain),
+        // and the resulting machine code returned 0 for most inputs
+        // after warm-up. Result: Spring's
+        // `BeanPropertyName.toDashedForm` produced
+        // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
+        // `InvalidConfigurationPropertyNameException` in SportMe.
+        if shared
+            .natives
+            .native_methods
+            .find(callee_class, callee_method, callee_desc)
+            .is_some()
+        {
+            cratonvm_jit::note_direct_callee_bind_refusal(
+                cratonvm_jit::DirectBindRefusal::NativeShadow,
+            );
+            return None;
+        }
+        // A direct compiled entry has no interpreter boundary to route an
+        // implicit exception through the callee's own handler. Keep only
+        // those methods on the checked dispatch path.
+        {
+            let cm = shared.classes.class_manager.read();
+            if let Some(callee_cid) =
+                cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
             {
-                cratonvm_jit::note_direct_callee_bind_refusal(
-                    cratonvm_jit::DirectBindRefusal::NativeShadow,
-                );
-                return None;
-            }
-            // A direct compiled entry has no interpreter boundary to route an
-            // implicit exception through the callee's own handler. Keep only
-            // those methods on the checked dispatch path.
-            {
-                let cm = shared.classes.class_manager.read();
-                if let Some(callee_cid) =
-                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
-                {
-                    let store = cm.class_store();
-                    if let Some((method, _decl)) = crate::classloading::find_method_recursive(
-                        callee_cid,
-                        callee_method,
-                        callee_desc,
-                        store,
-                    ) {
-                        // Sibling of the same gate in `direct_callee_lookup`.
-                        if method
-                            .code()
-                            .map_or(false, |code| !code.exception_table.is_empty())
-                            && !cratonvm_jit::direct_call_exc_table_publish_enabled()
-                        {
-                            cratonvm_jit::note_direct_callee_bind_refusal(
-                                cratonvm_jit::DirectBindRefusal::CalleeExceptionTable,
-                            );
-                            return None;
-                        }
-                    }
-                }
-            }
-            // Check JIT cache first
-            let callee_class_arc: Arc<str> = Arc::from(callee_class);
-            let callee_method_arc: Arc<str> = Arc::from(callee_method);
-            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
-            {
-                let callee_class_id = shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .find_class_by_name_for_class(callee_class, cached.declaring_class_id)
-                    .unwrap_or(ClassId::new(0));
-                let jit_cache = shared.jit.jit_cache.read();
-                if let Some(compiled) = jit_cache.get(
-                    &callee_class_arc,
-                    &callee_method_arc,
-                    &callee_desc_arc,
-                    callee_class_id,
+                let store = cm.class_store();
+                if let Some((method, _decl)) = crate::classloading::find_method_recursive(
+                    callee_cid,
+                    callee_method,
+                    callee_desc,
+                    store,
                 ) {
-                    // jit-invokedynamic-groovy-regression fix: never bake a
-                    // direct machine-code CALL to an artifact containing an
-                    // unconditional invokedynamic trap — its sentinel +
-                    // stashed frame would bail through the compiled CALLER's
-                    // epilogue, past the only point (a dispatch helper) that
-                    // can resume the callee precisely. Returning None keeps
-                    // the site on `jit_invoke_dispatch`, whose
-                    // `try_resume_trapped_callee` resolves the trap in place.
-                    if compiled.has_indy_trap {
+                    // Sibling of the same gate in `direct_callee_lookup`.
+                    if method
+                        .code()
+                        .map_or(false, |code| !code.exception_table.is_empty())
+                        && !cratonvm_jit::direct_call_exc_table_publish_enabled()
+                    {
                         cratonvm_jit::note_direct_callee_bind_refusal(
-                            cratonvm_jit::DirectBindRefusal::IndyTrap,
+                            cratonvm_jit::DirectBindRefusal::CalleeExceptionTable,
                         );
                         return None;
                     }
-                    // Cast: object/code pointer to integer address
-                    return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
-                    // Cast: JIT entry point to address
                 }
             }
-
-            // Look up the callee class and method
-            let cm = shared.classes.class_manager.read();
-            let callee_class_id =
-                cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)?;
-            let store = cm.class_store();
-            let (method, declaring_id) = crate::classloading::find_method_recursive(
+        }
+        // Check JIT cache first
+        let callee_class_arc: Arc<str> = Arc::from(callee_class);
+        let callee_method_arc: Arc<str> = Arc::from(callee_method);
+        let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+        {
+            let callee_class_id = shared
+                .classes
+                .class_manager
+                .read()
+                .find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                .unwrap_or(ClassId::new(0));
+            let jit_cache = shared.jit.jit_cache.read();
+            if let Some(compiled) = jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
                 callee_class_id,
-                callee_method,
-                callee_desc,
-                store,
-            )?;
-            // Direct callee compilation must share the synchronized-method gate.
-            if method.is_synchronized() {
-                cratonvm_jit::note_direct_callee_bind_refusal(
-                    cratonvm_jit::DirectBindRefusal::Synchronized,
-                );
-                return None;
-            }
-
-            let code_attr = method.code()?;
-
-            // jit-invokestatic-clinit-gap fix (2026-07-17): JVMS §5.5
-            // requires a class be initialized before the first invocation
-            // of any of its own (not inherited) static methods -- the same
-            // trigger family as the `jit_getstatic`/`jit_putstatic_*`/
-            // `jit_new_object` fixes above, but for `invokestatic`. This
-            // closure builds a raw machine-code CALL straight to the
-            // callee's compiled entry point (`direct_calls` in
-            // `jit/src/lib.rs`), bypassing BOTH the interpreter's own
-            // `execute_invokestatic` (which calls
-            // `ensure_class_initialized_shared` unconditionally before
-            // every dispatch) and the JIT's generic fallback dispatch
-            // helper (`jit_invoke_dispatch` -> `invoke_or_native` ->
-            // `invoke_shared`, which also checks). Once a JIT-compiled
-            // caller takes this direct-call fast path for an invokestatic
-            // site, that site never routes through either checked path
-            // again -- if the callee's declaring class hadn't been
-            // initialized yet the moment this closure ran, it may never
-            // get initialized before the direct CALL first executes.
-            //
-            // A class's initialized state is monotonic per JVMS (once
-            // Initialized, it never reverts), so checking ONCE here, at
-            // compile time, is sound forever for this call site. Only take
-            // the direct-call fast path when the callee is a `static`
-            // method (the actual JVMS trigger -- `invokespecial`'s
-            // `<init>`/private/super calls reach this same closure but
-            // don't independently require class init, since their
-            // receiver's class was already initialized via `new`) AND its
-            // declaring class is ALREADY initialized. Otherwise return
-            // `None`, which drops the call site to the generic dispatch
-            // fallback (`jit_invoke_dispatch`) -- correctness-safe (that
-            // path checks), just not the fast path for this one call site
-            // until a future recompile (e.g. after the class initializes
-            // and the caller tiers up again). `is_class_initialized_fast`
-            // reads the embedded per-`Class` atomic directly with no extra
-            // lock -- `cm`'s read guard above (borrowed by `store`) is
-            // still live here -- mirroring
-            // `ensure_class_initialized_shared`'s own fast path.
-            if method.is_static() {
-                let declaring_class_initialized = store
-                    .get(declaring_id)
-                    .map(crate::vm::is_class_initialized_fast)
-                    .unwrap_or(false);
-                if !declaring_class_initialized {
+            ) {
+                // jit-invokedynamic-groovy-regression fix: never bake a
+                // direct machine-code CALL to an artifact containing an
+                // unconditional invokedynamic trap — its sentinel +
+                // stashed frame would bail through the compiled CALLER's
+                // epilogue, past the only point (a dispatch helper) that
+                // can resume the callee precisely. Returning None keeps
+                // the site on `jit_invoke_dispatch`, whose
+                // `try_resume_trapped_callee` resolves the trap in place.
+                if compiled.has_indy_trap {
                     cratonvm_jit::note_direct_callee_bind_refusal(
-                        cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized,
+                        cratonvm_jit::DirectBindRefusal::IndyTrap,
                     );
                     return None;
                 }
+                // Cast: object/code pointer to integer address
+                return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
+                // Cast: JIT entry point to address
             }
+        }
 
-            let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
-            let source_file = store
+        // Look up the callee class and method
+        let cm = shared.classes.class_manager.read();
+        let callee_class_id =
+            cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)?;
+        let store = cm.class_store();
+        let (method, declaring_id) = crate::classloading::find_method_recursive(
+            callee_class_id,
+            callee_method,
+            callee_desc,
+            store,
+        )?;
+        // Direct callee compilation must share the synchronized-method gate.
+        if method.is_synchronized() {
+            cratonvm_jit::note_direct_callee_bind_refusal(
+                cratonvm_jit::DirectBindRefusal::Synchronized,
+            );
+            return None;
+        }
+
+        let code_attr = method.code()?;
+
+        // jit-invokestatic-clinit-gap fix (2026-07-17): JVMS §5.5
+        // requires a class be initialized before the first invocation
+        // of any of its own (not inherited) static methods -- the same
+        // trigger family as the `jit_getstatic`/`jit_putstatic_*`/
+        // `jit_new_object` fixes above, but for `invokestatic`. This
+        // closure builds a raw machine-code CALL straight to the
+        // callee's compiled entry point (`direct_calls` in
+        // `jit/src/lib.rs`), bypassing BOTH the interpreter's own
+        // `execute_invokestatic` (which calls
+        // `ensure_class_initialized_shared` unconditionally before
+        // every dispatch) and the JIT's generic fallback dispatch
+        // helper (`jit_invoke_dispatch` -> `invoke_or_native` ->
+        // `invoke_shared`, which also checks). Once a JIT-compiled
+        // caller takes this direct-call fast path for an invokestatic
+        // site, that site never routes through either checked path
+        // again -- if the callee's declaring class hadn't been
+        // initialized yet the moment this closure ran, it may never
+        // get initialized before the direct CALL first executes.
+        //
+        // A class's initialized state is monotonic per JVMS (once
+        // Initialized, it never reverts), so checking ONCE here, at
+        // compile time, is sound forever for this call site. Only take
+        // the direct-call fast path when the callee is a `static`
+        // method (the actual JVMS trigger -- `invokespecial`'s
+        // `<init>`/private/super calls reach this same closure but
+        // don't independently require class init, since their
+        // receiver's class was already initialized via `new`) AND its
+        // declaring class is ALREADY initialized. Otherwise return
+        // `None`, which drops the call site to the generic dispatch
+        // fallback (`jit_invoke_dispatch`) -- correctness-safe (that
+        // path checks), just not the fast path for this one call site
+        // until a future recompile (e.g. after the class initializes
+        // and the caller tiers up again). `is_class_initialized_fast`
+        // reads the embedded per-`Class` atomic directly with no extra
+        // lock -- `cm`'s read guard above (borrowed by `store`) is
+        // still live here -- mirroring
+        // `ensure_class_initialized_shared`'s own fast path.
+        if method.is_static() {
+            let declaring_class_initialized = store
                 .get(declaring_id)
-                .and_then(|c| c.source_file.as_deref())
-                .map(Arc::from);
-            let num_params = count_method_params(callee_desc);
-
-            let callee_cached = CachedBytecodeMethod {
-                declaring_class_id: declaring_id,
-                class_name: Arc::from(declaring_class_name),
-                method_name: Arc::from(callee_method),
-                method_descriptor: Arc::from(callee_desc),
-                source_file,
-                code: crate::runtime::frame::padded_bytecode(&code_attr.code),
-                exception_table: Arc::from(code_attr.exception_table.as_slice()),
-                max_stack: code_attr.max_stack,
-                max_locals: code_attr.max_locals,
-                num_params: num_params as u16, // Widening: parameter count conversion
-                is_synchronized: method.is_synchronized(),
-                is_static: method.is_static(),
-                force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
-                native_callback_cache: std::sync::OnceLock::new(),
-                invoc_key: std::sync::OnceLock::new(),
-                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
-                quickened: std::sync::OnceLock::new(),
-            };
-            drop(cm);
-
-            // S-HIB.1 twin — apply the static skip list to recursive callee
-            // compilations from THIS closure too. Before this check, the
-            // closure honored only the FJP blocklist + native-shadow gate, so
-            // a threshold compile could silently callee-compile methods every
-            // other path bans: complex `<init>`/`<clinit>` bodies (observed:
-            // `java/util/regex/Pattern.<init>` attempted during the
-            // `Pattern.compile` upgrade), `is_known_miscompile` entries, and
-            // anything in `CRATONVM_JIT_BISECT_SKIP` — which also made
-            // skip-based bisection silently unsound for any method reachable
-            // as a direct callee. Mirrors `try_jit_compile_callee`.
-            {
-                // The static JIT ban list was deleted 2026-07-31 (see
-                // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
-                // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
-                // remaining force-interpret lever, applied in `jit::try_compile`.
-                // GPU-offload JIT admission gate — see offload_jit_gate.
-                #[cfg(feature = "gpu-offload")]
-                if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
-                    shared,
-                    callee_cached.declaring_class_id,
-                    callee_method,
-                    &callee_cached.method_descriptor,
-                ) {
-                    return None;
-                }
+                .map(crate::vm::is_class_initialized_fast)
+                .unwrap_or(false);
+            if !declaring_class_initialized {
+                cratonvm_jit::note_direct_callee_bind_refusal(
+                    cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized,
+                );
+                return None;
             }
+        }
 
-            // Build resolvers for the callee's constant pool
-            let callee_cid = declaring_id;
-            let c_resolver = |cp_idx: u16| -> Option<String> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                class
-                    .constant_pool
-                    .get_class_name(cp_idx)
-                    .map(|s| s.to_string())
+        let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+        let source_file = store
+            .get(declaring_id)
+            .and_then(|c| c.source_file.as_deref())
+            .map(Arc::from);
+        let num_params = count_method_params(callee_desc);
+
+        let callee_cached = CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: Arc::from(declaring_class_name),
+            method_name: Arc::from(callee_method),
+            method_descriptor: Arc::from(callee_desc),
+            source_file,
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: num_params as u16, // Widening: parameter count conversion
+            is_synchronized: method.is_synchronized(),
+            is_static: method.is_static(),
+            force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        };
+        drop(cm);
+
+        // S-HIB.1 twin — apply the static skip list to recursive callee
+        // compilations from THIS closure too. Before this check, the
+        // closure honored only the FJP blocklist + native-shadow gate, so
+        // a threshold compile could silently callee-compile methods every
+        // other path bans: complex `<init>`/`<clinit>` bodies (observed:
+        // `java/util/regex/Pattern.<init>` attempted during the
+        // `Pattern.compile` upgrade), `is_known_miscompile` entries, and
+        // anything in `CRATONVM_JIT_BISECT_SKIP` — which also made
+        // skip-based bisection silently unsound for any method reachable
+        // as a direct callee. Mirrors `try_jit_compile_callee`.
+        {
+            // The static JIT ban list was deleted 2026-07-31 (see
+            // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+            // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+            // remaining force-interpret lever, applied in `jit::try_compile`.
+            // GPU-offload JIT admission gate — see offload_jit_gate.
+            #[cfg(feature = "gpu-offload")]
+            if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+                shared,
+                callee_cached.declaring_class_id,
+                callee_method,
+                &callee_cached.method_descriptor,
+            ) {
+                return None;
+            }
+        }
+
+        // Build resolvers for the callee's constant pool
+        let callee_cid = declaring_id;
+        let c_resolver = |cp_idx: u16| -> Option<String> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            class
+                .constant_pool
+                .get_class_name(cp_idx)
+                .map(|s| s.to_string())
+        };
+        let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
+            let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let nat_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => *name_and_type_index,
+                _ => return None,
             };
-            let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
-                let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
-                    return None;
-                }
-                // `None` ⇒ no genuine compact slot — do NOT fabricate
-                // `(0, false)` (see the sibling resolver's comment).
-                Some((
-                    field.field_index,
-                    type_tag,
-                    cratonvm_types::compact_field_slot(
-                        field.declaring_class_id.as_u32(),
-                        field.field_index,
-                    )
-                    .map(|(o, r)| (o as u32, r)),
-                ))
-            };
-            let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
-                let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let nat_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::FieldReference {
-                        name_and_type_index,
-                        ..
-                    }) => *name_and_type_index,
-                    _ => return None,
-                };
-                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let type_tag = *descriptor.as_bytes().first()?;
-                if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
-                    return None;
-                }
-                Some((
+            let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            let type_tag = *descriptor.as_bytes().first()?;
+            if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                return None;
+            }
+            // `None` ⇒ no genuine compact slot — do NOT fabricate
+            // `(0, false)` (see the sibling resolver's comment).
+            Some((
+                field.field_index,
+                type_tag,
+                cratonvm_types::compact_field_slot(
                     field.declaring_class_id.as_u32(),
                     field.field_index,
-                    type_tag,
-                    field.is_volatile,
-                ))
+                )
+                .map(|(o, r)| (o as u32, r)),
+            ))
+        };
+        let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
+            let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let nat_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::FieldReference {
+                    name_and_type_index,
+                    ..
+                }) => *name_and_type_index,
+                _ => return None,
             };
-            let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    Some(ConstantPoolEntry::InterfaceMethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index),
-                    _ => return None,
-                };
-                let target_class = class.constant_pool.get_class_name(class_idx)?;
-                let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                Some((
-                    target_class.to_string(),
-                    method_name.to_string(),
-                    descriptor.to_string(),
-                ))
+            let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            let type_tag = *descriptor.as_bytes().first()?;
+            if !jit_field_tag_agrees(&field, type_tag, cp_idx) {
+                return None;
+            }
+            Some((
+                field.declaring_class_id.as_u32(),
+                field.field_index,
+                type_tag,
+                field.is_volatile,
+            ))
+        };
+        let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::MethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index),
+                Some(ConstantPoolEntry::InterfaceMethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index),
+                _ => return None,
             };
-            // JVMS §6.5 `invokespecial` super-call redirect for the callee's
-            // own constant pool — see `invokespecial_owner_resolver` above /
-            // `try_compile`'s doc comment. `callee_cid` is the class whose
-            // bytecode is being compiled here (the eagerly-compiled callee),
-            // i.e. the calling class for every invoke site in ITS bytecode.
-            let c_invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index, false),
-                    Some(ConstantPoolEntry::InterfaceMethodReference {
-                        class_index,
-                        name_and_type_index,
-                        ..
-                    }) => (*class_index, *name_and_type_index, true),
-                    _ => return None,
-                };
-                let target_class = class.constant_pool.get_class_name(class_idx)?;
-                let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
-                // method selects exactly that method: no override lookup, no walk up
-                // from the receiver. javac emits 0xb6 for a call to a private instance
-                // method from Java 11 on (JEP 181 nestmates), where it used to emit
-                // `invokespecial` -- so this is now the ordinary encoding of
-                // `this.somePrivateHelper()`, including the
-                // constructor-calls-its-own-`init()` shape that
-                // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
-                // `HttpClientOptions` all use, one per level of the same chain.
-                //
-                // Answering here reclassifies the site as a DIRECT bind at the
-                // declaring class, which is what stops the compiled dispatchers
-                // resolving it from the receiver and landing on the most-derived
-                // same-named private method.
-                //
-                // Access control makes the answer precise rather than a guess: a
-                // private method is invocable only from the class that declares it, so
-                // the constant pool's owner name is this compiling class itself and no
-                // loader-blind name lookup is in play.
-                if opcode == 0xb6 {
-                    let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
-                    let store = cm.class_store();
-                    if let Some(declaring_id) = crate::classloading::invokevirtual_private_declaring_class(
+            let target_class = class.constant_pool.get_class_name(class_idx)?;
+            let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            Some((
+                target_class.to_string(),
+                method_name.to_string(),
+                descriptor.to_string(),
+            ))
+        };
+        // JVMS §6.5 `invokespecial` super-call redirect for the callee's
+        // own constant pool — see `invokespecial_owner_resolver` above /
+        // `try_compile`'s doc comment. `callee_cid` is the class whose
+        // bytecode is being compiled here (the eagerly-compiled callee),
+        // i.e. the calling class for every invoke site in ITS bytecode.
+        let c_invokespecial_owner_resolver = |cp_idx: u16, opcode: u8| -> Option<String> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::MethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index, false),
+                Some(ConstantPoolEntry::InterfaceMethodReference {
+                    class_index,
+                    name_and_type_index,
+                    ..
+                }) => (*class_index, *name_and_type_index, true),
+                _ => return None,
+            };
+            let target_class = class.constant_pool.get_class_name(class_idx)?;
+            let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+            // JVMS 5.4.6 -- an `invokevirtual` (0xb6) that resolves to a PRIVATE
+            // method selects exactly that method: no override lookup, no walk up
+            // from the receiver. javac emits 0xb6 for a call to a private instance
+            // method from Java 11 on (JEP 181 nestmates), where it used to emit
+            // `invokespecial` -- so this is now the ordinary encoding of
+            // `this.somePrivateHelper()`, including the
+            // constructor-calls-its-own-`init()` shape that
+            // `io/vertx/core/net/TCPSSLOptions`, `ClientOptionsBase` and
+            // `HttpClientOptions` all use, one per level of the same chain.
+            //
+            // Answering here reclassifies the site as a DIRECT bind at the
+            // declaring class, which is what stops the compiled dispatchers
+            // resolving it from the receiver and landing on the most-derived
+            // same-named private method.
+            //
+            // Access control makes the answer precise rather than a guess: a
+            // private method is invocable only from the class that declares it, so
+            // the constant pool's owner name is this compiling class itself and no
+            // loader-blind name lookup is in play.
+            if opcode == 0xb6 {
+                let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
+                let store = cm.class_store();
+                if let Some(declaring_id) =
+                    crate::classloading::invokevirtual_private_declaring_class(
                         cp_class_id,
                         method_name,
                         descriptor,
                         store,
-                    ) {
-                        return store.get(declaring_id).map(|c| c.name.to_string());
-                    }
-                    // Not private, but possibly unoverridable anyway — a `final`
-                    // method, or any method of a `final` class, has exactly one
-                    // possible target at this site for the same reason a private one
-                    // does. Same conclusion (statically bound; substitute the
-                    // DECLARING class, which for this rule is often NOT the class the
-                    // constant pool names), reached by a different argument. Both
-                    // rules live outside this file — the private one in
-                    // `classloading::invokevirtual_private_declaring_class`, this one
-                    // in `invoke::invokevirtual_site_final_owner` — so these three
-                    // per-door copies cannot drift apart on either.
-                    return super::invoke::invokevirtual_site_final_owner(
-                        &cm,
-                        callee_cid,
-                        target_class,
-                        method_name,
-                        descriptor,
-                    );
-                }
-                if opcode != 0xb7 {
-                    return None;
-                }
-                let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
-                let store = cm.class_store();
-                let start = crate::classloading::invokespecial_selection_start(
-                    callee_cid,
-                    cp_class_id,
-                    is_iface,
-                    method_name,
-                    store,
-                );
-                if start == cp_class_id {
-                    return None;
-                }
-                store.get(start).map(|c| c.name.to_string())
-            };
-            // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
-            // index to its target descriptor for the callee's constant pool.
-            let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<(String, usize)> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::InvokeDynamic {
-                        name_and_type_index,
-                        ..
-                    } => class
-                        .constant_pool
-                        .get_name_and_type(*name_and_type_index)
-                        .map(|(_name, descriptor)| {
-                            (
-                                descriptor.to_string(),
-                                crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
-                                    &class.constant_pool,
-                                    &class.bootstrap_methods,
-                                    cp_idx,
-                                    callee_cid,
-                                )
-                                .unwrap_or(0),
-                            )
-                        }),
-                    _ => None,
-                }
-            };
-
-            // new/anewarray resolver for callee's constant pool
-            let c_new_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitNewSite> {
-                let cm = shared.classes.class_manager.read();
-                resolve_jit_new_site(&cm, callee_cid, cp_idx)
-            };
-            // PGO-02: receiver class-id -> class-name resolver for a guarded
-                // speculative virtual/interface inline plan's SpeculatedReceiver
-                // invalidation dependency (plan_inline's fail-closed rule — see
-                // docs/feature-designs/profile-guided-inlining.md). `None` (id not
-                // loaded, or unloaded between profiling and compiling) refuses
-                // that one speculation rather than recording an unmatchable
-                // name-less dependency.
-            let c_class_id_namer = |cid: u32| -> Option<String> {
-                let cm = shared.classes.class_manager.read();
-                cm.get_class(cratonvm_types::ClassId::new(cid))
-                    .map(|c| c.name.to_string())
-            };
-            // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a
-            // site declared `(cp_class, name, desc)`. The guard admits a runtime
-            // class, so this — not the constant-pool callee — is what may be
-            // spliced behind it. See `resolve_receiver_inline_site`.
-            let c_receiver_inline_resolver =
-                |cid: u32, cp_class: &str, name: &str, desc: &str| {
-                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
-                };
-            // The optimizing tier's own inline resolver for this callee compile.
-            let c_ir_inline_resolver =
-                |callee_class: &str, callee_method: &str, callee_desc: &str| {
-                    resolve_ir_inline_site(
-                        shared,
-                        callee_cid,
-                        callee_class,
-                        callee_method,
-                        callee_desc,
                     )
-                };
-            // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
-            // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
-            let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
-            let c_elidable_init_resolver = |cp_idx: u16| -> bool {
-                resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx)
-            };
-            // invoke class-id resolver for the callee's constant pool — maps
-            // an invoke* CP index to its declared class id, for the CRC32/
-            // CRC32C `update` receiver class-id guard.
-            let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let class_idx = match class.constant_pool.get(cp_idx) {
-                    Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
-                    Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => {
-                        *class_index
-                    }
-                    _ => return None,
-                };
-                let target_class = class.constant_pool.get_class_name(class_idx)?;
-                Some(
-                    cm.find_class_by_name_for_class(target_class, callee_cid)?
-                        .as_u32(),
-                )
-            };
-
-            let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
-                let cm = shared.classes.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                // inc 35: `(bits, is_double)`.
-                match class.constant_pool.get(cp_idx)? {
-                    ConstantPoolEntry::Long(v) => Some((*v, false)),
-                    ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
-                    _ => None,
+                {
+                    return store.get(declaring_id).map(|c| c.name.to_string());
                 }
-            };
-
-            // RBC.2 — `ldc`/`ldc_w` int/float constants. Without this resolver
-            // every method containing an `ldc` (e.g. BC's `Nat*.gte` loading
-            // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
-            // interpreted forever. String/Class ldc returns None → compile
-            // bails (matches the OSR path's behaviour).
-            let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
-                let cm = shared.classes.class_manager.read();
-                jit_ldc_constant_for(&cm, callee_cid, cp_idx)
-            };
-
-            // Compile callee without recursive inlining (None for callee_compiler)
-            let c_pgo_profile = {
-                let profile_key = crate::jit::profile::MethodKey {
-                    class_id: callee_cached.declaring_class_id.as_u32(),
-                    method_name: callee_cached.method_name.clone(),
-                    descriptor: callee_cached.method_descriptor.clone(),
-                };
-                shared.jit.profile_store.get_profile(&profile_key)
-            };
-            let c_helpers = crate::jit::helpers::build_helpers_for(shared);
-            let c_string_layout_resolver = || resolve_string_field_layout(shared);
-            crate::jit::set_self_call_identity_stable(self_call_identity_stable(
-                shared,
-                callee_cached.declaring_class_id,
-            ));
-            // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
-            // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
-            // and for anything unregistered, which is the fail-closed direction.
-            // Cheap: only the strict arm of `direct_native_helper` calls it, and only
-            // for a triple whose helper cell is already non-zero.
-            let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
-                let registry = &shared.natives.native_methods;
-                registry
-                    .resolve_id(class, method, descriptor)
-                    .and_then(|id| registry.kind_of_id(id))
-                    .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
-            };
-            
-            let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
-                &callee_cached,
-                Some(&c_resolver),
-                Some(&c_field_resolver),
-                Some(&c_static_field_resolver),
-                Some(&c_invoke_resolver),
-                Some(&c_invokespecial_owner_resolver),
-                None, // no recursive inlining
-                Some(&c_new_resolver),
-                Some(&c_ldc_resolver),
-                Some(&c_ldc2w_resolver),
-                c_pgo_profile.as_ref(),
-                &c_helpers,
-                None, // no inlining in early-compile path
-                // String call-site intrinsics (length/charAt/hashCode/equals/…):
-                // resolve java/lang/String's value/coder/hash field layout so the
-                // JIT inlines these accessors instead of crossing the VM→native
-                // boundary per call (bug-03). `resolve_string_field_layout`
-                // returns None → intrinsics bail to dispatch when String isn't
-                // loaded yet.
-                Some(&c_string_layout_resolver),
-                Some(&c_invoke_class_id_resolver),
-                if c_scalar_new_on {
-                    Some(&c_elidable_init_resolver)
-                } else {
-                    None
-                },
-                // Early-compile path is the optimized (C2-equivalent) tier — the
-                // tiered C1 routing only flows through the background worker.
-                true,
-                // Gap B: int-only invokestatic → Op::Call. Now default-ON
-                // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
-                // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
-                // opt-out — restores single-pass dispatch for invokestatic.
-                crate::runtime::env_cache::jit_ir_call(),
-                // inc 24/29: invokespecial → Op::Call. Now default-ON;
-                // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
-                crate::runtime::env_cache::jit_ir_call_special(),
-                // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
-                crate::runtime::env_cache::jit_ir_long(),
-                // inc 26 + inline-cache lowering: invokevirtual/invokeinterface
-                // → Op::Call with MIC/PIC fast paths. Default-ON now that the IR
-                // backend has parity with single-pass dispatch;
-                // `CRATONVM_JIT_IR_CALL_VIRTUAL=0` opts out.
-                crate::runtime::env_cache::jit_ir_call_virtual(),
-                // inc 30 + Slices A/B/C: double/float XMM value tier. Now
-                // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
-                // FP-slot deopt resume all landed) and validated == HotSpot
-                // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
-                // is the opt-out (restores the int/long/ref-only IR path).
-                crate::runtime::env_cache::jit_ir_fp(),
-                // invokedynamic-uncommon-trap fix: resolves an invokedynamic
-                // CP index to its target descriptor for the callee's pool.
-                Some(&c_indy_descriptor_resolver),
-                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
-                    Some(&c_class_id_namer)
-                } else {
-                    None
-                },
-                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
-                    Some(&c_receiver_inline_resolver)
-                } else {
-                    None
-                },
-                // IR-tier inlining. Behind its own gate; `None` splices nothing.
-                if cratonvm_jit::ir_inline_enabled() {
-                    Some(&c_ir_inline_resolver)
-                } else {
-                    None
-                },
-                    // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
-                    // latch the JIT read for itself, so a `Compatible` VM sharing a
-                    // process with a `JdkOnly` one lost the thin direct-call helpers.
-                    crate::vm::dispatch_policy(shared).is_jdk_only(),
-
-                    // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
-
-                    // the JIT's seven hard-coded triples, as the §1.4 verdict on
-
-                    // whether a thin direct-call helper may shadow real bytecode.
-
-                    Some(&intrinsic_resolver),
-            )?;
-            let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
-            let needs_ctx = compiled.needs_context();
-            // jit-invokedynamic-groovy-regression fix — see the matching gate
-            // at the JIT-cache-hit return above. The artifact is still cached
-            // (below) for helper/interpreter dispatch, but never handed back
-            // for a baked direct machine-code CALL.
-            let indy_trap = compiled.has_indy_trap;
-            if crate::runtime::env_cache::dbg_jitc() {
-                eprintln!(
-                    "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
-                    callee_cached.class_name,
-                    callee_cached.method_name,
-                    callee_cached.method_descriptor,
-                    compiled.entry_ptr(),
-                    compiled.code_bytes().len()
+                // Not private, but possibly unoverridable anyway — a `final`
+                // method, or any method of a `final` class, has exactly one
+                // possible target at this site for the same reason a private one
+                // does. Same conclusion (statically bound; substitute the
+                // DECLARING class, which for this rule is often NOT the class the
+                // constant pool names), reached by a different argument. Both
+                // rules live outside this file — the private one in
+                // `classloading::invokevirtual_private_declaring_class`, this one
+                // in `invoke::invokevirtual_site_final_owner` — so these three
+                // per-door copies cannot drift apart on either.
+                return super::invoke::invokevirtual_site_final_owner(
+                    &cm,
+                    callee_cid,
+                    target_class,
+                    method_name,
+                    descriptor,
                 );
             }
-            crate::jit::disasm::maybe_dump_annotated(
-                "callee",
-                &callee_cached.class_name,
-                &callee_cached.method_name,
-                &callee_cached.method_descriptor,
-                compiled.entry_ptr(),
-                compiled.code_bytes(),
-                compiled.osr_pc_to_native.as_deref(),
-                compiled.osr_local_assignments.as_deref(),
-            );
-
-            // Store in JIT cache
-            stamp_compilation_epoch(
-                shared,
-                &callee_cached.class_name,
-                &callee_cached.method_name,
-                &callee_cached.method_descriptor,
-                &mut compiled,
-            );
-            // Stamp the wrapped-entry requirement before the body is shared.
-            // See `CompiledMethod::requires_wrapped_entry`: publication is the
-            // last point that still knows this is an `ACC_SYNCHRONIZED` method,
-            // and every unwrapped consumer downstream holds only a raw entry
-            // pointer.
-            compiled.requires_wrapped_entry = callee_cached.is_synchronized;
-            {
-                let mut jit_cache = shared.jit.jit_cache.write();
-                jit_cache.put(
-                    callee_cached.class_name.clone(),
-                    callee_cached.method_name.clone(),
-                    callee_cached.method_descriptor.clone(),
-                    callee_cached.declaring_class_id,
-                    compiled,
-                );
-            }
-
-            if indy_trap {
+            if opcode != 0xb7 {
                 return None;
             }
-            Some((entry, needs_ctx))
+            let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
+            let store = cm.class_store();
+            let start = crate::classloading::invokespecial_selection_start(
+                callee_cid,
+                cp_class_id,
+                is_iface,
+                method_name,
+                store,
+            );
+            if start == cp_class_id {
+                return None;
+            }
+            store.get(start).map(|c| c.name.to_string())
         };
+        // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
+        // index to its target descriptor for the callee's constant pool.
+        let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<(String, usize)> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            match class.constant_pool.get(cp_idx)? {
+                ConstantPoolEntry::InvokeDynamic {
+                    name_and_type_index,
+                    ..
+                } => class
+                    .constant_pool
+                    .get_name_and_type(*name_and_type_index)
+                    .map(|(_name, descriptor)| {
+                        (
+                            descriptor.to_string(),
+                            crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
+                                &class.constant_pool,
+                                &class.bootstrap_methods,
+                                cp_idx,
+                                callee_cid,
+                            )
+                            .unwrap_or(0),
+                        )
+                    }),
+                _ => None,
+            }
+        };
+
+        // new/anewarray resolver for callee's constant pool
+        let c_new_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitNewSite> {
+            let cm = shared.classes.class_manager.read();
+            resolve_jit_new_site(&cm, callee_cid, cp_idx)
+        };
+        // PGO-02: receiver class-id -> class-name resolver for a guarded
+        // speculative virtual/interface inline plan's SpeculatedReceiver
+        // invalidation dependency (plan_inline's fail-closed rule — see
+        // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+        // loaded, or unloaded between profiling and compiling) refuses
+        // that one speculation rather than recording an unmatchable
+        // name-less dependency.
+        let c_class_id_namer = |cid: u32| -> Option<String> {
+            let cm = shared.classes.class_manager.read();
+            cm.get_class(cratonvm_types::ClassId::new(cid))
+                .map(|c| c.name.to_string())
+        };
+        // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a
+        // site declared `(cp_class, name, desc)`. The guard admits a runtime
+        // class, so this — not the constant-pool callee — is what may be
+        // spliced behind it. See `resolve_receiver_inline_site`.
+        let c_receiver_inline_resolver = |cid: u32, cp_class: &str, name: &str, desc: &str| {
+            resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
+        };
+        // The optimizing tier's own inline resolver for this callee compile.
+        let c_ir_inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| {
+            resolve_ir_inline_site(shared, callee_cid, callee_class, callee_method, callee_desc)
+        };
+        // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
+        // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
+        let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
+        let c_elidable_init_resolver =
+            |cp_idx: u16| -> bool { resolve_jit_elidable_init_loading(shared, callee_cid, cp_idx) };
+        // invoke class-id resolver for the callee's constant pool — maps
+        // an invoke* CP index to its declared class id, for the CRC32/
+        // CRC32C `update` receiver class-id guard.
+        let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            let class_idx = match class.constant_pool.get(cp_idx) {
+                Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
+                Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => {
+                    *class_index
+                }
+                _ => return None,
+            };
+            let target_class = class.constant_pool.get_class_name(class_idx)?;
+            Some(
+                cm.find_class_by_name_for_class(target_class, callee_cid)?
+                    .as_u32(),
+            )
+        };
+
+        let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
+            let cm = shared.classes.class_manager.read();
+            let class = cm.get_class(callee_cid)?;
+            // inc 35: `(bits, is_double)`.
+            match class.constant_pool.get(cp_idx)? {
+                ConstantPoolEntry::Long(v) => Some((*v, false)),
+                ConstantPoolEntry::Double(v) => Some((v.to_bits() as i64, true)), // Cast: JIT ABI -- float bits to i64
+                _ => None,
+            }
+        };
+
+        // RBC.2 — `ldc`/`ldc_w` int/float constants. Without this resolver
+        // every method containing an `ldc` (e.g. BC's `Nat*.gte` loading
+        // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
+        // interpreted forever. String/Class ldc returns None → compile
+        // bails (matches the OSR path's behaviour).
+        let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+            let cm = shared.classes.class_manager.read();
+            jit_ldc_constant_for(&cm, callee_cid, cp_idx)
+        };
+
+        // Compile callee without recursive inlining (None for callee_compiler)
+        let c_pgo_profile = {
+            let profile_key = crate::jit::profile::MethodKey {
+                class_id: callee_cached.declaring_class_id.as_u32(),
+                method_name: callee_cached.method_name.clone(),
+                descriptor: callee_cached.method_descriptor.clone(),
+            };
+            shared.jit.profile_store.get_profile(&profile_key)
+        };
+        let c_helpers = crate::jit::helpers::build_helpers_for(shared);
+        let c_string_layout_resolver = || resolve_string_field_layout(shared);
+        crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+            shared,
+            callee_cached.declaring_class_id,
+        ));
+        // JDK-ONLY-WAVE2 §4. Answers "is this triple a reviewed
+        // `NativeKind::Intrinsic`?" — `false` for `Bridge`, for `SyntheticStub`
+        // and for anything unregistered, which is the fail-closed direction.
+        // Cheap: only the strict arm of `direct_native_helper` calls it, and only
+        // for a triple whose helper cell is already non-zero.
+        let intrinsic_resolver = |class: &str, method: &str, descriptor: &str| -> bool {
+            let registry = &shared.natives.native_methods;
+            registry
+                .resolve_id(class, method, descriptor)
+                .and_then(|id| registry.kind_of_id(id))
+                .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+        };
+
+        let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
+            &callee_cached,
+            Some(&c_resolver),
+            Some(&c_field_resolver),
+            Some(&c_static_field_resolver),
+            Some(&c_invoke_resolver),
+            Some(&c_invokespecial_owner_resolver),
+            None, // no recursive inlining
+            Some(&c_new_resolver),
+            Some(&c_ldc_resolver),
+            Some(&c_ldc2w_resolver),
+            c_pgo_profile.as_ref(),
+            &c_helpers,
+            None, // no inlining in early-compile path
+            // String call-site intrinsics (length/charAt/hashCode/equals/…):
+            // resolve java/lang/String's value/coder/hash field layout so the
+            // JIT inlines these accessors instead of crossing the VM→native
+            // boundary per call (bug-03). `resolve_string_field_layout`
+            // returns None → intrinsics bail to dispatch when String isn't
+            // loaded yet.
+            Some(&c_string_layout_resolver),
+            Some(&c_invoke_class_id_resolver),
+            if c_scalar_new_on {
+                Some(&c_elidable_init_resolver)
+            } else {
+                None
+            },
+            // Early-compile path is the optimized (C2-equivalent) tier — the
+            // tiered C1 routing only flows through the background worker.
+            true,
+            // Gap B: int-only invokestatic → Op::Call. Now default-ON
+            // (inc 23, soaked: bt10/14/16/18 == HotSpot + IrCall/IrCallGc
+            // probes == HotSpot, ON==OFF). `CRATONVM_JIT_IR_CALL=0` is the
+            // opt-out — restores single-pass dispatch for invokestatic.
+            crate::runtime::env_cache::jit_ir_call(),
+            // inc 24/29: invokespecial → Op::Call. Now default-ON;
+            // `CRATONVM_JIT_IR_CALL_SPECIAL=0` opts out.
+            crate::runtime::env_cache::jit_ir_call_special(),
+            // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
+            crate::runtime::env_cache::jit_ir_long(),
+            // inc 26 + inline-cache lowering: invokevirtual/invokeinterface
+            // → Op::Call with MIC/PIC fast paths. Default-ON now that the IR
+            // backend has parity with single-pass dispatch;
+            // `CRATONVM_JIT_IR_CALL_VIRTUAL=0` opts out.
+            crate::runtime::env_cache::jit_ir_call_virtual(),
+            // inc 30 + Slices A/B/C: double/float XMM value tier. Now
+            // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
+            // FP-slot deopt resume all landed) and validated == HotSpot
+            // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
+            // is the opt-out (restores the int/long/ref-only IR path).
+            crate::runtime::env_cache::jit_ir_fp(),
+            // invokedynamic-uncommon-trap fix: resolves an invokedynamic
+            // CP index to its target descriptor for the callee's pool.
+            Some(&c_indy_descriptor_resolver),
+            if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                Some(&c_class_id_namer)
+            } else {
+                None
+            },
+            if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                Some(&c_receiver_inline_resolver)
+            } else {
+                None
+            },
+            // IR-tier inlining. Behind its own gate; `None` splices nothing.
+            if cratonvm_jit::ir_inline_enabled() {
+                Some(&c_ir_inline_resolver)
+            } else {
+                None
+            },
+            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+            // latch the JIT read for itself, so a `Compatible` VM sharing a
+            // process with a `JdkOnly` one lost the thin direct-call helpers.
+            crate::vm::dispatch_policy(shared).is_jdk_only(),
+            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+
+            // the JIT's seven hard-coded triples, as the §1.4 verdict on
+
+            // whether a thin direct-call helper may shadow real bytecode.
+            Some(&intrinsic_resolver),
+        )?;
+        let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
+        let needs_ctx = compiled.needs_context();
+        // jit-invokedynamic-groovy-regression fix — see the matching gate
+        // at the JIT-cache-hit return above. The artifact is still cached
+        // (below) for helper/interpreter dispatch, but never handed back
+        // for a baked direct machine-code CALL.
+        let indy_trap = compiled.has_indy_trap;
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
+                callee_cached.class_name,
+                callee_cached.method_name,
+                callee_cached.method_descriptor,
+                compiled.entry_ptr(),
+                compiled.code_bytes().len()
+            );
+        }
+        crate::jit::disasm::maybe_dump_annotated(
+            "callee",
+            &callee_cached.class_name,
+            &callee_cached.method_name,
+            &callee_cached.method_descriptor,
+            compiled.entry_ptr(),
+            compiled.code_bytes(),
+            compiled.osr_pc_to_native.as_deref(),
+            compiled.osr_local_assignments.as_deref(),
+        );
+
+        // Store in JIT cache
+        stamp_compilation_epoch(
+            shared,
+            &callee_cached.class_name,
+            &callee_cached.method_name,
+            &callee_cached.method_descriptor,
+            &mut compiled,
+        );
+        // Stamp the wrapped-entry requirement before the body is shared.
+        // See `CompiledMethod::requires_wrapped_entry`: publication is the
+        // last point that still knows this is an `ACC_SYNCHRONIZED` method,
+        // and every unwrapped consumer downstream holds only a raw entry
+        // pointer.
+        compiled.requires_wrapped_entry = callee_cached.is_synchronized;
+        {
+            let mut jit_cache = shared.jit.jit_cache.write();
+            jit_cache.put(
+                callee_cached.class_name.clone(),
+                callee_cached.method_name.clone(),
+                callee_cached.method_descriptor.clone(),
+                callee_cached.declaring_class_id,
+                compiled,
+            );
+        }
+
+        if indy_trap {
+            return None;
+        }
+        Some((entry, needs_ctx))
+    };
 
     let pgo_profile = {
         let profile_key = crate::jit::profile::MethodKey {
@@ -5843,7 +5860,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             .and_then(|id| registry.kind_of_id(id))
             .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
     };
-    
+
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
@@ -5909,18 +5926,16 @@ pub(super) fn try_jit_upgrade_with_gate(
         } else {
             None
         },
-            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
-            // latch the JIT read for itself, so a `Compatible` VM sharing a
-            // process with a `JdkOnly` one lost the thin direct-call helpers.
-            crate::vm::dispatch_policy(shared).is_jdk_only(),
+        // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+        // latch the JIT read for itself, so a `Compatible` VM sharing a
+        // process with a `JdkOnly` one lost the thin direct-call helpers.
+        crate::vm::dispatch_policy(shared).is_jdk_only(),
+        // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
 
-            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+        // the JIT's seven hard-coded triples, as the §1.4 verdict on
 
-            // the JIT's seven hard-coded triples, as the §1.4 verdict on
-
-            // whether a thin direct-call helper may shadow real bytecode.
-
-            Some(&intrinsic_resolver),
+        // whether a thin direct-call helper may shadow real bytecode.
+        Some(&intrinsic_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -6096,7 +6111,8 @@ pub(super) static CALLEE_NEG_CACHE: [std::sync::atomic::AtomicU64; CALLEE_NEG_CA
 /// Counter of negative-cache hits, used to periodically re-run the full
 /// pipeline so a stale negative (e.g. a transient compile failure that
 /// would succeed now) cannot pin a hot callee to the interpreter forever.
-pub(super) static CALLEE_NEG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) static CALLEE_NEG_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(super) const CALLEE_NEG_REPROBE_MASK: u64 = 0xFFF;
 
 pub(super) fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
@@ -6167,7 +6183,12 @@ pub fn try_jit_compile_callee(
             // whole point of the tally is to name what has to be fixed.
             let why = cratonvm_jit::jit_bail_reason_for(class_name, method_name, descriptor)
                 .unwrap_or_else(|| "reason-not-recorded".to_string());
-            callee_probe_note(&format!("BAIL-LISTED[{why}]"), class_name, method_name, descriptor);
+            callee_probe_note(
+                &format!("BAIL-LISTED[{why}]"),
+                class_name,
+                method_name,
+                descriptor,
+            );
         }
         return None;
     }
@@ -6297,9 +6318,7 @@ pub fn try_jit_compile_callee(
 /// "`hit_entry=0` forever" unfalsifiable. Each now names itself.
 fn callee_probe_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some())
 }
 
 fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor: &str) {
@@ -6540,7 +6559,12 @@ pub(super) fn try_jit_compile_callee_slow(
     // `reason=vm-fjp-subclass-blocklisted` for both `CompletableFuture$
     // UniCompose.tryFire` and `$UniRelay.tryFire`.
     if is_fjp_subclass_blocklisted(shared, class_name, None) {
-        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-fjp-subclass-blocklisted");
+        cratonvm_jit::record_compile_refusal(
+            class_name,
+            method_name,
+            descriptor,
+            "vm-fjp-subclass-blocklisted",
+        );
         return None;
     }
     // FJP fix (CORRECTED): refuse to compile a method only when the method that
@@ -6564,7 +6588,12 @@ pub(super) fn try_jit_compile_callee_slow(
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
     if registered_native_will_run(shared, class_name, method_name, descriptor) {
-        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-callee-is-registered-native");
+        cratonvm_jit::record_compile_refusal(
+            class_name,
+            method_name,
+            descriptor,
+            "vm-callee-is-registered-native",
+        );
         return None;
     }
     // Look up the method bytecode
@@ -6575,7 +6604,12 @@ pub(super) fn try_jit_compile_callee_slow(
             // The receiver's class may simply not be loaded yet — a later
             // attempt can succeed, so this `None` must not be cached.
             *cache_negative = false;
-            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-declaring-class-not-loaded");
+            cratonvm_jit::record_compile_refusal(
+                class_name,
+                method_name,
+                descriptor,
+                "vm-declaring-class-not-loaded",
+            );
             return None;
         }
     };
@@ -6588,7 +6622,12 @@ pub(super) fn try_jit_compile_callee_slow(
     )?;
     // Direct dispatcher compilation also bypasses interpreter frame creation.
     if method.is_synchronized() && !allow_synchronized_wrapped_entry {
-        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-synchronized-no-wrapped-entry");
+        cratonvm_jit::record_compile_refusal(
+            class_name,
+            method_name,
+            descriptor,
+            "vm-synchronized-no-wrapped-entry",
+        );
         return None;
     }
 
@@ -6645,7 +6684,12 @@ pub(super) fn try_jit_compile_callee_slow(
     }
     if scan_refuses {
         crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
-        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-bytecode-scan-refused");
+        cratonvm_jit::record_compile_refusal(
+            class_name,
+            method_name,
+            descriptor,
+            "vm-bytecode-scan-refused",
+        );
         return None;
     }
     // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
@@ -6676,7 +6720,12 @@ pub(super) fn try_jit_compile_callee_slow(
             // dispatch through the safe fallback), at which point this
             // function should succeed and start caching the fast entry.
             *cache_negative = false;
-            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-declaring-class-not-initialized");
+            cratonvm_jit::record_compile_refusal(
+                class_name,
+                method_name,
+                descriptor,
+                "vm-declaring-class-not-initialized",
+            );
             return None;
         }
     }
@@ -6696,7 +6745,12 @@ pub(super) fn try_jit_compile_callee_slow(
             .find(declaring_class_name, method_name, descriptor)
             .is_some()
     {
-        cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-native-override-present");
+        cratonvm_jit::record_compile_refusal(
+            class_name,
+            method_name,
+            descriptor,
+            "vm-native-override-present",
+        );
         return None;
     }
     let source_file = store
@@ -6720,7 +6774,7 @@ pub(super) fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -6747,7 +6801,12 @@ pub(super) fn try_jit_compile_callee_slow(
             method_name,
             &cached.method_descriptor,
         ) {
-            cratonvm_jit::record_compile_refusal(class_name, method_name, descriptor, "vm-callee-compile-gate-refused");
+            cratonvm_jit::record_compile_refusal(
+                class_name,
+                method_name,
+                descriptor,
+                "vm-callee-compile-gate-refused",
+            );
             return None;
         }
     }
@@ -7127,7 +7186,10 @@ pub(super) fn try_jit_compile_callee_slow(
                 }};
             }
         if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
-            dc_no!("fjp-blocklist", cratonvm_jit::DirectBindRefusal::FjpBlocklist);
+            dc_no!(
+                "fjp-blocklist",
+                cratonvm_jit::DirectBindRefusal::FjpBlocklist
+            );
         }
         if shared
             .natives
@@ -7135,14 +7197,20 @@ pub(super) fn try_jit_compile_callee_slow(
             .find(callee_class, callee_method, callee_desc)
             .is_some()
         {
-            dc_no!("native-shadow", cratonvm_jit::DirectBindRefusal::NativeShadow);
+            dc_no!(
+                "native-shadow",
+                cratonvm_jit::DirectBindRefusal::NativeShadow
+            );
         }
         let callee_class_id = {
             let cm = shared.classes.class_manager.read();
             let Some(callee_cid) =
                 cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
             else {
-                dc_no!("callee-class-not-found", cratonvm_jit::DirectBindRefusal::CalleeClassNotFound);
+                dc_no!(
+                    "callee-class-not-found",
+                    cratonvm_jit::DirectBindRefusal::CalleeClassNotFound
+                );
             };
             let store = cm.class_store();
             let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
@@ -7151,10 +7219,16 @@ pub(super) fn try_jit_compile_callee_slow(
                 callee_desc,
                 store,
             ) else {
-                dc_no!("callee-method-not-found", cratonvm_jit::DirectBindRefusal::CalleeMethodNotFound);
+                dc_no!(
+                    "callee-method-not-found",
+                    cratonvm_jit::DirectBindRefusal::CalleeMethodNotFound
+                );
             };
             if method.is_synchronized() {
-                dc_no!("synchronized", cratonvm_jit::DirectBindRefusal::Synchronized);
+                dc_no!(
+                    "synchronized",
+                    cratonvm_jit::DirectBindRefusal::Synchronized
+                );
             }
             // A callee with no `Code` attribute at all (`map_or(true, ..)`)
             // is always refused — there is no body to bake a CALL to. A callee
@@ -7170,7 +7244,10 @@ pub(super) fn try_jit_compile_callee_slow(
                 }
             };
             if callee_code_bars_direct_call {
-                dc_no!("callee-exception-table", cratonvm_jit::DirectBindRefusal::CalleeExceptionTable);
+                dc_no!(
+                    "callee-exception-table",
+                    cratonvm_jit::DirectBindRefusal::CalleeExceptionTable
+                );
             }
             if method.is_static()
                 && !store
@@ -7178,7 +7255,10 @@ pub(super) fn try_jit_compile_callee_slow(
                     .map(crate::vm::is_class_initialized_fast)
                     .unwrap_or(false)
             {
-                dc_no!("declaring-class-not-initialized", cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized);
+                dc_no!(
+                    "declaring-class-not-initialized",
+                    cratonvm_jit::DirectBindRefusal::DeclaringClassNotInitialized
+                );
             }
             callee_cid
         };
@@ -7236,20 +7316,32 @@ pub(super) fn try_jit_compile_callee_slow(
             Some(compiled) => compiled,
             None => {
                 if !crate::runtime::env_cache::jit_eager_callee_chain() {
-                    dc_no!("callee-not-yet-compiled", cratonvm_jit::DirectBindRefusal::CalleeNotYetCompiled);
+                    dc_no!(
+                        "callee-not-yet-compiled",
+                        cratonvm_jit::DirectBindRefusal::CalleeNotYetCompiled
+                    );
                 }
                 if cratonvm_jit::jit_active_compile_depth() > MAX_EAGER_CALLEE_CHAIN_DEPTH {
-                    dc_no!("eager-callee-chain-depth", cratonvm_jit::DirectBindRefusal::EagerChainDepth);
+                    dc_no!(
+                        "eager-callee-chain-depth",
+                        cratonvm_jit::DirectBindRefusal::EagerChainDepth
+                    );
                 }
                 if cratonvm_jit::jit_active_compile_contains(
                     callee_class,
                     callee_method,
                     callee_desc,
                 ) {
-                    dc_no!("eager-callee-chain-cycle", cratonvm_jit::DirectBindRefusal::EagerChainCycle);
+                    dc_no!(
+                        "eager-callee-chain-cycle",
+                        cratonvm_jit::DirectBindRefusal::EagerChainCycle
+                    );
                 }
                 if !eager_callee_chain_try_spend() {
-                    dc_no!("eager-callee-chain-budget", cratonvm_jit::DirectBindRefusal::EagerChainBudget);
+                    dc_no!(
+                        "eager-callee-chain-budget",
+                        cratonvm_jit::DirectBindRefusal::EagerChainBudget
+                    );
                 }
                 // `optimize` is this compile's own backend selection, so a C1 body's
                 // callees are compiled at C1 and a C2 body's at C2 — the callee never
@@ -7261,7 +7353,10 @@ pub(super) fn try_jit_compile_callee_slow(
                     callee_desc,
                     optimize,
                 ) else {
-                    dc_no!("eager-callee-chain-compile-declined", cratonvm_jit::DirectBindRefusal::EagerChainCompileDeclined);
+                    dc_no!(
+                        "eager-callee-chain-compile-declined",
+                        cratonvm_jit::DirectBindRefusal::EagerChainCompileDeclined
+                    );
                 };
                 body
             }
@@ -7295,7 +7390,7 @@ pub(super) fn try_jit_compile_callee_slow(
             .and_then(|id| registry.kind_of_id(id))
             .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
     };
-    
+
     // Build inline resolver for method inlining (Session 31).
     //
     // Declared HERE rather than beside the other resolvers above because it
@@ -7396,18 +7491,16 @@ pub(super) fn try_jit_compile_callee_slow(
         } else {
             None
         },
-            // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
-            // latch the JIT read for itself, so a `Compatible` VM sharing a
-            // process with a `JdkOnly` one lost the thin direct-call helpers.
-            crate::vm::dispatch_policy(shared).is_jdk_only(),
+        // Per-VM JDK-only policy (JDK-ONLY-WAVE2 §2). Was a process-global
+        // latch the JIT read for itself, so a `Compatible` VM sharing a
+        // process with a `JdkOnly` one lost the thin direct-call helpers.
+        crate::vm::dispatch_policy(shared).is_jdk_only(),
+        // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
 
-            // JDK-ONLY-WAVE2 §4: the registry's own `NativeKind`, in place of
+        // the JIT's seven hard-coded triples, as the §1.4 verdict on
 
-            // the JIT's seven hard-coded triples, as the §1.4 verdict on
-
-            // whether a thin direct-call helper may shadow real bytecode.
-
-            Some(&intrinsic_resolver),
+        // whether a thin direct-call helper may shadow real bytecode.
+        Some(&intrinsic_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
@@ -7441,13 +7534,14 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.method_descriptor,
         )
     {
-        shared.jit.tiered_manager.request_deferred_new_retry(
-            &crate::jit::tiered::MethodKey::new(
+        shared
+            .jit
+            .tiered_manager
+            .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
                 &*cached.class_name,
                 &*cached.method_name,
                 &*cached.method_descriptor,
-            ),
-        );
+            ));
     }
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
@@ -7687,7 +7781,10 @@ pub(super) fn fetch_osr_compile_inputs(
 /// remain in that slower body for the entire subtree even if C2 is published
 /// concurrently. Every call target is resolved here and must be this exact
 /// static `(I)I` method; all remaining structural checks live in the JIT crate.
-pub(super) fn promote_scalar_selfrec_to_ir(shared: &SharedVm, key: &crate::jit::tiered::MethodKey) -> bool {
+pub(super) fn promote_scalar_selfrec_to_ir(
+    shared: &SharedVm,
+    key: &crate::jit::tiered::MethodKey,
+) -> bool {
     let Some((class_id, padded, _)) =
         fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
     else {
@@ -8307,12 +8404,9 @@ fn resolve_inline_site_from(
             no!("receiver-is-interface-or-array");
         }
     }
-    let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
-        search_start,
-        callee_method,
-        callee_desc,
-        store,
-    ) else {
+    let Some((method, declaring_id)) =
+        crate::classloading::find_method_recursive(search_start, callee_method, callee_desc, store)
+    else {
         no!("method-not-found-from-search-start");
     };
     if let Some(receiver_id) = receiver_class_id {
@@ -8812,8 +8906,7 @@ fn resolve_inline_site_from(
         // Receiver-included, one slot per parameter regardless of category —
         // the count `JitInvokeInfo::num_jit_args` carries and the count the
         // emitter pops, since the JIT operand stack holds one i64 per value.
-        let num_jit_args =
-            count_method_params(target_desc) + if opcode == 0xb8 { 0 } else { 1 };
+        let num_jit_args = count_method_params(target_desc) + if opcode == 0xb8 { 0 } else { 1 };
         invoke_targets.push((
             ipc,
             cratonvm_jit::InlineInvokeTarget {
@@ -9097,7 +9190,11 @@ fn resolve_inline_site_from(
                             target.descriptor,
                             ipc,
                             nest_depth + 1,
-                            if nested.is_some() { "SPLICED" } else { "refused" },
+                            if nested.is_some() {
+                                "SPLICED"
+                            } else {
+                                "refused"
+                            },
                         );
                     }
                     if let Some(nested) = nested {
@@ -9157,9 +9254,9 @@ fn resolve_inline_site_from(
                                 &Arc::from(callee_desc),
                                 declaring_id,
                             );
-                            let from_cache = artifact.as_ref().and_then(|cm| {
-                                cm.dominant_receiver_at_bci(*ipc)
-                            });
+                            let from_cache = artifact
+                                .as_ref()
+                                .and_then(|cm| cm.dominant_receiver_at_bci(*ipc));
                             match from_cache {
                                 Some(d) => (d, "mic"),
                                 None => {
@@ -9276,8 +9373,7 @@ fn resolve_inline_site_from(
             if target.invoke_kind != 1 && target.invoke_kind != 3 {
                 continue;
             }
-            target.direct_entry =
-                bind(&target.class_name, &target.method_name, &target.descriptor);
+            target.direct_entry = bind(&target.class_name, &target.method_name, &target.descriptor);
         }
     }
 
@@ -9392,9 +9488,7 @@ fn receiver_resolution_is_dispatch_faithful(
     // subclass receiver found something dispatch could not.
     use cratonvm_reader::class_access_flags::MethodAccessFlags;
     if method.is_static()
-        || method
-            .access_flags
-            .contains(MethodAccessFlags::PRIVATE)
+        || method.access_flags.contains(MethodAccessFlags::PRIVATE)
         || method.is_abstract()
     {
         return false;
@@ -9653,11 +9747,9 @@ impl Drop for JitSynchronizedMonitorGuard {
             let Some(monitor) = thread.native_pin_roots.get(self.pin_index).copied() else {
                 return;
             };
-            if let Err(error) = crate::vm::vm_exec::monitor_exit_and_retract_jmx(
-                shared,
-                monitor,
-                thread.thread_id,
-            ) {
+            if let Err(error) =
+                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, monitor, thread.thread_id)
+            {
                 tracing::warn!(thread_id = ?thread.thread_id, ?error,
                     "implicit monitorexit after JIT synchronized method failed");
             }
@@ -10144,7 +10236,9 @@ pub(super) fn execute_jit_call(
                 // sub-tag on the slow path, which is how a double carrying a
                 // NaN payload lost it across a deopt.
                 let (cv, kind) = saved_args[i];
-                thread.frames[frame_idx].stack.push_with_kind_unchecked(cv, kind);
+                thread.frames[frame_idx]
+                    .stack
+                    .push_with_kind_unchecked(cv, kind);
             }
             return Ok(CachedCallResult::CacheMiss);
         }
@@ -10213,7 +10307,9 @@ pub(super) fn execute_jit_call(
         for i in 0..np {
             // See the sibling restore above: bits AND mark.
             let (cv, kind) = saved_args[i];
-            thread.frames[frame_idx].stack.push_with_kind_unchecked(cv, kind);
+            thread.frames[frame_idx]
+                .stack
+                .push_with_kind_unchecked(cv, kind);
         }
         return Ok(CachedCallResult::CacheMiss);
     }
@@ -10934,7 +11030,8 @@ pub(super) fn execute_jit_call_oneshot(
             None
         } else {
             // SAFETY: non-zero JIT return encodes a heap pointer to a valid object header.
-            Some(unsafe { crate::types::ObjectRef::from_raw(result as *mut u8) }) // Cast: JIT ABI -- i64 register convention
+            Some(unsafe { crate::types::ObjectRef::from_raw(result as *mut u8) })
+            // Cast: JIT ABI -- i64 register convention
         })),
         _ => None, // void
     }))

@@ -36,7 +36,7 @@ passed before fails after. Two classes fail identically before and after —
 
 A loader built to HIDE a jar answers `getResources` correctly — and four
 separate lookups then supplied the answer from somewhere with no notion of
-that loader, so the hidden jar's `META-INF/services` registration (or its
+that loader, so the hidden jar's `../../../../apps/META-INF/services` registration (or its
 `module-info` equivalent) came back anyway. The provider CLASS stayed
 correctly hidden (`ModifiedClassPathClassLoader.loadClass` refuses it), so
 `ServiceLoader` read a registration it could not honour and raised
@@ -97,13 +97,13 @@ next was looked for.
    VM-global module registry with no notion of which loader is asking.
    `logback-classic.jar` and `hibernate-validator.jar` are modular jars that
    DECLARE their provider in `module-info`, so once the flat scan stopped
-   offering `META-INF/services`, the module registry offered the identical
+   offering `../../../../apps/META-INF/services`, the module registry offered the identical
    provider name straight back.
 
    This one is also a standalone divergence from the JDK, independent of any
    exclusion: **a modular jar reached through the CLASS path is an
    unnamed-module citizen whose `module-info` the JDK ignores outright**, so
-   `ServiceLoader` must see only its `META-INF/services`. Gated on the same
+   `ServiceLoader` must see only its `../../../../apps/META-INF/services`. Gated on the same
    predicate, which is true exactly for a loader with its own recorded URL
    list — i.e. a class-path loader. The null/builtin-loader case this source
    was added for (`ToolProvider.getSystemJavaCompiler()` needing
@@ -124,7 +124,7 @@ That page flagged, explicitly rather than papering over it, that
 `SpringFactoriesLoader.<clinit>` → SLF4J on their first line.
 
 Resolved: `logback-classic.jar` is the ONLY jar on this module's test
-classpath carrying `META-INF/services/org.slf4j.spi.SLF4JServiceProvider`
+classpath carrying `../../../../apps/META-INF/services/org.slf4j.spi.SLF4JServiceProvider`
 (verified against `cratonvm-test-cp.txt`; there is no `log4j-slf4j2-impl`).
 When only logback is excluded, log4j-api is still present, so
 commons-logging 1.3.6's `LogFactory.newStandardFactory` selects

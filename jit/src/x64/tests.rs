@@ -12,8 +12,8 @@ fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
     // aload_0; getfield; ifnonnull L; iconst_1; ireturn;
     // L: iconst_1; aload_0; getfield; invokestatic self; iadd; ireturn
     let pure = [
-        0x2a, 0xb4, 0x00, 0x01, 0xc7, 0x00, 0x05, 0x04, 0xac, 0x04, 0x2a, 0xb4, 0x00,
-        0x01, 0xb8, 0x00, 0x02, 0x60, 0xac,
+        0x2a, 0xb4, 0x00, 0x01, 0xc7, 0x00, 0x05, 0x04, 0xac, 0x04, 0x2a, 0xb4, 0x00, 0x01, 0xb8,
+        0x00, 0x02, 0x60, 0xac,
     ];
     let fields = [(1usize, 0usize, b'L'), (11, 0, b'L')];
     assert!(gc_inert_selfrec_candidate(
@@ -288,9 +288,7 @@ fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
         "the hazard requires the buried operand ABOVE an argument          (buried={buried}, arg={arg_lo}); with these two in the other order          the `min` would be right and this test would prove nothing"
     );
     // Depth 2 — the second argument, at the top as usual.
-    compiler
-        .push_stack()
-        .expect("second argument slot");
+    compiler.push_stack().expect("second argument slot");
 
     // `static int leaf(int a, int b) { return a; }`
     let site = make_inline_site(&[0x1a, 0xac], 2, 2, true, b'I');
@@ -540,12 +538,7 @@ unsafe extern "C" fn stub_putfield_double(obj_ptr: i64, field_index: i64, val: i
 // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
 // and a field index that is bounds-checked within the function body before any write.
 // val is either 0 (null) or a valid ObjectRef pointer from the managed heap.
-unsafe extern "C" fn stub_putfield_object(
-    _vm_ptr: i64,
-    obj_ptr: i64,
-    field_index: i64,
-    val: i64,
-) {
+unsafe extern "C" fn stub_putfield_object(_vm_ptr: i64, obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 {
         return;
     }
@@ -574,9 +567,9 @@ fn test_helpers() -> JitRuntimeHelpers {
         panic!("JIT test helper called an unimplemented runtime stub");
     }
     let sentinel = unimplemented_stub as *const () as usize; // Cast: address arithmetic
-    // `set_throw_bci` only records the throwing bci in a thread-local and is
-    // called on the throw path of every method carrying an exception check,
-    // so it needs a real no-op rather than the panicking stub.
+                                                             // `set_throw_bci` only records the throwing bci in a thread-local and is
+                                                             // called on the throw path of every method carrying an exception check,
+                                                             // so it needs a real no-op rather than the panicking stub.
     unsafe extern "C" fn record_throw_bci(_bci: i64) {}
     let throw_bci = record_throw_bci as *const () as usize; // Cast: address arithmetic
     JitRuntimeHelpers {
@@ -816,22 +809,22 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         1,
         1,
         false,
-        Vec::new(), // multianewarray_info
-        Vec::new(), // field_info
-        Vec::new(), // typecheck_info
-        Vec::new(), // static_field_info
-        Vec::new(), // new_info
-        Vec::new(), // new_deferred_info
-        Vec::new(), // anewarray_info
-        Vec::new(), // anewarray_deferred_info
-        Vec::new(), // invoke_info
-        Vec::new(), // direct_calls
-        Vec::new(), // mic_slots
-        Vec::new(), // pic_slots
-        Vec::new(), // ldc_info
-        Vec::new(), // ldc_string_info
-        Vec::new(), // ldc_class_info
-        Vec::new(), // ldc2w_info
+        Vec::new(),         // multianewarray_info
+        Vec::new(),         // field_info
+        Vec::new(),         // typecheck_info
+        Vec::new(),         // static_field_info
+        Vec::new(),         // new_info
+        Vec::new(),         // new_deferred_info
+        Vec::new(),         // anewarray_info
+        Vec::new(),         // anewarray_deferred_info
+        Vec::new(),         // invoke_info
+        Vec::new(),         // direct_calls
+        Vec::new(),         // mic_slots
+        Vec::new(),         // pic_slots
+        Vec::new(),         // ldc_info
+        Vec::new(),         // ldc_string_info
+        Vec::new(),         // ldc_class_info
+        Vec::new(),         // ldc2w_info
         Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
@@ -2470,8 +2463,8 @@ fn test_if_icmp_canonicalize_preserves_popped_operands() {
     // 17: iadd               [k+7]   (k+5 < k+3 is always false)
     // 18: ireturn
     let code: Vec<u8> = vec![
-        0x1a, 0x1a, 0x08, 0x60, 0x1a, 0x06, 0x60, 0xa1, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00,
-        0x05, 0x10, 0x09, 0x60, 0xac, 0, 0,
+        0x1a, 0x1a, 0x08, 0x60, 0x1a, 0x06, 0x60, 0xa1, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00, 0x05,
+        0x10, 0x09, 0x60, 0xac, 0, 0,
     ];
     let code_len = 19;
     let compiled = compile(
@@ -2531,8 +2524,8 @@ fn test_ifxx_canonicalize_preserves_popped_operand() {
     // 14: iadd
     // 15: ireturn
     let code: Vec<u8> = vec![
-        0x1a, 0x1a, 0x06, 0x60, 0x9e, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00, 0x05, 0x10, 0x09,
-        0x60, 0xac, 0, 0,
+        0x1a, 0x1a, 0x06, 0x60, 0x9e, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00, 0x05, 0x10, 0x09, 0x60,
+        0xac, 0, 0,
     ];
     let code_len = 16;
     let compiled = compile(
@@ -3140,10 +3133,7 @@ fn test_compile_math_min_max_float_double_intrinsic() {
         call_f(&min_f, f32::NEG_INFINITY, 0.0),
         f32::NEG_INFINITY.to_bits()
     );
-    assert_eq!(
-        call_f(&max_f, f32::INFINITY, 0.0),
-        f32::INFINITY.to_bits()
-    );
+    assert_eq!(call_f(&max_f, f32::INFINITY, 0.0), f32::INFINITY.to_bits());
     assert_eq!(call_f(&min_f, f32::INFINITY, nan_a), nan_a.to_bits());
 
     // --- the same grid for double ---
@@ -4552,11 +4542,29 @@ fn a_reference_getfield_does_not_read_a_non_reference_cell_as_a_pointer() {
     helpers.getfield = marker_getfield as *const () as usize;
     helpers.read_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
     let compiled = compile(
-        &code, code_len, 1, 1, false,
-        Vec::new(), field_info, Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-        HashMap::new(), HashMap::new(), &helpers,
-        std::collections::HashSet::new(), HashMap::new(), None,
+        &code,
+        code_len,
+        1,
+        1,
+        false,
+        Vec::new(),
+        field_info,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
     )
     .unwrap();
 
@@ -5130,12 +5138,12 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(), // mic_slots
-            Vec::new(), // pic_slots
-            Vec::new(), // ldc_info
-            Vec::new(), // ldc_string_info
-            Vec::new(), // ldc_class_info
-            Vec::new(), // ldc2w_info
+            Vec::new(),         // mic_slots
+            Vec::new(),         // pic_slots
+            Vec::new(),         // ldc_info
+            Vec::new(),         // ldc_string_info
+            Vec::new(),         // ldc_class_info
+            Vec::new(),         // ldc2w_info
             Default::default(), // ldc_fp_pcs
             HashMap::new(),
             HashMap::new(),
@@ -5143,7 +5151,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             std::collections::HashSet::new(),
             HashMap::new(),
             HashMap::new(), // inline_guard_variants (PGO-02)
-            None, // string_layout
+            None,           // string_layout
             &[],
             0,
             0b11, // param_oop_mask: both parameters are references
@@ -8021,8 +8029,8 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
     //  13: goto -13 -> 0
     //  16..: return padding
     let code = [
-        0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1a, 0x1d, 0x60, 0x3b, 0xa7,
-        0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1a, 0x1d, 0x60, 0x3b, 0xa7, 0xff,
+        0xf3, 0xb1, 0x00, 0x00, 0x00,
     ];
     let code_len = 17;
     let loops = detect_loops(&code, code_len);
@@ -8049,8 +8057,8 @@ fn test_bce_varadd_step_guard_and_commuted_refusal() {
     // the canonical compound shape — the step cannot be proven, so the
     // whole loop must be refused (no guard, no elision).
     let commuted = [
-        0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7,
-        0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7, 0xff,
+        0xf3, 0xb1, 0x00, 0x00, 0x00,
     ];
     assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
     let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
@@ -9052,8 +9060,8 @@ fn test_detect_int_array_element_wise_add() {
 fn test_detect_int_array_element_wise_mul() {
     // Same shape but imul (0x68)
     let code: Vec<u8> = vec![
-        0x03, 0x36, 0x04, 0x15, 0x04, 0x1D, 0xa2, 0x00, 0x14, 0x2A, 0x15, 0x04, 0x2B, 0x15,
-        0x04, 0x2e, 0x2C, 0x15, 0x04, 0x2e, 0x68, // imul
+        0x03, 0x36, 0x04, 0x15, 0x04, 0x1D, 0xa2, 0x00, 0x14, 0x2A, 0x15, 0x04, 0x2B, 0x15, 0x04,
+        0x2e, 0x2C, 0x15, 0x04, 0x2e, 0x68, // imul
         0x4F, 0x84, 0x04, 0x01, 0xa7, 0xff, 0xEA, 0xB1,
     ];
     let code_len = code.len();
@@ -9319,8 +9327,8 @@ fn tiny_unswitchable_loop() -> (Vec<u8>, usize) {
     // 16: goto -14 → 2        (back-edge)
     // 19: return
     let code: Vec<u8> = vec![
-        0x03, 0x3D, 0x1C, 0x1B, 0xa2, 0x00, 0x0F, 0x1A, 0x99, 0x00, 0x05, 0x00, 0x00, 0x84,
-        0x02, 0x01, 0xa7, 0xff, 0xF2, 0xB1, 0, 0,
+        0x03, 0x3D, 0x1C, 0x1B, 0xa2, 0x00, 0x0F, 0x1A, 0x99, 0x00, 0x05, 0x00, 0x00, 0x84, 0x02,
+        0x01, 0xa7, 0xff, 0xF2, 0xB1, 0, 0,
     ];
     let code_len = 20;
     (code, code_len)
@@ -9864,12 +9872,7 @@ fn test_inline_tlab_new_falls_through_on_null_thread() {
     }
     // SAFETY: extern "C" test stub that immediately panics; it touches no arguments
     // and performs no memory access, so it imposes no safety obligations on callers.
-    unsafe extern "C" fn unimplemented_post_init(
-        _vm: i64,
-        _obj: i64,
-        _cid: i64,
-        _nf: i64,
-    ) -> i64 {
+    unsafe extern "C" fn unimplemented_post_init(_vm: i64, _obj: i64, _cid: i64, _nf: i64) -> i64 {
         panic!("post_tlab_init must not be called when thread is null");
     }
 
@@ -9975,7 +9978,10 @@ fn alloc_spill_sink_partitions_the_gpr_file_exactly_once() {
     union.sort_unstable();
     let mut expected = ALL_SPILL_GPRS.to_vec();
     expected.sort_unstable();
-    assert_eq!(union, expected, "partition must be exact — no gap, no overlap");
+    assert_eq!(
+        union, expected,
+        "partition must be exact — no gap, no overlap"
+    );
 }
 
 /// Sink form of the inline-TLAB preamble: it drops the `get_current_thread`
@@ -11420,8 +11426,7 @@ fn s32_phase_c_plan_tracks_scalar_monitors() {
         declaring_class_id: 0,
     }));
     let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)];
-    let plan =
-        plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, 0);
+    let plan = plan_scalar_replacement(&code, code_len, &non_escaping, &new_info, &invoke_info, 0);
 
     assert!(
         plan.objects.contains_key(&0),
@@ -11704,8 +11709,8 @@ fn a_dead_region_between_two_live_ones_is_skipped_whole() {
     // 14: iconst_2          <- live again
     // 15: ireturn
     let code = [
-        0xa7, 0x00, 0x0e, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60,
-        0x05, 0xac,
+        0xa7, 0x00, 0x0e, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0x05,
+        0xac,
     ];
     assert!(compile_probe_method(&code, 2, 2).is_some());
 }
@@ -11764,7 +11769,8 @@ fn a_self_tail_call_may_not_swallow_a_branch_targeted_return() {
 #[test]
 fn a_sibling_tail_call_may_not_swallow_a_branch_targeted_return() {
     assert!(
-        compile_with_direct_call(&TAILCALL_OVER_SHARED_RETURN, 1, 1, 9, direct_callee_i()).is_some(),
+        compile_with_direct_call(&TAILCALL_OVER_SHARED_RETURN, 1, 1, 9, direct_callee_i())
+            .is_some(),
         "a direct-callable callee must not let the tail form eat the shared return"
     );
 }
@@ -12470,8 +12476,15 @@ fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
     //   6: ireturn
     let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/Target", "target", "(II)I", 2, b'I', 3)];
+    callee.resolved_invoke_infos = vec![resolved_invoke(
+        3,
+        "pkg/Target",
+        "target",
+        "(II)I",
+        2,
+        b'I',
+        3,
+    )];
 
     // caller: `static int f(int a) { return leaf(a); }`
     //   0: iload_0
@@ -12489,12 +12502,19 @@ fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
     // dispatch helper is `stub_invoke_dispatch`, which only reads the argument
     // buffer the emitted code just built.
     let got = unsafe { compiled.call_with_heap(0, &[5]) };
-    assert_eq!(got, 15, "the spliced call's result must be the body's value");
+    assert_eq!(
+        got, 15,
+        "the spliced call's result must be the body's value"
+    );
 
     let (class_name, method_name, descriptor, args) =
         take_last_dispatch().expect("the spliced body must have called the dispatch helper");
     assert_eq!(
-        (class_name.as_str(), method_name.as_str(), descriptor.as_str()),
+        (
+            class_name.as_str(),
+            method_name.as_str(),
+            descriptor.as_str()
+        ),
         ("pkg/Target", "target", "(II)I"),
         "the emitter must bake the JitInvokeInfo `resolved_invoke_infos` named",
     );
@@ -12789,8 +12809,7 @@ fn an_invokeinterface_inside_a_splice_is_five_bytes_wide() {
     //   8: ireturn
     let callee_body: [u8; 9] = [0x1a, 0x10, 0x0a, 0xb9, 0x00, 0x03, 0x02, 0x00, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/Iface", "m", "(II)I", 2, b'I', 2)];
+    callee.resolved_invoke_infos = vec![resolved_invoke(3, "pkg/Iface", "m", "(II)I", 2, b'I', 2)];
 
     let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
     let mut sites = HashMap::new();
@@ -12830,8 +12849,15 @@ fn a_nested_splice_replaces_the_call_entirely() {
     // ADDITIVE by design: the pc carries both a nested body and a dispatch
     // target, so a nested bail falls back to the call instead of failing the
     // outer splice. The next test relies on exactly this.
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.resolved_invoke_infos = vec![resolved_invoke(
+        3,
+        "pkg/Inner",
+        "inner",
+        "(II)I",
+        2,
+        b'I',
+        3,
+    )];
     callee.nested_sites = vec![crate::NestedInlineSite {
         callee_pc: 3,
         guard_class_id: 0,
@@ -12842,8 +12868,8 @@ fn a_nested_splice_replaces_the_call_entirely() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
-        .expect("a nested splice must compile");
+    let compiled =
+        compile_with_inlines_heap(&caller, 5, 1, 1, sites).expect("a nested splice must compile");
 
     let _ = take_last_dispatch();
     // SAFETY: as above.
@@ -12877,8 +12903,15 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
 
     let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
     let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.resolved_invoke_infos = vec![resolved_invoke(
+        3,
+        "pkg/Inner",
+        "inner",
+        "(II)I",
+        2,
+        b'I',
+        3,
+    )];
     callee.nested_sites = vec![crate::NestedInlineSite {
         callee_pc: 3,
         guard_class_id: 0,
@@ -12895,10 +12928,16 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
     let _ = take_last_dispatch();
     // SAFETY: as above.
     let got = unsafe { compiled.call_with_heap(0, &[5]) };
-    assert_eq!(got, 15, "the nested bail must fall back to the dispatch call");
-    let (_, _, _, args) =
-        take_last_dispatch().expect("the fallback dispatch must have run");
-    assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
+    assert_eq!(
+        got, 15,
+        "the nested bail must fall back to the dispatch call"
+    );
+    let (_, _, _, args) = take_last_dispatch().expect("the fallback dispatch must have run");
+    assert_eq!(
+        args,
+        vec![5, 10],
+        "with the same arguments the nested body would have had"
+    );
 }
 
 /// A VALUE-PRODUCING BRANCH MERGE splices, and both paths answer correctly.
@@ -13038,7 +13077,9 @@ fn two_merges_at_different_depths_in_one_body() {
     //  10: iadd              <-- merge, depth 2
     //  11: ireturn
     let callee = make_inline_site(
-        &[0x08, 0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0x60, 0xac],
+        &[
+            0x08, 0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0x60, 0xac,
+        ],
         1,
         1,
         true,
@@ -13049,8 +13090,8 @@ fn two_merges_at_different_depths_in_one_body() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
-        .expect("a two-deep merge must splice");
+    let compiled =
+        compile_with_inlines_heap(&caller, 5, 1, 1, sites).expect("a two-deep merge must splice");
 
     // SAFETY: as above.
     unsafe {
@@ -13091,11 +13132,16 @@ fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
     //   1: bipush 10
     //   3: invokevirtual #3
     //   6: ireturn
-    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    let mut callee = make_inline_site(
+        &[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
     // A guarded pc KEEPS its dispatch entry: the miss edge has to go
     // somewhere, and a virtual site has no direct bind to send it to.
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.resolved_invoke_infos = vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
     callee.nested_sites = vec![crate::NestedInlineSite {
         callee_pc: 3,
         guard_class_id: GUARD_CLASS_ID,
@@ -13132,8 +13178,7 @@ fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
 
     // SAFETY: as above.
     let got_miss = unsafe { compiled.call_with_heap(0, &[miss_addr]) };
-    let (_, _, _, args) =
-        take_last_dispatch().expect("a guard miss must take the ordinary call");
+    let (_, _, _, args) = take_last_dispatch().expect("a guard miss must take the ordinary call");
     assert_eq!(
         args,
         vec![miss_addr, 10],
@@ -13156,9 +13201,14 @@ fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
 fn a_null_receiver_takes_the_guarded_splices_miss_edge() {
     const GUARD_CLASS_ID: u32 = 0x4242;
     let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
-    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
-    callee.resolved_invoke_infos =
-        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    let mut callee = make_inline_site(
+        &[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+    callee.resolved_invoke_infos = vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
     callee.nested_sites = vec![crate::NestedInlineSite {
         callee_pc: 3,
         guard_class_id: GUARD_CLASS_ID,
@@ -13175,8 +13225,8 @@ fn a_null_receiver_takes_the_guarded_splices_miss_edge() {
     // SAFETY: JIT-compiled code from valid bytecode; a null receiver must not
     // be dereferenced by the guard, which is the property under test.
     let got = unsafe { compiled.call_with_heap(0, &[0]) };
-    let (_, _, _, args) = take_last_dispatch()
-        .expect("a null receiver must reach the ordinary call, not the body");
+    let (_, _, _, args) =
+        take_last_dispatch().expect("a null receiver must reach the ordinary call, not the body");
     assert_eq!(args, vec![0, 10]);
     assert_eq!(got, 10);
 }
@@ -13496,8 +13546,8 @@ fn s31_inline_getter_iload_ireturn() {
     let mut sites = HashMap::new();
     sites.insert(1, callee); // inline at pc=1
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13554,9 +13604,8 @@ fn inline_publishing_a_deopt_point_is_refused() {
     let refused = compile_with_inlines(&caller_code, caller_len, 1, 1, sites());
     super::INLINE_TEST_PUBLISHES_DEOPT.with(|f| f.set(false));
 
-    let refused = refused.expect(
-        "refusing the splice must fall back to a normal call, not bail the whole method",
-    );
+    let refused = refused
+        .expect("refusing the splice must fall back to a normal call, not bail the whole method");
     assert_ne!(
         refused.code_bytes(),
         inlined.code_bytes(),
@@ -13590,8 +13639,8 @@ fn s31_inline_add_two_params() {
     let mut sites = HashMap::new();
     sites.insert(2, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 2, 2, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 2, 2, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13630,8 +13679,8 @@ fn s31_inline_constant_return() {
     let mut sites = HashMap::new();
     sites.insert(0, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 0, 0, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 0, 0, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13663,8 +13712,8 @@ fn s31_inline_void_method() {
     let mut sites = HashMap::new();
     sites.insert(0, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13701,8 +13750,8 @@ fn s31_inline_with_branch() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13743,8 +13792,8 @@ fn s31_inline_with_if_icmp() {
     let callee = make_inline_site(&callee_bc, 2, 2, true, b'I');
     let mut sites = HashMap::new();
     sites.insert(2, callee);
-    let compiled = compile_with_inlines(&caller_code, caller_len, 2, 2, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 2, 2, sites).expect("compilation failed");
     // SAFETY: executing JIT-compiled machine code produced from valid
     // bytecode; the mmap region is executable.
     unsafe {
@@ -13773,8 +13822,8 @@ fn s31_inline_arithmetic_chain() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13807,8 +13856,8 @@ fn s31_inline_iinc_loop() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13848,8 +13897,8 @@ fn s31_inline_callee_uses_extra_locals() {
     let mut sites = HashMap::new();
     sites.insert(2, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 2, 2, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 2, 2, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -13907,8 +13956,8 @@ fn s31_inline_long_arithmetic() {
     let mut sites = HashMap::new();
     sites.insert(1, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -14015,8 +14064,8 @@ fn s31_inline_bipush_sipush() {
     let mut sites = HashMap::new();
     sites.insert(0, callee);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 0, 0, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 0, 0, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -14048,8 +14097,8 @@ fn s31_inline_multiple_sites() {
     sites.insert(1, site1);
     sites.insert(4, site2);
 
-    let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
-        .expect("compilation failed");
+    let compiled =
+        compile_with_inlines(&caller_code, caller_len, 1, 1, sites).expect("compilation failed");
 
     // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
@@ -15601,8 +15650,7 @@ fn dup_x2_form2_category_2_below_the_top() {
     // 5: iadd     [i + (int)w]
     // 6: ireturn
     let code = [0x1e, 0x1b, 0x5b, 0x57, 0x88, 0x60, 0xac];
-    let compiled = compile_probe_method(&code, 2, 2)
-        .expect("FORM-2 dup_x2 must JIT-compile");
+    let compiled = compile_probe_method(&code, 2, 2).expect("FORM-2 dup_x2 must JIT-compile");
     // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
     let r = unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") };
     assert_eq!(r, 13, "i + (int)w for w=10 i=3");
@@ -15629,8 +15677,7 @@ fn dup2_x1_form1_all_category_1() {
     // 7: iadd     [a+2b+2c]
     // 8: ireturn
     let code = [0x1a, 0x1b, 0x1c, 0x5d, 0x60, 0x60, 0x60, 0x60, 0xac];
-    let compiled = compile_probe_method(&code, 3, 3)
-        .expect("FORM-1 dup2_x1 must JIT-compile");
+    let compiled = compile_probe_method(&code, 3, 3).expect("FORM-1 dup2_x1 must JIT-compile");
     // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
     let r = unsafe { compiled.try_call(&[1, 2, 3]).expect("test JIT call") };
     assert_eq!(r, 1 + 2 * 2 + 2 * 3, "a + 2b + 2c for a=1 b=2 c=3");
@@ -15651,8 +15698,7 @@ fn dup2_x1_form2_category_2_top() {
     // 7: ladd     [2w + b]
     // 8: lreturn
     let code = [0x1b, 0x1e, 0x5d, 0x41, 0x85, 0x61, 0x20, 0x61, 0xad];
-    let compiled = compile_probe_method(&code, 2, 3)
-        .expect("FORM-2 dup2_x1 must JIT-compile");
+    let compiled = compile_probe_method(&code, 2, 3).expect("FORM-2 dup2_x1 must JIT-compile");
     // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
     let r = unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") };
     assert_eq!(r, 2 * 10 + 3, "2w + b for w=10 b=3");
@@ -15735,10 +15781,7 @@ const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
         "frem — the optimizing IR backend lowers it via a call to the jit_frem \
          fmod helper, so admitting it lets the IR pipeline see the method",
     ),
-    (
-        0x73,
-        "drem — same as frem, via jit_drem",
-    ),
+    (0x73, "drem — same as frem, via jit_drem"),
 ];
 
 /// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`

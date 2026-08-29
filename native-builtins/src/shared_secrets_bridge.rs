@@ -1006,13 +1006,13 @@ const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = true;
 /// for any `CRATONVM_*` name that is read but declared nowhere.
 fn thread_container_registration_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_THREAD_CONTAINERS").as_deref() {
+    *ENABLED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_THREAD_CONTAINERS").as_deref() {
             Ok("1") => true,
             Ok("0") => false,
             _ => VM_REMOVES_THREADS_FROM_CONTAINERS,
-        },
-    )
+        }
+    })
 }
 
 /// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
@@ -2882,10 +2882,7 @@ fn buffer_pool_get_memory_used(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 /// `getTotalCapacity()`. See `direct_buffer_pool_stats` for why this is the
 /// same number as `getMemoryUsed()` rather than a second counter.
-fn buffer_pool_get_total_capacity(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn buffer_pool_get_total_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     buffer_pool_get_memory_used(ctx, args)
 }
 
@@ -2928,7 +2925,12 @@ pub(crate) fn register_buffer_pool_mxbean(r: &mut NativeMethodRegistry) {
         "java/lang/management/BufferPoolMXBean",
         "jdk/internal/misc/VM$BufferPool",
     ] {
-        r.register(owner, "getName", "()Ljava/lang/String;", buffer_pool_get_name);
+        r.register(
+            owner,
+            "getName",
+            "()Ljava/lang/String;",
+            buffer_pool_get_name,
+        );
         r.register(owner, "getCount", "()J", buffer_pool_get_count);
         r.register(owner, "getMemoryUsed", "()J", buffer_pool_get_memory_used);
         r.register(
@@ -3033,12 +3035,12 @@ fn jujar_jar_file_has_classpath_attribute(
     let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
     let jar_h = scope.root(jar);
     let jar = scope.get(&jar_h);
-    let manifest = match scope.invoke_virtual(jar, "getManifest", "()Ljava/util/jar/Manifest;", &[])?
-    {
-        Some(Value::Object(Some(m))) => m,
-        // No manifest: no attribute. Same answer the real body gives.
-        _ => return Ok(Some(Value::Int(0))),
-    };
+    let manifest =
+        match scope.invoke_virtual(jar, "getManifest", "()Ljava/util/jar/Manifest;", &[])? {
+            Some(Value::Object(Some(m))) => m,
+            // No manifest: no attribute. Same answer the real body gives.
+            _ => return Ok(Some(Value::Int(0))),
+        };
     let manifest_h = scope.root(manifest);
     let manifest = scope.get(&manifest_h);
     let attrs = match scope.invoke_virtual(
@@ -3109,10 +3111,7 @@ fn jujar_is_initializing(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 /// attacker cannot forge per-entry attributes by handing over a `Manifest`
 /// object. This VM has no second, application-supplied copy to be confused
 /// with, so `Manifest.getAttributes(name)` IS that source.
-fn jujar_get_trusted_attributes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn jujar_get_trusted_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (Some(Value::Object(Some(manifest))), Some(name)) =
         (args.get(1).copied(), args.get(2).copied())
     else {

@@ -3033,7 +3033,8 @@ mod tests {
         // Default policy (escape hatch off): legal pre-Java-7 version, so the
         // structurally well-formed subroutine method is accepted — this is the
         // regression fix (ByteBuddy `JavaDispatcher$DynamicClassLoader.proxy`).
-        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
+        let accepted_default =
+            verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             accepted_default.is_ok(),
             "legal pre-Java-7 (major 49) subroutine method must be accepted by \
@@ -3387,7 +3388,8 @@ mod tests {
         // Legal pre-Java-7 (major 49) version: HotSpot loads this try-finally
         // double-jsr shape, so CratonVM accepts it after the structural scan —
         // by default, no escape hatch required.
-        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
+        let accepted_default =
+            verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             accepted_default.is_ok(),
             "ByteBuddy clear()-shape (try-finally with double-jsr to one \

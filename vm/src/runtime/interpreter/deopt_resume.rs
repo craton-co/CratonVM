@@ -29,7 +29,6 @@ use super::*;
 // Interpreted and compiled handler search, and the two routes across the
 // boundary between them: `interpreter/exception_dispatch.rs`.
 
-
 /// real-frame-deopt: `true` (default OFF) when an IR-path deopt should resume
 /// the interpreter at the trapping bci from the reconstructed frame, instead of
 /// re-running the method from entry. Gated by `CRATONVM_IR_DEOPT_RESUME` while
@@ -87,7 +86,9 @@ pub(super) fn fv_to_value(v: &cratonvm_jit::deopt::FrameValue) -> Option<Value> 
 /// one slot per value, including a cat-2 `long` (`push_long` advances by one
 /// compact slot, KIND_LONG) — and the IR abstract stack likewise carries one
 /// entry per `long`, so no two-slot expansion is needed here.
-pub(super) fn ir_deopt_frame_values(vals: &[cratonvm_jit::deopt::FrameValue]) -> Option<Vec<Value>> {
+pub(super) fn ir_deopt_frame_values(
+    vals: &[cratonvm_jit::deopt::FrameValue],
+) -> Option<Vec<Value>> {
     vals.iter().map(fv_to_value).collect()
 }
 
@@ -246,8 +247,7 @@ pub(super) fn resume_from_ir_deopt(
 /// `CompiledMethod::osr_exit_policy` refuses at ADMISSION any chain deeper than
 /// this, so that an OSR entry is never spent reaching a reject this sink was
 /// always going to give. Two copies of the number would let those two drift.
-pub(super) const MAX_INLINE_RESUME_DEPTH: usize =
-    cratonvm_jit::deopt::MAX_OSR_INLINE_RESUME_DEPTH;
+pub(super) const MAX_INLINE_RESUME_DEPTH: usize = cratonvm_jit::deopt::MAX_OSR_INLINE_RESUME_DEPTH;
 
 /// The bci to park an inlined CALLER frame at.
 ///
@@ -267,7 +267,11 @@ pub(super) const MAX_INLINE_RESUME_DEPTH: usize =
 ///
 /// Fail-closed on anything that is not an invoke: a caller scope whose bci does
 /// not name a call is a malformed chain, not a resumable frame.
-pub(super) fn caller_resume_pc(code: &[u8], code_len: usize, invoke_bci: usize) -> Result<usize, String> {
+pub(super) fn caller_resume_pc(
+    code: &[u8],
+    code_len: usize,
+    invoke_bci: usize,
+) -> Result<usize, String> {
     if invoke_bci >= code_len {
         return Err(format!(
             "caller bci {invoke_bci} is past the end of a {code_len}-byte method"
@@ -332,8 +336,12 @@ pub(super) fn caller_frame_values(
     }
     let locals = ir_deopt_locals(&rf.locals)
         .ok_or_else(|| format!("caller scope {} has an unmappable local", rf.method_key))?;
-    let stack = ir_deopt_frame_values(&rf.stack)
-        .ok_or_else(|| format!("caller scope {} has an unmappable stack slot", rf.method_key))?;
+    let stack = ir_deopt_frame_values(&rf.stack).ok_or_else(|| {
+        format!(
+            "caller scope {} has an unmappable stack slot",
+            rf.method_key
+        )
+    })?;
     Ok((locals, stack))
 }
 
@@ -386,17 +394,19 @@ fn resolve_inlined_callee(
         .and_then(|scoped| resolver.adopt(scoped))
         .map_err(|e| format!("{method_key} did not resolve: {e}"))?;
     let Some(decl_class) = cm.class_store().get(declaring) else {
-        return Err(format!("{method_key} resolved to a class that is not loaded"));
+        return Err(format!(
+            "{method_key} resolved to a class that is not loaded"
+        ));
     };
     let Some(method) = decl_class.methods.get(index as usize) else {
-        return Err(format!("{method_key} resolved to a method index out of range"));
+        return Err(format!(
+            "{method_key} resolved to a method index out of range"
+        ));
     };
     let Some(code_attr) = method.code() else {
         return Err(format!("{method_key} has no Code attribute"));
     };
-    let source_file = cm
-        .get_class(declaring)
-        .and_then(|c| c.source_file.clone());
+    let source_file = cm.get_class(declaring).and_then(|c| c.source_file.clone());
     Ok(Arc::new(CachedBytecodeMethod {
         declaring_class_id: declaring,
         class_name: Arc::from(class_name),
@@ -581,10 +591,18 @@ fn push_inlined_chain(
     if trace {
         let path = chain
             .iter()
-            .map(|f| format!("{}.{}@{}", f.cached.class_name, f.cached.method_name, f.resume_pc))
+            .map(|f| {
+                format!(
+                    "{}.{}@{}",
+                    f.cached.class_name, f.cached.method_name, f.resume_pc
+                )
+            })
             .collect::<Vec<_>>()
             .join(" -> ");
-        eprintln!("[cratonvm-deopt] PRECISE resume of a {}-frame inlined chain: {path}", chain.len());
+        eprintln!(
+            "[cratonvm-deopt] PRECISE resume of a {}-frame inlined chain: {path}",
+            chain.len()
+        );
     }
     for f in chain {
         thread.refill_pools_from_shared(
@@ -1176,7 +1194,9 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     // A refusal there still returns `Err`, so the caller's behaviour for any
     // chain the transfer cannot honour is exactly what it was.
     if !rframe.caller_frames.is_empty() {
-        return transfer_osr_exit_chain_into_live_frame(shared, thread, frame_idx, rframe, artifact);
+        return transfer_osr_exit_chain_into_live_frame(
+            shared, thread, frame_idx, rframe, artifact,
+        );
     }
     if !rframe.monitors.is_empty() {
         return Err("held monitors".to_string());
@@ -1212,7 +1232,13 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
         .iter()
         .enumerate()
         .map(|(i, v)| ("local", i, v))
-        .chain(rframe.stack.iter().enumerate().map(|(i, v)| ("stack", i, v)))
+        .chain(
+            rframe
+                .stack
+                .iter()
+                .enumerate()
+                .map(|(i, v)| ("stack", i, v)),
+        )
         .find_map(|(region, i, v)| match v {
             FrameValue::MaterializationRequired(ev) => {
                 Some(format!("materialization required ({region} {i}: {ev})"))
@@ -1446,17 +1472,12 @@ pub(super) fn transfer_osr_exception_exit_into_live_frame(
     // for the reason the sibling names it: falling through to the generic
     // "unmappable local" reports the wrong cause. Only LOCALS are inspected —
     // the stack is discarded at handler entry (see the doc comment).
-    if let Some(what) = rframe
-        .locals
-        .iter()
-        .enumerate()
-        .find_map(|(i, v)| match v {
-            FrameValue::MaterializationRequired(ev) => {
-                Some(format!("materialization required (local {i}: {ev})"))
-            }
-            _ => None,
-        })
-    {
+    if let Some(what) = rframe.locals.iter().enumerate().find_map(|(i, v)| match v {
+        FrameValue::MaterializationRequired(ev) => {
+            Some(format!("materialization required (local {i}: {ev})"))
+        }
+        _ => None,
+    }) {
         return Err(what);
     }
 
@@ -1589,7 +1610,15 @@ fn transfer_osr_exit_chain_into_live_frame(
     // outermost scope names some other method is a mis-routed stash rather than
     // a deep one — the same identity rule the single-frame path applies to
     // `rframe` itself.
-    let (live_class, live_method, live_desc, live_class_id, live_code, live_max_locals, live_max_stack) = {
+    let (
+        live_class,
+        live_method,
+        live_desc,
+        live_class_id,
+        live_code,
+        live_max_locals,
+        live_max_stack,
+    ) = {
         let f = &thread.frames[frame_idx];
         (
             f.class_name().to_string(),
@@ -1660,10 +1689,12 @@ fn transfer_osr_exit_chain_into_live_frame(
         .iter()
         .chain(std::iter::once(rframe))
         .any(|f| {
-            f.locals
-                .iter()
-                .chain(f.stack.iter())
-                .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)))
+            f.locals.iter().chain(f.stack.iter()).any(|v| {
+                matches!(
+                    v,
+                    FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+                )
+            })
         })
     {
         return Err("virtual-object slot in an inlined chain".to_string());
@@ -1695,7 +1726,9 @@ fn transfer_osr_exit_chain_into_live_frame(
     }
     push_inlined_chain(shared, thread, inner, trace)
         .map(|_| ())
-        .ok_or_else(|| "pushing the inlined chain failed after the live frame was written".to_string())
+        .ok_or_else(|| {
+            "pushing the inlined chain failed after the live frame was written".to_string()
+        })
 }
 
 /// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
@@ -1796,6 +1829,69 @@ pub(crate) fn dbg_deopt_sink(
         "[cratonvm-deopt] sink={site} running={running} stash={} bci={}",
         rframe.method_key, rframe.bci,
     );
+}
+
+/// May the interpreter re-run this method from entry instead of resuming
+/// precisely at `resume_bci`?
+///
+/// `true` means the abandoned compiled attempt cannot have committed anything
+/// observable, so a re-run from bci 0 is the same execution — the locals are
+/// rebuilt from the same arguments and nothing outside the frame was written.
+///
+/// # Why a PREFIX, and not the whole body
+///
+/// The rule used to be "the whole method commits no side effect", and that is
+/// the right rule for a method the compiler ran end to end. It is the wrong
+/// rule for an abandoned attempt: what a replay could DUPLICATE is only what
+/// the attempt already committed, and the attempt stopped at `resume_bci`.
+/// Every deopt point this VM emits carries `ResumeSemantics::REEXECUTE` (only
+/// `PendingException` differs, and those frames go to a different stash), so
+/// the bytecode AT `resume_bci` had not completed and the bytecodes after it
+/// never ran. Only `code[..resume_bci]` can have committed anything.
+///
+/// The narrower rule cost a real answer: netty's
+/// `UnpooledHeapByteBuf._getUnsignedMedium` is `getfield array; invokestatic
+/// getUnsignedMedium`, and once `CRATONVM_JIT_IR_INLINE` splices that callee
+/// in, an out-of-bounds read deopts at the invoke. The whole body "commits a
+/// side effect" — it contains a call — so the replay was refused and a
+/// three-byte bounds check raised `InternalError` instead of
+/// `IndexOutOfBoundsException`. Nothing before the invoke commits anything, and
+/// the call itself never completed, so the replay was always safe. See
+/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+///
+/// # The second half
+///
+/// A spliced artifact's attempt also ran part of a RELOCATED callee body, which
+/// the caller's bytecode does not describe. `spliced_bodies_pure` is the
+/// artifact's own answer for that half (`CompiledMethod::
+/// spliced_bodies_side_effect_free`), computed at compile time with this same
+/// predicate over each spliced region. It is vacuously `true` for an artifact
+/// that spliced nothing.
+///
+/// Conservative in both directions it can be: an out-of-range `resume_bci`
+/// (including the `u32::MAX` identity-less re-run sentinel) falls back to
+/// asking the question of the whole body, which is the historical rule.
+pub(crate) fn replay_from_entry_is_observably_equivalent(
+    code: &[u8],
+    spliced_bodies_pure: bool,
+    resume_bci: u32,
+) -> bool {
+    // The historical rule first: a body that commits nothing anywhere needs no
+    // reasoning about where the attempt stopped, and answers `true` even for
+    // the `u32::MAX` sentinel.
+    if !cratonvm_jit::bytecode_commits_side_effect(code, code.len()) {
+        return true;
+    }
+    if !spliced_bodies_pure {
+        return false;
+    }
+    let Ok(prefix) = usize::try_from(resume_bci) else {
+        return false;
+    };
+    if prefix > code.len() {
+        return false;
+    }
+    !cratonvm_jit::bytecode_commits_side_effect(code, prefix)
 }
 
 pub(crate) fn deopt_frame_matches_method(
@@ -2033,7 +2129,8 @@ mod deopt_step3_tests {
     /// A scalar-replaced object placeholder: id `id`, class `class_id`, with the
     /// given field values (`num_fields` derived from the vec length).
     fn vobj(id: usize, class_id: u32, fields: Vec<FrameValue>) -> FrameValue {
-        FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id,
             class_id,
             num_fields: fields.len(),
@@ -2707,7 +2804,8 @@ mod deopt_step3_tests {
     /// actual `field_values` length is rejected (malformed snapshot).
     #[test]
     fn verify_rejects_malformed_virtual_field_count() {
-        let bad = FrameValue::VirtualObject(VirtualObjectState { array_element_type: None,
+        let bad = FrameValue::VirtualObject(VirtualObjectState {
+            array_element_type: None,
             id: 0,
             class_id: 1,
             num_fields: 2,                          // claims 2…
@@ -3238,7 +3336,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 3);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            3,
+        );
 
         let deleted = rframe(
             vec![FrameValue::Int(2)],
@@ -3264,7 +3369,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 4);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            4,
+        );
 
         let (cm, plan) = osr_plan_for(4, 4);
         let tolerated = rframe(vec![FrameValue::Int(2), FrameValue::Unsupported], vec![], 4);
@@ -3284,11 +3396,9 @@ mod deopt_step3_tests {
         let refused = rframe(
             vec![
                 FrameValue::Int(3),
-                FrameValue::MaterializationRequired(
-                    cratonvm_jit::deopt::EliminatedValue::unknown(
-                        cratonvm_jit::deopt::EliminationCause::EliminatedStore,
-                    ),
-                ),
+                FrameValue::MaterializationRequired(cratonvm_jit::deopt::EliminatedValue::unknown(
+                    cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+                )),
             ],
             vec![],
             4,
@@ -3307,15 +3417,21 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 2);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            2,
+        );
 
         // The artifact's only deopt point is at bci 2; the stash names bci 9.
         let (cm, plan) = osr_plan_for(2, 2);
         let stray = rframe(vec![FrameValue::Int(7)], vec![], 9);
-        let why = transfer_osr_exit_into_live_frame_checked(
-            &shared, &mut thread, 0, &stray, &cm, &plan,
-        )
-        .expect_err("a bci from nowhere is not a resume point");
+        let why =
+            transfer_osr_exit_into_live_frame_checked(&shared, &mut thread, 0, &stray, &cm, &plan)
+                .expect_err("a bci from nowhere is not a resume point");
         assert!(why.contains("unresumable exit"), "got {why:?}");
 
         let frame = &thread.frames[0];
@@ -3334,7 +3450,14 @@ mod deopt_step3_tests {
         let cached = minimal_cached();
         // Entered at the loop header (bci 2) with i=0; the body committed 50
         // iterations and bailed at bci 9.
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 2);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(0)],
+            vec![],
+            2,
+        );
 
         let cm = cm_with_deopt_point(0, 9);
         let plan = cratonvm_jit::OsrEntryPlan {
@@ -3390,7 +3513,14 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(1)],
+            vec![],
+            0,
+        );
 
         // The fixture's body is `return`, so bci 0 is not an invoke — which is
         // exactly one of the malformed shapes the transfer must name rather
@@ -3431,5 +3561,105 @@ mod deopt_step3_tests {
             !why.contains("inlined caller chain"),
             "the chain is not what is wrong here: {why}"
         );
+    }
+    // ── replay_from_entry_is_observably_equivalent ──────────────────────
+
+    /// netty's `UnpooledHeapByteBuf._getUnsignedMedium`, byte for byte:
+    /// `aload_0; getfield #57; iload_1; invokestatic #262; ireturn`.
+    ///
+    /// Nine bytes, one of which is a call — so the OLD rule ("the body commits
+    /// no side effect") refused every replay, and an out-of-bounds read through
+    /// the spliced callee raised `InternalError` instead of
+    /// `IndexOutOfBoundsException`. The deopt resumes at the invoke, bci 5, and
+    /// nothing before bci 5 commits anything.
+    const GET_UNSIGNED_MEDIUM: [u8; 9] = [
+        0x2a, // 0: aload_0
+        0xb4, 0x00, 0x39, // 1: getfield
+        0x1b, // 4: iload_1
+        0xb8, 0x01, 0x06, // 5: invokestatic  <- the spliced site, the resume bci
+        0xac, // 8: ireturn
+    ];
+
+    #[test]
+    fn a_replay_is_allowed_when_nothing_before_the_resume_point_commits() {
+        // The whole body contains a call, so the historical rule refuses.
+        assert!(cratonvm_jit::bytecode_commits_side_effect(
+            &GET_UNSIGNED_MEDIUM,
+            GET_UNSIGNED_MEDIUM.len()
+        ));
+        // But the abandoned attempt stopped AT the call, and the prefix is
+        // three pure loads.
+        assert!(replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            5
+        ));
+    }
+
+    /// The same body, with a spliced callee that could have written something.
+    /// The prefix says nothing about the relocated bytecode, so the artifact's
+    /// own answer has to veto.
+    #[test]
+    fn an_impure_spliced_body_vetoes_the_prefix_rule() {
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            false,
+            5
+        ));
+    }
+
+    /// A resume point PAST a side effect is still refused: the attempt already
+    /// committed it, and a re-run from entry would do it twice.
+    #[test]
+    fn a_resume_point_after_a_store_still_refuses() {
+        // 0: aload_0  1: iload_1  2: putfield  5: aload_0  6: iload_1
+        // 7: invokestatic  10: ireturn
+        let code = [
+            0x2a, 0x1b, 0xb5, 0x00, 0x01, 0x2a, 0x1b, 0xb8, 0x00, 0x02, 0xac,
+        ];
+        assert!(
+            !replay_from_entry_is_observably_equivalent(&code, true, 7),
+            "the putfield at bci 2 is before the resume point and would be \
+             duplicated"
+        );
+        // Resuming at the putfield itself is fine — it had not run.
+        assert!(replay_from_entry_is_observably_equivalent(&code, true, 2));
+    }
+
+    /// A body that commits nothing anywhere keeps the historical answer,
+    /// including for the identity-less `u32::MAX` re-run sentinel that a null
+    /// deopt point stashes.
+    #[test]
+    fn a_pure_body_replays_at_any_resume_point_including_the_sentinel() {
+        let pure = [0x2a, 0x1b, 0xac]; // aload_0; iload_1; ireturn
+        assert!(replay_from_entry_is_observably_equivalent(&pure, true, 0));
+        assert!(replay_from_entry_is_observably_equivalent(
+            &pure,
+            true,
+            u32::MAX
+        ));
+        assert!(replay_from_entry_is_observably_equivalent(
+            &pure,
+            false,
+            u32::MAX
+        ));
+        // ...and an impure body with that sentinel is refused, because there is
+        // no resume point to reason about.
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            u32::MAX
+        ));
+    }
+
+    /// A resume bci past the end of the body is nonsense; refuse rather than
+    /// answer from a truncated walk.
+    #[test]
+    fn an_out_of_range_resume_bci_refuses() {
+        assert!(!replay_from_entry_is_observably_equivalent(
+            &GET_UNSIGNED_MEDIUM,
+            true,
+            36
+        ));
     }
 }

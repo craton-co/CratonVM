@@ -416,9 +416,12 @@ pub(crate) fn register_jdk25_language_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod jdk25_language_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -----------------------------------------------------------------------
     // ModuleImportResolver tests

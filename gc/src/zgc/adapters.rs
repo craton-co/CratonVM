@@ -210,10 +210,7 @@ pub fn page_candidate(page: &ZPageReal) -> PageCandidate {
 /// capacity measure and therefore no choice to make at the call site; for why,
 /// see the dated note on [`ZPageReal::relocation_capacity_bytes`].
 pub fn page_candidates(pages: &[Arc<ZPageReal>]) -> Vec<PageCandidate> {
-    pages
-        .iter()
-        .map(|p| page_candidate(p.as_ref()))
-        .collect()
+    pages.iter().map(|p| page_candidate(p.as_ref())).collect()
 }
 
 // ===========================================================================
@@ -771,7 +768,7 @@ mod tests {
     use crate::zgc::forwarding::{ZRelocationPolicy, ZRelocationSet};
     use crate::zgc::generation::{ZGenerationalConfig, ZPromotionPolicy};
     use crate::zgc::page::{ZPageAllocator, ZPageConfig};
-    use crate::zgc::remembered::{Z_REMSET_GRAIN_BYTES, ZStoreBarrier, ZStoreBarrierOutcome};
+    use crate::zgc::remembered::{ZStoreBarrier, ZStoreBarrierOutcome, Z_REMSET_GRAIN_BYTES};
 
     /// The 1/512-scale geometry `page.rs`'s own tests and
     /// `gc/tests/zgc_module_integration.rs` use: 4 KiB granule, 8 KiB small
@@ -1069,7 +1066,9 @@ mod tests {
             heap.old().page_count(),
             "register_old_pages must offer every old page"
         );
-        let set = table.get(old_page.id()).expect("the old page is registered");
+        let set = table
+            .get(old_page.id())
+            .expect("the old page is registered");
         assert_eq!(set.page_size(), old_page.size());
 
         let ctx = ZHeapGenerationContext::new(&heap);

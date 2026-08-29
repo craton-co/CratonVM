@@ -4,8 +4,8 @@
 //! Prints the live Rust layout contracts used by the interpreter, JIT and GC.
 
 use cratonvm_types::{
-    CompactValue, ObjectHeader, ObjectRef, RawSlot, Value, HEADER_SIZE,
-    MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    CompactValue, ObjectHeader, ObjectRef, RawSlot, Value, HEADER_SIZE, MARK_WORD_OFFSET,
+    REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
 
 fn row(name: &str, value: usize) {

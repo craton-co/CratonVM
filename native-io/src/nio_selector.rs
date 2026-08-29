@@ -705,8 +705,7 @@ fn selectors_read_depth() -> u32 {
 /// unconditional self-deadlock (parking_lot RwLocks are not upgradable in
 /// place), so it is asserted rather than left to be discovered by a stuck
 /// process. There is exactly one caller and it holds nothing.
-fn selectors_open_write(
-) -> parking_lot::RwLockWriteGuard<'static, HashMap<i32, SelectorSlot>> {
+fn selectors_open_write() -> parking_lot::RwLockWriteGuard<'static, HashMap<i32, SelectorSlot>> {
     debug_assert_eq!(
         selectors_read_depth(),
         0,
@@ -803,8 +802,7 @@ pub fn selector_close(id: i32) {
         // can skip this entry without locking it. Under the state lock, so the
         // two can never disagree in the direction that matters (mirror says
         // open, state says closed) — see `SelectorSlot::open`.
-        s.open
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        s.open.store(false, std::sync::atomic::Ordering::Relaxed);
         // An in-flight epoll_wait must be woken before its self-pipe and
         // epoll fd can be released. In particular, closing an epoll fd from a
         // different thread is not a portable wakeup primitive. Keep those
@@ -2197,9 +2195,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
             // socket-processing tasks per message where HotSpot needs exactly
             // one, which is what grew the connector pool to maxThreads.
             // See fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md.
-            if interest & OP_WRITE != 0
-                && h.os_handle().map(os_handle_writable).unwrap_or(true)
-            {
+            if interest & OP_WRITE != 0 && h.os_handle().map(os_handle_writable).unwrap_or(true) {
                 ready |= OP_WRITE;
             }
         }
@@ -2216,9 +2212,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
             // Same kernel check as the stream arm above. A datagram socket is
             // almost always writable, but "almost always" is not a readiness
             // contract and a full send buffer must not be reported ready.
-            if interest & OP_WRITE != 0
-                && h.os_handle().map(os_handle_writable).unwrap_or(true)
-            {
+            if interest & OP_WRITE != 0 && h.os_handle().map(os_handle_writable).unwrap_or(true) {
                 ready |= OP_WRITE;
             }
         }
@@ -2506,7 +2500,10 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
     if ctx.object_num_fields(obj) <= base + SI_OPEN_FLAG {
         return false;
     }
-    ctx.get_field(obj, base + SI_OPEN_FLAG).as_int().unwrap_or(0) != 0
+    ctx.get_field(obj, base + SI_OPEN_FLAG)
+        .as_int()
+        .unwrap_or(0)
+        != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -3456,7 +3453,6 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // that mask readyOps() against OP_*).
 // ---------------------------------------------------------------------------
 
-
 /// `SelectionKey.attach(Object)` -- guarded for a foreign receiver (see
 /// `socket_channel::foreign_nio_receiver`).
 ///
@@ -3482,7 +3478,12 @@ fn g_sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
 /// `SelectionKey.attachment()` -- see [`g_sk_attach`].
 fn g_sk_attachment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    match crate::socket_channel::foreign_nio_delegate(ctx, args, "attachment", "()Ljava/lang/Object;") {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "attachment",
+        "()Ljava/lang/Object;",
+    ) {
         Some(r) => r,
         None => sk_attachment(ctx, args),
     }
@@ -4459,7 +4460,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             "()Ljava/nio/channels/SelectableChannel;",
             g_sk_channel,
         );
-        r.register(c, "selector", "()Ljava/nio/channels/Selector;", g_sk_selector);
+        r.register(
+            c,
+            "selector",
+            "()Ljava/nio/channels/Selector;",
+            g_sk_selector,
+        );
         r.register(c, "interestOps", "()I", g_sk_interest_ops);
         r.register(
             c,
@@ -4953,9 +4959,12 @@ fn describe_kernel_readiness(fd: i32) -> String {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -4967,7 +4976,6 @@ mod tests {
         static NEXT: AtomicI32 = AtomicI32::new(0x7000_0001);
         NEXT.fetch_add(1, Ordering::SeqCst)
     }
-
 
     // --- selector-registry lock discipline ---------------------------------
     //
@@ -5019,7 +5027,9 @@ mod tests {
             drop(outer);
         });
 
-        ready_rx.recv_timeout(Duration::from_secs(5)).expect("outer guard taken");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("outer guard taken");
         let writer = thread::spawn(|| {
             // `selector_open` is the registry's only writer.
             selector_open()
@@ -5315,8 +5325,15 @@ mod tests {
         let id = selector_open();
         let (_client, server) = make_stream_pair();
         let fd = fake_fd();
-        selector_register(id, fd, OP_READ, None, 0, Some(SelectableKind::Stream(server)))
-            .unwrap();
+        selector_register(
+            id,
+            fd,
+            OP_READ,
+            None,
+            0,
+            Some(SelectableKind::Stream(server)),
+        )
+        .unwrap();
 
         // Nothing is ever written to the pair, so OP_READ cannot fire and each
         // select must wait out its timeout — with or without this call.
@@ -5350,8 +5367,15 @@ mod tests {
         let id = selector_open();
         let (_client, server) = make_stream_pair();
         let fd = fake_fd();
-        selector_register(id, fd, OP_READ, None, 0, Some(SelectableKind::Stream(server)))
-            .unwrap();
+        selector_register(
+            id,
+            fd,
+            OP_READ,
+            None,
+            0,
+            Some(SelectableKind::Stream(server)),
+        )
+        .unwrap();
 
         let handle = thread::spawn(move || {
             // Long enough that the main thread is parked in the kernel wait.

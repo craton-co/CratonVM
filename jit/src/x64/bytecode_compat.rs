@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 /// Scan bytecode and determine JIT compatibility.
 ///
 /// Returns `Some(needs_heap)` if the method can be JIT-compiled, `None` otherwise.

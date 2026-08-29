@@ -52,6 +52,9 @@ fn main() {
     //   3. C:/craton/gpu-java/src/main/java, then
     //      C:/craton/craton-gpu-java/src/main/java (Windows-only defaults;
     //      never consulted on Linux/macOS).
+    // Each checkout root is probed in both source layouts: the current
+    // aggregator one (<repo>/craton-gpu/src/main/java) and the pre-0.3.0
+    // flat one (<repo>/src/main/java). See `first_existing_layout`.
     // If none exists, the build script emits empty paths and a warning. The
     // build never fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
@@ -265,28 +268,55 @@ fn resolve_java_root_from(
 fn documented_sibling_java_root(manifest_dir: &Path) -> PathBuf {
     let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
     let workspace_parent = workspace_root.parent().unwrap_or(workspace_root);
-    workspace_parent
-        .join("craton-gpu-java")
+    let checkout = workspace_parent.join("craton-gpu-java");
+    first_existing_layout(&checkout)
+}
+
+/// Both source layouts a craton-gpu-java checkout can have, newest first.
+///
+/// 2026-08-28: that repo became a Maven aggregator, so its Java sources
+/// moved from `<repo>/src/main/java` down into
+/// `<repo>/craton-gpu/src/main/java`. Both are accepted, because this
+/// build script has to keep working against a checkout of either
+/// vintage — and because the failure it would otherwise produce is
+/// invisible. When no candidate resolves, the build does not fail: it
+/// emits an empty annotations directory and a `cargo:warning`, which is
+/// easy to miss and leaves a VM that silently recognises no
+/// `@GpuKernel` at all.
+///
+/// Returns the aggregator layout when neither exists, so the
+/// `cargo:warning` names the path a current checkout would use.
+fn first_existing_layout(checkout: &Path) -> PathBuf {
+    let aggregator = checkout
+        .join("craton-gpu")
         .join("src")
         .join("main")
-        .join("java")
+        .join("java");
+    if aggregator.is_dir() {
+        return aggregator;
+    }
+    let flat = checkout.join("src").join("main").join("java");
+    if flat.is_dir() {
+        return flat;
+    }
+    aggregator
 }
 
 fn platform_fallback_java_root(sibling: PathBuf, is_windows: bool) -> PathBuf {
     if is_windows {
         // The real checkout lives at C:/craton/gpu-java (not
-        // craton-gpu-java) on this box. Tried first; the old guess is kept
-        // as a second candidate in case a differently-named checkout is
-        // ever used instead.
-        let win_default = PathBuf::from("C:/craton/gpu-java/src/main/java");
-        if win_default.is_dir() {
-            return win_default;
+        // craton-gpu-java) on this box; the differently-named path is kept
+        // as a second candidate. Each is tried in both source layouts —
+        // see `first_existing_layout` for why there are two.
+        for root in ["C:/craton/gpu-java", "C:/craton/craton-gpu-java"] {
+            let candidate = first_existing_layout(&PathBuf::from(root));
+            if candidate.is_dir() {
+                return candidate;
+            }
         }
-        let win_default_legacy = PathBuf::from("C:/craton/craton-gpu-java/src/main/java");
-        if win_default_legacy.is_dir() {
-            return win_default_legacy;
-        }
-        return win_default;
+        // Nothing resolved: name the path a current checkout would use, so
+        // the `cargo:warning` points somewhere actionable.
+        return first_existing_layout(&PathBuf::from("C:/craton/gpu-java"));
     }
     sibling
 }

@@ -338,6 +338,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "clinit-order", on_key: Some("CRATONVM_DBG_CLINIT_ORDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "clone", on_key: Some("CRATONVM_DBG_CLONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "coerce", on_key: Some("CRATONVM_DBG_COERCE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "checkcast-inline", on_key: Some("CRATONVM_DBG_CHECKCAST_INLINE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "compact-inline", on_key: Some("CRATONVM_DBG_COMPACT_INLINE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "compact-legacy", on_key: Some("CRATONVM_DBG_COMPACT_LEGACY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "compactvalue", on_key: Some("CRATONVM_DBG_COMPACTVALUE"), off_key: None, off_word: None },
@@ -1150,6 +1151,7 @@ pub const INVENTORY: &[E] = &[
     // `x64::safepoint::collect_live_oop_homes`.
     E { group: Group::JIT, token: "staged-arg-shadow", on_key: None, off_key: Some("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"), off_word: None },
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
+    E { group: Group::JIT, token: "checkcast-inline", on_key: Some("CRATONVM_JIT_CHECKCAST_INLINE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "final-devirt", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
@@ -2839,10 +2841,16 @@ mod tests {
             .filter(|f| f.takes_value)
             .map(|f| f.flag)
             .collect();
-        assert_eq!(with_value, vec!["--jdk-only-report", "--dump-class-origins"]);
+        assert_eq!(
+            with_value,
+            vec!["--jdk-only-report", "--dump-class-origins"]
+        );
 
         assert!(jdk_only_flag("--jdk-onlyy").is_none());
-        assert!(jdk_only_flag("--jdk-only-report=x").is_none(), "exact match");
+        assert!(
+            jdk_only_flag("--jdk-only-report=x").is_none(),
+            "exact match"
+        );
         assert!(jdk_only_flag("").is_none());
     }
 
@@ -3034,7 +3042,10 @@ mod tests {
             // Joined 2026-08-21, default-ON for the same reason: without a
             // falsey word its `-token` form would unset the key and leave
             // the machinery on, which is not a kill switch.
-            ("zgc-relocate-proven-jit", "CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"),
+            (
+                "zgc-relocate-proven-jit",
+                "CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT",
+            ),
         ] {
             let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));
@@ -3070,7 +3081,11 @@ mod tests {
         for (group, token, key) in [
             (Group::JIT, "sp-inline-ic", "CRATONVM_JIT_SP_INLINE_IC"),
             (Group::JIT, "sp-tailcall", "CRATONVM_JIT_SP_TAILCALL"),
-            (Group::JIT, "osr-dead-locals", "CRATONVM_JIT_OSR_DEAD_LOCALS"),
+            (
+                Group::JIT,
+                "osr-dead-locals",
+                "CRATONVM_JIT_OSR_DEAD_LOCALS",
+            ),
         ] {
             let e = lookup(group, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));
@@ -3082,7 +3097,11 @@ mod tests {
 
         // Default-ON with a dedicated opt-out name: `-token` sets it.
         for (group, token, off_key) in [
-            (Group::JIT, "shadow-end-guard", "CRATONVM_SHADOW_NO_END_GUARD"),
+            (
+                Group::JIT,
+                "shadow-end-guard",
+                "CRATONVM_SHADOW_NO_END_GUARD",
+            ),
             (Group::JIT, "statics-index", "CRATONVM_NO_STATICS_INDEX"),
             (
                 Group::JIT,
@@ -3203,10 +3222,18 @@ mod tests {
     fn the_gc_diagnostic_knobs_resolve_from_their_grouped_token() {
         // (group variable, token, the legacy key it must set)
         let on: &[(&str, &str, &str)] = &[
-            ("CRATONVM_DBG", "sweep-referrers", "CRATONVM_DBG_SWEEP_REFERRERS"),
+            (
+                "CRATONVM_DBG",
+                "sweep-referrers",
+                "CRATONVM_DBG_SWEEP_REFERRERS",
+            ),
             ("CRATONVM_DBG", "owner-filter", "CRATONVM_DBG_OWNER_FILTER"),
             ("CRATONVM_GC", "oldgen-compact", "CRATONVM_OLDGEN_COMPACT"),
-            ("CRATONVM_GC", "owner-class-filter", "CRATONVM_OWNER_CLASS_FILTER"),
+            (
+                "CRATONVM_GC",
+                "owner-class-filter",
+                "CRATONVM_OWNER_CLASS_FILTER",
+            ),
         ];
         for &(var, token, key) in on {
             let c = case(&[(var, token)]);

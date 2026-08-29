@@ -2263,7 +2263,9 @@ mod tests {
              synthetic shim would make the census report a degrade on every \
              healthy proxy, which is worse than not counting at all"
         );
-        assert!(!super::emitted_super_is_the_synthetic_shim("jdk/proxy1/$Proxy0"));
+        assert!(!super::emitted_super_is_the_synthetic_shim(
+            "jdk/proxy1/$Proxy0"
+        ));
     }
 
     #[test]
@@ -2775,8 +2777,10 @@ mod tests {
         // so `define_class_with_options` can resolve both at link time —
         // exactly what `define_or_get_proxy_class` does via
         // `ctx.try_ensure_synthetic_class(...).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")` before defining the proxy.
-        cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        cm.try_ensure_synthetic_class("pkg/Greeter", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("pkg/Greeter", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         let spec = canonical_single_iface_spec();
         let bytes = emit_proxy_classfile(&spec).expect("canonical proxy emit must succeed");
@@ -2870,8 +2874,11 @@ mod tests {
         // `Proxy$Instance.<init>(InvocationHandler, Class[])V` method entry to
         // `synthetic_stub_ctor_methods`, so the stub's method table now
         // carries the ctor the generated `$ProxyN.<init>` resolves against.
-        let super_id = cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
-        cm.try_ensure_synthetic_class("pkg/Greeter", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let super_id = cm
+            .try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("pkg/Greeter", 0)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let super_cls = cm
             .get_class(super_id)
             .expect("synthetic Proxy$Instance must be registered");

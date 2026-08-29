@@ -510,9 +510,7 @@ impl CapabilityKind {
     /// Inverse of [`as_str`](Self::as_str).
     pub fn parse(text: &str) -> Option<CapabilityKind> {
         let text = text.trim();
-        CapabilityKind::ALL
-            .into_iter()
-            .find(|k| k.as_str() == text)
+        CapabilityKind::ALL.into_iter().find(|k| k.as_str() == text)
     }
 
     /// Whether this kind's scopes are paths (so a bare scope string in a grant
@@ -994,9 +992,9 @@ impl CapabilitySet {
             for (entry, parsed) in parse_grant_list(&list) {
                 match parsed {
                     Some(cap) => set.grants.push(cap),
-                    None => eprintln!(
-                        "[CAPABILITY] ignoring unparseable {GRANTS_VAR} entry {entry:?}"
-                    ),
+                    None => {
+                        eprintln!("[CAPABILITY] ignoring unparseable {GRANTS_VAR} entry {entry:?}")
+                    }
                 }
             }
         }
@@ -1325,12 +1323,11 @@ pub fn classify_native(class_name: &str, method_name: &str) -> Option<Capability
         // --- raw memory ----------------------------------------------------
         "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe" => Some(CapabilityKind::RawMemory),
         // --- foreign (Panama / FFM) ----------------------------------------
-        "java/lang/foreign/Linker" | "jdk/internal/foreign/abi/AbstractLinker" => {
-            match method_name {
-                "upcallHandle" => Some(CapabilityKind::ForeignUpcall),
-                _ => Some(CapabilityKind::ForeignDowncall),
-            }
-        }
+        "java/lang/foreign/Linker" | "jdk/internal/foreign/abi/AbstractLinker" => match method_name
+        {
+            "upcallHandle" => Some(CapabilityKind::ForeignUpcall),
+            _ => Some(CapabilityKind::ForeignDowncall),
+        },
         "java/lang/foreign/SymbolLookup" => Some(CapabilityKind::LibraryLoad),
         "java/lang/foreign/MemorySegment" => Some(CapabilityKind::RawMemory),
         // --- files ---------------------------------------------------------
@@ -1344,10 +1341,12 @@ pub fn classify_native(class_name: &str, method_name: &str) -> Option<Capability
             _ => None,
         },
         // --- network -------------------------------------------------------
-        "java/net/Socket" | "java/net/ServerSocket" | "java/net/DatagramSocket"
-        | "sun/nio/ch/Net" | "java/net/PlainSocketImpl" | "java/net/SocketImpl" => {
-            Some(CapabilityKind::Network)
-        }
+        "java/net/Socket"
+        | "java/net/ServerSocket"
+        | "java/net/DatagramSocket"
+        | "sun/nio/ch/Net"
+        | "java/net/PlainSocketImpl"
+        | "java/net/SocketImpl" => Some(CapabilityKind::Network),
         _ => None,
     }
 }
@@ -1580,7 +1579,9 @@ mod tests {
             .grant(Capability::parse_grant("network:*.example.com:443").unwrap());
 
         assert!(caps.check(Capability::file_read("/data/a")).is_ok());
-        assert!(caps.check(Capability::network("api.example.com:443")).is_ok());
+        assert!(caps
+            .check(Capability::network("api.example.com:443"))
+            .is_ok());
         assert!(caps.check(Capability::file_read("/etc/shadow")).is_err());
         assert!(caps.check(Capability::file_write("/data/a")).is_err());
         assert!(caps.check(Capability::process_spawn("/bin/sh")).is_err());
@@ -1696,6 +1697,14 @@ mod tests {
         let caps = CapabilitySet::new(VmId::from_raw(0x1234), CapabilityMode::Enforce);
         // Deliberately one line, with `line!()` immediately after: `check` is
         // `#[track_caller]`, so the recorded site must be the gate's line.
+        //
+        // `#[rustfmt::skip]` is LOAD-BEARING, not style. `cargo fmt` reflowed
+        // this call across three lines in `3de6b9c64`, `line!() - 1` then named
+        // the `.expect_err` line instead of the `.check` line, and the test went
+        // off by exactly one — red for every lane on the first gate it runs.
+        // The comment above already said "deliberately one line" and a comment
+        // is not a compile-time link; this attribute is.
+        #[rustfmt::skip]
         let denied = caps.check(Capability::network("metadata.internal:80")).expect_err("denied");
         let expected_line = line!() - 1;
 
@@ -1758,7 +1767,9 @@ mod tests {
         assert_eq!(caps.grants().len(), 4);
         assert!(caps.check(Capability::file_read("/data/x")).is_ok());
         assert!(caps.check(Capability::file_write("/tmp/x")).is_ok());
-        assert!(caps.check(Capability::process_spawn("/bin/anything")).is_ok());
+        assert!(caps
+            .check(Capability::process_spawn("/bin/anything"))
+            .is_ok());
         assert!(caps.check(Capability::file_write("/data/x")).is_err());
     }
 
@@ -1766,8 +1777,8 @@ mod tests {
     fn every_kind_round_trips_through_the_grant_syntax() {
         for kind in CapabilityKind::ALL {
             let text = format!("{}:*", kind.as_str());
-            let parsed = Capability::parse_grant(&text)
-                .unwrap_or_else(|| panic!("{text} must parse"));
+            let parsed =
+                Capability::parse_grant(&text).unwrap_or_else(|| panic!("{text} must parse"));
             assert_eq!(parsed.kind(), kind);
             assert_eq!(parsed.scope(), &Scope::Any);
             assert_eq!(CapabilityKind::parse(kind.as_str()), Some(kind));
@@ -1832,9 +1843,14 @@ mod tests {
     #[test]
     fn audit_records_the_first_call_site_not_the_last() {
         let caps = set(CapabilityMode::Permissive);
+        // One line, and `#[rustfmt::skip]` to keep it that way — see
+        // `denial_carries_kind_scope_vm_and_call_site` for what a reflow does
+        // to `line!() - 1`.
+        #[rustfmt::skip]
         caps.check(Capability::file_read("/data/a")).expect("permissive allows");
         let first = line!() - 1;
-        caps.check(Capability::file_read("/data/a")).expect("permissive allows");
+        caps.check(Capability::file_read("/data/a"))
+            .expect("permissive allows");
 
         let report = caps.audit_report();
         assert_eq!(report.uses.len(), 1);
@@ -1846,7 +1862,8 @@ mod tests {
     fn reset_audit_clears_records_but_keeps_policy() {
         let mut caps = set(CapabilityMode::Enforce);
         caps.grant(Capability::parse_grant("file-read:/data").unwrap());
-        caps.check(Capability::file_read("/data/a")).expect("granted");
+        caps.check(Capability::file_read("/data/a"))
+            .expect("granted");
         assert_eq!(caps.audit_report().total_checks(), 1);
         caps.reset_audit();
         assert_eq!(caps.audit_report().total_checks(), 0);

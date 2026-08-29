@@ -20,11 +20,11 @@ pub mod ffm_epoch;
 pub mod field_watch;
 pub mod flag_groups;
 pub mod flags;
-pub mod jfp;
 pub mod float_format;
 pub mod handle;
 mod heap_types;
 pub mod intern;
+pub mod jfp;
 pub mod jit_activation;
 pub mod loader_pin;
 pub mod lock_order;
@@ -35,7 +35,6 @@ pub mod reflective_probe;
 pub mod striped_counter;
 pub mod subsystem_config;
 mod value;
-
 
 /// One collection's `old address -> new address` relocation table.
 ///
@@ -64,12 +63,11 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
-    is_compact_object, layout_generation, layout_replace_guard, object_body_size,
-    foreign_layout_refusals, next_layout_domain, pack_fields_by_width_enabled,
-    read_compact_field, register_class_layout,
-    set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled, FIRST_LAYOUT_DOMAIN,
+    foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
+    next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
+    register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
     unregister_class_layout, with_class_layout, write_compact_field, CompactLayout,
-    FieldStorageKind,
+    FieldStorageKind, FIRST_LAYOUT_DOMAIN,
 };
 pub use flags::{
     flags, install as install_flags, BlockedAccessMode, EnvSource, FlagSource, GcFlags, IoFlags,
@@ -80,14 +78,14 @@ pub use flags::{
 // the call sites that must move here — `jit`, `gc`, `vm`, `native-api` — name
 // the flag surface as `cratonvm_types::…` today and should not have to learn a
 // second path to reach the same one snapshot.
+pub use float_format::{java_double_to_string, java_float_to_string};
+pub use handle::{HandleScope, HandleStorage, RootedHandle};
 pub use subsystem_config::{
     capability as capability_config, gc_metrics as gc_metrics_config,
     jit_metrics as jit_metrics_config, jit_verify as jit_verify_config, subsystems,
     thread_stress as thread_stress_config, CapabilityConfig, GcMetricsConfig, JitMetricsConfig,
     JitVerifyConfig, SubsystemConfig, ThreadStressConfig,
 };
-pub use float_format::{java_double_to_string, java_float_to_string};
-pub use handle::{HandleScope, HandleStorage, RootedHandle};
 // `mod heap_types` is private, so this list is the *only* way anything outside
 // this crate can name a heap constant. A `pub const` added to `heap_types.rs`
 // and left off this list is not merely inconvenient — it is unreachable from
@@ -97,16 +95,15 @@ pub use handle::{HandleScope, HandleStorage, RootedHandle};
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    element_type_tag_at, kind_tag_at,
-    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
-    ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
-    GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    GC_FLAGS_BYTE_OFFSET, KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK,
-    MARK_HASH_MASK, MARK_HASH_SHIFT, MARK_QUARTET_MASK, MARK_QUARTET_SHIFT, MAX_GC_AGE,
-    INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
-    MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET, NUM_SLOTS_OFFSET,
-    REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
+    element_type_tag_at, kind_tag_at, object_kind_from_tag, primitive_array_kind_tags_byte,
+    ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET,
+    AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, GC_FLAGS_BYTE_OFFSET,
+    GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK,
+    KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED, MARK_HASH_MASK, MARK_HASH_SHIFT,
+    MARK_INFLATED, MARK_NEUTRAL, MARK_QUARTET_MASK, MARK_QUARTET_SHIFT, MARK_STATE_MASK,
+    MARK_THIN_LOCKED, MARK_WORD_OFFSET, MAX_GC_AGE, NUM_SLOTS_OFFSET, REF_ELEMENT_SIZE,
+    REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
     THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
@@ -294,6 +291,34 @@ mod tests {
         // The last header field that had no named constant. `jit/src/x64.rs`
         // derived its own via `offset_of!` and `vm/src/jit/helpers.rs` still
         // writes a bare `raw_ptr.add(8)`; both should use this.
+
+        // The JIT's inline `checkcast` fast path bakes this byte as an
+        // immediate, so the packing it assumes is asserted here rather than
+        // trusted: `kind` in bits 0..1, `element_type` in bits 2..5, bits 6..7
+        // reserved zero. A `byte[]` is 0x21 and nothing else is.
+        assert_eq!(primitive_array_kind_tags_byte("[B"), Some(0x21));
+        assert_eq!(
+            primitive_array_kind_tags_byte("[I"),
+            Some(ObjectKind::Array as u8 | ((ArrayElementType::Int as u8) << 2)),
+        );
+        for d in ["[Z", "[C", "[F", "[D", "[B", "[S", "[I", "[J"] {
+            let tag = primitive_array_kind_tags_byte(d).expect(d);
+            assert_eq!(tag & KIND_TAG_BYTE_MASK, ObjectKind::Array as u8);
+            assert_eq!(tag & 0xC0, 0, "bits 6..7 are reserved zero: {d}");
+        }
+        // ONE dimension only. `[[B` holds references to `byte[]` objects, so
+        // its element type is `Reference` and this predicate must not claim it;
+        // reference arrays and plain classes have no answer here either.
+        for d in [
+            "[[B",
+            "[Ljava/lang/String;",
+            "java/lang/String",
+            "[",
+            "",
+            "B",
+        ] {
+            assert_eq!(primitive_array_kind_tags_byte(d), None, "{d}");
+        }
     }
 
     #[test]
@@ -458,7 +483,10 @@ pub mod stale_remap_census {
     /// `(resumed_from, dead_region)` totals for this process.
     #[inline]
     pub fn totals() -> (u64, u64) {
-        (RESUMED.load(Ordering::Relaxed), DEAD.load(Ordering::Relaxed))
+        (
+            RESUMED.load(Ordering::Relaxed),
+            DEAD.load(Ordering::Relaxed),
+        )
     }
 
     /// Print the census once, on whichever exit path runs first. Zeros
@@ -635,7 +663,9 @@ pub mod cell_census {
             // came through some OTHER route.
             eprintln!("[corrupt-cell] array_receiver={a}");
             if d == 0 {
-                eprintln!("[corrupt-cell] decoded=0 reported=0 — armed, and the guard did not fire");
+                eprintln!(
+                    "[corrupt-cell] decoded=0 reported=0 — armed, and the guard did not fire"
+                );
             } else if r < d {
                 eprintln!(
                     "[corrupt-cell] decoded={d} reported={r} — {} cell(s) NAMED BY NOBODY: a \

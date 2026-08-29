@@ -31,8 +31,7 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{
     create_java_string, create_java_string_uninterned, read_java_string, read_java_string_units,
-    NativeContextImpl,
-    SharedVm,
+    NativeContextImpl, SharedVm,
 };
 
 /// The StringConcatFactory bootstrap method class name.
@@ -300,7 +299,11 @@ pub fn make_jit_string_concat_site_from_parts(
             .iter()
             .skip(1)
             .map(|idx| {
-                Arc::from(resolve_concat_constant_units(pool, *idx).unwrap_or_default().as_slice())
+                Arc::from(
+                    resolve_concat_constant_units(pool, *idx)
+                        .unwrap_or_default()
+                        .as_slice(),
+                )
             })
             .collect();
         (Arc::from(recipe.as_slice()), constants)
@@ -404,7 +407,9 @@ pub fn make_jit_indy_bridge_site_from_parts(
         .into_iter()
         .map(|c| c as u8)
         .collect();
-    let frame_max_stack = u16::try_from(arg_types.len()).unwrap_or(u16::MAX).saturating_add(1);
+    let frame_max_stack = u16::try_from(arg_types.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
     Some(Box::into_raw(Box::new(JitIndyGenericSite {
         kind: JIT_INDY_SITE_GENERIC,
         class_id,
@@ -2276,9 +2281,7 @@ fn execute_string_concat<S: AsRef<[u16]>>(
                 // unpaired surrogate in the first place, so encoding those to
                 // units here loses nothing.
                 let units = match arg_val {
-                    Value::Object(Some(obj)) => {
-                        read_java_string_units(&shared.mem.heap, obj)
-                    }
+                    Value::Object(Some(obj)) => read_java_string_units(&shared.mem.heap, obj),
                     _ => None,
                 };
                 match units {
@@ -2390,7 +2393,9 @@ pub(crate) fn resolve_string_constant(cp: &ConstantPool, index: u16) -> Option<S
 /// lossless and `"x\uD801y" + n` still produced U+FFFD.
 fn resolve_concat_constant_units(cp: &ConstantPool, index: u16) -> Option<Vec<u16>> {
     let wide = match cp.get(index) {
-        Some(ConstantPoolEntry::StringReference { string_index }) => cp.get_utf8_wide(*string_index),
+        Some(ConstantPoolEntry::StringReference { string_index }) => {
+            cp.get_utf8_wide(*string_index)
+        }
         Some(ConstantPoolEntry::Utf8(_)) => cp.get_utf8_wide(index),
         _ => None,
     };

@@ -1465,6 +1465,17 @@ pub fn dump_method_stats_to_stderr() {
             "[cratonvm] JIT invokevirtual pinned non-virtual: private={private_pinned}              final={final_pinned}",
         );
     }
+    // Inline `checkcast`, by cause. The runtime engagement number is the
+    // `membership walks by JIT site: checkcast=` line above: every walk the
+    // fast path avoids is one that line does not report.
+    let (cc_sp, cc_ir, cc_prim, cc_no_target, cc_untrusted) = crate::checkcast_inline_sites();
+    if cc_sp | cc_ir | cc_prim | cc_no_target | cc_untrusted != 0 {
+        eprintln!(
+            "[cratonvm] JIT checkcast inline sites: single-pass={cc_sp} optimizing={cc_ir} \
+             prim-array={cc_prim} refused-no-target-id={cc_no_target} \
+             refused-untrusted-operand={cc_untrusted}",
+        );
+    }
     let (nio_served, nio_declined, md_served, md_declined) = crate::byte_element_helper_calls();
     if nio_served | nio_declined | md_served | md_declined != 0 {
         eprintln!(
@@ -1635,7 +1646,9 @@ impl TieredCompilationManager {
         // manager is constructed during VM init) so `process_uptime_ms`
         // reports genuine process age, not "time since first compile".
         process_start();
-        let core = Arc::new(CompilerCore::with_install_epoch_source(install_epoch_source));
+        let core = Arc::new(CompilerCore::with_install_epoch_source(
+            install_epoch_source,
+        ));
         // Diagnostic-only: the VM constructs exactly one manager per process
         // (this is an embedded single-JVM-per-process binary, not a
         // multi-tenant host), so a "last one registered" global handle is
@@ -2877,7 +2890,13 @@ impl std::fmt::Display for AdmissionDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AdmissionDecision::Admit(t) => {
-                write!(f, "admitted to {:?} [{}]: {}", t.tier, t.reason.category(), t.reason)?;
+                write!(
+                    f,
+                    "admitted to {:?} [{}]: {}",
+                    t.tier,
+                    t.reason.category(),
+                    t.reason
+                )?;
                 if let Some(bci) = t.osr_bci {
                     write!(f, " (OSR at bci {bci})")?;
                 }
@@ -2908,12 +2927,8 @@ pub trait TierPolicy: Send + Sync {
 
     /// OSR (loop-entry) selection. See [`OsrTrigger`] for why the trigger is
     /// part of the question.
-    fn select_osr(
-        &self,
-        signals: &TierSignals,
-        bci: u32,
-        trigger: OsrTrigger,
-    ) -> AdmissionDecision;
+    fn select_osr(&self, signals: &TierSignals, bci: u32, trigger: OsrTrigger)
+        -> AdmissionDecision;
 
     /// C1→C2 supersede after a C1-family body publishes.
     ///
@@ -3381,10 +3396,7 @@ impl BoundedCompileQueue {
 
     /// Remove and return every queued request matching `pred`, preserving the
     /// arrival order of the ones that stay.
-    fn drain_matching(
-        &mut self,
-        pred: impl Fn(&CompilationTask) -> bool,
-    ) -> Vec<CompilationTask> {
+    fn drain_matching(&mut self, pred: impl Fn(&CompilationTask) -> bool) -> Vec<CompilationTask> {
         let mut dropped = Vec::new();
         for band in CompilationPriority::BY_RANK {
             let queue = self.band_mut(band);
@@ -3447,18 +3459,15 @@ impl InvalidationEvent {
     pub fn breaks(&self, dep: &Dependency) -> bool {
         match (self, dep) {
             (
-                InvalidationEvent::ClassRedefined(class)
-                | InvalidationEvent::ClassUnloaded(class),
+                InvalidationEvent::ClassRedefined(class) | InvalidationEvent::ClassUnloaded(class),
                 Dependency::ClassUnchanged(dep_class),
             ) => class == dep_class,
             (
-                InvalidationEvent::ClassRedefined(class)
-                | InvalidationEvent::ClassUnloaded(class),
+                InvalidationEvent::ClassRedefined(class) | InvalidationEvent::ClassUnloaded(class),
                 Dependency::NoSubclassOverrides { class_name, .. },
             ) => class == class_name,
             (
-                InvalidationEvent::ClassRedefined(class)
-                | InvalidationEvent::ClassUnloaded(class),
+                InvalidationEvent::ClassRedefined(class) | InvalidationEvent::ClassUnloaded(class),
                 Dependency::DirectCall(callee),
             ) => *class == callee.class_name,
             (
@@ -4039,7 +4048,11 @@ impl CompilationBroker {
     /// conditioned on the authoritative `outstanding` table instead of being
     /// written unconditionally by each of the five paths that used to do it.
     fn release_slot(&mut self, key: &MethodKey) {
-        if self.outstanding.keys().any(|request| request.method == *key) {
+        if self
+            .outstanding
+            .keys()
+            .any(|request| request.method == *key)
+        {
             return;
         }
         if let Some(state) = self.states.get_mut(key) {
@@ -4321,7 +4334,13 @@ impl CompilationBroker {
         let current_epoch = self.epoch_of(&key.class_name);
         let record = self.outstanding.remove(&request);
         self.counters.completed += 1;
-        if !matches!(record, Some(OutstandingRequest { dispatched: true, .. })) {
+        if !matches!(
+            record,
+            Some(OutstandingRequest {
+                dispatched: true,
+                ..
+            })
+        ) {
             // Either the broker never saw this request, or it was completed
             // without ever being dispatched. Both are wiring bugs, and both
             // still fall through to the state update below (minus a stale
@@ -4485,8 +4504,8 @@ impl CompilationBroker {
     /// dispatched has its verdict discarded by [`Self::complete`]. The epoch
     /// bump is the single O(1) act that makes all three true.
     pub fn invalidate(&mut self, event: &InvalidationEvent) -> Vec<ArtifactId> {
-        if let InvalidationEvent::ClassRedefined(class)
-        | InvalidationEvent::ClassUnloaded(class) = event
+        if let InvalidationEvent::ClassRedefined(class) | InvalidationEvent::ClassUnloaded(class) =
+            event
         {
             let class = class.clone();
             self.bump_epoch(&class);
@@ -4526,7 +4545,8 @@ impl CompilationBroker {
     /// queued requests, and discard its tracked state. The broker-side
     /// counterpart of [`TieredCompilationManager::invalidate_class`].
     pub fn purge_class(&mut self, class_name: &str) -> Vec<ArtifactId> {
-        let mut retired = self.invalidate(&InvalidationEvent::ClassUnloaded(class_name.to_string()));
+        let mut retired =
+            self.invalidate(&InvalidationEvent::ClassUnloaded(class_name.to_string()));
         // A body of this class that recorded no `ClassUnchanged` dependency
         // is still unreachable once the class is gone; drop it too, and give
         // its bytes back.
@@ -5140,12 +5160,18 @@ mod tests {
         let declined = test_key();
         let healthy = MethodKey::new("Other", "m", "()V");
 
-        assert_eq!(mgr.on_method_invocation(&declined), Some(CompilationTier::C1));
+        assert_eq!(
+            mgr.on_method_invocation(&declined),
+            Some(CompilationTier::C1)
+        );
         mgr.core
             .complete_task(&declined, CompilationTier::C1, 0, false, false, true);
 
         // The other method is untouched and still compiles normally.
-        assert_eq!(mgr.on_method_invocation(&healthy), Some(CompilationTier::C1));
+        assert_eq!(
+            mgr.on_method_invocation(&healthy),
+            Some(CompilationTier::C1)
+        );
         mgr.core
             .complete_task(&healthy, CompilationTier::C1, 1, true, false, false);
         assert_eq!(mgr.current_tier(&healthy), CompilationTier::C1);
@@ -6193,9 +6219,7 @@ mod tests {
         let key = epoch_key("queuedThenRedefined");
         mgr.enqueue_compilation(c1_task(&key));
         assert!(
-            mgr.method_states()
-                .iter()
-                .any(|(k, _, _)| *k == key),
+            mgr.method_states().iter().any(|(k, _, _)| *k == key),
             "enqueue tracks the method"
         );
 
@@ -6243,7 +6267,11 @@ mod tests {
         // Re-admission works, at the new epoch, and now dispatches.
         mgr.enqueue_compilation(c1_task(&key));
         assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
-        assert_eq!(mgr.dropped_requests(), 1, "the re-admitted one was not dropped");
+        assert_eq!(
+            mgr.dropped_requests(),
+            1,
+            "the re-admitted one was not dropped"
+        );
     }
 
     #[test]
@@ -6816,7 +6844,11 @@ mod broker_tests {
         assert_eq!(broker.outstanding_len(), 1);
         assert_eq!(broker.counters().deduplicated, 1);
         assert_eq!(
-            broker.counters().decline_reasons.get("already_queued").copied(),
+            broker
+                .counters()
+                .decline_reasons
+                .get("already_queued")
+                .copied(),
             Some(1)
         );
     }
@@ -6828,7 +6860,11 @@ mod broker_tests {
         assert!(warm(&mut broker, &k).is_admit());
         let task = broker.next_request().expect("queued");
         assert_eq!(broker.queue_depth(), 0);
-        assert_eq!(broker.outstanding_len(), 1, "in flight is still outstanding");
+        assert_eq!(
+            broker.outstanding_len(),
+            1,
+            "in flight is still outstanding"
+        );
 
         broker
             .states
@@ -7256,7 +7292,10 @@ mod broker_tests {
         );
         let state = broker.state(&k).expect("state");
         assert!(state.ineligible);
-        assert_eq!(state.tier_fail_count, 0, "a policy verdict is not a failure");
+        assert_eq!(
+            state.tier_fail_count, 0,
+            "a policy verdict is not a failure"
+        );
         assert_eq!(
             broker.on_invocation(&k, 0).category(),
             "permanently_ineligible"
@@ -7296,7 +7335,11 @@ mod broker_tests {
         );
         assert_eq!(broker.on_invocation(&k, 0).category(), "retries_exhausted");
         assert_eq!(
-            broker.counters().bailout_categories.get("register_pressure").copied(),
+            broker
+                .counters()
+                .bailout_categories
+                .get("register_pressure")
+                .copied(),
             Some(u64::from(MAX_TIER_FAIL_RETRIES))
         );
     }
@@ -7381,7 +7424,10 @@ mod broker_tests {
         assert_eq!(broker.outstanding_len(), 0);
         assert_eq!(broker.queue_depth(), 0);
         assert_eq!(
-            counters.bailout_categories.get("register_pressure").copied(),
+            counters
+                .bailout_categories
+                .get("register_pressure")
+                .copied(),
             Some(4)
         );
 
@@ -7464,4 +7510,3 @@ mod broker_tests {
         assert!(osr.to_string().contains("(OSR at bci 9)"));
     }
 }
-

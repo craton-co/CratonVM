@@ -99,8 +99,8 @@ coordination. Agents can claim any item without reading any other.
 ### RA.8 — `ServiceLoader.load(Class, ClassLoader)` scans META-INF/services
 
 - **Files:** `native-builtins/src/` (new `service_loader.rs` or extend existing).
-- **Reproducer:** `ServiceLoader.load(CharsetProvider.class).iterator()` should enumerate providers declared in `META-INF/services/java.nio.charset.spi.CharsetProvider`. Current: returns empty.
-- **Success:** walks the classpath for `META-INF/services/<interface>` files, loads each listed class.
+- **Reproducer:** `ServiceLoader.load(CharsetProvider.class).iterator()` should enumerate providers declared in `../../../apps/META-INF/services/java.nio.charset.spi.CharsetProvider`. Current: returns empty.
+- **Success:** walks the classpath for `../../../apps/META-INF/services/<interface>` files, loads each listed class.
 - **Parallel-safe with:** all RA.*.
 
 ---

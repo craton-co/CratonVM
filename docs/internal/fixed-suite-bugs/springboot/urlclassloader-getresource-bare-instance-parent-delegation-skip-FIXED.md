@@ -35,7 +35,7 @@ try (URLClassLoader classLoader = new URLClassLoader(new URL[] { this.temp.toURI
 }
 ```
 
-`this.temp` holds only a generated `META-INF/spring.components` index file
+`this.temp` holds only a generated `../../../../apps/META-INF/spring.components` index file
 — the actual `TestListener.class` bytes live on the **parent** (the real
 test classpath). Spring's indexed classpath scan finds the index via the
 child loader's own URL, then must open each listed class name as a

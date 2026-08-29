@@ -325,7 +325,10 @@ fn census() -> (usize, usize, usize, Vec<String>) {
                 continue;
             }
 
-            if t.contains("OrderedPlMutex") || t.contains("OrderedPlRwLock") || t.contains("OrderedMutex") {
+            if t.contains("OrderedPlMutex")
+                || t.contains("OrderedPlRwLock")
+                || t.contains("OrderedMutex")
+            {
                 ordered += 1;
                 continue;
             }

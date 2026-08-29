@@ -345,7 +345,7 @@ discards the bytes**:
 * the JMOD branch of `find_all_resource_urls_impl` — a `getResource` hit on a
   JMOD paid a full deflate purely to decide whether to emit a URL string;
 * the multi-release resolution inside the signed-JAR code-source path, which
-  inflated each candidate `META-INF/versions/N/...` entry and then re-read the
+  inflated each candidate `../../../apps/META-INF/versions/N/...` entry and then re-read the
   winner immediately afterwards — decompressing the same entry twice.
 
 Both now use `archive_has_entry`, which takes the same lock and calls `by_name`

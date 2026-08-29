@@ -213,8 +213,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if scan_marks_enabled() {
         SCAN_MARKS.lock().clear();
     }
-    let __rp_t0 = crate::memory::native_roots::rootprof::on()
-        .then(std::time::Instant::now);
+    let __rp_t0 = crate::memory::native_roots::rootprof::on().then(std::time::Instant::now);
     let mut roots = Vec::new();
 
     // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
@@ -263,9 +262,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             .unwrap_or_default()
     };
     for frame in &thread.frames {
-        if let Some(loader) =
-            cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, frame.class_id.as_u32())
-        {
+        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+            shared.vm_identity,
+            frame.class_id.as_u32(),
+        ) {
             if act_dbg {
                 eprintln!(
                     "[MIRRORWHY] root via FRAME class={:?} loader={:#x}",
@@ -277,7 +277,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
     for class_id in cratonvm_types::jit_activation::active_class_ids() {
-        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id) {
+        if let Some(loader) =
+            cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id)
+        {
             if act_dbg {
                 eprintln!(
                     "[MIRRORWHY] root via JIT_ACTIVATION class={:?} loader={:#x}",
@@ -289,7 +291,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "1: Thread frames — scan locals and operand stacks (SoA layout)");
+    mark_scan_section(
+        roots.len(),
+        "1: Thread frames — scan locals and operand stacks (SoA layout)",
+    );
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //
     // Spring Boot SEGV fix (2026-05-16): `ValueStack::scan_object_refs`
@@ -388,7 +393,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "3: Class lock objects — synthetic objects for static synchroniz");
+    mark_scan_section(
+        roots.len(),
+        "3: Class lock objects — synthetic objects for static synchroniz",
+    );
     // 3. Class lock objects — synthetic objects for static synchronized methods
     {
         let class_locks = shared.classes.class_locks.read();
@@ -413,13 +421,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "4: Off-frame per-thread roots — the test-harness print buffer a");
+    mark_scan_section(
+        roots.len(),
+        "4: Off-frame per-thread roots — the test-harness print buffer a",
+    );
     // 4. Off-frame per-thread roots — the test-harness print buffer and the
     //    scoped-value bindings. Shared with both peer-publish paths; see
     //    `push_off_frame_thread_roots`.
     push_off_frame_thread_roots(thread, &mut roots);
 
-    mark_scan_section(roots.len(), "4b: Native invoke pins — object args popped off the operand stac");
+    mark_scan_section(
+        roots.len(),
+        "4b: Native invoke pins — object args popped off the operand stac",
+    );
     // 4b. Native invoke pins — object args popped off the operand stack for
     //     `safe_native_call` (see `JvmThread::native_pin_roots`).
     for obj_ref in &thread.native_pin_roots {
@@ -446,7 +460,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "4c: Native object in flight — object return before the interpret");
+    mark_scan_section(
+        roots.len(),
+        "4c: Native object in flight — object return before the interpret",
+    );
     // 4c. Native object in flight — object return before the interpreter pushes
     //     it onto the operand stack, or native-thrown exception before it is
     //     routed into a Java handler / uncaught dispatch.
@@ -454,7 +471,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(obj_ref);
     }
 
-    mark_scan_section(roots.len(), "4d: Direct JIT HashMap node cache. Both refs remain valid across");
+    mark_scan_section(
+        roots.len(),
+        "4d: Direct JIT HashMap node cache. Both refs remain valid across",
+    );
     // 4d. Direct JIT HashMap node cache. Both refs remain valid across a
     // moving collection because this scan and gc.rs remap them with the thread.
     for entry in &thread.jit_hashmap_string_node_cache {
@@ -471,7 +491,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "5: Interned string pool — all interned String objects");
+    mark_scan_section(
+        roots.len(),
+        "5: Interned string pool — all interned String objects",
+    );
     // 5. Interned string pool — all interned String objects
     {
         let string_pool = shared.mem.string_pool.read();
@@ -480,7 +503,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "6: Class mirror cache — java.lang.Class objects");
+    mark_scan_section(
+        roots.len(),
+        "6: Class mirror cache — java.lang.Class objects",
+    );
     // 6. Class mirror cache — java.lang.Class objects
     //
     // A mirror's `classLoader` field is a real heap edge to its defining
@@ -604,7 +630,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "6b: Cached proxy-dispatch `Method` objects (see `proxy_method_ca");
+    mark_scan_section(
+        roots.len(),
+        "6b: Cached proxy-dispatch `Method` objects (see `proxy_method_ca",
+    );
     // 6b. Cached proxy-dispatch `Method` objects (see `proxy_method_cache`'s
     // doc comment in `class_realm.rs`) — these are meant to be shared and
     // reused across every future dispatch to the same proxy method, so they
@@ -616,7 +645,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "7: System streams (System.out, System.err, System.in)");
+    mark_scan_section(
+        roots.len(),
+        "7: System streams (System.out, System.err, System.in)",
+    );
     // 7. System streams (System.out, System.err, System.in)
     //
     // try_read, NOT read: the singleton initializers (e.g.
@@ -650,7 +682,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "8: Primitive type Class mirrors (int.class, boolean.class, etc");
+    mark_scan_section(
+        roots.len(),
+        "8: Primitive type Class mirrors (int.class, boolean.class, etc",
+    );
     // 8. Primitive type Class mirrors (int.class, boolean.class, etc.)
     {
         let prim_mirrors = shared.classes.primitive_mirrors.read();
@@ -659,7 +694,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "8a: Canonical java.lang.Module mirrors (one per module name). Th");
+    mark_scan_section(
+        roots.len(),
+        "8a: Canonical java.lang.Module mirrors (one per module name). Th",
+    );
     // 8a. Canonical java.lang.Module mirrors (one per module name). These are
     //     long-lived singletons handed back by `Class.getModule()`; without
     //     rooting them a moving GC would reclaim/relocate them and the cache
@@ -671,7 +709,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "8b: VarHandle permanent roots (B-J). VarHandles live in `static");
+    mark_scan_section(
+        roots.len(),
+        "8b: VarHandle permanent roots (B-J). VarHandles live in `static",
+    );
     // 8b. VarHandle permanent roots (B-J). VarHandles live in `static final`
     //     fields and are used for lock-free CAS; without rooting them here a
     //     moving GC reclaimed them and left their static holder slots stale.
@@ -682,7 +723,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "8c: Pre-allocated singleton OutOfMemoryError — thrown on a 100%");
+    mark_scan_section(
+        roots.len(),
+        "8c: Pre-allocated singleton OutOfMemoryError — thrown on a 100%",
+    );
     // 8c. Pre-allocated singleton OutOfMemoryError — thrown on a 100%-full heap
     //     when a fresh exception cannot be materialized. Must survive every GC
     //     permanently (it is held only by `SharedVm`, not any Java field), so a
@@ -693,7 +737,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "8d: Cached 'main' java.lang.ThreadGroup singleton");
+    mark_scan_section(
+        roots.len(),
+        "8d: Cached 'main' java.lang.ThreadGroup singleton",
+    );
     // 8d. Cached "main" java.lang.ThreadGroup singleton
     //     (`NativeContextImpl::get_or_create_main_thread_group`,
     //     vm/src/vm/vm_exec.rs). This mirrors the `singleton_oom`/
@@ -725,7 +772,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "9: JNI global references — prevent GC from collecting objects h");
+    mark_scan_section(
+        roots.len(),
+        "9: JNI global references — prevent GC from collecting objects h",
+    );
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
         shared
@@ -735,7 +785,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             .collect_roots(&mut roots);
     }
 
-    mark_scan_section(roots.len(), "9a: Native upcall table — each live slot holds a `target: Object");
+    mark_scan_section(
+        roots.len(),
+        "9a: Native upcall table — each live slot holds a `target: Object",
+    );
     // 9a. Native upcall table — each live slot holds a `target: ObjectRef` for the
     //     Java callback the legacy `pe_upcall_invoke` dispatch path invokes.
     //     Un-rooted, a moving GC could reclaim/relocate the target out from under
@@ -756,7 +809,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     `crate::native::jni::update_local_refs_after_gc` (gc.rs).
     crate::native::jni::collect_local_ref_roots(&mut roots);
 
-    mark_scan_section(roots.len(), "9c: JNI keep-alive pin set (INT-10): arrays checked out via");
+    mark_scan_section(
+        roots.len(),
+        "9c: JNI keep-alive pin set (INT-10): arrays checked out via",
+    );
     // 9c. JNI keep-alive pin set (INT-10): arrays checked out via
     //     GetPrimitiveArrayCritical / Get<Type>ArrayElements. Native code
     //     holds a detached COPY of the body (so relocation is safe), but the
@@ -774,7 +830,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "10: Thread-local ObjectRefs — java_thread_obj, pending_async_exc");
+    mark_scan_section(
+        roots.len(),
+        "10: Thread-local ObjectRefs — java_thread_obj, pending_async_exc",
+    );
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception,
     //     jit_pending_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
@@ -808,7 +867,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     });
 
-    mark_scan_section(roots.len(), "10b: Registry-held java.lang.Thread mirrors of every ALIVE thread");
+    mark_scan_section(
+        roots.len(),
+        "10b: Registry-held java.lang.Thread mirrors of every ALIVE thread",
+    );
     // 10b. Registry-held java.lang.Thread mirrors of every ALIVE thread.
     //      HotSpot semantics: a thread's mirror is a strong root while the
     //      thread lives. Natives serve these raw copies back into bytecode
@@ -826,7 +888,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(obj_ref);
     }
 
-    mark_scan_section(roots.len(), "11: Root snapshot (for cross-thread GC scanning)");
+    mark_scan_section(
+        roots.len(),
+        "11: Root snapshot (for cross-thread GC scanning)",
+    );
     // 11. Root snapshot (for cross-thread GC scanning)
     {
         let snapshot = thread.root_snapshot.lock();
@@ -835,13 +900,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "12: Scoped value bindings (JEP 446) are published by");
+    mark_scan_section(
+        roots.len(),
+        "12: Scoped value bindings (JEP 446) are published by",
+    );
     // 12. Scoped value bindings (JEP 446) are published by
     //     `push_off_frame_thread_roots` at step 4, together with the print
     //     buffer — the two off-frame categories every per-thread root path
     //     must agree on.
 
-    mark_scan_section(roots.len(), "13: Resolution cache — CONSTANT_Dynamic values may hold ObjectRe");
+    mark_scan_section(
+        roots.len(),
+        "13: Resolution cache — CONSTANT_Dynamic values may hold ObjectRe",
+    );
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
         let cache = shared.classes.resolution_cache.read();
@@ -866,7 +937,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         });
     }
 
-    mark_scan_section(roots.len(), "14: NEW-1.5 — conservative scan of every active JIT spill region");
+    mark_scan_section(
+        roots.len(),
+        "14: NEW-1.5 — conservative scan of every active JIT spill region",
+    );
     // 14. NEW-1.5 — conservative scan of every active JIT spill region on the
     //     calling thread. Each qword in a JIT frame's stack region whose value
     //     is a valid object header is reported as a root. The semispace
@@ -1029,10 +1103,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     let mut jit_scan_done = false;
     if moving_young_precise_only && crate::jit::conservative_roots::coverage_gate_active() {
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
-        if crate::jit::conservative_roots::verify_active_coverage_into(
-            &shared.mem.heap,
-            &mut roots,
-        ) {
+        if crate::jit::conservative_roots::verify_active_coverage_into(&shared.mem.heap, &mut roots)
+        {
             moving_young_precise_only = false;
             jit_scan_done = true;
         } else {
@@ -1151,7 +1223,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         );
     }
 
-    mark_scan_section(roots.len(), "14b: Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code");
+    mark_scan_section(
+        roots.len(),
+        "14b: Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code",
+    );
     // 14b. Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code pushes
     //      every live oop (locals AND operand-stack entries) onto this thread's
     //      shadow stack immediately before a GC-capable call. Unlike the
@@ -1248,7 +1323,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    mark_scan_section(roots.len(), "15: Round-9 CRIT GC-correctness fix: process-global Integer.valu");
+    mark_scan_section(
+        roots.len(),
+        "15: Round-9 CRIT GC-correctness fix: process-global Integer.valu",
+    );
     // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
     //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in
     //     `native-builtins/src/lang_math.rs` and previously used
@@ -1257,7 +1335,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to the GC root scanner — under a moving collector the
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
-    mark_scan_section(roots.len(), "15a: Unsafe / Class$Atomic synthetic-offset side stores. These ho");
+    mark_scan_section(
+        roots.len(),
+        "15a: Unsafe / Class$Atomic synthetic-offset side stores. These ho",
+    );
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores. These hold live
     //      `ObjectRef`s that exist in NO heap slot (the synthetic-offset scheme
     //      services load/CAS/store from a Rust-side map when the field's real
@@ -1270,19 +1351,28 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      `java/lang/ref/SoftReference`). Remap companion in `gc.rs`
     //      (`gc_update_unsafe_side_store_refs`).
 
-    mark_scan_section(roots.len(), "16: Round-9 perf + GC fix: process-global LambdaMetafactory Call");
+    mark_scan_section(
+        roots.len(),
+        "16: Round-9 perf + GC fix: process-global LambdaMetafactory Call",
+    );
     // 16. Round-9 perf + GC fix: process-global LambdaMetafactory CallSite
     //     cache. Cached CallSites and their bootstrap-arg ObjectRef keys
     //     must stay live across collections; the matching post-compaction
     //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
 
-    mark_scan_section(roots.len(), "16a: Zero-capture lambda proxy singleton cache (companion to the");
+    mark_scan_section(
+        roots.len(),
+        "16a: Zero-capture lambda proxy singleton cache (companion to the",
+    );
     // 16a. Zero-capture lambda proxy singleton cache (companion to the
     //      LambdaMetafactory CallSite cache in step 16 above, but for the
     //      cached proxy INSTANCE of a non-capturing lambda rather than the
     //      CallSite metadata). Lives in `vm/src/runtime/invokedynamic.rs`.
 
-    mark_scan_section(roots.len(), "17: Overlay-backed collections (LinkedList / LinkedHashMap / Tre");
+    mark_scan_section(
+        roots.len(),
+        "17: Overlay-backed collections (LinkedList / LinkedHashMap / Tre",
+    );
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet). These keep backing arrays + nodes in Rust side-tables,
     //     invisible to ordinary field tracing. The moving/G1/ZGC paths retain
@@ -1293,7 +1383,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     full-GC path so it can reclaim an otherwise-dead overlay owner rather
     //     than globally rooting its transient compiler graph.
 
-    mark_scan_section(roots.len(), "18: Singleton built-in class loaders (app / platform). These syn");
+    mark_scan_section(
+        roots.len(),
+        "18: Singleton built-in class loaders (app / platform). These syn",
+    );
     // 18. Singleton built-in class loaders (app / platform). These synthetic
     //     `ClassLoader` objects live ONLY in process-global mutexes in
     //     `native-builtins/src/classloader.rs`, invisible to every scan above.
@@ -1304,7 +1397,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     / heap-size dependent). Remap companion in `gc.rs`
     //     (`gc_update_loader_singleton_refs`).
 
-    mark_scan_section(roots.len(), "18a: Process-global `System.getenv()` / `System.getProperties()`");
+    mark_scan_section(
+        roots.len(),
+        "18a: Process-global `System.getenv()` / `System.getProperties()`",
+    );
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons cached in `native-builtins/src/lang_system.rs`. Like the
     //      class loaders above, these synthetic objects live ONLY in process-
@@ -1313,7 +1409,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      next `getenv()`/`getProperties()` returns a stale `ObjectRef`. Remap
     //      companion in `gc.rs` (`gc_update_system_singleton_refs`).
 
-    mark_scan_section(roots.len(), "18b: Process-global Locale caches (cached default Locale + synthe");
+    mark_scan_section(
+        roots.len(),
+        "18b: Process-global Locale caches (cached default Locale + synthe",
+    );
     // 18b. Process-global Locale caches (cached default Locale + synthetic
     //      Locale side-tables) in native-builtins. Same stale-pointer hazard as
     //      the class loaders: a moving young GC reclaims/relocates the cached
@@ -1322,7 +1421,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      → SIGSEGV (TestServerInfo / TestSwallowAbortedUploads). Remap
     //      companion in `gc.rs` (`gc_update_locale_refs`).
 
-    mark_scan_section(roots.len(), "18c: `java.lang.ClassValue` memoization cache (BUG-W) — cached");
+    mark_scan_section(
+        roots.len(),
+        "18c: `java.lang.ClassValue` memoization cache (BUG-W) — cached",
+    );
     // 18c. `java.lang.ClassValue` memoization cache (BUG-W) — cached
     //      `computeValue(Class)` results live only in a process-global
     //      side-table in `native-builtins/src/phases_late.rs`, invisible to
@@ -1331,7 +1433,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      keeps handing back the stale `ObjectRef`. Remap companion in
     //      `gc.rs` (`gc_update_classvalue_cache_refs`).
 
-    mark_scan_section(roots.len(), "19: JBoss MSC container-held service objects. The `ServiceContai");
+    mark_scan_section(
+        roots.len(),
+        "19: JBoss MSC container-held service objects. The `ServiceContai",
+    );
     // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
     //     state machine references Java objects (the `Service` instance whose
     //     `start()`/`stop()` we invoke, the synthetic `ServiceController`
@@ -1343,7 +1448,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     use-after-free. Remap companion in `gc.rs`
     //     (`gc_update_msc_service_refs`).
 
-    mark_scan_section(roots.len(), "19b: Round-4 B4: java.util.logging / JBoss LogManager mirrors — t");
+    mark_scan_section(
+        roots.len(),
+        "19b: Round-4 B4: java.util.logging / JBoss LogManager mirrors — t",
+    );
     // 19b. Round-4 B4: java.util.logging / JBoss LogManager mirrors — the
     //     LogManager / Logger / LogContext singletons and the attachments
     //     table are cached as raw addresses in process-global side-tables in
@@ -1352,7 +1460,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     a later native lookup (use-after-free). Remap companion in `gc.rs`
     //     (`gc_update_logmanager_refs`).
 
-    mark_scan_section(roots.len(), "20: Class-level annotation-proxy identity cache. The per-class");
+    mark_scan_section(
+        roots.len(),
+        "20: Class-level annotation-proxy identity cache. The per-class",
+    );
     // 20. Class-level annotation-proxy identity cache. The per-class
     //     `getAnnotation(X)` / `getDeclaredAnnotations()` proxies are cached in
     //     a process-global side-table in `native-builtins/src/lang_class.rs`
@@ -1421,7 +1532,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     results live in no heap slot, so a GC between `submit` and `get` must
     //     root them here. Remap companion in `gc.rs`.
 
-    mark_scan_section(roots.len(), "21: Uniform native-root registry (driven above, via");
+    mark_scan_section(
+        roots.len(),
+        "21: Uniform native-root registry (driven above, via",
+    );
     // 21. Uniform native-root registry (driven above, via
     //     `native_roots::scan_all_roots`). A native subsystem holding
     //     ObjectRefs in a side-table belongs in `native_roots::VM_ROOT_SOURCES`

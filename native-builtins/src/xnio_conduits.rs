@@ -84,7 +84,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -2258,7 +2258,10 @@ fn native_setter_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Test-only helpers to inflate a source / sink channel as a Java object.
 // ---------------------------------------------------------------------------
 
-fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_source_conduit_obj(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS)?;
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
@@ -2266,7 +2269,10 @@ fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<Obje
     Ok(obj)
 }
 
-fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_sink_conduit_obj(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS)?;
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
@@ -2278,7 +2284,10 @@ fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<Object
 /// channel id. Public (but `#[doc(hidden)]`) so integration tests in other
 /// crates can stand up a conduit without threading a full Selector in.
 #[doc(hidden)]
-pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+pub fn alloc_source_channel_obj(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS)?;
     // Family-1 fix (cce0079): the conduit alloc below can move the
     // still-unrooted `obj` — pin and refresh it, or `remember_source_obj`
@@ -2298,7 +2307,10 @@ pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<
 
 /// Allocate a Java-side `ConduitStreamSinkChannel` bound to the given id.
 #[doc(hidden)]
-pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+pub fn alloc_sink_channel_obj(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS)?;
     // Family-1 fix (cce0079): same as `alloc_source_channel_obj` — refresh
     // `obj` across the conduit alloc before registry/field use.
@@ -2884,10 +2896,13 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     fn make_byte_buffer(
@@ -3329,7 +3344,9 @@ mod tests {
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
         let ch_obj = alloc_source_channel_obj(&mut ctx, id).unwrap();
         // Build a Setter tied to SRC_FIELD_READ_LISTENER on ch_obj.
-        let setter = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS).unwrap();
+        let setter =
+            try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS)
+                .unwrap();
         ctx.set_field(
             setter,
             SETTER_FIELD_CHANNEL_HANDLE,

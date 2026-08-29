@@ -5,7 +5,7 @@
 | **Status** | Wave 1, measurement. No enforcement lands here. Conversions are listed per site; most sites are annotated, not changed. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) §1, §5, §10 |
 | **Answers** | the [`jdk-only-native-review.md`](jdk-only-native-review.md) checklist line *"No object field is accessed by assumed synthetic slot index"* — that box cannot be ticked without this evidence base |
-| **Related** | [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) P0 rows *Residual synthetic native set* and *Direct `ensure_synthetic_class` calls* |
+| **Related** | [`jdk-only-runtime-services.md`](../../known-issues/jdk-only/runtime-services-blocker-inventory.md) P0 rows *Residual synthetic native set* and *Direct `ensure_synthetic_class` calls* |
 | **Evidence base** | Real layouts in this document were read off a JDK 25 image (`jdk-25.0.3.9-hotspot`) with `javap -p`, walking the superclass chain by hand. Rows without that evidence are marked **unknown** and say what would settle them. |
 
 > **This audit is a prerequisite for wave 2, not cleanup after it.** The

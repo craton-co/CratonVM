@@ -33,7 +33,7 @@ Against HotSpot the reference CAS goes **29.6x -> 9.8x**. The residual is
 
 ## What the cost actually was
 
-A native profile of `probes/VhCasProbe.java` — a Java-frame sampler cannot
+A native profile of the isolated CAS probe below — a Java-frame sampler cannot
 answer this, and that mistake has already cost this cluster three days once:
 
 | | share |
@@ -171,8 +171,26 @@ remaining ~90% of a composition chain is still unattributed.
 
 ## Repro
 
+The probe is `VhCasProbe`, which sits with the others under `apps/probes/`. That
+tree stopped being tracked in `3b2901531`, so the loop that matters is written
+out here rather than left behind a path — and it is short, because the whole
+point is that it holds ONE `VarHandle` call:
+
+```java
+// `expected` is carried in a Java local, so the timed loop contains no read.
+Node cur = a;
+for (int i = 0; i < iters; i++) {
+    Node nxt = (cur == a) ? b : a;
+    if (REF.compareAndSet(p, cur, nxt)) ok++;
+    cur = nxt;
+}
+```
+
+`REF` is a `VarHandle` for a `volatile Node` instance field. The other three arms
+are the same shape: a CAS whose `expected` was never stored (the failing path),
+an `int` CAS, and `REF.set` as the floor.
+
 ```bash
-javac -d <out> probes/VhCasProbe.java
 cratonvm --java-home <jdk> -Dprobe.iters=5000000 -cp <out> VhCasProbe
 java -Dprobe.iters=5000000 -cp <out> VhCasProbe
 ```
@@ -183,8 +201,7 @@ per-door site counts. Read them together — a bind that moved nothing looks
 exactly like a bind that was never reached unless both are shown.
 
 Note that `HibfixVarHandleProbe`'s CAS rows are COMPOSITES: each iteration does
-a `VarHandle.get` and then the CAS. `VhCasProbe` carries the expected value in a
-Java local, so its loop holds one `VarHandle` call and no read.
+a `VarHandle.get` and then the CAS, which is why the isolated probe exists.
 
 ## Related
 

@@ -798,7 +798,7 @@ mod imp {
 
     use super::{
         peer_deadline_ms, peer_total_deadline_ms, XT_CYCLES_WITH_UNCLASSIFIED,
-        XT_PEERS_CLASSIFIED_AFTER_RETRY, XT_PEER_RESIGNALS, XT_PEERS_UNCLASSIFIED,
+        XT_PEERS_CLASSIFIED_AFTER_RETRY, XT_PEERS_UNCLASSIFIED, XT_PEER_RESIGNALS,
     };
 
     const STATE_EMPTY: u8 = 0;

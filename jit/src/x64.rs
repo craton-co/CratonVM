@@ -61,8 +61,7 @@ use cratonvm_jit_api::npe_action;
 use cratonvm_types::narrow_oop::{narrow_base, narrow_oops_enabled};
 use cratonvm_types::{
     ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET,
-    FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
@@ -74,7 +73,6 @@ mod cpu_features;
 pub use cpu_features::{
     has_avx2, has_bmi1, has_lzcnt, has_pclmulqdq, has_popcnt, has_sse41, has_sse42,
 };
-
 
 // ---------------------------------------------------------------------------
 // Switch-instruction validation helpers (HIGH security, task #8)
@@ -222,12 +220,12 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
-mod objects;
-mod arrays;
-mod simd;
 mod arith;
-mod osr;
+mod arrays;
 mod deopt_stubs;
+mod objects;
+mod osr;
+mod simd;
 
 /// Test-only switch that makes every inlined body publish deopt metadata.
 ///
@@ -242,10 +240,10 @@ thread_local! {
     pub(crate) static INLINE_TEST_PUBLISHES_DEOPT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-pub mod safepoint;
+mod emit;
 mod frames;
 mod operand_stack;
-mod emit;
+pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64
 // ---------------------------------------------------------------------------
@@ -1692,8 +1690,8 @@ mod deopt_snapshot_tests {
 
     use super::{
         classify_local_kinds, code_uses_long_float_double, opcode_touches_long_float_double,
-        pure_high_halves, refine_ambiguous_local_kinds, wide_local_high_halves,
-        typed_local_frame_value, LocalKind,
+        pure_high_halves, refine_ambiguous_local_kinds, typed_local_frame_value,
+        wide_local_high_halves, LocalKind,
     };
 
     #[test]
@@ -1798,7 +1796,8 @@ mod deopt_snapshot_tests {
 
         // And the same method one local smaller DOES get a mask, so the cliff is
         // the local count and not something about `wide` encodings.
-        let (masks64, reached64) = crate::x64::licm::compute_local_oop_masks(&code, code.len(), 64, 0);
+        let (masks64, reached64) =
+            crate::x64::licm::compute_local_oop_masks(&code, code.len(), 64, 0);
         assert!(!masks64.is_empty() && !reached64.is_empty());
     }
 
@@ -2000,7 +1999,10 @@ mod deopt_snapshot_tests {
 
         // The whole-method scan still names slot 5 — `lstore 4` is there.
         let halves = wide_local_high_halves(&code, code.len());
-        assert!(halves.contains(&5), "the scan names it; the filter is the gate");
+        assert!(
+            halves.contains(&5),
+            "the scan names it; the filter is the gate"
+        );
 
         assert!(
             pure_high_halves(&kinds, &halves).is_empty(),
@@ -2293,22 +2295,23 @@ impl Compiler {
             0
         };
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
-        // Headroom above the operand stack for the direct-call argument-service
-        // copy. That copy preserves a direct callee's Java arguments for the cold
-        // exception-table service, and it must NOT be placed on the argument slots
-        // themselves: `pop_stack` reclaims them but the popped `StackSlot::Frame`s
-        // stay live until `emit_stack_arg_setup` marshals them, so an aliased
-        // reservation reverses the arguments into themselves and the callee gets
-        // arg0 in every slot (fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md).
-        //
-        // The copy needs one slot per argument, and a call site's arguments are
-        // themselves on the operand stack, so `max_stack` slots of headroom is
-        // always sufficient. Cap it so a deep-stack method does not double its
-        // frame for a service copy that can never be that wide; a call with more
-        // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
-        // reservation and falls back, exactly as an over-wide method does today.
+                                                                                              // Headroom above the operand stack for the direct-call argument-service
+                                                                                              // copy. That copy preserves a direct callee's Java arguments for the cold
+                                                                                              // exception-table service, and it must NOT be placed on the argument slots
+                                                                                              // themselves: `pop_stack` reclaims them but the popped `StackSlot::Frame`s
+                                                                                              // stay live until `emit_stack_arg_setup` marshals them, so an aliased
+                                                                                              // reservation reverses the arguments into themselves and the callee gets
+                                                                                              // arg0 in every slot (fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md).
+                                                                                              //
+                                                                                              // The copy needs one slot per argument, and a call site's arguments are
+                                                                                              // themselves on the operand stack, so `max_stack` slots of headroom is
+                                                                                              // always sufficient. Cap it so a deep-stack method does not double its
+                                                                                              // frame for a service copy that can never be that wide; a call with more
+                                                                                              // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
+                                                                                              // reservation and falls back, exactly as an over-wide method does today.
         const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
-        let spill_slots = max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS));
+        let spill_slots =
+            max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS));
         let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to
@@ -2849,7 +2852,6 @@ impl Compiler {
     //
     // Moved to `x64/inlining.rs`.
 
-
     /// Emit a balanced binary search for lookupswitch.
     /// `pairs` is sorted by key (per JVM spec). Value to match is in EAX.
     /// At each node: CMP EAX, mid_key → JE target, JL left_subtree, fall to right_subtree.
@@ -2931,10 +2933,6 @@ impl Compiler {
         self.emit_binary_search_lookup(left, default_target);
     }
 
-
-
-
-
     // -----------------------------------------------------------------------
     // Bytecode compilation
     // -----------------------------------------------------------------------
@@ -2943,7 +2941,6 @@ impl Compiler {
     // inherent method on this same `Compiler`, declared `pub(super)` there so
     // `compile_with_param_slots` below can call it; `Compiler` is private to
     // this module, so that is not reachable from outside the backend.
-
 
     /// Record which target `patch_branches` could not resolve, plus the
     /// highest PC at or below it that the emitter actually placed. The pair
@@ -3056,15 +3053,12 @@ impl Compiler {
 // `x64/driver.rs`. The `pub use` above keeps `x64::compile` and
 // `x64::compile_with_param_slots` resolving where they always did.
 
-
 // ---------------------------------------------------------------------------
 // Bytecode loop rewriter
 // ---------------------------------------------------------------------------
 //
 // Moved to `x64/loop_rewrite.rs`: the per-thread arming switch, the native and
 // bytecode unroll planners, and the side-table replication helpers.
-
-
 
 #[cfg(test)]
 mod tests;
@@ -3109,7 +3103,6 @@ mod flag_and_header_contracts;
 // rather than a peeled prefix.
 #[cfg(test)]
 mod loop_unroll_admission;
-
 
 /// One spliced callee's local-variable oop coverage, for the safepoints emitted
 /// while its body is being walked.

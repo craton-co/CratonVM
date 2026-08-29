@@ -44,64 +44,22 @@ install, no `rt.jar`, one self-contained binary.
 
 ## Performance
 
-CPU, vs HotSpot JDK 25 C2:
-same flags both sides (`-Xmx8g`), one phase per fresh process pinned to one
-core, arms **alternated with the order flipped on alternate pairs**, 9 pairs
-per phase, no sample discarded, and **every one of the 18 samples per phase**
-checksum-verified on both arms — not just the medians, so a mid-series drift
-cannot hide behind a matching median. Zero mismatches. All seven phases come
-from **one binary in one window**, 1-minute load 1.8–3.8 throughout, with the
-series aborted and retried if load left the band mid-run. Full methodology in
-[BENCHMARK.md](BENCHMARK.md).
+CPU, vs HotSpot JDK 25 C2 — same flags both sides, checksum-verified against
+HotSpot on every run (zero mismatches):
 
-| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | earlier ratio |
-|-------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
-| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | 0.6% | 2.79x |
-| Sieve (100K × 20K)      | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
-| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
-| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | 1.75x |
-| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | 0.9% | 7.7x  |
-| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% | 8.34x |
+| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) |
+|--------------------------|-----------|-----------|-----------|---------------|
+| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% |
+| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | 0.6% |
+| Sieve (100K × 20K)      | 2,333 ms  | 2,360 ms  | **1.01x** | 2.0% |
+| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% |
+| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% |
+| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | 0.9% |
+| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% |
 
-CratonVM's run-to-run spread is under 1% on five of the seven rows. Ratios are
-the durable content; absolute times are this host on this day.
-
-**Two rows are at parity with HotSpot C2** — Matrix and Sieve. Fibonacci sits
-at 3.49x, Arithmetic at 1.94x. String/Regex is the row that has moved most.
-
-HashMap and Binary Trees sit above their earlier figures, but those earlier
-absolutes were taken on a since-re-provisioned host and were never re-measured
-under the current protocol — read BENCHMARK.md before treating either as a
-regression.
-
-‡ **Fibonacci carries a known shape.** Both JIT backends erase the dead
-shadow-stack thread fetch from the prologue; the single-pass backend jumps over
-the erased ~46-byte span, and the IR backend previously overwrote it with
-one-byte `NOP`s, so every IR method that published nothing retired 46 NOPs on
-entry, on every invocation. That is fixed. The residual gap to the pre-IR
-single-pass body (near 2.9x) is precise-root and deopt metadata the IR tier
-emits and the single-pass backend did not: the safepoint-id slot the collector
-reads to pick an oop map, and the innermost-RBP mirror the stack walker reads.
-Nothing today compares an IR body against the C1 body it replaces before
-keeping it; that is an open policy question, not metadata to be deleted.
-
-† **HotSpot is *bimodal* on Sieve, which is why this row's HotSpot CV is the
-worst in the table and why the ratio should be read as parity, not as a
-number.** Across an 18-sample characterisation it lands either at ~2,369 ms or
-~2,739 ms, with nothing in between — one run reads 2,386 ms and the next
-2,734 ms on an unchanged binary. CratonVM's samples over the same 18 runs are
-unimodal (2,276–2,498). In the series above, eight HotSpot samples fall in
-2,279–2,357 and one lands at 2,755, which is the entire reason CV_HotSpot is
-5.8% against CratonVM's 2.0%. The median (2,333 ms) therefore sits in the low
-mode, and the 1.01x above is a low-mode-vs-CratonVM reading. Had the split gone
-the other way the same binaries would have printed something nearer 0.9x. Both
-are parity; neither is a 10% claim in either direction.
-
-The optimizing tier declines a method whose loops the single-pass backend would
-lower better, and what that backend can do and the IR tier cannot is enumerated
-in `jit/src/x64/single_pass_only.rs` rather than discovered one regression at a
-time.
+Two rows (Matrix, Sieve) are at parity with HotSpot C2. Full methodology,
+per-row footnotes (HotSpot's Sieve bimodality, the Fibonacci gap), and
+historical context: [BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
@@ -115,22 +73,18 @@ bit-identical to HotSpot):
 | Dot-product reduction (int·int → long, x300/elem)        | 1,172 ms   | unimplemented | **12 ms**    | **98x**    | n/a          |
 
 Unlike TornadoVM, the supported automatic path needs no `@Parallel`
-annotations or TaskGraph API. This applies only to the eligibility subset in
-the GPU reference; it is not a general promise that arbitrary Java runs on the
-GPU. The multiply-add and dot-product rows are GPU wins; BENCHMARK.md's GPU
-notes explain how a HotSpot constant-folding artifact makes the CPU side of
-those two rows easy to misread. Full results, extra sizes, and methodology notes:
+annotations or TaskGraph API — within a deliberately narrow eligibility
+subset, not a general promise that arbitrary Java runs on the GPU. Full
+results, extra sizes, and methodology:
 [BENCHMARK.md](BENCHMARK.md) and [docs/gpu/README.md](docs/gpu/README.md).
 
-## What Runs Today
+## What to build on
 
 Boots, runs, and passes large real-world test suites:
 
 - **Spring / Spring Boot**
-- **Apache Tomcat**
-- **Netty** 
+- **Tomcat / Netty**
 - **Hibernate / Hibernate Reactive**
-- **Quarkus**
 - **H2 DB / PostgreSQL driver**
 - **Apache Commons Math** 
 - **Bouncy Castle Java**
@@ -183,7 +137,7 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
 | Option | Description |
 |--------|-------------|
 | `-c`, `-cp`, `--classpath <PATH>` | Directories and JARs to search. Separator: `:` (Unix) / `;` (Windows). |
-| `--jar <FILE>` | Execute a JAR (main class from `META-INF/MANIFEST.MF`; classpath from the JAR and its manifest `Class-Path`). |
+| `--jar <FILE>` | Execute a JAR (main class from `apps/META-INF/MANIFEST.MF`; classpath from the JAR and its manifest `Class-Path`). |
 | `-Xmx<SIZE>`, `--Xmx <SIZE>` | Maximum heap size (`256m`, `1g`, `8g`). Default: 256 MB. |
 | `-XX:+UseG1GC` | Use the region-based G1 collector (experimental; generational is the default). |
 | `-D<name>=<value>` | Set a Java system property. |
@@ -201,44 +155,22 @@ Every command above is verified against the current binary. `--gpu` and the
 other GPU options require a `--features gpu-driver` build — see
 [docs/gpu/README.md](docs/gpu/README.md).
 
-## JDK-only mode (`--jdk-only`) — internal diagnostic
+## JDK-only mode (`--jdk-only`)
 
-Where CratonVM cannot yet run the JDK's own code, it substitutes: a native
-Rust implementation, or occasionally a fabricated stand-in class. That is what
-makes the VM useful today, and it is also why "it runs" and "it runs the real
-class bytes" are different claims. `--jdk-only` is the instrument that tells
-them apart — it asks the VM to treat real JDK class bytes as authoritative and
-to report every substitution it would otherwise have made silently.
-
-**Read the status honestly:**
-
-- It is an **internal diagnostic stage**, not a supported runtime mode, and
-  not a compatibility guarantee. The default is and remains `--real-jdk`;
-  nothing here changes a default run.
-- The current wave is **instrumentation and measurement, not deletion**. Only
-  two things are actually enforced today: class fabrication, and the
-  *registration* of synthetic-stub natives. The remaining dispatch-side rules
-  are **counted and reported**, not yet refused.
-- A `--jdk-only` run is **expected to fail on programs that pass under
-  `--real-jdk`**. That failure is the measurement, not a regression in your
-  program.
-- It requires a real JDK image and never falls back.
-
-A/B a program to see what it depends on:
+An **internal diagnostic**, not a supported runtime mode — `--real-jdk`
+remains the default. It asks the VM to treat real JDK class bytes as
+authoritative and report every compatibility substitution it would otherwise
+make silently, so it is *expected* to fail on programs that pass under the
+default. A/B a program to see what it depends on:
 
 ```bash
 ./target/release/cratonvm -cp . MyApp                                   # default: --real-jdk
 ./target/release/cratonvm --jdk-only --jdk-only-report report.json -cp . MyApp
 ```
 
-The report names each violation with the class involved and, where the kind of
-violation has them, the method, descriptor, class origin and attempted native
-kind. `--dump-class-origins <FILE>` adds the per-class provenance census.
-
-Details: [docs/CONFIG.md](docs/CONFIG.md#jdk-only-mode) (flags and modes),
-[docs/jdk-only-migration.md](docs/jdk-only-migration.md) (operator guide),
-[docs/feature-designs/jdk-only-mode.md](docs/feature-designs/jdk-only-mode.md)
-(the design contract — a proposal, not a statement that a wave has landed).
+Details: [docs/jdk-only-migration.md](docs/jdk-only-migration.md) (operator
+guide); the rest of the JDK-only docset is indexed from
+[docs/README.md](docs/README.md#what-is---jdk-only-mode).
 
 ## Limitations
 
