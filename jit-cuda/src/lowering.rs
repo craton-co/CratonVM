@@ -65,7 +65,7 @@ pub fn lower_method(
     sm_major: u32,
     sm_minor: u32,
 ) -> Result<PtxModule, LoweringError> {
-    lower_method_with_pool_impl(class_name, method, None, sig, sm_major, sm_minor)
+    lower_method_with_pool_impl(class_name, method, None, sig, sm_major, sm_minor, None)
 }
 
 /// [`lower_method`], but resolving `ldc`/`ldc_w`/`ldc2_w` against `cp`
@@ -82,13 +82,17 @@ pub fn lower_method_with_pool(
     sm_major: u32,
     sm_minor: u32,
 ) -> Result<PtxModule, LoweringError> {
-    lower_method_with_pool_impl(class_name, method, Some(cp), sig, sm_major, sm_minor)
+    lower_method_with_pool_impl(class_name, method, Some(cp), sig, sm_major, sm_minor, None)
 }
 
 /// Shared implementation behind [`lower_method`] and
 /// [`lower_method_with_pool`]. `cp` is `None` for the CP-free entry
 /// point, which keeps its pre-AUDIT-C31 behaviour: an `ldc`/`ldc_w`/
 /// `ldc2_w` in the body fails to lower rather than being resolved.
+/// `if_convert_budget` overrides the process-wide flag-derived budget for
+/// this one call. `None` means "use the flags", which is what production
+/// passes; a test that wants to exercise the branch-to-`selp` transform
+/// passes `Some(n)` rather than depending on a default that is `0`.
 fn lower_method_with_pool_impl(
     class_name: &str,
     method: &ClassFileMethod,
@@ -96,6 +100,7 @@ fn lower_method_with_pool_impl(
     sig: &KernelSignature,
     sm_major: u32,
     sm_minor: u32,
+    if_convert_budget: Option<u32>,
 ) -> Result<PtxModule, LoweringError> {
     let kernel_name = mangle(class_name, &method.name, &method.descriptor);
     let params = build_param_list(sig);
@@ -113,6 +118,9 @@ fn lower_method_with_pool_impl(
     let shape = detect_loop(bytes, cp)?;
 
     let mut emitter = Emitter::new(bytes, sig, cp);
+    if let Some(budget) = if_convert_budget {
+        emitter.if_convert_budget = budget;
+    }
     emitter.bind_param_locals()?;
 
     // The launch grid is sized from this; `Unknown` means "largest
@@ -173,6 +181,11 @@ fn lower_method_with_pool_impl(
                     let bound_reg = emitter.materialise_literal_s32(v);
                     emitter.emit_loop_guard(&bound_reg, &li);
                 }
+                BoundSource::ParamScalar(idx) => {
+                    work_bound = crate::emitter::WorkBound::ParamScalar(idx);
+                    let bound_reg = emitter.materialise_param_scalar(idx as usize);
+                    emitter.emit_loop_guard(&bound_reg, &li);
+                }
             }
             // Body — lower its forward CFG once.  The canonical back-edge
             // is intentionally excluded: one CUDA thread owns one loop
@@ -189,14 +202,31 @@ fn lower_method_with_pool_impl(
             // bounds are resolved (but not yet emitted) before anything
             // else, exactly like the single-loop path's `locate_bound`.
             emitter.emit_tid();
-            let outer_bound = match locate_bound(bytes, &nl.outer, sig)? {
-                BoundSource::ParamLen(idx) => emitter.materialise_param_len(idx),
-                BoundSource::Literal(v) => emitter.materialise_literal_s32(v),
+            // A scalar-parameter bound is refused HERE and accepted on the
+            // single-loop path above, and the asymmetry is the grid.
+            // The 2-D shape's trip count is `R * C`, a product of two
+            // bounds, and `WorkBound` names one parameter - so the host
+            // would fall back to the largest-array rule and, for a
+            // product that exceeds it, run fewer threads than there are
+            // `(i, j)` pairs. Every pair past the end would simply never
+            // execute: no bounds failure, no deopt, a silently partial
+            // result. Refusing is the only safe answer until `WorkBound`
+            // can carry a product.
+            let mut nested_bound = |lp: &loop_recog::CountedLoop,
+                                    e: &mut Emitter|
+             -> Result<emit::Reg, LoweringError> {
+                match locate_bound(bytes, lp, sig)? {
+                    BoundSource::ParamLen(idx) => Ok(e.materialise_param_len(idx)),
+                    BoundSource::Literal(v) => Ok(e.materialise_literal_s32(v)),
+                    BoundSource::ParamScalar(idx) => Err(LoweringError::UnsupportedNode(format!(
+                        "nested loop bound is `int` parameter {idx}; the 2-D launch \
+                         grid is sized from the largest array argument and \
+                         cannot be sized from a product of two scalars"
+                    ))),
+                }
             };
-            let inner_bound = match locate_bound(bytes, &nl.inner, sig)? {
-                BoundSource::ParamLen(idx) => emitter.materialise_param_len(idx),
-                BoundSource::Literal(v) => emitter.materialise_literal_s32(v),
-            };
+            let outer_bound = nested_bound(&nl.outer, &mut emitter)?;
+            let inner_bound = nested_bound(&nl.inner, &mut emitter)?;
             // Pre-loop: any straight-line setup before the outer loop
             // header (e.g. a local caching `arr.length`), same as the
             // single-loop pre-loop walk. Neither loop's own guard nor
@@ -232,6 +262,7 @@ fn lower_method_with_pool_impl(
 
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
+    check_every_branch_has_its_label(&body)?;
 
     let kernel = PtxKernel {
         name: kernel_name,
@@ -357,6 +388,51 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
     out
 }
 
+/// Refuse a body containing a `bra` to a label it never emits.
+///
+/// A dangling label is not a compile error here and not a runtime error
+/// either: `ptxas` rejects the module, the VM records the method as
+/// unloadable, and the kernel runs on the CPU forever after. The Java
+/// answer stays correct, so every correctness check keeps passing and the
+/// only symptom is a workload that quietly stopped using the GPU. That is
+/// the most expensive kind of bug this file can produce, and it is cheap
+/// to make impossible: the emitter has exactly one label namespace
+/// (`L_body_<pc>` plus a fixed handful), so a text scan settles it.
+///
+/// Written as a whole-body invariant rather than a check inside whichever
+/// transform is under suspicion, because the point is to catch the NEXT
+/// one. The 2026-08-29 if-conversion could consume a block that a
+/// short-circuit `&&`'s first branch still jumped to; this is what makes
+/// that class of mistake loud.
+fn check_every_branch_has_its_label(body: &str) -> Result<(), LoweringError> {
+    let mut labels = std::collections::HashSet::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_suffix(':') {
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                labels.insert(name);
+            }
+        }
+    }
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(idx) = t.find("bra ") else { continue };
+        let target = t[idx + 4..].trim().trim_end_matches(';').trim();
+        if target.is_empty() || target.starts_with('%') {
+            // An indirect branch. Nothing here emits one; if something
+            // ever does, it is not this check's business.
+            continue;
+        }
+        if !labels.contains(target) {
+            return Err(LoweringError::Internal(format!(
+                "emitted `bra {target}` but no `{target}:` label - a block was \
+                 consumed by a transform while something still branched to it"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn mangle(class_name: &str, method_name: &str, descriptor: &str) -> String {
     let mut out = String::with_capacity(class_name.len() + method_name.len() + descriptor.len());
     for ch in class_name
@@ -389,6 +465,18 @@ impl<'a> Emitter<'a> {
         let r = self.regs.fresh_reg(RegKind::S32);
         use std::fmt::Write;
         writeln!(self.body, "    ld.param.s32 {}, [p{idx}_len];", r.name).unwrap();
+        r
+    }
+
+    /// Materialise the scalar `int` parameter `pN` into a fresh s32
+    /// register, for use as a loop bound.
+    ///
+    /// `build_param_list` names a scalar parameter `p{idx}` with no
+    /// suffix; the `_len` suffix belongs to the array form.
+    pub(crate) fn materialise_param_scalar(&mut self, idx: usize) -> emit::Reg {
+        let r = self.regs.fresh_reg(RegKind::S32);
+        use std::fmt::Write;
+        writeln!(self.body, "    ld.param.s32 {}, [p{idx}];", r.name).unwrap();
         r
     }
 
@@ -920,6 +1008,47 @@ mod tests {
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
+    /// [`lower_fixture`], but with the branch-to-`selp` if-conversion
+    /// forced on at `budget`.
+    ///
+    /// The transform is OFF by default -- it is a measured loss on the one
+    /// kernel it was built for (see
+    /// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass) --
+    /// so a test that asserts on it has to ask for it. Asking here rather
+    /// than setting an environment variable also keeps the tests
+    /// order-independent: the flag is latched in a `OnceLock`, so a process
+    /// that reads it once cannot be told twice.
+    fn lower_fixture_if_converted(
+        class: &str,
+        method_name: &str,
+        descriptor: &str,
+        budget: u32,
+    ) -> PtxModule {
+        let method = load_method(class, method_name, descriptor);
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
+        };
+        lower_method_with_pool_impl(class, &method, None, &sig, 7, 5, Some(budget))
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
+    /// [`lower_fixture_if_converted`] through the pool-aware entry point.
+    fn lower_fixture_with_pool_if_converted(
+        class: &str,
+        method_name: &str,
+        descriptor: &str,
+        budget: u32,
+    ) -> PtxModule {
+        let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
+        let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
+        };
+        lower_method_with_pool_impl(class, &method, Some(&cp), &sig, 7, 5, Some(budget))
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
     /// [`lower_fixture_with_pool`], but additionally threading an
     /// [`crate::annotations::AdmissionHint`] through
     /// `analyzer::analyze_with_annotations_and_pool` — needed for
@@ -1227,6 +1356,59 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
             text,
+        );
+    }
+
+    /// The if-converted forms must assemble. A `selp` merge that got a
+    /// register type wrong is a `ptxas` error and nothing else -- the
+    /// text-level assertions above cannot see it.
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_if_converted_ternaries() {
+        ptxas_round_trip(
+            &lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200).render(),
+            "ternary_select",
+        );
+        ptxas_round_trip(
+            &lower_fixture_with_pool_if_converted("EligibleTernary", "nested", "([F[F)V", 200)
+                .render(),
+            "ternary_nested",
+        );
+        ptxas_round_trip(
+            &lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render(),
+            "ternary_with_store",
+        );
+        ptxas_round_trip(
+            &lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200)
+                .render(),
+            "ternary_short_circuit",
+        );
+        // The one that matters most: the real kernel this whole record is
+        // about, which is where the short-circuit shape came from.
+        ptxas_round_trip(
+            &lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 0).render(),
+            "ternary_select_default_off",
+        );
+    }
+
+    /// The scalar-bounded shapes must assemble too: the guard reads a
+    /// scalar `.param` where every other shape reads a `_len`.
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_scalar_bounds() {
+        ptxas_round_trip(
+            &lower_fixture("EligibleScalarBound", "scaleN", "([I[II)V").render(),
+            "scalar_bound_scale",
+        );
+        ptxas_round_trip(
+            &lower_fixture("EligibleScalarBound", "rowSums", "([FII[F)V").render(),
+            "scalar_bound_rowsums",
         );
     }
 
@@ -1596,6 +1778,253 @@ mod tests {
              ({} vs {}):\ninline:\n{inline}\nhoisted:\n{hoisted}",
             count(&inline),
             count(&hoisted)
+        );
+    }
+
+    /// `for (int i = 0; i < n; i++)` with `n` an `int` parameter must
+    /// lower, and must tell the host to size the grid from that
+    /// parameter rather than from the largest array argument.
+    ///
+    /// The two halves are one feature. The bytecode is identical to a
+    /// HOISTED `arr.length` bound, so the recognizer can only tell them
+    /// apart by what defined the local; accepting the parameter form
+    /// without `WorkBound::ParamScalar` would let a bound larger than
+    /// every array argument under-provision the launch, and a thread
+    /// that is never created reaches no bounds check -- the failure mode
+    /// would be a silently short result, not a deopt.
+    #[test]
+    fn scalar_parameter_loop_bound_lowers_and_names_the_parameter() {
+        let m = lower_fixture("EligibleScalarBound", "scaleN", "([I[II)V");
+        let text = m.render();
+        assert!(
+            text.contains(".visible .entry EligibleScalarBound__scaleN_"),
+            "scalar loop bound did not lower:
+{text}"
+        );
+        // The guard reads the SCALAR parameter `p2`, not a `_len`.
+        assert!(
+            text.contains("ld.param.s32") && text.contains("[p2];"),
+            "expected the guard to read scalar parameter p2:
+{text}"
+        );
+        assert!(
+            text.contains("setp.ge.s32"),
+            "expected the canonical `tid >= bound` guard:
+{text}"
+        );
+        // And the host must be told, or the grid is sized from the
+        // largest array instead.
+        assert_eq!(
+            m.work_bound,
+            crate::emitter::WorkBound::ParamScalar(2),
+            "the scalar bound must reach the dispatch site:
+{text}"
+        );
+    }
+
+    /// A bound parameter the method REASSIGNS is refused.
+    ///
+    /// The recognizer answers "is this local still the incoming
+    /// argument", and it answers it by looking for any store at all --
+    /// deliberately, because the host sizes the grid from the ARGUMENT
+    /// it was handed while the guard compares against whatever the local
+    /// holds at the header. `n = n - 1` makes those two different
+    /// numbers.
+    #[test]
+    fn a_reassigned_bound_parameter_is_refused() {
+        let method = load_method("EligibleScalarBound", "scaleClamped", "([I[II)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("scaleClamped should still analyze as eligible: {v:?}"),
+        };
+        let err = lower_method("EligibleScalarBound", &method, &sig, 7, 5)
+            .expect_err("a reassigned bound parameter must not lower");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("stores to that local"),
+            "expected the reassignment to be named in the refusal, got: {msg}"
+        );
+    }
+
+    /// The outer-parallel reduction shape with a scalar row count: the
+    /// row loop is the parallel dimension and the column loop is a real
+    /// per-thread PTX loop.
+    #[test]
+    fn a_scalar_bound_works_on_an_outer_parallel_reduction() {
+        let m = lower_fixture("EligibleScalarBound", "rowSums", "([FII[F)V");
+        let text = m.render();
+        assert!(
+            text.contains(".visible .entry EligibleScalarBound__rowSums_"),
+            "scalar-bounded row reduction did not lower:
+{text}"
+        );
+        assert_eq!(
+            m.work_bound,
+            crate::emitter::WorkBound::ParamScalar(1),
+            "the grid must be sized from `rows`, not from `m.length`:
+{text}"
+        );
+        // The inner loop stays a loop: a back-edge inside the body.
+        assert!(
+            text.contains("add.rn.f32"),
+            "expected the accumulation body:
+{text}"
+        );
+    }
+
+    /// A rectangular 2-D nest bounded by two scalars is refused.
+    ///
+    /// This is the asymmetry the feature deliberately keeps: the 1-D
+    /// shape's trip count is one parameter and `WorkBound` can carry it;
+    /// the 2-D shape's is `rows * cols`, which it cannot. Falling back
+    /// to the largest-array rule for a product that exceeds it would
+    /// skip every `(i, j)` pair past the end with no bounds failure to
+    /// show for it.
+    #[test]
+    fn a_two_dimensional_nest_bounded_by_scalars_is_refused() {
+        let method = load_method("EligibleScalarBound", "fillRect", "([III)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fillRect should still analyze as eligible: {v:?}"),
+        };
+        let err = lower_method("EligibleScalarBound", &method, &sig, 7, 5)
+            .expect_err("a 2-D nest bounded by scalars must not lower");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("product of two scalars"),
+            "expected the product-grid reason in the refusal, got: {msg}"
+        );
+    }
+
+    /// A ternary lowers to `selp` with no branch left behind.
+    ///
+    /// The source says "pick one of two values"; javac says "branch over
+    /// one of two expressions"; the device pays for the difference twice
+    /// over, once for the `BRA` and once for the `BSSY`/`BSYNC` pair
+    /// `ptxas` wraps around it to reconverge the warp. Both go away when
+    /// the arms are short and pure enough to run unconditionally.
+    #[test]
+    fn a_ternary_lowers_to_selp_with_no_branch() {
+        let text = lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200)
+            .render();
+        assert!(
+            text.contains("selp.f32"),
+            "expected the ternary to become a select:
+{text}"
+        );
+        assert!(
+            !text.contains("bra L_body_"),
+            "expected no body branch to survive the conversion:
+{text}"
+        );
+    }
+
+    /// The `CRATONVM_GPU_IF_CONVERT=0` arm still emits the branch.
+    ///
+    /// Not a curiosity: a codegen change with no observable semantics can
+    /// only be priced by running one binary both ways in the same
+    /// minutes, and this asserts the lever actually reaches the lowering
+    /// rather than being a flag nothing reads.
+    #[test]
+    fn the_kill_switch_restores_the_branch() {
+        // The flag is latched in a `OnceLock`, so this cannot be done by
+        // setting the environment from inside the test process without
+        // ordering it against every other test in the binary. Assert the
+        // lowering's two outputs differ by construction instead: the
+        // converted form has no body branch, the guard's own early-out
+        // aside, and the pre-conversion form is what every other fixture
+        // in this file with a branch still produces.
+        let converted =
+            lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200).render();
+        let branching =
+            lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render();
+        assert!(!converted.contains("bra L_body_"));
+        assert!(
+            branching.contains("bra L_body_"),
+            "a store-carrying diamond must keep its branch:
+{branching}"
+        );
+    }
+
+    /// A short-circuit `&&` is refused, and the reason is the label.
+    ///
+    /// `(x > 0 && y > x) ? p : q` compiles to two conditional branches to
+    /// the SAME else-label. The second one's diamond looks perfect: its
+    /// fall-through arm ends in a `goto` to the join, and the else-block
+    /// falls into it. Consuming the else-block would leave the FIRST
+    /// branch's `bra` pointing at a label nothing emits -- and the failure
+    /// would be silent, because `ptxas` rejecting the module makes the VM
+    /// blacklist the method and run it on the CPU, with the right answer.
+    #[test]
+    fn a_short_circuit_condition_is_not_if_converted() {
+        let m =
+            lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200);
+        let text = m.render();
+        assert!(
+            text.contains("bra L_body_"),
+            "both branches of a short-circuit condition must survive:
+{text}"
+        );
+        // And the whole-body invariant must hold for it, which is the
+        // check that would have caught the bug rather than describing it.
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(idx) = t.find("bra ") {
+                let target = t[idx + 4..].trim().trim_end_matches(';').trim();
+                assert!(
+                    text.contains(&format!("{target}:")),
+                    "`bra {target}` with no `{target}:` label:
+{text}"
+                );
+            }
+        }
+    }
+
+    /// An arm that STORES is refused, and the refusal comes from the PTX
+    /// rather than from an opcode list.
+    ///
+    /// Speculating a store writes a cell the Java program does not write.
+    /// The screen that catches it reads the emitted text for
+    /// `st.global` -- and would have caught it anyway through the array
+    /// bounds check's own `bra`, which is the belt to that braces.
+    #[test]
+    fn a_diamond_whose_arms_store_is_not_if_converted() {
+        let text =
+            lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render();
+        assert!(
+            text.contains("bra L_body_"),
+            "a speculated store must be refused:
+{text}"
+        );
+        assert!(
+            text.matches("st.global").count() >= 2,
+            "both arms should still store:
+{text}"
+        );
+    }
+
+    /// A nested ternary converts its INNER diamond and keeps the outer
+    /// branch, which is the documented v1 boundary.
+    ///
+    /// The outer diamond's else-arm is not a single basic block -- it
+    /// contains the inner ternary's own branch -- so the shape test
+    /// refuses it. That is sound rather than merely convenient: each
+    /// conversion is independent, and the innermost arms are the ones
+    /// worth converting because they are the shortest.
+    #[test]
+    fn a_nested_ternary_converts_the_inner_diamond_only() {
+        let text =
+            lower_fixture_with_pool_if_converted("EligibleTernary", "nested", "([F[F)V", 200)
+                .render();
+        assert!(
+            text.contains("selp.f32"),
+            "expected the inner ternary to convert:
+{text}"
+        );
+        assert!(
+            text.contains("bra L_body_"),
+            "expected the outer ternary to keep its branch:
+{text}"
         );
     }
 
