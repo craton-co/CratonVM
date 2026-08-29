@@ -3037,6 +3037,10 @@ pub mod dispatch_timing {
         if calls == 0 {
             return;
         }
+        // The bridge's own engagement census, printed first because it is
+        // what says whether the two per-launch driver-call savings below
+        // are being served at all.
+        cratonvm_types::gpu_event_census::exit_summary();
         let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
         eprintln!(
             "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",

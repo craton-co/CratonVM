@@ -63,6 +63,21 @@ pub(crate) struct EventStub {
 struct EventCuda {
     cu_event: cudarc::driver::sys::CUevent,
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    /// The context free list this handle came from and returns to.
+    /// See `backend_cuda::DeviceContextInner::event_pool`.
+    pool: std::sync::Arc<crate::backend_cuda::EventPool>,
+    /// Raw `CUstream` this event was last recorded on, or `0`.
+    ///
+    /// Read by [`Stream::wait_event`] to skip a wait that cannot mean
+    /// anything: work already queued on a stream is ordered before work
+    /// queued after it, so `cuStreamWaitEvent(S, E)` where `E` was
+    /// recorded on `S` is a driver round trip for a guarantee the stream
+    /// already gives. That is not a rare case -- it is EVERY launch in a
+    /// chunked dispatch after the first, and every launch in a
+    /// single-stream chain like GPULlama3's 453-kernel forward pass,
+    /// because each one waits on the `last_write` its predecessor
+    /// stamped onto the same stream.
+    recorded_on: std::sync::atomic::AtomicUsize,
 }
 
 // # Safety
@@ -92,15 +107,20 @@ unsafe impl Sync for EventCuda {}
 #[cfg(feature = "cuda")]
 impl Drop for EventCuda {
     fn drop(&mut self) {
-        // Bind to the owning context before destroying — same pattern
-        // cudarc uses in `CudaDevice::drop` (which destroys the
-        // per-device sync event).
-        let _ = self.device.bind_to_thread();
-        // SAFETY: the event remains uniquely owned and live, and its owning
-        // device context was bound immediately above.
-        unsafe {
-            let _ = cudarc::driver::result::event::destroy(self.cu_event);
-        }
+        // Return the handle to the context's free list rather than
+        // destroying it. `EventPool::put` destroys it itself once the
+        // pool is full, and the pool destroys everything it holds when
+        // the context goes away -- so no handle outlives its context and
+        // none leaks. `bind_to_thread` is paid only on those two paths,
+        // not on the common one.
+        //
+        // Safe to recycle even with work in flight: a `cuStreamWaitEvent`
+        // already issued against this handle captured the event's
+        // contents at the time of that call, so re-recording the handle
+        // for a later submission cannot reach back and satisfy it. The
+        // handle is uniquely ours here by construction -- `Drop` runs
+        // only when the last `Arc<Event>` is gone.
+        self.pool.put(self.cu_event);
     }
 }
 
@@ -126,9 +146,33 @@ impl Event {
     #[cfg(feature = "cuda")]
     pub fn new(ctx: &DeviceContext) -> Result<Self> {
         let device = ctx.inner().device().clone();
+        let pool = ctx.inner().event_pool().clone();
+        // Recycled first: a pooled handle costs a `Vec::pop` where a
+        // fresh one costs `cuEventCreate` now and `cuEventDestroy`
+        // later. This path runs twice per kernel submission and
+        // GPULlama3 makes 453 of those per token.
+        //
+        // `bind_to_thread` stays on BOTH paths deliberately. Callers of
+        // `Event::new` are entitled to a bound context afterwards --
+        // `backend_cuda::record_compute_event`'s own comment says as much
+        // -- and skipping it here would make that guarantee depend on
+        // whether the pool happened to have a spare handle, which is the
+        // worst possible shape for a latent unbound-context bug.
         device
             .bind_to_thread()
             .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+        if let Some(cu_event) = pool.take() {
+            cratonvm_types::gpu_event_census::note_recycled();
+            return Ok(Self {
+                inner: EventCuda {
+                    cu_event,
+                    device,
+                    pool,
+                    recorded_on: std::sync::atomic::AtomicUsize::new(0),
+                },
+                id: next_event_id(),
+            });
+        }
         // `CU_EVENT_DISABLE_TIMING` matches cudarc's own per-device
         // sync event: we don't want the (slightly more expensive)
         // timing variant since the bridge never measures elapsed
@@ -137,10 +181,33 @@ impl Event {
             cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
         )
         .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e:?}")))?;
+        cratonvm_types::gpu_event_census::note_created();
         Ok(Self {
-            inner: EventCuda { cu_event, device },
+            inner: EventCuda {
+                cu_event,
+                device,
+                pool,
+                recorded_on: std::sync::atomic::AtomicUsize::new(0),
+            },
             id: next_event_id(),
         })
+    }
+
+    /// Remember which raw stream last recorded this event, so
+    /// [`Stream::wait_event`] can elide a same-stream wait. Cuda-mode
+    /// only; the stub backend tracks the same thing as a stream id in
+    /// `EventStub::recorded_on`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_recorded_on(&self, stream: cudarc::driver::sys::CUstream) {
+        self.inner
+            .recorded_on
+            .store(stream as usize, Ordering::Relaxed);
+    }
+
+    /// The raw stream this event was last recorded on, or `0`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn recorded_on_raw(&self) -> usize {
+        self.inner.recorded_on.load(Ordering::Relaxed)
     }
 
     /// Unique id (test / debug aid). Stable for the lifetime of the
@@ -296,7 +363,9 @@ impl Stream {
         // SAFETY: event and stream share the bound owning context and remain
         // live for this synchronous enqueue.
         unsafe { cudarc::driver::result::event::record(event.inner.cu_event, self.raw()) }
-            .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
+            .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))?;
+        event.set_recorded_on(self.raw());
+        Ok(())
     }
 
     /// Make this stream wait for `event`. All subsequent work on this
@@ -317,6 +386,18 @@ impl Stream {
 
     #[cfg(feature = "cuda")]
     pub fn wait_event(&self, event: &Event) -> Result<()> {
+        // An event recorded on THIS stream needs no wait: everything
+        // queued on a stream before a point is already ordered before
+        // everything queued after it. Skipping is exactly equivalent and
+        // saves a driver round trip on the hottest ordering edge there
+        // is -- a chain of kernels on one stream, where each launch would
+        // otherwise wait on the `last_write` its predecessor stamped
+        // there. See `EventCuda::recorded_on`.
+        if event.recorded_on_raw() == self.raw() as usize {
+            cratonvm_types::gpu_event_census::note_wait_elided();
+            return Ok(());
+        }
+        cratonvm_types::gpu_event_census::note_wait_issued();
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before driving the stream/event (see
         // `record_event`).

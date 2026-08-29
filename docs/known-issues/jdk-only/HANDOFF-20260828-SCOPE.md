@@ -243,6 +243,13 @@ the flake it looked like.)
 1-ULP `Math.pow`/`sin`/`log10`). Confirming coverage is the point — that is
 seven probes' worth of tail surface nobody has to re-derive.
 
+**First tail slice taken 2026-08-29: `java.lang.invoke`'s LOOKUP and TYPE
+surface** — `MethodHandles$Lookup` 6 triples, `MethodType` 5, `MethodHandle` 3,
+`MethodHandles` 1. 83 probe rows, **27 differing -> 1**, ten defects. Record:
+`the-invoke-lookup-surface-ten-defects-and-one-that-corrupted-an-interned-type-20260829.md`.
+Distinct from the DISPATCH surface (`invoke`/`invokeExact`) that L5's residual
+round closed — worth knowing if you take another `java.lang.invoke` slice.
+
 ---
 
 ## 3. The method — four families in, it is mechanical
