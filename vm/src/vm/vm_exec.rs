@@ -16747,6 +16747,31 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// Read straight off the submission — whichever code path failed
     /// stamped the category at that moment, so nothing here has to infer
     /// it from the message.
+    fn gpu_dispatch_gemm(
+        &mut self,
+        half: bool,
+        a_handle: u64,
+        b_handle: u64,
+        c_handle: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::runtime::kernels::GemmKind;
+            let kind = if half { GemmKind::F16 } else { GemmKind::F32 };
+            Some(crate::runtime::offload::dispatch_gemm(
+                self.shared, kind, a_handle, b_handle, c_handle, m, n, k,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (half, a_handle, b_handle, c_handle, m, n, k);
+            None
+        }
+    }
+
     fn gpu_future_error_kind(
         &self,
         handle: u64,

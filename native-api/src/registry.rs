@@ -4209,6 +4209,35 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
         None
     }
 
+    /// Dispatch a built-in GEMM: `C[MxN] = A[MxK] * B[KxN]`, row-major.
+    ///
+    /// `half` selects the fp16 input variant (fp32 accumulate) over the
+    /// all-fp32 one. The three handles are `craton.gpu.GpuArray` handles,
+    /// not Java arrays, deliberately: their device buffers are cached, so
+    /// a weight matrix uploaded once stays resident across calls. A
+    /// decode step multiplies by the same weights every token, and
+    /// re-uploading them would cost more than the arithmetic.
+    ///
+    /// Returns a submission handle with the usual lifecycle, or `None`
+    /// when this VM has no GPU offload compiled in.
+    ///
+    /// This exists because the bytecode lowering cannot express a matrix
+    /// multiply — three nested loops, a shared tile, a barrier — and
+    /// rejects such a method rather than mis-lowering it. See
+    /// `vm::runtime::kernels`.
+    fn gpu_dispatch_gemm(
+        &mut self,
+        _half: bool,
+        _a_handle: u64,
+        _b_handle: u64,
+        _c_handle: u64,
+        _m: i32,
+        _n: i32,
+        _k: i32,
+    ) -> Option<u64> {
+        None
+    }
+
     /// GpuStream affinity — mint a new Java-visible CUDA stream on the
     /// per-VM default-ordinal `OffloadCache`.
     ///
