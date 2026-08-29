@@ -10,7 +10,9 @@ hibernate class. It is also, on the evidence here, **faster** — 8% on a serial
 netty slice, 15-26% on hibernate.
 
 And it breaks one test, every time:
-`docs/known-issues/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-20260828.md`.
+`fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`
+(FIXED 2026-08-28 — the spliced-bci argument was dropped on the floor, and the
+replay rule asked about the whole body instead of the abandoned attempt).
 A 3-byte out-of-bounds read through a spliced accessor raises `InternalError`
 ("precise deoptimization unavailable … reason UnreachedCode") instead of
 `IndexOutOfBoundsException`. That is a user-visible wrong exception type on an
