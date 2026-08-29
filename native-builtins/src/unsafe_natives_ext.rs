@@ -1855,6 +1855,61 @@ fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_i
     );
 }
 
+/// First-touch classification of an offset that reached the NULL-BASE fallback
+/// side store, for L1 residual R5.
+///
+/// A null base means an ABSOLUTE ADDRESS in the JDK's contract, and HotSpot
+/// SIGSEGVs on one it cannot map. Here such an access falls through to a
+/// private `static_{int,long,obj}_store` keyed by the offset, which invents the
+/// slot and succeeds -- including `compareAndSwapInt`, which then returns
+/// `true` having written nowhere any reader can see.
+///
+/// The population that matters is the offsets with NO explanation: not an
+/// arena handle, not a synthetic offset, not a registered static field. The
+/// first three are legitimate users of this store (`Thread$ThreadIdentifiers
+/// .next()` mints a synthetic one). This counts and names the fourth.
+///
+/// Deliberately lock-free and flag-free: one relaxed `fetch_add`, and a warn
+/// only on the first occurrence and then at powers of two, so the magnitude is
+/// visible without a bounded-sink or a new declared flag. It is on the
+/// null-base fallback branch only, which is not a hot path -- every classified
+/// access returns before reaching it.
+///
+/// MEASURED 2026-08-29 across the whole 117-vector corpus, both modes, with a
+/// denominator that has since been removed:
+///
+///   null-base fallback REACHED     5 warn-lines, 1 vector (RChmKeySetView)
+///   of those, UNCLASSIFIED         0            0 vectors
+///
+/// So the fallback is genuinely exercised and every offset that reached it was
+/// classifiable. The refusal this instrument exists to justify -- an
+/// `IllegalArgumentException` for an unclassified offset, matching what
+/// `setMemory`/`copyMemory` already do at address 0 -- is therefore free on the
+/// corpus, and is STILL NOT TAKEN: the corpus does not include the three
+/// definition-of-done workloads, and this fallback's sibling
+/// (`objectFieldOffset1`'s synthetic mint) exists precisely for WildFly and
+/// Spring Boot, which are not in it either. The instrument stays so that
+/// whoever runs those workloads gets the number for free.
+pub(crate) fn note_unsafe_side_store_offset(offset: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if crate::unsafe_arena_addr_is_tagged(offset as i64)
+        || crate::is_synthetic_offset(offset)
+        || unsafe_static_field_target(offset).is_some()
+    {
+        return;
+    }
+    static UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
+    let n = UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n.is_power_of_two() {
+        tracing::warn!(
+            target: "cratonvm::unsafe",
+            occurrence = n + 1,
+            offset = format!("{offset:#x}"),
+            "UNCLASSIFIED-NULL-BASE: an Unsafe access with a null base whose              offset is neither an arena handle, nor a synthetic offset, nor a              registered static field. HotSpot reads this as an absolute address              and faults; here it lands in a private side store, so a CAS can              report success having written nowhere a reader can see. L1 R5."
+        );
+    }
+}
+
 fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
     let target = lock_unsafe_shard_usize(unsafe_static_field_targets(), offset)
         .get(&offset)
@@ -2468,6 +2523,7 @@ pub(crate) fn native_unsafe_cas_int(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
@@ -2521,6 +2577,7 @@ pub(crate) fn native_unsafe_cas_long(
                 }
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -2676,6 +2733,7 @@ pub(crate) fn native_unsafe_cas_object(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected {
@@ -2766,6 +2824,7 @@ pub(crate) fn native_unsafe_get_int_volatile(
                     _ => Value::Int(0),
                 }));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2799,6 +2858,7 @@ pub(crate) fn native_unsafe_put_int_volatile(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2833,6 +2893,7 @@ pub(crate) fn native_unsafe_get_long_volatile(
                     _ => Value::Long(0),
                 }));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2867,6 +2928,7 @@ pub(crate) fn native_unsafe_put_long_volatile(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2897,6 +2959,7 @@ fn native_unsafe_get_object_volatile(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -2933,6 +2996,7 @@ fn native_unsafe_put_object_volatile(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2963,6 +3027,7 @@ pub(crate) fn native_unsafe_get_object(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -2997,6 +3062,7 @@ pub(crate) fn native_unsafe_put_object(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3316,6 +3382,7 @@ pub(crate) fn native_unsafe_get_int(
                     _ => Value::Int(0),
                 }));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3349,6 +3416,7 @@ pub(crate) fn native_unsafe_put_int(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3491,6 +3559,7 @@ pub(crate) fn native_unsafe_get_long(
                     _ => Value::Long(0),
                 }));
             }
+            note_unsafe_side_store_offset(offset);
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3532,6 +3601,7 @@ pub(crate) fn native_unsafe_put_long(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
+            note_unsafe_side_store_offset(offset);
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3706,6 +3776,7 @@ pub(crate) fn native_unsafe_get_and_add_int(
             if let Some(old) = unsafe_static_get_and_add_int(ctx, offset, delta) {
                 return Ok(Some(Value::Int(old)));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -3772,6 +3843,7 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             if let Some(prev) = unsafe_static_get_and_set_int(ctx, offset, nv) {
                 return Ok(Some(Value::Int(prev)));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
@@ -4145,6 +4217,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -4209,6 +4282,7 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
                 return Ok(Some(Value::Long(prev)));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -4258,6 +4332,7 @@ fn native_unsafe_get_and_set_object(
             if let Some(prev) = unsafe_static_get_and_set_object(ctx, offset, nv) {
                 return Ok(Some(Value::Object(prev)));
             }
+            note_unsafe_side_store_offset(offset);
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
@@ -5961,6 +6036,7 @@ mod unsafe_static_field_offset_tests {
     fn thread_next_tid_offset_seeds_positive_null_base_counter() {
         let mut ctx = MockNativeContext::new();
         let offset = thread_next_tid_offset();
+        note_unsafe_side_store_offset(offset);
         lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
 
         let first = native_unsafe_get_and_add_long(

@@ -1058,18 +1058,20 @@ pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Map$Entry;",
         native_p64_sm_last_entry,
     );
-    r.register(
-        sm,
-        "pollFirstEntry",
-        "()Ljava/util/Map$Entry;",
-        native_p64_sm_first_entry,
-    );
-    r.register(
-        sm,
-        "pollLastEntry",
-        "()Ljava/util/Map$Entry;",
-        native_p64_sm_last_entry,
-    );
+    // `pollFirstEntry` / `pollLastEntry` are NOT registered here.
+    //
+    // They used to point at `native_p64_sm_first_entry` / `..._last_entry` --
+    // the same bodies `firstEntry`/`lastEntry` use, which answer the entry and
+    // do not REMOVE it. MEASURED against HotSpot 25.0.4+7 on the shipping path
+    // (apps/probes/LinkedSequencedShadowSweep 88): the entry survives the poll, so
+    // `while ((e = m.pollLastEntry()) != null)` -- the idiom the method exists
+    // for -- never terminates.
+    //
+    // `native-collections`' `register_linked_hashmap_natives` registers both on
+    // this same interface with bodies that remove, and it runs in EVERY mode;
+    // this pass runs only under `--features synthetic-jdk` and, because
+    // `register_synthetic_overrides` runs last, used to overwrite them there.
+    // `registrar_drift::no_new_mode_drift` is the gate that names that shape.
     r.register(
         sm,
         "reversed",
@@ -1139,24 +1141,18 @@ pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Map$Entry;",
         native_p64_lhm_last_entry,
     );
-    r.register(
-        lhm,
-        "sequencedKeySet",
-        "()Ljava/util/SequencedSet;",
-        native_p64_lhm_seq_key_set,
-    );
-    r.register(
-        lhm,
-        "sequencedValues",
-        "()Ljava/util/SequencedCollection;",
-        native_p64_lhm_seq_values,
-    );
-    r.register(
-        lhm,
-        "sequencedEntrySet",
-        "()Ljava/util/SequencedSet;",
-        native_p64_lhm_seq_entry_set,
-    );
+    // `sequencedKeySet` / `sequencedValues` / `sequencedEntrySet` are NOT
+    // registered here, and their bodies are gone with them.
+    //
+    // They walked the insertion-order chain by RAW SLOT -- `get_field(node, 0)`
+    // for the key, `get_field(node, 5)` for `after` -- against a node layout
+    // that is `HASH=0, KEY=1, VALUE=2, NEXT=3, BEFORE=4, AFTER=5`, so they read
+    // the HASH as the key and the KEY as the value. Their own comment recorded
+    // the other half ("Return as ArrayList (simplification -- real Java returns
+    // a Set view)").
+    //
+    // `register_linked_hashmap_natives` registers all three, in every mode, as
+    // the live `keySet`/`values`/`entrySet` the interface narrows.
     r.register(
         lhm,
         "reversed",
@@ -1485,73 +1481,6 @@ pub(crate) fn native_p64_lhm_last_entry(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     p64_seq_map_edge_entry(ctx, this, true)
-}
-
-pub(crate) fn native_p64_lhm_seq_key_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    // Walk insertion order: head → ... → tail via field 5 (after)
-    let mut keys = Vec::new();
-    let mut cur = ctx.get_field(this, 3); // head
-    while let Value::Object(Some(node)) = cur {
-        keys.push(ctx.get_field(node, 0)); // key
-        cur = ctx.get_field(node, 5); // after
-    }
-    // Return as ArrayList (simplification — real Java returns a Set view)
-    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
-    for (i, k) in keys.iter().enumerate() {
-        ctx.set_array_element(arr, i, *k);
-    }
-    ctx.set_field(al, 0, Value::Object(Some(arr)));
-    ctx.set_field(al, 1, Value::Int(keys.len() as i32));
-    Ok(Some(Value::Object(Some(al))))
-}
-
-pub(crate) fn native_p64_lhm_seq_values(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let mut vals = Vec::new();
-    let mut cur = ctx.get_field(this, 3);
-    while let Value::Object(Some(node)) = cur {
-        vals.push(ctx.get_field(node, 1)); // value
-        cur = ctx.get_field(node, 5);
-    }
-    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, vals.len());
-    for (i, v) in vals.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
-    }
-    ctx.set_field(al, 0, Value::Object(Some(arr)));
-    ctx.set_field(al, 1, Value::Int(vals.len() as i32));
-    Ok(Some(Value::Object(Some(al))))
-}
-
-pub(crate) fn native_p64_lhm_seq_entry_set(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let mut entries = Vec::new();
-    let mut cur = ctx.get_field(this, 3);
-    while let Value::Object(Some(node)) = cur {
-        let key = ctx.get_field(node, 0);
-        let val = ctx.get_field(node, 1);
-        entries.push(p64_make_entry(ctx, key, val)?);
-        cur = ctx.get_field(node, 5);
-    }
-    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, entries.len());
-    for (i, e) in entries.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
-    }
-    ctx.set_field(al, 0, Value::Object(Some(arr)));
-    ctx.set_field(al, 1, Value::Int(entries.len() as i32));
-    Ok(Some(Value::Object(Some(al))))
 }
 
 pub(crate) fn native_p64_lhm_reversed(

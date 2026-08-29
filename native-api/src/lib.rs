@@ -27,6 +27,7 @@ pub mod init_level;
 /// Can `new` legally produce an instance of this class? The JVMS 6.5
 /// predicate behind every fabricated-abstract-receiver fix, shared by the
 /// crate that MINTS such receivers and the one that REPORTS their class.
+pub mod array_store;
 pub mod instantiable;
 pub mod intrinsic;
 /// The layout-alias census — the one detector that sees every native object

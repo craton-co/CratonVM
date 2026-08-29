@@ -21024,6 +21024,17 @@ pub fn register_essential_natives_with_shims(
         "getTimeZone",
         "(Ljava/lang/String;)Ljava/util/TimeZone;",
         |ctx, args| {
+            // A null id is an NPE, and it is NOT the same thing as an unknown
+            // one: `TimeZone.getTimeZone("Not/AZone")` legitimately answers GMT
+            // (measured, and reproduced here), so substituting UTC for null made
+            // the fabricated answer indistinguishable from the documented one.
+            // MEASURED no-throw (apps/probes/LocaleDateTzShadowSweep 94).
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let id = match args.first() {
                 Some(Value::Object(Some(o))) => {
                     ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
@@ -30205,7 +30216,28 @@ pub(crate) const BUFFER_ADDRESS_SENTINEL: usize = 0x7fff_ffff_ffff_fffe;
 pub(crate) fn array_index_scale_for_name(name: &str) -> i32 {
     let bytes = name.as_bytes();
     if bytes.first() != Some(&b'[') {
-        return 1;
+        // A NON-ARRAY class answers 0, which is what
+        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
+        // callers guard on (`if (scale == 0) throw`). It answered the
+        // catch-all 1 until 2026-08-29 -- a plausible basis for address
+        // arithmetic over a class that has no elements, which in this family
+        // is the dangerous direction.
+        //
+        // The oracle cannot referee this row: HotSpot's own refusal names
+        // `java/lang/InvalidClassException`, which does not exist, so the
+        // throw fails to link and the caller gets a `NoClassDefFoundError`.
+        // Recorded in
+        // `unsafe-objectfieldoffset-accepted-a-static-and-the-jdk-refusal-that-is-itself-broken-20260826.md`,
+        // and a prior session declined to change the value because the blast
+        // radius was unmeasured.
+        //
+        // MEASURED 2026-08-29, whole 117-vector corpus, both modes: this
+        // function was ASKED 161 (compatible) / 175 (strict) times, in every
+        // one of the 117 vectors -- and NOT ONCE with a non-array class. The
+        // blast radius is zero and the arm is unreachable from the corpus, so
+        // taking the specified answer costs nothing and makes a
+        // `scale == 0` guard fire where it should.
+        return 0;
     }
     match bytes.get(1).copied() {
         Some(b'Z') | Some(b'B') => 1, // boolean, byte

@@ -1454,6 +1454,82 @@ pub mod arraycopy_message {
     pub fn type_mismatch(src_ty: &str, dest_ty: &str) -> String {
         format!("arraycopy: type mismatch: can not copy {src_ty}[] into {dest_ty}[]")
     }
+
+    /// An internal class name or descriptor as HotSpot's `external_name()`
+    /// prints it: `[Ljava/lang/String;` -> `java.lang.String[]`, `[I` ->
+    /// `int[]`, `java/lang/String` -> `java.lang.String`.
+    pub fn external_class_name(internal: &str) -> String {
+        let mut dims = 0usize;
+        let mut rest = internal;
+        while let Some(stripped) = rest.strip_prefix('[') {
+            dims += 1;
+            rest = stripped;
+        }
+        let base = if dims == 0 {
+            rest.replace('/', ".")
+        } else {
+            match rest.as_bytes().first() {
+                Some(b'L') => rest
+                    .trim_start_matches('L')
+                    .trim_end_matches(';')
+                    .replace('/', "."),
+                Some(b'Z') => "boolean".to_string(),
+                Some(b'B') => "byte".to_string(),
+                Some(b'C') => "char".to_string(),
+                Some(b'S') => "short".to_string(),
+                Some(b'I') => "int".to_string(),
+                Some(b'J') => "long".to_string(),
+                Some(b'F') => "float".to_string(),
+                Some(b'D') => "double".to_string(),
+                _ => rest.replace('/', "."),
+            }
+        };
+        format!("{base}{}", "[]".repeat(dims))
+    }
+
+    /// The PER-ELEMENT `ArrayStoreException` text: a reference copy whose
+    /// source holds an element the destination component type cannot accept.
+    ///
+    /// Distinct from [`type_mismatch`] above, which is the BULK rejection when
+    /// the two element KINDS differ and no element is ever examined.
+    ///
+    /// Both arguments are internal names: `src_array_component` is the source
+    /// array's component (`java/lang/Object` for an `Object[]`), and
+    /// `dst_component` is the destination array's component.
+    ///
+    /// # The two halves are rendered in different dialects, on purpose
+    ///
+    /// That is HotSpot's sentence, not an inconsistency to tidy up. The source
+    /// is the array's `external_name()`; the destination component is the
+    /// component Klass's own dotted NAME, which for an array class is a
+    /// descriptor. MEASURED on 25.0.4+7 (`probes/DodArrayStoreSweep`):
+    ///
+    /// ```text
+    /// ... elements of java.lang.Object[] ... destination array, java.lang.String
+    /// ... elements of java.lang.Object[] ... destination array, [Ljava.lang.Integer;
+    /// ... elements of java.lang.Object[] ... destination array, [I
+    /// ```
+    ///
+    /// # Why it lives here rather than beside its callers
+    ///
+    /// Three natives in two crates must print it identically —
+    /// `System.arraycopy` and `Arrays.copyOf(U[],int,Class)` in
+    /// `native-builtins`, and `ArrayList.toArray(T[])` in
+    /// `native-collections` — and `native-builtins` depends on
+    /// `native-collections`, so no home in either crate can serve all three.
+    /// It was private to `native-builtins` and that is precisely why the
+    /// `toArray` store check went unwritten for a day.
+    pub fn element_type_mismatch(src_array_component: &str, dst_component: &str) -> String {
+        let dst_rendered = if dst_component.starts_with('[') {
+            dst_component.replace('/', ".")
+        } else {
+            external_class_name(dst_component)
+        };
+        format!(
+            "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {dst_rendered}",
+            external_class_name(src_array_component),
+        )
+    }
 }
 
 impl RuntimeError {
@@ -2320,6 +2396,40 @@ mod tests {
         // Not "java.lang.String", not "Object" — HotSpot prints this literal
         // for every reference array, including an array of arrays.
         assert_eq!(name(crate::ArrayElementType::Reference), "object array");
+    }
+
+    #[test]
+    fn arraycopy_element_type_mismatch_matches_hotspot() {
+        use arraycopy_message::element_type_mismatch as msg;
+        // MEASURED on HotSpot 25.0.4+7, `probes/DodArrayStoreSweep`. The source
+        // half is an external name and the destination half is the component
+        // Klass's dotted NAME -- two dialects in one sentence, which is
+        // HotSpot's and not ours to normalise.
+        assert_eq!(
+            msg("java/lang/Object", "java/lang/String"),
+            "arraycopy: element type mismatch: can not cast one of the elements \
+             of java.lang.Object[] to the type of the destination array, java.lang.String"
+        );
+        assert_eq!(
+            msg("java/lang/Object", "[Ljava/lang/Integer;"),
+            "arraycopy: element type mismatch: can not cast one of the elements \
+             of java.lang.Object[] to the type of the destination array, [Ljava.lang.Integer;"
+        );
+        assert_eq!(
+            msg("java/lang/Object", "[I"),
+            "arraycopy: element type mismatch: can not cast one of the elements \
+             of java.lang.Object[] to the type of the destination array, [I"
+        );
+    }
+
+    #[test]
+    fn external_class_name_is_hotspots_external_name() {
+        use arraycopy_message::external_class_name as ext;
+        assert_eq!(ext("java/lang/String"), "java.lang.String");
+        assert_eq!(ext("[Ljava/lang/String;"), "java.lang.String[]");
+        assert_eq!(ext("[[Ljava/lang/String;"), "java.lang.String[][]");
+        assert_eq!(ext("[I"), "int[]");
+        assert_eq!(ext("[[D"), "double[][]");
     }
 
     #[test]

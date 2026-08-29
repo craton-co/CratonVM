@@ -37,11 +37,30 @@ use cuda_bridge::{DeviceContext, DeviceModule, KernelArgs, LaunchConfig};
 /// cheaply detect.
 const GEMM_PTX: &str = include_str!("gemm.ptx");
 
-/// Tile edge, and therefore the block dimension. Must match `TILE` in
-/// `gemm.cu` — the kernel indexes its shared tile by `threadIdx`, so a
-/// launch with a different block shape reads the wrong elements rather
-/// than failing.
-pub const TILE: u32 = 16;
+/// Rows of `C` one thread block computes. Must match `BM` in `gemm.cu`.
+pub const BM: u32 = 64;
+
+/// Columns of `C` one thread block computes. Must match `BN` in `gemm.cu`.
+pub const BN: u32 = 64;
+
+/// Rows of `C` one *thread* computes. Must match `TM` in `gemm.cu`.
+pub const TM: u32 = 4;
+
+/// Columns of `C` one *thread* computes. Must match `TN` in `gemm.cu`.
+pub const TN: u32 = 4;
+
+/// Threads per block along x and y: `(BN/TN, BM/TM)`, i.e. 16 x 16 = 256.
+///
+/// Note that the block *dimension* and the block *tile* are no longer the
+/// same number, which they were before register blocking. A block is 16x16
+/// threads and computes a 64x64 patch of `C`, because each thread owns a
+/// `TM x TN` sub-block. Sizing the grid by the thread count instead of the
+/// tile — the obvious mistake, and the one the old code's shape made easy
+/// — launches 16 times too many blocks and lets them write over each
+/// other.
+pub const BLOCK_X: u32 = BN / TN;
+/// See [`BLOCK_X`].
+pub const BLOCK_Y: u32 = BM / TM;
 
 /// Entry points the module is loaded with.
 const ENTRY_POINTS: [&str; 4] = [
@@ -86,18 +105,23 @@ pub fn load(ctx: &DeviceContext) -> cuda_bridge::Result<DeviceModule> {
 
 /// Launch configuration for a GEMM producing an `m x n` result.
 ///
-/// One thread per output element, `TILE x TILE` per block, so the grid is
-/// the output shape rounded up. Note the axis assignment: `x` indexes
-/// columns and `y` rows, matching the kernel's
-/// `row = blockIdx.y * TILE + ty`. Transposing this is the kind of
-/// mistake that produces a correct-looking result on a square matrix and
-/// garbage on any other.
+/// Grid sized by the BLOCK TILE, block sized by the THREAD COUNT.
+///
+/// Each block computes a `BM x BN` patch of `C` using `BLOCK_Y x BLOCK_X`
+/// threads, so the grid is the output rounded up to the patch and the
+/// block is the thread count — two different numbers since register
+/// blocking landed. Dividing the grid by the thread count instead would
+/// launch 16x too many blocks, all writing over each other.
+///
+/// Note the axis assignment: `x` indexes columns and `y` rows, matching
+/// the kernel's `row0 = blockIdx.y * BM`. Transposing this produces a
+/// correct-looking result on a square matrix and garbage on any other.
 pub fn gemm_launch_config(m: i32, n: i32) -> LaunchConfig {
-    let gx = (n.max(0) as u32).div_ceil(TILE).max(1);
-    let gy = (m.max(0) as u32).div_ceil(TILE).max(1);
+    let gx = (n.max(0) as u32).div_ceil(BN).max(1);
+    let gy = (m.max(0) as u32).div_ceil(BM).max(1);
     LaunchConfig {
         grid: (gx, gy, 1),
-        block: (TILE, TILE, 1),
+        block: (BLOCK_X, BLOCK_Y, 1),
         shared_bytes: 0,
     }
 }
@@ -287,25 +311,62 @@ mod tests {
         );
     }
 
-    /// The block shape the host launches with must match the tile the
-    /// kernel indexes by. A mismatch does not fail: it reads the wrong
-    /// shared-memory elements and returns a plausible wrong answer.
+    /// Every tiling constant must match the CUDA source.
+    ///
+    /// A mismatch does not fail loudly: the kernel indexes its shared tile
+    /// and its accumulators by `threadIdx` against these numbers, so a
+    /// launch built from different ones reads the wrong elements and
+    /// returns a plausible wrong answer. There are four of them now rather
+    /// than one, and they interact — `BLOCK_X` is `BN/TN` — so checking
+    /// them individually is the only way to localise a drift.
     #[test]
-    fn tile_matches_the_cuda_source() {
+    fn tiling_constants_match_the_cuda_source() {
         let cu = include_str!("gemm.cu");
-        let line = cu
-            .lines()
-            .find(|l| l.starts_with("#define TILE "))
-            .expect("gemm.cu must #define TILE");
-        let declared: u32 = line
-            .trim_start_matches("#define TILE ")
-            .trim()
-            .parse()
-            .expect("TILE must be an integer");
-        assert_eq!(
-            declared, TILE,
-            "gemm.cu's TILE and this module's TILE disagree; the launch \
-             block shape would not match the kernel's shared tile"
+        let define = |name: &str| -> u32 {
+            let prefix = format!("#define {name} ");
+            cu.lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("gemm.cu must #define {name}"))
+                .trim_start_matches(&prefix)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be an integer"))
+        };
+
+        assert_eq!(define("BM"), BM, "block tile rows disagree");
+        assert_eq!(define("BN"), BN, "block tile columns disagree");
+        assert_eq!(define("TM"), TM, "thread tile rows disagree");
+        assert_eq!(define("TN"), TN, "thread tile columns disagree");
+    }
+
+    /// The derived thread counts must stay consistent with the tiles.
+    #[test]
+    fn block_dimensions_follow_from_the_tiles() {
+        assert_eq!(BLOCK_X, BN / TN);
+        assert_eq!(BLOCK_Y, BM / TM);
+        // 256 threads: one warp per 32 of them, and a round number of
+        // warps is what keeps the cooperative loads uniform.
+        assert_eq!(BLOCK_X * BLOCK_Y, 256);
+        assert_eq!((BLOCK_X * BLOCK_Y) % 32, 0, "block must be whole warps");
+    }
+
+    /// The cooperative loads assume the tile divides evenly by the thread
+    /// count, so every thread does the same number of iterations.
+    #[test]
+    fn cooperative_loads_divide_evenly() {
+        let threads = BLOCK_X * BLOCK_Y;
+        assert_eq!((BM * 16) % threads, 0, "A tile must divide by the thread count");
+        assert_eq!((16 * BN) % threads, 0, "B tile must divide by the thread count");
+    }
+
+    /// Shared memory must fit. `BK*(BM+BN)` floats, and 48 KB is the
+    /// per-block default on every architecture this targets.
+    #[test]
+    fn shared_memory_fits_a_block() {
+        let bytes = 16 * (BM + BN) * 4;
+        assert!(
+            bytes <= 48 * 1024,
+            "shared tile is {bytes} bytes, past the 48 KB per-block default"
         );
     }
 
@@ -354,14 +415,14 @@ mod tests {
 
     #[test]
     fn grid_covers_every_output_element() {
-        // Exactly one tile.
-        let cfg = gemm_launch_config(16, 16);
+        // Exactly one block tile.
+        let cfg = gemm_launch_config(64, 64);
         assert_eq!(cfg.grid, (1, 1, 1));
-        assert_eq!(cfg.block, (TILE, TILE, 1));
+        assert_eq!(cfg.block, (BLOCK_X, BLOCK_Y, 1));
 
         // One past a tile boundary in each direction rounds up.
-        let cfg = gemm_launch_config(17, 33);
-        assert_eq!(cfg.grid, (3, 2, 1), "grid is (ceil(N/16), ceil(M/16), 1)");
+        let cfg = gemm_launch_config(65, 129);
+        assert_eq!(cfg.grid, (3, 2, 1), "grid is (ceil(N/BN), ceil(M/BM), 1)");
 
         // A degenerate shape still launches at least one block rather
         // than zero, which the driver rejects.
@@ -369,11 +430,22 @@ mod tests {
         assert_eq!(cfg.grid, (1, 1, 1));
     }
 
+    /// The grid divides by the block TILE, not by the thread count.
+    ///
+    /// These are 64 and 16 respectively, so confusing them launches four
+    /// times the blocks in each dimension — sixteen times too many, every
+    /// one writing over its neighbours' output.
+    #[test]
+    fn grid_is_sized_by_the_tile_not_the_thread_count() {
+        let cfg = gemm_launch_config(256, 256);
+        assert_eq!(cfg.grid, (4, 4, 1), "256/BN = 4, not 256/BLOCK_X = 16");
+    }
+
     #[test]
     fn grid_axes_are_not_transposed() {
         // Deliberately non-square: transposing the axes is invisible on a
         // square shape and wrong everywhere else.
-        let cfg = gemm_launch_config(/* m */ 64, /* n */ 16);
+        let cfg = gemm_launch_config(/* m */ 256, /* n */ 64);
         assert_eq!(
             cfg.grid,
             (1, 4, 1),

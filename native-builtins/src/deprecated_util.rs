@@ -2042,6 +2042,22 @@ fn native_locale_get_iso3_language(
             _ => String::new(),
         }
     };
+    // THIRD FALLBACK, and the one that covers `Locale.of(..)`. A real `Locale`
+    // keeps its language in `baseLocale.language`, and fills neither the side
+    // table (which `locale_alloc` and the `<init>` natives write) nor the
+    // synthetic slot 0 -- so `Locale.of("en","US").getISO3Language()` answered
+    // `""` against HotSpot's `"eng"` (apps/probes/LocaleDateTzShadowSweep 10). Ask
+    // our own `getLanguage()`, which is registered and already right for every
+    // shape, rather than adding a third copy of the lookup: the `iso2_to_iso3`
+    // table below was complete all along and simply never got a code to map.
+    let lang2 = if lang2.is_empty() {
+        match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        lang2
+    };
     let iso3 = iso2_to_iso3(&lang2);
     let result = if iso3.is_empty() { &lang2 } else { iso3 };
     let s = ctx.create_string(result);
