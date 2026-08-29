@@ -185,6 +185,15 @@ pub struct OffloadCache {
     /// reference to every event, so a submission still waiting on one
     /// never has it re-recorded under it.
     chunk_events: RwLock<Vec<std::sync::Arc<cuda_bridge::Event>>>,
+    /// The built-in kernel module (GEMM and the fp16 converters), loaded
+    /// once per device on first use.
+    ///
+    /// Lazily rather than at construction: most programs never call a
+    /// built-in, and loading PTX costs a driver JIT of every kernel in
+    /// the module. `None` means "not yet attempted"; a load failure is
+    /// reported to the caller and retried next time, since the usual
+    /// cause is a transient out-of-memory rather than bad PTX.
+    builtin_module: RwLock<Option<Arc<cuda_bridge::DeviceModule>>>,
     chunk_stage_i32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i32>>>>,
     chunk_stage_i64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i64>>>>,
     chunk_stage_f32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f32>>>>,
@@ -258,6 +267,7 @@ impl OffloadCache {
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
             chunk_streams: RwLock::new(Vec::new()),
             chunk_events: RwLock::new(Vec::new()),
+            builtin_module: RwLock::new(None),
             chunk_stage_i32: RwLock::new(None),
             chunk_stage_i64: RwLock::new(None),
             chunk_stage_f32: RwLock::new(None),
@@ -277,6 +287,33 @@ impl OffloadCache {
     /// that as a silent fall-through.
     pub fn device(&self) -> Option<&DeviceContext> {
         self.ctx.as_ref()
+    }
+
+    /// The built-in kernel module for this device, loading it on first
+    /// call.
+    ///
+    /// See [`crate::runtime::kernels`] for what is in it and why those
+    /// kernels are not lowered from bytecode.
+    pub fn builtin_module(&self) -> Result<Arc<cuda_bridge::DeviceModule>, String> {
+        if let Some(m) = self.builtin_module.read().as_ref() {
+            return Ok(Arc::clone(m));
+        }
+        let ctx = self
+            .device()
+            .ok_or_else(|| "no CUDA device available for the built-in kernels".to_string())?;
+
+        let mut slot = self.builtin_module.write();
+        // Another thread may have loaded it while we waited for the write
+        // lock; loading twice would be correct but would JIT the module a
+        // second time for nothing.
+        if let Some(m) = slot.as_ref() {
+            return Ok(Arc::clone(m));
+        }
+        let module = crate::runtime::kernels::load(ctx)
+            .map_err(|e| format!("loading the built-in kernel module: {e}"))?;
+        let module = Arc::new(module);
+        *slot = Some(Arc::clone(&module));
+        Ok(module)
     }
 
     /// Look up a method. On first hit for an eligible method we
@@ -1135,7 +1172,7 @@ mod tests {
             event: None,
             status: parking_lot::Mutex::new(SubmissionStatus::Failed {
                 message: "test: dispatch-time failure".to_string(),
-                    kind: GpuErrorKind::Unknown,
+                kind: GpuErrorKind::Unknown,
             }),
             finalize: parking_lot::Mutex::new(None),
             device_done: std::sync::atomic::AtomicBool::new(false),
@@ -1587,10 +1624,7 @@ pub enum SubmissionStatus {
     /// `kind` — recorded here, at the point of failure, rather than
     /// reconstructed on the Java side by matching substrings against
     /// the driver's wording.
-    Failed {
-        message: String,
-        kind: GpuErrorKind,
-    },
+    Failed { message: String, kind: GpuErrorKind },
 }
 
 /// Async kernel submission handle.
@@ -1789,11 +1823,7 @@ impl OffloadCache {
     ) -> Vec<std::sync::Arc<cuda_bridge::Event>> {
         {
             let held = self.chunk_events.read();
-            if held.len() >= want
-                && held
-                    .iter()
-                    .all(|e| std::sync::Arc::strong_count(e) == 1)
-            {
+            if held.len() >= want && held.iter().all(|e| std::sync::Arc::strong_count(e) == 1) {
                 return held[..want].to_vec();
             }
         }
@@ -1823,6 +1853,33 @@ impl OffloadCache {
     /// caller reads as "do not chunk" and falls back to the single
     /// whole-array launch.
     #[cfg(feature = "gpu-offload")]
+    /// A stream the built-in kernels launch on, created once and reused.
+    ///
+    /// Built-ins are not on a caller-named `GpuStream`: nothing in the
+    /// Java API lets a caller place a `GpuBlas.gemm` on a particular
+    /// stream yet. Reusing one is what makes consecutive GEMMs ordered
+    /// with respect to each other, which is what a caller chaining
+    /// projections actually wants, and it avoids a `cuStreamCreate` per
+    /// call.
+    ///
+    /// Borrows the chunked-writeback pool's first stream rather than
+    /// adding another: that pool already exists per device, is created
+    /// lazily, and a built-in launch and a chunked writeback never
+    /// contend for ordering (a chunked writeback belongs to one
+    /// bytecode dispatch, which has already been given its own stream).
+    fn default_internal_stream(&self) -> Result<std::sync::Arc<Stream>, cuda_bridge::DeviceError> {
+        let ctx = self
+            .device()
+            .ok_or(cuda_bridge::DeviceError::NoDriver)?;
+        if let Some(s) = self.chunk_stream_pool(ctx).first() {
+            return Ok(std::sync::Arc::clone(s));
+        }
+        // The pool declines to build itself when stream creation fails;
+        // try once directly so the caller gets the driver's own error
+        // rather than a bare "no streams".
+        Stream::new(ctx).map(std::sync::Arc::new)
+    }
+
     fn chunk_stream_pool(&self, ctx: &cuda_bridge::DeviceContext) -> Vec<std::sync::Arc<Stream>> {
         {
             let have = self.chunk_streams.read();
@@ -1840,8 +1897,10 @@ impl OffloadCache {
             match Stream::new(ctx) {
                 Ok(s) => made.push(std::sync::Arc::new(s)),
                 Err(e) => {
-                    tracing::debug!("gpu offload: chunk stream pool unavailable ({e}); \
-                                     falling back to the whole-array writeback");
+                    tracing::debug!(
+                        "gpu offload: chunk stream pool unavailable ({e}); \
+                                     falling back to the whole-array writeback"
+                    );
                     return Vec::new();
                 }
             }
@@ -2077,7 +2136,14 @@ impl OffloadCache {
                     // Cast: `work` is a JVM array length, so it fits usize.
                     let events = self.chunk_event_pool(ctx, chunk_count_wanted());
                     match launch_chunked(
-                        self, &events, ctx, &kernel, &args, work as usize, &pool, plain,
+                        self,
+                        &events,
+                        ctx,
+                        &kernel,
+                        &args,
+                        work as usize,
+                        &pool,
+                        plain,
                     ) {
                         Ok(wb) => {
                             // Give the submission a completion event that
@@ -2119,7 +2185,7 @@ impl OffloadCache {
                             // writeback and returning stale Java state.
                             return make(SubmissionStatus::Failed {
                                 message: format!("chunked dispatch failed: {msg}"),
-                    kind: GpuErrorKind::Launch,
+                                kind: GpuErrorKind::Launch,
                             });
                         }
                     }
@@ -2165,7 +2231,7 @@ impl OffloadCache {
         if let Err(e) = stream.record_event(&event) {
             return make(SubmissionStatus::Failed {
                 message: format!("Stream::record_event: {e}"),
-                    kind: kind_of_device_error(&e),
+                kind: kind_of_device_error(&e),
             });
         }
 
@@ -2288,6 +2354,354 @@ fn submissions(
 /// handle. The caller (typically the Java glue right after
 /// `dispatch_async`) keeps the handle and hands it back when the Java
 /// side polls for completion.
+/// Dispatch a built-in GEMM: `C[MxN] = A[MxK] * B[KxN]`, row-major.
+///
+/// `a_handle`, `b_handle` and `c_handle` are `craton.gpu.GpuArray`
+/// handles. Their device buffers come from the same `device_cache` the
+/// bytecode dispatch path uses, so a weight matrix uploaded for one call
+/// is still resident for the next — which is the whole point of taking
+/// handles rather than Java arrays here. A decode step multiplies by the
+/// same weights every token; re-uploading them would cost more than the
+/// arithmetic.
+///
+/// Returns a submission handle with the same lifecycle as any other:
+/// await it with `Native.futureSynchronize`, release it with
+/// `Native.releaseFuture`. `C`'s contents land back in its `GpuArray` on
+/// finalization.
+///
+/// `trans_a` / `trans_b` read the corresponding operand transposed. This
+/// is expressed as strides rather than as separate kernels — see
+/// [`crate::runtime::kernels::Strides`] — so the operand's element count
+/// is unchanged and only its indexing differs.
+///
+/// `stream_handle` places the launch on a Java-visible `GpuStream`,
+/// making it ordered with respect to everything else on that stream.
+/// `None` uses the shared built-in stream, which orders built-ins against
+/// each other and nothing else.
+///
+/// Errors are reported as a `Failed` submission rather than a panic, so
+/// the Java side sees a `GpuException` carrying the reason.
+#[cfg(feature = "gpu-offload")]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gemm(
+    shared: &crate::vm::SharedVm,
+    kind: crate::runtime::kernels::GemmKind,
+    a_handle: u64,
+    b_handle: u64,
+    c_handle: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    trans_a: bool,
+    trans_b: bool,
+    stream_handle: Option<u64>,
+) -> u64 {
+    use crate::runtime::kernels;
+
+    let cache = shared
+        .offload_registry
+        .get_or_create(shared.config.gpu_device_ordinal, &shared.config);
+
+    // Shape first: an out-of-range shape becomes an out-of-bounds global
+    // read on the device, which is either silent garbage or a fault
+    // attributed to some later launch.
+    let (a_elems, b_elems, c_elems) = match kernels::gemm_shape(m, n, k) {
+        Ok(t) => t,
+        Err(e) => return record_failed_submission(None, GpuErrorKind::Compile, e),
+    };
+
+    let ctx = match cache.device() {
+        Some(c) => c,
+        None => {
+            return record_failed_submission(
+                None,
+                GpuErrorKind::Launch,
+                "gemm: no CUDA device available".to_string(),
+            )
+        }
+    };
+
+    let module = match cache.builtin_module() {
+        Ok(m) => m,
+        Err(e) => return record_failed_submission(None, GpuErrorKind::Compile, e),
+    };
+
+    let stream = match stream_handle {
+        // A caller-named stream. An unknown handle is an error rather than
+        // a silent fallback to the default: the whole reason to name a
+        // stream is ordering, and quietly running somewhere else would
+        // produce a race the caller specifically asked to avoid.
+        Some(h) => match cache.resolve_stream(h) {
+            Some(s) => s,
+            None => {
+                return record_failed_submission(
+                    None,
+                    GpuErrorKind::Launch,
+                    format!("gemm: unknown or released stream handle {h}"),
+                )
+            }
+        },
+        None => match cache.default_internal_stream() {
+            Ok(s) => s,
+            Err(e) => {
+                return record_failed_submission(None, kind_of_device_error(&e), e.to_string())
+            }
+        },
+    };
+
+    // C is always f32 and always written, so it is resolved (and, on a
+    // cache miss, uploaded) the same way an output array is on the
+    // bytecode path.
+    let c_buf = match resident_f32(ctx, c_handle, c_elems, "C") {
+        Ok(b) => b,
+        Err(e) => return record_failed_submission(Some(stream), kind_of_device_message(&e), e),
+    };
+
+    let launch = kernels::gemm_launch_config(m, n);
+
+    // `Strides::of` wants the operand's column count AS STORED, which is
+    // not the logical one when the operand is transposed:
+    //
+    //   A is logically MxK. Untransposed it is stored MxK, so stored
+    //   cols = K. Transposed, the logical MxK is a view of a stored KxM,
+    //   so stored cols = M.
+    //
+    //   B is logically KxN. Untransposed, stored KxN, cols = N.
+    //   Transposed, it is a view of a stored NxK, so cols = K.
+    //
+    // Passing the logical width instead is the classic version of this
+    // bug: it agrees with the correct answer on a square operand and
+    // indexes into the wrong element on every other shape.
+    let a_strides = kernels::Strides::of(trans_a, if trans_a { m } else { k });
+    let b_strides = kernels::Strides::of(trans_b, if trans_b { k } else { n });
+
+    let args = match kind {
+        kernels::GemmKind::F32 => {
+            let a = match resident_f32(ctx, a_handle, a_elems, "A") {
+                Ok(b) => b,
+                Err(e) => {
+                    return record_failed_submission(
+                        Some(stream),
+                        kind_of_device_message(&e),
+                        e,
+                    )
+                }
+            };
+            let b = match resident_f32(ctx, b_handle, b_elems, "B") {
+                Ok(b) => b,
+                Err(e) => {
+                    return record_failed_submission(
+                        Some(stream),
+                        kind_of_device_message(&e),
+                        e,
+                    )
+                }
+            };
+            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
+            // The Arcs must outlive the launch; the writeback below holds
+            // one for C, and these two keep A and B alive across it.
+            let _keep = (a, b);
+            args
+        }
+        kernels::GemmKind::F16 => {
+            let a = match resident_i16(ctx, a_handle, a_elems, "A") {
+                Ok(b) => b,
+                Err(e) => {
+                    return record_failed_submission(
+                        Some(stream),
+                        kind_of_device_message(&e),
+                        e,
+                    )
+                }
+            };
+            let b = match resident_i16(ctx, b_handle, b_elems, "B") {
+                Ok(b) => b,
+                Err(e) => {
+                    return record_failed_submission(
+                        Some(stream),
+                        kind_of_device_message(&e),
+                        e,
+                    )
+                }
+            };
+            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
+            let _keep = (a, b);
+            args
+        }
+    };
+
+    if let Err(e) = module.launch_on_stream(ctx, kind.entry_name(), &launch, args, &stream) {
+        return record_failed_submission(
+            Some(stream),
+            kind_of_device_error(&e),
+            format!("gemm: launch_on_stream({}): {e}", kind.entry_name()),
+        );
+    }
+
+    let event = match cuda_bridge::Event::new(ctx) {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(e) => {
+            return record_failed_submission(
+                Some(stream),
+                kind_of_device_error(&e),
+                format!("gemm: Event::new after launch: {e}"),
+            )
+        }
+    };
+    if let Err(e) = stream.record_event(&event) {
+        return record_failed_submission(
+            Some(stream),
+            kind_of_device_error(&e),
+            format!("gemm: Stream::record_event: {e}"),
+        );
+    }
+
+    // One writeback: C back into its GpuArray's host bytes. A and B are
+    // inputs and stay device-resident.
+    let writebacks = vec![MarshalWriteback::ResidentF32 {
+        handle: c_handle,
+        buf: c_buf,
+        len: c_elems,
+    }];
+    // The same guard every other dispatch site takes: it keeps the
+    // collector off the marshalled arrays until the writeback has drained.
+    // `Heap::enter_gpu_critical` returns a token borrowed from the heap,
+    // which cannot be stored in a submission that outlives this frame.
+    let gc_guard = GcCriticalGuard::acquire();
+
+    let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let submission = std::sync::Arc::new(StreamSubmission {
+        handle,
+        stream: Some(stream),
+        event: Some(event),
+        status: parking_lot::Mutex::new(SubmissionStatus::Running),
+        finalize: parking_lot::Mutex::new(Some(FinalizeState {
+            writebacks,
+            _gc_critical: gc_guard,
+        })),
+        device_done: std::sync::atomic::AtomicBool::new(false),
+    });
+    register_submission(submission);
+    handle
+}
+
+/// Resolve a `GpuArray` handle to a device-resident `f32` buffer,
+/// uploading its host bytes on a cache miss.
+#[cfg(feature = "gpu-offload")]
+fn resident_f32(
+    ctx: &DeviceContext,
+    handle: u64,
+    elems: usize,
+    role: &str,
+) -> Result<std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, String> {
+    if let Some(arc) = device_cache::get_f32(handle) {
+        if arc.len() < elems {
+            return Err(format!(
+                "gemm: {role} (handle {handle}) holds {} f32 elements, the shape needs {elems}",
+                arc.len()
+            ));
+        }
+        return Ok(arc);
+    }
+    let (ty, count, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)
+        .ok_or_else(|| format!("gemm: {role} (handle {handle}) is not a live GpuArray"))?;
+    if ty != cratonvm_types::ArrayElementType::Float {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) is a {ty:?} array; this kernel needs float"
+        ));
+    }
+    if count < elems {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) has {count} elements, the shape needs {elems}"
+        ));
+    }
+    // Check the bytes, not just the reported count. `array_snapshot` reports
+    // a length for every element type but only fills `bytes` for the ones it
+    // knows, so an unhandled type arrives as "N elements, zero bytes" — which
+    // uploads as an empty device buffer and is then read off the end by the
+    // kernel. Failing here turns that into a message rather than a
+    // CUDA_ERROR_ILLEGAL_ADDRESS attributed to some later, unrelated call.
+    if bytes.len() < elems * 4 {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) reports {count} elements but carries only {} \
+             bytes; the shape needs {elems} ({} bytes). Does the VM snapshot {ty:?} arrays?",
+            bytes.len(),
+            elems * 4
+        ));
+    }
+    // `pod_collect_to_vec`, not `cast_slice`: the snapshot is a `Vec<u8>`,
+    // whose allocation carries alignment 1, and reinterpreting it as `&[f32]`
+    // requires 4. `cast_slice` panics when the allocator happened not to
+    // oblige — which it does often enough to look like it works. This copies
+    // instead, which the upload was going to do anyway.
+    let host: Vec<f32> = bytemuck::pod_collect_to_vec(&bytes);
+    let buf = crate::runtime::gpu_marshal::upload(ctx, &host)
+        .map_err(|e| format!("gemm: uploading {role} (len={count}): {e}"))?;
+    let arc = std::sync::Arc::new(buf);
+    device_cache::put_f32(handle, arc.clone());
+    Ok(arc)
+}
+
+/// Resolve a `GpuArray` handle to a device-resident 16-bit buffer.
+///
+/// The elements are IEEE-754 binary16 bit patterns carried in a Java
+/// `short[]`, because Java has no half type. Nothing here interprets
+/// them; the kernel reads the same bytes as `__half`.
+#[cfg(feature = "gpu-offload")]
+fn resident_i16(
+    ctx: &DeviceContext,
+    handle: u64,
+    elems: usize,
+    role: &str,
+) -> Result<std::sync::Arc<cuda_bridge::DeviceBuffer<i16>>, String> {
+    if let Some(arc) = device_cache::get_i16(handle) {
+        if arc.len() < elems {
+            return Err(format!(
+                "gemm: {role} (handle {handle}) holds {} f16 elements, the shape needs {elems}",
+                arc.len()
+            ));
+        }
+        return Ok(arc);
+    }
+    let (ty, count, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)
+        .ok_or_else(|| format!("gemm: {role} (handle {handle}) is not a live GpuArray"))?;
+    if ty != cratonvm_types::ArrayElementType::Short {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) is a {ty:?} array; an f16 kernel needs short \
+             (binary16 bit patterns)"
+        ));
+    }
+    if count < elems {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) has {count} elements, the shape needs {elems}"
+        ));
+    }
+    // Check the bytes, not just the reported count. `array_snapshot` reports
+    // a length for every element type but only fills `bytes` for the ones it
+    // knows, so an unhandled type arrives as "N elements, zero bytes" — which
+    // uploads as an empty device buffer and is then read off the end by the
+    // kernel. Failing here turns that into a message rather than a
+    // CUDA_ERROR_ILLEGAL_ADDRESS attributed to some later, unrelated call.
+    if bytes.len() < elems * 2 {
+        return Err(format!(
+            "gemm: {role} (handle {handle}) reports {count} elements but carries only {} \
+             bytes; the shape needs {elems} ({} bytes). Does the VM snapshot {ty:?} arrays?",
+            bytes.len(),
+            elems * 2
+        ));
+    }
+    // Alignment-safe, for the reason spelled out in `resident_f32`. This is
+    // the path that actually panicked on an RTX 2060 —
+    // `TargetAlignmentGreaterAndInputNotAligned` out of `cast_slice` — so
+    // the hazard is not theoretical.
+    let host: Vec<i16> = bytemuck::pod_collect_to_vec(&bytes);
+    let buf = crate::runtime::gpu_marshal::upload(ctx, &host)
+        .map_err(|e| format!("gemm: uploading {role} (len={count}): {e}"))?;
+    let arc = std::sync::Arc::new(buf);
+    device_cache::put_i16(handle, arc.clone());
+    Ok(arc)
+}
+
 /// Live-submission count past which [`register_submission`] starts
 /// warning.
 ///
@@ -2803,7 +3217,8 @@ pub fn dispatch_method_from_native_on_stream(
             return record_failed_submission(
                 None,
                 GpuErrorKind::Compile,
-                format!("submitMethod: load class failed for {class_name}: {e:?}"),);
+                format!("submitMethod: load class failed for {class_name}: {e:?}"),
+            );
         }
         let cm = shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
@@ -2811,10 +3226,11 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: class not loaded after load_class_concurrent: {class_name}"
-                    ),);
+                    ),
+                );
             }
         };
         let class = match cm.get_class(class_id) {
@@ -2822,8 +3238,9 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
-                    format!("submitMethod: class id missing in manager: {class_name}"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: class id missing in manager: {class_name}"),
+                );
             }
         };
         let mi = match class
@@ -2835,10 +3252,11 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method not found: {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         };
         let is_static_local = class.methods[mi as usize].is_static();
@@ -2871,25 +3289,27 @@ pub fn dispatch_method_from_native_on_stream(
                     else {
                         return record_failed_submission(
                             None,
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} is not a FieldReference \
                                  entry in {class_name}'s constant pool — analyzer / class \
                                  mismatch",
                                 names.len(),
-                            ),);
+                            ),
+                        );
                     };
                     let Some((nm, _desc)) =
                         class.constant_pool.get_name_and_type(*name_and_type_index)
                     else {
                         return record_failed_submission(
                             None,
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field_cps[{}]=#{cp} has no resolvable \
                                  NameAndType",
                                 names.len(),
-                            ),);
+                            ),
+                        );
                     };
                     names.push(nm.to_string());
                 }
@@ -2914,10 +3334,11 @@ pub fn dispatch_method_from_native_on_stream(
             LookupOutcome::Blacklisted => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: method blacklisted: {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         }
     };
@@ -2974,11 +3395,12 @@ pub fn dispatch_method_from_native_on_stream(
             None => {
                 return record_failed_submission(
                     None,
-                GpuErrorKind::Launch,
+                    GpuErrorKind::Launch,
                     format!(
                         "submitMethod: unknown or released stream handle {h} \
                          ({class_name}.{method_name}{descriptor})",
-                    ),);
+                    ),
+                );
             }
         },
         None => match CudaStream::new(ctx) {
@@ -3056,20 +3478,22 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static receiver is not an object reference: {other:?}",
-                    ),);
+                    ),
+                );
             }
             None => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: non-static method called with no arguments \
                          (expected receiver as arg 0): {class_name}.{method_name}{descriptor}",
-                    ),);
+                    ),
+                );
             }
         };
 
@@ -3100,11 +3524,12 @@ pub fn dispatch_method_from_native_on_stream(
                         drop(token);
                         return record_failed_submission(
                             Some(stream.clone()),
-                GpuErrorKind::Compile,
+                            GpuErrorKind::Compile,
                             format!(
                                 "submitMethod: this_field `{field_name}` not found on receiver's \
                                  class hierarchy (receiver class_id={receiver_class_id:?})",
-                            ),);
+                            ),
+                        );
                     }
                 }
             };
@@ -3124,22 +3549,24 @@ pub fn dispatch_method_from_native_on_stream(
                     drop(token);
                     return record_failed_submission(
                         Some(stream.clone()),
-                GpuErrorKind::Compile,
+                        GpuErrorKind::Compile,
                         format!(
                             "submitMethod: this_field `{field_name}` (pthis_{i}) is not an \
                              object reference: {other:?}",
-                        ),);
+                        ),
+                    );
                 }
             };
             let Some(etype) = shared.mem.heap.array_element_type(field_obj) else {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
+                    GpuErrorKind::Compile,
                     format!(
                         "submitMethod: this_field `{field_name}` (pthis_{i}) does not point at a \
                          primitive array",
-                    ),);
+                    ),
+                );
             };
             // Phase 10 #2 — `pthis_*` (receiver-field) params are not
             // represented in `KernelSignature::param_kinds` (the
@@ -3212,10 +3639,10 @@ pub fn dispatch_method_from_native_on_stream(
                         Err(msg) => {
                             drop(token);
                             return record_failed_submission(
-                        Some(stream.clone()),
-                        kind_of_device_message(&msg),
-                        msg,
-                    );
+                                Some(stream.clone()),
+                                kind_of_device_message(&msg),
+                                msg,
+                            );
                         }
                     }
                     continue;
@@ -3243,10 +3670,10 @@ pub fn dispatch_method_from_native_on_stream(
                         Err(msg) => {
                             drop(token);
                             return record_failed_submission(
-                        Some(stream.clone()),
-                        kind_of_device_message(&msg),
-                        msg,
-                    );
+                                Some(stream.clone()),
+                                kind_of_device_message(&msg),
+                                msg,
+                            );
                         }
                     }
                     continue;
@@ -3274,15 +3701,17 @@ pub fn dispatch_method_from_native_on_stream(
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
-                    format!("submitMethod: arg #{i} is null"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} is null"),
+                );
             }
             _ => {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
-                GpuErrorKind::Compile,
-                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),);
+                    GpuErrorKind::Compile,
+                    format!("submitMethod: arg #{i} type unsupported: {arg:?}"),
+                );
             }
         }
     }
@@ -3388,7 +3817,8 @@ pub fn dispatch_method_from_native_on_stream(
             return record_failed_submission(
                 Some(stream.clone()),
                 GpuErrorKind::Compile,
-                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),);
+                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),
+            );
         }
     };
     {
@@ -3625,11 +4055,7 @@ pub fn finalize_submission(
             .iter()
             .filter(is_chunk)
             .chain(writebacks.iter().filter(is_flag))
-            .chain(
-                writebacks
-                    .iter()
-                    .filter(|wb| !is_chunk(wb) && !is_flag(wb)),
-            )
+            .chain(writebacks.iter().filter(|wb| !is_chunk(wb) && !is_flag(wb)))
         {
             match wb.writeback(shared, &local_token) {
                 Ok(Some(result)) => scalar_result = Some(result),
@@ -3802,7 +4228,7 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
                 if matches!(&*status, SubmissionStatus::Running) {
                     *status = SubmissionStatus::Failed {
                         message: format!("event.query: {e}"),
-                    kind: kind_of_device_error(&e),
+                        kind: kind_of_device_error(&e),
                     };
                 }
             }
@@ -3861,11 +4287,7 @@ const AWAIT_SPINS: u32 = 64;
 /// A zero or negative `timeout_nanos` is a pure poll: the status is
 /// checked once and the answer returned without sleeping.
 #[cfg(feature = "gpu-offload")]
-pub fn await_submission(
-    shared: &crate::vm::SharedVm,
-    handle: u64,
-    timeout_nanos: u64,
-) -> i32 {
+pub fn await_submission(shared: &crate::vm::SharedVm, handle: u64, timeout_nanos: u64) -> i32 {
     use cratonvm_native_api::registry::{GPU_AWAIT_COMPLETED, GPU_AWAIT_TIMED_OUT};
 
     let deadline = std::time::Instant::now()
@@ -3880,9 +4302,7 @@ pub fn await_submission(
             // An unknown handle is terminal in the only sense that
             // matters here: no further waiting can change the answer.
             None => return GPU_AWAIT_COMPLETED,
-            Some(PollOutcome::Completed) | Some(PollOutcome::Failed) => {
-                return GPU_AWAIT_COMPLETED
-            }
+            Some(PollOutcome::Completed) | Some(PollOutcome::Failed) => return GPU_AWAIT_COMPLETED,
             Some(PollOutcome::Running) => {}
         }
 
@@ -3995,6 +4415,10 @@ pub(crate) mod device_cache {
     use std::sync::{Arc, OnceLock};
 
     pub(crate) enum CachedBuffer {
+        /// 16-bit elements: IEEE-754 binary16 bit patterns carried in a
+        /// Java `short[]`, for the fp16 built-in kernels. Nothing in the
+        /// cache interprets them; only the kernel does.
+        I16(Arc<DeviceBuffer<i16>>),
         I32(Arc<DeviceBuffer<i32>>),
         I64(Arc<DeviceBuffer<i64>>),
         F32(Arc<DeviceBuffer<f32>>),
@@ -4014,6 +4438,26 @@ pub(crate) mod device_cache {
 
     fn map() -> &'static Mutex<FxHashMap<u64, Entry>> {
         CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    }
+
+    pub(crate) fn get_i16(handle: u64) -> Option<Arc<DeviceBuffer<i16>>> {
+        match map().lock().get(&handle) {
+            Some(Entry {
+                buf: CachedBuffer::I16(arc),
+                ..
+            }) => Some(arc.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_i16(handle: u64, buf: Arc<DeviceBuffer<i16>>) {
+        map().lock().insert(
+            handle,
+            Entry {
+                buf: CachedBuffer::I16(buf),
+                dirty: false,
+            },
+        );
     }
 
     pub(crate) fn get_i32(handle: u64) -> Option<Arc<DeviceBuffer<i32>>> {
@@ -4133,6 +4577,11 @@ pub(crate) mod device_cache {
             }
             entry.dirty = false;
             match &entry.buf {
+                // fp16 buffers are inputs to the built-in kernels and are
+                // never written by one, so a dirty fp16 entry cannot arise.
+                // If that changes, this needs a real download arm rather
+                // than a silent None.
+                CachedBuffer::I16(_) => return None,
                 CachedBuffer::I32(a) => CachedBufferArcs::I32(a.clone()),
                 CachedBuffer::I64(a) => CachedBufferArcs::I64(a.clone()),
                 CachedBuffer::F32(a) => CachedBufferArcs::F32(a.clone()),
@@ -4570,7 +5019,6 @@ pub(crate) mod input_cache {
     }
 }
 
-
 /// One chunk of a chunked writeback: where it lives in the array, and the
 /// event that fires when its device->staging copy has landed.
 #[cfg(feature = "gpu-offload")]
@@ -4612,7 +5060,6 @@ pub enum ChunkedStage {
         host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>,
     },
 }
-
 
 /// How many streams a chunked dispatch rotates its launches over, and how
 /// many chunks it splits the iteration space into.
@@ -4765,7 +5212,6 @@ fn take_chunkable_writeback(
     Some(writebacks.remove(idx))
 }
 
-
 /// Issue a chunked, overlapped dispatch.
 ///
 /// Splits `[0, work)` into `chunk_count_wanted()` chunks and, for each, launches
@@ -4885,8 +5331,7 @@ fn launch_chunked(
         let done = match events.get(chunks.len()) {
             Some(e) => std::sync::Arc::clone(e),
             None => std::sync::Arc::new(
-                cuda_bridge::Event::new(ctx)
-                    .map_err(|e| format!("chunk event (lo={lo}): {e}"))?,
+                cuda_bridge::Event::new(ctx).map_err(|e| format!("chunk event (lo={lo}): {e}"))?,
             ),
         };
         stream
@@ -4898,7 +5343,6 @@ fn launch_chunked(
 
     Ok(MarshalWriteback::Chunked { obj, stage, chunks })
 }
-
 
 /// Define an `OffloadCache` accessor for a reusable page-locked staging
 /// slab of one element type.
@@ -5109,7 +5553,8 @@ impl MarshalWriteback {
                             // DMA that owned `[lo, lo+len)` in staging is
                             // complete and the range is ours to read. No
                             // other chunk covers it.
-                            let src = unsafe { &$host.as_mut_slice()[chunk.lo..chunk.lo + chunk.len] };
+                            let src =
+                                unsafe { &$host.as_mut_slice()[chunk.lo..chunk.lo + chunk.len] };
                             $write(*obj, &shared.mem.heap, src, chunk.lo, token).map_err(|e| {
                                 format!("chunked {} write (lo={}): {e}", $what, chunk.lo)
                             })?;
@@ -5248,9 +5693,7 @@ impl MarshalWriteback {
         match self {
             // A chunked writeback covers the whole array; its length is
             // the sum of the chunks, which by construction tile it.
-            Self::Chunked { chunks, .. } => {
-                Some(chunks.iter().map(|c| c.len).sum())
-            }
+            Self::Chunked { chunks, .. } => Some(chunks.iter().map(|c| c.len).sum()),
             Self::I32 { len, .. }
             | Self::I64 { len, .. }
             | Self::F32 { len, .. }
@@ -5362,7 +5805,7 @@ fn marshal_resident_array_arg(
                         format!("GpuArray handle {arr_handle} released before its first upload")
                     })?;
                 let host: &[$ty] = bytemuck::cast_slice(&host_bytes);
-                let buf = gpu_marshal::upload(ctx, host)
+                let buf = crate::runtime::gpu_marshal::upload(ctx, host)
                     .map_err(|e| format!("upload {} (GpuArray, len={len}): {e}", $tag))?;
                 let arc = std::sync::Arc::new(buf);
                 $cache_put(arr_handle, arc.clone());

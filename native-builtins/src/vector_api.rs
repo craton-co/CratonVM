@@ -10,11 +10,11 @@
 //!   - VectorShuffle — lane reordering
 //!   - VectorOperators — operation code constants
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
-use cratonvm_types::error::MethodCallFailed;
 
 // ---------------------------------------------------------------------------
 // Element type codes
@@ -189,7 +189,14 @@ fn alloc_vector(
     op_count: i32,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let lanes = vec![data_hash as i64; normalized_lane_count(lane_count)];
-    Ok(alloc_vector_lanes(ctx, class_name, species_idx, lane_count, &lanes, op_count)?)
+    Ok(alloc_vector_lanes(
+        ctx,
+        class_name,
+        species_idx,
+        lane_count,
+        &lanes,
+        op_count,
+    )?)
 }
 
 fn alloc_vector_lanes(
@@ -908,7 +915,10 @@ fn vector_fma(
 const VS: &str = "jdk/incubator/vector/VectorSpecies";
 
 // VectorSpecies synthetic: [0]=species_idx (Int), [1]=element_type (Int), [2]=bit_size (Int), [3]=lane_count (Int)
-fn alloc_species(ctx: &mut dyn NativeContext, species_idx: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_species(
+    ctx: &mut dyn NativeContext,
+    species_idx: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let cfg = get_species_config(species_idx as usize);
     let obj = try_alloc_concurrent_synthetic(ctx, VS, 4)?;
     ctx.set_field(obj, 0, Value::Int(species_idx));
@@ -1574,7 +1584,11 @@ fn iv_cast_shape(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 const VM: &str = "jdk/incubator/vector/VectorMask";
 
 // VectorMask synthetic: [0]=lane_count (Int), [1]=true_count (Int), [2]=lane payload (long[] 0/1)
-fn alloc_mask(ctx: &mut dyn NativeContext, lane_count: i32, true_count: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_mask(
+    ctx: &mut dyn NativeContext,
+    lane_count: i32,
+    true_count: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let lanes = (0..normalized_lane_count(lane_count))
         .map(|i| (i as i32) < true_count)
         .collect::<Vec<_>>();
@@ -1753,7 +1767,11 @@ fn vm_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 const VSH: &str = "jdk/incubator/vector/VectorShuffle";
 
 // VectorShuffle synthetic: [0]=lane_count (Int), [1]=pattern (Int: 0=identity, 1=reverse, 2=broadcast0)
-fn alloc_shuffle(ctx: &mut dyn NativeContext, lane_count: i32, pattern: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_shuffle(
+    ctx: &mut dyn NativeContext,
+    lane_count: i32,
+    pattern: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, VSH, 2)?;
     ctx.set_field(obj, 0, Value::Int(lane_count));
     ctx.set_field(obj, 1, Value::Int(pattern));
@@ -2559,11 +2577,14 @@ fn register_vector_operators(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod vector_api_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::test_mock::MockNativeContext;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

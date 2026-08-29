@@ -86,7 +86,7 @@ So the trigger is not "a method with many repeated List params" in the
 abstract — it needs the real classpath. The likely reason: `handleFailedStart
 (RuntimeValue)` builds a `SmallRyeConfig` via `SmallRyeConfigBuilder.build()`
 before ever reaching the `initializeLogging` call, and that build does a
-**wide `ServiceLoader`/`META-INF/services` scan across the whole classpath**
+**wide `ServiceLoader`/`../../../apps/META-INF/services` scan across the whole classpath**
 for `ConfigBuilderCustomizer` and `ConfigSource` providers — confirmed by
 partial classpath subsetting: shrinking the classpath to ~245 entries still
 pulled in providers from `smallrye-reactive-messaging`

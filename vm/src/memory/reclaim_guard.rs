@@ -717,7 +717,11 @@ pub(crate) fn corrupt_cell_selftest_inject(site: &'static str) {
 fn corrupt_cell_selftest_inject_cold(site: &'static str) {
     static GETFIELD: std::sync::Once = std::sync::Once::new();
     static PUTFIELD: std::sync::Once = std::sync::Once::new();
-    let once = if site == "getfield" { &GETFIELD } else { &PUTFIELD };
+    let once = if site == "getfield" {
+        &GETFIELD
+    } else {
+        &PUTFIELD
+    };
     once.call_once(|| {
         // `raw0` spells "SELFTEST" so the record cannot be mistaken for a real
         // cell by anyone reading a log later.
@@ -853,7 +857,13 @@ pub(crate) fn report_corrupt_cell_producer(
     let ascii = |w: u64| -> String {
         w.to_le_bytes()
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect()
     };
     match recv {

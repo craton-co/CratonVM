@@ -194,10 +194,17 @@ fn for_each_test_source(allowed: &[(&str, &str)], mut visit: impl FnMut(&str, &s
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
-        if allowed.iter().any(|(allowed_name, _)| *allowed_name == name) {
+        if allowed
+            .iter()
+            .any(|(allowed_name, _)| *allowed_name == name)
+        {
             continue;
         }
         let src = match std::fs::read_to_string(&path) {

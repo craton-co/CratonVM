@@ -364,7 +364,6 @@ impl CallSiteProfile {
             .max_by_key(|(_, &c)| c)
             .map(|(&id, _)| id)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,7 +1566,6 @@ mod tests {
         assert!(tp.is_megamorphic());
     }
 
-
     #[test]
     fn type_profile_ratios_sum_to_at_most_one() {
         let mut tp = ReceiverTypeProfile::new(0);
@@ -1590,9 +1588,6 @@ mod tests {
         cs.record_call(20);
         assert_eq!(cs.most_common_callee(), Some(10));
     }
-
-
-
 
     // ---- DeoptProfile -------------------------------------------------------
 
@@ -1745,14 +1740,7 @@ mod tests {
         assert!(!hot.contains(&20));
     }
 
-
     // ---- InliningPolicy -----------------------------------------------------
-
-
-
-
-
-
 
     // ---- PgoRepository ------------------------------------------------------
 

@@ -1194,7 +1194,8 @@ impl Compiler {
             return;
         }
         let Ok(d) = Disp::encode_for_base(disp as i64, base) else {
-            self.buf.mark_codegen_unencodable("mem8-displacement-unencodable");
+            self.buf
+                .mark_codegen_unencodable("mem8-displacement-unencodable");
             return;
         };
         // This form has always emitted an explicit displacement byte, including

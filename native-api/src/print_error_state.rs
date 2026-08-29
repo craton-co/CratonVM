@@ -388,7 +388,12 @@ pub fn record_host_io_failure<T, E>(
 /// caller — that is the fault `reportError`'s own `catch (Exception ex2)`
 /// exists to prevent. Returns whether the report was delivered so a caller
 /// that wants to know can ask.
-pub fn report_handler_error(ctx: &mut dyn NativeContext, handler: ObjectRef, ex: ObjectRef, code: i32) -> bool {
+pub fn report_handler_error(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+    ex: ObjectRef,
+    code: i32,
+) -> bool {
     ctx.invoke_virtual(
         handler,
         "reportError",

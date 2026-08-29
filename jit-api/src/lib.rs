@@ -807,7 +807,6 @@ pub const fn getfield_index_of(arg: i64) -> i64 {
     (arg as u64 & !GETFIELD_FLAG_BITS) as i64
 }
 
-
 #[cfg(test)]
 mod getfield_arg_tests {
     use super::*;

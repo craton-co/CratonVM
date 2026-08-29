@@ -295,7 +295,8 @@ fn build_boot_layer(
     }
     drop(memo);
 
-    let layer = try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT)?;
+    let layer =
+        try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT)?;
     let layer_pin = ctx.pin_native_root(layer);
 
     let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "layer parents")?;
@@ -339,7 +340,10 @@ fn build_boot_layer(
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-fn populate_boot_layer_modules(ctx: &mut dyn NativeContext, layer: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+fn populate_boot_layer_modules(
+    ctx: &mut dyn NativeContext,
+    layer: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*layer);
     let w5_out = populate_boot_layer_modules_body(ctx, *layer);
     *layer = ctx.read_native_pin(w5_pin, *layer);
@@ -580,7 +584,10 @@ fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: Object
 /// just on `HashSet` instead of `Module`. The real-layout helper builds an
 /// actual `HashMap` with real `HashMap$Node` buckets, so unforced real
 /// bytecode reads it correctly with no detection/adaptation needed.
-fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_package_set(
+    ctx: &mut dyn NativeContext,
+    packages: &[&str],
+) -> Result<ObjectRef, MethodCallFailed> {
     let keys: Vec<ObjectRef> = packages.iter().map(|pkg| ctx.create_string(pkg)).collect();
     Ok(crate::build_real_layout_string_hashset(ctx, &keys)?)
 }
@@ -676,13 +683,20 @@ fn record_module_packages(ctx: &mut dyn NativeContext, module: ObjectRef, name: 
 /// Fabricated stand-ins for names the registry does NOT know are deliberately
 /// left out of that cache: they are a permissive fallback, not a fact about the
 /// module graph, and `cache_module_mirror` installs a permanent GC root.
-fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn build_module(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    layer: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let registered = ctx.module_is_registered(name);
     if registered {
         if let Some(cached) = ctx.get_cached_module_mirror(Some(name)) {
             // `Class.getModule()`'s builder never sets `layer`; seed it so
             // `getLayer() == ModuleLayer.boot()` holds on the shared mirror.
-            if !matches!(ctx.get_field_by_name(cached, "layer"), Value::Object(Some(_))) {
+            if !matches!(
+                ctx.get_field_by_name(cached, "layer"),
+                Value::Object(Some(_))
+            ) {
                 ctx.set_field_by_name(cached, "layer", Value::Object(Some(layer)));
             }
             record_module_packages(ctx, cached, name);
@@ -766,7 +780,10 @@ pub(crate) fn native_module_define_module0(
 }
 
 /// Wrap an ObjectRef as `Optional.of(value)`.
-fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn wrap_optional_present(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     ctx.set_field(opt, 0, Value::Object(Some(value)));
     Ok(opt)
@@ -1606,12 +1623,14 @@ fn build_requires_set(
     // enum's `<clinit>` is four `new Modifier(int)` calls and an array, so it
     // cannot realistically throw, and a descriptor missing its modifier set is
     // a far better outcome than `getDescriptor()` itself failing.
-    let modifier_enum =
-        if entries.iter().any(|(_, transitive, is_static)| *transitive || *is_static) {
-            ctx.ensure_class_initialized(REQUIRES_MODIFIER_ENUM).ok()
-        } else {
-            None
-        };
+    let modifier_enum = if entries
+        .iter()
+        .any(|(_, transitive, is_static)| *transitive || *is_static)
+    {
+        ctx.ensure_class_initialized(REQUIRES_MODIFIER_ENUM).ok()
+    } else {
+        None
+    };
 
     let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires")?;
     let pin = ctx.pin_native_root(set);
@@ -1620,7 +1639,8 @@ fn build_requires_set(
             try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4)?;
         let element_pin = ctx.pin_native_root(element);
 
-        let mut mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+        let mut mods =
+            new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
         let mods_pin = ctx.pin_native_root(mods);
         if let Some(enum_id) = modifier_enum {
             for (wanted, constant) in [(*transitive, "TRANSITIVE"), (*is_static, "STATIC")] {
@@ -1676,7 +1696,11 @@ pub(crate) fn build_module_descriptor(
     // `&self` reads on the class manager and must not interleave with the Java
     // re-entry below.
     let is_open = ctx.module_is_open(module_name);
-    let uses: Vec<String> = ctx.module_uses(module_name).iter().map(|s| dotted(s)).collect();
+    let uses: Vec<String> = ctx
+        .module_uses(module_name)
+        .iter()
+        .map(|s| dotted(s))
+        .collect();
     let packages: Vec<String> = ctx
         .module_packages(module_name)
         .iter()
@@ -1772,19 +1796,15 @@ pub(crate) fn build_module_descriptor(
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "packages", Value::Object(Some(packages_set)));
 
-    let exports_set = build_export_like_set(
-        ctx,
-        "java/lang/module/ModuleDescriptor$Exports",
-        &exports,
-    )?;
+    let exports_set =
+        build_export_like_set(ctx, "java/lang/module/ModuleDescriptor$Exports", &exports)?;
     // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
     // because the wrapper allocates and can therefore move `desc`.
     let exports_set = wrap_unmodifiable_set(ctx, exports_set);
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "exports", Value::Object(Some(exports_set)));
 
-    let opens_set =
-        build_export_like_set(ctx, "java/lang/module/ModuleDescriptor$Opens", &opens)?;
+    let opens_set = build_export_like_set(ctx, "java/lang/module/ModuleDescriptor$Opens", &opens)?;
     // Immutable: see `wrap_unmodifiable_set`. Placed BEFORE the pin re-read
     // because the wrapper allocates and can therefore move `desc`.
     let opens_set = wrap_unmodifiable_set(ctx, opens_set);
@@ -2396,10 +2416,13 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn validate_module_name_accepts_valid_names() {

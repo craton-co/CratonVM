@@ -761,12 +761,7 @@ impl JdkOnlyViolation {
                 // Emitted for every row of this kind, never conditionally — an
                 // absent `outcome` would be indistinguishable from
                 // `bytecode-won`, which is the direction that hides a violation.
-                json_field(
-                    &mut out,
-                    &mut first,
-                    "outcome",
-                    self.shadow_outcome(),
-                );
+                json_field(&mut out, &mut first, "outcome", self.shadow_outcome());
             }
             JdkOnlyViolation::MissingBootClass {
                 class,
@@ -1975,7 +1970,10 @@ mod tests {
             message: String::new(),
         };
         let (_, msg) = iae.as_java_throwable().unwrap();
-        assert!(msg.is_none(), "an empty IAE message means getMessage() == null");
+        assert!(
+            msg.is_none(),
+            "an empty IAE message means getMessage() == null"
+        );
 
         let iae = RuntimeError::IllegalArgumentException {
             message: "argument type mismatch".to_string(),

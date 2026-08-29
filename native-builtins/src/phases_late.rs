@@ -21,8 +21,8 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    try_alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
-    jul_logger_parent_get, jul_logger_parent_set, native_noop, native_noop_with_this, obj_arg,
+    jul_logger_handlers_get, jul_logger_handlers_set, jul_logger_parent_get, jul_logger_parent_set,
+    native_noop, native_noop_with_this, obj_arg, try_alloc_concurrent_synthetic,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
@@ -318,62 +318,6 @@ pub(crate) fn objectstreamclass_natives(_registry: &mut NativeMethodRegistry) {}
 pub(crate) fn unsafe_wp1_2_natives(registry: &mut NativeMethodRegistry) {
     crate::unsafe_natives::register_unsafe_wp1_2(registry);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
 /// `new BufferedWriter(writer)`) from the synthetic, fd-backed object the
@@ -1175,12 +1119,11 @@ fn native_quarkus_logging_handle_failed_start(
         // itself runs on either shape: empty list for every `List`, empty map
         // for the `Map`, false for both booleans, a null `RuntimeValue` for the
         // handler slot and the supplied one for the last.
-        let recorder_class_id = match ctx.ensure_class_initialized(
-            "io/quarkus/runtime/logging/LoggingSetupRecorder",
-        ) {
-            Ok(cid) => cid,
-            Err(_) => return Ok(None),
-        };
+        let recorder_class_id =
+            match ctx.ensure_class_initialized("io/quarkus/runtime/logging/LoggingSetupRecorder") {
+                Ok(cid) => cid,
+                Err(_) => return Ok(None),
+            };
         let Some(descriptor) = ctx
             .declared_methods(recorder_class_id)
             .into_iter()
@@ -1228,84 +1171,6 @@ fn native_quarkus_logging_handle_failed_start(
     ctx.unpin_native_roots(supplier_rv_pin);
     result
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // ProcessBuilder / Process — actual process execution via std::process
@@ -1707,36 +1572,15 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // Shares `register_p60_process_handle`'s implementation: this triple is
     // registered from BOTH registrars and the two must not answer differently
     // depending on which ran last.
-    r.register("java/lang/ProcessHandle", "isAlive", "()Z", p60_handle_is_alive);
+    r.register(
+        "java/lang/ProcessHandle",
+        "isAlive",
+        "()Z",
+        p60_handle_is_alive,
+    );
     r.set_category(__ph_cat);
     r.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // Phase 58: CompletableFuture expansion, NIO Channels, GZIP/Zip streams,
@@ -1757,47 +1601,6 @@ pub(crate) fn register_phase58_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ===========================================================================
 // ZipOutputStream helpers
 // ===========================================================================
@@ -1807,29 +1610,6 @@ pub(crate) fn register_phase58_natives(registry: &mut NativeMethodRegistry) {
 /// immediately on closeEntry.
 use std::collections::HashMap as ZoHashMap;
 use std::sync::Mutex as StdMutex;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // StringConcatFactory — used by modern Java bytecode for string concatenation
@@ -1963,134 +1743,6 @@ pub(crate) fn register_phase59_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // Phase 60: HTTP Client, Reactive Streams (Flow), MatchResult, CallSite,
 //           Record expansion, ProcessHandle expansion, AbstractMap
@@ -2108,19 +1760,6 @@ pub(crate) fn register_phase60_natives(registry: &mut NativeMethodRegistry) {
     register_p60_abstract_map(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // java.util.regex.MatchResult — interface implemented by Matcher
@@ -2179,7 +1818,6 @@ pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
 }
-
 
 fn p60_parent_pid() -> i64 {
     #[cfg(unix)]
@@ -2695,14 +2333,19 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     // same probe the `ProcessHandleImpl` natives in `native-io/src/process.rs`
     // already answer with — so the two cannot report different process trees —
     // and which THROWS on a failed scan the way HotSpot does.
-    r.register(ph, "children", "()Ljava/util/stream/Stream;", |ctx, args| {
-        if let Some(result) =
-            p60_delegate_to_real_handle(ctx, args, "children", "()Ljava/util/stream/Stream;")
-        {
-            return result;
-        }
-        p60_unmeasurable_process_tree(ctx)
-    });
+    r.register(
+        ph,
+        "children",
+        "()Ljava/util/stream/Stream;",
+        |ctx, args| {
+            if let Some(result) =
+                p60_delegate_to_real_handle(ctx, args, "children", "()Ljava/util/stream/Stream;")
+            {
+                return result;
+            }
+            p60_unmeasurable_process_tree(ctx)
+        },
+    );
     r.register(
         ph,
         "descendants",
@@ -2963,11 +2606,15 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     // `java/lang/ProcessHandle*` triple in both boot arms (`vm_init.rs:1901`
     // and `:2406`, after `register_io_natives`), so nothing overwrites it. It
     // is also a NEW triple — no prior slot, so last-write-wins does not apply.
-    r.register(phi, "commandLine", "()Ljava/util/Optional;", p60_empty_optional);
+    r.register(
+        phi,
+        "commandLine",
+        "()Ljava/util/Optional;",
+        p60_empty_optional,
+    );
     r.set_category(__prev_cat);
     ()
 }
-
 
 // =============================================================================
 // Phase 61: Text formatting, Logging, Charset, ClassLoader, Reflect, Files/Path
@@ -2985,11 +2632,6 @@ pub(crate) fn register_phase61_natives(registry: &mut NativeMethodRegistry) {
     register_p61_net(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
 
 // =============================================================================
 // java.util.logging — FileHandler, StreamHandler, LogManager, Logger additions
@@ -3294,8 +2936,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // bytecode that can move it (the native stale-local family). This
             // ordering also gives the JDK's answer for free: exactly one
             // report, naming whichever failure came first.
-            let close_failure =
-                cratonvm_native_api::print_error_state::ERROR_MANAGER_CLOSE_FAILURE;
+            let close_failure = cratonvm_native_api::print_error_state::ERROR_MANAGER_CLOSE_FAILURE;
             // The comment above already keeps the absorbed THROWABLE off a local
             // across `close()`. `stream` itself is still held across the flush
             // and its error reporting, both of which are arbitrary Java.
@@ -3395,7 +3036,6 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-
 /// `java.util.logging.Handler`'s `ErrorManager` surface, and the default
 /// `ErrorManager` itself.
 ///
@@ -3426,34 +3066,44 @@ fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
 
     // `public synchronized void setErrorManager(ErrorManager em)` — the JDK
     // throws NPE on null before storing.
-    r.register(h, "setErrorManager", "(Ljava/util/logging/ErrorManager;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // `Handler.setErrorManager` is `if (em == null) throw new
-        // NullPointerException();` before the store — the same idiom this file
-        // already uses for a null argument a JDK method refuses.
-        let Some(Value::Object(Some(manager))) = args.get(1).copied() else {
-            return Err(RuntimeError::NullPointerException { message: None }.into());
-        };
-        crate::jul_handler_error_manager_set(ctx, this, manager);
-        Ok(None)
-    });
+    r.register(
+        h,
+        "setErrorManager",
+        "(Ljava/util/logging/ErrorManager;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `Handler.setErrorManager` is `if (em == null) throw new
+            // NullPointerException();` before the store — the same idiom this file
+            // already uses for a null argument a JDK method refuses.
+            let Some(Value::Object(Some(manager))) = args.get(1).copied() else {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            };
+            crate::jul_handler_error_manager_set(ctx, this, manager);
+            Ok(None)
+        },
+    );
 
     // `public ErrorManager getErrorManager()`. The JDK's field initializer is
     // `= new ErrorManager()`, i.e. every Handler has one from construction and
     // this never returns null. Minting on first read is observably the same:
     // the identity is stable once minted, and nothing can observe the object
     // before something asks for it.
-    r.register(h, "getErrorManager", "()Ljava/util/logging/ErrorManager;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(existing) = crate::jul_handler_error_manager_get(ctx, this) {
-            return Ok(Some(Value::Object(Some(existing))));
-        }
-        let minted = try_alloc_concurrent_synthetic(ctx, "java/util/logging/ErrorManager", 1)?;
-        // Slot 0 is `reported` — see the `error` body below.
-        ctx.set_field(minted, 0, Value::Int(0));
-        crate::jul_handler_error_manager_set(ctx, this, minted);
-        Ok(Some(Value::Object(Some(minted))))
-    });
+    r.register(
+        h,
+        "getErrorManager",
+        "()Ljava/util/logging/ErrorManager;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(existing) = crate::jul_handler_error_manager_get(ctx, this) {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            let minted = try_alloc_concurrent_synthetic(ctx, "java/util/logging/ErrorManager", 1)?;
+            // Slot 0 is `reported` — see the `error` body below.
+            ctx.set_field(minted, 0, Value::Int(0));
+            crate::jul_handler_error_manager_set(ctx, this, minted);
+            Ok(Some(Value::Object(Some(minted))))
+        },
+    );
 
     // `protected void reportError(String msg, Exception ex, int code)`:
     //     try { errorManager.error(msg, ex, code); }
@@ -3461,33 +3111,38 @@ fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
     //                             ex2.printStackTrace(); }
     // The inner call is VIRTUAL, so an application's own ErrorManager subclass
     // is what runs — which is the whole point of the surface.
-    r.register(h, "reportError", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
-        let ex = args.get(2).copied().unwrap_or(Value::Object(None));
-        let code = match args.get(3) {
-            Some(Value::Int(c)) => *c,
-            _ => 0,
-        };
-        let Ok(Some(Value::Object(Some(manager)))) = ctx.invoke_virtual(
-            this,
-            "getErrorManager",
-            "()Ljava/util/logging/ErrorManager;",
-            &[],
-        ) else {
-            return Ok(None);
-        };
-        // The JDK's own `catch (Exception ex2)` around this call: reporting a
-        // failure must not become a second, different failure on the caller.
-        let reported = ctx.invoke_virtual(
-            manager,
-            "error",
-            "(Ljava/lang/String;Ljava/lang/Exception;I)V",
-            &[msg, ex, Value::Int(code)],
-        );
-        cratonvm_native_api::delegated_close::absorb_exception(&*ctx, reported)?;
-        Ok(None)
-    });
+    r.register(
+        h,
+        "reportError",
+        "(Ljava/lang/String;Ljava/lang/Exception;I)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+            let ex = args.get(2).copied().unwrap_or(Value::Object(None));
+            let code = match args.get(3) {
+                Some(Value::Int(c)) => *c,
+                _ => 0,
+            };
+            let Ok(Some(Value::Object(Some(manager)))) = ctx.invoke_virtual(
+                this,
+                "getErrorManager",
+                "()Ljava/util/logging/ErrorManager;",
+                &[],
+            ) else {
+                return Ok(None);
+            };
+            // The JDK's own `catch (Exception ex2)` around this call: reporting a
+            // failure must not become a second, different failure on the caller.
+            let reported = ctx.invoke_virtual(
+                manager,
+                "error",
+                "(Ljava/lang/String;Ljava/lang/Exception;I)V",
+                &[msg, ex, Value::Int(code)],
+            );
+            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, reported)?;
+            Ok(None)
+        },
+    );
 
     // `java.util.logging.ErrorManager` itself = 1 field (`reported`).
     r.register(em, "<init>", "()V", |ctx, args| {
@@ -3505,41 +3160,46 @@ fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
     // The first-call-only latch is not decoration — it is what keeps a broken
     // sink from filling the console, and a version without it would be a
     // visibly different VM under any handler that fails repeatedly.
-    r.register(em, "error", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if matches!(ctx.get_field(this, 0), Value::Int(v) if v != 0) {
-            return Ok(None);
-        }
-        ctx.set_field(this, 0, Value::Int(1));
-        let code = match args.get(3) {
-            Some(Value::Int(c)) => *c,
-            _ => 0,
-        };
-        let mut text = format!("java.util.logging.ErrorManager: {code}");
-        if let Some(Value::Object(Some(msg))) = args.get(1).copied() {
-            if let Some(msg) = ctx.read_string(msg) {
-                text.push_str(": ");
-                text.push_str(&msg);
+    r.register(
+        em,
+        "error",
+        "(Ljava/lang/String;Ljava/lang/Exception;I)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if matches!(ctx.get_field(this, 0), Value::Int(v) if v != 0) {
+                return Ok(None);
             }
-        }
-        // Route through the live Java `System.err` rather than the host's
-        // stderr: a test that redirected `System.err` (Spring Boot's
-        // `OutputCaptureExtension`, Tomcat's log capture) must see this, and
-        // the JDK writes it with `System.err.println`.
-        if let Some(err) = ctx.get_system_stream("err") {
-            let line = ctx.create_string(&text);
-            let _ = ctx.invoke_virtual(
-                err,
-                "println",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(line))],
-            );
-        }
-        if let Some(Value::Object(Some(ex))) = args.get(2).copied() {
-            let _ = ctx.invoke_virtual(ex, "printStackTrace", "()V", &[]);
-        }
-        Ok(None)
-    });
+            ctx.set_field(this, 0, Value::Int(1));
+            let code = match args.get(3) {
+                Some(Value::Int(c)) => *c,
+                _ => 0,
+            };
+            let mut text = format!("java.util.logging.ErrorManager: {code}");
+            if let Some(Value::Object(Some(msg))) = args.get(1).copied() {
+                if let Some(msg) = ctx.read_string(msg) {
+                    text.push_str(": ");
+                    text.push_str(&msg);
+                }
+            }
+            // Route through the live Java `System.err` rather than the host's
+            // stderr: a test that redirected `System.err` (Spring Boot's
+            // `OutputCaptureExtension`, Tomcat's log capture) must see this, and
+            // the JDK writes it with `System.err.println`.
+            if let Some(err) = ctx.get_system_stream("err") {
+                let line = ctx.create_string(&text);
+                let _ = ctx.invoke_virtual(
+                    err,
+                    "println",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(line))],
+                );
+            }
+            if let Some(Value::Object(Some(ex))) = args.get(2).copied() {
+                let _ = ctx.invoke_virtual(ex, "printStackTrace", "()V", &[]);
+            }
+            Ok(None)
+        },
+    );
 
     // NOT done here: `ErrorManager`'s six `public static final int` codes.
     // A synthetic class has no static field table to put them in, so
@@ -3930,10 +3590,6 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     ()
 }
 
-
-
-
-
 // =============================================================================
 // Phase 62: CharBuffer, Time expansion (MonthDay/YearMonth/Year), NumberFormat
 //           factories, Collectors expansion, NavigableMap/Set completion,
@@ -3957,34 +3613,6 @@ pub(crate) fn register_phase62_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // Phase 63: WeakHashMap, ResourceBundle, ServiceLoader, MethodHandles.Lookup,
 //           ScheduledExecutorService, Formatter expansion, Enumeration stubs
@@ -4002,16 +3630,6 @@ pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
     register_p63_enumeration(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // java.util.ServiceLoader — basic service discovery
@@ -4198,8 +3816,6 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-
-
 // =============================================================================
 // java.util.Formatter expansion — format method for String.format support
 // Formatter = 2-field (output=0 StringBuilder-like, locale=1)
@@ -4209,7 +3825,6 @@ pub(crate) fn register_p63_formatter(_r: &mut NativeMethodRegistry) {
     // Formatter already fully implemented in earlier phase (register_formatter_natives)
     // Only adding locale() method which was missing
 }
-
 
 // =============================================================================
 // Phase 64: SequencedCollection/Map/Set (Java 21), HexFormat (Java 17),
@@ -4229,24 +3844,6 @@ pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
     register_p64_math_clamp(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // HexFormat — Java 17
@@ -4835,20 +4432,30 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(hf, "withUpperCase", "()Ljava/util/HexFormat;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let mut cfg = p64_hex_cfg(ctx, this);
-        cfg.ucase = true;
-        let obj = p64_hex_new(ctx, &cfg)?;
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    r.register(hf, "withLowerCase", "()Ljava/util/HexFormat;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let mut cfg = p64_hex_cfg(ctx, this);
-        cfg.ucase = false;
-        let obj = p64_hex_new(ctx, &cfg)?;
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        hf,
+        "withUpperCase",
+        "()Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.ucase = true;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        hf,
+        "withLowerCase",
+        "()Ljava/util/HexFormat;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mut cfg = p64_hex_cfg(ctx, this);
+            cfg.ucase = false;
+            let obj = p64_hex_new(ctx, &cfg)?;
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -4964,9 +4571,7 @@ fn p64_hf_bytes_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     match args.get(1) {
         Some(Value::Object(Some(a))) => Ok(*a),
         _ => Err(RuntimeError::NullPointerException {
-            message: Some(
-                "Cannot read the array length because \"bytes\" is null".to_string(),
-            ),
+            message: Some("Cannot read the array length because \"bytes\" is null".to_string()),
         }
         .into()),
     }
@@ -5029,18 +4634,17 @@ fn native_p64_format_hex_range(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cfg = p64_hex_cfg(ctx, this);
-    let units = match args.get(1) {
-        Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
-        _ => {
-            return Err(RuntimeError::NullPointerException {
+    let units =
+        match args.get(1) {
+            Some(Value::Object(Some(r))) => p64_hf_seq_units(ctx, *r),
+            _ => return Err(RuntimeError::NullPointerException {
                 message: Some(
                     "Cannot invoke \"java.lang.CharSequence.length()\" because \"string\" is null"
                         .to_string(),
                 ),
             }
-            .into())
-        }
-    };
+            .into()),
+        };
     p64_parse_hex_answer(ctx, &cfg, &units)
 }
 
@@ -5221,10 +4825,6 @@ fn p64_parse_hex_chars(chars: &[u16], cfg: &P64HexCfg) -> Result<Vec<u8>, Method
     Ok(out)
 }
 
-
-
-
-
 // =============================================================================
 // RandomGenerator — Java 17 interface
 // Register for Random (already exists) and ThreadLocalRandom
@@ -5321,7 +4921,8 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
         "current",
         "()Ljava/util/concurrent/ThreadLocalRandom;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2)?;
             ctx.set_field(obj, 0, Value::Long(p64_simple_random() as i64));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -5736,13 +5337,6 @@ pub(crate) fn register_phase65_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
 // =============================================================================
 // Pattern additions — asMatchPredicate, splitAsStream
 // =============================================================================
@@ -5811,8 +5405,6 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-
-
 // =============================================================================
 // Phase 66: Collator/BreakIterator, FileVisitor/WatchService stubs,
 //           ConstantDesc/Constable, Thread.Builder (virtual threads),
@@ -5831,36 +5423,6 @@ pub(crate) fn register_phase66_natives(registry: &mut NativeMethodRegistry) {
     register_p66_pushback_reader(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // Phase 67: StructuredTaskScope, ScopedValue, Stream.Gatherer stubs,
@@ -5920,72 +5482,6 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
     register_p67_misc(registry);
     registry.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // Miscellaneous: Additional refinements
@@ -6262,9 +5758,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     r.register(sl, "getCapturedArgCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         match ctx.get_field_by_name(this, "capturedArgs") {
-            Value::Object(Some(a))
-                if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array =>
-            {
+            Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => {
                 Ok(Some(Value::Int(ctx.array_length(a) as i32)))
             }
             _ => Ok(Some(Value::Int(0))),
@@ -6714,61 +6208,6 @@ pub(crate) fn register_phase68_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // Phase 69: Cleaner, Spliterator/StreamSupport, WebSocket stubs,
 //           SwitchBootstraps, CompactNumberFormat, SubmissionPublisher
@@ -6943,7 +6382,8 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         "create",
         "()Ljava/lang/ref/Cleaner;",
         |ctx, _args| {
-            let cleaner = try_alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS)?;
+            let cleaner =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS)?;
             // The previous version allocated a bare 1-slot object and stopped
             // there, so `register` had nowhere to keep its Cleanables alive
             // and every registered cleanup action was collectible before it
@@ -7076,8 +6516,6 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
 }
-
-
 
 // =============================================================================
 // Spring `PropertyBatchUpdateException` diagnostic intercept
@@ -7331,16 +6769,6 @@ pub(crate) fn register_de4_demo_stubs(_registry: &mut NativeMethodRegistry) {
     // runs; if the jar is absent, callers get a clear NoSuchMethodError.
 }
 
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // Misc: java.util.Objects additions, Predicate.not (Java 11)
 // =============================================================================
@@ -7551,10 +6979,6 @@ pub(crate) fn register_phase70_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
 // =============================================================================
 // java.util.zip.GZIP*Stream — REMOVED. Real implementation is in
 // register_p58_gzip_streams (Phase 58) at lines 7391+. The previous Phase 70
@@ -7576,12 +7000,6 @@ fn oos_write_bytes(ctx: &mut dyn NativeContext, stream: ObjectRef, bytes: &[u8])
     }
     ctx.unpin_native_roots(stream_pin);
 }
-
-
-
-
-
-
 
 // =============================================================================
 // Phase 71: Wrapper extras, BigInteger extensions, Files bridge, Thread extras,
@@ -7779,9 +7197,7 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
             };
             let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
                 Ok(r) => r,
-                Err(message) => {
-                    return Err(RuntimeError::NumberFormatException { message }.into())
-                }
+                Err(message) => return Err(RuntimeError::NumberFormatException { message }.into()),
             };
             Ok(Some(Value::Int(
                 u32::from_str_radix(s.trim(), rad).unwrap_or(0) as i32,
@@ -7952,9 +7368,7 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
             };
             let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
                 Ok(r) => r,
-                Err(message) => {
-                    return Err(RuntimeError::NumberFormatException { message }.into())
-                }
+                Err(message) => return Err(RuntimeError::NumberFormatException { message }.into()),
             };
             Ok(Some(Value::Long(
                 u64::from_str_radix(s.trim(), rad).unwrap_or(0) as i64,
@@ -8023,400 +7437,6 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// The `byte[]` argument of a `BigInteger` constructor.
 ///
@@ -8791,9 +7811,8 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         // mismatch. Testing `signum == 0` against the raw bytes would reject
         // `new BigInteger(0, new byte[]{0})`, which is legal.
         if signum == 0
-            && (0..len).any(
-                |i| matches!(ctx.get_array_element(arr, i), Value::Int(x) if (x & 0xff) != 0),
-            )
+            && (0..len)
+                .any(|i| matches!(ctx.get_array_element(arr, i), Value::Int(x) if (x & 0xff) != 0))
         {
             return Err(RuntimeError::NumberFormatException {
                 message: "signum-magnitude mismatch".to_string(),
@@ -9056,17 +8075,6 @@ fn bi_div_mod_2_32(value: &str) -> (String, u32) {
     }
     (quotient, rem as u32)
 }
-
-
-
-
-
-
-
-
-
-
-
 
 // =============================================================================
 // java.util.logging extras — only methods not in phases 31/54/61
@@ -9512,49 +8520,6 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // ES4: Elasticsearch CLI launcher short-circuits.
 //
@@ -9618,24 +8583,6 @@ pub(crate) fn register_es4_elasticsearch_stubs(_r: &mut NativeMethodRegistry) {
     // jar is absent, callers get a clear NoSuchMethodError.
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // =============================================================================
 // Phase D: Java 25 — Stream Gatherers, Scoped Values, Structured Concurrency
 // =============================================================================
@@ -9651,10 +8598,13 @@ pub(crate) fn register_es4_elasticsearch_stubs(_r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod ra1_char_buffer_roundtrip_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     #[test]
@@ -9719,20 +8669,20 @@ mod ra1_char_buffer_roundtrip_tests {
     }
 }
 
-
-
-
 // =============================================================================
 // nb-core fixes (fable-2026-06-10): SubmissionPublisher subscriber delivery
 // (B6) and Charset.forName fail-closed for unknown charsets (B7).
 // =============================================================================
 #[cfg(test)]
 mod nb_core_stubs_fix_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn sp_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
@@ -9981,10 +8931,13 @@ mod nb_core_stubs_fix_tests {
 
 #[cfg(test)]
 mod nb_phases_late_security_fix_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -- BUG nb-phases-late(4): Mac key-material scrubbing -----------------
 
@@ -10083,9 +9036,12 @@ mod nb_phases_late_security_fix_tests {
 
 #[cfg(test)]
 mod nb_phases_late_robustness_fix_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -- finding 1: JSON unescape surrogate pairs + multi-byte safety --------
 
@@ -10215,9 +9171,12 @@ mod nb_phases_late_robustness_fix_tests {
 
 #[cfg(test)]
 mod cert_verify_bounds_security_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // HIGH (cert-verify): In the default (non-legacy) build the no-op
     // `verify(PublicKey)` natives MUST NOT be registered, so the real
@@ -10347,7 +9306,12 @@ mod cert_verify_bounds_security_tests {
         register_p68_crypto_mac(&mut r);
         // (method, descriptor, expect_registered, note when NOT expected)
         for (name, desc, expect_registered, why_not) in [
-            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", true, ""),
+            (
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/crypto/Mac;",
+                true,
+                "",
+            ),
             (
                 "getInstance",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
@@ -10542,7 +9506,10 @@ pub(crate) fn uuid_from_string_bits(name: &str) -> Result<(i64, i64), MethodCall
         if from > chars.len() {
             return None;
         }
-        chars[from..].iter().position(|c| *c == '-').map(|p| p + from)
+        chars[from..]
+            .iter()
+            .position(|c| *c == '-')
+            .map(|p| p + from)
     };
     let invalid = || RuntimeError::IllegalArgumentException {
         message: format!("Invalid UUID string: {name}"),
@@ -10676,10 +9643,13 @@ mod uuid_from_string_spec_tests {
 
 #[cfg(test)]
 mod ffm_p67_layout_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn object_ref(value: Value) -> ObjectRef {
         match value {
@@ -10695,11 +9665,13 @@ mod ffm_p67_layout_tests {
         let mut ctx = mock_ctx();
 
         let ptr_name = ctx.create_string("ptr");
-        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8).unwrap();
+        let ptr_layout =
+            p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8).unwrap();
         ctx.set_field(ptr_layout, 3, Value::Object(Some(ptr_name)));
 
         let size_name = ctx.create_string("size");
-        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8).unwrap();
+        let size_layout =
+            p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8).unwrap();
         ctx.set_field(size_layout, 3, Value::Object(Some(size_name)));
 
         let members = ctx.new_array(ArrayElementType::Reference, 2);
@@ -10721,8 +9693,12 @@ mod ffm_p67_layout_tests {
         );
 
         let path_name = ctx.create_string("size");
-        let path_elem =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2).unwrap();
+        let path_elem = try_alloc_concurrent_synthetic(
+            &mut ctx,
+            "java/lang/foreign/MemoryLayout$PathElement",
+            2,
+        )
+        .unwrap();
         ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
         ctx.set_field(path_elem, 1, Value::Int(0));
         let path = ctx.new_array(ArrayElementType::Reference, 1);
@@ -11165,7 +10141,11 @@ mod unsigned_radix_tests {
     fn long_unsigned(v: i64, radix: i32) -> String {
         let r = registry();
         let f = r
-            .find("java/lang/Long", "toUnsignedString", "(JI)Ljava/lang/String;")
+            .find(
+                "java/lang/Long",
+                "toUnsignedString",
+                "(JI)Ljava/lang/String;",
+            )
             .expect("Long.toUnsignedString(JI) must be registered");
         let mut ctx = mock_ctx();
         match f(&mut ctx, &[Value::Long(v), Value::Int(radix)]).expect("never throws") {
@@ -11277,10 +10257,18 @@ mod unsigned_radix_tests {
         let worker = std::thread::spawn(move || {
             let r = registry();
             let pi = r
-                .find("java/lang/Integer", "parseUnsignedInt", "(Ljava/lang/String;I)I")
+                .find(
+                    "java/lang/Integer",
+                    "parseUnsignedInt",
+                    "(Ljava/lang/String;I)I",
+                )
                 .expect("Integer.parseUnsignedInt(String,int) must be registered");
             let pl = r
-                .find("java/lang/Long", "parseUnsignedLong", "(Ljava/lang/String;I)J")
+                .find(
+                    "java/lang/Long",
+                    "parseUnsignedLong",
+                    "(Ljava/lang/String;I)J",
+                )
                 .expect("Long.parseUnsignedLong(String,int) must be registered");
             let mut ctx = mock_ctx();
             let s = ctx.create_string("5");
@@ -11307,7 +10295,11 @@ mod unsigned_radix_tests {
             threw.iter().all(|&t| t),
             "every out-of-range radix must throw NumberFormatException, got {threw:?}"
         );
-        assert_eq!(legal, vec![true, true, true], "legal radices must still parse");
+        assert_eq!(
+            legal,
+            vec![true, true, true],
+            "legal radices must still parse"
+        );
         worker.join().expect("worker thread panicked");
     }
 }

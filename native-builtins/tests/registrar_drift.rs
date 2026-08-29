@@ -482,21 +482,57 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// `allowed_in(JdkOnly)`, and the strict dump reports `synthetic-stub: 0`
 /// whole-registry, so the surviving bodies serve both modes.
 const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
-    ("java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J"),
-    ("java/lang/management/ThreadMXBean", "getDaemonThreadCount", "()I"),
-    ("java/lang/management/ThreadMXBean", "getPeakThreadCount", "()I"),
+    (
+        "java/lang/management/ThreadMXBean",
+        "getAllThreadIds",
+        "()[J",
+    ),
+    (
+        "java/lang/management/ThreadMXBean",
+        "getDaemonThreadCount",
+        "()I",
+    ),
+    (
+        "java/lang/management/ThreadMXBean",
+        "getPeakThreadCount",
+        "()I",
+    ),
     ("java/lang/management/ThreadMXBean", "getThreadCount", "()I"),
-    ("java/lang/management/ThreadMXBean", "getTotalStartedThreadCount", "()J"),
-    ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringEnabled", "()Z"),
-    ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringSupported", "()Z"),
-    ("java/lang/management/ThreadMXBean", "isThreadCpuTimeSupported", "()Z"),
-    ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
+    (
+        "java/lang/management/ThreadMXBean",
+        "getTotalStartedThreadCount",
+        "()J",
+    ),
+    (
+        "java/lang/management/ThreadMXBean",
+        "isThreadContentionMonitoringEnabled",
+        "()Z",
+    ),
+    (
+        "java/lang/management/ThreadMXBean",
+        "isThreadContentionMonitoringSupported",
+        "()Z",
+    ),
+    (
+        "java/lang/management/ThreadMXBean",
+        "isThreadCpuTimeSupported",
+        "()Z",
+    ),
+    (
+        "java/lang/foreign/MemorySegment",
+        "getUtf8String",
+        "(J)Ljava/lang/String;",
+    ),
     (
         "java/lang/foreign/MemorySegment",
         "reinterpret",
         "(J)Ljava/lang/foreign/MemorySegment;",
     ),
-    ("cratonvm/internal/foreign/MemorySegmentImpl", "getUtf8String", "(J)Ljava/lang/String;"),
+    (
+        "cratonvm/internal/foreign/MemorySegmentImpl",
+        "getUtf8String",
+        "(J)Ljava/lang/String;",
+    ),
     (
         "cratonvm/internal/foreign/MemorySegmentImpl",
         "reinterpret",
@@ -2972,7 +3008,10 @@ fn param_names(sig: &str) -> Vec<String> {
             None => piece,
         };
         let name = name.trim_start_matches("mut ").trim();
-        if !name.is_empty() && name.bytes().all(|x| is_ident(x)) && !name.starts_with(|ch: char| ch.is_ascii_digit()) {
+        if !name.is_empty()
+            && name.bytes().all(|x| is_ident(x))
+            && !name.starts_with(|ch: char| ch.is_ascii_digit())
+        {
             out.push(name.to_string());
         } else {
             out.push(String::new());
@@ -3838,7 +3877,7 @@ fn build_analysis() -> Analysis {
     let mut register_sites = 0usize;
     let mut resolved_sites = 0usize;
     let mut loop_expanded_sites = 0usize;
-let mut param_bound_sites = 0usize;
+    let mut param_bound_sites = 0usize;
     let mut unresolved_where: BTreeMap<String, usize> = BTreeMap::new();
     let bump = |m: &mut BTreeMap<String, usize>, k: &str| {
         *m.entry(k.to_string()).or_insert(0) += 1;

@@ -40,13 +40,13 @@ mod class_manager;
 /// consumers in `vm-cli` / `difftest` name the type through
 /// `cratonvm_classloading::class_origin::…`.
 pub mod class_origin;
-pub mod define_census;
 mod class_path;
+pub mod define_census;
 pub(crate) mod fx_hash;
 pub mod jar_signer;
-pub mod metadata_handle;
 pub mod loader_constraints;
 pub mod loaders;
+pub mod metadata_handle;
 pub mod module;
 pub mod proxy_gen;
 pub mod resolution;
@@ -62,11 +62,10 @@ pub mod vtype;
 
 pub use class::{
     class_origin_epoch, find_field_recursive, find_field_recursive_by_descriptor,
-    find_method_recursive, invokespecial_selection_start,
-    invokevirtual_final_declaring_class, invokevirtual_private_declaring_class,
-    ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
-    RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE,
-    RECORD_OBJ_TO_STRING,
+    find_method_recursive, invokespecial_selection_start, invokevirtual_final_declaring_class,
+    invokevirtual_private_declaring_class, ArrayInfo, Class, ClassId, ClassLoaderId, ClassState,
+    ClassStore, CodeSource, RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS,
+    RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
 };
 // JDK-only mode (contract §5): every `Class` carries a `ClassOrigin`, and the
 // `--dump-class-origins` census is a `Vec<ClassOriginEntry>`. Both are named at
@@ -76,8 +75,8 @@ pub use class_origin::{ClassOrigin, ClassOriginEntry};
 // The per-registration adjudication of a native against the bytes on the class
 // path (`--dump-native-registry` schema 3's `image_declaring_method`). Named at
 // the crate root for the same reason as `ClassOrigin`: `vm` is the consumer.
-pub use class_manager::ImageMethodVerdict;
 pub use class_manager::is_bootstrap_appended_class;
+pub use class_manager::ImageMethodVerdict;
 // JVMS §5.3.3: an array class is created FROM its element type, so an absent
 // element is the request itself failing (ClassNotFoundException), not a missing
 // dependency of something found (NoClassDefFoundError). The `ClassLoader.loadClass`
@@ -93,11 +92,10 @@ pub use class_manager::synthetic_stub_field_model;
 // The per-class constructor descriptors the synthetic stub declares. Exported
 // because `native-builtins` must register natives for exactly this list —
 // the stub's method table and the registry cannot be allowed to disagree.
-pub use class_manager::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
 pub use class_manager::{
     any_class_redefined,
-    class_definition_epoch,
     bump_jit_supersede_epoch,
+    class_definition_epoch,
     drain_pending_class_hooks,
     install_class_file_load_hook,
     install_class_load_hook,
@@ -142,6 +140,7 @@ pub use class_manager::{
     CLASS_INIT_IN_PROGRESS,
     CLASS_INIT_UNINITIALIZED,
 };
+pub use class_manager::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
 pub use class_path::{ClassPath, ManifestInfo};
 // Round 5 audit fix (MED #10) / Round 7 audit fix (MED #11): expose the
 // reflective `(class, name, descriptor)` cache so VM-side reflective

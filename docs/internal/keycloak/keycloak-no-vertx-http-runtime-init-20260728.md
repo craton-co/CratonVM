@@ -106,7 +106,7 @@ level handling -- both providers end up at our own natives -- and is left as is.
    * `MAX_TOTAL_OBJECTS` was 10 000 and `put_kv` **silently dropped** every
      write to a not-yet-tracked object past that. The Keycloak boot had 24 016
      tracked objects by the time Infinispan loaded
-     `META-INF/infinispan-version.properties`, so all 14 parsed entries were
+     `../../../apps/META-INF/infinispan-version.properties`, so all 14 parsed entries were
      discarded. Raised to 262 144 (it is a runaway-growth backstop, not a
      working-set limit) and the drop is now visible under
      `CRATONVM_DIAG_PROPERTIES`.

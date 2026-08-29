@@ -132,7 +132,10 @@ fn n_registrations_produce_n_minus_one_rows_naming_one_winner() {
     let shadowed = registry.shadowed_registrations();
     assert_eq!(shadowed.len(), 3, "four registrations, three losers");
 
-    let winners: Vec<_> = shadowed.iter().filter_map(|r| r.winner_at.clone()).collect();
+    let winners: Vec<_> = shadowed
+        .iter()
+        .filter_map(|r| r.winner_at.clone())
+        .collect();
     assert_eq!(winners.len(), 3);
     assert!(
         winners.windows(2).all(|w| w[0] == w[1]),
@@ -213,7 +216,10 @@ fn the_baseline_key_carries_no_line_number() {
         "provenance must name this test file, not registry.rs — `register` is \
          `#[track_caller]` and must stay that way; got {file}"
     );
-    assert!(!file.contains('\\'), "separators must be normalised: {file}");
+    assert!(
+        !file.contains('\\'),
+        "separators must be normalised: {file}"
+    );
 }
 
 /// The free function and the registry method are the same analysis.

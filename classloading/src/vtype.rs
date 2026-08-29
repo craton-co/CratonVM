@@ -1481,8 +1481,19 @@ mod tests {
     #[test]
     fn valid_field_descriptors_accepted() {
         for d in [
-            "I", "J", "D", "F", "B", "C", "S", "Z", "[I", "[[J", "Ljava/lang/String;",
-            "[Ljava/lang/Object;", "[[Ljava/util/Map$Entry;",
+            "I",
+            "J",
+            "D",
+            "F",
+            "B",
+            "C",
+            "S",
+            "Z",
+            "[I",
+            "[[J",
+            "Ljava/lang/String;",
+            "[Ljava/lang/Object;",
+            "[[Ljava/util/Map$Entry;",
         ] {
             assert!(is_valid_field_descriptor(d), "{d} should be valid");
         }
@@ -1491,16 +1502,16 @@ mod tests {
     #[test]
     fn malformed_field_descriptors_rejected() {
         for d in [
-            "",                     // empty
-            "V",                    // void is not a field type
-            "Q",                    // unknown tag
-            "L",                    // bare L
-            "Ljava/lang/String",    // unterminated
-            "L;",                   // empty class name
-            "Lja.va/Foo;",          // '.' is illegal in an internal name
-            "[",                    // dangling array marker
-            "II",                   // trailing garbage
-            "Ljava/lang/String;X",  // trailing garbage
+            "",                    // empty
+            "V",                   // void is not a field type
+            "Q",                   // unknown tag
+            "L",                   // bare L
+            "Ljava/lang/String",   // unterminated
+            "L;",                  // empty class name
+            "Lja.va/Foo;",         // '.' is illegal in an internal name
+            "[",                   // dangling array marker
+            "II",                  // trailing garbage
+            "Ljava/lang/String;X", // trailing garbage
         ] {
             assert!(!is_valid_field_descriptor(d), "{d} should be rejected");
         }
@@ -1525,13 +1536,13 @@ mod tests {
         for d in [
             "",
             "V",
-            "()",                    // no return type
-            "(I",                    // no ')'
-            "I)V",                   // no '('
-            "()VV",                  // trailing garbage
-            "(Ljava/lang/String)V",  // unterminated parameter
-            "(Q)V",                  // unknown parameter tag
-            "()Q",                   // unknown return tag
+            "()",                   // no return type
+            "(I",                   // no ')'
+            "I)V",                  // no '('
+            "()VV",                 // trailing garbage
+            "(Ljava/lang/String)V", // unterminated parameter
+            "(Q)V",                 // unknown parameter tag
+            "()Q",                  // unknown return tag
         ] {
             assert!(!is_valid_method_descriptor(d), "{d} should be rejected");
         }

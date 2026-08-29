@@ -262,9 +262,7 @@ fn emit_load_mem(out: &mut Vec<u8>, dst: u8, base: u8, disp: i32, load: CaptureL
 fn capture_payload_offset(index: usize, load: CaptureLoad) -> i32 {
     let cell = cratonvm_types::HEADER_SIZE + index * cratonvm_types::SLOT_SIZE;
     let payload = match load {
-        CaptureLoad::Reference | CaptureLoad::Wide => {
-            cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET
-        }
+        CaptureLoad::Reference | CaptureLoad::Wide => cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET,
         CaptureLoad::Float | CaptureLoad::Int => cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET,
     };
     (cell + payload) as i32 // Cast: x86-64 disp32; a capture index is small
@@ -350,9 +348,8 @@ pub fn lambda_adapter_shape_collisions() -> u64 {
 /// thunk is reachable from an inline-cache slot that this map cannot see, so
 /// its lifetime is the process's, matching how the JIT retains compiled code
 /// by default.
-fn adapters() -> &'static parking_lot::Mutex<
-    std::collections::HashMap<AdapterKey, Arc<CompiledMethod>>,
-> {
+fn adapters(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<AdapterKey, Arc<CompiledMethod>>> {
     static ADAPTERS: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<AdapterKey, Arc<CompiledMethod>>>,
     > = std::sync::OnceLock::new();
@@ -601,7 +598,11 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn one_int_capture_loads_the_cell_and_leaves_the_sam_arg_alone() {
         let code = emit_adapter(0, &[CaptureLoad::Int], 1, 0);
-        assert_eq!(&code[..3], &[0x49, 0x89, 0xFB], "mov r11, rdi (save the proxy)");
+        assert_eq!(
+            &code[..3],
+            &[0x49, 0x89, 0xFB],
+            "mov r11, rdi (save the proxy)"
+        );
         // MOVSXD rdi, [r11 + HEADER_SIZE + PAYLOAD32] = 16 + 4 = 20.
         assert_eq!(&code[3..6], &[0x49, 0x63, 0xBB], "movsxd rdi, [r11+disp32]");
         assert_eq!(&code[6..10], &20i32.to_le_bytes());
@@ -616,7 +617,11 @@ mod tests {
     fn two_captures_slide_the_sam_arg_up_before_loading() {
         let code = emit_adapter(0, &[CaptureLoad::Int, CaptureLoad::Int], 1, 0);
         assert_eq!(&code[..3], &[0x49, 0x89, 0xFB], "mov r11, rdi");
-        assert_eq!(&code[3..6], &[0x48, 0x89, 0xF2], "mov rdx, rsi — the SAM arg moves first");
+        assert_eq!(
+            &code[3..6],
+            &[0x48, 0x89, 0xF2],
+            "mov rdx, rsi — the SAM arg moves first"
+        );
         assert_eq!(&code[6..9], &[0x49, 0x63, 0xBB], "movsxd rdi, [r11+20]");
         assert_eq!(&code[9..13], &20i32.to_le_bytes());
         assert_eq!(&code[13..16], &[0x49, 0x63, 0xB3], "movsxd rsi, [r11+36]");
@@ -630,7 +635,11 @@ mod tests {
     fn a_reference_capture_reads_the_64_bit_payload() {
         let code = emit_adapter(0, &[CaptureLoad::Reference], 0, 0);
         assert_eq!(&code[3..6], &[0x49, 0x8B, 0xBB], "mov rdi, [r11+disp32]");
-        assert_eq!(&code[6..10], &24i32.to_le_bytes(), "HEADER_SIZE + PAYLOAD64");
+        assert_eq!(
+            &code[6..10],
+            &24i32.to_le_bytes(),
+            "HEADER_SIZE + PAYLOAD64"
+        );
     }
 
     /// A `float` capture is a 4-byte load into the 32-bit register, which
@@ -655,12 +664,20 @@ mod tests {
     fn the_three_loads_encode_the_same_on_both_abis() {
         let mut out = Vec::new();
         emit_load_mem(&mut out, 7, R11, 0x18, CaptureLoad::Reference);
-        assert_eq!(out[..3], [0x49, 0x8B, 0xBB], "REX.WB + MOV r64,m64 + mod=10");
+        assert_eq!(
+            out[..3],
+            [0x49, 0x8B, 0xBB],
+            "REX.WB + MOV r64,m64 + mod=10"
+        );
         assert_eq!(out[3..], 0x18i32.to_le_bytes(), "disp32, always");
 
         out.clear();
         emit_load_mem(&mut out, 7, R11, 0x14, CaptureLoad::Wide);
-        assert_eq!(out[..3], [0x49, 0x8B, 0xBB], "a Wide is the same 8-byte load");
+        assert_eq!(
+            out[..3],
+            [0x49, 0x8B, 0xBB],
+            "a Wide is the same 8-byte load"
+        );
 
         out.clear();
         emit_load_mem(&mut out, 7, R11, 0x14, CaptureLoad::Float);
@@ -673,7 +690,11 @@ mod tests {
 
         out.clear();
         emit_load_mem(&mut out, 7, R11, 0x14, CaptureLoad::Int);
-        assert_eq!(out[..3], [0x49, 0x63, 0xBB], "MOVSXD — the int category sign-extends");
+        assert_eq!(
+            out[..3],
+            [0x49, 0x63, 0xBB],
+            "MOVSXD — the int category sign-extends"
+        );
     }
 
     /// Where each capture's payload sits: uniform 16-byte cells from

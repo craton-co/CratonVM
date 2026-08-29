@@ -27,12 +27,12 @@
 //! function of values constructed here, so this file runs in the default build
 //! on every platform.
 
+use cratonvm_types::error::JdkOnlyViolation;
 use cratonvm_vm::config::{
     CompatibilityMode, ExecutionPolicy, JdkMode, VmConfig, EMBEDDED_DEFAULT_COMPATIBILITY_MODE,
     LAUNCHER_DEFAULT_COMPATIBILITY_MODE,
 };
 use cratonvm_vm::error::VmError;
-use cratonvm_types::error::JdkOnlyViolation;
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -87,7 +87,10 @@ fn embedded_default_is_compatible_too() {
 #[test]
 fn compatibility_mode_default_impl_is_the_permissive_one() {
     assert_eq!(CompatibilityMode::default(), CompatibilityMode::Compatible);
-    assert_eq!(ExecutionPolicy::default(), ExecutionPolicy::compatible(true));
+    assert_eq!(
+        ExecutionPolicy::default(),
+        ExecutionPolicy::compatible(true)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -133,14 +136,12 @@ fn strict_plus_synthetic_library_is_a_configuration_error() {
         .with_jdk_mode(JdkMode::Synthetic)
         .with_compatibility_mode(CompatibilityMode::JdkOnly);
 
-    let err = cfg
-        .validate_compatibility()
-        .expect_err(
-            "--jdk-only means real class bytes are authoritative; the \
+    let err = cfg.validate_compatibility().expect_err(
+        "--jdk-only means real class bytes are authoritative; the \
              synthetic library is built entirely out of the substitutions the \
              mode exists to forbid, so there would be no class library left to \
              run",
-        );
+    );
     let msg = match err {
         VmError::InvalidConfiguration(m) => m,
         other => panic!(
@@ -381,7 +382,10 @@ fn every_violation_names_its_class_and_method_descriptor() {
             | JdkOnlyViolation::MissingBootClass { class, .. }
             | JdkOnlyViolation::MissingImplementation { class, .. } => class.clone(),
         };
-        assert!(summary.contains(&class), "summary lost the class: {summary}");
+        assert!(
+            summary.contains(&class),
+            "summary lost the class: {summary}"
+        );
         assert!(rendered.contains(&class), "render lost the class");
         assert!(json.contains(&class), "to_json lost the class");
 

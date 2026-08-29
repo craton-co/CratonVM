@@ -217,8 +217,7 @@ pub fn set_enabled(v: bool) {
 
 /// Number of running recordings summed over every [`FlightRecorder`] in the
 /// process. [`is_enabled`] is `true` exactly while this is non-zero.
-static RUNNING_RECORDINGS: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+static RUNNING_RECORDINGS: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 /// Publish a recorder's change in running-recording count.
 ///

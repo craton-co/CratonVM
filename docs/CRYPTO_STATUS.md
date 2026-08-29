@@ -140,7 +140,7 @@ below.**
 Signed-JAR trust decisions are handled by a **separate, self-contained**
 implementation in `classloading/src/jar_signer.rs` — not the JCA
 `Signature` provider above.  It parses the PKCS#7 / CMS SignedData
-signer block (`META-INF/*.RSA|.DSA|.EC`), verifies the `messageDigest`
+signer block (`../apps/META-INF/*.RSA|.DSA|.EC`), verifies the `messageDigest`
 authenticated attribute against the `.SF` digest, verifies the
 SignerInfo signature over the SignedAttributes against the leaf
 certificate, and walks the X.509 chain to a trust anchor.  It is

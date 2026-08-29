@@ -58,8 +58,7 @@ fn bi_read_mag_be(ctx: &dyn NativeContext, mag: ObjectRef, len: usize) -> Vec<u3
 fn bi_write_mag_be(ctx: &mut dyn NativeContext, mag: ObjectRef, be: &[u32]) {
     // SAFETY of the cast: `[u32]` and `[i32]` have identical layout; the
     // element loop below performs the same `w as i32` reinterpretation.
-    let signed: &[i32] =
-        unsafe { std::slice::from_raw_parts(be.as_ptr() as *const i32, be.len()) };
+    let signed: &[i32] = unsafe { std::slice::from_raw_parts(be.as_ptr() as *const i32, be.len()) };
     if ctx.write_int_array_from(mag, 0, signed) {
         return;
     }
@@ -263,7 +262,10 @@ pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
     }
 }
 
-pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn bi_alloc(
+    ctx: &mut dyn NativeContext,
+    value: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = bignum_alloc(ctx, BignumClass::Integer, 2)?;
     // GC-SAFETY (use-after-move — mirrors the `bi_alloc_int` fix): `obj` is
     // freshly allocated and not yet reachable from any Java root. The
@@ -340,7 +342,10 @@ pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bi
 /// `O(words)`, writing `signum` + big-endian `mag:[I` directly with NO decimal
 /// conversion (unlike `bi_alloc`, which goes through `decimal_to_mag_words`).
 /// Fast write boundary for the limb rewrite.
-pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn bi_alloc_int(
+    ctx: &mut dyn NativeContext,
+    v: &crate::bigint::BigInt,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = bignum_alloc(ctx, BignumClass::Integer, 2)?;
     // GC-SAFETY (bc math-ec use-after-move, 2026-06-05): `obj` is freshly
     // allocated and NOT yet reachable from any Java root. The `new_array` /
@@ -1056,11 +1061,14 @@ pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
 
 #[cfg(test)]
 mod biginteger_modpow_modinverse_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bi_alloc_int, bi_mod_inverse_str, bi_mod_pow_str};
     use crate::bigint::BigInt;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // --- modPow sign handling (the registered native delegates to these
     //     helpers; these tests pin the underlying arithmetic that the old
@@ -1986,9 +1994,7 @@ fn bi_pow_check_range(base: &crate::bigint::BigInt, exp: i32) -> Result<(), Meth
     // `if (scaleFactor <= Long.SIZE) { …small path, cannot overflow… }`
     // `if (scaleFactor + bitsToShift - exponent >= Integer.MAX_VALUE) reportOverflow();`
     let scale_factor = remaining_bits * i64::from(exp);
-    if scale_factor > 64
-        && scale_factor + bits_to_shift - i64::from(exp) >= i64::from(i32::MAX)
-    {
+    if scale_factor > 64 && scale_factor + bits_to_shift - i64::from(exp) >= i64::from(i32::MAX) {
         return Err(bi_overflow());
     }
     Ok(())
@@ -2024,17 +2030,17 @@ fn bd_pow_ten_check(n: i32) -> Result<(), MethodCallFailed> {
 /// OpenJDK 25.0.3+9; the probes are `scratchpad/f7/{Pow,Scale,Shr}.java`.
 #[cfg(test)]
 mod argument_driven_range_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{
-        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
-        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
-    };
     use super::{
         bd_narrowing_truncates_to_zero, bd_plain_string_check, bd_pow_ten_check, bd_product_scale,
         bd_rescale_operand, bd_to_big_integer_check, bd_to_f32, bd_to_f64, bd_truncate,
         bi_pow_check_range, bi_shift_right_str,
     };
     use crate::bigint::BigInt;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::error::{MethodCallFailed, VmError};
 
     /// `"<ExceptionClass>: <message>"` — the same shape as the `!!` column of
@@ -2786,9 +2792,7 @@ fn bi_ctor_string_arg(
     match arg {
         Some(Value::Object(Some(o))) => Ok(ctx.read_string(*o).unwrap_or_default()),
         _ => Err(RuntimeError::NullPointerException {
-            message: Some(
-                "Cannot invoke \"String.length()\" because \"val\" is null".to_string(),
-            ),
+            message: Some("Cannot invoke \"String.length()\" because \"val\" is null".to_string()),
         }
         .into()),
     }
@@ -3569,7 +3573,11 @@ fn bd_unscaled_and_precision(value: &str, scale: i32) -> (String, i32) {
     (unscaled, precision)
 }
 
-fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn bd_alloc(
+    ctx: &mut dyn NativeContext,
+    value: &str,
+    scale: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = bignum_alloc(ctx, BignumClass::Decimal, 3)?;
     // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
     // across the `bi_alloc` / `create_string` allocations below, which can
@@ -4042,7 +4050,12 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Populate an existing `BigDecimal` instance from a decimal string + scale.
 /// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
 /// synthetic value/scale/precision) automatically.
-fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) -> Result<(), MethodCallFailed> {
+fn bd_write_into(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    value: &str,
+    scale: i32,
+) -> Result<(), MethodCallFailed> {
     // GC-SAFETY (use-after-move — see `bi_alloc`): pin `this` across the
     // `bi_alloc` / `create_string` allocations, which can trigger a minor GC
     // that relocates it. Re-read the forwarded ref before the `set_field`s so we
@@ -5554,10 +5567,7 @@ mod bi_to_string_radix_tests {
         assert_eq!(s(big, 16), "18ee90ff6c373e0ee4e3f0ad2");
         assert_eq!(s(big, 36), "byw97um9s91dlz68tsi");
         assert_eq!(s(big, 8), "143564417755415637016711617605322");
-        assert_eq!(
-            s(&format!("-{big}"), 16),
-            "-18ee90ff6c373e0ee4e3f0ad2"
-        );
+        assert_eq!(s(&format!("-{big}"), 16), "-18ee90ff6c373e0ee4e3f0ad2");
         assert_eq!(s(&format!("-{big}"), 36), "-byw97um9s91dlz68tsi");
     }
 

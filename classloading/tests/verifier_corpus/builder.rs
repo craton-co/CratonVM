@@ -75,7 +75,13 @@ pub const ACC_PUBLIC: u16 = 0x0001;
 pub const ACC_STATIC: u16 = 0x0008;
 
 impl MethodSpec {
-    pub fn new(name: &str, descriptor: &str, max_stack: u16, max_locals: u16, code: Vec<u8>) -> Self {
+    pub fn new(
+        name: &str,
+        descriptor: &str,
+        max_stack: u16,
+        max_locals: u16,
+        code: Vec<u8>,
+    ) -> Self {
         MethodSpec {
             access_flags: ACC_PUBLIC | ACC_STATIC,
             name: name.to_string(),
@@ -114,7 +120,10 @@ impl MethodSpec {
 /// A `same_frame` entry (JVMS §4.7.4): identical locals, empty stack.
 /// `offset_delta` must be in `0..=63`.
 pub fn same_frame(offset_delta: u8) -> Vec<u8> {
-    assert!(offset_delta <= 63, "same_frame offset_delta must fit 0..=63");
+    assert!(
+        offset_delta <= 63,
+        "same_frame offset_delta must fit 0..=63"
+    );
     vec![offset_delta]
 }
 

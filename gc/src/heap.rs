@@ -294,9 +294,7 @@ impl Heap {
         let topo = numa::global_topology();
         let num_numa_nodes = topo.num_nodes.max(1);
         Self {
-            layout_domain: std::sync::atomic::AtomicU32::new(
-                cratonvm_types::FIRST_LAYOUT_DOMAIN,
-            ),
+            layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
             from_space: Mutex::new(Arena::new(half)),
             to_space: Mutex::new(Arena::new(half)),
             next_hash_code: AtomicI32::new(1),
@@ -636,9 +634,7 @@ impl Heap {
                 // Not NEUTRAL: the object inflated, and the hash went with it
                 // into its Monitor. Never mint here -- see
                 // `collector::displaced_identity_hash`.
-                crate::collector::displaced_identity_hash(
-                    header.mark_word.load(Ordering::Relaxed),
-                )
+                crate::collector::displaced_identity_hash(header.mark_word.load(Ordering::Relaxed))
             }
         }
     }
@@ -2393,8 +2389,7 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 /// Relaxed throughout: this is a diagnostic on an already-failed path, and the
 /// only ordering that matters - the counter moving before the reader re-reads it
 /// - comes from the read being sequenced between the two loads on one thread.
-static CORRUPT_CELL_SLOT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static CORRUPT_CELL_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CORRUPT_CELL_RAW0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CORRUPT_CELL_RAW1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CORRUPT_CELL_TID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3518,8 +3513,10 @@ mod tests {
         let a = heap.alloc_object(ClassId::new(7), 1);
         let b = heap.alloc_object(ClassId::new(7), 1);
         let arr = heap.alloc_array(ClassId::new(3), ArrayElementType::Reference, 2);
-        heap.set_array_element(arr, 0, Value::Object(Some(a))).unwrap();
-        heap.set_array_element(arr, 1, Value::Object(Some(b))).unwrap();
+        heap.set_array_element(arr, 0, Value::Object(Some(a)))
+            .unwrap();
+        heap.set_array_element(arr, 1, Value::Object(Some(b)))
+            .unwrap();
         let before = crate::heap::array_receiver_field_accesses();
 
         assert!(heap.get_field(arr, 0).is_null());

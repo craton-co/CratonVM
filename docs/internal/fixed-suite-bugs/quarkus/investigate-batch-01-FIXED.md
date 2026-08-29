@@ -85,7 +85,7 @@ Any quarkus PASS with `started=0` is worth re-reading as unknown, not green.
 
 With the two bootstrap classes finally running, both failed: `Failed to load
 beans`, from `Sisu.addClassLoader`, which parses every
-`META-INF/plexus/components.xml` on the classpath while concurrently
+`../../../../apps/META-INF/plexus/components.xml` on the classpath while concurrently
 class-loading 591 bean classes. 5–22 of the 46 documents failed on every run
 with `ParseError at [1,2]: The markup in the document preceding the root
 element must be well-formed` or `[1,11]: The processing instruction target

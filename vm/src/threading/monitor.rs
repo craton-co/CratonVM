@@ -231,10 +231,8 @@ fn monitor_pending_notify() -> bool {
 /// say how much of the waking this VM does actually depends on the signal:
 /// `consumed` far above `condvar_signalled` would mean the condvar was
 /// carrying almost none of it.
-static NOTIFY_CREDITS_CREATED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static NOTIFY_CREDITS_CONSUMED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static NOTIFY_CREDITS_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOTIFY_CREDITS_CONSUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CONDVAR_SIGNALLED_RETURNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Credits taken on a wakeup the condvar did NOT signal — the waiter's
@@ -265,7 +263,11 @@ pub fn report_monitor_notify_census_at_exit() {
         NOTIFY_CREDITS_CONSUMED.load(Relaxed),
         NOTIFY_CREDITS_TAKEN_UNSIGNALLED.load(Relaxed),
         CONDVAR_SIGNALLED_RETURNS.load(Relaxed),
-        if monitor_pending_notify() { "ON" } else { "OFF" },
+        if monitor_pending_notify() {
+            "ON"
+        } else {
+            "OFF"
+        },
     );
 }
 
@@ -872,12 +874,10 @@ impl Monitor {
     /// wrong even though it looks equivalent.
     #[inline]
     pub fn displace_hash(&self, hash: i32) -> i32 {
-        match self.displaced_hash.compare_exchange(
-            0,
-            hash,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .displaced_hash
+            .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => hash,
             Err(existing) => existing,
         }
@@ -2257,7 +2257,9 @@ impl MonitorTable {
     #[cold]
     fn dbg_monexit_forensics(&self, obj_ref: ObjectRef, tid: ThreadId, mark: u64, arm: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MONEXIT").is_some()) {
+        if !*ON
+            .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MONEXIT").is_some())
+        {
             return;
         }
         let key = obj_ref.as_ptr() as usize;
@@ -2475,9 +2477,7 @@ impl MonitorTable {
             .map_err(|MonitorError::NotOwner| {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
-                        message: format!(
-                            "current thread is not owner"
-                        ),
+                        message: format!("current thread is not owner"),
                     },
                 ))
             })
@@ -2491,9 +2491,7 @@ impl MonitorTable {
         monitor.notify(thread_id).map_err(|MonitorError::NotOwner| {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::IllegalMonitorStateException {
-                    message: format!(
-                        "current thread is not owner"
-                    ),
+                    message: format!("current thread is not owner"),
                 },
             ))
         })
@@ -3442,7 +3440,6 @@ mod tests {
 
     #[test]
     fn monitor_contention_two_threads() {
-
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let heap = Heap::new();
@@ -3687,7 +3684,9 @@ mod tests {
             // spurious wake (which is all the interrupt wake is, to this
             // thread) simply re-parks.
             while !waiter_cond.load(Ordering::Acquire) {
-                waiter_table.wait(obj, ThreadId(1), Some(2_000), None).unwrap();
+                waiter_table
+                    .wait(obj, ThreadId(1), Some(2_000), None)
+                    .unwrap();
             }
             waiter_table.exit(obj, ThreadId(1)).unwrap();
         });
@@ -3703,7 +3702,9 @@ mod tests {
         table.notify(obj, ThreadId(2)).unwrap();
         table.exit(obj, ThreadId(2)).unwrap();
 
-        waiter.join().expect("notify was lost after an interrupt wake");
+        waiter
+            .join()
+            .expect("notify was lost after an interrupt wake");
     }
 
     /// An interrupt aimed at an object that has never been waited on must not

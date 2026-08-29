@@ -46,7 +46,7 @@ entry = jarFile.getJarEntry(entry.getName());   // once PER ENTRY
 ```
 
 and `getJarEntry` reaches `jar_contents_cached` up to three times —
-`p59_jar_is_multi_release`, the `META-INF/versions/N/…` search, and the entry
+`p59_jar_is_multi_release`, the `../../../apps/META-INF/versions/N/…` search, and the entry
 lookup itself. Tomcat runs that scan once per embedded-container start;
 `TomcatServletWebServerFactoryTests` starts 121 of them over a 130-jar test
 classpath, 38 of which really are multi-release.

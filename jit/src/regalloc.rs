@@ -2408,8 +2408,7 @@ mod tests {
         //  6: 0xb1        return
         let code = [0x15, 0x46, 0x36, 0x46, 0x15, 0x46, 0xb1];
         let code_len = code.len();
-        let (rows, covered, words) =
-            live_locals_per_pc_all(&code, code_len, 0, &[], &[], 71);
+        let (rows, covered, words) = live_locals_per_pc_all(&code, code_len, 0, &[], &[], 71);
         assert_eq!(words, 2, "71 locals needs two 64-slot windows");
         assert!(covered[0] && covered[2] && covered[4]);
 
@@ -2419,7 +2418,8 @@ mod tests {
             live_locals_per_pc_with_handlers(&code, code_len, 0, &[], &[]);
         for pc in 0..=code_len {
             assert_eq!(
-                rows[pc * words], old_rows[pc],
+                rows[pc * words],
+                old_rows[pc],
                 "window 0 must equal the 64-local analysis at pc {pc}"
             );
             assert_eq!(covered[pc], old_covered[pc], "coverage differs at pc {pc}");
@@ -2437,7 +2437,11 @@ mod tests {
             0,
             "slot 70 is dead at the store that overwrites it"
         );
-        assert_ne!(rows[4 * words + 1] & bit, 0, "slot 70 is live at its second use");
+        assert_ne!(
+            rows[4 * words + 1] & bit,
+            0,
+            "slot 70 is live at its second use"
+        );
     }
 
     /// The window form of the parameter seed must place a parameter slot in the
@@ -3059,7 +3063,8 @@ mod tests {
         let code = [0x2a, 0x1f, 0x2d, 0x01, 0xb6, 0x00, 0x01, 0xb1];
         let param_slots = [0usize, 1, 3, 4];
 
-        let result = allocate_registers_with_handlers(&code, code.len(), 5, 4, &param_slots, &[], &[]);
+        let result =
+            allocate_registers_with_handlers(&code, code.len(), 5, 4, &param_slots, &[], &[]);
         let homes: Vec<Option<u8>> = param_slots
             .iter()
             .map(|&s| result.assignments.get(s).copied().flatten())
@@ -3118,7 +3123,10 @@ mod tests {
             0,
             "local 1 must be live at the protected pc — the handler reads it"
         );
-        assert!(covered[8], "the handler pc must become a covered block start");
+        assert!(
+            covered[8],
+            "the handler pc must become a covered block start"
+        );
         assert_eq!(
             aware[1] & (1 << 1),
             0,
@@ -3548,14 +3556,34 @@ mod tests {
         }
         code.push(0xb1); // return
         let code_len = code.len();
-        let result = allocate_registers_with(&code, code_len, 12, 12, &[], &[], &ARM64_LOCAL_GPRS, &ARM64_LOCAL_FPS, &[]);
+        let result = allocate_registers_with(
+            &code,
+            code_len,
+            12,
+            12,
+            &[],
+            &[],
+            &ARM64_LOCAL_GPRS,
+            &ARM64_LOCAL_FPS,
+            &[],
+        );
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
 
     #[test]
     fn save_area_contract_holds_for_the_handler_shaped_method() {
         let code = HANDLER_AFTER_RETURN;
-        let result = allocate_registers_with(&code, code.len(), 3, 1, &[], &[], &ARM64_LOCAL_GPRS, &ARM64_LOCAL_FPS, &[]);
+        let result = allocate_registers_with(
+            &code,
+            code.len(),
+            3,
+            1,
+            &[],
+            &[],
+            &ARM64_LOCAL_GPRS,
+            &ARM64_LOCAL_FPS,
+            &[],
+        );
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
 
@@ -4320,7 +4348,8 @@ fn ls_bit_set(bits: &mut [u64], i: usize) {
 /// Is bit `i` set?
 #[inline]
 fn ls_bit_get(bits: &[u64], i: usize) -> bool {
-    bits.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+    bits.get(i / 64)
+        .is_some_and(|w| w & (1u64 << (i % 64)) != 0)
 }
 
 /// Visit every set bit, in increasing order.
@@ -5182,7 +5211,11 @@ pub fn allocate_linear_scan(
         if live.is_ref[id] && model.range_covers_safepoint(range) {
             continue;
         }
-        if model.regs.class_size(live.class[id].unwrap_or(RegClass::Gp)) == 0 {
+        if model
+            .regs
+            .class_size(live.class[id].unwrap_or(RegClass::Gp))
+            == 0
+        {
             continue;
         }
         promotable[id] = true;
@@ -5928,7 +5961,10 @@ pub fn verify_allocation(
             if live.pinned.get(id).copied().unwrap_or(false) {
                 return Err(Bailout::with_context(
                     BailoutReason::Internal("regalloc: a pinned value was promoted"),
-                    format!("n{node} holds {reg} over [{}, {}]", seg.range.lo, seg.range.hi),
+                    format!(
+                        "n{node} holds {reg} over [{}, {}]",
+                        seg.range.lo, seg.range.hi
+                    ),
                 ));
             }
             if live.is_ref.get(id).copied().unwrap_or(false)
@@ -6028,7 +6064,10 @@ pub fn verify_allocation(
                     BailoutReason::Internal(
                         "regalloc: an ABI-pinned value is in the wrong register",
                     ),
-                    format!("n{} needs {} at {} but holds {actual}", f.node, f.reg, f.pos),
+                    format!(
+                        "n{} needs {} at {} but holds {actual}",
+                        f.node, f.reg, f.pos
+                    ),
                 ));
             }
         }
@@ -6043,7 +6082,10 @@ pub fn verify_allocation(
                     BailoutReason::Internal(
                         "regalloc: an ABI-pinned register is held by another value",
                     ),
-                    format!("n{other} holds {} at {}, pinned to n{}", f.reg, f.pos, f.node),
+                    format!(
+                        "n{other} holds {} at {}, pinned to n{}",
+                        f.reg, f.pos, f.node
+                    ),
                 ));
             }
         }
@@ -6546,7 +6588,11 @@ mod linear_scan_tests {
 
         let alloc = allocate_linear_scan(&graph, &live, &model).expect("allocates");
         let segs = &alloc.segments[v as usize];
-        assert_eq!(segs.len(), 3, "prefix in r0, memory over the call, then back");
+        assert_eq!(
+            segs.len(),
+            3,
+            "prefix in r0, memory over the call, then back"
+        );
         assert_eq!(
             segs[0],
             Segment {
@@ -7090,7 +7136,10 @@ mod linear_scan_tests {
                 checked += 1;
             }
         }
-        assert!(checked > 0, "the swap loop must have phi arguments to check");
+        assert!(
+            checked > 0,
+            "the swap loop must have phi arguments to check"
+        );
     }
 
     #[test]
@@ -7103,8 +7152,7 @@ mod linear_scan_tests {
 
         let mut saw_hazard = false;
         for b in 0..schedule.blocks.len() {
-            let copies =
-                phi_edge_copies(&graph, &schedule, &live, &alloc, b).expect("edge copies");
+            let copies = phi_edge_copies(&graph, &schedule, &live, &alloc, b).expect("edge copies");
             if copies.is_empty() {
                 continue;
             }

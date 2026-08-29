@@ -158,11 +158,7 @@ mod tests {
         let a = obs("42");
         let b = obs("42");
         let c = obs("42");
-        let runs = [
-            (Mode::NoJit, &a),
-            (Mode::DirectEmit, &b),
-            (Mode::IrJit, &c),
-        ];
+        let runs = [(Mode::NoJit, &a), (Mode::DirectEmit, &b), (Mode::IrJit, &c)];
         assert!(disagreements(&runs).is_empty());
     }
 
@@ -189,7 +185,11 @@ mod tests {
         let a = obs("42");
         let b = obs("42");
         let odd = obs("99");
-        let runs = [(Mode::NoJit, &a), (Mode::DirectEmit, &b), (Mode::IrJit, &odd)];
+        let runs = [
+            (Mode::NoJit, &a),
+            (Mode::DirectEmit, &b),
+            (Mode::IrJit, &odd),
+        ];
         let splits = disagreements(&runs);
         assert_eq!(splits.len(), 2);
         let labels: Vec<String> = splits.iter().map(|s| s.label()).collect();

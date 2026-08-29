@@ -33,9 +33,8 @@ use std::collections::HashMap;
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_MARKED,
-    HEADER_SIZE,
-    REF_ELEMENT_SIZE, SLOT_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_MARKED, HEADER_SIZE, REF_ELEMENT_SIZE,
+    SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::{ObjectRef, Value};
@@ -146,8 +145,7 @@ pub static WALK_DESYNC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// that some earlier phase left a live reference to an unwalked address.
 /// Silent before this counter existed; a compaction that reclaims nothing and
 /// a compaction that had nothing to reclaim look identical from outside.
-pub static COMPACT_ESCAPE_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static COMPACT_ESCAPE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GCAUD-9 (2026-08-03): how many old-gen compactions were ABANDONED because
 /// `walk_objects` covered fewer bytes than `used_bytes` says are allocated —
@@ -418,8 +416,7 @@ impl OldGen {
             if overlaps > 0 {
                 crate::gen_heap::OLD_FREE_LIST_OVERLAPS
                     .fetch_add(overlaps as u64, std::sync::atomic::Ordering::Relaxed);
-                static REPORTS: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
+                static REPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                     let (o, s, n) = first.unwrap_or((0, 0, 0));
                     tracing::error!(
@@ -1213,7 +1210,9 @@ impl OldGen {
                     obj_ptr as usize,
                     total_size,
                     header.class_id.as_u32(),
-                    ObjectHeader::kind_tag(header.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
+                    ObjectHeader::kind_tag(
+                        header.mark_word.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
                     crate::gen_heap::OLD_FREED_SITE_COMPACT,
                     drop_flags.get(&(obj_ptr as usize)).copied().unwrap_or(0),
                 );
@@ -1489,10 +1488,7 @@ impl OldGen {
     /// closure ran off `objects`; `objects_promoted` counts the under-marked
     /// objects this pass rescued and is the signal that the marker missed a
     /// push site (it is `0` on every healthy cycle).
-    fn close_live_set_over_old_gen(
-        objects: &[(*mut u8, usize)],
-        data: &[u8],
-    ) -> (usize, bool) {
+    fn close_live_set_over_old_gen(objects: &[(*mut u8, usize)], data: &[u8]) -> (usize, bool) {
         // `walk_objects` yields ascending object starts, so a binary search
         // over the same slice is an exact membership test with no extra
         // allocation. Assert the ordering rather than assume it: this is the
@@ -1501,8 +1497,11 @@ impl OldGen {
             objects.windows(2).all(|w| w[0].0 < w[1].0),
             "close_live_set_over_old_gen requires ascending object starts",
         );
-        let is_walked_base =
-            |addr: usize| objects.binary_search_by_key(&addr, |&(p, _)| p as usize).is_ok();
+        let is_walked_base = |addr: usize| {
+            objects
+                .binary_search_by_key(&addr, |&(p, _)| p as usize)
+                .is_ok()
+        };
 
         let mut escaped = false;
         let mut promoted_total = 0usize;
@@ -1766,7 +1765,10 @@ mod tests {
             collected_offsets(&og, &ranges),
             expected_in_ranges(&offsets, &ranges)
         );
-        assert_eq!(collected_offsets(&og, &ranges), vec![offsets[2], offsets[3]]);
+        assert_eq!(
+            collected_offsets(&og, &ranges),
+            vec![offsets[2], offsets[3]]
+        );
     }
 
     #[test]
@@ -1916,7 +1918,8 @@ mod tests {
             ptrs.push(og.alloc(S, 8).expect("fresh old gen must serve S bytes"));
         }
         let tail = og.capacity() - og.used();
-        og.alloc(tail, 8).expect("the trailing free block must be allocatable");
+        og.alloc(tail, 8)
+            .expect("the trailing free block must be allocatable");
         assert_eq!(og.free_block_count(), 0, "no free space must remain");
 
         for p in ptrs.drain(..) {
@@ -1974,7 +1977,8 @@ mod tests {
         let live = og.alloc(S, 8).unwrap();
         let c = og.alloc(S, 8).unwrap();
         let tail = og.capacity() - og.used();
-        og.alloc(tail, 8).expect("the trailing free block must be allocatable");
+        og.alloc(tail, 8)
+            .expect("the trailing free block must be allocatable");
 
         // SAFETY: `a` and `c` each came from `alloc(S, 8)` and are freed once;
         // `live` is deliberately left allocated between them.
@@ -1993,7 +1997,10 @@ mod tests {
         );
         // The live object is untouched and its own hole is still usable.
         let _ = live;
-        assert!(og.alloc(S, 8).is_some(), "each individual hole still serves S");
+        assert!(
+            og.alloc(S, 8).is_some(),
+            "each individual hole still serves S"
+        );
     }
 
     #[test]
@@ -2174,7 +2181,10 @@ mod tests {
             // B is left UNMARKED (would be floating garbage without the guard).
             let b_hdr = &mut *(b as *mut ObjectHeader);
             b_hdr.set_num_slots(1);
-            b_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, B_TAG), std::sync::atomic::Ordering::Relaxed);
+            b_hdr.mark_word.store(
+                ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, B_TAG),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         let map = og.compact();
@@ -2202,7 +2212,10 @@ mod tests {
             // proving we did not leave the slot pointing at zeroed memory.
             let b_hdr = &*(b_new as *const ObjectHeader);
             assert_eq!(
-                ObjectHeader::neutral_hash(b_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), B_TAG,
+                ObjectHeader::neutral_hash(
+                    b_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+                B_TAG,
                 "B data lost across compaction"
             );
             // GC metadata cleared on the survivor.
@@ -2247,7 +2260,9 @@ mod tests {
 
         // The recovered hole must be the full 48 bytes, not 44: a 48-byte
         // request has to be servable from it, at the same address.
-        let c = og.alloc(48, 8).expect("the freed 48-byte hole must be reusable");
+        let c = og
+            .alloc(48, 8)
+            .expect("the freed 48-byte hole must be reusable");
         assert_eq!(
             c, a,
             "a 48-byte request must land back in the freed block, not past the \
@@ -2306,7 +2321,10 @@ mod tests {
             let c_hdr = &mut *(c as *mut ObjectHeader);
             c_hdr.set_num_slots(1);
             c_hdr.add_gc_flags(GC_FLAG_MARKED);
-            c_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, C_TAG), std::sync::atomic::Ordering::Relaxed);
+            c_hdr.mark_word.store(
+                ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, C_TAG),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         // Return B's block to the free list WITHOUT zeroing it — the exact
@@ -2350,8 +2368,18 @@ mod tests {
             // C did not slide over the filler, and its mark bit was cleared so
             // the next cycle starts from a clean slate.
             let c_hdr = &*(c as *const ObjectHeader);
-            assert_eq!(ObjectHeader::neutral_hash(c_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), C_TAG, "C must not have moved");
-            assert_eq!(c_hdr.gc_flags() & GC_FLAG_MARKED, 0, "marks must be cleared");
+            assert_eq!(
+                ObjectHeader::neutral_hash(
+                    c_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+                C_TAG,
+                "C must not have moved"
+            );
+            assert_eq!(
+                c_hdr.gc_flags() & GC_FLAG_MARKED,
+                0,
+                "marks must be cleared"
+            );
             assert!(!c_hdr.is_forwarded());
         }
     }
@@ -2507,7 +2535,10 @@ mod tests {
         let objects = og.walk_objects();
         let (rescued, escaped) = og.close_live_set(&objects);
 
-        assert!(escaped, "a referent outside the object walk must be reported");
+        assert!(
+            escaped,
+            "a referent outside the object walk must be reported"
+        );
         assert_eq!(rescued, 0, "nothing in the walked set needed promoting");
         // SAFETY: `b`'s block is unallocated but still mapped inside `og`.
         unsafe {

@@ -606,7 +606,10 @@ pub fn dump_to_file(
             }
             body.clear();
             write_varint(&mut body, layout.chunk_type_id);
-            write_varint(&mut body, event.start_time.saturating_sub(chunk_start_nanos));
+            write_varint(
+                &mut body,
+                event.start_time.saturating_sub(chunk_start_nanos),
+            );
             write_varint(&mut body, event.end_time.saturating_sub(event.start_time));
             for (value, kind) in event.fields.iter().zip(layout.field_kinds.iter()) {
                 write_field(&mut body, value, *kind);
@@ -759,10 +762,7 @@ fn truncated() -> JfrDumpError {
 }
 
 fn invalid(message: impl Into<String>) -> JfrDumpError {
-    JfrDumpError::Io(io::Error::new(
-        io::ErrorKind::InvalidData,
-        message.into(),
-    ))
+    JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, message.into()))
 }
 
 /// A `<class>` element from the metadata event.
@@ -793,7 +793,10 @@ impl RawElement {
     }
 }
 
-fn read_element(cursor: &mut Cursor<'_>, pool: &[Option<String>]) -> Result<RawElement, JfrDumpError> {
+fn read_element(
+    cursor: &mut Cursor<'_>,
+    pool: &[Option<String>],
+) -> Result<RawElement, JfrDumpError> {
     let pooled = |index: u64| -> Result<String, JfrDumpError> {
         pool.get(index as usize)
             .cloned()
@@ -946,7 +949,9 @@ pub fn read_chunk(path: &Path) -> Result<Chunk, JfrDumpError> {
                 let type_name = types
                     .get(field_type)
                     .map(|ty| ty.name.as_str())
-                    .ok_or_else(|| invalid(format!("field type id {field_type} is not declared")))?;
+                    .ok_or_else(|| {
+                        invalid(format!("field type id {field_type} is not declared"))
+                    })?;
                 let value = match type_name {
                     "int" => ChunkValue::Int(cursor.varint()? as u32 as i32),
                     "long" => ChunkValue::Long(cursor.varint()? as i64),
@@ -1051,7 +1056,10 @@ mod tests {
         // -1 as a long: all 64 bits set, i.e. the 9-byte form with the last
         // byte raw.
         write_varint(&mut buf, u64::MAX);
-        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            buf,
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -1119,7 +1127,11 @@ mod tests {
         assert_eq!(&bytes[0..4], &JDK_FILE_MAGIC);
         assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), JDK_MAJOR);
         let chunk_size = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        assert_eq!(chunk_size, bytes.len() as u64, "chunkSize must be the file size");
+        assert_eq!(
+            chunk_size,
+            bytes.len() as u64,
+            "chunkSize must be the file size"
+        );
         assert_eq!(chunk_size, written);
         assert_eq!(
             u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
@@ -1186,7 +1198,10 @@ mod tests {
             metadata_position, JDK_HEADER_SIZE,
             "with no events the metadata event follows the header directly"
         );
-        assert_ne!(metadata_position, 0, "a zero metadataPosition is rejected as a truncated chunk");
+        assert_ne!(
+            metadata_position, 0,
+            "a zero metadataPosition is rejected as a truncated chunk"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1380,17 +1395,26 @@ mod tests {
         let mut no_metadata = good.clone();
         no_metadata[24..32].copy_from_slice(&0u64.to_be_bytes());
         std::fs::write(&path, &no_metadata).unwrap();
-        assert!(read_chunk(&path).is_err(), "a zero metadataPosition must be rejected");
+        assert!(
+            read_chunk(&path).is_err(),
+            "a zero metadataPosition must be rejected"
+        );
 
         // A chunkSize that disagrees with the file size is what stops
         // `isLastChunk()` from ever terminating.
         let mut wrong_size = good.clone();
         wrong_size[8..16].copy_from_slice(&(good.len() as u64 + 16).to_be_bytes());
         std::fs::write(&path, &wrong_size).unwrap();
-        assert!(read_chunk(&path).is_err(), "a wrong chunkSize must be rejected");
+        assert!(
+            read_chunk(&path).is_err(),
+            "a wrong chunkSize must be rejected"
+        );
 
         std::fs::write(&path, &good).unwrap();
-        assert!(read_chunk(&path).is_ok(), "the unmodified chunk must still read");
+        assert!(
+            read_chunk(&path).is_ok(),
+            "the unmodified chunk must still read"
+        );
         std::fs::remove_file(&path).ok();
     }
 

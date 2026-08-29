@@ -33,7 +33,7 @@ record. Nothing else.
 (`native-builtins/src/jboss_jdkspecific.rs:376-451`). `junit-jupiter-engine-5.14.4.jar`
 carries both a `module-info.class` declaring
 `provides org.junit.platform.engine.TestEngine with …JupiterTestEngine` **and**
-the matching `META-INF/services` descriptor — measured, §3. So the real
+the matching `../../../apps/META-INF/services` descriptor — measured, §3. So the real
 `ServiceLoader` finds `JupiterTestEngine` twice: once from the module source,
 once from the class-path source. JUnit's `LinkedHashSet<TestEngine>` keeps both
 distinct instances and `EngineIdValidator` throws.
@@ -140,7 +140,7 @@ is sufficient by construction. The one-command falsifier is in §6.)*
 * 31 entries, **0 exact duplicates**;
 * duplicate *basenames* only: `main`, `test` (different directories) and
   `junit-4.13.2.jar` (two paths, and JUnit 4 declares no `TestEngine`);
-* **exactly two entries carry `META-INF/services/org.junit.platform.engine.TestEngine`**:
+* **exactly two entries carry `../../../apps/META-INF/services/org.junit.platform.engine.TestEngine`**:
 
 ```
 junit-jupiter-engine-5.14.4.jar -> org.junit.jupiter.engine.JupiterTestEngine
@@ -284,7 +284,7 @@ cratonvm --jdk-only --java-home "$JDK" \
 Predicted RED at `ModuleLayer.boot() contains a module whose only source is the
 CLASS path`. The A/B is the same command on a binary built with `f0a472dcf`'s
 `ModuleLayer.boot()` call reverted; predicted GREEN. The suite module declares
-its providers **only** in `module-info` and ships no `META-INF/services`, so
+its providers **only** in `module-info` and ships no `../../../apps/META-INF/services`, so
 `ServiceLoader.load(Greeter, appLoader)` must find **zero** providers from
 `-cp` — the sharpest possible contrast.
 
@@ -302,7 +302,7 @@ The bc-java reproduction is the four classes named in `C17` §6.2, run under
 | `resourceCensus` | over N iterations and both loaders: `getResources` URLs are DISTINCT, and the count does not drift between calls | the queued R11 hypothesis. **Kept as its falsifier, not as the test for this defect** — §0 shows a duplicate URL cannot reach the caller. |
 | `setDiscipline` | fresh `HashSet.add` true-then-false; `LinkedHashSet` of 64 identity-distinct objects iterates exactly 64 with no repeat | mechanism 2 of §1 — the one nobody had excluded |
 | `providerCensus` | no service resolves the same provider CLASS twice, on N fresh loaders; no count drift; one `ServiceLoader` iterated twice yields the SAME instances | a duplicate provider from any source, plus the JDK's documented cache |
-| `classPathModuleSeparation` | a `-cp`-only module is NOT in `ModuleLayer.boot()`; its classes are in the UNNAMED module; its resolved provider set equals exactly what the `META-INF/services` descriptors name | **this defect** |
+| `classPathModuleSeparation` | a `-cp`-only module is NOT in `ModuleLayer.boot()`; its classes are in the UNNAMED module; its resolved provider set equals exactly what the `../../../apps/META-INF/services` descriptors name | **this defect** |
 
 **It cannot be vacuously green.** `classPathModuleSeparation` *fails* — it does
 not skip — when `-Dcratonvm.rt.cpmodule` / `-Dcratonvm.rt.cpclass` are absent,
@@ -317,7 +317,7 @@ only counts — so the harness's cross-VM `CK` diff stays valid.
 ### 7.2 HotSpot oracle
 
 JDK 25.0.3 (Microsoft build), this host, 2026-08-13. Fixture: a purpose-built
-`d1-cpmod.jar` with `module-info` **and** a `META-INF/services` descriptor for
+`d1-cpmod.jar` with `module-info` **and** a `../../../apps/META-INF/services` descriptor for
 the same provider, on `-cp`.
 
 ```

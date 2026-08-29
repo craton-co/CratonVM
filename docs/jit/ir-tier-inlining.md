@@ -173,7 +173,7 @@ first-rep.
 
 ## Open
 
-1. ~~**Escape analysis still reports `0/2`.**~~ **CLOSED 2026-08-27.** Both
+1. ~~**Escape analysis still reports `0/2`.**~~ **CLOSED.** Both
    allocations are deleted and the `volume` arm has converged onto its own
    control (24.9 ns/voxel against `rawseg`'s 23.8). It took four things, none of
    which was the one this note guessed at — a per-allocation dominance proof

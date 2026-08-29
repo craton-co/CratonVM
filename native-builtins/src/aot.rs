@@ -12,11 +12,11 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 use cratonvm_types::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 
 use crate::{native_noop, native_noop_with_this};
 
@@ -1122,8 +1122,7 @@ pub fn aot_flush_training_data() -> usize {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return 0;
     }
-    let output_path = AOT_CACHE_OUTPUT_PATH.lock()
-        .clone();
+    let output_path = AOT_CACHE_OUTPUT_PATH.lock().clone();
     let Some(output_path) = output_path else {
         return 0;
     };
@@ -1283,8 +1282,7 @@ fn leyden_get_aot_cache_input_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_INPUT_PATH.lock()
-        .clone();
+    let path = AOT_CACHE_INPUT_PATH.lock().clone();
     match path {
         Some(p) => {
             let s = ctx.create_string(&p);
@@ -1298,8 +1296,7 @@ fn leyden_get_aot_cache_output_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_OUTPUT_PATH.lock()
-        .clone();
+    let path = AOT_CACHE_OUTPUT_PATH.lock().clone();
     match path {
         Some(p) => {
             let s = ctx.create_string(&p);
@@ -1554,10 +1551,13 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod aot_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // Serialize tests that mutate AOT global state
     // (AOT_CACHE_GLOBAL, AOT_TRAINING_RECORDER, AOT_PRELINKER_CACHE, AOT_ENABLED,

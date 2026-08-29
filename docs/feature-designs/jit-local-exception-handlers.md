@@ -267,7 +267,7 @@ left was the gate.
 `mic_publish_exception_table_callees()` is therefore default-ON since
 2026-08-17, interlocked so it refuses to publish whenever
 `CRATONVM_JIT_SP_IC_DEOPT_CHECK` is not `On`. The acceptance test is
-`probes/CalleeExceptionTableSemanticsProbe.java`, whose fourth arm — the ban
+`apps/probes/CalleeExceptionTableSemanticsProbe.java`, whose fourth arm — the ban
 lifted with that check deleted — is the red proof: an `ArithmeticException`
 escapes the callee's own `catch` to `main`. Measurement and the full record are
 in `internal/performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`.

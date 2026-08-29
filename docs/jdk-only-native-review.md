@@ -5,7 +5,7 @@
 | **Status** | Active. This is the gate every `SyntheticStub` must pass to survive into strict mode. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) §1, §4, §7 |
 | **Input** | `target/jdk-only-audit/stub-review.tsv`, produced by `scripts/jdk-only-census.sh` |
-| **Related** | [`synthetic-vs-real-explained.md`](synthetic-vs-real-explained.md) (the existing change policy) · [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) |
+| **Related** | [`synthetic-vs-real-explained.md`](synthetic-vs-real-explained.md) (the existing change policy) · [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md) |
 
 Reviewing a stub means answering one question: **why does Rust code run here
 instead of the JDK's own bytecode, and is that reason still true?**

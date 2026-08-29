@@ -545,7 +545,6 @@ fn watch_service_surface_has_a_single_owner_in_native_io() {
     }
 }
 
-
 /// Whoever ends up owning a `javax.net.ssl` entry point is decided purely by
 /// registration order, and nothing about a duplicate is visible at the call
 /// site — which is how the same defect has now shipped three times.
@@ -670,10 +669,13 @@ fn no_native_mints_a_field_less_ssl_socket_factory_carrier() {
     let mut violations: Vec<String> = Vec::new();
     for rel in scanned {
         let path = root.join(rel);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("scanned file {rel} is unreadable: {e} — \
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "scanned file {rel} is unreadable: {e} — \
                  if it moved, update this list; a silently-skipped file makes \
-                 the whole guard vacuous"));
+                 the whole guard vacuous"
+            )
+        });
         for (i, line) in src.lines().enumerate() {
             let Some(rest) = line.split("\"javax/net/ssl/SSLSocketFactory\"").nth(1) else {
                 continue;
@@ -745,7 +747,9 @@ fn p61_does_not_displace_phase57_path_natives() {
         registry
             .census()
             .into_iter()
-            .filter(|e| e.class == "java/nio/file/Path" && e.name == name && e.descriptor == descriptor)
+            .filter(|e| {
+                e.class == "java/nio/file/Path" && e.name == name && e.descriptor == descriptor
+            })
             .next_back()
             .and_then(|e| e.registered_by)
     }

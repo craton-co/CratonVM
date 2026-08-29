@@ -349,14 +349,8 @@ mod tests {
         // which the CPU reads back as -128.
         assert_eq!(Disp::encode(128), Ok(Disp::Disp32(128)));
         assert_eq!(Disp::encode(256), Ok(Disp::Disp32(256)));
-        assert_eq!(
-            Disp::encode(i32::MIN as i64),
-            Ok(Disp::Disp32(i32::MIN))
-        );
-        assert_eq!(
-            Disp::encode(i32::MAX as i64),
-            Ok(Disp::Disp32(i32::MAX))
-        );
+        assert_eq!(Disp::encode(i32::MIN as i64), Ok(Disp::Disp32(i32::MIN)));
+        assert_eq!(Disp::encode(i32::MAX as i64), Ok(Disp::Disp32(i32::MAX)));
     }
 
     #[test]
@@ -391,7 +385,10 @@ mod tests {
     #[test]
     fn the_unsigned_narrowing_this_replaces_would_address_backwards() {
         let bad = 128u8 as i8; // what `HEADER_SIZE as u8` would produce at 128
-        assert_eq!(bad, -128, "0x80 decodes as -128, i.e. 128 bytes BEFORE base");
+        assert_eq!(
+            bad, -128,
+            "0x80 decodes as -128, i.e. 128 bytes BEFORE base"
+        );
         assert!(
             Disp::encode(128).unwrap().as_disp8().is_none(),
             "the checked encoder must refuse to call 128 a disp8"
@@ -400,7 +397,16 @@ mod tests {
 
     #[test]
     fn encode32_always_forces_the_wide_form() {
-        for v in [0i64, 1, -1, 127, -128, 128, i32::MAX as i64, i32::MIN as i64] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            127,
+            -128,
+            128,
+            i32::MAX as i64,
+            i32::MIN as i64,
+        ] {
             let d = Disp::encode32(v).expect("in i32 range");
             assert_eq!(d.mod_bits(), 0b10, "encode32({v}) must stay mod=10");
             assert_eq!(d.byte_len(), 4, "encode32({v}) must stay four bytes");
@@ -673,10 +679,7 @@ mod tests {
         // must not be "optimized" back into a literal disp8 byte, so pin the
         // fact that some of them genuinely exceed 127.
         let disp32_sites: [(&str, i64); 4] = [
-            (
-                "legacy field cell 0",
-                HEADER_SIZE as i64,
-            ),
+            ("legacy field cell 0", HEADER_SIZE as i64),
             (
                 "legacy field cell 6 (first one past disp8)",
                 HEADER_SIZE as i64 + 6 * SLOT_SIZE as i64,

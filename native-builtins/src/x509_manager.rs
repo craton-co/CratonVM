@@ -113,8 +113,8 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::keystore;
+use crate::try_alloc_concurrent_synthetic;
 
 // ---------------------------------------------------------------------------
 // Per-manager state
@@ -1687,7 +1687,13 @@ mod real_chain_shape_tests {
         let root_self_signed = cert("Trusted Root", &root_key, "Trusted Root", &root_key, true);
         // The SAME subject and the SAME key, certified by somebody else — the
         // shape a real cross-certificate has.
-        let root_cross_signed = cert("Trusted Root", &root_key, "Other Root", &other_root_key, true);
+        let root_cross_signed = cert(
+            "Trusted Root",
+            &root_key,
+            "Other Root",
+            &other_root_key,
+            true,
+        );
         assert_ne!(
             root_self_signed, root_cross_signed,
             "the fixture must present a DIFFERENT encoding, or it proves nothing"
@@ -1721,7 +1727,13 @@ mod real_chain_shape_tests {
             &other_root_key,
             true,
         );
-        let leaf = cert("leaf.example", &leaf_key, "Trusted Root", &impostor_key, false);
+        let leaf = cert(
+            "leaf.example",
+            &leaf_key,
+            "Trusted Root",
+            &impostor_key,
+            false,
+        );
 
         let trust = trust_with(root_self_signed);
         assert!(
@@ -1739,8 +1751,20 @@ mod real_chain_shape_tests {
         let inter_key = p384_key();
         let leaf_key = p384_key();
         let root = cert("P384 Root", &root_key, "P384 Root", &root_key, true);
-        let inter = cert("P384 Intermediate", &inter_key, "P384 Root", &root_key, true);
-        let leaf = cert("leaf.example", &leaf_key, "P384 Intermediate", &inter_key, false);
+        let inter = cert(
+            "P384 Intermediate",
+            &inter_key,
+            "P384 Root",
+            &root_key,
+            true,
+        );
+        let leaf = cert(
+            "leaf.example",
+            &leaf_key,
+            "P384 Intermediate",
+            &inter_key,
+            false,
+        );
 
         let trust = trust_with(root);
         assert!(
@@ -2168,10 +2192,7 @@ fn rebuild_path(chain: &[Vec<u8>], trust: &TrustManagerState) -> Option<Vec<Vec<
     Some(path.iter().map(|&i| chain[i].clone()).collect())
 }
 
-fn validate_ordered_chain(
-    chain: &[Vec<u8>],
-    trust: &TrustManagerState,
-) -> Result<(), TrustError> {
+fn validate_ordered_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<(), TrustError> {
     if chain.is_empty() {
         return Err(TrustError::EmptyChain);
     }
@@ -4061,8 +4082,18 @@ fn register_trust_manager(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",
         "([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",
     ] {
-        r.register(fqn, "checkClientTrusted", desc, check_client_trusted_extended);
-        r.register(fqn, "checkServerTrusted", desc, check_server_trusted_extended);
+        r.register(
+            fqn,
+            "checkClientTrusted",
+            desc,
+            check_client_trusted_extended,
+        );
+        r.register(
+            fqn,
+            "checkServerTrusted",
+            desc,
+            check_server_trusted_extended,
+        );
     }
     r.register(
         fqn,
@@ -4742,7 +4773,11 @@ fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
 /// `sun.security.x509.X509CertImpl` (real bytecode, so `toString()` and
 /// friends work correctly) parsed from the DER first, only falling back to
 /// a bare synthetic mirror if that construction itself fails.
-fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+fn make_x509_mirror(
+    ctx: &mut dyn NativeContext,
+    alias: &str,
+    der: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
     Ok(crate::keystore::make_x509_mirror(ctx, alias, der)?)
 }
 
@@ -5182,10 +5217,7 @@ fn check_server_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `No name matching localhost found` on this VM too — it was simply never
 /// reached. See
 /// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
-fn check_server_trusted_extended(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn check_server_trusted_extended(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
     check_extended_tm_endpoint_identity(ctx, args, false)
 }
@@ -5198,10 +5230,7 @@ fn check_server_trusted_extended(
 /// server has no name to identify its client by. Mirrored here rather than
 /// skipped, so a server that DOES set the algorithm gets the same answer it
 /// gets on HotSpot instead of a silent pass.
-fn check_client_trusted_extended(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn check_client_trusted_extended(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
     check_extended_tm_endpoint_identity(ctx, args, true)
 }
@@ -5402,10 +5431,7 @@ fn extended_tm_peer_host(
 /// — and falls back to the peer host when the SNI check fails against a
 /// DIFFERENT name. Reproducing the preference matters: a client that connects by
 /// IP but sends SNI is identified by the SNI name on HotSpot.
-fn extended_tm_sni_host_name(
-    ctx: &mut dyn NativeContext,
-    session: ObjectRef,
-) -> Option<String> {
+fn extended_tm_sni_host_name(ctx: &mut dyn NativeContext, session: ObjectRef) -> Option<String> {
     let names = match ctx.invoke_virtual(
         session,
         "getRequestedServerNames",
@@ -5427,7 +5453,10 @@ fn extended_tm_sni_host_name(
         };
         // Type 0 is `StandardConstants.SNI_HOST_NAME`; only that one carries a
         // host name, and only `SNIHostName` declares `getAsciiName()`.
-        if !matches!(ctx.invoke_virtual(sn, "getType", "()I", &[]), Ok(Some(Value::Int(0)))) {
+        if !matches!(
+            ctx.invoke_virtual(sn, "getType", "()I", &[]),
+            Ok(Some(Value::Int(0)))
+        ) {
             continue;
         }
         if let Ok(Some(Value::Object(Some(s)))) =
@@ -5894,7 +5923,10 @@ mod tests {
     //! shell out to `openssl` — every cert byte here is produced by the
     //! `mk_cert` builder below so the suite passes on any host.
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     use super::*;
 
@@ -6341,7 +6373,11 @@ mod tests {
             Some("zboth"),
             "the clientAuth-marked alias must be preferred: got {clients:?}"
         );
-        assert_eq!(clients.len(), 2, "neither alias may be dropped: {clients:?}");
+        assert_eq!(
+            clients.len(),
+            2,
+            "neither alias may be dropped: {clients:?}"
+        );
     }
 
     #[test]
@@ -6417,7 +6453,10 @@ mod tests {
         });
         match validate_chain(&[impostor], &trust) {
             Err(TrustError::Expired { .. }) => {}
-            other => panic!("a same-subject impostor must still be Expired, got {:?}", other),
+            other => panic!(
+                "a same-subject impostor must still be Expired, got {:?}",
+                other
+            ),
         }
     }
 
@@ -6900,13 +6939,22 @@ mod tests {
 
         // Already a valid path: must still validate, by the untouched
         // presented-order route.
-        let r = validate_chain(&[leaf.clone(), issuer_by_trusted, issuer_by_other.clone()], &trust);
-        assert!(r.is_ok(), "already-ordered path must still validate, got {r:?}");
+        let r = validate_chain(
+            &[leaf.clone(), issuer_by_trusted, issuer_by_other.clone()],
+            &trust,
+        );
+        assert!(
+            r.is_ok(),
+            "already-ordered path must still validate, got {r:?}"
+        );
 
         // Path building must NOT rescue a set with no path to the anchor:
         // dropping the untrusted intermediate leaves a leaf with no issuer.
         let r = validate_chain(&[leaf, issuer_by_other], &trust);
-        assert!(r.is_err(), "no path to the anchor must stay rejected, got {r:?}");
+        assert!(
+            r.is_err(),
+            "no path to the anchor must stay rejected, got {r:?}"
+        );
     }
 
     #[test]

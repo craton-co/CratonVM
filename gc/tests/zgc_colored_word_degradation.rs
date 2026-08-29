@@ -117,14 +117,11 @@ fn site_2_rawslot_to_compact_reference_degrades_a_colored_word() {
 #[test]
 fn site_3_decode_value_checked_never_consults_the_callback_for_a_colored_word() {
     let callback_ran = std::cell::Cell::new(false);
-    let decoded = cratonvm_types::decode_value_checked(
-        colored_word(),
-        cratonvm_types::VTAG_OBJECT,
-        |_| {
+    let decoded =
+        cratonvm_types::decode_value_checked(colored_word(), cratonvm_types::VTAG_OBJECT, |_| {
             callback_ran.set(true);
             true
-        },
-    );
+        });
     assert!(
         matches!(decoded, Value::Object(None)),
         "TRIPWIRE: decode_value_checked no longer nulls a colored word. Got {decoded:?}"

@@ -475,12 +475,7 @@ impl ZSlotObservation {
 
     /// A 16-byte-cell observation ([`ZSlotShape::LegacyField`] /
     /// [`ZSlotShape::StaticField`]), carrying the cell's discriminant.
-    pub fn tagged(
-        shape: ZSlotShape,
-        slot_addr: u64,
-        raw_word: u64,
-        tag: u32,
-    ) -> ZSlotObservation {
+    pub fn tagged(shape: ZSlotShape, slot_addr: u64, raw_word: u64, tag: u32) -> ZSlotObservation {
         ZSlotObservation {
             shape,
             slot_addr,
@@ -1191,9 +1186,11 @@ impl ZSlotCensus {
         // Phase 1: drain the object list. The view may hold its registry lock
         // for exactly this long and no longer.
         let mut objects: Vec<(u64, ClassId, ZCensusObjectKind)> = Vec::new();
-        view.for_each_live_object(&mut |addr: u64, class_id: ClassId, kind: ZCensusObjectKind| {
-            objects.push((addr, class_id, kind));
-        });
+        view.for_each_live_object(
+            &mut |addr: u64, class_id: ClassId, kind: ZCensusObjectKind| {
+                objects.push((addr, class_id, kind));
+            },
+        );
 
         let mut totals = ZShapeTotals::empty(ZCensusStrategy::HeapWalk);
         let mut classes: FxHashMap<u32, ZClassRow> = FxHashMap::default();
@@ -1213,8 +1210,7 @@ impl ZSlotCensus {
 
             match kind.slot_shape() {
                 Some(shape) => {
-                    totals.objects[shape.index()] =
-                        totals.objects[shape.index()].saturating_add(1);
+                    totals.objects[shape.index()] = totals.objects[shape.index()].saturating_add(1);
                 }
                 None => {
                     totals.objects_without_ref_slots =
@@ -1245,10 +1241,12 @@ impl ZSlotCensus {
                 totals.non_null_slots[i] =
                     totals.non_null_slots[i].saturating_add(local_non_null[i]);
             }
-            totals.legacy_unwritten_slots =
-                totals.legacy_unwritten_slots.saturating_add(local_unwritten);
-            totals.legacy_primitive_slots =
-                totals.legacy_primitive_slots.saturating_add(local_primitive);
+            totals.legacy_unwritten_slots = totals
+                .legacy_unwritten_slots
+                .saturating_add(local_unwritten);
+            totals.legacy_primitive_slots = totals
+                .legacy_primitive_slots
+                .saturating_add(local_primitive);
 
             match row {
                 Some(row) => {
@@ -1311,11 +1309,11 @@ impl ZSlotCensus {
             totals.legacy_unwritten_slots = totals
                 .legacy_unwritten_slots
                 .saturating_add(static_unwritten);
-            totals.legacy_primitive_slots =
-                totals.legacy_primitive_slots.saturating_add(static_primitive);
+            totals.legacy_primitive_slots = totals
+                .legacy_primitive_slots
+                .saturating_add(static_primitive);
             let static_idx: usize = ZSlotShape::StaticField.index();
-            totals.objects[static_idx] =
-                totals.objects[static_idx].saturating_add(statics_blocks);
+            totals.objects[static_idx] = totals.objects[static_idx].saturating_add(statics_blocks);
 
             for (class_id, slots) in static_rows.into_iter() {
                 match class_row(&mut classes, class_id, &mut overflow_objects) {
@@ -1350,7 +1348,9 @@ impl ZSlotCensus {
         // Fold into the cumulative counters, then publish the class table.
         for shape in ZSlotShape::ALL {
             let i = shape.index();
-            self.walk[i].slots.fetch_add(totals.slots[i], Ordering::Relaxed);
+            self.walk[i]
+                .slots
+                .fetch_add(totals.slots[i], Ordering::Relaxed);
             self.walk[i]
                 .non_null_slots
                 .fetch_add(totals.non_null_slots[i], Ordering::Relaxed);
@@ -1594,9 +1594,8 @@ impl ZSlotCensus {
             let i = shape.index();
             // A structurally-unreachable column must say so rather than print a
             // zero that reads as a measurement.
-            let unreached = shape == ZSlotShape::StaticField
-                && !self.statics_wired()
-                && totals.slots[i] == 0;
+            let unreached =
+                shape == ZSlotShape::StaticField && !self.statics_wired() && totals.slots[i] == 0;
             let share_col = if unreached {
                 String::from("NOT WIRED")
             } else {
@@ -1865,7 +1864,11 @@ fn class_row<'a>(
         *overflow_objects = overflow_objects.saturating_add(1);
         return None;
     }
-    Some(classes.entry(raw).or_insert_with(|| ZClassRow::new(class_id)))
+    Some(
+        classes
+            .entry(raw)
+            .or_insert_with(|| ZClassRow::new(class_id)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,8 +2320,16 @@ mod tests {
         c.run_walk(&view).unwrap();
         c.record_access_batch(ZSlotShape::LegacyField, 1_000, 1_000);
 
-        assert_eq!(c.walk_totals().legacy_share(), 0.0, "nothing legacy is live");
-        assert_eq!(c.access_totals().legacy_share(), 1.0, "every read is legacy");
+        assert_eq!(
+            c.walk_totals().legacy_share(),
+            0.0,
+            "nothing legacy is live"
+        );
+        assert_eq!(
+            c.access_totals().legacy_share(),
+            1.0,
+            "every read is legacy"
+        );
         assert_eq!(
             c.walk_totals().verdict(),
             ZCensusVerdict::LegacyNegligible,
@@ -2465,7 +2476,11 @@ mod tests {
         let ids: Vec<u32> = walk.classes.iter().map(|r| r.class_id.as_u32()).collect();
         // 11 legacy slots each for 5 and 9 -> tie broken by ascending ClassId;
         // then 3 legacy slots for 7; then the compact class with zero legacy.
-        assert_eq!(ids, vec![5, 9, 7, 2], "ranking must be legacy-first and total-ordered");
+        assert_eq!(
+            ids,
+            vec![5, 9, 7, 2],
+            "ranking must be legacy-first and total-ordered"
+        );
         assert_eq!(walk.classes[0].legacy_slots(), 11);
         assert_eq!(walk.classes[3].legacy_slots(), 0);
         assert_eq!(walk.classes[3].total_slots(), 50);
@@ -2519,7 +2534,10 @@ mod tests {
         assert_eq!(walk.kind_disagreements, 1);
         assert_eq!(c.kind_disagreements(), 1);
         let summary = c.format_summary();
-        assert!(summary.contains("VOID"), "a void run must say so: {summary}");
+        assert!(
+            summary.contains("VOID"),
+            "a void run must say so: {summary}"
+        );
     }
 
     // -- statics wiring ----------------------------------------------------
@@ -2590,13 +2608,8 @@ mod tests {
         );
         // 6 fixed + 4 per shape (walk) + 5 walk extras + 3 per shape (access)
         // + 1 access extra + 2 verdicts + 3 per top class.
-        let expected = 6
-            + 4 * Z_SLOT_SHAPE_COUNT
-            + 5
-            + 3 * Z_SLOT_SHAPE_COUNT
-            + 1
-            + 2
-            + 3 * TSV_TOP_CLASSES;
+        let expected =
+            6 + 4 * Z_SLOT_SHAPE_COUNT + 5 + 3 * Z_SLOT_SHAPE_COUNT + 1 + 2 + 3 * TSV_TOP_CLASSES;
         assert_eq!(header_cols.len(), expected);
         assert_eq!(header_cols.len(), ZSlotCensus::tsv_column_names().len());
         assert_eq!(header_cols[0], "run");

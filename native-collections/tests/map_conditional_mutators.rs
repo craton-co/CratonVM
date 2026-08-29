@@ -49,11 +49,24 @@ const REMOVE_KV: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Z";
 const REPLACE_KV: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 const REPLACE_KOV: &str = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z";
 
-fn put(reg: &NativeMethodRegistry, ctx: &mut MockCtx, class: &str, m: ObjectRef, k: Value, v: Value) {
+fn put(
+    reg: &NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    class: &str,
+    m: ObjectRef,
+    k: Value,
+    v: Value,
+) {
     call(reg, ctx, class, "put", PUT, &[Value::Object(Some(m)), k, v]).unwrap();
 }
 
-fn get(reg: &NativeMethodRegistry, ctx: &mut MockCtx, class: &str, m: ObjectRef, k: Value) -> Value {
+fn get(
+    reg: &NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    class: &str,
+    m: ObjectRef,
+    k: Value,
+) -> Value {
     call(reg, ctx, class, "get", GET, &[Value::Object(Some(m)), k])
         .unwrap()
         .unwrap_or(Value::Object(None))
@@ -178,7 +191,11 @@ fn lhm_remove_kv_keeps_the_entry_when_the_value_differs() {
         &[Value::Object(Some(lhm)), k1, wrong],
     )
     .unwrap();
-    assert_eq!(removed, Some(Value::Int(0)), "mismatched value must not remove");
+    assert_eq!(
+        removed,
+        Some(Value::Int(0)),
+        "mismatched value must not remove"
+    );
     assert_eq!(size(&reg, &mut ctx, LHM, lhm), 1);
     assert_eq!(get_int(&reg, &mut ctx, LHM, lhm, k1), Some(10));
 }

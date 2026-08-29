@@ -215,10 +215,12 @@ pub fn user_loader_builtin_parent(ns: u32) -> Option<u32> {
 /// bisecting a regression to this change; read once and cached.
 pub fn loader_parent_chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_LOADER_PARENT_CHAIN") {
-        Ok(v) => !(v.is_empty() || v == "0"),
-        Err(_) => true,
-    })
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_LOADER_PARENT_CHAIN") {
+            Ok(v) => !(v.is_empty() || v == "0"),
+            Err(_) => true,
+        },
+    )
 }
 
 /// `CRATONVM_DBG_LOADER_CHAIN=1` — print one line per supertype a user loader

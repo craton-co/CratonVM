@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 pub(super) fn execute_invoke(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -517,7 +516,12 @@ pub(super) fn call_site_type_can_hold_a_thread_mirror(cp_class_name: &str) -> bo
 /// [`stale_mirror_recovery_applies`] against a live receiver, reading its
 /// header only after confirming the address is inside a heap region.
 fn receiver_is_a_reclaimed_span(shared: &SharedVm, recv: ObjectRef) -> bool {
-    if shared.mem.heap.is_heap_addr(recv.as_ptr() as usize).is_none() {
+    if shared
+        .mem
+        .heap
+        .is_heap_addr(recv.as_ptr() as usize)
+        .is_none()
+    {
         return false;
     }
     // SAFETY: `is_heap_addr` just confirmed the address is inside a heap
@@ -562,7 +566,10 @@ pub(super) fn execute_invoke_kind(
     // early-return placement can produce on a resolution error is acceptable.
     if is_special && crate::jit::profile::is_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
+        shared
+            .jit
+            .profile_store
+            .record_call_site_borrowed(cid, mn, md, pc);
     }
 
     if crate::runtime::env_cache::dbg_loader_trace()
@@ -2809,7 +2816,12 @@ impl ParamTags {
     #[inline]
     pub(super) fn of(descriptor: &str) -> Self {
         if param_tag_scan_disabled() {
-            return Self { tags: [b'L'; Self::INLINE], len: 0, overflow: false, bypass: true };
+            return Self {
+                tags: [b'L'; Self::INLINE],
+                len: 0,
+                overflow: false,
+                bypass: true,
+            };
         }
         let bytes = descriptor.as_bytes();
         let mut tags = [b'L'; Self::INLINE];
@@ -3022,7 +3034,6 @@ pub(super) fn coerce_arg(
 // Getting from a call site's SAM descriptor to the implementation method,
 // and making the arguments fit: `interpreter/lambda.rs`.
 
-
 /// [`invoke_cached_native_callback`] for the two inline-cache `Native` arms,
 /// which hold the resolved [`NativeMethodId`] and can therefore ask whether the
 /// slot claims **leaf** — see
@@ -3195,7 +3206,6 @@ pub(super) fn dump_stack_on_soe(thread: &JvmThread) {
 // Which methods a registered Rust native takes over from real bytecode, the
 // superclass walk that gives an abstract-class native its reach, and the
 // redefinition rules that make an override yield: `interpreter/native_override.rs`.
-
 
 /// Every constant registry triple [`try_stackless_invoke`] can dispatch from an
 /// arm that holds a `NativeCallback` but **no `NativeMethodId`**, and therefore
@@ -3711,42 +3721,42 @@ pub(super) fn try_stackless_invoke(
             &mut step1_native_id,
             &mut step1_refusal,
         )
-            .or_else(|| {
-                class_name
-                    .starts_with("sun/security/ssl/SSLContextImpl")
-                    .then(|| {
-                        shared.natives.native_methods.find(
-                            "javax/net/ssl/SSLContext",
-                            method_name,
-                            descriptor,
-                        )
-                    })
-                    .flatten()
-            })
-            .or_else(|| {
-                class_name
-                    .starts_with("sun/security/ssl/SSLSocketFactoryImpl")
-                    .then(|| {
-                        shared.natives.native_methods.find(
-                            "javax/net/ssl/SSLSocketFactory",
-                            method_name,
-                            descriptor,
-                        )
-                    })
-                    .flatten()
-            })
-            .or_else(|| {
-                class_name
-                    .starts_with("sun/security/ssl/SSLSocketImpl")
-                    .then(|| {
-                        shared.natives.native_methods.find(
-                            "javax/net/ssl/SSLSocket",
-                            method_name,
-                            descriptor,
-                        )
-                    })
-                    .flatten()
-            })
+        .or_else(|| {
+            class_name
+                .starts_with("sun/security/ssl/SSLContextImpl")
+                .then(|| {
+                    shared.natives.native_methods.find(
+                        "javax/net/ssl/SSLContext",
+                        method_name,
+                        descriptor,
+                    )
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            class_name
+                .starts_with("sun/security/ssl/SSLSocketFactoryImpl")
+                .then(|| {
+                    shared.natives.native_methods.find(
+                        "javax/net/ssl/SSLSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            class_name
+                .starts_with("sun/security/ssl/SSLSocketImpl")
+                .then(|| {
+                    shared.natives.native_methods.find(
+                        "javax/net/ssl/SSLSocket",
+                        method_name,
+                        descriptor,
+                    )
+                })
+                .flatten()
+        })
     })
     .or_else(|| {
         if method_name == "<init>" {
@@ -4208,12 +4218,8 @@ pub(super) fn try_stackless_invoke(
                 )
             })
         });
-        let decision = crate::vm::resolve_dispatch(
-            crate::vm::dispatch_policy(shared),
-            class,
-            method,
-            native,
-        );
+        let decision =
+            crate::vm::resolve_dispatch(crate::vm::dispatch_policy(shared), class, method, native);
         // A `SyntheticStub` refusal is a real policy stop (§1.3) and must not
         // fall through to some other implementation.
         //
@@ -4229,7 +4235,9 @@ pub(super) fn try_stackless_invoke(
         let mut refusal: Option<cratonvm_types::error::JdkOnlyViolation> = None;
         let callback = match decision {
             crate::vm::DispatchDecision::Reject(
-                violation @ cratonvm_types::error::JdkOnlyViolation::SyntheticNativeInvocation { .. },
+                violation @ cratonvm_types::error::JdkOnlyViolation::SyntheticNativeInvocation {
+                    ..
+                },
             ) => {
                 refusal = Some(violation);
                 None
@@ -4565,8 +4573,7 @@ pub(super) fn try_stackless_invoke(
             // `monitor_enter_synchronized_method` above published JMX
             // ownership; this bail must retract it or the entry outlives the
             // acquisition. See `vm_exec::monitor_exit_and_retract_jmx`.
-            let _ =
-                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id);
+            let _ = crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id);
         }
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,
@@ -4618,7 +4625,6 @@ pub(super) fn try_stackless_invoke(
 //
 // The three cached dispatch tiers and the native-shadow consult every one
 // of them has to pass: `interpreter/dispatch_virtual.rs`.
-
 
 /// Resolve the metadata for a constant-pool method reference.
 ///

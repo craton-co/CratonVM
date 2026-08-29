@@ -744,8 +744,12 @@ fn open_span(category: Category) -> PhaseSpan {
             let rel = since_epoch_ns(now).saturating_add(1);
             let account = &state.account;
             let charged = account.attributed_ns.load(Ordering::Relaxed);
-            account.attributed_at_root_open.store(charged, Ordering::Relaxed);
-            account.open_root_start_ns_biased.store(rel, Ordering::Relaxed);
+            account
+                .attributed_at_root_open
+                .store(charged, Ordering::Relaxed);
+            account
+                .open_root_start_ns_biased
+                .store(rel, Ordering::Relaxed);
         }
         state.account.open_depth.fetch_add(1, Ordering::Relaxed);
         state.stack.push(Frame {
@@ -790,7 +794,10 @@ fn close_span(token: u64) {
             }
         }
         if state.stack.is_empty() {
-            state.account.open_root_start_ns_biased.store(0, Ordering::Relaxed);
+            state
+                .account
+                .open_root_start_ns_biased
+                .store(0, Ordering::Relaxed);
         }
     });
 }
@@ -1969,11 +1976,13 @@ mod tests {
         let report = report();
         let expected = (THREADS * SPANS) as u64;
         assert_eq!(
-            report.entries[Category::JavaExecution.index()].1, expected,
+            report.entries[Category::JavaExecution.index()].1,
+            expected,
             "outer spans lost or duplicated across threads"
         );
         assert_eq!(
-            report.entries[Category::GcPause.index()].1, expected,
+            report.entries[Category::GcPause.index()].1,
+            expected,
             "inner spans lost or duplicated across threads"
         );
         assert_eq!(
@@ -2260,7 +2269,10 @@ mod tests {
         handle.expect("spawn").join().expect("join");
 
         let doc = report().to_json();
-        assert!(doc.contains("we\\\"ird\\n\\tname"), "thread name not escaped");
+        assert!(
+            doc.contains("we\\\"ird\\n\\tname"),
+            "thread name not escaped"
+        );
         assert!(!doc.contains("we\"ird"), "raw quote leaked into the JSON");
 
         set_level_for_test(Level::Off);

@@ -1358,7 +1358,9 @@ pub(crate) fn native_throwable_get_message(
         // exception class. Gate the fallback on the slot actually being a String.
         _ => match ctx.get_field(this, 0) {
             v @ Value::Object(Some(o))
-                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                if ctx
+                    .class_name_arc_of_id(ctx.class_id_of_object(o))
+                    .as_deref()
                     == Some("java/lang/String") =>
             {
                 v
@@ -1524,10 +1526,7 @@ fn throwable_refusal(
     let built = ctx.new_object_initialized(
         exc_class,
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-        &[
-            Value::Object(Some(msg_ref)),
-            Value::Object(Some(cause)),
-        ],
+        &[Value::Object(Some(msg_ref)), Value::Object(Some(cause))],
     );
     ctx.unpin_native_roots(pin);
     match built {
@@ -1710,7 +1709,9 @@ fn throwable_detail_message_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> O
         _ if has_named_detail_message => Value::Object(None),
         _ => match ctx.get_field(t, 0) {
             v @ Value::Object(Some(o))
-                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                if ctx
+                    .class_name_arc_of_id(ctx.class_id_of_object(o))
+                    .as_deref()
                     == Some("java/lang/String") =>
             {
                 v
@@ -1918,11 +1919,12 @@ pub(crate) fn native_throwable_print_stack_trace(
     // Java-level buffer entirely. Resolve the CURRENT `System.err` value and
     // route through its own `println` when it's wrapped.
     let err_stream = ctx.class_id_by_name("java/lang/System").and_then(|sys| {
-        ctx.static_field_index_by_name(sys, "err")
-            .and_then(|idx| match ctx.get_static_field(sys, idx) {
+        ctx.static_field_index_by_name(sys, "err").and_then(|idx| {
+            match ctx.get_static_field(sys, idx) {
                 Value::Object(Some(s)) => Some(s),
                 _ => None,
-            })
+            }
+        })
     });
     match err_stream {
         Some(s) if matches!(ctx.get_field_by_name(s, "out"), Value::Object(Some(_))) => {
@@ -2233,12 +2235,10 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // supplies it, and fall back to the old length test when it does not (a
     // synthetic-JDK image has no such static).
     if let Value::Object(Some(set_arr)) = throwable_field_get(ctx, this, "stackTrace") {
-        let unassigned = ctx
-            .class_id_by_name("java/lang/Throwable")
-            .and_then(|cid| {
-                ctx.static_field_index_by_name(cid, "UNASSIGNED_STACK")
-                    .map(|idx| ctx.get_static_field(cid, idx))
-            });
+        let unassigned = ctx.class_id_by_name("java/lang/Throwable").and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "UNASSIGNED_STACK")
+                .map(|idx| ctx.get_static_field(cid, idx))
+        });
         let is_sentinel = matches!(unassigned, Some(Value::Object(Some(u))) if u == set_arr);
         let was_set = match unassigned {
             // The real class library is present: identity decides, so an
@@ -2546,7 +2546,12 @@ const STE_FIELD_LINE: usize = 3;
 /// module/loader strings), not slot 0. The legacy synthetic-stub layout
 /// uses raw slots `[class, method, file, line]`. Prefer the named field
 /// when the class carries it; fall back to the raw slot otherwise.
-pub(crate) fn ste_read_field(ctx: &dyn NativeContext, ste: ObjectRef, named: &str, raw_slot: usize) -> Value {
+pub(crate) fn ste_read_field(
+    ctx: &dyn NativeContext,
+    ste: ObjectRef,
+    named: &str,
+    raw_slot: usize,
+) -> Value {
     if ctx
         .resolve_field_index("java/lang/StackTraceElement", "declaringClass")
         .is_some()
@@ -2907,94 +2912,94 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
 /// declares for one of these must have a native here, or the synthetic stub
 /// declares a method that resolves to nothing.
 pub(crate) const THROWABLE_FAMILY_CLASSES: &[&str] = &[
-        "java/lang/Throwable",
-        "java/lang/Exception",
-        "java/lang/RuntimeException",
-        "java/lang/Error",
-        "java/lang/LinkageError",
-        "java/lang/NoClassDefFoundError",
-        "java/lang/SecurityException",
-        "java/lang/ReflectiveOperationException",
-        "java/lang/ClassNotFoundException",
-        "java/lang/NoSuchMethodError",
-        "java/lang/NoSuchFieldError",
-        "java/lang/NoSuchMethodException",
-        "java/lang/NoSuchFieldException",
-        "java/lang/CloneNotSupportedException",
-        "java/lang/InstantiationException",
-        "java/lang/IllegalAccessException",
-        "java/lang/reflect/InaccessibleObjectException",
-        "java/lang/reflect/InvocationTargetException",
-        "java/lang/InterruptedException",
-        "java/lang/NullPointerException",
-        "java/lang/ArithmeticException",
-        "java/lang/ArrayIndexOutOfBoundsException",
-        "java/lang/IndexOutOfBoundsException",
-        "java/lang/StringIndexOutOfBoundsException",
-        "java/lang/ClassCastException",
-        "java/lang/IllegalArgumentException",
-        "java/lang/IllegalStateException",
-        "java/lang/UnsupportedOperationException",
-        "java/lang/TypeNotPresentException",
-        "java/lang/StackOverflowError",
-        "java/lang/OutOfMemoryError",
-        "java/util/NoSuchElementException",
-        "java/util/InputMismatchException",
-        "java/util/MissingResourceException",
-        "java/util/FormatterClosedException",
-        "java/io/IOException",
-        "java/io/FileNotFoundException",
-        "java/io/UncheckedIOException",
-        "java/io/NotSerializableException",
-        // `java/io/InvalidClassException` is deliberately NOT in this list, for
-        // the same reason `java/util/regex/PatternSyntaxException` is not: it
-        // OVERRIDES `getMessage()`, prepending the offending class name to the
-        // detail message. A blanket bridge in front of that override returns
-        // the bare `Throwable.detailMessage`, so
-        // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
-        // reported "bad serialVersionUID" where HotSpot reports
-        // "com.example.Foo; bad serialVersionUID" -- and deserialization
-        // diagnostics lose the one field that says WHICH class failed.
-        //
-        // Found 2026-08-05 by checking `javap -p` for a declared
-        // getMessage/getLocalizedMessage/toString across every class in these
-        // two lists; it and `NullPointerException` were the only two left after
-        // PatternSyntaxException. See
-        // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
-        "java/io/EOFException",
-        "java/io/UnsupportedEncodingException",
-        "java/net/MalformedURLException",
-        "java/net/UnknownHostException",
-        "java/lang/NumberFormatException",
-        "java/util/ConcurrentModificationException",
-        "java/util/concurrent/TimeoutException",
-        "java/util/concurrent/RejectedExecutionException",
-        "java/util/concurrent/CancellationException",
-        "java/util/concurrent/CompletionException",
-        "java/util/concurrent/ExecutionException",
-        "java/util/concurrent/BrokenBarrierException",
-        "java/text/ParseException",
-        // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
-        // list. It is the one exception here that OVERRIDES `getMessage()`:
-        // the JDK builds a three-line report ("Unclosed character class near
-        // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
-        // fields and never sets `Throwable.detailMessage`. A blanket
-        // `getMessage` bridge in front of that override returns the null
-        // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
-        // where HotSpot gives the full report. Its real constructor is
-        // `(String,String,int)V`, which is not among the `<init>` shapes
-        // registered here either, so every bridge this loop would add is
-        // either dead or actively wrong. Removed 2026-08-05.
-        "java/lang/NegativeArraySizeException",
-        "java/lang/AssertionError",
-        "java/lang/MatchException",
-        "java/lang/IncompatibleClassChangeError",
-        "java/lang/IllegalAccessError",
-        "java/lang/ExceptionInInitializerError",
-        "java/lang/VerifyError",
-        "java/lang/AbstractMethodError",
-        "java/lang/InternalError",
-        "java/lang/UnsatisfiedLinkError",
+    "java/lang/Throwable",
+    "java/lang/Exception",
+    "java/lang/RuntimeException",
+    "java/lang/Error",
+    "java/lang/LinkageError",
+    "java/lang/NoClassDefFoundError",
+    "java/lang/SecurityException",
+    "java/lang/ReflectiveOperationException",
+    "java/lang/ClassNotFoundException",
+    "java/lang/NoSuchMethodError",
+    "java/lang/NoSuchFieldError",
+    "java/lang/NoSuchMethodException",
+    "java/lang/NoSuchFieldException",
+    "java/lang/CloneNotSupportedException",
+    "java/lang/InstantiationException",
+    "java/lang/IllegalAccessException",
+    "java/lang/reflect/InaccessibleObjectException",
+    "java/lang/reflect/InvocationTargetException",
+    "java/lang/InterruptedException",
+    "java/lang/NullPointerException",
+    "java/lang/ArithmeticException",
+    "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/IndexOutOfBoundsException",
+    "java/lang/StringIndexOutOfBoundsException",
+    "java/lang/ClassCastException",
+    "java/lang/IllegalArgumentException",
+    "java/lang/IllegalStateException",
+    "java/lang/UnsupportedOperationException",
+    "java/lang/TypeNotPresentException",
+    "java/lang/StackOverflowError",
+    "java/lang/OutOfMemoryError",
+    "java/util/NoSuchElementException",
+    "java/util/InputMismatchException",
+    "java/util/MissingResourceException",
+    "java/util/FormatterClosedException",
+    "java/io/IOException",
+    "java/io/FileNotFoundException",
+    "java/io/UncheckedIOException",
+    "java/io/NotSerializableException",
+    // `java/io/InvalidClassException` is deliberately NOT in this list, for
+    // the same reason `java/util/regex/PatternSyntaxException` is not: it
+    // OVERRIDES `getMessage()`, prepending the offending class name to the
+    // detail message. A blanket bridge in front of that override returns
+    // the bare `Throwable.detailMessage`, so
+    // `new InvalidClassException("com.example.Foo", "bad serialVersionUID")`
+    // reported "bad serialVersionUID" where HotSpot reports
+    // "com.example.Foo; bad serialVersionUID" -- and deserialization
+    // diagnostics lose the one field that says WHICH class failed.
+    //
+    // Found 2026-08-05 by checking `javap -p` for a declared
+    // getMessage/getLocalizedMessage/toString across every class in these
+    // two lists; it and `NullPointerException` were the only two left after
+    // PatternSyntaxException. See
+    // `a-bridge-in-front-of-an-overridden-getmessage-FIXED-20260805.md`.
+    "java/io/EOFException",
+    "java/io/UnsupportedEncodingException",
+    "java/net/MalformedURLException",
+    "java/net/UnknownHostException",
+    "java/lang/NumberFormatException",
+    "java/util/ConcurrentModificationException",
+    "java/util/concurrent/TimeoutException",
+    "java/util/concurrent/RejectedExecutionException",
+    "java/util/concurrent/CancellationException",
+    "java/util/concurrent/CompletionException",
+    "java/util/concurrent/ExecutionException",
+    "java/util/concurrent/BrokenBarrierException",
+    "java/text/ParseException",
+    // `java/util/regex/PatternSyntaxException` is deliberately NOT in this
+    // list. It is the one exception here that OVERRIDES `getMessage()`:
+    // the JDK builds a three-line report ("Unclosed character class near
+    // index 0", the pattern, a caret) from its `desc`/`pattern`/`index`
+    // fields and never sets `Throwable.detailMessage`. A blanket
+    // `getMessage` bridge in front of that override returns the null
+    // `detailMessage`, so `"x".split("[")` reported `getMessage() == null`
+    // where HotSpot gives the full report. Its real constructor is
+    // `(String,String,int)V`, which is not among the `<init>` shapes
+    // registered here either, so every bridge this loop would add is
+    // either dead or actively wrong. Removed 2026-08-05.
+    "java/lang/NegativeArraySizeException",
+    "java/lang/AssertionError",
+    "java/lang/MatchException",
+    "java/lang/IncompatibleClassChangeError",
+    "java/lang/IllegalAccessError",
+    "java/lang/ExceptionInInitializerError",
+    "java/lang/VerifyError",
+    "java/lang/AbstractMethodError",
+    "java/lang/InternalError",
+    "java/lang/UnsatisfiedLinkError",
 ];
 
 /// The native body for one `(class, constructor descriptor)` pair from
@@ -3452,7 +3457,10 @@ mod throwable_ctor_table_tests {
             ]
         );
         for dead in THROWABLE_DEFAULT_CTORS {
-            assert!(!unchecked_io.contains(dead), "{dead} is dead on UncheckedIOException");
+            assert!(
+                !unchecked_io.contains(dead),
+                "{dead} is dead on UncheckedIOException"
+            );
         }
 
         // `NoClassDefFoundError` has no cause-taking constructor at all — the

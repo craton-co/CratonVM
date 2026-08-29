@@ -906,7 +906,9 @@ impl Asm {
     /// `REX` byte, emitted unconditionally (every caller here sets `W`).
     fn rex_w(&mut self, r: bool, x: bool, b: bool) {
         self.byte(
-            0x48 | (if r { 0x04 } else { 0 }) | (if x { 0x02 } else { 0 }) | (if b { 0x01 } else { 0 }),
+            0x48 | (if r { 0x04 } else { 0 })
+                | (if x { 0x02 } else { 0 })
+                | (if b { 0x01 } else { 0 }),
         );
     }
 
@@ -1041,11 +1043,7 @@ struct ValueLife {
 
 /// Validate the body's single-assignment discipline and compute last uses.
 fn analyse_values(body: &[VecStep]) -> Result<Vec<ValueLife>, VecEmitRefusal> {
-    fn use_value(
-        lives: &mut [ValueLife],
-        v: VecValueId,
-        at: usize,
-    ) -> Result<(), VecEmitRefusal> {
+    fn use_value(lives: &mut [ValueLife], v: VecValueId, at: usize) -> Result<(), VecEmitRefusal> {
         match lives.get_mut(v) {
             Some(life) if life.def.is_some() => {
                 life.last_use = Some(at);
@@ -1055,11 +1053,7 @@ fn analyse_values(body: &[VecStep]) -> Result<Vec<ValueLife>, VecEmitRefusal> {
         }
     }
 
-    fn def_value(
-        lives: &mut [ValueLife],
-        v: VecValueId,
-        at: usize,
-    ) -> Result<(), VecEmitRefusal> {
+    fn def_value(lives: &mut [ValueLife], v: VecValueId, at: usize) -> Result<(), VecEmitRefusal> {
         match lives.get_mut(v) {
             Some(life) if life.def.is_none() => {
                 life.def = Some(at);
@@ -1186,10 +1180,7 @@ pub(crate) fn emit_vector_loop(req: &VecEmitRequest<'_>) -> Result<VecLoopCode, 
         // independently of the gate's own `GcReferenceAccess` refusal.
         return Err(VecEmitRefusal::ObjectReferenceElement);
     }
-    if matches!(
-        plan.elem,
-        MemKind::Byte | MemKind::Char | MemKind::Short
-    ) {
+    if matches!(plan.elem, MemKind::Byte | MemKind::Char | MemKind::Short) {
         return Err(VecEmitRefusal::SubwordElement { elem: plan.elem });
     }
     let elem_size = elem_bytes(plan.elem);
@@ -1402,11 +1393,11 @@ pub(crate) fn emit_vector_loop(req: &VecEmitRequest<'_>) -> Result<VecLoopCode, 
 
 /// The byte displacement of element `iv + index_offset` from the array base.
 fn element_disp(index_offset: i32, elem_size: usize) -> Result<i64, VecEmitRefusal> {
-    let scaled = (index_offset as i64)
-        .checked_mul(elem_size as i64)
-        .ok_or(VecEmitRefusal::DisplacementOutOfRange {
+    let scaled = (index_offset as i64).checked_mul(elem_size as i64).ok_or(
+        VecEmitRefusal::DisplacementOutOfRange {
             disp: index_offset as i64,
-        })?;
+        },
+    )?;
     scaled
         .checked_add(HEADER_SIZE as i64)
         .ok_or(VecEmitRefusal::DisplacementOutOfRange { disp: scaled })
@@ -1631,7 +1622,10 @@ mod tests {
 
     #[test]
     fn the_default_policy_is_off() {
-        assert_eq!(VecEmitPolicy::from_flag_value(None), VecEmitPolicy::Disabled);
+        assert_eq!(
+            VecEmitPolicy::from_flag_value(None),
+            VecEmitPolicy::Disabled
+        );
         for falsey in ["", " ", "0", "false", "OFF", "No"] {
             assert_eq!(
                 VecEmitPolicy::from_flag_value(Some(falsey)),
@@ -1792,7 +1786,10 @@ mod tests {
         ];
         assert_eq!(code.code, expected);
         assert_eq!(code.remainder_entry, expected.len());
-        assert!(code.fallback_sites.is_empty(), "no guards, no fallback edges");
+        assert!(
+            code.fallback_sites.is_empty(),
+            "no guards, no fallback edges"
+        );
         assert_eq!(code.lanes, 8);
         assert_eq!(code.width_bytes, 32);
         assert_eq!(code.max_remainder_iterations, 7);
@@ -2125,10 +2122,7 @@ mod tests {
         plan.isa = VectorIsa::strict_align128();
         plan.alignment = Alignment::Proven(16);
         let shape = elementwise_shape();
-        assert_eq!(
-            emit(&plan, &shape),
-            Err(VecEmitRefusal::StrictAlignmentIsa)
-        );
+        assert_eq!(emit(&plan, &shape), Err(VecEmitRefusal::StrictAlignmentIsa));
 
         plan.alignment = Alignment::Unknown;
         assert_eq!(
@@ -2192,7 +2186,10 @@ mod tests {
             0x48, 0x83, 0xFE, 0x08,             // cmp rsi, 8
             0x0F, 0x8C, 0x00, 0x00, 0x00, 0x00, // jl  fallback
         ];
-        assert_eq!(&code.code[..expected_guards.len()], expected_guards.as_slice());
+        assert_eq!(
+            &code.code[..expected_guards.len()],
+            expected_guards.as_slice()
+        );
         assert_eq!(code.fallback_sites, vec![6, 15, 25]);
         // Every fallback site is a `rel32` field left at zero for the caller.
         for site in &code.fallback_sites {
@@ -2434,7 +2431,10 @@ mod tests {
         use crate::regalloc::xmm_roles::vector_pool_is_encodable;
         // Outside the pool: never encodable, saved or not, on any target.
         for reg in [0u8, 1, 5, 7] {
-            assert!(!vector_pool_is_encodable(reg, &[]), "xmm{reg} with no saves");
+            assert!(
+                !vector_pool_is_encodable(reg, &[]),
+                "xmm{reg} with no saves"
+            );
             assert!(!vector_pool_is_encodable(reg, &[reg]), "xmm{reg} saved");
         }
         // Inside the pool and saved by the frame: always fine.

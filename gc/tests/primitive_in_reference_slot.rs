@@ -123,10 +123,7 @@ fn round_trip(heap: &VmHeap, class_id: u32, value: Value) -> Value {
 /// Every backend this build can construct, named, so a failure message says
 /// which arm disagreed instead of which array index did.
 fn backends() -> Vec<(&'static str, GcBackend)> {
-    let mut v = vec![
-        ("gen_heap", GcBackend::Generational),
-        ("g1", GcBackend::G1),
-    ];
+    let mut v = vec![("gen_heap", GcBackend::Generational), ("g1", GcBackend::G1)];
     #[cfg(feature = "zgc")]
     v.push(("zgc", GcBackend::Zgc));
     v
@@ -150,7 +147,10 @@ fn every_collector_agrees_on_a_primitive_in_a_reference_slot() {
         .iter()
         .map(|&(name, backend)| {
             let heap = VmHeap::new(backend, HEAP_BYTES);
-            (name, round_trip(&heap, REF_FIRST_CLASS, Value::Int(SENTINEL)))
+            (
+                name,
+                round_trip(&heap, REF_FIRST_CLASS, Value::Int(SENTINEL)),
+            )
         })
         .collect();
 

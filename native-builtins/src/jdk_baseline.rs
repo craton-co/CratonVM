@@ -1317,9 +1317,9 @@ mod tests {
             .lines()
             .filter(|l| {
                 !l.starts_with("METHOD\t")
-                    || l.split('\t').nth(3).is_some_and(|f| {
-                        f.split(',').any(|x| x == "public" || x == "protected")
-                    })
+                    || l.split('\t')
+                        .nth(3)
+                        .is_some_and(|f| f.split(',').any(|x| x == "public" || x == "protected"))
             })
             .collect();
         let dropped = CDS.lines().count() - kept.len();
@@ -1383,7 +1383,10 @@ mod tests {
             ("dumpDynamicArchive", "(Ljava/lang/String;)V"),
         ] {
             assert!(b.declares(n, d), "{n}{d} is a real member of JDK 25's CDS");
-            assert!(declared.contains(&(n, d)), "{n}{d} must be on the declared surface");
+            assert!(
+                declared.contains(&(n, d)),
+                "{n}{d} must be on the declared surface"
+            );
             assert!(
                 !public.contains(&(n, d)),
                 "{n}{d} is private; it must NOT be on the public surface. If it is, the two \

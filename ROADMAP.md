@@ -150,7 +150,7 @@ Beyond those, the per-service-area blockers that stop broad real-class execution
 — `String` dispatch, thread/executor semantics, ForkJoin worker execution,
 `ProcessHandle`, reflection accessors, JNI binding, JPMS, NIO — are inventoried
 with their current evidence in
-[`docs/jdk-only-runtime-services.md`](docs/jdk-only-runtime-services.md).
+[`docs/known-issues/jdk-only/runtime-services-blocker-inventory.md`](docs/known-issues/jdk-only/runtime-services-blocker-inventory.md).
 
 Two standing constraints on all of it: the default `compatible` mode must remain
 **byte-for-byte unchanged** (most of the dangerous mistakes catalogued so far

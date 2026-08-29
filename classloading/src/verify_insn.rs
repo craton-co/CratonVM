@@ -2617,7 +2617,16 @@ mod tests {
         method: &str,
         descriptor: &str,
     ) -> Result<InsnVerifyResult, LinkageError> {
-        verify_instruction(insn, 0, frame, cp, class, method, descriptor, &MockHierarchy)
+        verify_instruction(
+            insn,
+            0,
+            frame,
+            cp,
+            class,
+            method,
+            descriptor,
+            &MockHierarchy,
+        )
     }
 
     #[test]
@@ -2644,15 +2653,7 @@ mod tests {
     fn new_with_an_out_of_range_cp_index_rejected() {
         let cp = init_cp();
         let mut frame = make_frame(1, 4);
-        assert!(run(
-            &Instruction::New(9999),
-            &mut frame,
-            &cp,
-            "Test",
-            "m",
-            "()V"
-        )
-        .is_err());
+        assert!(run(&Instruction::New(9999), &mut frame, &cp, "Test", "m", "()V").is_err());
     }
 
     #[test]
@@ -2709,9 +2710,9 @@ mod tests {
         // descriptor used to disable the type check on this operand entirely.
         let cp = ConstantPool::new(vec![
             ConstantPoolEntry::Tombstone,
-            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::Utf8("Test".into()), // 1
             ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
-            ConstantPoolEntry::Utf8("f".into()),                 // 3
+            ConstantPoolEntry::Utf8("f".into()),    // 3
             ConstantPoolEntry::Utf8("Ljava/lang/String".into()), // 4 — no ';'
             ConstantPoolEntry::NameAndType {
                 name_index: 3,
@@ -2755,9 +2756,9 @@ mod tests {
     fn invokestatic_with_a_malformed_method_descriptor_rejected() {
         let cp = ConstantPool::new(vec![
             ConstantPoolEntry::Tombstone,
-            ConstantPoolEntry::Utf8("Test".into()),              // 1
+            ConstantPoolEntry::Utf8("Test".into()), // 1
             ConstantPoolEntry::ClassReference { name_index: 1 }, // 2
-            ConstantPoolEntry::Utf8("m".into()),                 // 3
+            ConstantPoolEntry::Utf8("m".into()),    // 3
             ConstantPoolEntry::Utf8("(Ljava/lang/String)V".into()), // 4 — no ';'
             ConstantPoolEntry::NameAndType {
                 name_index: 3,

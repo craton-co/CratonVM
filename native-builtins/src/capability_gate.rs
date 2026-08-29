@@ -105,7 +105,9 @@ pub fn open_random_access_gated(
     write: bool,
 ) -> Result<FdId, FdCapabilityError> {
     match ctx.vm_capabilities() {
-        Some(caps) => ctx.fd_table().open_random_access_checked(&caps, path, write),
+        Some(caps) => ctx
+            .fd_table()
+            .open_random_access_checked(&caps, path, write),
         None => Ok(ctx.fd_table().open_random_access(path, write)?),
     }
 }
@@ -863,4 +865,3 @@ mod tests {
         );
     }
 }
-

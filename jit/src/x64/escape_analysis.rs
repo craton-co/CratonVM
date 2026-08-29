@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 /// Per-`invokespecial` shape needed for precise escape analysis.
 ///
 /// `analyze_escapes` walks raw bytecode and cannot resolve constant-pool
@@ -1227,10 +1226,11 @@ pub(super) fn find_bypassable_loop_headers(
                 }
                 let read_off = |at: usize| -> isize {
                     // Cast: signed branch displacement to isize
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        as isize
                 };
                 push_edge(pc, pc as isize + read_off(p), &mut edges); // default
-                                                                     // Cast: table bound to i32
+                                                                      // Cast: table bound to i32
                 let low = read_off(p + 4) as i32;
                 // Cast: table bound to i32
                 let high = read_off(p + 8) as i32;
@@ -1257,7 +1257,8 @@ pub(super) fn find_bypassable_loop_headers(
                 }
                 let read_off = |at: usize| -> isize {
                     // Cast: signed branch displacement to isize
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+                        as isize
                 };
                 push_edge(pc, pc as isize + read_off(p), &mut edges); // default
                 let npairs =
@@ -1429,7 +1430,11 @@ pub(super) struct ByteSieveLoop {
 // enormous application loop retains the scalar path's cooperative polls.
 pub(super) const MAX_BULK_BYTE_LOOP_SPAN: i32 = 1 << 20;
 
-pub(super) fn decode_bulk_int_load(code: &[u8], code_len: usize, pc: usize) -> Option<(usize, usize)> {
+pub(super) fn decode_bulk_int_load(
+    code: &[u8],
+    code_len: usize,
+    pc: usize,
+) -> Option<(usize, usize)> {
     if pc >= code_len {
         return None;
     }
@@ -1921,7 +1926,11 @@ pub(super) fn match_invariant_aaload(
 
 /// Find loop-invariant aaload sequences that can be hoisted out of loops.
 /// For nested loops, hoists to the outermost loop where the sequence is invariant.
-pub(super) fn find_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]) -> Vec<LoopHoist> {
+pub(super) fn find_loop_hoists(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> Vec<LoopHoist> {
     if loops.is_empty() {
         return Vec::new();
     }

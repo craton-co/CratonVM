@@ -194,7 +194,7 @@ default and is unaffected.**
   stage has landed.
 - [Migration and operator guide](jdk-only-migration.md) — what the flag means,
   how to read a violation, and the staged path from diagnostic to default.
-- [Blocker inventory by service area](jdk-only-runtime-services.md) — the
+- [Blocker inventory by service area](known-issues/jdk-only/runtime-services-blocker-inventory.md) — the
   confirmed, open work list; a floor, not a ceiling.
 - [Native promotion review](jdk-only-native-review.md) — the checklist a
   `SyntheticStub` must pass to become a reviewed `Bridge` or `Intrinsic`.
@@ -217,7 +217,7 @@ CI publishes its dumps under `target/jdk-only-audit/`.
 - [Known Limitations](book/src/java-support/limitations.md) — the manual's list.
 - [`known-issues/`](known-issues/) — unresolved bugs and active
   investigations, with reproducers.
-- [Blocker inventory for `--jdk-only`](jdk-only-runtime-services.md)
+- [Blocker inventory for `--jdk-only`](known-issues/jdk-only/runtime-services-blocker-inventory.md)
 - [Differential testing](testing/differential.md) — what is compared, and how
   to trust the answer. No divergence is currently open. ·
   [opcode coverage](testing/opcode-coverage.md)

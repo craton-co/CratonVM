@@ -43,8 +43,7 @@ use tracing::info;
 /// the phase report require an unrelated JIT flag. See
 /// `docs/observability/phase-accounting.md` §10.3.
 fn maybe_dump_shutdown_reports() {
-    static DUMPED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     if DUMPED
         .compare_exchange(
@@ -69,7 +68,10 @@ fn maybe_dump_shutdown_reports() {
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some() {
         let (methods, stats) = cratonvm_jit::x64::isel::shadow_totals();
         if methods != 0 {
-            eprintln!("[ir-isel] TOTALS methods={methods} {}", stats.summary_line());
+            eprintln!(
+                "[ir-isel] TOTALS methods={methods} {}",
+                stats.summary_line()
+            );
         }
         let (mir_methods, tiles, mismatches) = cratonvm_jit::ir_lower::mir_totals::read();
         if mir_methods != 0 {
@@ -77,8 +79,7 @@ fn maybe_dump_shutdown_reports() {
             // sizing of the increment byte equality cannot cover: what the
             // encoder would have written for the tiles it is not allowed to
             // emit, against what the per-opcode arms did write.
-            let (shadow, arm_bytes, enc_bytes) =
-                cratonvm_jit::ir_lower::mir_totals::read_shadow();
+            let (shadow, arm_bytes, enc_bytes) = cratonvm_jit::ir_lower::mir_totals::read_shadow();
             eprintln!(
                 "[ir-isel] MIR TOTALS methods={mir_methods} tiles={tiles} \
                  mismatches={mismatches} shadow_tiles={shadow} \
@@ -3259,7 +3260,10 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
                         // clamps LOUDLY rather than silently reverting to the
                         // default, but advising a number the run will change is
                         // still worse than advising the right one.
-                        (recorded as u64 + dropped).saturating_mul(2).max(8192).min(65_536),
+                        (recorded as u64 + dropped)
+                            .saturating_mul(2)
+                            .max(8192)
+                            .min(65_536),
                     );
                 }
                 // The JIT fast-path sink is a SECOND bounded collection feeding
@@ -3389,7 +3393,11 @@ fn write_jdk_only_dumps_on_exit() {
 ///
 /// Called from the clean shutdown path **and** from each failing path that
 /// still has a VM, so a strict-mode failure is categorisable.
-fn finish_jdk_only(args: &Args, shared: &cratonvm_vm::SharedVm, watermark: &mut ViolationWatermark) {
+fn finish_jdk_only(
+    args: &Args,
+    shared: &cratonvm_vm::SharedVm,
+    watermark: &mut ViolationWatermark,
+) {
     if args.trace_jdk_only || args.explain_jdk_only {
         trace_jdk_only_violations(shared, watermark, "shutdown", args.explain_jdk_only);
     }
@@ -3497,7 +3505,10 @@ fn launcher_assertions_requested(argv: &[String]) -> Option<bool> {
 /// stops at the `--` separator so a Java program argument of the same spelling
 /// is never consumed.
 fn launcher_phase_report_path(argv: &[String]) -> Option<String> {
-    let end = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+    let end = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(argv.len());
     let launcher = &argv[..end];
     for (i, arg) in launcher.iter().enumerate() {
         if let Some(path) = arg.strip_prefix("--dump-phase-report=") {
@@ -4491,9 +4502,8 @@ fn run() -> Result<()> {
     // this function can propagate, instead of a raw panic/exit from deep
     // inside argv scanning.
     if let Some(raw) = &hotspot_flags.jfr_start_recording {
-        config.jfr_start_recording = Some(
-            parse_jfr_start_recording_opts(raw).map_err(|e| anyhow::anyhow!("{e}"))?,
-        );
+        config.jfr_start_recording =
+            Some(parse_jfr_start_recording_opts(raw).map_err(|e| anyhow::anyhow!("{e}"))?);
     }
 
     // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
@@ -5030,7 +5040,12 @@ fn run() -> Result<()> {
         // never looks up a service is unharmed — but the operator is told,
         // because from here on every module-declared provider is silently
         // absent.
-        match vm.invoke("java/lang/ModuleLayer", "boot", "()Ljava/lang/ModuleLayer;", &[]) {
+        match vm.invoke(
+            "java/lang/ModuleLayer",
+            "boot",
+            "()Ljava/lang/ModuleLayer;",
+            &[],
+        ) {
             Ok(Some(Value::Object(Some(_)))) => {
                 tracing::info!("module system initialised (ModuleLayer.boot)");
             }
@@ -5393,7 +5408,8 @@ fn run() -> Result<()> {
             eprintln!(
                 "[cratonvm] VarHandle write thin direct calls: served={served} declined={declined}",
             );
-            let (cas_served, cas_declined) = cratonvm_vm::jit::helpers::varhandle_field_cas_counts();
+            let (cas_served, cas_declined) =
+                cratonvm_vm::jit::helpers::varhandle_field_cas_counts();
             eprintln!(
                 "[cratonvm] VarHandle field CAS in-funnel: served={cas_served} declined={cas_declined}",
             );
@@ -5574,7 +5590,8 @@ fn run() -> Result<()> {
             // and a cycle that was never told to avoid moving them.
             // `shortcircuits` is the denominator: without it a zero cannot be
             // told apart from an audit that never ran.
-            let sc = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
+            let sc =
+                cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SHORTCIRCUITS.load(O::Relaxed);
             let sup = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED.load(O::Relaxed);
             let supa = cratonvm_vm::jit::conservative_roots::UNREG_MEMO_SUPPRESSED_AUTHORITATIVE
                 .load(O::Relaxed);
@@ -7066,16 +7083,10 @@ mod tests {
     #[test]
     fn early_nojit_scan_ignores_java_program_arguments() {
         assert!(launcher_nojit_requested(&tokens(&[
-            "cratonvm",
-            "--nojit",
-            "Main",
-            "--"
+            "cratonvm", "--nojit", "Main", "--"
         ])));
         assert!(!launcher_nojit_requested(&tokens(&[
-            "cratonvm",
-            "Main",
-            "--",
-            "--nojit"
+            "cratonvm", "Main", "--", "--nojit"
         ])));
     }
 
@@ -7120,7 +7131,10 @@ mod tests {
             launcher_phase_report_path(&tokens(&["cratonvm", "--dump-phase-report"])),
             None
         );
-        assert_eq!(launcher_phase_report_path(&tokens(&["cratonvm", "Main"])), None);
+        assert_eq!(
+            launcher_phase_report_path(&tokens(&["cratonvm", "Main"])),
+            None
+        );
     }
 
     /// The launcher consumes the option, but clap must still accept it or the
@@ -7202,7 +7216,13 @@ mod tests {
     #[test]
     fn explicit_java_home_is_visible_to_the_banner() {
         assert_eq!(
-            scan_explicit_java_home(&tokens(&["cratonvm", "--java-home", "/opt/jdk", "Main", "--"])),
+            scan_explicit_java_home(&tokens(&[
+                "cratonvm",
+                "--java-home",
+                "/opt/jdk",
+                "Main",
+                "--"
+            ])),
             Some("/opt/jdk".to_string())
         );
         assert_eq!(
@@ -8272,7 +8292,8 @@ mod tests {
         // netty take the same path it takes on a stock JDK 25.
         let out = normalize_java_launcher_argv(argv(&["java", "-Xmx1g", "Main"]));
         assert!(
-            !out.iter().any(|a| a.contains("sun.misc.unsafe.memory.access")),
+            !out.iter()
+                .any(|a| a.contains("sun.misc.unsafe.memory.access")),
             "a default command line must not mention the property: {out:?}"
         );
     }
@@ -8321,7 +8342,11 @@ mod tests {
             "-da:some.Class",
         ] {
             let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
-            assert_eq!(out, argv(&["java", "Main"]), "flag {flag} survived the strip");
+            assert_eq!(
+                out,
+                argv(&["java", "Main"]),
+                "flag {flag} survived the strip"
+            );
         }
     }
 
@@ -9173,7 +9198,9 @@ mod tests {
         // ...and the execution-mode list must be the one `java.vm.info` will
         // carry, so the banner and the property agree on the policy token.
         assert!(
-            strict.contains(cratonvm_vm::vm::vm_info_mode_list(CompatibilityMode::JdkOnly)),
+            strict.contains(cratonvm_vm::vm::vm_info_mode_list(
+                CompatibilityMode::JdkOnly
+            )),
             "the banner must spell the mode list the way java.vm.info does: {strict}"
         );
         let default = version_banner(
