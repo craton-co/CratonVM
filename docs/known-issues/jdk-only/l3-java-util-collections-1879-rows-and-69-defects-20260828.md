@@ -13,7 +13,8 @@
 its measurement here.** Twelve differential probes, 1879 rows, against HotSpot
 25.0.4+7, run in BOTH modes on every one of five builds. Six of the twelve are
 0-diff in both modes; the other six carry only the eight residual rows of §6 and
-the thirteen of the companion dispatch-door record.
+the thirteen of the companion dispatch-door record (those thirteen are
+CLOSED as of 2026-08-29 — see §6.5).
 
 Lane brief: `HANDOFF-20260828-L3-util-collections.md` (retired). Method:
 `HANDOFF-20260828-SCOPE.md` §3.
@@ -60,7 +61,7 @@ Every one of the 56 classes is now covered by a probe.
 | `PqOptionalShadowSweep` | 125 | 2 (§6.1, §6.2) | 2 |
 | `LinkedSequencedShadowSweep` | 102 | 1 (§6.3) | 1 |
 | `LocaleDateTzShadowSweep` | 123 | 1 (§6.4) | 1 |
-| `MethodRefDoorProbe` | 25 | 13 (§6.5) | 13 |
+| `MethodRefDoorProbe` | 25 | **0** | **0** |
 
 ## 3. The defects, by shape
 
@@ -442,9 +443,40 @@ display name comes from the CLDR bundle through `LocaleServiceProvider`, and
 `getDisplayName` is not registered at all — this is real bytecode failing to
 find its resource. Filed against the locale-data surface, not L3's.
 
-### 6.5 The method-reference dispatch door — its own record
+### 6.5 The method-reference dispatch door — FIXED 2026-08-29
 
-See the companion page. 13 of `MethodRefDoorProbe`'s 25 rows.
+Was 13 of `MethodRefDoorProbe`'s 25 rows; the probe is now 0-diff in both modes.
+The cause was not the missing gate the companion page first named but the class
+the gate is asked ABOUT: ordinary virtual dispatch probes the registry with the
+RECEIVER's class, and the lambda door probed with the class that DECLARES the
+method. `java/util/HashMap$KeyIterator` carries the native and does not declare
+`remove()`; `java/util/HashMap$HashIterator` declares it and carries nothing.
+Fixed in `vm/src/runtime/interpreter/lambda.rs`. Full account, including the 977
+registrations that share the shape and were deliberately NOT activated, in
+`a-bound-method-reference-is-a-different-dispatch-door-20260828.md`.
+
+### 6.6 `Properties.keySet().iterator()` answers the wrong iterator class — 1 row
+
+Found on 2026-08-29 while diagnosing §6.5, by a probe written to check an
+assumption rather than to find a defect:
+
+```text
+Properties.keySet().iterator().getClass().getName()
+  HotSpot   java.util.concurrent.ConcurrentHashMap$KeyIterator
+  CratonVM  java.util.HashMap$KeyIterator          (both modes)
+```
+
+Real: `Properties` stores its entries in a `ConcurrentHashMap` in JDK 25, so its
+key-set iterator is the CHM one. This VM keeps them in the side table and mints
+the `HashMap` carrier. Behaviourally the two agree on all 182 rows of
+`PropertiesShadowSweep` — this is a `getClass().getName()` difference, which is
+the shape `an-identity-only-probe-understates-a-behavioural-gap` warns can be
+either cosmetic or the visible edge of a real one. Recorded rather than fixed
+because changing the minted carrier is the
+`two-producers-of-one-carrier-class-is-a-failure-family` trap: the CHM key
+iterator name already has a producer (`MAP_KEY_ITR_CARRIERS`), and adding a
+second one to it is what made `elements()` never terminate. Probe:
+`apps/probes/ItrClassNameProbe.java`.
 
 ## 7. The final verification, on the tree every lane landed into
 
@@ -467,7 +499,7 @@ twelve probes recompiled from source and re-run, both modes, one run:
 | `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 1 / 1 |
 | `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 1 |
 | `UtilTailShadowSweep` | 146 / 146 / 146 | 0 / 0 |
-| `MethodRefDoorProbe` | 25 / 25 / 25 | 13 / 13 |
+| `MethodRefDoorProbe` | 25 / 25 / 25 | 0 / 0 |
 
 Row counts equal and the trailing `DONE` present on all thirty-six runs, so no
 run is a truncated tail reading as clean. The eight differing rows are §6's
