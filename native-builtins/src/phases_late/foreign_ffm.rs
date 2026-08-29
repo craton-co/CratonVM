@@ -917,12 +917,72 @@ pub(crate) fn p67_receiver_session(
 /// session we modelled, so a segment (whose slot 1 is a `Long` address) and any
 /// other 2+-slot object answer `None`.
 fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<ObjectRef> {
-    if ctx.object_num_fields(arena) <= P67_ARENA_SESSION {
+    let slots = p67_arena_slots(ctx, arena);
+    if ctx.object_num_fields(arena) <= slots.session {
         return None;
     }
-    match ctx.get_field(arena, P67_ARENA_SESSION) {
+    match ctx.get_field(arena, slots.session) {
         Value::Object(Some(session)) if p67_session_modelled(ctx, session) => Some(session),
         _ => None,
+    }
+}
+
+/// The class an `Arena` carrier is minted as: the REAL JDK implementation.
+///
+/// It used to be the `java.lang.foreign.Arena` INTERFACE, which made
+/// `Arena.ofConfined().getClass()` answer `java.lang.foreign.Arena` where
+/// HotSpot answers `jdk.internal.foreign.ArenaImpl` -- an object whose class
+/// `isInterface()` is true and whose `getSuperclass()` is null, which the Java
+/// object model does not contain.
+pub(crate) const P67_ARENA_IMPL: &str = "jdk/internal/foreign/ArenaImpl";
+
+/// Enough slots for the real class's two fields plus the two flags this VM
+/// keeps that the JDK has no field for. `try_alloc_concurrent_synthetic` takes
+/// the LARGER of this and the loaded class's own field count, so the request is
+/// a floor, not a claim about the layout.
+const P67_ARENA_IMPL_SLOTS: usize = 4;
+
+/// Where an `Arena`'s fields live, resolved from the receiver's class.
+///
+/// `ArenaImpl` is a real JDK class with two instance fields (`session`,
+/// `shouldReserveMemory`); the interface carrier this file used to mint had
+/// none, so its slot numbers were free to choose. Resolving by NAME is the
+/// pattern [`p67_session_slots`] already uses for `MemorySessionImpl`, and it
+/// is what lets these accessors keep serving a carrier minted before this
+/// change -- by another registrar, or by a build that could not load the impl.
+pub(crate) struct P67ArenaSlots {
+    pub(crate) session: usize,
+    pub(crate) open: usize,
+    pub(crate) closeable: usize,
+}
+
+impl P67ArenaSlots {
+    /// The historical interface carrier. Still reachable: `refused_class` hands
+    /// back a synthetic stand-in when the impl class will not load.
+    const SYNTHETIC: Self = Self {
+        session: P67_ARENA_SESSION,
+        open: P67_ARENA_OPEN,
+        closeable: P67_ARENA_CLOSEABLE,
+    };
+}
+
+pub(crate) fn p67_arena_slots(ctx: &dyn NativeContext, arena: ObjectRef) -> P67ArenaSlots {
+    let class_id = ctx.class_id_of_object(arena);
+    match ctx.resolve_field_index_by_class_id(class_id, "session") {
+        // `open` and `closeable` have no JDK field to live in -- the JDK keeps
+        // that state in the session, and expresses closeability by WHICH
+        // session subclass it builds. They are APPENDED past the real layout
+        // rather than aliased onto `shouldReserveMemory`, so nothing this VM
+        // writes can be read back by real JDK bytecode as a field it declared.
+        Some(session) => {
+            let base = ctx.class_num_total_fields(class_id);
+            P67ArenaSlots {
+                session,
+                open: base,
+                closeable: base + 1,
+            }
+        }
+        None => P67ArenaSlots::SYNTHETIC,
     }
 }
 
@@ -944,20 +1004,20 @@ fn p67_new_arena_kind(
     confined: bool,
     closeable: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
+    let arena = try_alloc_concurrent_synthetic(ctx, P67_ARENA_IMPL, P67_ARENA_IMPL_SLOTS)?;
     // The session allocation below can move the fresh arena (native stale-local
     // family).
     let arena_pin = ctx.pin_native_root(arena);
     let session_value = p67_memory_session(ctx)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
-    ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
-    ctx.set_field(arena, P67_ARENA_SESSION, session_value);
-    ctx.set_field(
-        arena,
-        P67_ARENA_CLOSEABLE,
-        Value::Int(i32::from(closeable)),
-    );
+    // Resolved AFTER the allocation, from the object that actually came back:
+    // if the impl class would not load, this is the synthetic carrier and its
+    // slots are the historical ones.
+    let slots = p67_arena_slots(ctx, arena);
+    ctx.set_field(arena, slots.open, Value::Int(1));
+    ctx.set_field(arena, slots.session, session_value);
+    ctx.set_field(arena, slots.closeable, Value::Int(i32::from(closeable)));
     if confined {
         if let Value::Object(Some(session)) = session_value {
             let owner = ctx.current_thread_object();
@@ -1063,13 +1123,32 @@ fn p67_session_delegate(
 /// answer into a use-after-FREE. Real segments carry their session in the named
 /// `scope` field (`AbstractMemorySegmentImpl.scope`); synthetic ones have no
 /// such field and are unaffected.
+/// The receiver is `&mut` because this function can RELOCATE it:
+/// `checkValidState()` below is Java bytecode, so the collector can run inside
+/// it and forward `segment`. Taking it by value left that entirely to the
+/// callers, and they split two ways — `p67_segment_get_string` and
+/// `lang_invoke`'s VarHandle-segment shape had each pinned around this call by
+/// hand, with a comment saying exactly why, while the three sites beside them
+/// (`p67_segment_get_width`, and both calls in `p67_segment_set_width`) went
+/// straight on to `p67_segment_parts`, which reads the receiver's fields. That
+/// is the ratio `scripts/stale-receiver-audit.py`'s header predicts, and `&mut`
+/// is its prescribed remedy: it makes an unconverted caller a COMPILE ERROR
+/// instead of something the next audit has to find again.
 pub(crate) fn p67_segment_check_scope(
     ctx: &mut dyn NativeContext,
-    segment: ObjectRef,
+    segment: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if let Value::Object(Some(scope)) = ctx.get_field_by_name(segment, "scope") {
+    if let Value::Object(Some(scope)) = ctx.get_field_by_name(*segment, "scope") {
         if p67_session_is_real(ctx, scope) {
-            ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[])?;
+            // The one GC point in this function. Pin across it and hand the
+            // caller the forwarded reference; every other branch below only
+            // reads fields and cannot move anything.
+            let pin = ctx.pin_native_root(*segment);
+            let checked =
+                ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[]);
+            *segment = ctx.read_native_pin(pin, *segment);
+            ctx.unpin_native_roots(pin);
+            checked?;
             return Ok(());
         }
         // W7-89: a REAL segment can carry one of OUR sessions. The
@@ -1095,8 +1174,8 @@ pub(crate) fn p67_segment_check_scope(
     // Synthetic segment: slot 2 names the owning arena. Deliberately NOT
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
-    if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(owner)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
+    if ctx.object_num_fields(*segment) > P67_SEGMENT_ARENA {
+        if let Value::Object(Some(owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
             if let Some(session) = p67_arena_session(ctx, owner) {
                 p67_session_check_valid(ctx, session)?;
             } else if crate::panama::pe_session_modelled(ctx, owner) {
@@ -2283,11 +2362,10 @@ pub(crate) fn p67_segment_get_string(
         _ => 0,
     };
     // GC-safety: `checkValidState()` is Java bytecode and can relocate `seg`.
-    let seg_pin = ctx.pin_native_root(seg);
-    let checked = p67_segment_check_scope(ctx, seg);
-    let seg = ctx.read_native_pin(seg_pin, seg);
-    ctx.unpin_native_roots(seg_pin);
-    checked?;
+    // The pin lives inside `p67_segment_check_scope` now, and the `&mut` hands
+    // the forwarded reference back here.
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
     let base = crate::panama_libffi::segment_address(ctx, seg);
     let size = crate::panama_libffi::segment_byte_size(ctx, seg);
     if offset < 0 || size <= 0 || offset >= size {
@@ -2337,7 +2415,8 @@ pub(crate) fn p67_segment_get_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
-    p67_segment_check_scope(ctx, seg)?;
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(Some(if width == 8 {
             Value::Long(0)
@@ -2415,12 +2494,20 @@ pub(crate) fn p67_segment_get_width(
 /// read-only flag IS on the carrier and `p67_segment_is_read_only` is the
 /// registered `isReadOnly()` body, so this reads the single source of truth
 /// rather than a second copy of it.
+/// `&mut` for the same reason as [`p67_segment_check_scope`], though this one
+/// has no Java dispatch of its own today: `p67_segment_is_read_only` only reads
+/// fields, so nothing here moves the receiver, and the only allocation is the
+/// Rust-side message on the throwing path — which never returns to the caller's
+/// reuse. It takes `&mut` anyway because its sole caller reaches it one line
+/// after `p67_segment_check_scope`, which DOES relocate, and because a
+/// by-value receiver here is the shape the audit is watching for; if this ever
+/// grows a dispatch, the callers are already correct.
 fn p67_segment_check_writable(
     ctx: &mut dyn NativeContext,
-    seg: ObjectRef,
+    seg: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     let read_only = matches!(
-        p67_segment_is_read_only(ctx, &[Value::Object(Some(seg))])?,
+        p67_segment_is_read_only(ctx, &[Value::Object(Some(*seg))])?,
         Some(Value::Int(n)) if n != 0
     );
     if read_only {
@@ -2448,8 +2535,9 @@ pub(crate) fn p67_segment_set_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
-    p67_segment_check_scope(ctx, seg)?;
-    p67_segment_check_writable(ctx, seg)?;
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
+    p67_segment_check_writable(ctx, &mut seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(None);
     };
@@ -2853,38 +2941,63 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
         crate::panama::pe_arena_allocate_from_string,
     );
-    r.register(arena, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // A non-closeable arena refuses BEFORE anything is torn down --
-        // `global()` and `ofAuto()`. See `P67_ARENA_CLOSEABLE` for the
-        // measurement; the message is HotSpot's, transcribed.
-        if ctx.object_num_fields(this) > P67_ARENA_CLOSEABLE
-            && matches!(ctx.get_field(this, P67_ARENA_CLOSEABLE), Value::Int(0))
-        {
-            return Err(RuntimeError::UnsupportedOperationException {
-                message: "Attempted to close a non-closeable session".into(),
-            }
-            .into());
-        }
-        // Close the arena's session FIRST: a second `close()` must surface the
-        // session's IllegalStateException rather than silently re-clearing the
-        // flag, and the cleanups have to run while the arena is still open.
-        if let Some(session) = p67_arena_session(ctx, this) {
-            p67_session_just_close(ctx, session)?;
-            p67_session_run_close_actions(ctx, session)?;
-        }
-        ctx.set_field(this, P67_ARENA_OPEN, Value::Int(0));
-        Ok(None)
-    });
+    // The impl class as well: `allocateFrom(String)` is the shape
+    // `RJdkForeign.downcall` uses, and it is the one that crashed.
     r.register(
-        arena,
-        "scope",
-        "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)?))
-        },
+        "jdk/internal/foreign/ArenaImpl",
+        "allocateFrom",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate_from_string,
     );
+    // BOTH names, and for the reason `register_p67_segment_surface` states a
+    // few hundred lines down: native dispatch is keyed on the RECEIVER'S CLASS,
+    // and an arena is now stamped `ArenaImpl`. `close()` and `scope()` are real
+    // methods on that class, so a registration left only on the interface would
+    // lose the dispatch to JDK bytecode reading this VM's field values.
+    // Spelled out rather than `[arena, P67_ARENA_IMPL]`: `registrar_drift`
+    // resolves the class from the CALL TEXT, and a variable or a const reads to
+    // it as no registration at all -- which turned a live drift pair into a
+    // "stale baseline" failure. `panama.rs`'s allocator loop spells its classes
+    // out for the same reason.
+    for arena_cls in [
+        "java/lang/foreign/Arena",
+        "jdk/internal/foreign/ArenaImpl",
+    ] {
+        r.register(arena_cls, "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // A non-closeable arena refuses BEFORE anything is torn down --
+            // `global()` and `ofAuto()`. See `P67_ARENA_CLOSEABLE` for the
+            // measurement; the message is HotSpot's, transcribed.
+            let slots = p67_arena_slots(ctx, this);
+            if ctx.object_num_fields(this) > slots.closeable
+                && matches!(ctx.get_field(this, slots.closeable), Value::Int(0))
+            {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: "Attempted to close a non-closeable session".into(),
+                }
+                .into());
+            }
+            // Close the arena's session FIRST: a second `close()` must surface
+            // the session's IllegalStateException rather than silently
+            // re-clearing the flag, and the cleanups have to run while the
+            // arena is still open.
+            if let Some(session) = p67_arena_session(ctx, this) {
+                p67_session_just_close(ctx, session)?;
+                p67_session_run_close_actions(ctx, session)?;
+            }
+            ctx.set_field(this, slots.open, Value::Int(0));
+            Ok(None)
+        });
+        r.register(
+            arena_cls,
+            "scope",
+            "()Ljava/lang/foreign/MemorySegment$Scope;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(p67_receiver_session(ctx, this)?))
+            },
+        );
+    }
     let session = "jdk/internal/foreign/MemorySessionImpl";
     r.register(
         session,
@@ -3115,8 +3228,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             //   ((AbstractMemorySegmentImpl) segment).sessionImpl().checkValidState();
             // i.e. resolve the segment's session, then check THAT — which is
             // exactly `p67_segment_check_scope`.
-            let segment = obj_arg(args, 0)?;
-            p67_segment_check_scope(ctx, segment)?;
+            let mut segment = obj_arg(args, 0)?;
+            p67_segment_check_scope(ctx, &mut segment)?;
             Ok(None)
         },
     );
@@ -4248,9 +4361,16 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     );
     // Arena.allocate(long) is an interface default method in the real JDK.
     // Route it directly so it cannot construct a JDK segment whose layout
-    // differs from the native MemorySegment bridge.
+    // differs from the native MemorySegment bridge. On the impl class as well,
+    // for the receiver-class reason above -- `allocate(JJ)` is already on both.
     r.register(
         "java/lang/foreign/Arena",
+        "allocate",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "jdk/internal/foreign/ArenaImpl",
         "allocate",
         "(J)Ljava/lang/foreign/MemorySegment;",
         crate::panama::pe_arena_allocate,
@@ -4644,9 +4764,9 @@ mod g19_scope_tests {
     fn a_stamped_session_that_has_closed_refuses_the_access() {
         let mut ctx = mock_ctx();
         let session = p67_memory_session(&mut ctx).unwrap();
-        let seg = stamped_segment(&mut ctx, session, 16);
+        let mut seg = stamped_segment(&mut ctx, session, 16);
         assert!(
-            p67_segment_check_scope(&mut ctx, seg).is_ok(),
+            p67_segment_check_scope(&mut ctx, &mut seg).is_ok(),
             "an open session must let the access through"
         );
 
@@ -4656,7 +4776,7 @@ mod g19_scope_tests {
         };
         let slots = p67_session_slots(&ctx, session_obj);
         ctx.set_field(session_obj, slots.state, Value::Int(0));
-        let err = p67_segment_check_scope(&mut ctx, seg).unwrap_err();
+        let err = p67_segment_check_scope(&mut ctx, &mut seg).unwrap_err();
         assert!(
             format!("{err:?}").contains("Already closed"),
             "a closed stamped session must refuse; got {err:?}"

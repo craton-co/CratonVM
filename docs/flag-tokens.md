@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-503 tokens.
+504 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -291,6 +291,7 @@ export inherited from a parent shell.
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
 | `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
 | `zgc-target` | `CRATONVM_DBG_ZGC_TARGET` |
+| `zgc-high` | `CRATONVM_DBG_ZGC_HIGH` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
 | `jit-field-sites` | `CRATONVM_DBG_JIT_FIELD_SITES` |
 | `g1-live-memo` | `CRATONVM_DBG_G1_LIVE_MEMO` |
@@ -569,12 +570,15 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-246 tokens.
+249 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
+| `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
+| `gpu-if-convert` | `CRATONVM_GPU_IF_CONVERT` |
+| `gpu-if-convert-max-ops` | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
 | `unresolved-field-substitute` | `CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE` |
 | `sp-ic-deopt-check` | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` |
@@ -822,7 +826,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-78 tokens.
+81 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -886,6 +890,9 @@ export inherited from a parent shell.
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
+| `zgc-high-compaction` | `CRATONVM_ZGC_HIGH_COMPACTION` |
+| `zgc-tlab-starved-recycle` | `CRATONVM_ZGC_TLAB_STARVED_RECYCLE` |
+| `zgc-publish-vacated` | `CRATONVM_ZGC_PUBLISH_VACATED` |
 | `xt-jit-coverage-handshake` | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` |
 | `osr-coverage-shadow` | `CRATONVM_OSR_COVERAGE_SHADOW` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
@@ -980,7 +987,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1005,6 +1012,7 @@ export inherited from a parent shell.
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 | `wait-spurious-ms` | `CRATONVM_WAIT_SPURIOUS_MS` |
 | `monitor-pending-notify` | `CRATONVM_MONITOR_PENDING_NOTIFY` |
+| `win-hires-park` | `CRATONVM_WIN_HIRES_PARK` |
 
 ## `CRATONVM_SECURITY`
 

@@ -25,6 +25,10 @@ const CHM: &str = "java/util/concurrent/ConcurrentHashMap";
 const LHM: &str = "java/util/LinkedHashMap";
 const TM: &str = "java/util/TreeMap";
 const AD: &str = "java/util/ArrayDeque";
+// The class `ArrayDeque.iterator()` hands out since `e9b788959`. It is the one
+// HotSpot 25.0.4+7 names; the fabrication `java/util/ArrayDeque$Itr` it replaced
+// is declared by no JDK image, which is why `--jdk-only` refused it.
+const AD_ITR: &str = "java/util/ArrayDeque$DeqIterator";
 const COLLECTIONS: &str = "java/util/Collections";
 const UNMOD_COLLECTION: &str = "cratonvm/internal/UnmodifiableCollection";
 const UNMOD_LIST: &str = "cratonvm/internal/UnmodifiableList";
@@ -91,10 +95,57 @@ fn generic_snapshot_iterator_roots_array_and_shell_across_allocation() {
     }
 }
 
+/// The `ArrayDeque` iterator's snapshot graph, rooted across three allocations.
+///
+/// # The shape this walks, and why it is walked rather than indexed
+///
+/// This test used to read the backing deque out of `iterator` field 2, because
+/// `native_ad_iterator` minted the fabrication `java/util/ArrayDeque$Itr` with
+/// `field 0 = snapshot array, 1 = cursor, 2 = backing deque`. On 2026-08-29
+/// (`e9b788959`) that fabrication was retired: the site now mints the class
+/// HotSpot hands out, `java/util/ArrayDeque$DeqIterator`, through
+/// `alloc_family_snapshot_iterator`, and the graph gained a level:
+///
+/// ```text
+///   DeqIterator[b + 0] -> ArrayList-shaped wrapper
+///                            wrapper[elementData] -> Object[n + 1]
+///                                                      [0..n) elements
+///                                                      [n]    THE SOURCE DEQUE
+///   DeqIterator[b + 1] = cursor  = 0
+///   DeqIterator[b + 2] = lastRet = -1
+/// ```
+///
+/// where `b = object_num_fields(itr) - 3`, the carrier's own declared fields.
+/// The old assertion did not fail loudly on a changed contract — it read
+/// `lastRet` and reported `iterator lost backing deque: Int(-1)`, which names a
+/// coercion defect that is not there. So this walks the graph structurally
+/// (trailing-three convention, the wrapper's one array-valued field, the
+/// array's trailing capacity slot) instead of hard-coding three indices that
+/// belong to three different classes. A layout change now shows up as a walk
+/// that cannot find the next hop, with the hop named.
+///
+/// # What is under test is unchanged
+///
+/// Every allocation on that path can move the source deque, the elements and
+/// the array, so each must be read back through its pin before it is stored.
+/// The assertions that matter are the `assert_ne!`s: a pointer equal to the
+/// pre-allocation one is a value that was NOT read back through its forwarding
+/// pin, which is the defect this file exists for.
 #[test]
 fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
+    // `DeqIterator` must report its REAL declared width, or the carrier path is
+    // not the one under test. `java.util.ArrayDeque$DeqIterator` declares
+    // `cursor`, `remaining` and `lastRet`, plus javac's synthetic `this$0` for
+    // the inner class: four. `alloc_arraylist_iterator_as` mints
+    // `class_num_total_fields + 3`, and `al_itr_alt_base` recognises its own
+    // mint by that exact width -- behind an early-out for anything four fields
+    // or narrower. With the mock's default of zero the iterator would be minted
+    // three wide, take that early-out, and be delegated to bytecode the mock
+    // does not have, so `hasNext` would answer `Ok(None)` and the iteration half
+    // of this test would be measuring nothing.
+    ctx.declare_class_fields(AD_ITR, 4);
     let deque_cid = ctx.ensure_class_initialized(AD).unwrap();
     let deque = ctx.alloc_object(deque_cid, 4);
     call(
@@ -136,9 +187,54 @@ fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
     };
     ctx.set_relocate_pins_on_alloc(false);
 
-    let backing = match ctx.get_field(iterator, 2) {
+    // The class is part of the contract, not decoration: the whole point of
+    // `e9b788959` was that this site stopped answering a name no JDK image
+    // declares. A silent return to a fabrication would otherwise leave every
+    // assertion below still passing.
+    assert_eq!(
+        ctx.class_name_of_id(ctx.class_id_of_object(iterator))
+            .as_deref(),
+        Some(AD_ITR),
+        "ArrayDeque.iterator() must hand out the class HotSpot hands out"
+    );
+
+    // Hop 1: the wrapper, in the first of the three trailing snapshot slots.
+    let carrier_fields = ctx.object_num_fields(iterator);
+    assert_eq!(
+        carrier_fields, 7,
+        "the mint is `class_num_total_fields + 3`: DeqIterator's four plus the triple"
+    );
+    let wrapper = match ctx.get_field(iterator, carrier_fields - 3) {
+        Value::Object(Some(wrapper)) => wrapper,
+        other => panic!("iterator lost its snapshot wrapper: {other:?}"),
+    };
+
+    // Hop 2: the wrapper's backing array. Found by kind rather than by slot —
+    // `al_slots` resolves `elementData` by name and the mock need not agree
+    // with any particular index.
+    let arr = (0..ctx.object_num_fields(wrapper))
+        .find_map(|i| match ctx.get_field(wrapper, i) {
+            Value::Object(Some(o))
+                if ctx.heap_kind_of(o) == cratonvm_types::ObjectKind::Array =>
+            {
+                Some(o)
+            }
+            _ => None,
+        })
+        .expect("snapshot wrapper lost its backing array");
+    assert_eq!(
+        ctx.array_length(arr),
+        3,
+        "snapshot array is the two elements plus the trailing source slot"
+    );
+
+    // Hop 3: the source deque, in the array's trailing capacity slot. This is
+    // the ref `propagate_list_removal` reads to route `Iterator.remove()` back
+    // to `native_ad_remove_first_occurrence`, so losing it is a silently
+    // non-mutating `remove()`, not a crash.
+    let backing = match ctx.get_array_element(arr, 2) {
         Value::Object(Some(backing)) => backing,
-        other => panic!("iterator lost backing deque: {other:?}"),
+        other => panic!("snapshot array lost the source deque: {other:?}"),
     };
     assert_ne!(
         backing, deque,
@@ -146,12 +242,28 @@ fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
     );
     assert_eq!(ctx.class_id_of_object(backing), deque_cid);
 
+    // The elements travel the same path and get the same treatment.
+    for (i, (before, expected_cid)) in [(e1, 901u32), (e2, 902u32)].into_iter().enumerate() {
+        let stored = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(stored)) => stored,
+            other => panic!("snapshot array lost element {i}: {other:?}"),
+        };
+        assert_eq!(ctx.class_id_of_object(stored).as_u32(), expected_cid);
+        assert_ne!(
+            Value::Object(Some(stored)),
+            before,
+            "element {i} must be read back through its forwarding pin"
+        );
+    }
+
+    // And the iterator walks them, through the natives the
+    // `VALUES_ITR_CARRIERS` loop bound to the real carrier class.
     for expected_cid in [901, 902] {
         assert_eq!(
             call(
                 &reg,
                 &mut ctx,
-                "java/util/ArrayDeque$Itr",
+                AD_ITR,
                 "hasNext",
                 "()Z",
                 &[Value::Object(Some(iterator))],
@@ -162,7 +274,7 @@ fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
         let value = call(
             &reg,
             &mut ctx,
-            "java/util/ArrayDeque$Itr",
+            AD_ITR,
             "next",
             "()Ljava/lang/Object;",
             &[Value::Object(Some(iterator))],
@@ -174,11 +286,13 @@ fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
         };
         assert_eq!(ctx.class_id_of_object(object).as_u32(), expected_cid);
     }
+    // The trailing source slot is capacity, not content: `size` is 2, so the
+    // walk must stop before it rather than hand the deque out as an element.
     assert_eq!(
         call(
             &reg,
             &mut ctx,
-            "java/util/ArrayDeque$Itr",
+            AD_ITR,
             "hasNext",
             "()Z",
             &[Value::Object(Some(iterator))],

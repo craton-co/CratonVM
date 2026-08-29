@@ -21147,6 +21147,16 @@ fn key_itr_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         .saturating_sub(MAP_KEY_ITR_NUM_FIELDS)
 }
 
+/// The map a key/entry view was taken over, for a view carried by a set.
+///
+/// The same two steps `map_itr_comod_source` takes, without the iterator: a
+/// set-shaped view's backing map, and then the SOURCE behind that backing when
+/// the backing is itself a view.
+fn key_itr_view_source(ctx: &dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
+    let backing = hs_backing_map(ctx, set)?;
+    Some(view_backing_source(ctx, backing).unwrap_or(backing))
+}
+
 /// The iterator class a `HashSet`-shaped receiver's `iterator()` should mint,
 /// matching what HotSpot answers for that receiver.
 ///
@@ -21162,6 +21172,40 @@ fn key_itr_carrier_for(
     entryset: bool,
 ) -> &'static str {
     let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(receiver));
+    // A VIEW WHOSE SOURCE IS A `Properties` answers the CHM family, because
+    // JDK 25 backs `Properties` with a `ConcurrentHashMap` and
+    // `Properties.keySet()` is `map.keySet()`. MEASURED
+    // (`apps/probes/ItrClassNameProbe`): HotSpot 25.0.4+7 answers
+    // `ConcurrentHashMap$KeyIterator` where this VM answered
+    // `HashMap$KeyIterator`. The view's own class already matches
+    // (`Collections$SynchronizedSet`) and the view is already live, so the
+    // iterator's class was the last of the three to disagree.
+    //
+    // Checked before the class-name tests because this VM's `Properties`
+    // keySet is carried by a `LinkedHashSet`, which would otherwise take the
+    // LinkedHashMap pair.
+    //
+    // NOT the `two-producers-of-one-carrier-class` trap, and the difference is
+    // worth stating because it is the same class the CHM views mint. Every
+    // name in `MAP_KEY_ITR_CARRIERS` shares ONE object shape -- five fields at
+    // `key_itr_base`, derived from the object's WIDTH -- and ONE registrar,
+    // `native_map_key_itr_*`. A second producer is a problem when the two
+    // shapes differ, as the dormant `PriorityQueue$Itr` row was; here the
+    // class name is a LABEL over an identical object, and the natives cannot
+    // tell the producers apart because there is nothing to tell apart.
+    if let Some(src) = key_itr_view_source(ctx, receiver) {
+        if ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(src))
+            .as_deref()
+            == Some("java/util/Properties")
+        {
+            return if entryset {
+                "java/util/concurrent/ConcurrentHashMap$EntryIterator"
+            } else {
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator"
+            };
+        }
+    }
     // The CHM views answer their OWN family's classes, like every other map
     // family in this function. Checked before the LinkedHashMap test because a
     // CHM view is neither, and falling through would give it the HashMap pair.
@@ -22821,34 +22865,47 @@ fn native_arrays_fill_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let arr = *arr;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     // A null value stores into any reference array, and a component type of
-    // `java/lang/Object` accepts everything; both short-circuit.
-    if let Value::Object(Some(v)) = val {
-        let comp = ctx.class_id_of_object(arr);
-        let actual = ctx.class_id_of_object(v);
-        let exact_admits = actual == comp
-            || ctx.is_subclass(actual, comp)
-            || ctx.class_name_of_id(comp).as_deref() == Some("java/lang/Object");
-        // The exact check above compares `arr`'s own reported class id against
-        // `v`'s, which is wrong whenever the component itself has no ordinary
-        // class id to compare against -- e.g. a `char[][]`'s component is the
-        // primitive array class `char[]`, which `class_id_of_object` cannot
-        // resolve the same way for the array (`arr`) and the value (`v`).
-        // Fall back to the shared, hardened JVMS aastore covariance predicate --
-        // already used by `java.lang.reflect.Array.set` for the identical
-        // "may this be stored into a reference array" question (see
-        // `reflect_array_element_assignable` in native-builtins/src/lib.rs) --
-        // before refusing. MEASURED: `Arrays.fill((Object[]) new char[3][],
-        // new char[]{'a'})` incorrectly threw `ArrayStoreException:
-        // java.lang.Object` under CratonVM while HotSpot filled it fine
-        // (`sun.nio.cs.HKSCS$Encoder.initc2b`'s `Arrays.fill(c2b,
-        // C2B_UNMAPPABLE)` hit exactly this, breaking every real
-        // `Big5-HKSCS`/`MS950_HKSCS`/etc. charset's static init).
-        if !exact_admits && !ctx.aastore_element_assignable(arr, v).unwrap_or(false) {
-            return Err(RuntimeError::ArrayStoreException {
-                message: ctx.class_name_of_id(actual).unwrap_or_default(),
-            }
-            .into());
-        }
+    // `java/lang/Object` accepts everything; `reject_unstorable` short-circuits
+    // both.
+    //
+    // THE `ClassId` COMPARISON THIS REPLACES WAS WRONG IN BOTH DIRECTIONS, and
+    // the fix arrived in two halves. The first half kept an exact
+    // `class_id_of_object(arr) == class_id_of_object(v)` test and only
+    // *consulted* the shared predicate when it failed, because on a REFERENCE
+    // ARRAY the header's class id holds the COMPONENT class -- so a `char[][]`'s
+    // component is the primitive array class `char[]`, which the two sides
+    // cannot report the same way. MEASURED: `Arrays.fill((Object[]) new
+    // char[3][], new char[]{'a'})` threw `ArrayStoreException:
+    // java.lang.Object` here while HotSpot filled it fine
+    // (`sun.nio.cs.HKSCS$Encoder.initc2b`'s `Arrays.fill(c2b, C2B_UNMAPPABLE)`
+    // hit exactly this, breaking every real `Big5-HKSCS`/`MS950_HKSCS`/etc.
+    // charset's static init).
+    //
+    // That half left two defects standing, both of them the SAME root cause
+    // wearing different clothes:
+    //
+    //  * `unwrap_or(false)` made the fallback fail CLOSED. `None` is "this
+    //    context models no hierarchy", which is the one answer that must never
+    //    become a refusal -- the shared predicate's whole contract is that it
+    //    is ADDITIVE and never manufactures a false `ArrayStoreException`.
+    //  * the REFUSAL MESSAGE named `class_id_of_object(v)`, i.e. the component
+    //    again, so an array-valued element was reported one dimension short.
+    //    That is how the hibernate-reactive failure was identifiable at all:
+    //    `ArrayStoreException: org.hibernate.sql.results.graph.Initializer`
+    //    names an INTERFACE, and no instance can ever have an interface as its
+    //    class.
+    //
+    // `reject_unstorable` is the one place a native's store rule lives: the
+    // shared predicate, failing open on `None`, with `aastore`'s own external
+    // name of the VALUE. `StoreRoute::Aastore` because the JDK's
+    // `Arrays.fill(Object[], Object)` is a plain `a[i] = val` loop.
+    if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+        ctx,
+        arr,
+        val,
+        cratonvm_native_api::array_store::StoreRoute::Aastore,
+    ) {
+        return Err(e);
     }
     let len = ctx.array_length(arr);
     for i in 0..len {

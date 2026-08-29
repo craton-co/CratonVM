@@ -292,6 +292,33 @@ fn alloc_singleton(
     ctx: &mut dyn NativeContext,
     owner_class: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // ONE object per owner, for the life of the process.
+    //
+    // This function is named `alloc_singleton` and allocated on every call, so
+    // every `SharedSecrets.getJavaXxxAccess()` handed out a fresh accessor:
+    //
+    //   SharedSecrets.getJavaLangAccess() == SharedSecrets.getJavaLangAccess()
+    //     HotSpot   true      was  false
+    //
+    // -- for nine of the ten getters. The JDK's accessors are `static final`
+    // fields set once during boot, and identity is part of what a caller gets:
+    // code all over the class library caches one in a `static final` of its own
+    // precisely because re-fetching is supposed to be free and to answer the
+    // same object.
+    //
+    // The memo sits HERE rather than in `alloc_named_synthetic_singleton`
+    // below, which is only the fallback arm. Putting it there first fixed
+    // exactly the one getter whose helper calls that function directly, and
+    // left the nine that take the real-class arm untouched -- see
+    // `apps/probes/JdkInternalSweep.java`, which said so in nine rows.
+    if let Some(existing) = synthetic_singleton_roots()
+        .lock()
+        .get(owner_class)
+        .copied()
+        .and_then(|h| ctx.resolve_global_root(h))
+    {
+        return Ok(existing);
+    }
     // Resolve the real class when the image has it. The synthetic fallback
     // reserves 1 field slot so downstream callers that happen to poke at
     // field 0 don't go out of bounds.
@@ -302,10 +329,36 @@ fn alloc_singleton(
     if let Ok(cid) = ctx.ensure_class_initialized(owner_class) {
         if cid != cratonvm_types::ClassId::new(0) {
             let real_fields = ctx.class_num_total_fields(cid);
-            return Ok(ctx.alloc_object(cid, real_fields.max(1)));
+            let obj = ctx.alloc_object(cid, real_fields.max(1));
+            return Ok(publish_owner_singleton(ctx, owner_class, obj));
         }
     }
     alloc_named_synthetic_singleton(ctx, owner_class)
+}
+
+/// Publish `obj` as the one accessor for `owner_class`, or hand back whoever
+/// won the race.
+///
+/// The reference is kept as a GLOBAL ROOT: these objects outlive every native
+/// call and must survive a moving collection, which a raw `ObjectRef` parked in
+/// a process-global map would not.
+fn publish_owner_singleton(
+    ctx: &mut dyn NativeContext,
+    owner_class: &str,
+    obj: ObjectRef,
+) -> ObjectRef {
+    let handle = ctx.add_global_root(obj);
+    let mut roots = synthetic_singleton_roots().lock();
+    if let Some(published) = roots.get(owner_class).copied() {
+        drop(roots);
+        ctx.remove_global_root(handle);
+        if let Some(existing) = ctx.resolve_global_root(published) {
+            return existing;
+        }
+        return obj;
+    }
+    roots.insert(owner_class.to_string(), handle);
+    obj
 }
 
 fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Option<ObjectRef> {
@@ -319,13 +372,50 @@ fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Optio
 /// image with no `java.base`; fabricating a `java/nio/Buffer$2` stand-in there
 /// is the compatibility substitution contract §5 refuses, so a strict run gets
 /// the `NoClassDefFoundError` instead.
+/// The accessor object for `owner_class`, allocated at most ONCE per process.
+///
+/// This function is named `..._singleton` and allocated unconditionally, so
+/// every `SharedSecrets.getJavaXxxAccess()` handed out a fresh object per call:
+///
+/// ```text
+///   SharedSecrets.getJavaLangAccess() == SharedSecrets.getJavaLangAccess()
+///     HotSpot   true      was  false
+/// ```
+///
+/// -- for all ten getters. The JDK's are static fields set once during boot,
+/// and identity is part of what a caller gets: `SharedSecrets` accessors are
+/// held in `static final` fields all over the class library precisely because
+/// re-fetching one is supposed to be free and to yield the same object.
+///
+/// The memo holds a GLOBAL ROOT rather than a raw reference: these objects
+/// outlive any native call and must survive a moving collection, which a raw
+/// `ObjectRef` in a process-global map would not. MEASURED by
+/// `apps/probes/JdkInternalSweep.java`.
 fn alloc_named_synthetic_singleton(
     ctx: &mut dyn NativeContext,
     owner_class: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(existing) = synthetic_singleton_roots()
+        .lock()
+        .get(owner_class)
+        .copied()
+        .and_then(|h| ctx.resolve_global_root(h))
+    {
+        return Ok(existing);
+    }
     let cid = crate::util_concurrent_ext::refused_class(ctx, owner_class, 1)?;
     let fields = ctx.class_num_total_fields(cid).max(1);
-    Ok(ctx.alloc_object(cid, fields))
+    let obj = ctx.alloc_object(cid, fields);
+    Ok(publish_owner_singleton(ctx, owner_class, obj))
+}
+
+/// Owner class name -> the global-root handle of its one accessor object.
+fn synthetic_singleton_roots(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, usize>> {
+    static ROOTS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn alloc_java_nio_access_singleton(
@@ -335,10 +425,22 @@ fn alloc_java_nio_access_singleton(
     // Buffer$1. If neither class is loadable, keep a named owner so
     // invokeinterface resolves against registered JavaNioAccess bridge methods
     // instead of the generic AnonymousObject$1 fallback.
-    match alloc_owner_instance(ctx, "java/nio/Buffer$2")
-        .or_else(|| alloc_owner_instance(ctx, "java/nio/Buffer$1"))
+    // Memoised through the same map as [`alloc_named_synthetic_singleton`], so
+    // this getter is as stable as the other nine -- `alloc_owner_instance`
+    // allocates on every call, and the JDK's `getJavaNioAccess()` answers one
+    // object for the life of the VM.
+    if let Some(existing) = synthetic_singleton_roots()
+        .lock()
+        .get("java/nio/Buffer$2")
+        .copied()
+        .and_then(|h| ctx.resolve_global_root(h))
     {
-        Some(obj) => Ok(obj),
+        return Ok(existing);
+    }
+    let fresh = alloc_owner_instance(ctx, "java/nio/Buffer$2")
+        .or_else(|| alloc_owner_instance(ctx, "java/nio/Buffer$1"));
+    match fresh {
+        Some(obj) => Ok(publish_owner_singleton(ctx, "java/nio/Buffer$2", obj)),
         None => alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"),
     }
 }

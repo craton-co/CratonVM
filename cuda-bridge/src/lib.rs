@@ -846,6 +846,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         // Allocate the per-buffer last_write event up front so we can
         // record it on the user stream right after the upload DMA.
         let event = std::sync::Arc::new(Event::new(ctx)?);
+        let event_for_stamp = std::sync::Arc::clone(&event);
         // Submit the H→D copy AND record `last_write` on the USER
         // stream (see `from_host_async_unchecked` / `upload_on_stream`).
         // SAFETY: this function's caller upholds the documented host lifetime;
@@ -858,6 +859,13 @@ impl<T: DeviceElem> DeviceBuffer<T> {
                 event.cu_event_raw(),
             )?
         };
+        // `upload_on_stream` recorded `event` on exactly `stream`, but
+        // it took the raw handle rather than the wrapper, so stamp the
+        // bookkeeping here. Without it every later launch on this same
+        // stream issues a `cuStreamWaitEvent` for an ordering the stream
+        // already provides -- see `EventCuda::recorded_on`.
+        #[cfg(feature = "cuda")]
+        event_for_stamp.set_recorded_on(stream.raw());
         // Surface the upload on the user `stream`'s op log for callers
         // that introspect the queue. In cuda mode `record_op` is a
         // no-op so this collapses to nothing.
@@ -880,6 +888,29 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// `last_write` event (not the context-wide `e_k`) so the D→H copy
     /// is ordered behind THIS buffer's producing kernel / upload, even
     /// when concurrent pipelines launch on other buffers.
+    /// Overwrite this buffer in place from `host`, keeping the device
+    /// pointer.
+    ///
+    /// [`DeviceBuffer::from_host`] allocates. This does not, and that
+    /// is the whole point: a captured CUDA graph bakes each argument
+    /// pointer into its nodes, so the only way to hand a replay new
+    /// input is to write through the pointer the graph already holds.
+    /// Reallocating would leave the graph pointing at freed memory.
+    ///
+    /// Synchronous. The bytes are on the device when this returns, so
+    /// `host` may be reused immediately and a replay submitted
+    /// afterwards observes them. Because the host blocks, no event
+    /// bookkeeping is needed to order a later kernel behind this
+    /// write -- the write already happened.
+    ///
+    /// `host.len()` must equal [`DeviceBuffer::len`]. A short slice
+    /// would leave the buffer half-updated, which is a wrong answer
+    /// rather than a failure.
+    pub fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        self.inner.copy_from_host(host)
+    }
+
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
         // H10c: bind the context to this thread before driving CUDA.
         self.inner.bind_to_thread()?;
@@ -1113,6 +1144,28 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         })
     }
 
+    /// Overwrite this buffer in place from `host`, keeping the device
+    /// pointer.
+    ///
+    /// [`DeviceBuffer::from_host`] allocates. This does not, and that
+    /// is the whole point: a captured CUDA graph bakes each argument
+    /// pointer into its nodes, so the only way to hand a replay new
+    /// input is to write through the pointer the graph already holds.
+    /// Reallocating would leave the graph pointing at freed memory.
+    ///
+    /// Synchronous. The bytes are on the device when this returns, so
+    /// `host` may be reused immediately and a replay submitted
+    /// afterwards observes them. Because the host blocks, no event
+    /// bookkeeping is needed to order a later kernel behind this
+    /// write -- the write already happened.
+    ///
+    /// `host.len()` must equal [`DeviceBuffer::len`]. A short slice
+    /// would leave the buffer half-updated, which is a wrong answer
+    /// rather than a failure.
+    pub fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        self.inner.copy_from_host(host)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
@@ -1241,6 +1294,7 @@ use backend_stub as backend;
 
 pub mod critical;
 pub mod event;
+pub mod graph;
 pub mod launch;
 pub mod stream;
 

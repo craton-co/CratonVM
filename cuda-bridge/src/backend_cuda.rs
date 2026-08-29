@@ -149,6 +149,96 @@ pub(crate) struct DeviceContextInner {
     /// events shared between the three copy/compute streams. See
     /// `StreamBarriers` doc for the choreography.
     barriers: Arc<StreamBarriers>,
+    /// Free list of `CUevent` handles, recycled instead of destroyed.
+    ///
+    /// Every kernel submission mints TWO events on this path -- one
+    /// inside `DeviceModule::launch_on_stream` (the per-buffer
+    /// `last_write` marker) and one in `vm::runtime::offload` (the
+    /// submission-completion marker) -- and destroys both when the
+    /// submission is finalized. GPULlama3's forward pass makes 453
+    /// submissions per token, so that is ~900 `cuEventCreate` /
+    /// `cuEventDestroy` pairs per token on a path whose whole per-token
+    /// host budget is 14 ms. A `CUevent` carries no per-recording state
+    /// worth resetting -- `cuEventRecord` overwrites it, and a
+    /// `cuStreamWaitEvent` already issued against it captured its
+    /// contents AT THE TIME OF THE CALL (CUDA driver semantics), so a
+    /// later re-record cannot retroactively satisfy or break an
+    /// outstanding wait. Recycling is therefore sound, and the handle
+    /// only ever returns here once the last `Arc<Event>` holding it is
+    /// gone.
+    event_pool: Arc<EventPool>,
+}
+
+/// See [`DeviceContextInner::event_pool`].
+///
+/// Capped so a pathological burst of concurrent submissions cannot leave
+/// an unbounded number of live `CUevent`s parked here for the process's
+/// lifetime; past the cap a returning handle is destroyed as before.
+pub(crate) struct EventPool {
+    free: std::sync::Mutex<Vec<cudarc::driver::sys::CUevent>>,
+    dev: Arc<CudaDevice>,
+}
+
+/// How many idle events one context parks. Two per in-flight submission,
+/// and the offload path warns at 1024 live submissions, so this covers
+/// the deepest pipeline the VM tolerates with room to spare.
+const EVENT_POOL_CAP: usize = 4096;
+
+// SAFETY: mirrors `EventCuda`'s impls. The pool holds raw `CUevent`
+// handles and the `Arc<CudaDevice>` whose primary context owns them;
+// every method binds that context before touching a handle.
+unsafe impl Send for EventPool {}
+// SAFETY: the free list is behind a `Mutex`, and CUDA serializes event
+// creation and destruction on the bound context.
+unsafe impl Sync for EventPool {}
+
+impl EventPool {
+    /// Take a recycled handle, or `None` when the free list is empty.
+    ///
+    /// Deliberately does NOT create on a miss: the caller is
+    /// `Event::new`, which already has the create path and its own
+    /// error mapping, and a pool hit must not pay for `bind_to_thread`.
+    pub(crate) fn take(&self) -> Option<cudarc::driver::sys::CUevent> {
+        self.free
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+    }
+
+    /// Return a handle, or destroy it if the pool is full.
+    pub(crate) fn put(&self, ev: cudarc::driver::sys::CUevent) {
+        let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
+        if free.len() < EVENT_POOL_CAP {
+            free.push(ev);
+            return;
+        }
+        drop(free);
+        let _ = self.dev.bind_to_thread();
+        // SAFETY: the handle is uniquely owned here (its last `Event` has
+        // just dropped) and its owning context was bound immediately
+        // above.
+        unsafe {
+            let _ = cudarc::driver::result::event::destroy(ev);
+        }
+    }
+}
+
+impl Drop for EventPool {
+    fn drop(&mut self) {
+        let _ = self.dev.bind_to_thread();
+        for ev in self
+            .free
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+        {
+            // SAFETY: the pool is being dropped, so no `Event` holds any
+            // of these handles; the owning context was bound above.
+            unsafe {
+                let _ = cudarc::driver::result::event::destroy(ev);
+            }
+        }
+    }
 }
 
 impl DeviceContextInner {
@@ -191,6 +281,10 @@ impl DeviceContextInner {
             copy_h2d: copy_h2d.into(),
             compute: compute.into(),
             copy_d2h: copy_d2h.into(),
+            event_pool: Arc::new(EventPool {
+                free: std::sync::Mutex::new(Vec::new()),
+                dev: dev.clone(),
+            }),
             barriers: Arc::new(StreamBarriers { e_h2d, e_k, dev }),
         })
     }
@@ -222,6 +316,18 @@ impl DeviceContextInner {
     /// re-creating it. The returned `Arc` is cheap to clone.
     pub(crate) fn device(&self) -> &Arc<CudaDevice> {
         &self.dev
+    }
+
+    /// The context's recycled-`CUevent` free list. See
+    /// [`DeviceContextInner::event_pool`].
+    pub(crate) fn event_pool(&self) -> &Arc<EventPool> {
+        &self.event_pool
+    }
+
+    /// The raw handle of the context's shared compute stream, for the
+    /// same-stream wait elision in `launch_raw_inner`.
+    pub(crate) fn compute_stream_raw(&self) -> cudarc::driver::sys::CUstream {
+        self.compute.stream
     }
 
     /// AUDIT 2026-05-29 (SOUND-1 / H10c): bind this context's primary
@@ -441,6 +547,7 @@ impl DeviceModuleInner {
         // never-written buffer has `None` and is skipped. Snapshotting the
         // event under the mutex avoids holding the lock across the FFI
         // `wait_event` call.
+        let compute_raw = ctx.compute.stream as usize;
         for slot in &last_write_slots {
             let maybe_ev = slot
                 .lock()
@@ -448,6 +555,16 @@ impl DeviceModuleInner {
                 .as_ref()
                 .cloned();
             if let Some(ev) = maybe_ev {
+                // Written by an earlier launch on THIS stream: the
+                // stream already orders us behind it, so the barrier
+                // would buy nothing and cost a driver round trip. Same
+                // elision as `Stream::wait_event`; see
+                // `EventCuda::recorded_on`.
+                if ev.recorded_on_raw() == compute_raw {
+                    cratonvm_types::gpu_event_census::note_wait_elided();
+                    continue;
+                }
+                cratonvm_types::gpu_event_census::note_wait_issued();
                 // SAFETY: `ev` is an `Arc<Event>` cloned out of the slot
                 // and kept alive for this iteration; `cu_event_raw()` only
                 // borrows its handle for the FFI call, and `compute.stream`
@@ -539,6 +656,9 @@ impl DeviceModuleInner {
             cudarc::driver::result::event::record(event.cu_event_raw(), ctx.compute.stream)
                 .map_err(map_err("cuEventRecord kernel_done (compute)"))?;
         }
+        // Same bookkeeping `Stream::record_event` does, so the wait loop
+        // above can recognise its own stream and skip the barrier.
+        event.set_recorded_on(ctx.compute.stream);
         Ok(())
     }
 
@@ -1123,6 +1243,54 @@ impl<
                 .map_err(map_err("cuStreamSynchronize copy_d2h"))?;
         }
         Ok(())
+    }
+
+    /// Overwrite this buffer's contents in place from `host`.
+    ///
+    /// The one thing `from_host` cannot do: it allocates, and a caller
+    /// that needs the DEVICE POINTER to stay the same cannot allocate.
+    /// A captured CUDA graph bakes every argument pointer into its
+    /// nodes, so the only way to feed a replay new input is to write
+    /// through the pointer it already holds.
+    ///
+    /// Synchronous, like `from_host` and `to_host`: the copy is
+    /// observable on the device when this returns, so a caller may
+    /// reuse `host` immediately and a replay submitted afterwards sees
+    /// the new bytes. The copy runs on `copy_h2d` and host-blocks on
+    /// that stream alone, leaving `compute` and `copy_d2h` running.
+    ///
+    /// Length must match exactly. A shorter `host` would leave a
+    /// partially-updated buffer, which is a wrong answer rather than an
+    /// error, and a longer one would write past the allocation.
+    pub(crate) fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        if host.len() != self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "copy_from_host length mismatch: host.len()={}, slice.len()={}",
+                host.len(),
+                self.len()
+            )));
+        }
+        if host.is_empty() {
+            return Ok(());
+        }
+        self.dev.bind_to_thread().map_err(map_err("bind_to_thread"))?;
+        let dst = *DevicePtr::device_ptr(&*self.slice);
+        // SAFETY: lengths were checked equal above, the context is bound,
+        // and the `cuStreamSynchronize` below discharges the borrow of
+        // `host` that the async copy takes.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(dst, host, self.copy_h2d_stream())
+                .map_err(map_err("cuMemcpyHtoDAsync copy_from_host"))?;
+            cudarc::driver::result::stream::synchronize(self.copy_h2d_stream())
+                .map_err(map_err("cuStreamSynchronize copy_from_host"))?;
+        }
+        Ok(())
+    }
+
+    /// The stream `copy_from_host` uploads on -- the same one the
+    /// allocation was bound to when it came from `from_host`.
+    fn copy_h2d_stream(&self) -> cudarc::driver::sys::CUstream {
+        self.stream.stream
     }
 
     /// AUDIT 2026-05-24 (C32 stream-port fix): truly async D→H.

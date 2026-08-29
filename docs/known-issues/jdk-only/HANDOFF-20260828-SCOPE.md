@@ -25,28 +25,41 @@ been removed again.
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
-| **L8 the long tail** | **IN PROGRESS 2026-08-29** — 217 unprobed rows across 56 classes (§2.1); 2 of 7 batches closed, 16 defects, 5233 probe rows 0-diff | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
+| **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 141 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
-**All seven lanes are DONE** — L1 through L7, the last of them on 2026-08-29.
-Six of the seven lane handoffs are retired to `internal/jdk-only/`; L5's
-lives with its records in this directory.
+**ALL EIGHT LANES ARE DONE** — L1 through L8, the last of them (the long tail)
+on 2026-08-29. Seven of the eight lane handoffs are retired to
+`internal/jdk-only/`; L5's lives with its records in this directory, and L8
+never had a brief of its own — it was §2.1 of this page, and its four records
+are in the internal tree.
 
-**This page is NOT retired with them, and should not be.** Three things on it
-are still live:
+**This page is STILL NOT retired, and still should not be.** Every lane it
+scoped has landed, and that is not the same thing as the page having no
+question left. Three things on it are live, and the first two would each be a
+lane:
 
 * **Phase 2 is not adjudicated.** The lanes measured the surface; the worklist
   is **1065 distinct `native-won` triples** (P4-A, corpus-wide — not the 334 a
   five-probe screen saw), and `[has_code≠retire]` applies to every one of them:
-  a 0-diff argues KEEP as often as it argues retire.
-* **§4 still carries OPEN, owned items** — the FFM interface-classed identity
-  family, sized but deliberately not fixed, and `KeyStore.getInstance("JCEKS")`,
-  unclaimed and missing in both modes.
+  a 0-diff argues KEEP as often as it argues retire. Nothing in the eight lanes
+  touched this — they fixed BEHAVIOUR, which is the prerequisite for
+  adjudication, not the adjudication.
+* **§4 still carries OPEN, owned items.** The FFM interface-classed identity
+  family is measured twice and blocked on a CONTRACT decision rather than a
+  patch — is the VM's carrier a compatibility stand-in or its own allocation
+  shape? — and `KeyStore.getInstance("JCEKS")` is a JCA format missing in BOTH
+  modes, i.e. a feature gap rather than a shadow defect. Neither is closable by
+  the lane that happens to be reading this page.
 * **§5 is the operational surface every lane runs from** — the landing
   protocol, the known-red vectors and gates on `dev`, and the instrument traps.
-  Retiring it would move that out of the directory people read.
+  **This one is structural: retiring the page would move the landing protocol
+  out of the directory people read**, which is the opposite of what retirement
+  is for.
 
-A page that still poses a question belongs in `known-issues/`, even when the
-work that prompted it has landed.
+A page that still poses a question belongs in `known-issues/`, even when all
+the work that prompted it has landed. What would unblock retirement is the two
+lanes above finishing and §5 being rehomed somewhere it stays visible — in that
+order, and none of it is a residual of the eight.
 
 **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
 you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
@@ -188,15 +201,66 @@ bridge rows whose real method has Code and owns its slot   2063  across 195 clas
 **So the tail is 217 rows, not 780** — six lanes closed 1753 between them. The
 unprobed remainder groups into seven batches, and they are what L8 is working:
 
-| batch | rows | classes | state |
+**ALL SEVEN BATCHES ARE CLOSED (2026-08-29). 56 defects fixed, 4 recorded,
+20 141 probe rows at 0-diff in both modes.**
+
+| batch | rows | probe | result |
 | --- | ---: | --- | --- |
-| `java/net/URI` + `URL` | 14 | and `uri-resolve-folded-…-20260826.md` §4 deferred a fix pending exactly this probe | **DONE 2026-08-29** — `UriRecompositionSweep`, 1258 rows 0-diff both modes, **7 defects**; the deferred row was 26. `l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md` |
-| Throwable and the exception hierarchy | 117 | `Throwable` 16 + 41 classes at 2-5 each, all sharing one registration set | **DONE 2026-08-29** — `ThrowableFamilySweep`, 3975 rows 0-diff both modes, **9 defects**. `l8-tail-throwable-nine-defects-and-the-one-the-registry-had-to-name-20260829.md` |
-| `java/math/BigInteger` | 24 | the largest single class left | open |
-| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 26 | | open |
-| `java/security/MessageDigest` + `AccessController` | 20 | | open |
-| `jdk/internal` — `VM`, `SharedSecrets`, `Signal`, `AbstractClassLoaderValue` | ~19 | | open |
-| `java/lang/ref` | ~12 | GC-adjacent | open |
+| `java/net/URI` + `URL` | 14 | `UriRecompositionSweep` 1256 | **7 defects**; the row §4 deferred was 26 |
+| Throwable and the exception hierarchy | 117 | `ThrowableFamilySweep` 3973 | **9 defects**; `owns_slot` named the registrar that mattered |
+| `java/math/BigInteger` | 24 | `BigIntegerSweep` 13 253 | **3 defects**, all on error paths |
+| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 43 | `SystemRuntimeObjectSweep` 125 | **18 fixed, 4 recorded** |
+| `java/lang/ref` | 19 | `RefFamilySweep` 60 | **2 defects**, one of them a hang |
+| `java/security` | 27 | `SecuritySurfaceSweep` 1333 | **11 defects**, all on refusal paths |
+| `jdk/internal` | 29 | `JdkInternalSweep` 120 | **6 defects**; one line of them was 12 rows |
+| *(written along the way)* | — | `HelpfulNpeProbe` 21 | refuted the hypothesis that this VM has no helpful NPEs |
+
+**Row counts here are the probes' own `rows N` lines, not `wc -l`.** Every probe
+in this family prints two trailer lines (`rows N` and `DONE <name>`), and
+`tail-run.sh` reports `hs=<LINES>`. Taking the runner's number as a row count
+overstates every probe by two — small, systematic, and it scales with the number
+of probes. Corrected here and in the four records on 2026-08-29.
+
+Records, under the internal tree at `jdk-only/`:
+`l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md`,
+`l8-tail-throwable-nine-defects-and-the-one-the-registry-had-to-name-20260829.md`,
+`l8-tail-biginteger-system-and-ref-23-defects-and-a-hang-20260829.md`,
+`l8-tail-security-and-jdk-internal-seventeen-defects-and-the-tail-is-closed-20260829.md`.
+
+The four recorded residuals are all in the `System` batch and all named with
+their reasons in its record: `System.setOut(null)`, `setSecurityManager` (a
+documented security-model decision coupled to the exec/Panama gating), and the
+two rows of the largest open finding — **`--jdk-only`'s `System.getLogger`
+resolves to `SimpleConsoleLogger` rather than the JUL provider**, so every
+`System.Logger` in that mode ignores logging configuration. That is a
+`ServiceLoader`/module-graph defect, several sizes larger than the rows it
+shows up on.
+
+### What the seven batches had in common
+
+The estimate for these seven was ~217 rows and "the tail". What they actually
+were, over and over:
+
+* **A comment that recorded a deviation and never priced it.** `BigInteger`'s
+  `modPow` said a negative modulus is "outside the BigInteger spec" and computed
+  anyway; `Throwable`'s suppressed-exception list said it held an array where
+  the JDK holds a `List`, which cost every suppression-bearing throwable its
+  serialization; `Signal`'s registrar stated a field order the class does not
+  have.
+* **One decision with more than one registrar.** `owns_slot` is the column that
+  settles which one runs, and twice a fix landed for one descriptor and not its
+  neighbour because of it.
+* **A defect that announced itself by ARITHMETIC rather than by content.** 280
+  identical rows meant a probe bug; nine of ten getters meant a fix at the wrong
+  level of the call chain; twelve rows across three signals meant one line.
+* **Deferrals that were requests for a measurement.** Two of them, both closed:
+  the `URI` recomposition row and the `System.Logger` `OFF` arm.
+
+### What is NOT closed
+
+The unowned `--jdk-only` surface is not the same thing as the corpus. These
+seven batches close the 217 rows this page scoped; `--jdk-only-report` still
+counts native-won triples elsewhere, and the four residuals above are real.
 
 The Throwable row was estimated at ~70 and measured at **117** once the family
 was counted from the registry rather than from the class list — every
@@ -357,7 +421,7 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
+| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED TWICE, INDEPENDENTLY, AND THE TWO AGREE.** Behaviour is FIXED (9 defects, 199 rows) -- see `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`, which is the record of this defect and sizes the identity residual across FIVE class families. The MECHANISM and the contract question are in `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md`: the carrier is minted through `try_ensure_synthetic_class`, the door `--jdk-only` refuses by design, so strict falls back to the interface. **Still OPEN, and the blocker is a CONTRACT decision, not a patch** -- is the VM's carrier a compatibility stand-in or its own allocation shape? |
 | **The BEHAVIOURAL half of the same surface: CLOSED 2026-08-29.** 199 differential rows over the segment/arena/layout API (`apps/probes/FfmSegmentSweep.java`) found **nine defects that are not identity** and every one is now 0-diff in both modes: a native `asReadOnly()` segment ACCEPTED WRITES; `ByteOrder` was minted per call so `ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()` was false; `Arena.global().close()` succeeded; `allocate(-1)`, two bad alignments and `ofArray(null)` did not refuse; and `s.asSlice(0, s.byteSize()).equals(s)` was false. The identity rows to the left are what REMAINS after those. | **DONE** — `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`. It also measures what the identity defect does NOT break: `isInstance`, `instanceof`, `isAssignableFrom` and a class-keyed `HashMap` round-trip all answer correctly on an interface-classed segment, in both modes — so the contract decision to the left is a decision about identity alone. || ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
@@ -536,30 +600,46 @@ Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
   was not. And a failure rate that climbs with load is a race in someone's code,
   not noise to be re-run away — here, ours.
 
-### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+### A gate was red on `dev` for ~5 hours on 2026-08-29 — CLOSED, kept for the technique
 
-`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
-`origin/dev` as of `a5c67dcda`:
+`cargo test -p cratonvm-native-builtins --lib` was 4176 passed, **1 failed**
+between `5a6348d28` and `b5a784fee`:
+`properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot`,
+naming `native_properties_clone` and `native_properties_replace_all`. Both the
+guard and the two functions it names landed in the SAME commit. Fixed by the
+owning lane, which took the exit this row argued for — reading the ORDERED
+snapshot — rather than adding the pair to `ALLOWED`.
+
+**The reusable part is how ownership was settled: without a build.** The test is
+a source witness over ONE file (`include_str!("properties_sidetable.rs")`), so
+its verdict is a pure function of that file's bytes, and
+`git diff origin/dev -- <that file>` came back empty. That is a proof, not an
+inference, and it costs a second. Reach for it before rebuilding a pristine
+`dev` — and note it only works because the witness reads a fixed path; a witness
+that scans a directory has to be re-run.
+
+**Both halves of the list matter.** This section lists known-red VECTORS, and a
+lane that runs the gates first had nothing to check a gate red against.
+
+**And a second one is OPEN as of `ff92ca9a4` (2026-08-29 evening).** Same test,
+different row:
 
 ```
-properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
-  these functions read the UNORDERED side-table snapshot:
-  ["native_properties_clone", "native_properties_replace_all"]
+cargo test -p cratonvm-native-builtins --test registrar_drift   (also with --features management)
+  the_drift_baseline_has_no_stale_rows
+  STALE BASELINE — 1 recorded drift pair(s) no longer drift.
+    register_phase54_atomics
+      java/util/concurrent/atomic/AtomicReference.compareAndSet(Ljava/lang/Object;Ljava/lang/Object;)Z
 ```
 
-**It is not your merge, and you can prove that without building anything.** The
-test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
-— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
-native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
-touched it, which makes the red identical to pristine `dev`'s.
-
-It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
-new guard it is: the guard and the two functions it names landed in the same
-commit. Left for that lane rather than silenced here, because the guard's two
-exits are not equivalent and picking between them is a behavioural call, not a
-gate-quieting one — `Properties.clone()` hands its key order to Java through
-`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
-that order, so "add it to ALLOWED" would be the wrong exit for both.
+It arrived with `7c90ec930` ("de-register the now-slower `AtomicReference
+.compareAndSet` stub"), which collapsed the pair and did not regenerate the
+baseline — the failure text says to do both in one commit. `registrar_drift.rs`,
+`phases_early.rs` and `vm/src/jit/helpers.rs` are byte-identical to `origin/dev`
+on any branch that has not touched them, which is how to tell it from yours.
+Left for that lane: the fix is to move the triple to `FIXED_NOT_DRIFTING` with
+`--dump-native-registry` evidence, which is a claim about their change, not
+about the gate.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.

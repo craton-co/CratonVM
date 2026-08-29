@@ -457,6 +457,63 @@ another, in the worse direction, since a spurious
 once. Reverted. Closing row 81 needs a generation counting structural GROWTH
 rather than size, and the deque has no field to hold one.
 
+#### A FOURTH cost, found 2026-08-29 after the lane landed: one unit test left red, and the mock hole under it
+
+`cargo test -p cratonvm-native-collections --test gc_native_pins` went red on
+`array_deque_iterator_roots_snapshot_graph_across_allocations`, deterministically,
+5/5. The lane's own verification is arms and probes — `114/114 --jdk-only,
+74/74 SUITE=core` — and neither runs this crate's Rust unit tests, so a red that
+`cargo test` catches in 0.01 s survived a full landing gate.
+
+**The message named a defect that is not there.** It read
+`iterator lost backing deque: Int(-1)`, because the test hard-coded
+`get_field(iterator, 2)` against the retired fabrication's layout
+(`0 = array, 1 = cursor, 2 = backing deque`) and the real carrier's slot 2 is
+`lastRet`, which the mint sets to `-1`. `Int(-1)` in a reference slot is exactly
+the shape of the `gc::guard` "descriptor-aware field access DESTROYED the value"
+family, so the obvious reading of that panic sends the next reader after a
+coercion bug in a path that has none. The graph is fine; the test was pinning a
+contract the change deliberately replaced:
+
+```text
+  DeqIterator[b + 0] -> ArrayList-shaped wrapper
+                           wrapper[elementData] -> Object[n + 1]
+                                                     [0..n) elements
+                                                     [n]    THE SOURCE DEQUE
+  DeqIterator[b + 1] = cursor  = 0
+  DeqIterator[b + 2] = lastRet = -1        b = object_num_fields - 3
+```
+
+The test now WALKS that graph — trailing-three convention, the wrapper's one
+array-valued field, the array's trailing capacity slot — rather than indexing
+three slots that belong to three different classes, and asserts the carrier
+class by name so a silent return to a fabrication cannot leave it green.
+
+**The mock hole is the part worth keeping.** `MockCtx` did not override
+`class_num_total_fields`, so it used the trait default: **zero declared fields
+for every class**. That is not a neutral default here. `alloc_arraylist_iterator_as`
+mints `class_num_total_fields + 3`, and `al_itr_alt_base` recognises this crate's
+own mint by that EXACT width — behind an early-out for anything four fields or
+narrower. A carrier reporting zero is minted three wide, trips the early-out, and
+`al_itr_delegate_foreign` sends it to real bytecode, of which a mock has none.
+So `hasNext` answered `Ok(None)` and **the entire `VALUES_ITR_CARRIERS` path was
+unreachable from unit tests, silently** — the same species as the two traps
+above, one level further out: not a registration nobody produces, but a test
+context in which nobody can produce one. `MockCtx::declare_class_fields` closes
+it; the test declares `DeqIterator`'s real four (`this$0`, `cursor`,
+`remaining`, `lastRet`) and asserts the minted width is 7.
+
+Falsified before landing, twice, each against the restored source: skipping the
+source's `read_native_pin` fails the `assert_ne!` that names it, and skipping an
+element's fails on the element's class id. No production code changed.
+
+**The latent coupling this leaves.** `AL_ITR_PLAIN_MAX_FIELDS` (4) must stay
+below every carrier's mint width, i.e. below `class_num_total_fields + 3` for
+every entry in `VALUES_ITR_CARRIERS`. Today the narrowest is 4 declared fields
+(`TreeMap$KeyIterator`, `ArrayDeque$DeqIterator`), so the margin is three. A
+future carrier with one declared field would be delegated to its own bytecode
+without a word.
+
 ### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
 
 Was 1 row: `size()` answered 3 after an `iterator().remove()` where HotSpot
@@ -546,28 +603,43 @@ HotSpot says `British Pound`, and had no entry for CNY/CHF/CAD/AUD at all; it
 now goes through the shared helper so the two copies cannot drift, and the eight
 fallback names are HotSpot's own, measured rather than guessed. And:
 
-### 6.4b `ResourceBundle.getBundle` fabricates a bundle HotSpot refuses — 2 rows, OPEN
+### 6.4b `ResourceBundle.getBundle` fabricates a bundle HotSpot refuses — FIXED 2026-08-29
+
+`CurrencyNameProbe` is 0-diff in both modes, 27 rows.
+
+`getBundle` is CALLER-SENSITIVE: it resolves against the caller's module.
+`sun.util.resources.*` lives in `java.base` and is not exported, so an
+unnamed-module caller cannot see it and HotSpot answers
+`MissingResourceException` — while `java.base`'s own code loads it fine. This VM
+had no such distinction and handed its synthesized locale bundle to everyone.
+
+Widening the probe past the two rows that failed is what made the fix obvious:
 
 ```text
-ResourceBundle.getBundle("sun.util.resources.CurrencyNames", Locale.ENGLISH)
-  HotSpot   MissingResourceException: Can't find bundle for base name ...
-  CratonVM  a java.util.ResourceBundle, whose getString("USD") answers "$"
-
-ResourceBundle.getBundle("sun.util.resources.LocaleNames", Locale.ENGLISH)
-  same shape
+getBundle sun.util.resources.CurrencyNames        HotSpot MissingResourceException
+getBundle sun.util.resources.LocaleNames          HotSpot MissingResourceException
+getBundle sun.text.resources.FormatData           HotSpot MissingResourceException
+getBundle sun.util.resources.CalendarData         HotSpot MissingResourceException
+getBundle sun.util.resources.cldr.CurrencyNames   HotSpot MissingResourceException
+getBundle com.example.NoSuchBundleAtAll20260829   HotSpot MissingResourceException  <- already agreed
 ```
 
-A fabricated SUCCESS, which is the more serious direction: an application
-probing for a bundle it does not expect to exist is told it does. The
-campaign's own fabrication screen does not catch it, because
-`java.util.ResourceBundle` is a REAL class — what is fabricated is the
-resource, not the type.
+The last row is the tell. **The refusal path already existed** — `rb_get_bundle`
+throws for every base name `is_jdk_internal_bundle` does not claim. All the fix
+adds is that a JDK-internal name is JDK-internal to APPLICATION code too, which
+is one `&& !caller_is_app` on that gate.
 
-Not fixed here, and the reason is worth stating rather than leaving as silence:
-the VM's own locale shims consume these synthetic bundles, so making
-`getBundle` refuse them is a change to the locale/resource surface with its own
-blast radius, not a `java.util` collections fix. Probe:
-`apps/probes/CurrencyNameProbe.java`, rows 17-21.
+The synthesized bundles stay for a `java.*`/`sun.*`/`jdk.*` caller, which is what
+keeps this VM's own locale shims working: `populate_format_data_en` exists
+because real `DateFormatSymbols` bytecode needs it. The caller is read from
+`capture_stack_trace(0).last()` — the immediate caller, since that capture is
+outermost-first — before anything allocates, and it is the same reading
+`caller_bundle_class_loader` next door already relies on.
+
+This was the residual filed as "not fixed here, because the VM's own locale
+shims consume these synthetic bundles". That was true and it was not a reason to
+stop: the shims and the application are different callers, and the VM could
+already tell them apart.
 
 ### 6.5 The method-reference dispatch door — FIXED 2026-08-29
 
@@ -581,60 +653,80 @@ Fixed in `vm/src/runtime/interpreter/lambda.rs`. Full account, including the 977
 registrations that share the shape and were deliberately NOT activated, in
 `a-bound-method-reference-is-a-different-dispatch-door-20260828.md`.
 
-### 6.6 `Properties.keySet().iterator()` answers the wrong iterator class — 1 row
+### 6.6 `Properties.keySet().iterator()` answers the wrong iterator class — FIXED 2026-08-29
 
-Found on 2026-08-29 while diagnosing §6.5, by a probe written to check an
-assumption rather than to find a defect:
+`ItrClassNameProbe` is 0-diff in both modes.
 
 ```text
 Properties.keySet().iterator().getClass().getName()
   HotSpot   java.util.concurrent.ConcurrentHashMap$KeyIterator
-  CratonVM  java.util.HashMap$KeyIterator          (both modes)
+  was       java.util.HashMap$KeyIterator          (both modes)
 ```
 
-Real: `Properties` stores its entries in a `ConcurrentHashMap` in JDK 25, so its
-key-set iterator is the CHM one. This VM keeps them in the side table and mints
-the `HashMap` carrier. Behaviourally the two agree on all 182 rows of
-`PropertiesShadowSweep` — this is a `getClass().getName()` difference, which is
-the shape `an-identity-only-probe-understates-a-behavioural-gap` warns can be
-either cosmetic or the visible edge of a real one. Recorded rather than fixed
-because changing the minted carrier is the
-`two-producers-of-one-carrier-class-is-a-failure-family` trap: the CHM key
-iterator name already has a producer (`MAP_KEY_ITR_CARRIERS`), and adding a
-second one to it is what made `elements()` never terminate. Probe:
-`apps/probes/ItrClassNameProbe.java`.
+JDK 25 backs `Properties` with a `ConcurrentHashMap` and `Properties.keySet()`
+is `map.keySet()`, so the iterator belongs to the CHM family. Widening the probe
+showed the other two thirds already agreed — the view's own class is
+`Collections$SynchronizedSet` on both, and the view is live on both (a `put`
+after the view is taken moves its `size`) — which is what narrowed this to the
+iterator's class alone and made it a four-line change: a key/entry view whose
+SOURCE is a `Properties` answers the CHM pair, checked ahead of the class-name
+tests because this VM's `Properties` keySet is carried by a `LinkedHashSet`.
 
-## 7. The final verification, on the tree every lane landed into
+**Not the two-producers trap, and the difference is the point.** This mints the
+same class the CHM views mint. Every name in `MAP_KEY_ITR_CARRIERS` shares ONE
+object shape — five fields at `key_itr_base`, derived from the object's WIDTH —
+and ONE registrar. A second producer is a problem when the two SHAPES differ, as
+the dormant `PriorityQueue$Itr` registration in §6.1 was; here the class name is
+a label over an identical object and the natives cannot tell the producers
+apart, because there is nothing to tell apart.
 
-The numbers above were taken as the lane went. They were RE-TAKEN at the end, on
-the binary built from the merge of all seven lanes plus the release-day
-reorganisation, `cargo fmt` and the GPU work — a tree that differs from the one
-the fixes were written against by far more than this lane contributed. All
-twelve probes recompiled from source and re-run, both modes, one run:
+## 7. The final verification, and where the residuals ended
+
+Every number here was RE-TAKEN at the end, on a binary built from the merge of
+all seven lanes plus the release-day reorganisation, `cargo fmt` and the GPU
+work — a tree that differs from the one the fixes were written against by far
+more than this lane contributed. Sixteen probes recompiled from source and
+re-run, both modes, one run:
 
 | probe | rows (HotSpot / compat / strict) | differing rows compat / strict |
 | --- | --- | --- |
 | `PropertiesShadowSweep` | 182 / 182 / 182 | 0 / 0 |
-| `TreeShadowSweep` | 232 / 232 / 232 | 2 / 2 |
-| `DequeListShadowSweep` | 172 / 172 / 172 | 1 / 1 |
+| `TreeShadowSweep` | 232 / 232 / 232 | 0 / 0 |
+| `DequeListShadowSweep` | 172 / 172 / 172 | **1 / 1** |
 | `HashtableVectorShadowSweep` | 136 / 136 / 136 | 0 / 0 |
 | `ArrayListShadowSweep` | 164 / 164 / 164 | 0 / 0 |
-| `LinkedSequencedShadowSweep` | 102 / 102 / 102 | 1 / 1 |
-| `PqOptionalShadowSweep` | 125 / 125 / 125 | 2 / 2 |
+| `LinkedSequencedShadowSweep` | 102 / 102 / 102 | 0 / 0 |
+| `PqOptionalShadowSweep` | 125 / 125 / 125 | 0 / 0 |
 | `CollectionsShadowSweep` | 172 / 172 / 172 | 0 / 0 |
-| `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 1 / 1 |
-| `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 1 |
+| `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 0 / 0 |
+| `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 0 |
 | `UtilTailShadowSweep` | 146 / 146 / 146 | 0 / 0 |
 | `MethodRefDoorProbe` | 25 / 25 / 25 | 0 / 0 |
+| `FailFastShapeProbe` | 12 / 12 / 12 | 0 / 0 |
+| `ItrClassNameProbe` | 12 / 12 / 12 | 0 / 0 |
+| `CurrencyNameProbe` | 27 / 27 / 27 | 0 / 0 |
+| `PqItrProbe` | 11 / 11 / 11 | 0 / 0 |
 
-Row counts equal and the trailing `DONE` present on all thirty-six runs, so no
-run is a truncated tail reading as clean. The eight differing rows are §6's
-eight and the thirteen are the companion record's thirteen — the same rows, not
-merely the same count. Nothing the other six lanes landed moved a row of this
-one, and nothing this lane landed moved after the merges.
+Row counts equal and the trailing `DONE` present on all forty-eight runs, so no
+run is a truncated tail reading as clean.
 
-Gates on that tree: all six RC=0. Arms: 112/112 under `--jdk-only`, 112/112
-`SUITE=all`, 72/72 `SUITE=core`.
+**One differing row is left in the whole corpus**: `ArrayDeque`'s fail-fast on
+`add`, §6.1, which stays open because HotSpot is fail-fast on an `ArrayDeque`
+`add` and NOT on a remove and a size-based generation cannot tell those apart.
+
+The residuals as first recorded were 8 rows plus the companion record's 13. Of
+those 21, **20 are closed** — and four of them were closed by finding that the
+first diagnosis pointed at the wrong thing:
+
+| residual | the first reading | what it actually was |
+| --- | --- | --- |
+| §6.5 dispatch door | "the MethodHandle path does not consult the force-native gate" | it consults it about the DECLARING class where virtual dispatch uses the RECEIVER's |
+| §6.4 currency name | "the CLDR bundle is not reachable" | the data was already there under the lowercase key; the plumbing was missing |
+| §6.1 fail-fast | "the check has nowhere to run" | four iterator-CLASS differences, of which fail-fast was the shadow |
+| §6.4b bundle | "the VM's own shims consume these, so it cannot refuse" | the shims and the application are different CALLERS, and the VM could already tell them apart |
+
+Gates on that tree: all six RC=0. Arms: 115/115 under `--jdk-only`, 115/115
+`SUITE=all`, 75/75 `SUITE=core`.
 
 ## 8. Reproduce
 

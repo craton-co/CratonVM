@@ -1591,6 +1591,58 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// scan is the established, well-tested path and answers the same thing.
 /// Because our native IS the `getBundle` frame (no Java frame is pushed for
 /// it), the innermost captured Java frame is the caller.
+/// `true` when the code that called `ResourceBundle.getBundle` is application
+/// code rather than the JDK's own.
+///
+/// `getBundle` is CALLER-SENSITIVE: it resolves against the caller's module.
+/// `sun.util.resources.*` and friends live in `java.base` and are not exported,
+/// so an unnamed-module caller cannot see them and HotSpot answers
+/// `MissingResourceException` -- while `java.base`'s own code loads them fine.
+/// This VM had no such distinction and handed its synthesized locale bundle to
+/// everyone.
+///
+/// MEASURED (`apps/probes/CurrencyNameProbe`, HotSpot 25.0.4+7, from an
+/// ordinary classpath class):
+///
+/// ```text
+/// getBundle sun.util.resources.CurrencyNames        MissingResourceException
+/// getBundle sun.util.resources.LocaleNames          MissingResourceException
+/// getBundle sun.text.resources.FormatData           MissingResourceException
+/// getBundle sun.util.resources.CalendarData         MissingResourceException
+/// getBundle sun.util.resources.cldr.CurrencyNames   MissingResourceException
+/// getBundle com.example.NoSuchBundleAtAll           MissingResourceException  <- this one already agreed
+/// ```
+///
+/// The last row is the tell: the refusal path already existed and was reached
+/// only by names `is_jdk_internal_bundle` does not claim. All this adds is that
+/// a JDK-internal name is JDK-internal to APPLICATION code too.
+///
+/// The synthesized bundles stay for a `java.*`/`sun.*`/`jdk.*` caller, which is
+/// what keeps this VM's own locale shims working -- `populate_format_data_en`
+/// exists because real `DateFormatSymbols` bytecode needs it.
+///
+/// `frames.last()` is the IMMEDIATE caller: `capture_stack_trace` is
+/// outermost-first (see `frame_class_ids`, "innermost-first, matching
+/// `capture_stack_trace`'s `.iter().rev()` convention"), which is the same
+/// reading `caller_bundle_class_loader` below relies on.
+fn bundle_caller_is_application(ctx: &mut dyn NativeContext) -> bool {
+    let frames = ctx.capture_stack_trace(0);
+    let Some(frame) = frames.last() else {
+        return false;
+    };
+    let Some(cid) = frame.class_id else {
+        return false;
+    };
+    let Some(name) = ctx.class_name_arc_of_id(cid) else {
+        return false;
+    };
+    !(name.starts_with("java/")
+        || name.starts_with("javax/")
+        || name.starts_with("sun/")
+        || name.starts_with("jdk/")
+        || name.starts_with("com/sun/"))
+}
+
 fn caller_bundle_class_loader(
     ctx: &mut dyn NativeContext,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
@@ -1832,6 +1884,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if crate::nbflags().dbg_catalina {
         eprintln!("CATALINA-DBG: ResourceBundle.getBundle native — name={bundle_name:?}");
     }
+    // Read the caller BEFORE anything allocates: this walks the live frame
+    // stack, and every later use of it is past a dozen allocations.
+    let caller_is_app = bundle_caller_is_application(ctx);
 
     // Resolve the requested locale from a Locale argument (getBundle(String,
     // Locale[, ClassLoader|Control])). Other shapes (or a Control in slot 1)
@@ -1963,7 +2018,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // genuinely-absent app bundle gets MissingResourceException
     // (java.util.ResourceBundle.getBundle's contract, which callers such as
     // Tomcat's StringManager rely on).
-    if is_jdk_internal_bundle(&bundle_name) {
+    // ...and JDK-internal to APPLICATION code as well, which is why the
+    // caller matters. See `bundle_caller_is_application`.
+    if is_jdk_internal_bundle(&bundle_name) && !caller_is_app {
         ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
         // W7-80: the requested locale reaches `build_bundle` now. It used to
         // be dropped here, which is why every locale got the same en bundle —

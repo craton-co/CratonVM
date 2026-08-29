@@ -412,6 +412,24 @@ static FL_ALIGN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// spread over 1204296 bytes of contiguous arena`, occupants
 /// `java/lang/String` (80 B) and `java/lang/Object` (24 B) — inside the high
 /// region.
+///
+/// # Where it is armed, and where it was NOT (2026-08-29)
+///
+/// [`Arena::alloc`]'s LOW free-list exits cannot fire it: a low tier only ever
+/// returns an offset below `high_cursor`, so `is_high` is false there by
+/// construction. For a week the three sites it was armed at were exactly those
+/// three, and the page above recorded the resulting zero as "an untriggered
+/// instrument, not evidence". The one exit that can return a high offset —
+/// `alloc`'s last-resort `high_fit`, which spends the large-object end's own
+/// free list rather than raise `OutOfMemoryError` — is now armed too, under
+/// the site name `high-free-list-last-resort`.
+///
+/// It is still not a refusal, and should not become one: refusing would trade
+/// a fragmentation hazard for an `OutOfMemoryError` on a heap that has bytes.
+/// What changed the balance is that the damage is no longer PERMANENT —
+/// `ZgcRealHeap::compact_high_region` packs a small survivor up there against
+/// the top with everything else, so it stops walling the region at the next
+/// relocating cycle.
 static REGION_LEAK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Count of small allocations placed in the large-object region, for a test or
@@ -1251,8 +1269,26 @@ impl Arena {
         // ABSOLUTELY last, in two steps. First take from the large-object
         // end's FREE LIST if it has anything: those bytes are already claimed
         // by the high end, so spending them costs the reserve nothing.
+        //
+        // THIS IS THE ARM THAT PUTS A SMALL OBJECT IN THE LARGE-OBJECT REGION,
+        // and until 2026-08-29 it was the one arm of this function with no
+        // region tripwire on it.
+        //
+        // The `bug-h2-testkillprocess-zgc-oom-at-97-percent-free` page carried
+        // "the two small objects in the large-object region" as an open
+        // residual for a week: the fragmentation report placed an 80-byte
+        // `String` and a 24-byte `Object` above `high_cursor`, where
+        // `ZGC_LARGE_OBJECT_MIN`'s design says only large objects live, and the
+        // tripwire "fired ZERO times across a full failing run". It could not
+        // have fired. `note_region_leak` sat on the three LOW free-list exits,
+        // every one of which returns an offset below `high_cursor` by
+        // construction, so all three were unfireable by definition — and the
+        // only exit that can return a high offset had none. An untriggered
+        // instrument reading zero is not evidence, which that page said about
+        // this very counter; this is what it was missing.
         if !self.free_high.is_empty() {
             if let Some(off) = self.high_fit(alloc_size, align) {
+                self.note_region_leak("high-free-list-last-resort", off, alloc_size);
                 // SAFETY: inside the consumed block.
                 return Some(unsafe { self.data.as_mut_ptr().add(off) });
             }
@@ -1575,6 +1611,24 @@ impl Arena {
         } else {
             self.small_max_floor()
         }
+    }
+
+    /// Bytes the LOW bump may still take without eating the large-object
+    /// reserve — i.e. the headroom [`Self::alloc`]'s ordinary bump path has
+    /// before the last-resort arm at the bottom of that function starts
+    /// spending the reserve to avoid an `OutOfMemoryError`.
+    ///
+    /// Published because the TLAB refill needs it to make a decision the free
+    /// list alone cannot inform. "Is there a recycled chunk worth taking?" has
+    /// a different answer depending on what the ALTERNATIVE is: with headroom,
+    /// the alternative is a clean full-size bump and a short chunk is mere
+    /// churn; without it, the alternative is eating the reserve, and a short
+    /// chunk is then strictly better than the large-object end losing the space
+    /// it was promised. See `zgc::recycled_chunk_size`.
+    pub fn low_bump_headroom(&self) -> usize {
+        self.high_cursor
+            .saturating_sub(self.remaining_high_reserve())
+            .saturating_sub(self.cursor)
     }
 
     /// Bytes of [`Self::high_reserve`] the large-object end has not claimed
@@ -2105,10 +2159,36 @@ impl Arena {
         self.cursor
     }
 
+    /// `vacated` is the third argument and the reason it exists is the whole
+    /// of `Follow-up 2026-08-29` on
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`:
+    /// **the space a slide empties is only reclaimed when the CURSOR can drop
+    /// to it, and otherwise it was lost forever.**
+    ///
+    /// The sweep free-lists dead objects by walking the object-start REGISTRY.
+    /// A slide rebuilds that registry with the survivors' NEW bases, so the old
+    /// ones are gone from it and no later sweep can ever discover them. If
+    /// anything live sits above the compacted region — one survivor on an
+    /// unselected dense page is enough — `new_cursor` is pinned above the
+    /// vacated span, the span is neither below the cursor nor on the free list,
+    /// and it is invisible to the allocator for the rest of the process.
+    ///
+    /// Measured on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`: four
+    /// compaction cycles relocated **885 793 objects** and the largest free
+    /// block at the failing 262 160-byte request was **8 184 bytes**. The
+    /// slide's own output is 2 MiB-granular and contiguous by construction,
+    /// which is exactly the shape that request needed and exactly what was
+    /// being thrown away.
+    ///
+    /// So the caller now names the offset spans it emptied, and they are added
+    /// to the free list here. A kept block that overlaps one is dropped rather
+    /// than kept beside it: the span is a superset of that dead space, and
+    /// publishing both would hand the same bytes out twice.
     pub(crate) fn compact_low_to(
         &mut self,
         new_cursor: usize,
         touched: std::ops::Range<usize>,
+        vacated: &[(usize, usize)],
     ) -> usize {
         assert!(
             new_cursor <= self.cursor,
@@ -2139,16 +2219,153 @@ impl Arena {
                     return None;
                 }
                 let overlaps_touched = off < touched.end && touched.start < off + size;
-                (!overlaps_touched).then_some((off, size))
+                // ...and a block inside a span the caller is about to publish
+                // is superseded by it. By construction there are no straddlers
+                // to worry about (a block starting below `touched.end` is
+                // already dropped above, and every span starts at or above it),
+                // so an overlap here is a containment; dropping on the weaker
+                // test costs at most a few bytes and can never double-publish.
+                let inside_vacated = vacated
+                    .iter()
+                    .any(|&(s, e)| off < e && s < off + size);
+                (!overlaps_touched && !inside_vacated).then_some((off, size))
             })
             .collect();
         self.clear_low_free_list();
         for (off, size) in keep {
             self.add_free_block(off, size);
         }
+        for &(s, e) in vacated {
+            // Clamp: bytes at or above the new cursor are un-bumped tail now,
+            // and serving them from both the list and the cursor is the
+            // double-hand-out this function's own history records.
+            let e = e.min(new_cursor);
+            if e > s {
+                // ZERO IT FIRST, for the reason the span above `new_cursor` is
+                // zeroed and the reason the sweep zeroes a dead object's header
+                // before free-listing it: a slid-away survivor leaves its old
+                // bytes behind verbatim, including a valid-looking
+                // `ObjectHeader`, and a conservative scanner that met one would
+                // resurrect a corpse. The whole span rather than the headers,
+                // because unlike the sweep this pass does not know where inside
+                // it the object grid fell.
+                self.data[s..e].fill(0);
+                self.add_free_block(s, e - s);
+            }
+        }
         // Every recorded low object start just moved.
         self.clear_alloc_anchors();
         reclaimed
+    }
+
+    /// Publish the result of an external slide over the LARGE-OBJECT end.
+    ///
+    /// The mirror of [`Self::compact_low_to`], and the geometry is mirrored
+    /// too: the high region bumps DOWN from `capacity`, so compacting it packs
+    /// survivors against the TOP and leaves its holes at the bottom.
+    ///
+    /// Two arguments rather than one cursor, because the high end cannot be
+    /// described by a cursor the way the low end can:
+    ///
+    /// * `floor` — the lowest offset the caller's slide is AUTHORITATIVE about.
+    ///   At or above it, this method owns the free list; below it, nothing has
+    ///   changed and every existing block is kept. It is `high_cursor` when the
+    ///   slide walked the whole region, and the floor of the packed region when
+    ///   the slide stopped early on a header it could not size.
+    /// * `vacated` — the offset spans inside `[floor, capacity)` that the slide
+    ///   emptied. Every byte in them is dead by the caller's assertion, a claim
+    ///   only a relocator that has just moved every survivor out of them can
+    ///   make; every other byte at or above `floor` is a live object or the
+    ///   grid padding beside one. A LIST rather than a single span because one
+    ///   pinned large object splits the region in two, and dropping the free
+    ///   space on the far side of it would lose that memory permanently — the
+    ///   failure [`Self::compact_low_to`]'s own history records.
+    ///
+    /// Both are `pub(crate)`-only claims, which is why this is not `pub`.
+    ///
+    /// Returns the bytes that were live-object space before the slide and are
+    /// free after it. Bytes already on `free_high` are not counted: they were
+    /// free before and are free after, merely contiguous — and contiguity is
+    /// what this exists for, not reclaim.
+    ///
+    /// # The bytes stay on THIS end's free list
+    ///
+    /// Deliberately not `high_cursor += hole`. Raising the cursor moves the
+    /// bytes into the SHARED MIDDLE, where the low end carves TLAB chunks out
+    /// of them — the drain [`Self::retract_high_cursor_into_free_head`]
+    /// documents (`TestNonBlockingAPI` reached its failing allocation with the
+    /// large-object region holding 3,224 free bytes, handed back one sweep at a
+    /// time). Publishing merged blocks instead leaves the span where only large
+    /// objects can take it, and `high_max` becomes the whole span, which is the
+    /// number [`Self::alloc_high`]'s best fit consults. A caller that wants the
+    /// excess handed back has the retraction, whose reserve policy already
+    /// decides how much.
+    pub(crate) fn compact_high_to(&mut self, floor: usize, vacated: &[(usize, usize)]) -> usize {
+        assert!(
+            floor >= self.high_cursor,
+            "high compaction floor is below the high cursor: {floor} < {}",
+            self.high_cursor
+        );
+        assert!(
+            floor <= self.data.len(),
+            "high compaction floor past capacity: {floor} > {}",
+            self.data.len()
+        );
+        // Zero every vacated span, for the reason `compact_low_to` gives: a
+        // slid-away survivor leaves its old bytes behind verbatim, including a
+        // valid-looking `ObjectHeader`, and a conservative scanner that met one
+        // would resurrect a corpse.
+        for &(start, end) in vacated {
+            assert!(
+                start >= floor && end <= self.data.len() && start <= end,
+                "vacated span {start}..{end} is outside the authoritative region \
+                 {floor}..{}",
+                self.data.len()
+            );
+            self.data[start..end].fill(0);
+        }
+        // Rebuild this end's free list: everything wholly below `floor` is
+        // kept verbatim, a straddler is truncated to its part below it, and
+        // everything else is replaced by `vacated` — because at or above
+        // `floor` a pre-existing block either lies inside a span the slide just
+        // emptied (so `vacated` already names it) or names bytes a survivor was
+        // packed into (so keeping it would hand out occupied memory).
+        let old_total: usize = self.free_high.iter().map(|b| b.size).sum();
+        let mut kept: Vec<FreeBlock> = Vec::with_capacity(self.free_high.len());
+        for b in self.free_high.drain(..) {
+            if b.offset >= floor {
+                continue;
+            }
+            let size = b.size.min(floor - b.offset);
+            if size != 0 {
+                kept.push(FreeBlock {
+                    offset: b.offset,
+                    size,
+                });
+            }
+        }
+        self.free_bytes_total -= old_total;
+        self.high_max = 0;
+        self.high_pushed = 0;
+        let mut new_total = 0usize;
+        for b in kept {
+            new_total += b.size;
+            self.push_high(b);
+        }
+        for &(start, end) in vacated {
+            if end > start {
+                new_total += end - start;
+                self.push_high(FreeBlock {
+                    offset: start,
+                    size: end - start,
+                });
+            }
+        }
+        // A vacated span is very often adjacent to a kept block just below the
+        // floor, and the whole point of this pass is one BIG block rather than
+        // two touching ones.
+        self.coalesce_high();
+        new_total.saturating_sub(old_total)
     }
 
     pub fn reset(&mut self) {
@@ -2561,7 +2778,7 @@ mod tests {
         );
 
         // The slide wrote into [4096, 12288) and left the cursor at 22528.
-        let reclaimed = arena.compact_low_to(22_528, 4096..12_288);
+        let reclaimed = arena.compact_low_to(22_528, 4096..12_288, &[]);
         assert!(reclaimed > 0, "the cursor must actually retract");
 
         let kept = arena.free_blocks_sorted();
@@ -2832,6 +3049,198 @@ mod tests {
             arena.high_free_shape().1,
             4096,
             "and the retained half is still on the HIGH free list",
+        );
+    }
+
+    /// `compact_high_to` publishes ONE maximal block where the slide left a
+    /// mosaic — which is the entire reason the large-object end grew a
+    /// compactor. A best fit over three 1 KiB holes cannot serve 3 KiB; over
+    /// their merge it can, and that is the assertion.
+    #[test]
+    fn compacting_the_high_end_merges_its_holes_into_one_servable_block() {
+        // Capacity exactly four allocations wide, so the two ends meet and the
+        // bump path is out -- the state a fragmented heap is actually in, and
+        // the only one in which a free-list miss is an `OutOfMemoryError`.
+        let mut arena = Arena::new(4096);
+        let base = arena.base_ptr() as usize;
+        // Four 1 KiB large objects, alternating live and dead. Addresses
+        // descend, so `a` is the highest.
+        let a = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let b = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let c = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let d = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        assert!(a > b && b > c && c > d, "the high end bumps DOWN");
+        // `b` and `d` die; the sweep free-lists them, leaving two 1 KiB holes
+        // with a live kilobyte between them.
+        arena.add_free_block(b, 1024);
+        arena.add_free_block(d, 1024);
+        assert_eq!(arena.high_free_shape(), (2, 2048, 1024));
+        assert!(
+            arena.alloc_high(2048, 8).is_none(),
+            "the precondition: 2 KiB free in two blocks cannot serve 2 KiB"
+        );
+
+        // The slide the collector would have performed: `c` packs against `a`
+        // (into `b`'s span), `a` stays. Everything below `c`'s new base is
+        // then dead.
+        //
+        // SAFETY: the test owns the arena and nothing else reads these bytes.
+        unsafe {
+            std::ptr::copy(
+                (base + c) as *const u8,
+                (base + b) as *mut u8,
+                1024,
+            )
+        };
+        let new_floor = b;
+        let reclaimed = arena.compact_high_to(d, &[(d, new_floor)]);
+
+        assert_eq!(
+            reclaimed, 0,
+            "and the pass buys CONTIGUITY, not bytes: the same two kilobytes
+             were free before and after, which is why `reclaimed` is the wrong
+             number to judge this pass by"
+        );
+        let (blocks, bytes, largest) = arena.high_free_shape();
+        assert_eq!(
+            (blocks, bytes, largest),
+            (1, 2048, 2048),
+            "the holes must come back as ONE block, not two touching ones"
+        );
+        assert!(
+            arena.alloc_high(2048, 8).is_some(),
+            "the request that could not be served before the compaction must \
+             be servable after it -- that is the whole feature"
+        );
+    }
+
+    /// A free block BELOW the authoritative floor is kept verbatim.
+    ///
+    /// This is the case a pinned large object creates: the slide compacts the
+    /// region above it and knows nothing about the region below, so a wholesale
+    /// replacement of the high free list would lose every byte down there
+    /// permanently. `Arena::compact_low_to` records having made exactly that
+    /// mistake at the other end (the `repros/frag-churn` OOM at 99 % dead), and
+    /// this is the check that it was not repeated here.
+    #[test]
+    fn compacting_the_high_end_keeps_the_free_space_below_its_floor() {
+        let mut arena = Arena::new(16384);
+        let base = arena.base_ptr() as usize;
+        let _top = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let hole_above = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let pinned = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let hole_below = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        arena.add_free_block(hole_above, 1024);
+        arena.add_free_block(hole_below, 1024);
+        assert_eq!(arena.high_free_shape().1, 2048);
+
+        // The slide stopped at `pinned`: it is authoritative only from
+        // `pinned + 1024` upwards, and it emptied nothing new up there.
+        let reclaimed = arena.compact_high_to(pinned + 1024, &[]);
+
+        assert_eq!(reclaimed, 0, "nothing new was freed");
+        let (blocks, bytes, _largest) = arena.high_free_shape();
+        assert_eq!(
+            (blocks, bytes),
+            (1, 1024),
+            "the hole above the floor is inside the packed region and goes; \
+             the one BELOW it must survive untouched"
+        );
+        assert_eq!(
+            arena.free_blocks_sorted()[0],
+            (hole_below, 1024),
+            "and it must be the same block, at the same offset"
+        );
+    }
+
+    /// A vacated span adjacent to a kept block comes back as one block, not
+    /// two touching ones. Contiguity is the only thing this pass buys, so
+    /// leaving the seam in would make it buy nothing.
+    #[test]
+    fn a_vacated_high_span_merges_with_the_hole_below_the_floor() {
+        let mut arena = Arena::new(16384);
+        let base = arena.base_ptr() as usize;
+        let _top = arena.alloc_high(2048, 8).unwrap() as usize - base;
+        let vacated = arena.alloc_high(2048, 8).unwrap() as usize - base;
+        let below = arena.alloc_high(2048, 8).unwrap() as usize - base;
+        arena.add_free_block(below, 2048);
+
+        let reclaimed = arena.compact_high_to(vacated, &[(vacated, vacated + 2048)]);
+
+        assert_eq!(reclaimed, 2048);
+        assert_eq!(
+            arena.high_free_shape(),
+            (1, 4096, 4096),
+            "the vacated span and the pre-existing hole below it are adjacent \
+             and must be published as one 4 KiB block"
+        );
+    }
+
+    /// The vacated span is ZEROED. A slid-away survivor leaves a valid-looking
+    /// `ObjectHeader` behind, and a conservative scanner that met one would
+    /// resurrect a corpse — the same contract `compact_low_to` and `reset`
+    /// state at the other end.
+    #[test]
+    fn compacting_the_high_end_zeroes_what_it_frees() {
+        let mut arena = Arena::new(16384);
+        let base = arena.base_ptr() as usize;
+        let _live = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        let corpse = arena.alloc_high(1024, 8).unwrap() as usize - base;
+        // SAFETY: the test owns the arena; this is the "header left behind"
+        // the zeroing exists to erase.
+        unsafe { std::ptr::write_bytes((base + corpse) as *mut u8, 0xAB, 1024) };
+
+        arena.compact_high_to(corpse, &[(corpse, corpse + 1024)]);
+
+        // SAFETY: same span, still inside the arena.
+        let bytes = unsafe { std::slice::from_raw_parts((base + corpse) as *const u8, 1024) };
+        assert!(
+            bytes.iter().all(|b| *b == 0),
+            "the vacated span must be zeroed, or a conservative scan can \
+             resurrect what was there"
+        );
+    }
+
+    /// **The region tripwire fires on the ONE arm that can trip it.**
+    ///
+    /// `Arena::alloc`'s low free-list exits return offsets below `high_cursor`
+    /// by construction, so arming them was arming nothing: the counter read
+    /// zero for a week on a workload whose fragmentation report was naming an
+    /// 80-byte `String` and a 24-byte `Object` above `high_cursor` at the same
+    /// time. The last-resort `high_fit` is the exit that can put a small object
+    /// in the large-object region, and this is the test that says so.
+    ///
+    /// The delta, not the absolute: the counter is process-global and bounded
+    /// logging shares it with every other test in the binary.
+    #[test]
+    fn a_small_object_served_from_the_high_free_list_trips_the_region_wire() {
+        let mut arena = Arena::new(8192);
+        // Claim and release 4 KiB at the high end, so its free list has a block
+        // and the two cursors can meet.
+        let big = arena.alloc_high(4096, 8).unwrap() as usize - arena.base_ptr() as usize;
+        arena.add_free_block(big, 4096);
+        assert_eq!(arena.high_free_shape(), (1, 4096, 4096));
+
+        // Bump the low end right up to `high_cursor`, so the ordinary paths are
+        // all exhausted and only the last resort is left.
+        arena.alloc(2048, 8).unwrap();
+        arena.alloc(2048, 8).unwrap();
+        assert_eq!(arena.low_bump_headroom(), 0, "the two ends have met");
+
+        let before = small_allocations_in_large_region();
+        let p = arena.alloc(64, 8).expect(
+            "the last resort must still serve this rather than raise OutOfMemoryError",
+        );
+        let off = p as usize - arena.base_ptr() as usize;
+        assert!(
+            off >= arena.high_cursor(),
+            "the only space left was the large-object end's own free list"
+        );
+        assert_eq!(
+            small_allocations_in_large_region(),
+            before + 1,
+            "and the region tripwire must SEE it -- the residual this closes is \
+             an untriggered instrument reading zero"
         );
     }
 
