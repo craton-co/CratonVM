@@ -9561,7 +9561,30 @@ fn recycled_chunk_size(
     }
     // Below the preferred floor: worth it only when a full chunk can no longer
     // be bumped without spending the large-object reserve.
-    (bump_headroom < want && size >= (want / 64).max(need)).then_some(size)
+    (starved_recycle_enabled() && bump_headroom < want && size >= (want / 64).max(need))
+        .then_some(size)
+}
+
+/// `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` — the kill switch for the starved
+/// floor in [`recycled_chunk_size`]. Default ON.
+///
+/// It exists so the change is a RE-RUN and not a rebuild: with it off, the
+/// refill floor is `want / 8` in every regime, byte for byte what it was before
+/// 2026-08-29. `CRATONVM_ZGC_TLAB=0` is not a substitute — it turns the whole
+/// thread-local buffer off and changes the allocation path, the free-list
+/// shape and the run time (561 s against 103 s on `TestMVStoreTool`), so an arm
+/// that differs by it differs by far more than this decision.
+fn starved_recycle_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_STARVED_RECYCLE") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        },
+    )
 }
 
 /// Share of the arena that TLAB chunks may hold in RESERVATION at one time.

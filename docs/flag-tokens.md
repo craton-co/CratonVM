@@ -823,7 +823,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-79 tokens.
+80 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -888,6 +888,7 @@ export inherited from a parent shell.
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
 | `zgc-high-compaction` | `CRATONVM_ZGC_HIGH_COMPACTION` |
+| `zgc-tlab-starved-recycle` | `CRATONVM_ZGC_TLAB_STARVED_RECYCLE` |
 | `xt-jit-coverage-handshake` | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` |
 | `osr-coverage-shadow` | `CRATONVM_OSR_COVERAGE_SHADOW` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |

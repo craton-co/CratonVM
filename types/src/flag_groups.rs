@@ -1519,6 +1519,11 @@ pub const INVENTORY: &[E] = &[
     // failing at 97 % free came from an end nothing could relocate. See
     // `gc/src/zgc.rs::zgc_high_compaction_enabled`.
     E { group: Group::GC, token: "zgc-high-compaction", on_key: Some("CRATONVM_ZGC_HIGH_COMPACTION"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the starved TLAB-refill floor. Default-ON, so a
+    // KILL SWITCH: `=0` restores the unconditional `want / 8` floor, which is
+    // what let a starved bump spend the large-object reserve on TLAB churn.
+    // See `gc/src/zgc.rs::starved_recycle_enabled`.
+    E { group: Group::GC, token: "zgc-tlab-starved-recycle", on_key: Some("CRATONVM_ZGC_TLAB_STARVED_RECYCLE"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the cross-thread JIT coverage handshake.
     // Default-ON, so a KILL SWITCH, with the same `off_word: Some("0")` as its
     // neighbours: `=0` restores the blanket "any peer inside compiled code
