@@ -25,7 +25,7 @@ been removed again.
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
-| **L8 the long tail** | **IN PROGRESS 2026-08-29** — 217 unprobed rows across 56 classes (§2.1); 2 of 7 batches closed, 16 defects, 5233 probe rows 0-diff | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
+| **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 108 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
 **All seven lanes are DONE** — L1 through L7, the last of them on 2026-08-29.
 Six of the seven lane handoffs are retired to `internal/jdk-only/`; L5's
@@ -188,15 +188,60 @@ bridge rows whose real method has Code and owns its slot   2063  across 195 clas
 **So the tail is 217 rows, not 780** — six lanes closed 1753 between them. The
 unprobed remainder groups into seven batches, and they are what L8 is working:
 
-| batch | rows | classes | state |
+**ALL SEVEN BATCHES ARE CLOSED (2026-08-29). 56 defects fixed, 4 recorded,
+20 108 probe rows at 0-diff in both modes.**
+
+| batch | rows | probe | result |
 | --- | ---: | --- | --- |
-| `java/net/URI` + `URL` | 14 | and `uri-resolve-folded-…-20260826.md` §4 deferred a fix pending exactly this probe | **DONE 2026-08-29** — `UriRecompositionSweep`, 1258 rows 0-diff both modes, **7 defects**; the deferred row was 26. `l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md` |
-| Throwable and the exception hierarchy | 117 | `Throwable` 16 + 41 classes at 2-5 each, all sharing one registration set | **DONE 2026-08-29** — `ThrowableFamilySweep`, 3975 rows 0-diff both modes, **9 defects**. `l8-tail-throwable-nine-defects-and-the-one-the-registry-had-to-name-20260829.md` |
-| `java/math/BigInteger` | 24 | the largest single class left | open |
-| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 26 | | open |
-| `java/security/MessageDigest` + `AccessController` | 20 | | open |
-| `jdk/internal` — `VM`, `SharedSecrets`, `Signal`, `AbstractClassLoaderValue` | ~19 | | open |
-| `java/lang/ref` | ~12 | GC-adjacent | open |
+| `java/net/URI` + `URL` | 14 | `UriRecompositionSweep` 1258 | **7 defects**; the row §4 deferred was 26 |
+| Throwable and the exception hierarchy | 117 | `ThrowableFamilySweep` 3975 | **9 defects**; `owns_slot` named the registrar that mattered |
+| `java/math/BigInteger` | 24 | `BigIntegerSweep` 13 255 | **3 defects**, all on error paths |
+| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 43 | `SystemRuntimeObjectSweep` 125 | **18 fixed, 4 recorded** |
+| `java/lang/ref` | 19 | `RefFamilySweep` 60 | **2 defects**, one of them a hang |
+| `java/security` | 27 | `SecuritySurfaceSweep` 1335 | **11 defects**, all on refusal paths |
+| `jdk/internal` | 29 | `JdkInternalSweep` 120 | **6 defects**; one line of them was 12 rows |
+| *(written along the way)* | — | `HelpfulNpeProbe` 20 | refuted the hypothesis that this VM has no helpful NPEs |
+
+Records, under the internal tree at `jdk-only/`:
+`l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md`,
+`l8-tail-throwable-nine-defects-and-the-one-the-registry-had-to-name-20260829.md`,
+`l8-tail-biginteger-system-and-ref-23-defects-and-a-hang-20260829.md`,
+`l8-tail-security-and-jdk-internal-seventeen-defects-and-the-tail-is-closed-20260829.md`.
+
+The four recorded residuals are all in the `System` batch and all named with
+their reasons in its record: `System.setOut(null)`, `setSecurityManager` (a
+documented security-model decision coupled to the exec/Panama gating), and the
+two rows of the largest open finding — **`--jdk-only`'s `System.getLogger`
+resolves to `SimpleConsoleLogger` rather than the JUL provider**, so every
+`System.Logger` in that mode ignores logging configuration. That is a
+`ServiceLoader`/module-graph defect, several sizes larger than the rows it
+shows up on.
+
+### What the seven batches had in common
+
+The estimate for these seven was ~217 rows and "the tail". What they actually
+were, over and over:
+
+* **A comment that recorded a deviation and never priced it.** `BigInteger`'s
+  `modPow` said a negative modulus is "outside the BigInteger spec" and computed
+  anyway; `Throwable`'s suppressed-exception list said it held an array where
+  the JDK holds a `List`, which cost every suppression-bearing throwable its
+  serialization; `Signal`'s registrar stated a field order the class does not
+  have.
+* **One decision with more than one registrar.** `owns_slot` is the column that
+  settles which one runs, and twice a fix landed for one descriptor and not its
+  neighbour because of it.
+* **A defect that announced itself by ARITHMETIC rather than by content.** 280
+  identical rows meant a probe bug; nine of ten getters meant a fix at the wrong
+  level of the call chain; twelve rows across three signals meant one line.
+* **Deferrals that were requests for a measurement.** Two of them, both closed:
+  the `URI` recomposition row and the `System.Logger` `OFF` arm.
+
+### What is NOT closed
+
+The unowned `--jdk-only` surface is not the same thing as the corpus. These
+seven batches close the 217 rows this page scoped; `--jdk-only-report` still
+counts native-won triples elsewhere, and the four residuals above are real.
 
 The Throwable row was estimated at ~70 and measured at **117** once the family
 was counted from the registry rather than from the class list — every

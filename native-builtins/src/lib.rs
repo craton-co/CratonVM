@@ -13697,15 +13697,25 @@ pub fn register_essential_natives_with_shims(
             _ => Ok(Some(Value::Object(None))),
         },
     );
+    // `CodeSource.getCertificates()` is `certs == null ? null : certs.clone()`.
+    // NULL is the answer for a code source with no certificates, and it is what
+    // `new CodeSource(url, (Certificate[]) null)` produces -- which is the
+    // common shape. This fabricated an EMPTY ARRAY instead, so a caller's
+    // `if (certs != null)` took the wrong branch and then found nothing in it.
+    //
+    // The array was also an `Object[]` in a slot declared
+    // `[Ljava/security/cert/Certificate;`, which nothing inside this VM
+    // objects to and real bytecode does -- the same descriptor mismatch that
+    // made `Throwable.suppressedExceptions` unserialisable. Reading the field
+    // avoids inventing either. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     registry.register(
         "java/security/CodeSource",
         "getCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |ctx, _args| {
-            Ok(Some(Value::Object(Some(ctx.new_array(
-                cratonvm_types::ArrayElementType::Reference,
-                0,
-            )))))
+        |ctx, args| match args.first() {
+            Some(Value::Object(Some(cs))) => Ok(Some(ctx.get_field_by_name(*cs, "certs"))),
+            _ => Ok(Some(Value::Object(None))),
         },
     );
     // URL.getPath() — prefer real-JDK 13-field layout (path@6, file@3,
@@ -15529,7 +15539,22 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            let ok = (45..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            // A PREVIEW minor (65535) is legal only for the CURRENT major.
+            // JDK 25's own predicate:
+            //
+            //     if (major < 45 || major > classFileMajorVersion) return false;
+            //     if (major <= 55) return true;   // any minor
+            //     return minor == 0
+            //         || (minor == 65535 && major == classFileMajorVersion);
+            //
+            // Accepting `(68, 65535)` -- a JDK 24 class file claiming preview
+            // -- is the shape this gate exists to refuse: preview features are
+            // not forward-compatible, and a class file that says "preview" for
+            // an older release is one whose bytecode this VM has no business
+            // running. MEASURED by `apps/probes/JdkInternalSweep.java`.
+            const CURRENT_MAJOR: i32 = 69;
+            let ok = (45..=CURRENT_MAJOR).contains(&major)
+                && (major < 56 || minor == 0 || (minor == 65535 && major == CURRENT_MAJOR));
             Ok(Some(Value::Int(ok as i32)))
         },
     );
@@ -25686,6 +25711,47 @@ fn native_protection_domain_implies(
     // permissive answer rather than inventing a denial.
     if args.len() < 2 {
         return Ok(Some(Value::Int(1)));
+    }
+    // A STATIC domain answers from its OWN permission collection and never
+    // consults the policy. `ProtectionDomain(CodeSource, PermissionCollection)`
+    // -- the two-argument constructor -- sets `staticPermissions = true`, and
+    // the JDK's `implies` is then
+    //
+    //     if (hasAllPerm) return true;
+    //     if (permissions != null) return permissions.implies(perm);
+    //     return false;
+    //
+    // Falling through to the policy core instead meant a domain constructed
+    // with NO permissions answered TRUE for `AllPermission`, because the core
+    // is allow-all with no `java.policy` loaded. **That is a security answer
+    // given the permissive way for a reason that has nothing to do with the
+    // domain being asked about**, and it is the one shape of wrong answer this
+    // predicate must not produce. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`:
+    // `new ProtectionDomain(null, null).implies(new AllPermission())` is
+    // `false` on HotSpot and was `true` here.
+    if let Some(Value::Object(Some(pd))) = args.first() {
+        if matches!(ctx.get_field_by_name(*pd, "staticPermissions"), Value::Int(1)) {
+            if matches!(ctx.get_field_by_name(*pd, "hasAllPerm"), Value::Int(1)) {
+                return Ok(Some(Value::Int(1)));
+            }
+            let Value::Object(Some(perms)) = ctx.get_field_by_name(*pd, "permissions") else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let perm = args.get(1).copied().unwrap_or(Value::Object(None));
+            return match ctx.invoke_virtual(
+                perms,
+                "implies",
+                "(Ljava/security/Permission;)Z",
+                &[perm],
+            ) {
+                Ok(Some(v @ Value::Int(_))) => Ok(Some(v)),
+                // The collection could not be asked: deny rather than fall
+                // through to the allow-all core, which is the failure mode
+                // this arm exists to remove.
+                _ => Ok(Some(Value::Int(0))),
+            };
+        }
     }
     // A null permission carries no grant to satisfy: deny, matching the
     // `Policy.implies` native's null handling (security_manager.rs).

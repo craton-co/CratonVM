@@ -1496,6 +1496,80 @@ fn register_signal_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// The two fields `jdk.internal.misc.Signal` / `sun.misc.Signal` carry.
+#[derive(Clone, Copy)]
+enum SignalField {
+    Name,
+    Number,
+}
+
+impl SignalField {
+    fn name(self) -> &'static str {
+        match self {
+            SignalField::Name => "name",
+            SignalField::Number => "number",
+        }
+    }
+
+    /// The slot to use when the name does not resolve. This is the layout a
+    /// synthetic `Signal` stub has -- and, historically, the layout this
+    /// registrar assumed for the REAL class too, which was the defect: `javap
+    /// -p jdk.internal.misc.Signal` declares `private int number;` before
+    /// `private java.lang.String name;`, so the real slots are the other way
+    /// round from these.
+    fn fallback_slot(self) -> usize {
+        match self {
+            SignalField::Name => 0,
+            SignalField::Number => 1,
+        }
+    }
+}
+
+/// Write a `Signal` field by NAME, falling back to [`SignalField::fallback_slot`]
+/// when the receiver resolves no such name.
+///
+/// The read-back is what makes the fallback safe rather than a guess: it tells
+/// "the receiver has this field" apart from "the name resolved to nothing"
+/// without this code having to know which kind of receiver it is holding. Same
+/// shape as `lang_misc::write_throwable_field`, which exists for the same
+/// reason and against the same two receiver kinds.
+fn signal_field_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field: SignalField,
+    value: Value,
+) {
+    ctx.set_field_by_name(this, field.name(), value);
+    if ctx.get_field_by_name(this, field.name()) != value {
+        let slot = field.fallback_slot();
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, value);
+        }
+    }
+}
+
+/// [`signal_field_set`]'s reader. A resolved name wins; an unresolved one falls
+/// back to the same slot the writer used.
+fn signal_field_get(ctx: &mut dyn NativeContext, this: ObjectRef, field: SignalField) -> Value {
+    let by_name = ctx.get_field_by_name(this, field.name());
+    let unresolved = match field {
+        // An unset or unresolvable reference slot reads back as `Object(None)`
+        // or as the raw `Int(0)` of an untyped slot; a real signal always has a
+        // name, so either means the name did not resolve.
+        SignalField::Name => matches!(by_name, Value::Object(None) | Value::Int(0)),
+        // Signal numbers are positive, so a zero means the same thing.
+        SignalField::Number => matches!(by_name, Value::Int(0) | Value::Object(None)),
+    };
+    if !unresolved {
+        return by_name;
+    }
+    let slot = field.fallback_slot();
+    if slot < ctx.object_num_fields(this) {
+        return ctx.get_field(this, slot);
+    }
+    by_name
+}
+
 fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1514,23 +1588,35 @@ fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
             .into());
         }
 
-        ctx.set_field(this, 0, Value::Object(Some(name_obj)));
-        ctx.set_field(this, 1, Value::Int(number));
+        // BY NAME, NOT BY SLOT. The comment above this registrar said "field 0
+        // = name (String), field 1 = number (Int)" and the real class declares
+        // them the other way round:
+        //
+        //   javap -p jdk.internal.misc.Signal
+        //     private int number;
+        //     private java.lang.String name;
+        //
+        // so the constructor wrote a String reference into an `int` slot and an
+        // `int` into a reference slot. `getName()` came back null, `getNumber()`
+        // came back 0, and `toString()` -- real bytecode reading `this.name` --
+        // printed `SIGnull` for every signal. `equals` then threw an NPE from
+        // inside the JDK. MEASURED by `apps/probes/JdkInternalSweep.java`: 12
+        // rows, all of them this one line.
+        signal_field_set(ctx, this, SignalField::Name, Value::Object(Some(name_obj)));
+        signal_field_set(ctx, this, SignalField::Number, Value::Int(number));
         Ok(None)
     });
 
     // getNumber()I — return signal number
     r.register(sig_class, "getNumber", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let num = ctx.get_field(this, 1);
-        Ok(Some(num))
+        Ok(Some(signal_field_get(ctx, this, SignalField::Number)))
     });
 
     // getName()Ljava/lang/String; — return signal name
     r.register(sig_class, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name_val = ctx.get_field(this, 0);
-        Ok(Some(name_val))
+        Ok(Some(signal_field_get(ctx, this, SignalField::Name)))
     });
 
     // handle(Signal, SignalHandler) -> SignalHandler — register a handler
