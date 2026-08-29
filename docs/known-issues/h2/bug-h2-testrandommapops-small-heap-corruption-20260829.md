@@ -54,7 +54,48 @@ runs:
 `CRATONVM_DBG_COLL_REFRESH` reports **zero** engagements on the failing runs, so
 the receiver-pinning path the parent page fixed is not involved at all.
 
-## Why "repro and dump" is the wrong instrument here
+## 2026-08-29: it is CHEAP now — 2/2 in under 90 s on a quiet host
+
+The page's own next move was *"make the defect cheaper before diagnosing it"*.
+That happened, and not by tuning the heap: on the 2026-08-29 tip, `--Xmx 256m`,
+host load ~3:
+
+| rep | rc | secs | `oom` | `arena` | failure |
+|---|---:|---:|---:|---:|---|
+| 1 | 1 | **88** | 0 | 0 | `NullPointerException` at `TestRandomMapOps.openStore`, `seed:-67298774724213935 op:1349` |
+| 2 | 1 | **46** | 0 | 0 | `NullPointerException` |
+
+**Two failures in two runs, in 46 and 88 seconds**, against a documented base
+rate of roughly one in three runs of twenty minutes. Zero `OutOfMemoryError`
+and zero arena failures, so this is not the fragmentation family — it is the
+corruption this page is about, arriving an order of magnitude sooner.
+
+The collector census from the first of them, on a 256 MB heap:
+
+```text
+collections=30 compaction_cycles=24 objects_relocated=159832
+relocation_skipped_jit=6 relocation_on_proven_jit=24
+zgc-high-compaction: cycles=12 declined=12 vacated_spans=331
+                     vacated_bytes=691546832
+```
+
+**The obvious hypothesis is that the 2026-08-29 vacated-span publication raised
+the rate, and it is the one the parent work predicted in writing.** Before that
+change, a span the slide emptied under a pinned cursor was leaked — so a holder
+still naming a vacated address met a zeroed corpse. It is handed back to the
+allocator now, so the same stale read meets whatever was allocated over it,
+sooner and louder. `bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md`
+carries the same warning for the same reason.
+
+**That hypothesis needs the arm, not the argument.** The A/B is
+`CRATONVM_ZGC_PUBLISH_VACATED=0` on the same binary, and until it is run this
+section claims only what it measured: 2/2 at under 90 s on the current tip.
+
+Either way the page gains: a defect that reproduces in a minute is one somebody
+can bisect, which is exactly what its own "repro-and-dump is the wrong
+instrument at this rate" paragraph was waiting for.
+
+## Why "repro and dump" WAS the wrong instrument
 
 One failure in three, twenty minutes a run, and a different symptom each time
 means an attempt costs an hour and buys a signature nobody has seen before.
