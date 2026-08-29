@@ -256,7 +256,7 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | `panama.rs` — unclaimed, closest to L1 |
+| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
 | ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
