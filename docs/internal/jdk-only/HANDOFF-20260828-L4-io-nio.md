@@ -8,46 +8,48 @@
 > **What the lane did.** The `native-won` surface was mined rather than guessed:
 > **199 distinct triples** across `java/io` and `java/nio`, from a
 > `--jdk-only-report` over `probes/L4Reach.java`. Five new differential probes
-> cover all of them — `L4FileSweep` (331 rows), `L4FilesSweep` (395),
+> cover all of them — `L4FileSweep` (486 rows), `L4FilesSweep` (395),
 > `L4ByteBufferSweep` (404), `L4PrintStreamSweep` (123), `L4StreamTailSweep`
-> (208) — **1461 rows against HotSpot 25.0.4+7, in both modes.**
+> (208) — **1616 rows against HotSpot 25.0.4+7, in both modes.**
 >
-> **49 defects, all fixed.** Including a `PrintStream.write(byte[], 0, -1)` that
-> **panicked the VM** (`capacity overflow` — `-1 as usize`), a
-> `sun.nio.ch.FileChannelImpl.truncate(-1)` that clamped to zero and DELETED the
-> file, `Files.copy`/`move` raising `IllegalStateException` (not an
-> `IOException` at all, so `catch (IOException)` could not see it),
-> `Path.startsWith` implemented as a STRING prefix (so `/appsecret` starts with
-> `/app`), a `SimpleFileVisitor` whose `visitFileFailed` answered `CONTINUE` and
-> therefore swallowed every walk error, and a `PrintStream` that ignored its own
-> charset on every text write.
+> **52 defects fixed and 8 shadows retired.** Including a
+> `PrintStream.write(byte[], 0, -1)` that **panicked the VM** (`capacity
+> overflow` — `-1 as usize`), a `sun.nio.ch.FileChannelImpl.truncate(-1)` that
+> clamped to zero and DELETED the file, `Files.copy`/`move` raising
+> `IllegalStateException` (not an `IOException` at all, so `catch (IOException)`
+> could not see it), `Path.startsWith` implemented as a STRING prefix (so
+> `/appsecret` starts with `/app`), a `SimpleFileVisitor` whose
+> `visitFileFailed` answered `CONTINUE` and therefore swallowed every walk
+> error, a `PrintStream` that ignored its own charset on every text write, and
+> **a backslash treated as a path separator on Unix** — 47 rows in one existing
+> probe, from a predicate whose own comment claimed it was platform-independent.
 >
-> **Final state: 1458 of 1461 rows identical in both modes.** The three
-> residuals are recorded with their measurements in the record's §4 — one is
-> contract-equivalent (`newBufferedReader` on a directory throws the same type,
-> earlier), one is not a contract at all (`BufferedWriter` does not buffer), and
-> one is a RESOLUTION finding no registrar edit can move
-> (`FileInputStream.skip` resolves to its superclass; both candidate natives
-> report `invocations: 0`).
+> **Final state: 1615 of 1616 rows identical in both modes.** The one residual
+> is recorded in the record's §4.3: `FileInputStream.skip` past end of file,
+> which is contract-legal and which no registrar edit can move — both candidate
+> natives report `invocations: 0`, so the answer comes from
+> `InputStream.skip`'s superclass default.
 >
-> **Four nominations for other lanes** are in the record's §4: retire the two
-> `Files.newBufferedReader` registrations (they read the whole file at open);
-> retire the six `java/io/BufferedWriter` registrations (their fd-backed arm is
-> `#[cfg(feature = "synthetic-jdk")]` and dead in every shipping build, so both
-> shipping modes run pure pass-throughs); the `FileInputStream.skip` resolution
-> defect; and `p57_alloc_provider` minting the default `FileSystemProvider` as
-> an instance of the ABSTRACT `java/nio/file/spi/FileSystemProvider` — the same
-> fabricated-abstract-receiver shape as the roadmap's Phase-1 `MemorySegment`
-> row, and the cause of the `NoSuchMethodError` that `Files.probeContentType`
-> died with.
+> **Two nominations for other lanes** are in the record's §4:
+> `FileInputStream.skip`'s resolution defect, and `p57_alloc_provider` minting
+> the default `FileSystemProvider` as an instance of the ABSTRACT
+> `java/nio/file/spi/FileSystemProvider` — the same fabricated-abstract-receiver
+> shape as the roadmap's Phase-1 `MemorySegment` row, and the cause of the
+> `NoSuchMethodError` that `Files.probeContentType` died with.
+>
+> **The step that found the most, and that this brief did not ask for:** running
+> the family's four EXISTING probes on the final binary as a control, after the
+> lane's own five were all 0-diff. `FilePathSweep` was 94 differing lines and
+> yielded the largest single cause in the lane. A new probe asks the questions
+> its author thought of.
 >
 > Everything below this banner is the ORIGINAL BRIEF as written on 2026-08-28,
 > kept verbatim. Two of its statements did not survive contact and are corrected
 > in the record: the "residual 14 recorded as OPEN" for `java.io.File` could not
-> be located in any record and the family is now 0-diff over 331 rows; and the
-> Windows path predicates it warns about are not reachable from the Linux build
-> host, so they are covered by `nio_file.rs`'s 23 `#[cfg(windows)]` tests rather
-> than by this lane's probes.
+> be located in any record, and the family is now 0-diff over 486 rows; and its
+> warning that "path predicates on this host are not the ones the Unix-shaped
+> intuition suggests" turned out to point the wrong way — the predicates were
+> written from the WINDOWS intuition, and it was the Unix rows that were wrong.
 
 ---
 

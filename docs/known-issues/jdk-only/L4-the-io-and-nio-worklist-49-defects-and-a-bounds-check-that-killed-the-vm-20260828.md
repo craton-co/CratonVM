@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 49 defects, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 52 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -11,15 +11,21 @@ HotSpot, `cratonvm --jdk-only`, and `cratonvm` in the default mode — diffed on
 
 | probe | rows | covers |
 | --- | ---: | --- |
-| `probes/L4FileSweep.java` | 331 | the 50 `java/io/File` triples |
+| `probes/L4FileSweep.java` | 486 | the 50 `java/io/File` triples |
 | `probes/L4FilesSweep.java` | 395 | `java/nio/file/Files` 31, `Path` 9, `Paths` 1 |
 | `probes/L4ByteBufferSweep.java` | 404 | `ByteBuffer` 11, `DirectByteBuffer` 9, `HeapByteBuffer` 4 |
 | `probes/L4PrintStreamSweep.java` | 123 | `PrintStream` 25, `PrintWriter` 1 |
 | `probes/L4StreamTailSweep.java` | 208 | the `java.io` stream tail and the `java.nio` tail |
 | `probes/L4Reach.java` | — | NOT a differential probe; it exists only to make the census |
 
-**1461 differential rows. 1458 identical in both modes**; the three residual
-rows are §4, and none of them is a missing fix.
+**1616 differential rows, 1615 identical in both modes.** The one residual is
+§4, and it is not a missing fix — it is a resolution finding no registrar edit
+can move.
+
+Four EXISTING probes were re-run on the final binary as a control, because a
+lane that only runs its own probes cannot see what it broke — and one of them
+found work: `TailFamilySweep` 0, `IoSystemSweep` 0, **`FilePathSweep` 94 → 0**
+(§3.8), `FilesSweep` 0 apart from its own random temp-directory name.
 
 ---
 
@@ -51,7 +57,7 @@ The same run's counts are the definition-of-done predicate and they hold:
 **`java.nio.ByteBuffer` was clean on the first run and never moved** — 404 rows
 over three backings (heap, direct, and a wrapped array with a non-zero offset),
 0 differences before any fix in this lane. That is worth stating as loudly as
-the defects; §7 has the list.
+the defects; §6 has the list.
 
 ---
 
@@ -82,11 +88,11 @@ Two things follow, and the second matters more:
 
 ---
 
-## 3. Forty-nine defects, and where they cluster
+## 3. Fifty-two defects, and where they cluster
 
 Every one is on a contract edge — nulls, bounds, refusal TYPES, argument
-validation, callback boundaries. **Not one is a wrong answer to an ordinary
-call**, in any of the six families.
+validation, callback boundaries, platform predicates. **Not one is a wrong
+answer to an ordinary call**, in any of the six families.
 
 ### 3.1 `java.io.File` — 8
 
@@ -151,7 +157,7 @@ accepts a relative suffix of an absolute path and demands a root match only when
 `equals` had no type test at all, so it was not symmetric — `path.equals(str)`
 true and `str.equals(path)` false gives a `HashSet` and a `List.contains`
 different answers depending on which side holds which. The replacement test is
-deliberately generous (this VM's own `java/nio/file/Path`, anything a
+deliberately generous (this VM's own `java/nio/file/Path`, anything
 `synthetic_implements_declared` admits, or a class whose simple name ends
 `Path` — which is every real JDK implementation), because a false here would be
 a REGRESSION for a real `sun.nio.fs.UnixPath` reaching the same native.
@@ -344,11 +350,7 @@ species: a failure reported as an ordinary, plausible success.
 `bw.write((String) null, 0, 1)` is the sharpest. The `BufferedWriter` natives
 DELEGATE to the wrapped writer and forwarded the null blind; somewhere down the
 chain it was stringified and **one character of the word "null" was written to
-the file as data**. The delegating arm now enforces `BufferedWriter`'s own
-argument contract before forwarding — which is not the wrapped writer's:
-`write(String, off, len)` is the one overload where a negative `len` writes
-nothing rather than throwing, and where the bounds failure is the
-`String`-specific subclass.
+the file as data**.
 
 The two type rows run the OTHER way from the rest of this campaign:
 `ArrayIndexOutOfBoundsException` is a SUBCLASS, so `catch
@@ -359,7 +361,79 @@ BOTH, depending on which branch of `implWrite` the length picks —
 delegate for a long one — so that branch is reproduced rather than a single type
 picked.
 
-### 3.8 One defect the DEFAULT mode has and `--jdk-only` does not
+### 3.8 A BACKSLASH IS NOT A SEPARATOR ON UNIX — 47 rows in one existing probe
+
+This one was not on the mined worklist. It came from re-running four EXISTING
+`java.io` probes on the final binary as a control, which is a step a lane that
+only runs its own probes never takes. `probes/FilePathSweep.java` was **94
+differing lines**, and every one of them had a backslash in the input.
+
+```text
+new File("..\\..\\up").getName()      HotSpot "..\..\up"   CratonVM "up"
+new File("..\\..\\up").getParent()    HotSpot null         CratonVM "..\.."
+new File("\\x").isAbsolute()          HotSpot false        CratonVM true
+new File("trailing\\").getName()      HotSpot "trailing\"  CratonVM "trailing"
+new File("relative\\win\\path").toURI()
+                        HotSpot   file:/…/relative%5Cwin%5Cpath
+                        CratonVM  file:/…/relative/win/path
+```
+
+Two causes, both a platform predicate written as if it were universal:
+
+**`u_is_sep` answered "`/` or `\`, on every platform"**, with a comment saying
+so. It is not true. `java.io.File` delegates to `FileSystem`, and
+`UnixFileSystem`'s separator is `/` alone — on Unix a backslash is an ORDINARY
+FILENAME CHARACTER and a file really can be called `a\b`. That predicate feeds
+`getName`, `getParent`, `getParentFile`, `isAbsolute`, the prefix-length rule
+and both `File(parent, child)` joins, which is why one wrong answer produced
+forty-six differing rows.
+
+The second row is the one that reaches ordinary code: a filename containing a
+backslash — which a Windows-authored name copied onto a Linux box routinely has
+— was split into a directory and a basename that do not exist, so
+`getParentFile().mkdirs()` created a WRONG DIRECTORY and the file was written
+somewhere nobody asked for.
+
+**`File.toURI()` slashified unconditionally.** `slashify` is
+`WinNTFileSystem`'s; `UnixFileSystem`'s is the identity, and what happens to a
+backslash there is that `ParseUtil.encodePath` escapes it (`\` is not a URI path
+character). Rewriting it to `/` does not merely render differently — round-
+tripped through `new File(uri)` it names a DIFFERENT FILE, three levels down a
+tree that does not exist.
+
+The Windows arm of both is unchanged, and it is what the 23 `#[cfg(windows)]`
+tests in `nio_file.rs` pin. `file_uri_reject`'s own separator scan was moved to
+a new `u_is_sep_either`, because a URI's syntax genuinely is platform-
+independent and the `file:\C:\…` spelling that constructor is documented to
+receive must keep working on a Linux host too.
+
+`L4FileSweep` now carries fourteen backslash-bearing inputs and a `toURI` row
+for every path shape, so this class of row cannot go missing again from a
+Linux-shaped probe: **331 rows → 486**.
+
+### 3.9 `File.toURI()` percent-encoded characters `java.net.URI` leaves alone
+
+```text
+new File("unicode/é中文").toURI().toString()
+  HotSpot   file:/…/unicode/é中文
+  CratonVM  file:/…/unicode/%C3%A9%E4%B8%AD%E6%96%87
+```
+
+`File.toURI()` is `new URI("file", null, slashify(path), null)`, and the
+multi-argument constructor renders through `URI.quote`, which escapes a
+character below U+0080 only when the mask rejects it and **appends everything
+above it unchanged**; only `toASCIIString()` encodes the rest. Encoding it here
+made `toString()` and `getPath()` disagree with every real JDK, and made a URI
+built from a non-ASCII filename compare unequal to the one HotSpot builds from
+the same file. The one exception `URI.quote` itself carries is kept: a
+non-ASCII space or control character is still escaped.
+
+The probe asks both halves — a space is `%20`, an e-acute is itself, and
+`toASCIIString()` encodes both — because a shim that percent-encodes everything
+gets the first row right and the second wrong, which is exactly what this one
+did.
+
+### 3.10 One defect the DEFAULT mode has and `--jdk-only` does not
 
 ```text
 new BufferedOutputStream(sink, 0)
@@ -374,65 +448,52 @@ into line with strict rather than the reverse.
 
 ---
 
-## 4. Three residual rows
+## 4. Eight shadows retired — and the one residual row
 
-Each is measured, and none is a missing fix.
+### 4.1 `Files.newBufferedReader`, both overloads
 
-### 4.1 `Files.newBufferedReader(<a directory>)` — same type, earlier
+The two bodies read the WHOLE FILE with `p57_read_to_string` and handed back a
+reader over the resulting string. The real method is
 
-```text
-HotSpot   no-throw at open; IOException on the first read
-CratonVM  IOException at open
+```java
+new BufferedReader(new InputStreamReader(Files.newInputStream(path), cs))
 ```
 
-`Files.newBufferedReader` reads the WHOLE FILE at open and hands back a reader
-over the resulting string, so a directory fails there rather than on the first
-read. The exception TYPE is the same, and every realistic caller —
-`try (BufferedReader r = Files.newBufferedReader(p)) { … }` — sees the two
-identically; only a caller that holds the reader without reading it can tell
-them apart.
-
-Not repaired, because both available repairs are worse: returning a reader over
-the empty string turns a refusal into a silently empty file, and a
-deferred-error reader is a change to a shared reader path this lane cannot
-measure. **NOMINATION**, and the stronger reason is not this row: reading the
-whole file at open is exactly the memory cost `newBufferedReader` exists to
-avoid. Retiring the two `Files.newBufferedReader` registrations fixes both — the
-real bytecode is `new BufferedReader(new InputStreamReader(Files.newInputStream(
-path), cs))`, and `Files.newInputStream(<a directory>)` already matches HotSpot
-on this VM (measured, `L4FilesSweep` row `newInputStream dir`).
-
-### 4.2 `BufferedWriter` does not buffer — and six triples are ready to retire
+which STREAMS. The shim was buying a whole-file read, in memory, at open, in
+exchange for a refusal at the wrong moment:
 
 ```text
-new BufferedWriter(sw, 4).write("ab"); sw.toString().length()
-  HotSpot   0     (still in the buffer)
-  CratonVM  2     (already through)
+Files.newBufferedReader(<a directory>)
+  HotSpot   no-throw at open; IOException on the first read
+  shim      IOException at open      (std::fs::read of a directory)
 ```
 
-Not a contract difference: `BufferedWriter`'s javadoc states buffering as the
-mechanism, not as an observable, and nothing may depend on data NOT having
-reached the delegate. Ordering, `flush` and `close` are all preserved, and the
-write-through errs on the side of delivering data rather than losing it.
+Retired. `Files.newInputStream` is registered a few lines above and matches
+HotSpot on every input this lane measured, including the directory row, so both
+halves are fixed by removing the shim rather than by patching it.
+`L4FilesSweep` went to 0 differences on the same run.
 
-**NOMINATION, with the measurement a retirement needs.** All six
-`java/io/BufferedWriter` registrations (`write(I)`, `write(String,II)`,
-`write([CII)`, `newLine`, `flush`, `close`) have exactly two arms: a delegating
-arm that forwards to the wrapped `out`, and an fd-backed arm reached through
-`bw_synthetic_fd` — **which is `#[cfg(feature = "synthetic-jdk")]` and therefore
-returns `None` in every shipping build**, because `Files.newBufferedWriter`'s fd
-path was deleted on 2026-08-05. So in the two shipping modes these six natives
-are pure pass-throughs that defeat the class's buffering and bypass its own
-argument contract, and the real bytecode would do all of it correctly. Their
-invocation counts on this lane's reach run: `close 2, flush 1, newLine 2,
-write(String,II) 2, write([CII) 2, write(I) 0`.
+### 4.2 the six `java/io/BufferedWriter` registrations
 
-Not retired here: retirement re-tags a triple `SyntheticStub`, which changes
-`--jdk-only` only, and these natives sit on the console-output path that
-`picocli` / `JUnit-console` help text and `MockMvcTester.debug` were repaired
-against. It wants its own gate run.
+`write(I)`, `write(String,II)`, `write([CII)`, `newLine`, `flush`, `close` — all
+gated to `synthetic-jdk`, which is the only build where their second arm can
+fire.
 
-### 4.3 `FileInputStream.skip` past end of file — and `skip0` never runs
+Each had exactly two: a delegating arm forwarding to the wrapped `out`, and an
+fd-backed arm reached through `bw_synthetic_fd` — and **that helper is itself
+`#[cfg(feature = "synthetic-jdk")]` and answers `None` in every shipping
+build**, because `Files.newBufferedWriter`'s fd path was deleted on 2026-08-05.
+So in `--jdk-only` and `--real-jdk` these six were pure pass-throughs standing
+in front of the real class, and they cost the BUFFERING (`new
+BufferedWriter(sw, 4).write("ab")` reached the delegate immediately, where
+HotSpot holds it) and the class's OWN argument contract, which is not the
+delegate's — the `write((String) null, 0, 1)` row in §3.7.
+
+Retired, and verified against the probe that pins the family's close semantics
+as well as this lane's own: `TailFamilySweep` and `L4StreamTailSweep` are both
+0-diff in both modes with the real bytecode running instead.
+
+### 4.3 THE RESIDUAL — `FileInputStream.skip` past end of file
 
 ```text
 new FileInputStream(<2-byte file>); read × 3; skip(4)
@@ -482,19 +543,21 @@ Java object model says cannot be instantiated, so any real bytecode that calls a
 concrete-subclass method on it dies. Before this lane it took a whole probe run
 with it.
 
-### 4.5 What a Linux host cannot ask
+### 4.5 What a Linux host can and cannot ask
 
-Every row here is Linux-shaped. The Windows path predicates the L4 lane doc
-warns about — a drive-absolute path, a driveless-rooted `\x`, a UNC path — are
-not reachable from this host and are covered instead by the 23
-`#[cfg(windows)]` regression tests `nio_file.rs` already carries. The
-`getParentFile` repair routes through `file_parent_units`, which is the same
-`prefixLength` transcription `getParent` uses and which those tests pin, so the
-Windows rows move WITH the Unix ones rather than being left behind.
+§3.8 is what a Linux host CAN ask that a Windows-shaped intuition does not: the
+`\`-as-a-filename-character rows exist only there, and they were the largest
+single cause in the lane.
+
+What it cannot ask is the mirror set — a drive-absolute path, a driveless-rooted
+`\x`, a UNC path — which the L4 lane doc warns about and which are covered by
+the 23 `#[cfg(windows)]` regression tests `nio_file.rs` already carries. Both
+repairs in §3.8 leave the Windows arm byte-identical and are `cfg`-selected, so
+those tests still pin exactly what they pinned.
 
 ---
 
-## 5. Three process notes, each paid for
+## 5. Four process notes, each paid for
 
 **A probe must not normalise with a method it is testing.** `L4FileSweep` built
 its `<CWD>` token with `getParentFile()`. One defect in that method renamed the
@@ -512,6 +575,13 @@ lane needed the neighbouring column twice: once for `Files.getFileStore`, where
 the check sat on the copy nothing runs, and once for `FileInputStream.skip`,
 where both candidate natives report `invocations: 0` and no edit to either could
 have moved the answer.
+
+**Re-run the family's EXISTING probes on the final binary, not only your own.**
+The lane's five probes were 0-diff and the work looked finished; running the
+four `java.io` probes that were already in the tree found `FilePathSweep` at 94
+differing lines and the largest single cause in the lane (§3.8). A new probe
+asks the questions its author thought of, and this one was written on a Linux
+host by someone who did not think of backslashes.
 
 ---
 
@@ -531,14 +601,14 @@ absolute-vs-relative bounds; `wrap` with an offset; and the remaining-elements
 definition of `equals` / `hashCode` / `compareTo` / `mismatch`, including a heap
 buffer equal to a direct one with the same contents.
 
-**`java.io.File`'s path-string surface is right.** 24 path shapes × 8
-accessors, plus `getCanonicalPath` vs `getAbsolutePath` on a non-existent file
-and the whole `toURI` round trip. `list` / `listFiles` on a FILE answer null
-rather than an empty array, with and without each filter overload, and a null
-filter means "no filtering" rather than NPE. `mkdir` on an existing directory,
-`delete` on a non-empty one and `renameTo` from a missing source all answer
-FALSE rather than throwing. Every `createTempFile` validation row was already
-right.
+**`java.io.File`'s path-string surface is right** — now including the
+backslash rows: 38 path shapes × 9 accessors. `getCanonicalPath` vs
+`getAbsolutePath` on a non-existent file and the whole `toURI` round trip are
+right. `list` / `listFiles` on a FILE answer null rather than an empty array,
+with and without each filter overload, and a null filter means "no filtering"
+rather than NPE. `mkdir` on an existing directory, `delete` on a non-empty one
+and `renameTo` from a missing source all answer FALSE rather than throwing.
+Every `createTempFile` validation row was already right.
 
 **`java.nio.file.Path`'s text operations are right** apart from the four rows in
 §3.2: `normalize`, `resolve` (including the absolute-child rule),
@@ -584,7 +654,12 @@ cratonvm --java-home "$JDK" --jdk-only --explain-jdk-only \
     --jdk-only-report rep.json --dump-native-registry reg.json \
     -cp probes/out L4Reach
 
-# the five differential probes, three arms each
+# the five differential probes, three arms each -- plus the four EXISTING
+# java.io probes, which is where §3.8 came from
 bash probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
-                     L4PrintStreamSweep L4StreamTailSweep
+                     L4PrintStreamSweep L4StreamTailSweep \
+                     TailFamilySweep IoSystemSweep FilesSweep FilePathSweep
 ```
+
+`FilesSweep`'s two differing lines are its own harness artefact — it prints the
+random name of the temporary directory it created, which no two runs share.
