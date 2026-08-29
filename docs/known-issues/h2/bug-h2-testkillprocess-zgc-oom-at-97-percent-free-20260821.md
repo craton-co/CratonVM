@@ -1414,10 +1414,11 @@ correct and actionable, and there is currently nothing that can act on them.
 
 ## Follow-up 2026-08-29: both ends are compacted now, and the floor that fed one end to the other
 
-Three defects, in the order a reader should take them: the large-object end had
-no compactor, the TLAB refill floor was spending that end's reserve on churn,
-and the instrument meant to catch small objects leaking into that end was armed
-on three sites that could not fire it.
+Four defects, in the order a reader should take them: **the slide was losing
+every byte it emptied whenever the cursor could not follow it down**, the
+large-object end had no compactor at all, the TLAB refill floor was spending
+that end's reserve on churn, and the instrument meant to catch small objects
+leaking into that end was armed on three sites that could not fire it.
 
 ### 1. A correction to §"Follow-up 2026-08-28" before anything else
 
@@ -1451,10 +1452,85 @@ high_reserve_unclaimed=129695184
 `high_cursor - cursor` is **196 320 bytes**: the two ends have met. The
 large-object end holds 4.5 MB and is asked for 262 160; the reserve that exists
 to stop exactly this is **129 695 184 bytes unclaimed**, i.e. it was never
-claimed because the low end had already bumped through it. That is item 2
-below, and it is what "the whole of `TestMVStoreTool`" actually needed.
+claimed because the low end had already bumped through it. That is item 4
+below, and items 2 and 3 are what let it get there.
 
-### 2. The large-object end is relocatable — `ZgcRealHeap::compact_high_region`
+### 2. The slide was LOSING what it emptied — the largest of the four
+
+This is the one that explains why compaction never produced a big hole, and it
+had been true since compaction went default-on on 2026-08-13.
+
+**Reclaim was the cursor drop and nothing else.** `Arena::compact_low_to`
+retracts the bump cursor to `new_cursor` and hands back `[new_cursor, cursor)`.
+That is the whole answer only when the cursor can reach `dest` — the top of the
+region the slide packed its survivors into. One survivor on an unselected dense
+page above it pins `new_cursor` higher, and then the bytes the slide just
+emptied are neither below the cursor nor on the free list.
+
+**And no later sweep can find them.** The sweep free-lists dead objects by
+walking the object-start REGISTRY, and the slide rebuilds that registry with the
+survivors' NEW bases a few statements later — so the old ones stop existing as
+far as every other subsystem is concerned. The space is invisible to the
+allocator for the rest of the process.
+
+The measurement that names it, `TestMVStoreTool` at `--Xmx 1g`:
+
+```text
+compaction_cycles=4 objects_relocated=885793
+...
+request=262160 free_list_bytes=706940280 largest_free_block=8184
+span_hist=8:47715 16:40407 32:80 64:138 256:1 512:1 1K:116147 2K:81414 4K:46675
+```
+
+**885 793 objects relocated, and the largest free block is 8 184 bytes.** Read
+the histogram: nothing above 4 KiB exists. A compactor that moves nearly a
+million objects per run and leaves no span bigger than a page of text is not
+compacting for the allocator's benefit at all — and the slide's own output is
+2 MiB-granular and contiguous by construction, which is exactly the shape the
+262 160-byte request needed.
+
+The caller now names the offset spans it emptied and `compact_low_to` publishes
+them. Two details are load-bearing:
+
+* **They are zeroed first.** A slid-away survivor leaves its old bytes behind
+  verbatim, including a valid-looking `ObjectHeader`; a conservative scanner
+  that met one would resurrect a corpse. That is the same contract the span
+  above `new_cursor` already had and the reason the sweep zeroes a dead
+  object's header before free-listing it.
+* **They are SCREENED against the live set at its post-slide addresses**, not
+  argued for from the page partition. A selected page above `dest` is dead by
+  construction — every survivor based on it was packed below — but an OBSTACLE
+  (an object based on an unselected page whose tail straddles into a selected
+  one) never moves, and neither does anything above the point where the slide
+  gave up on an unsizable header. One pass, a prefix maximum and a binary
+  search per page settle it. Same shape as the `live_ceiling` check beside it
+  and for the same reason: an argument that the partition is exhaustive is an
+  argument about the partition, not about what is in the span. It can only DROP
+  a span, i.e. reclaim less.
+
+`CRATONVM_ZGC_PUBLISH_VACATED=0` is the same-binary bisect, and it is per heap
+so the A/B runs inside one test binary — which is what
+`a_slide_that_cannot_drop_the_cursor_still_frees_what_it_emptied` does: the
+control arm must reclaim **zero** to the free list, or the test proves nothing
+about the other one.
+
+> **This removes a safety net that a DIFFERENT open defect was standing on, and
+> that has to be said out loud.**
+> `bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md` is open on
+> a holder that keeps naming an address the slide vacated
+> (`receiver names an address the ZGC slide VACATED … target_still_live=true`).
+> While the vacated span was merely leaked, that stale read met a zeroed corpse
+> and surfaced as `java.lang.Object`. Now the span goes back to the allocator,
+> so the same stale read meets whatever was allocated over it — a different
+> FACE of the same defect, possibly sooner and possibly louder.
+>
+> That is not a reason to keep leaking the memory; the leak is what produced
+> the `OutOfMemoryError` this whole page is about. It IS a reason to run
+> `TestMultiThread` as the canary on every arm here and to expect its signature
+> to change, and it is why the canary is in the measurement table above rather
+> than in a follow-up.
+
+### 3. The large-object end is relocatable — `ZgcRealHeap::compact_high_region`
 
 Survivors are packed against `capacity` in DESCENDING address order (the mirror
 of the low slide's ascending walk, and just as load-bearing), and
@@ -1492,7 +1568,7 @@ only reason anyone found out is that it carried a counter.
 
 `CRATONVM_ZGC_HIGH_COMPACTION=0` is the same-binary bisect.
 
-### 3. A starved bump must recycle a short chunk, not eat the reserve
+### 4. A starved bump must recycle a short chunk, not eat the reserve
 
 `recycled_chunk_size`'s floor was `want / 8` unconditionally — 64 KiB against a
 512 KiB chunk, which is `ZTlabConfig::max_tlab_alloc` and a good floor while
@@ -1527,7 +1603,7 @@ thread-local buffer off and changes the allocation path, the free-list shape and
 the run time (561 s against 103 s), so an arm that differs by it differs by far
 more than this one decision.
 
-### 4. The region tripwire was armed on three sites that could not fire it
+### 5. The region tripwire was armed on three sites that could not fire it
 
 §"Still open" has carried *"the two small objects in the large-object region"*
 since this page was filed, with the note that the tripwire *"fired zero times
@@ -1548,7 +1624,7 @@ changed the balance is that the damage is no longer PERMANENT — item 2 packs a
 small survivor up there against the top with everything else, so it stops
 walling the region at the next relocating cycle.
 
-### 5. `CRATONVM_ZGC_TARGETED_COMPACTION` records a window nothing consumes
+### 6. `CRATONVM_ZGC_TARGETED_COMPACTION` records a window nothing consumes
 
 Measured with the flag ON, and it is a finding about that feature rather than
 about this class: `targeted_pages=0` even though the window it recorded was
