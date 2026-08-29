@@ -646,27 +646,24 @@ python3 probes/dod-report.py /data/dod-out/rep-tcssl-strict.json
 
 ## Where the probes are
 
-`3b2901531` ("major doc consistency update before the realeas", 2026-08-29)
-removed 915 files including the whole `probes/` tree, so every Reproduce block
-in this directory now names files the tree does not have. Following the
-convention `e1ff937b4` set for L6's sweeps, this lane's probes are named with
-the commit that carries them and a one-line restore each:
+**In the tree, at `probes/`, committed normally.**
 
-```bash
-git show 7da07b4ac:probes/DodSpringApp.java        > probes/DodSpringApp.java
-git show 7da07b4ac:probes/DodJdbcWorkload.java     > probes/DodJdbcWorkload.java
-git show 7da07b4ac:probes/DodJUnitRunner.java      > probes/DodJUnitRunner.java
-git show 7da07b4ac:probes/DodH2JdbcSuite.java      > probes/DodH2JdbcSuite.java
-git show 7da07b4ac:probes/DodServiceLoaderSweep.java > probes/DodServiceLoaderSweep.java
-git show 7da07b4ac:probes/dodscreen-linux.sh       > probes/dodscreen-linux.sh
-git show 7da07b4ac:probes/dod-arms.sh              > probes/dod-arms.sh
-git show 7da07b4ac:probes/dod-report.py            > probes/dod-report.py
-git show 7da07b4ac:probes/dod-summary.py           > probes/dod-summary.py
-git show e8776985a:probes/DodArrayStoreSweep.java  > probes/DodArrayStoreSweep.java
-git show e8776985a:probes/AbstractReceiverSweep.java > probes/AbstractReceiverSweep.java
-chmod +x probes/dodscreen-linux.sh probes/dod-arms.sh
+They were not, for one day, and this section used to say so. `3b2901531`
+("major doc consistency update before the realeas", 2026-08-29) removed 915
+files including the whole `probes/` tree, so these records were first written
+with a `git show <commit>:probes/…` restore block each, following the convention
+`e1ff937b4` set for L6's sweeps. Dev then put `probes/` back — `BdProbe`,
+`FjpProbe`, `L3ViewItrSweep`, `L5ModuleInvokeSweep` — so the restore blocks are
+withdrawn and the files are simply in the tree:
+
+```text
+probes/DodSpringApp.java     probes/DodJdbcWorkload.java   probes/DodJUnitRunner.java
+probes/DodH2JdbcSuite.java   probes/DodServiceLoaderSweep.java
+probes/DodArrayStoreSweep.java  probes/AbstractReceiverSweep.java
+probes/dodscreen-linux.sh    probes/dod-arms.sh
+probes/dod-report.py         probes/dod-summary.py
 ```
 
-`DodServiceLoaderSweep` gained its `S-iteratorClass` row after `7da07b4ac`; take
-that one from `e8776985a` too if the iterator-identity assertion is what you are
-after.
+If you are reading this from a commit inside that one-day window, `7da07b4ac`
+and `e8776985a` are the two that carry them, and `DodServiceLoaderSweep` gained
+its `S-iteratorClass` row only in the second.
