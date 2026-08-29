@@ -1,4 +1,4 @@
-# L6 (concurrency and threads) is CLEAN — 546 rows, 33 defects, 0 residuals of its own
+# L6 (concurrency and threads) is CLEAN — 34 defects, and all three arms green
 
 **Status: COMPLETE 2026-08-28.** Lane L6 of the seven in
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l6cc-20260828` on the Linux
@@ -477,19 +477,19 @@ campaign keeps finding: **the middles are correct and the perimeters were not.**
   `CompletionHandler` forms with their attachments, `force`, `truncate`,
   `lock`/`tryLock`, EOF, and every other argument refusal.
 
-## 8. The three arms
+## 8. The three arms — all green
 
 Final run, on the fully merged tree, release binary:
 
 | arm | result |
 | --- | --- |
-| `CRATONVM_ARGS=--jdk-only` | **111 passed, 1 failed** — `RJdkEnumerations` |
+| `CRATONVM_ARGS=--jdk-only` | **112 passed, 0 failed** |
 | `SUITE=all` | **112 passed, 0 failed** |
 | `SUITE=core` | **72 passed, 0 failed** |
 
-That is cleaner than the baseline this lane started from
-(`the-roadmaps-phase-1-and-3-re-adjudicated-and-six-fixes-20260827` §6.5:
-111/1, 110/2, 72/0), and both of the reds it lost are recorded below.
+The baseline this lane started from was 111/1, 110/2, 72/0
+(`the-roadmaps-phase-1-and-3-re-adjudicated-and-six-fixes-20260827` §6.5).
+Every red it lost is recorded below or in §9.
 
 ### The two reds that were not this lane's, and how that was established
 
@@ -527,11 +527,10 @@ L1 fixed it independently in `43088b840`; this branch's identical fix was
 resolved in its favour at the merge, because theirs also restores the doc
 comment that went missing with the attribute.
 
-**`RJdkEnumerations` improved and then hit a different wall.** On dev it fails in
-compatible mode with `ConcurrentHashMap.elements(): hasMoreElements() never
-terminated` — §2.2, fixed here, and the vector now passes. Under `--jdk-only` it
-gets FURTHER than it ever did and dies on a pre-existing Phase-1 fabrication in
-a family this lane does not own:
+**`RJdkEnumerations` improved twice.** On dev it fails in compatible mode with
+`ConcurrentHashMap.elements(): hasMoreElements() never terminated` — §2.2, fixed
+here. Under `--jdk-only` it then got FURTHER than it ever had and died on a
+SECOND, pre-existing Phase-1 fabrication, which §9 closes:
 
 ```text
 java/lang/NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
@@ -547,15 +546,7 @@ shape the roadmap is about. `Properties.values()` is a
 `Collections.synchronizedCollection` over a `Hashtable$ValueCollection`, so it
 takes that path.
 
-**Not fixed here, and the reason is specific rather than budgetary.** The two
-sibling mint sites (`native_ksv_iterator`, `native_hs_iterator`) land their
-refusals on `real_snapshot_iterator`, which needs a `SnapshotItrRoute` saying
-where `remove()` must delete from. There is no route for a Hashtable-backed
-values view, and inventing one is the `Properties`/`Hashtable` cluster's work —
-lane L3's. The alternative, falling back to `java/util/ArrayList$Itr`, would add
-a receiver with no `modCount` to that class, which is exactly the precondition
-the `ArrayList$Itr` bytecode-yield allow-list is waiting on: it would buy a green
-vector by quietly weakening another lane's blocker.
+**This was first recorded as lane L3's, and that was wrong — see §9.**
 
 Everything else is green: `cargo test -p cratonvm-types`; the seven
 native-builtins gate tests with and without `--features management`; `--lib` for
@@ -564,7 +555,100 @@ native-builtins gate tests with and without `--features management`; `--lib` for
 the same tree. `tools/check_markdown_links.py` reports the same six pre-existing
 issues it reports on pristine dev.
 
-## 9. Reproduce
+## 9. The pre-existing probes, and the handoff that turned out not to be one
+
+The scope doc gained a warning after this lane started:
+
+> **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
+> you wrote.** A new probe asks the questions its author thought of.
+
+L6 had not. Eleven probes in the tree touch these families; run against the final
+binary in both modes they found **no new defect** — and one crash that the four
+new sweeps could not have seen, because none of them iterates a `Properties`
+values view.
+
+```text
+                                    compat   --jdk-only
+MapViewBehaviourProbe   194 rows    0 diffs  DIED at row 0
+ItrClassProbe            66 rows   18 rows   DIED at row 31
+```
+
+Both died on the fabrication `RJdkEnumerations` dies on:
+`NoClassDefFoundError: cratonvm/internal/ArrayListViewItr`, at
+`Collections$SynchronizedCollection.iterator()` — which is what
+`Hashtable.values()` returns, so `Properties` reaches it too. **So the item §8
+handed to lane L3 was not one vector under one flag; it was every `--jdk-only`
+caller that iterates a map values view, and it took out two probes before their
+first row.**
+
+### The reason it was deferred did not survive being looked at
+
+§8 first said the refusal needed a `SnapshotItrRoute` for a Hashtable-backed
+values view and that inventing one was the `Properties` cluster's work. Reading
+the code instead of the summary: the route arms in `native_snapshot_itr_remove`
+are one line each, and the one this needs already exists as a function —
+`native_al_remove_obj` is the view's own registered `remove(Object)` and already
+propagates a removal into the SOURCE MAP for a live values view. So
+`SnapshotItrRoute::ViewCollection` is that single call, and
+`alloc_arraylist_iterator` gets the refusal arm its two sibling mint sites have
+had since 2026-08-11.
+
+**Before recording something as too expensive to fix, check the API you are
+assuming you lack** — which is the lesson the scope doc's own §0 already carried
+from L5, and which this lane then had to learn again.
+
+One detail that is not incidental: the snapshot handed to
+`real_snapshot_iterator` is an EXACT-LENGTH COPY, not the view's own backing
+array. `real_snapshot_iterator` uses the array directly when the lengths match,
+and this route's `remove()` shifts that same array underneath the iterator — the
+cursor would skip the element after every removal. The fabricated carrier never
+had that problem because its `next()` re-reads the live list each time.
+
+### What the other nine probes said
+
+Nothing to fix, and the three that differ are worth naming so the next reader
+does not chase them:
+
+* **`ChmVsHashMapProbe`** prints ns/op. It is a PERFORMANCE probe and its diff
+  is CratonVM being slower than HotSpot, which is not a contract.
+* **`CowSnapshotProbe`**'s one differing row labels itself
+  `(either answer is legal)` — a weakly-consistent CHM iterator may or may not
+  observe a concurrent removal. HotSpot saw 3, CratonVM 4.
+* **`ChmOrderCensus`** differs on 818 of 2282 rows, all of them hash-container
+  ITERATION ORDER (`keys=[0,1,]` against `keys=[1,0,]`). It exists to record that
+  divergence; it is unspecified in the JDK and the campaign's own probe rules say
+  never to assert it.
+* `ChmTableSizeProbe` exits 1 with zero rows on **HotSpot too** — the probe needs
+  arguments this harness does not pass. Not a VM result either way.
+
+`ItrClassProbe` is worth one more line, because it is the census `a0168ed03`
+verified its carrier change against. Compatible mode differs on 18 of 66
+receivers where that record measured 20: the two rows that moved are this lane's
+`ConcurrentHashMap` key-set and entry-set iterators. Under `--jdk-only` it is 10
+— **strict mode names more of HotSpot's iterator classes than compatible mode
+does**, which is the sixth place in this campaign where `--jdk-only` is the more
+correct of the two.
+
+## 10. Reproduce
+
+> **The `probes/` tree is no longer in the working tree.** `3b2901531`
+> (*"major doc consistency update before the realeas"*, 2026-08-29) removed 915
+> files and 126 525 lines, the whole probe corpus among them — every probe this
+> record names, and every probe the other six lane records name. The four
+> sweeps are in history and restore in one command each:
+>
+> ```bash
+> git show c8f47f9a5:probes/ThreadShadowSweep.java   > probes/ThreadShadowSweep.java
+> git show c8f47f9a5:probes/ForkJoinShadowSweep.java > probes/ForkJoinShadowSweep.java
+> git show c8f47f9a5:probes/ChmShadowSweep.java      > probes/ChmShadowSweep.java
+> git show 2790005f4:probes/AsyncChannelSweep.java   > probes/AsyncChannelSweep.java
+> git show 2790005f4:probes/ChmElemDbg.java probes/ThreadIntrDbg.java probes/L6MsgProbe.java
+> ```
+>
+> The final verification in §8 ran the compiled classes in `probes/out` — which
+> is untracked build output and survived the deletion — against the newly built
+> binary. That is a measurement of the BINARY with unchanged probe bytecode, not
+> a recompile, and it is stated that way rather than implied.
 
 ```bash
 javac -d probes/out probes/{Thread,ForkJoin,Chm}ShadowSweep.java probes/AsyncChannelSweep.java
