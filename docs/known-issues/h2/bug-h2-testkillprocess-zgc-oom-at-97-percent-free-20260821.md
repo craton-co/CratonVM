@@ -1596,27 +1596,48 @@ is a different heap. The accounting stays exact either way —
 the spans, and a kept block inside a span is dropped rather than kept beside
 it — so nothing is counted or handed out twice.
 
-**The A/B, one binary, one switch, arms interleaved** (`TestMVStoreTool`,
-`--Xmx 1g`, 500 s cap):
+**The A/B, one binary, arms interleaved, and it does NOT say what a first
+reading suggests** (`TestMVStoreTool`, `--Xmx 1g`, 500 s cap, two reps):
 
-| arm | rc | secs | `oom` | `arena` | load at start |
-|---|---|---:|---:|---:|---:|
-| default | 124 (cap) | 500 | **0** | **0** | 18.1 |
-| `CRATONVM_ZGC_PUBLISH_VACATED=0` | 1 | **81** | **6** | 1 | 14.2 |
+| arm | switches OFF | rc | secs | `oom` | `arena` | load |
+|---|---|---:|---:|---:|---:|---:|
+| `base` | — | 124 (cap) | 500 | **0** | 0 | 18.1 |
+| `base` | — | 124 (cap) | 500 | **0** | 0 | 16.3 |
+| `neither` | all three | 124 (cap) | 500 | **0** | 0 | 30.9 |
+| `neither` | all three | 124 (cap) | 500 | **0** | 0 | 24.1 |
+| `novac` | `PUBLISH_VACATED` only | 1 | **81** | **6** | 1 | 14.2 |
+| `novac` | `PUBLISH_VACATED` only | 1 | **60** | **6** | 1 | 9.6 |
 
-and the failure line from the `=0` arm is the sentence this whole page has been
-trying to write:
+Read the third and fifth rows together. **`novac` fails 2/2 and `neither`,
+which has that same switch off AND two more besides, passes 2/2.** So this is
+not "the publication fixes the class". It is:
+
+**THE SWITCHES ARE NOT INDEPENDENT — item 4 is only safe with item 2.** The
+starved refill floor takes 8–64 KiB blocks off the free list when the bump is
+out of headroom. With item 2 supplying page-granular spans back, that is
+recycling. Without it, nothing replenishes the large end of the free list and
+the floor grinds the last of it into TLAB chunks. The failure line from a
+`novac` run says exactly that:
 
 ```text
 request=9888 used=1073740088 capacity=1073741824
 free_list_bytes=797496464 largest_free_block=8184
 ```
 
-**A 9 888-byte request failing with 797 MB free.** Not the 262 160-byte
-large-object request the page opened on — a ten-kilobyte one. With the slide's
-output discarded, the free list is ground to ≤ 8 KiB pieces and the heap cannot
-serve a small allocation either. That arm also reports
+**A 9 888-byte request failing with 797 MB free** — not the 262 160-byte
+large-object request this page opened on, a ten-kilobyte one. That arm reports
 `vacated_spans=0 vacated_bytes=0`, which is what the switch is for.
+
+**And what the table does NOT establish**: `neither` is the pre-2026-08-29
+behaviour and it passed 2/2 here, so these runs do not show a rate improvement
+over it. They cannot: the same class on the same host, same day, on a
+pre-change binary, failed at 58 s, 63 s, 65 s, 67 s, 76 s and 127 s and passed
+past 400 s twice. **`TestMVStoreTool` is flaky on this host today**, and a
+two-rep table cannot separate a flaky pass from a fix. What this section
+therefore claims is what it measured: the mechanisms ENGAGE (the census above),
+one switch turns a passing configuration into a failing one 2/2, and the defect
+each repair names is real in the code. A rate claim needs a quiet host and
+ten reps an arm, and it is not made here.
 
 **One cost is known and deliberately not optimised yet.** The span is zeroed
 with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
