@@ -1643,6 +1643,21 @@ org.h2.test.store.TestKillProcessWhileWriting  rc=0  secs=403  oom=0  arena=0
 2026-08-21 to 2026-08-26 getting off the floor, still there. 2.08 GB of vacated
 span republished on the way.
 
+**The corruption canary**, which is the measurement that HAD to be taken because
+item 2 hands the vacated span back to the allocator and so removes the safety
+net `TestMultiThread`'s own open stale-holder defect was standing on:
+
+```text
+org.h2.test.db.TestMultiThread  rc=0  secs=235  oom=0  arena=0
+  compaction_cycles=1 objects_relocated=3736 relocation_on_proven_jit=1
+  zgc-high-compaction: cycles=1 declined=0 vacated_spans=6 vacated_bytes=11904888
+```
+
+`rc=0`, zero `names an address the ZGC slide VACATED` reports, zero
+`ClassCastException`/`NoSuchMethodError`. **One run is not a rate** — that class
+is flaky by its own page's account — but it is the run that had to come back
+clean before this shipped, and it did.
+
 **Closed in code, not only in prose.** `recycled_chunk_size` now takes the
 publication's state and the starved floor is inert without it
 (`starved_recycle_permitted`), with a test carrying these numbers. Both default
