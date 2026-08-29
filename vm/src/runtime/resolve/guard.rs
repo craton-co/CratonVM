@@ -254,22 +254,11 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        4,
+        3,
         "migration step 3a: invoke dispatch. The SEAM-02 split distributed \
          this cluster across several interpreter files; the per-needle totals \
          are pinned by `the_split_did_not_change_the_interpreter_budget` \
-         below, so no row here has to restate the distribution. \
-         2026-08-28, 3 -> 4: `1dbbe2b36` (perf(jit): bind an invokevirtual \
-         whose target is final) added the `loader_interface_override` site \
-         without the paired edit here, and BOTH guards have been red on dev's \
-         tip ever since — `origin/dev` at `e4cf33843` still has 4 sites and a \
-         row saying 3. The site itself is sound: it asks the RECEIVER's own \
-         class_id whether it really overrides the interface method, and the \
-         name-based lookup it replaced was wrong across classloaders \
-         (`SpringBootContextLoaderAotTests` under \
-         `@CompileWithForkedClassLoader`). Recorded rather than migrated \
-         because it needs a VM identity the read-locked `class_store` here \
-         does not carry — NOMINATION for whoever owns step 3a.",
+         below, so no row here has to restate the distribution.",
     ),
     (
         "vm/src/runtime/interpreter/native_override.rs",
@@ -669,13 +658,7 @@ fn the_allowlist_has_no_dead_rows() {
 fn the_split_did_not_change_the_interpreter_budget() {
     // (needle, total permitted across `vm/src/runtime/interpreter*`)
     const INTERPRETER_TOTALS: &[(&str, usize)] = &[
-        // 2026-08-28: 29 -> 30, and this is the ratchet moving in the
-        // direction it is meant to resist, so it says why. `1dbbe2b36` added
-        // one site to `invoke.rs`; the number is raised to describe the tree
-        // rather than left to red every lane's gate run. It is a NOMINATION,
-        // not an endorsement: migrating that site to `MemberResolver` puts
-        // this back to 29.
-        ("find_method_recursive(", 30),
+        ("find_method_recursive(", 29),
         ("find_field_recursive(", 5),
         ("resolve_field_ref(", 13),
         ("resolve_method_metadata(", 2),
