@@ -150,6 +150,58 @@ against a primitive `long`'s 1.5.
 HotSpot inlines all five to approximately nothing, which is why its per-byte
 figure (43.6 ns) is barely above its `new Random().nextInt()` figure (35.2).
 
+## The obvious fix was built, measured, and REVERTED — read this before rebuilding it
+
+`java.util.Random.seed` is a `private final AtomicLong` in every real JDK, and
+this VM's `AtomicLong` keeps its value in **field 0 of the object** with no side
+table of its own (`util_concurrent_ext::native_atomic_long_get` / `_set`). So
+the state has an obvious per-object home that dies with the instance, and moving
+it there is a change to one file. It was written: `seed_slot` /`cell_get` /
+`cell_put` / `cell_install` in `securerandom.rs`, resolving the slot through
+`resolve_field_index_by_class_id` off the receiver's own `ClassId`, falling back
+to the table for a receiver whose class declares no `seed` slot (the fabricated
+synthetic-JDK shape).
+
+It works, and it is **not an improvement**. Measured on the built binary, same
+harness, same host:
+
+| arm | table (today) | per-object, resolve every call | per-object + slot memo |
+|---|---:|---:|---:|
+| shared `Random.nextInt()` | **85.6** | 312.9 | 213.6 |
+| `new Random(seed).nextInt()` | **570.2** | 836.9 | 862.7 |
+| the fixture's `read()`, per byte | **1670.6** | 1690.2 | 1728.6 |
+
+All eight rows of `probes/RandomSpec.java` stay byte-identical to real HotSpot
+throughout, so it is correct — it is just slower, and slower on the very test
+this page is about.
+
+**Two things it ran into, both worth knowing before anyone rebuilds it:**
+
+1. **`resolve_field_index_by_class_id` costs ~115 ns** — it takes the
+   class-manager READ LOCK and walks the hierarchy comparing field names. That
+   is more than the whole `nextInt` it was added to. A one-slot thread-local
+   memo keyed by `(vm_identity, ClassId)` — the shape
+   `typecheck::reference_array_component_is_object` already uses, VM identity in
+   the key because `ClassId`s are per-VM dense indices — recovers about a third
+   of it and no more. What is left is four `NativeContext` field accesses per
+   `nextInt` (`obj[seed]`, `cell[0]`, then the write) against the table path's
+   one identity hash plus one lock.
+2. **It would weaken `java.util.Random`'s documented thread-safety.** The table
+   path does its read-modify-write under the table's write lock, so it is atomic
+   per operation. A plain read-then-write through two field accesses is not, so
+   two threads sharing a `Random` could draw the same value. The JDK's own
+   implementation is safe because it CASes the `AtomicLong` in a retry loop —
+   which this would also have to do, making it slower again.
+
+So the per-object move is not the repair. **The repair is eviction**: the tables
+are keyed by identity hash, and the one place that knows which hashes have just
+died is `HashCodeTable::update_after_gc`, which already drops exactly those
+entries for its own table. A hook there that also evicts the tables keyed by its
+output fixes `SEED_TABLE`, `GAUSSIAN_TABLE` and `VH_META_TABLE` at once, and
+costs nothing per `nextInt`. That crosses `gc` -> `native-builtins`, so it wants
+a design and a census of the family first — which is why it is not in this
+change.
+
 ## What would make the test pass
 
 The budget is 120 s for 100M bytes: **≤1200 ns/byte**, against 1670 today. A
@@ -160,7 +212,9 @@ whole gap closed. Either mechanism, addressed, is likely enough on its own.
 
 - Size the side-table family (`SEED_TABLE`, `GAUSSIAN_TABLE`, `VH_META_TABLE`,
   and whatever else keys per-object native state by identity hash) before
-  designing the eviction hook. A defect with several copies comes back.
+  designing the eviction hook at `HashCodeTable::update_after_gc`. A defect with
+  several copies comes back. **Not** the per-object move — that was built and
+  measured and is slower; see the section above.
 - Decide whether `java.util.Random` needs a native at all in real-JDK mode. The
   JDK's own implementation is pure Java, keeps its state in the object, and is
   JIT-compilable. **MEASURED: the full spec surface is byte-identical** between
