@@ -411,6 +411,31 @@ of on the test result.
   was not. And a failure rate that climbs with load is a race in someone's code,
   not noise to be re-run away — here, ours.
 
+### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+
+`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
+`origin/dev` as of `a5c67dcda`:
+
+```
+properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
+  these functions read the UNORDERED side-table snapshot:
+  ["native_properties_clone", "native_properties_replace_all"]
+```
+
+**It is not your merge, and you can prove that without building anything.** The
+test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
+— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
+native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
+touched it, which makes the red identical to pristine `dev`'s.
+
+It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
+new guard it is: the guard and the two functions it names landed in the same
+commit. Left for that lane rather than silenced here, because the guard's two
+exits are not equivalent and picking between them is a behavioural call, not a
+gate-quieting one — `Properties.clone()` hands its key order to Java through
+`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
+that order, so "add it to ALLOWED" would be the wrong exit for both.
+
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
 
