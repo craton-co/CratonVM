@@ -27,26 +27,39 @@ been removed again.
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 | **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 108 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
-**All seven lanes are DONE** — L1 through L7, the last of them on 2026-08-29.
-Six of the seven lane handoffs are retired to `internal/jdk-only/`; L5's
-lives with its records in this directory.
+**ALL EIGHT LANES ARE DONE** — L1 through L8, the last of them (the long tail)
+on 2026-08-29. Seven of the eight lane handoffs are retired to
+`internal/jdk-only/`; L5's lives with its records in this directory, and L8
+never had a brief of its own — it was §2.1 of this page, and its four records
+are in the internal tree.
 
-**This page is NOT retired with them, and should not be.** Three things on it
-are still live:
+**This page is STILL NOT retired, and still should not be.** Every lane it
+scoped has landed, and that is not the same thing as the page having no
+question left. Three things on it are live, and the first two would each be a
+lane:
 
 * **Phase 2 is not adjudicated.** The lanes measured the surface; the worklist
   is **1065 distinct `native-won` triples** (P4-A, corpus-wide — not the 334 a
   five-probe screen saw), and `[has_code≠retire]` applies to every one of them:
-  a 0-diff argues KEEP as often as it argues retire.
-* **§4 still carries OPEN, owned items** — the FFM interface-classed identity
-  family, sized but deliberately not fixed, and `KeyStore.getInstance("JCEKS")`,
-  unclaimed and missing in both modes.
+  a 0-diff argues KEEP as often as it argues retire. Nothing in the eight lanes
+  touched this — they fixed BEHAVIOUR, which is the prerequisite for
+  adjudication, not the adjudication.
+* **§4 still carries OPEN, owned items.** The FFM interface-classed identity
+  family is measured twice and blocked on a CONTRACT decision rather than a
+  patch — is the VM's carrier a compatibility stand-in or its own allocation
+  shape? — and `KeyStore.getInstance("JCEKS")` is a JCA format missing in BOTH
+  modes, i.e. a feature gap rather than a shadow defect. Neither is closable by
+  the lane that happens to be reading this page.
 * **§5 is the operational surface every lane runs from** — the landing
   protocol, the known-red vectors and gates on `dev`, and the instrument traps.
-  Retiring it would move that out of the directory people read.
+  **This one is structural: retiring the page would move the landing protocol
+  out of the directory people read**, which is the opposite of what retirement
+  is for.
 
-A page that still poses a question belongs in `known-issues/`, even when the
-work that prompted it has landed.
+A page that still poses a question belongs in `known-issues/`, even when all
+the work that prompted it has landed. What would unblock retirement is the two
+lanes above finishing and §5 being rehomed somewhere it stays visible — in that
+order, and none of it is a residual of the eight.
 
 **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
 you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
