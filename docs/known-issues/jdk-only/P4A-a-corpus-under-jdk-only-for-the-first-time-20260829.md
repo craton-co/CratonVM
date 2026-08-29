@@ -217,5 +217,5 @@ python3 corpus-census.py "$OUT/rep" 218
 
 Each vector needs its own working directory: H2 tests open files by
 CWD-relative path and will collide otherwise. The runner and the census tool are
-carried by this commit; `probes/` is deleted from the tree, so restore them the
-way the sibling records do (`git show <commit>:probes/…`).
+carried by this commit, and they live in `scripts/` rather than `probes/`
+because they are tooling over a corpus, not a probe program.
