@@ -4279,6 +4279,23 @@ fn seed_sunjsse_services() {
         "DKS",
         "sun.security.provider.DomainKeyStore$DKS",
     );
+    // JCEKS is a SunJCE service, not a SUN one -- `KeyStore.getInstance("JCEKS")`
+    // resolves through the JCE provider on HotSpot, and registering it under
+    // SUN would put it in the wrong provider for anyone who asks
+    // `getProvider().getName()`. Absent entirely until 2026-08-29:
+    // `KeyStoreException: JCEKS not found` in both modes, which is the
+    // wrong-refuse direction (code that works on every real JDK and dies here).
+    //
+    // The format is JKS's with a different magic (0xCECECECE) and a stronger
+    // key-protection PBE. This VM's JKS path does not decrypt private keys
+    // anyway, so what it serves for JCEKS is exactly what it serves for JKS,
+    // written under the right magic -- see `keystore::JCEKS_MAGIC`.
+    put_service(
+        "SunJCE",
+        "KeyStore",
+        "JCEKS",
+        "com.sun.crypto.provider.JceKeyStore",
+    );
     // NO `PKCS#12` alias. The JDK does not register one and
     // `KeyStore.getInstance("PKCS#12")` is a `KeyStoreException` there —
     // measured. This VM invented the alias, so a spelling the platform refuses

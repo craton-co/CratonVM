@@ -316,6 +316,15 @@ pub fn keystore_get_cert_der(id: i32, alias: &str) -> Option<Vec<u8>> {
 /// JKS magic constant `0xFEEDFEED` (file's first 4 bytes, big-endian).
 pub const JKS_MAGIC: u32 = 0xFEEDFEED;
 
+/// JCEKS magic constant `0xCECECECE`.
+///
+/// JCEKS is JKS's record layout under a different magic and with a stronger
+/// key-protection PBE. This VM's JKS path does not decrypt private keys, so the
+/// two are the same parser here and the magic is the whole difference --
+/// MEASURED against HotSpot by `apps/probes/KeyStoreTypeProbe.java`, whose
+/// `[JCEKS] stored magic` row is `cececece`.
+pub const JCEKS_MAGIC: u32 = 0xCECE_CECE;
+
 /// JKS HMAC salt. The construction is `SHA1(passwd_utf16be || SALT || body)`.
 const JKS_HMAC_SALT: &[u8] = b"Mighty Aphrodite";
 
@@ -339,7 +348,8 @@ pub(crate) fn load_keystore_ex(
     if bytes.len() < 4 {
         return Err(KeyStoreError::Truncated(0));
     }
-    if u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == JKS_MAGIC {
+    let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic == JKS_MAGIC || magic == JCEKS_MAGIC {
         load_jks(bytes, password)
     } else if bytes[0] == 0x30 {
         load_pkcs12_ex(bytes, password, verify_mac)
@@ -1419,7 +1429,10 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
 
     let mut r = JksReader::new(bytes);
     let magic = r.u32_be()?;
-    if magic != JKS_MAGIC {
+    // Either magic: the record layout that follows is identical, and refusing
+    // JCEKS here would make the type registered above unreadable by its own
+    // writer.
+    if magic != JKS_MAGIC && magic != JCEKS_MAGIC {
         return Err(KeyStoreError::BadJksMagic);
     }
     let version = r.u32_be()?;
@@ -1826,9 +1839,23 @@ pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Ve
 /// envelope (see `jks_protect_key`), which is the exact inverse of the
 /// `jks_recover_key` call `load_jks` makes on the way back in.
 pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
+    write_jks_with_magic(store, password, JKS_MAGIC)
+}
+
+/// [`write_jks`] under an explicit magic, so JCEKS can share the record writer.
+///
+/// The two formats differ in the magic and in how a private key is protected;
+/// this writer does not protect private keys differently per format, so the
+/// magic is the whole difference it can express -- and writing a JCEKS store
+/// under the JKS magic would produce a file `keytool -storetype JCEKS` refuses.
+pub(crate) fn write_jks_with_magic(
+    store: &LoadedKeyStore,
+    password: &[u8],
+    magic: u32,
+) -> Vec<u8> {
     let cert_type: &[u8] = b"X.509";
     let mut body: Vec<u8> = Vec::new();
-    body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
+    body.extend_from_slice(&magic.to_be_bytes());
     body.extend_from_slice(&2u32.to_be_bytes()); // version 2
                                                  // JKS has no compatible representation for SecretKeyEntry.  Keep the
                                                  // entry available in memory, but omit it from this legacy wire format.
@@ -2258,6 +2285,11 @@ const ADVERTISED_KEYSTORE_CLASSES: &[&str] = &[
     "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
     "sun/security/provider/DomainKeyStore$DKS",
     "sun/security/pkcs12/PKCS12KeyStore",
+    // SunJCE's `KeyStore.JCEKS`. The row in `provider_chain` and this one are
+    // joined only by a string, which is what
+    // `advertised_keystore_registration_tests` below exists to check -- see its
+    // doc comment for the 754-to-563 regression that gap once caused.
+    "com/sun/crypto/provider/JceKeyStore",
 ];
 
 #[cfg(test)]
@@ -3875,6 +3907,23 @@ pub(crate) fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// (keycloak TruststoreBuilderTest.testMergedTrustStore). Writing JKS (which
 /// CV's load path detects by magic and parses via load_jks) round-trips the
 /// entries through CV regardless of the declared KeyStore type.
+/// Hand `bytes` to a Java `OutputStream` via `write(byte[])`.
+///
+/// Extracted so the three format arms of [`engine_store`] share one emitter
+/// rather than three copies of the array-building loop.
+fn write_bytes_to_stream(
+    ctx: &mut dyn NativeContext,
+    out: ObjectRef,
+    bytes: &[u8],
+) -> MethodCallResult {
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    ctx.invoke_virtual(out, "write", "([B)V", &[Value::Object(Some(arr))])?;
+    Ok(None)
+}
+
 pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
@@ -3922,6 +3971,34 @@ pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // the shape every already-validated round trip in this VM (the keycloak
     // truststore merge, the TLS identity paths) is measured against, and CV's
     // loader detects either format by magic on the way back in.
+    // FORMAT BY DECLARED TYPE FIRST. The SPI class the caller actually got is
+    // right here -- the refusal above already reads it -- and it is the only
+    // thing that says which format the caller ASKED for.
+    //
+    // This used to be decided by CONTENT alone, with the reason stated: "CV's
+    // loader detects either format by magic on the way back in". That is true
+    // of CV's loader, and it is the whole premise: it assumes nothing else will
+    // ever read the file. So `KeyStore.getInstance("PKCS12").store(..)` emitted
+    // a JKS file -- first four bytes `feedfeed` where HotSpot writes a DER
+    // SEQUENCE -- and every PKCS12 keystore this VM produced was unreadable by
+    // keytool, OpenSSL and every other JVM. MEASURED by
+    // `apps/probes/KeyStoreTypeProbe.java`.
+    //
+    // `write_pkcs12` already existed and was already under test; it simply was
+    // not reachable from the declared type.
+    let spi = class_name_of(ctx, this);
+    if spi.starts_with("sun/security/pkcs12/PKCS12KeyStore") {
+        let bytes = write_pkcs12(&store, &password).map_err(|message| {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::IOException { message },
+            ))
+        })?;
+        return write_bytes_to_stream(ctx, out, &bytes);
+    }
+    if spi.starts_with("com/sun/crypto/provider/JceKeyStore") {
+        let bytes = write_jks_with_magic(&store, &password, JCEKS_MAGIC);
+        return write_bytes_to_stream(ctx, out, &bytes);
+    }
     let bytes = if store
         .entries
         .values()
@@ -3941,13 +4018,7 @@ pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     } else {
         write_jks(&store, &password)
     };
-    // Build a Java byte[] and call OutputStream.write(byte[]).
-    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-    for (i, b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
-    }
-    ctx.invoke_virtual(out, "write", "([B)V", &[Value::Object(Some(arr))])?;
-    Ok(None)
+    write_bytes_to_stream(ctx, out, &bytes)
 }
 
 // ---------------------------------------------------------------------------

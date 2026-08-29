@@ -186,11 +186,43 @@ fn craton_segment_class_id(ctx: &mut dyn NativeContext) -> Option<cratonvm_types
     if packed != 0 && (packed >> 32) == vm {
         return Some(cratonvm_types::ClassId::new((packed & 0xFFFF_FFFF) as u32));
     }
+    // THE VM'S OWN ALLOCATION SHAPE, NOT A COMPATIBILITY STAND-IN -- so this is
+    // `ensure_vm_internal_class` (`ClassOrigin::VmInternal`, legal in every
+    // mode by contract §1 item 6) and not `try_ensure_synthetic_class`, which
+    // mints stand-ins and which `--jdk-only` refuses by design.
+    //
+    // That refusal was the defect. Strict got `None` here and the caller fell
+    // back to stamping the receiver with the `java/lang/foreign/MemorySegment`
+    // INTERFACE -- an impossible class for an instance to have, and the exact
+    // condition the carrier exists to cure. So the mode whose purpose is to
+    // refuse fabrications landed back on the older wrong answer.
+    //
+    // The decision and its evidence:
+    // `docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`.
+    // In short, five signals and none of them a matter of taste: no JDK class
+    // has this name; the JDK relationships come from `synthetic_implements`
+    // rather than from the name; the carrier deliberately does NOT share
+    // `AbstractMemorySegmentImpl`'s layout (see that table's own comment on why
+    // aliasing it would be wrong); it is one of a family of three CratonVM
+    // carriers; and `ensure_generated_class`'s doc names "the VM's own internal
+    // allocation shapes" as its fourth listed category.
+    //
+    // MEASURED by `apps/probes/FfmCarrierProbe.java`: `getClass().isInterface()`
+    // is false for every FFM receiver on HotSpot, and was true for nine
+    // `MemorySegment` doors under `--jdk-only`.
     let class_id = match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
         Some(id) => id,
-        None => ctx
-            .try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0)
-            .ok()?,
+        None => {
+            let id = ctx.ensure_vm_internal_class(CRATON_SEGMENT_CLASS, 0);
+            // `ClassId(0)` is the untyped-allocation id, which is what a
+            // non-VM context's default returns. Minting on it would land on
+            // the `AnonymousObject$N` receiver rather than the carrier, so
+            // treat it as "no carrier" and keep the old fallback.
+            if id == cratonvm_types::ClassId::new(0) {
+                return None;
+            }
+            id
+        }
     };
     CACHED.store((vm << 32) | u64::from(class_id.as_u32()), Ordering::Relaxed);
     Some(class_id)
@@ -779,17 +811,74 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
 // --- Arena: lifecycle-scoped memory management ---
 // Arena synthetic: [0]=kind (Int), [1]=alloc_ids (Object — int array of alloc IDs), [2]=closed (Int), [3]=count (Int)
 
+/// The global arena's root handle, or `None` before the first `Arena.global()`.
+///
+/// `LockLevel::Scratch` (L0) is a LEAF: takeable while holding anything, and
+/// nothing takeable while holding it. Every `ctx` call in the caller happens
+/// outside this lock's scope, which is the property L0 states and the order
+/// checker enforces -- a lock in this crate held across a VM call is a cycle
+/// through the heap and class-manager locks.
+fn global_arena_cell(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<Option<usize>> {
+    use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
+    static CELL: std::sync::OnceLock<OrderedPlMutex<Option<usize>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| OrderedPlMutex::new(None, LockLevel::Scratch))
+}
+
+/// The published handle, if any. A function so the guard cannot outlive the
+/// map read -- see the note in `shared_secrets_bridge::owner_singleton_handle`.
+fn global_arena_handle() -> Option<usize> {
+    *global_arena_cell().lock()
+}
+
+/// Publish `handle` unless someone already did; returns the winner if not ours.
+fn claim_global_arena(handle: usize) -> Option<usize> {
+    let mut cell = global_arena_cell().lock();
+    match *cell {
+        Some(existing) => Some(existing),
+        None => {
+            *cell = Some(handle);
+            None
+        }
+    }
+}
+
 pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
     let arena = "java/lang/foreign/Arena";
 
+    // `Arena.global()` IS A SINGLETON. The JDK's is
+    // `MemorySessionImpl.GLOBAL_SESSION`, one object for the life of the VM,
+    // and `Arena.global() == Arena.global()` is `true` on HotSpot. This minted
+    // a fresh arena on every call -- in BOTH modes -- so the identity was
+    // wrong, and so was every `alloc_ids` table but the last one: allocations
+    // recorded against one global arena were invisible to the next caller's.
+    //
+    // MEASURED by `apps/probes/FfmCarrierProbe.java`, the one row that differs
+    // in compatible mode as well as strict.
     r.register(arena, "global", "()Ljava/lang/foreign/Arena;", |ctx, _| {
+        if let Some(existing) = global_arena_handle().and_then(|h| ctx.resolve_global_root(h)) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
         let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
         let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(ffi::ARENA_GLOBAL));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
         ctx.set_field(a, 2, Value::Int(0));
         ctx.set_field(a, 3, Value::Int(0));
-        Ok(Some(Value::Object(Some(a))))
+        // Published under a global root: the global arena outlives every native
+        // call and must survive a moving collection, which a raw `ObjectRef` in
+        // a process-global cell would not.
+        let handle = ctx.add_global_root(a);
+        match claim_global_arena(handle) {
+            None => Ok(Some(Value::Object(Some(a)))),
+            // Lost the race: drop ours and answer with theirs, so two callers
+            // cannot hold two different global arenas.
+            Some(published) => {
+                ctx.remove_global_root(handle);
+                let winner = ctx.resolve_global_root(published).unwrap_or(a);
+                Ok(Some(Value::Object(Some(winner))))
+            }
+        }
     });
     r.register(arena, "ofAuto", "()Ljava/lang/foreign/Arena;", |ctx, _| {
         let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
