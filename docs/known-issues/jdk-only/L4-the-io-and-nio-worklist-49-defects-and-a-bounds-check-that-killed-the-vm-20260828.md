@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 74 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 82 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -1442,3 +1442,168 @@ java/nio/LongBuffer   clear ()Ljava/nio/Buffer;  inv=8    (was 0)
         `fileKey` answers on `sun/nio/fs/UnixFileAttributes` (inv=1),
         which is the registration the fix changed.
 ```
+
+
+---
+
+# PART FIVE — the census closed, and what the tail actually is
+
+Part two asked the completeness question and left a number on the table: **159
+of 405 adjudication rows had never been reached by any probe.** Parts three and
+four each answered a slice of it without re-taking the measurement. This part
+re-takes it, closes what is closable, and — more usefully — says what the
+remainder *is*, because most of it turned out not to be a coverage gap at all.
+
+## P5.1 The re-take
+
+Same filter as §P2.1 (a `Bridge` that owns its slot and stands in front of a
+real method that is declared, has `Code`, and is not itself native), unioned
+over **fourteen** probe runs, each with `--explain-jdk-only` — the flag whose
+absence made part two's first count wrong by 2.6×:
+
+```text
+             part two        now
+surface         405          454      (parts three and four added registrations)
+reached         246          329
+never           159          125
+```
+
+The surface grows because fixing a defect often means registering something. The
+number that matters is the third row, and moving it 159 → 125 took a fifth
+probe, `apps/probes/L4CensusTail.java` (119 rows), aimed only at rows nothing
+had executed.
+
+**Eight defects, all measured:**
+
+| # | Method | This VM | HotSpot |
+|---|---|---|---|
+| 1 | `new StringBufferInputStream("abé中")` | 7 bytes, UTF-8 | 4 bytes, the low byte of each char |
+| 2 | `LineNumberInputStream.available()` | the raw count | `(in.available() + 1) / 2` |
+| 3 | `LineNumberInputStream.read(b, -1, 1)` | silently nothing | `IndexOutOfBoundsException` |
+| 4 | `DataOutputStream.write(null, 0, 1)` / bad range | silently nothing | NPE / `IndexOutOfBoundsException` |
+| 5 | `FileVisitResult.valueOf("NOPE")` | **`CONTINUE`** | `IllegalArgumentException` |
+| 6 | `FileVisitResult.valueOf(null)` | `CONTINUE` | NPE |
+| 7 | `Path.of(URI)` — no scheme / unknown scheme | a Path | IAE / `FileSystemNotFoundException` |
+| 8 | `FileTime.from((Instant) null)` | epoch 0 | NPE |
+
+plus the residual part three declined, now measured and fixed — see P5.4.
+
+Two are worth more than a table row. `FileVisitResult.valueOf` answering
+**`CONTINUE`** for an unrecognised name is the worst available default: a walk
+that asked to `TERMINATE` through a misspelt or externally-supplied name kept
+walking. And `StringBufferInputStream` is a *deliberately lossy* class — the low
+byte of each char, which is exactly why it is deprecated — so "fixing" it into
+UTF-8 changed the byte values and the length together, and a caller that sized a
+buffer from `available()` read a different number of different bytes.
+
+## P5.2 I patched the dead copy
+
+The first pass of fixes 1–3 went into `native-builtins/src/deprecated_io_util.rs`,
+compiled green, built, and **changed nothing**. The registry said why:
+
+```text
+java/io/StringBufferInputStream read ()I  inv=0   own=False  deprecated_io_util.rs:1322
+java/io/StringBufferInputStream read ()I  inv=11  own=True   deprecated_util.rs:2285
+```
+
+**Two files register the same triples, and `deprecated_util.rs` wins every
+one.** Every overlapping row in `deprecated_io_util.rs` is `owns_slot=false,
+invocations=0` — a complete shadowed duplicate of both classes. (Not entirely
+dead: `LineNumberInputStream.mark(I)V` is registered *only* there, and does own
+its slot. A file can be 90% dead and still load-bearing.)
+
+This is the third time in this lane that "which registrar wins" was the answer
+and the fourth time overall — `canRead` in part three, `FilterOutputStream`'s
+three descriptors in part three, `File.canRead`'s four doors. **The rule that
+keeps paying: before editing a native, dump the registry and confirm the row you
+are about to change has `owns_slot=true` and non-zero invocations.** Both copies
+are corrected here, so a future change to registration order cannot resurrect
+the defect, and the live file now says in a banner which one it is.
+
+## P5.3 Most of the remaining 125 is not a coverage gap
+
+This is the part worth carrying out of the lane. Classified:
+
+```text
+ 34  channels / selectors        network-shaped, unclaimed (§P2.5)
+ 24  SharedSecrets access bridges  reachable only from JDK-internal callers
+ 12  java.io exception classes    the shared Throwable table, all packages
+ 12  java/io/UnixFileSystem       driven indirectly through java.io.File
+  7  abstract receivers           java/nio/Buffer, java/io/OutputStream, ...
+ 36  the rest
+```
+
+And "the rest" is mostly **not unexercised either.** Four of them, measured:
+
+```text
+java/nio/DoubleBuffer   array        ()[D       inv=0  own=True  single registration
+java/nio/HeapCharBuffer toString     (II)...    inv=0  own=True  single registration
+java/nio/MappedByteBuffer force      ()...      inv=0  own=True  single registration
+java/nio/file/FileStore getBlockSize ()J        inv=0  own=True  single registration
+```
+
+`L4CensusTail` calls all four, and all four rows are 0-diff — the methods ran and
+answered correctly. There is no competing registration. So the native was never
+consulted, and the reason is the one this campaign already has a name for:
+**native dispatch keys on the RECEIVER's runtime class** (H11-1). A registration
+on `java/nio/DoubleBuffer` cannot be selected for a `HeapDoubleBuffer` receiver;
+`MappedByteBuffer.force` cannot be selected for the `DirectByteBuffer` a mapped
+buffer actually is; `FileStore.getBlockSize` cannot be selected for
+`LinuxFileStore`.
+
+**`invocations: 0` on a row whose method demonstrably ran is not a coverage
+statement — it is a statement that the registration is unreachable.** Reading it
+as "needs a probe" is what part two did, and it is why 125 still looks like work
+outstanding when much of it is a registrar-placement question instead. I
+measured four, not all thirty-six, so this is the dominant explanation rather
+than a proven partition — but it changes what the number means, and any future
+attempt to "cover" this tail should check reachability before writing a probe.
+
+## P5.4 The residual part three declined, measured
+
+§P3.10 recorded `FileSystems.newFileSystem` over a non-archive as an unclaimed
+residual, deferred for blast radius: those three registrations are on the hot
+path for every jar this VM opens. **It was measurable the whole time** — the
+oracle answers in one row:
+
+```text
+FileSystems.newFileSystem(<a text file>, (ClassLoader) null)
+  HotSpot   ProviderNotFoundException
+  this VM   a jar filesystem over a text file
+```
+
+The blast-radius concern was real and survives; what was wrong was treating it
+as a reason not to *ask*. The fix is scoped so it cannot touch the hot path: a
+two-byte magic test, refusing only a **readable regular file whose first bytes
+are not `PK`**. A real jar takes exactly the path it took before, and so does
+anything unreadable, absent, a directory, or one of this VM's own `jar:`
+sentinels.
+
+Returning a filesystem for a non-archive is worse than it sounds: the failure
+does not appear at the mount, it appears at the first entry lookup, in a caller
+with no idea the mount was bogus.
+
+*(Recorded because it is the fourth deferral reason of mine to die on contact,
+and the pattern is always the same: the reason was about the FIX, and I let it
+stop the MEASUREMENT.)*
+
+## P5.5 Final state
+
+```text
+2920 differential rows across nine L4 probes, both modes
+2919 identical to HotSpot 25.0.4+7
+   1 residual — FileInputStream.skip past EOF (§4.3), unchanged
+```
+
+plus the four pre-existing family probes, 0-diff.
+
+```bash
+CV=/data/vm-l4io OUT=/data/l4out bash apps/probes/l4run.sh \
+  L4CensusTail L4BridgeSweep L4TailSweep2 L4TypedBufferSweep L4FileSweep \
+  L4FilesSweep L4ByteBufferSweep L4PrintStreamSweep L4StreamTailSweep \
+  TailFamilySweep IoSystemSweep FilesSweep FilePathSweep
+```
+
+The census itself is reproducible and is the thing to re-run rather than
+re-derive — `--explain-jdk-only` plus `--dump-native-registry` per probe, unioned
+under the §P2.1 filter. Its two queries for covariant bridges are in §P4.1.
