@@ -934,3 +934,68 @@ they make them specific.
 
 R5 stays OPEN, with a stronger reason than before: not "unmeasured", but
 "measured, and the obvious fix is refuted".
+
+---
+
+## 13. R1 on the workload it was written for — 0, and what that is worth
+
+§4.1 declined to match HotSpot's `InternalError` for
+`objectFieldOffset1` on a missing field name, because the minted synthetic
+offset is documented as the thing that unblocked WildFly's
+`Class$Atomic.casReflectionData` and **Spring Boot's
+`AbstractClassLoaderValue.putIfAbsent`** — workloads the regression corpus does
+not contain. §9.3 measured 0 mints across 118 corpus vectors and said so.
+
+Spring Boot is now reachable: L7's `probes/dod-arms.sh` runs it, and the arm was
+re-run here against this lane's instrumented binary.
+
+```text
+--jdk-only, this lane's binary, L7's DoD arms
+  sbsimple   Spring Boot, full context refresh, 55 beans   rc=0  DOD RESULT OK
+             "minting synthetic offset"   0
+             UNCLASSIFIED-NULL-BASE       0
+  tcssl      embedded Tomcat over HTTPS, 297 beans,
+             three real HTTPS requests                     rc=0  DOD RESULT OK
+             "minting synthetic offset"   0
+             UNCLASSIFIED-NULL-BASE       0
+```
+
+So the mint path is **dormant on the workload whose name is in its own
+justification**. Across four independent populations it has now fired zero
+times: 118 regression vectors, 218 H2 classes, a Spring Boot context refresh,
+and a servlet container serving HTTPS.
+
+**That is not a licence to remove it, and the reason is specific.** The rescue
+has two named consumers and only one has been measured. WildFly — the other, and
+the one whose `casReflectionData` hang the registrar comment actually cites — is
+**not checked out on this host** (`apps/wildfly*` does not exist), so its
+verdict is absent rather than negative. A rescue with two consumers, one silent
+and one unmeasured, is not a rescue that has been shown to be unnecessary.
+
+**R1 therefore stays OPEN, with its remaining question reduced to one name.**
+Anyone with a WildFly checkout can settle it: run it under `--jdk-only` with a
+binary carrying the existing `objectFieldOffset1` warn — it is already in the
+tree and needs no probe — and grep stderr for `minting synthetic offset`.
+
+### 13.1 Method note: the first attempt answered 0 from runs that never ran
+
+The first pass at this reported `UNCLASSIFIED=0 mint=0` for both arms — from
+runs that had died **in one second with zero output lines**. This lane's own
+worktree has no compiled `DodSpringApp` driver (`probes/out`), so the arm never
+reached Spring at all, and the stderr it left carried a `--jdk-only` policy
+violation that I briefly mistook for a regression on `dev`.
+
+Two things stopped it becoming a false result, and both were somebody else's
+design rather than my care:
+
+* **L7's runner prints `lines=0` and `NO-DOD-RESULT-LINE`.** A runner that
+  reports how much output a vector produced turns "it failed instantly" into a
+  visible fact instead of a zero.
+* **Isolating the variable before believing the conclusion.** Running L7's
+  binary with L7's classes (OK), then *this lane's* binary with L7's classes
+  (OK) showed the binary was never the problem. Had I stopped one step earlier I
+  would have filed a `dev` regression that does not exist.
+
+Third instance in this lane of the same shape — §9.4's mute instrument, §12's
+corpus blindness, and now this. **A zero is a claim about a run, and the run has
+to be shown to have happened first.**
