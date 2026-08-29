@@ -982,7 +982,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1007,6 +1007,7 @@ export inherited from a parent shell.
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 | `wait-spurious-ms` | `CRATONVM_WAIT_SPURIOUS_MS` |
 | `monitor-pending-notify` | `CRATONVM_MONITOR_PENDING_NOTIFY` |
+| `win-hires-park` | `CRATONVM_WIN_HIRES_PARK` |
 
 ## `CRATONVM_SECURITY`
 
