@@ -80,7 +80,7 @@ to cancel drift), full H2D+kernel+D2H, checksums bit-identical to HotSpot; the
 3840×2160 row is pooled over two independent 6-round passes (12 rounds total,
 craton faster in all 12) run 30 minutes apart, which agreed within noise. The
 kernel is the reduced proxy (`bench-gpu/RayTracerKernel.java`), documented in
-`docs/internal/gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`,
+the retired `gpu/raytracer-vs-tornadovm-RESOLVED-20260821` write-up,
 not the full `apps/TornadoVM-Ray-Tracer` app (whose real kernel — reflections,
 soft shadows, a skybox — needs dynamic-length scene loops neither engine's
 analyzer admits yet). The margin over TornadoVM shrinks with resolution
