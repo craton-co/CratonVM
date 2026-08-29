@@ -248,23 +248,23 @@ cargo test -p cratonvm-native-builtins  (the seven gate tests)      RC=0
     shim_inheritance_guard, registry_contracts
     ... the same three with --features management                   RC=0
 cargo test -p cratonvm-vm --lib                                     RC=0
-cargo test -p cratonvm-native-builtins --lib          RC=101, and NOT this lane's
-    properties_sidetable::tests::
-      only_order_insensitive_functions_read_the_unordered_snapshot
+cargo test -p cratonvm-native-builtins --lib                         RC=0
+    (RC=101 on the tree an hour earlier, on `dev`'s own
+     properties_sidetable source-witness guard; `c5f66112d` fixed it)
 
 ARM 1  CRATONVM_ARGS=--jdk-only        115 of 115 passed
 ARM 2  SUITE=all                       115 of 115 passed
 ARM 3  SUITE=core                       75 of  75 passed
 ```
 
-The one red is `dev`'s own: `5a6348d28 fix(util): Properties.clone() and
-replaceAll() NPE` added two functions that read the unordered side-table
-snapshot, which that file's own source-witness test forbids. The test's input is
-`include_str!("properties_sidetable.rs")` and nothing else, and the file here is
-byte-identical to `origin/dev`'s, so it reproduces on pristine `dev`. Recorded
-in the scope page for every lane; not fixed here, because whether
-`ordered_snapshot_kv` is the right call is a decision belonging to the lane that
-wrote that fix.
+The one red seen along the way was `dev`'s own: `5a6348d28 fix(util):
+Properties.clone() and replaceAll() NPE` added two functions reading the
+unordered side-table snapshot, which that file's own source-witness test
+forbids. It was attributed in a single `git diff` rather than bisected -- the
+test's input is `include_str!("properties_sidetable.rs")` and nothing else, and
+that file was byte-identical to `origin/dev`'s -- recorded in the scope page for
+every lane, and left to the lane that wrote it, which fixed it the same hour
+(`c5f66112d`).
 
 ### A correction, kept rather than quietly edited
 

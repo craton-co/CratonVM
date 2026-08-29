@@ -203,8 +203,10 @@ was counted from the registry rather than from the class list — every
 `Exception`/`Error` subclass in `THROWABLE_FAMILY_CLASSES`, not just the ones
 whose names looked central.
 
-**A red on `dev` that is not any lane's merge:** `cargo test -p
-cratonvm-native-builtins --lib` fails on `properties_sidetable`'s own
+**A red on `dev` that was not any lane's merge — FIXED by `c5f66112d` on
+2026-08-29, an hour after this note was written.** Kept because the shape
+recurs and because the guard did its job. `cargo test -p
+cratonvm-native-builtins --lib` failed on `properties_sidetable`'s own
 source-witness guard, from `5a6348d28 fix(util): Properties.clone() and
 replaceAll() NPE on a Properties this VM built`:
 
@@ -217,12 +219,20 @@ properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered
 That test reads `include_str!("properties_sidetable.rs")` and nothing else, and
 the file is byte-identical to `origin/dev`'s — so it reproduces on pristine
 `dev` and no merge can be blamed for it. The guard's message offers two ways
-out; **the escape hatch (`ALLOWED`) looks like the wrong one**, since a cloned
+out; **the escape hatch (`ALLOWED`) looked like the wrong one**, since a cloned
 `Properties` and an in-place `replaceAll` both hand an iteration order back to
-Java, which is what `ordered_snapshot_kv` exists for. Left to the lane that
-wrote the fix rather than guessed at from outside it. (For the OTHER red of the
-week, `RSslEndpointIdentification`, see the Vectors section below — it is fixed,
-and it was the vector's own bug rather than the flake it looked like.)
+Java, which is what `ordered_snapshot_kv` exists for. That was left to the lane
+that wrote the fix rather than guessed at from outside it — and that lane
+reached the same answer: `c5f66112d fix(properties): clone and replaceAll hand
+Java an iteration order, so they read the ordered snapshot`.
+
+**The transferable part is the attribution, not the fix.** The test's input is
+`include_str!("properties_sidetable.rs")` and nothing else, so byte-identity
+with `origin/dev`'s copy of that one file is a complete proof that a merge did
+not cause it. A red you can attribute in one `git diff` is a red you do not have
+to bisect. (For the OTHER red of the week, `RSslEndpointIdentification`, see the
+Vectors section below — it is fixed, and it was the vector's own bug rather than
+the flake it looked like.)
 
 **Re-run the tail's existing probes before writing a new one.** Restored to
 `apps/probes/` and taken on the current binary, they are: `LangMiscSweep`,
