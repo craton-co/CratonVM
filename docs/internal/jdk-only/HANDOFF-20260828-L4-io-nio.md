@@ -7,7 +7,7 @@
 >
 > **What the lane did.** The `native-won` surface was mined rather than guessed:
 > **199 distinct triples** across `java/io` and `java/nio`, from a
-> `--jdk-only-report` over `probes/L4Reach.java`. Five new differential probes
+> `--jdk-only-report` over `apps/probes/L4Reach.java`. Five new differential probes
 > cover all of them — `L4FileSweep` (486 rows), `L4FilesSweep` (395),
 > `L4ByteBufferSweep` (404), `L4PrintStreamSweep` (123), `L4StreamTailSweep`
 > (208) — **1616 rows against HotSpot 25.0.4+7, in both modes.**

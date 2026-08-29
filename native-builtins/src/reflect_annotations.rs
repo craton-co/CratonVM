@@ -962,6 +962,36 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                 .find(|v| matches!(v, Value::Object(Some(_))))
                 .copied()
                 .unwrap_or(Value::Object(None));
+            // ARGUMENT VALIDATION, which this had none of. The JDK's body is
+            // `if (!map.isEmpty()) throw new IllegalArgumentException("Map is
+            // non-empty");`, preceded by the implicit NPE of that same call.
+            // MEASURED no-throw for both (apps/probes/CollectionsShadowSweep 162-163).
+            //
+            // The non-empty refusal is the load-bearing one: the returned set's
+            // whole contract is that it holds exactly the backing map's keys and
+            // that `add(e)` is `map.put(e, TRUE)`. A pre-populated map breaks
+            // that silently -- the set reports elements nobody added to it, and
+            // a `FALSE`-valued entry is a member all the same.
+            let backing = match map {
+                Value::Object(Some(m)) => m,
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
+            };
+            if !matches!(
+                ctx.invoke_virtual(backing, "isEmpty", "()Z", &[]),
+                Ok(Some(Value::Int(1)))
+            ) {
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "Map is non-empty".to_string(),
+                    }
+                    .into(),
+                );
+            }
             // The plain `HashSet` returned below uses value `hashCode`/`equals`,
             // which matches `HashMap`/`WeakHashMap`/`ConcurrentHashMap` backings
             // (all key-hash/equals based). But an `IdentityHashMap` backing must

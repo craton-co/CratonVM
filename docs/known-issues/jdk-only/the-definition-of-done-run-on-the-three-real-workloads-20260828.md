@@ -389,6 +389,16 @@ unchanged, and it is `panama.rs`'s own piece of work.
 
 ## 8. Residuals — measured, and why each was not fixed here
 
+> **FOLLOWED UP 2026-08-29: three of these four reasons did not survive contact,
+> and two of the residuals are now closed.** R2 turned out to be a family of
+> THIRTY classes with a second, worse defect underneath it, and R3 was closed by
+> retiring the shadow rather than improving it. R1 is confirmed WILL-NOT-FIX
+> with the reason verified rather than repeated, and R4 is measured properly —
+> seven sites, not one — and left as a lane with a standing assertion.
+> `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`.
+> Read that page for the current status of each; what follows is what was known
+> on the 28th.
+
 Four, each measured, three of them mode-independent and none of them a
 `--jdk-only` blocker.
 
@@ -633,3 +643,30 @@ for m in hotspot compat strict; do bash probes/dod-arms.sh $m; done
 python3 probes/dod-summary.py /data/dod-out
 python3 probes/dod-report.py /data/dod-out/rep-tcssl-strict.json
 ```
+
+## Where the probes are
+
+`3b2901531` ("major doc consistency update before the realeas", 2026-08-29)
+removed 915 files including the whole `probes/` tree, so every Reproduce block
+in this directory now names files the tree does not have. Following the
+convention `e1ff937b4` set for L6's sweeps, this lane's probes are named with
+the commit that carries them and a one-line restore each:
+
+```bash
+git show 7da07b4ac:probes/DodSpringApp.java        > probes/DodSpringApp.java
+git show 7da07b4ac:probes/DodJdbcWorkload.java     > probes/DodJdbcWorkload.java
+git show 7da07b4ac:probes/DodJUnitRunner.java      > probes/DodJUnitRunner.java
+git show 7da07b4ac:probes/DodH2JdbcSuite.java      > probes/DodH2JdbcSuite.java
+git show 7da07b4ac:probes/DodServiceLoaderSweep.java > probes/DodServiceLoaderSweep.java
+git show 7da07b4ac:probes/dodscreen-linux.sh       > probes/dodscreen-linux.sh
+git show 7da07b4ac:probes/dod-arms.sh              > probes/dod-arms.sh
+git show 7da07b4ac:probes/dod-report.py            > probes/dod-report.py
+git show 7da07b4ac:probes/dod-summary.py           > probes/dod-summary.py
+git show e8776985a:probes/DodArrayStoreSweep.java  > probes/DodArrayStoreSweep.java
+git show e8776985a:probes/AbstractReceiverSweep.java > probes/AbstractReceiverSweep.java
+chmod +x probes/dodscreen-linux.sh probes/dod-arms.sh
+```
+
+`DodServiceLoaderSweep` gained its `S-iteratorClass` row after `7da07b4ac`; take
+that one from `e8776985a` too if the iterator-identity assertion is what you are
+after.

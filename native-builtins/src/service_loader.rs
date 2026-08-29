@@ -3724,51 +3724,83 @@ fn native_sl_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    let sl = "java/util/ServiceLoader";
-    r.register(
-        sl,
-        "load",
-        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-        native_sl_load_class,
-    );
-    r.register(
-        sl,
-        "load",
-        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-        native_sl_load_class_loader,
-    );
-    r.register(
-        sl,
-        "loadInstalled",
-        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-        native_sl_load_class,
-    );
-    r.register(sl, "iterator", "()Ljava/util/Iterator;", native_sl_iterator);
-    r.register(
-        sl,
-        "forEach",
-        "(Ljava/util/function/Consumer;)V",
-        native_sl_for_each,
-    );
-    r.register(
-        sl,
-        "stream",
-        "()Ljava/util/stream/Stream;",
-        native_sl_stream,
-    );
-    r.register(
-        sl,
-        "spliterator",
-        "()Ljava/util/Spliterator;",
-        native_sl_spliterator,
-    );
-    r.register(
-        sl,
-        "findFirst",
-        "()Ljava/util/Optional;",
-        native_sl_find_first,
-    );
-    r.register(sl, "reload", "()V", native_sl_reload);
+    // SYNTHETIC-JDK ONLY. `java.util.ServiceLoader` is pure Java -- this
+    // registrar's own header says so -- and a synthetic JDK is the only build
+    // with no bytecode to run. In a real-JDK build these nine were a shadow
+    // over a class the VM already executes correctly, and getting it slightly
+    // wrong: `native_sl_iterator` materialises the providers into a list, so
+    // `iterator()` answered `java.util.ArrayList$Itr` where HotSpot answers
+    // `java.util.ServiceLoader$2` (MEASURED, `probes/DodServiceLoaderSweep`),
+    // losing the lazy iterator's semantics -- a `ServiceConfigurationError`
+    // raised at `load` instead of at the offending provider. The
+    // `ServiceLoader$Itr.hasNext` / `.next` rows below took ZERO invocations
+    // for the same reason: what came back was never an `Itr`.
+    //
+    // The bytecode path is measured, not assumed. `--jdk-only` refuses every
+    // SyntheticStub, so it has been running the real `ServiceLoader` all along,
+    // and after the class-path-module fix it is HotSpot-identical on both SPIs
+    // and completes all five definition-of-done workloads -- `jdbc` 92/92 and
+    // `h2jdbc` 12/12 among them, whose `DriverManager` discovery is
+    // `ServiceLoader.load(java.sql.Driver.class)`, the exact case `jdbc.rs`
+    // says this registrar exists for.
+    //
+    // The gate is INSIDE the registrar because it has two callers --
+    // `vm_init::init_service_loader_bootstrap` and
+    // `jdbc::register_jdbc_service_loader` -- and `--dump-native-registry`
+    // shows every row twice, once from each. A gate at one call site would
+    // leave the other one registering.
+    //
+    // In a synthetic-jdk build nothing changes, ordering included: these still
+    // land after `register_p63_service_loader`'s empty-iterator stubs, which
+    // live inside `register_synthetic_overrides` and exist only there.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        let sl = "java/util/ServiceLoader";
+        r.register(
+            sl,
+            "load",
+            "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            native_sl_load_class,
+        );
+        r.register(
+            sl,
+            "load",
+            "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+            native_sl_load_class_loader,
+        );
+        r.register(
+            sl,
+            "loadInstalled",
+            "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            native_sl_load_class,
+        );
+        r.register(sl, "iterator", "()Ljava/util/Iterator;", native_sl_iterator);
+        r.register(
+            sl,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_sl_for_each,
+        );
+        r.register(
+            sl,
+            "stream",
+            "()Ljava/util/stream/Stream;",
+            native_sl_stream,
+        );
+        r.register(
+            sl,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_sl_spliterator,
+        );
+        r.register(
+            sl,
+            "findFirst",
+            "()Ljava/util/Optional;",
+            native_sl_find_first,
+        );
+        r.register(sl, "reload", "()V", native_sl_reload);
+    }
 
     // Re-register `StreamSupport.stream(Spliterator, boolean)` — see the
     // header comment on `native_stream_support_stream_from_spliterator`. This

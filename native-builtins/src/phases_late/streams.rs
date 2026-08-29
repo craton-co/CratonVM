@@ -3572,23 +3572,19 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
     // merge that assumes pre-sorted input) skipped their own sort and produced
     // silently unordered results. Our synthetic spliterators are never SORTED,
     // so this now throws — the spec'd answer for an unsorted source.
-    r.register(
-        spl,
-        "getComparator",
-        "()Ljava/util/Comparator;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let ch = p59_spliterator_characteristics(ctx, this);
-            if (ch & P59_SPLITERATOR_SORTED) != 0 {
-                // SORTED but no comparator recorded => natural ordering.
-                return Ok(Some(Value::Object(None)));
-            }
-            Err(RuntimeError::IllegalStateException {
-                message: "Spliterator source is not SORTED".into(),
-            }
-            .into())
-        },
-    );
+    // `getComparator` is NOT registered here any more. The identical three-way
+    // rule -- the Comparator when SORTED by one, `null` when SORTED naturally,
+    // `IllegalStateException` otherwise -- now lives in `native-collections`'
+    // `register_iterator_protocol_natives`, which runs in EVERY mode. This pass
+    // runs only under `--features synthetic-jdk`, so the rule was absent from
+    // the shipping build and `treeSet.spliterator().getComparator()` fell
+    // through to the interface default, which throws unconditionally
+    // (apps/probes/UtilTailShadowSweep 143).
+    //
+    // The two bodies AGREE -- this one asks `this.characteristics()` virtually,
+    // which lands on the shipping body -- which is why this is the one row of
+    // the six `registrar_drift::no_new_mode_drift` reported that was redundant
+    // rather than wrong.
     // hasCharacteristics(c) is defined as `(characteristics() & c) == c`.
     // The constant `false` contradicted characteristics() (which reports
     // ORDERED|SIZED), so callers took the "unordered / unsized" branch and

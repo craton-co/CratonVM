@@ -5413,6 +5413,18 @@ fn run() -> Result<()> {
             eprintln!(
                 "[cratonvm] VarHandle field CAS in-funnel: served={cas_served} declined={cas_declined}",
             );
+            // The bound CAS route. Read it TOGETHER with the in-funnel pair
+            // above: once `compareAndSet` sites bind, the in-funnel count is
+            // supposed to fall to what the interpreter and the declined sites
+            // still send through it, and a bind that moved nothing looks
+            // exactly like a bind that was never reached unless both are
+            // printed.
+            let (cd_served, cd_declined) =
+                cratonvm_vm::jit::helpers::varhandle_cas_direct_counts();
+            let (cd_sp, cd_osr) = cratonvm_jit::varhandle_cas_direct_helper_sites();
+            eprintln!(
+                "[cratonvm] VarHandle CAS thin direct calls: served={cd_served} declined={cd_declined}                  (sites: singlepass={cd_sp} osr={cd_osr})",
+            );
         }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per

@@ -24,12 +24,11 @@ been removed again.
 | **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
-| **L3 `java.util` collections** | unclaimed — the last one | your own worktree | your own branch |
+| **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 
-**L5 is DONE to the bottom — its residuals too — and every file it held is
-free.** L2 is taken (see the table). L1, L4 and L6 are DONE. **L3 and L7 are
-unclaimed**, and L3 (`java.util` collections, ~380 rows) is the largest lane
-left on the board.
+**Six of the seven lanes are DONE** — L1, L3, L4, L5, L6 and L7. L2
+(`StringBuilder` / `StringBuffer` / `AbstractStringBuilder`) is the only one
+still open, and it is taken; see the table.
 
 **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
 you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
@@ -40,6 +39,21 @@ platform-independent and was not. A new probe asks the questions its author
 thought of, and L4's author was on a Linux host and did not think of
 backslashes. Cheap to do, and it is the only step that can catch what your
 fixes broke as well as what they missed.
+
+**Two things L3 found that the next lane should read before starting.**
+`x::m` and `() -> x.m()` are DIFFERENT DISPATCH DOORS on this VM — a bound
+method reference is a MethodHandle that bypasses the force-native gate, so
+`t(tag, x::m)` in a probe measures the door and not the family. It cost L3 a
+build cycle; write the lambda. And `owns_slot: true` is not enough to know a
+registration can fire: if the class INHERITS the method as an interface default,
+dispatch resolves to the interface and the class-name row is dead. The dump says
+so in the same row — `real_declaring_method.has_code: false` next to
+`invocations: 0`.
+
+**And re-run the ARMS after you merge, not only before.** L3's merge of L4 and
+L5 turned `RExceptions` and `RJdkFailure` red — a `ClassNotFoundException`
+message, nothing either lane's own gates could see. Two green lanes combine into
+a red tree; the arms on the MERGED tree are the only thing that says so.
 
 **Every lane that has finished has found defects OUTSIDE its `native-won`
 triples, and L5 found five.** The triples are a worklist, not a boundary: they
@@ -256,7 +270,7 @@ planning:
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
-| **NEW.** `Properties.values().iterator()` mints the fabricated `cratonvm/internal/ArrayListViewItr`, and its `try_alloc_synthetic(..)?` has **no refusal arm** — so `--jdk-only` kills the caller with `NoClassDefFoundError`. This is what `RJdkEnumerations` fails on under `--jdk-only` now that L6 fixed the CHM half. | **L3** (`Properties`/`Hashtable` cluster). Its two sibling mint sites land refusals on `real_snapshot_iterator`, which needs a `SnapshotItrRoute` for a Hashtable-backed values view. Falling back to `java/util/ArrayList$Itr` instead would add a `modCount`-less receiver to that class, which is the precondition the bytecode-yield allow-list is waiting on. |
+| ~~`Properties.values().iterator()` mints the fabricated `cratonvm/internal/ArrayListViewItr` through a `try_alloc_synthetic(..)?` with no refusal arm~~ | **FIXED by L6, 2026-08-29** — after first recording it as L3's. It was not one vector: it also killed `MapViewBehaviourProbe` at row 0 of 194 and `ItrClassProbe` at row 31 of 66 under `--jdk-only`. The route it was said to need is one call to a function that already existed. `L6-concurrency-lane-complete-20260828.md` §9. |
 | ~~`Class.forName("[L<absent>;")`'s `ClassNotFoundException` names the DESCRIPTOR, not the element~~ | **FIXED by L1's `39e2ded07`, 2026-08-28**, between L6's arms run and its push. It is what made `RExceptions` and `RJdkFailure` red for every lane; `L6-concurrency-lane-complete-20260828.md` §8 records the measurement that attributed it to pristine `dev`. |
 
 ---
