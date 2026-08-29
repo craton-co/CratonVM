@@ -1890,6 +1890,14 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             .into());
         }
         cb_write_int_field(ctx, this, "position", CB_FIELD_POS, new_pos);
+        // Same closing line as `limit(int)`: `if (mark > newPosition) mark =
+        // -1;`. Fixed on the argument, not on a measured row -- the probe's
+        // ordering happens not to leave a mark above a lowered position -- but
+        // it is the same two-line contract and leaving one half of it undone is
+        // how the `limit` half survived this long.
+        if cb_read_int_field(ctx, this, "mark", CB_FIELD_MARK) > new_pos {
+            cb_set_mark(ctx, this, -1);
+        }
         Ok(Some(Value::Object(Some(this))))
     });
     r.register(cb, "limit", "()I", |ctx, args| {
@@ -1920,6 +1928,17 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         cb_write_int_field(ctx, this, "limit", CB_FIELD_LIMIT, new_lim);
         if cb_read_int_field(ctx, this, "position", CB_FIELD_POS) > new_lim {
             cb_write_int_field(ctx, this, "position", CB_FIELD_POS, new_lim);
+        }
+        // `Buffer.limit(int)` ends `if (mark > newLimit) mark = -1;`. Without
+        // it a mark left ABOVE the new limit survives, and the next `reset()`
+        // sets the position past the limit instead of raising
+        // `InvalidMarkException` -- a buffer whose position exceeds its limit,
+        // which every `remaining()`-driven loop then reads as empty.
+        //
+        // MEASURED with `apps/probes/L4BridgeSweep.java` (`position(3);
+        // mark(); limit(2); reset()`), heap, view and `wrap(CharSequence)`.
+        if cb_read_int_field(ctx, this, "mark", CB_FIELD_MARK) > new_lim {
+            cb_set_mark(ctx, this, -1);
         }
         Ok(Some(Value::Object(Some(this))))
     });
