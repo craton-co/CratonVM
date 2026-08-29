@@ -1,5 +1,10 @@
 # L5 (reflection and class metadata) is CLEAN — 483 rows, 20 defects, 0 residuals
 
+> **Superseded in two places by
+> `L5-residuals-module-packages-and-invokeexact-20260828.md`:** the two items §5
+> leaves open are now closed, and the `forName` fix in §4 shipped a regression
+> two regression-suite vectors caught (see the CORRECTION in §4).
+
 **Status: COMPLETE 2026-08-28.** Lane L5 of the seven in
 `HANDOFF-20260828-SCOPE.md`. Worktree `h2-known-issues-206dee`, branch
 `claude/jdk-only-mode-handoff-09b48c`.
@@ -151,6 +156,24 @@ The real defect was the **delegation itself**. `Class.forName` needs no loader
 for an array descriptor, and now resolves one directly before any delegation.
 Both probes assert both halves so the asymmetry is pinned from either side and
 cannot be "simplified" back.
+
+### CORRECTION 2026-08-28: the fix that replaced them shipped a THIRD regression
+
+The `forName` short-circuit below is right, and it went out with a defect this
+page did not catch, because this page's acceptance ran the GATE SET and not the
+three `regression-suite` arms. `Class.forName("[Lcom.foo.Missing;")` must throw
+`ClassNotFoundException("com.foo.Missing")` — JVMS 5.3.3 builds an array class
+from its ELEMENT type — and the delegation that was removed was ALSO what
+produced that message: the loader saw the element name and reported it. The
+short-circuit reported the descriptor.
+
+`RJdkFailure.java:168` and `RExceptions.java:382` both assert it and both went
+red on the pushed commit. Fixed, with the full account of how it escaped, in
+`L5-residuals-module-packages-and-invokeexact-20260828.md` §6.
+
+**So "0 residuals" on this page means "no residual my probes could see".** Three
+probes, 483 rows, and a fourth regression from the same three-line change that
+none of them asked about. The vectors did.
 
 **Both regressions were caught by the runner's ROW COUNT check**
 (`20 of 90 rows -- the missing 70 are UNTESTED, not clean`) and by **re-running

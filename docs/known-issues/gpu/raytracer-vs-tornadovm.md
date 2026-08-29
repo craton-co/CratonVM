@@ -7,7 +7,7 @@ GPU output is now bit-identical to HotSpot on every pixel at every resolution
 measured. Two further defects found on the way — one in each benchmark twin —
 are also fixed. The headline speedup claim the original record made **did not
 survive** measurement across a resolution sweep and has been replaced with the
-decomposition below. Restored here from `docs/internal/` (that tree is
+decomposition below. Restored here from the internal tree (which is
 stripped from public git history) because the shrinking-margin-with-size
 finding keeps being independently re-derived by fresh measurement, and now has
 a third confirming data point at 8K — see §12.
