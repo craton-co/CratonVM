@@ -6,8 +6,10 @@
 The `xt_cov=(accepted=0 refused=1730)` lead this page shipped with turned out to
 be four measurements deep: the peers DO park, some of their own proofs return
 false, the obligation is `UNPUBLISHED_FRAME_OOP` in 3 of 4, and six of the seven
-unpublished words belong to a single frame whose safepoint-id slot holds the low
-32 bits of a heap pointer.
+unpublished words belong to frames whose safepoint-id slot carries no usable id.
+The discriminator then split THAT into two defects: **10 of 13 such frames have
+`sp_id == 0` — they have not reached their first safepoint — and 3 have a heap
+pointer sitting in the reserved slot.** It is not a shifted `rbp`.
 
 Split out 2026-08-29 from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which is
@@ -173,20 +175,54 @@ exactly one word. The machinery works; one frame's id does not.
 > conflated "a map was found and does not name the slot" with "no map exists for
 > this id". It now prints `no-map-for-id`, and that is the line to grep.
 
-### 4. What to do next, in order
+### 4. The discriminator, run — and it is TWO defects, not one
 
-1. **Decide which of two shapes the garbage id is**, because they are opposite
-   repairs and the evidence above does not separate them:
-   * **something wrote an oop into the reserved sp-id slot** (a codegen defect:
-     a store whose offset lands in the reserved-locals tail), or
-   * **`rbp` is wrong for this frame**, so `[rbp - sp_id_slot_off]` lands on a
-     neighbouring slot that legitimately holds an oop (a frame-resolution
-     defect, the same family as the 2026-08-26 "two innermost-frame mirrors were
-     not moving together" fix on the parent page).
+`sp_id_off` and the whole reserved-locals tail are now printed beside a
+`no-map-for-id` frame, which separates "something stored an oop into the
+reserved slot" from "rbp is wrong so the read landed on a neighbour". One run,
+13 such frames:
 
-   The discriminator is cheap: print `sp_id_slot_off` and the whole reserved
-   tail beside the id. If the pointer sits at exactly `sp_id_slot_off` the store
-   is the bug; if the tail's OTHER slots also look shifted by one, the rbp is.
+```text
+no-map-for-id sp_id_off=24 tail(8..64): [8]=0x2006689f670 [16]=0x20012385010
+    [24]=0x2004264ebc0 [32]=0x7305aeff7408 [40]=0x0 [48]=0x200161f0030 ...
+no-map-for-id sp_id_off=48 tail(32..88): [32]=0x0 [40]=0x20012385010
+    [48]=0x0 [56]=0x7305adff5408 [64]=0x80 [72]=0x20016ef0168 ...
+```
+
+| what is in the sp-id slot | frames | reading |
+|---|---:|---|
+| **`0`** | **10** | the frame has not reached its first safepoint — the slot is still the prologue's zero |
+| **a heap pointer** | **3** | the reserved slot has been OVERWRITTEN with an oop |
+| anything else | 0 | — |
+
+**It is not a shifted `rbp`.** In the first line the pointer sits at exactly
+`sp_id_off=24`, and the rest of that tail is plausible for this frame
+(`0x7305aeff7408` is a native/stack pointer — the cached JIT thread or the stack
+floor; `[40]=0x0`). A wrong `rbp` would have made the whole tail read like some
+other frame's, and it does not.
+
+So the one lead has become two, with very different sizes and repairs:
+
+* **10 of 13 — `sp_id == 0`, a frame that has not reached a safepoint yet.**
+  `find_oop_map_for_safepoint_id(0)` finds nothing, `frame_active_map_slots`
+  returns `None`, and the 2026-08-27 dead-slot relaxation FAILS CLOSED by
+  design — so every movable-looking word in that frame's band refuses the whole
+  collection. This is the dominant population and it is not a corruption at
+  all; it is a frame the machinery has no statement about. Whether it can be
+  discharged is a real question: its java locals hold incoming arguments, so a
+  relocation still has to rewrite them, and with no map the shadow stack is the
+  only channel that could. **Start here — it is 77 % of the refusals.**
+* **3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
+  reserved-locals tail. Small, and a genuine codegen defect: nothing may write a
+  Java reference into a slot the frame layout reserved for the safepoint id.
+  Print the storing method (`cm.method_label` is already on the line) and look
+  at what it compiles at that offset.
+
+### 5. What to do next, in order
+
+1. **Take the `sp_id == 0` population first** — 10 of 13, and the question is
+   whether a frame that has taken no safepoint can be discharged at all rather
+   than refusing every cycle it is live for.
 2. Only then look at the `operand-spill` words. Four of the seven are on the
    frame with the garbage id and may simply be its neighbours.
 3. `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` remains the same-binary control: it
