@@ -469,16 +469,22 @@ fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
     let u2 = "jdk/internal/misc/Unsafe";
 
     // --- T8.4.1: defineClass with CAFEBABE validation ---
-    // (The existing registration in lib.rs is a no-op stub; register a real one here
-    //  under sun/misc/Unsafe which is the deprecated path. The lib.rs version for
-    //  jdk/internal/misc/Unsafe already has defineAnonymousClass which validates.)
-    r.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
-    // Also register for jdk/internal variant
+    //
+    // The `sun/misc/Unsafe` registration was RETIRED 2026-08-29.
+    // `sun.misc.Unsafe.defineClass` is ABSENT from every supported image (JDK
+    // 17.0.20.1+1, 21.0.12+8, 25.0.4+7 -- measured, not read off one image), so
+    // nothing could dispatch to it, and it took 0 invocations across 118 corpus
+    // vectors in both modes.
+    //
+    // `deprecated_verify.rs` tagged it `ImageStatus::Declared`, whose own doc
+    // reads "at least one supported image declares the triple ... and MUST
+    // stay". That tag was a claim NOTHING COULD FALSIFY: the T8 test asserts a
+    // `Declared` row IS registered and never checks the claim against an image,
+    // while it does enforce the opposite direction. Retagged in the same
+    // commit, which is what makes this removal the manifest's own instruction.
+    //
+    // The `jdk/internal/misc` spelling below is declared on all three images
+    // and stays.
     r.register(
         u2,
         "defineClass",
@@ -1796,7 +1802,10 @@ mod tests {
         let result = call_native(
             &reg,
             &mut ctx,
-            "sun/misc/Unsafe",
+            // `sun.misc` spelling RETIRED 2026-08-29 -- absent from JDK 17,
+            // 21 and 25. This test's subject is the CAFEBABE validation, not
+            // the spelling, and `jdk.internal.misc` runs the same body.
+            "jdk/internal/misc/Unsafe",
             "defineClass",
             "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
             &[
@@ -1829,7 +1838,10 @@ mod tests {
         let result = call_native(
             &reg,
             &mut ctx,
-            "sun/misc/Unsafe",
+            // `sun.misc` spelling RETIRED 2026-08-29 -- absent from JDK 17,
+            // 21 and 25. This test's subject is the CAFEBABE validation, not
+            // the spelling, and `jdk.internal.misc` runs the same body.
+            "jdk/internal/misc/Unsafe",
             "defineClass",
             "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
             &[
