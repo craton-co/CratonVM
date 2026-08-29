@@ -3086,11 +3086,34 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
+        // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR, and every
+        // dimension is stripped. HotSpot never hands an array descriptor to a
+        // loader, so what fails to resolve — and what the exception reports —
+        // is the component:
+        //
+        //   Class.forName("[Lp.X;")   CNFE msg="p.X"
+        //   Class.forName("[[Lp.X;")  CNFE msg="p.X"
+        //
+        // This branch reported `dotted_name`, i.e. `[Lp.X;`, which is the one
+        // string HotSpot never puts there. `regression-suite/src/RExceptions
+        // .java` asserts both rows and went red on it; the vector's own comment
+        // carries the JDK 25 measurement.
+        //
+        // A descriptor that is not the `L…;` reference form (a primitive array
+        // such as `[I`) cannot reach here — those resolve — but the fallback
+        // keeps the full name rather than inventing one.
+        let element_name = {
+            let stripped = dotted_name.trim_start_matches('[');
+            match stripped.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                Some(element) => element.to_string(),
+                None => dotted_name.clone(),
+            }
+        };
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &dotted_name,
+            &element_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }

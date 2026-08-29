@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 52 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 55 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -663,3 +663,227 @@ bash probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
 
 `FilesSweep`'s two differing lines are its own harness artefact — it prints the
 random name of the temporary directory it created, which no two runs share.
+
+---
+
+# PART TWO — the completeness question, and what asking it found
+
+**Added 2026-08-29.** Part one closed the 199 `native-won` triples. This part
+asks the question part one could not: *those are the rows a program MET — what
+about the rest of the family?* Answering it took three more defects out, one of
+them a data-corruption bug, and cleared a compile break on `dev`'s tip.
+
+**The filename says 49 defects and the title now says 55.** The slug is left
+alone deliberately — the scope doc and the retired lane brief both cite it, and
+a rename costs more than it explains.
+
+## P2.1 The number, and the instrument reading that made my first one wrong
+
+Unioned over eleven probe runs, filtering `java.io` + `java.nio` to rows that
+are `bridge`, own their slot, and shadow a real method that is declared, has
+`Code` and is not `ACC_NATIVE`:
+
+```text
+405  the static adjudication surface for this lane
+246  reached by at least one probe
+159  never reached by any of them
+  3  of those 159 are FLOORS, not totals (invocations_complete false)
+```
+
+**My first pass said 414 and it was wrong by 2.6×.** The filter read `has_code`
+out of `image_declaring_method`, and
+
+> **`--dump-native-registry` leaves `image_declaring_method` NULL unless
+> `--explain-jdk-only` is also passed.**
+
+Ten of the eleven dumps were plain `--dump-native-registry`, so every one of
+their rows failed the filter, every dump contributed zero, and the "union" was a
+single run wearing a union's clothes. The tell was a `reached 0` for a probe
+whose raw rows showed `invocations: 6` two commands earlier. `real_declaring_
+method` is populated in both shapes and is what a census should filter on.
+
+This matters beyond one lane: the scope doc's §5 sends every lane to that dump,
+and a census script that filters on the image block will silently report zero
+without erroring.
+
+The three floors are `SimpleFileVisitor`'s callbacks — which part one's
+`walkFileTree` repair provably calls, so their zero is a floor in exactly the
+way `invocations_complete` says.
+
+## P2.2 `CharBuffer.get(int)` was position-relative — the wrong characters, with every number right
+
+`probes/L4TypedBufferSweep.java` is new: **501 rows**, six typed buffers
+(`Int`, `Long`, `Short`, `Float`, `Double`, `Char`) × three backings, covering
+~50 census rows no probe in the tree had ever reached. One row differed.
+
+```text
+CharBuffer cb = ByteBuffer.allocate(8).asCharBuffer();   // "abcd"
+cb.flip(); cb.get();                                      // position is now 1
+cb.get(new char[4], 1, 2);
+  HotSpot   .bc.
+  CratonVM  .cd.
+```
+
+It reads as a bulk-copy defect and is not one. **Every visible number was
+correct** — position 1 after the single `get()`, position 3 after the bulk read,
+`charAt`, `toString` and `length` all right, and the `IntBuffer` and
+`ShortBuffer` views correct on the identical sequence. Only the characters were
+wrong.
+
+`CharBuffer.get(char[],int,int)` has no native, so the real bytecode ran and
+called the absolute `get(int)` once per element with the right indices — onto a
+body that added the position to them again. `charAt(int)` and `get(int)` were
+sharing one implementation, and they are two different contracts:
+
+```text
+CharSequence.charAt(i)   ->  get(position() + checkIndex(i, 1))   RELATIVE
+Buffer      .get(index)  ->  Objects.checkIndex(index, limit)     ABSOLUTE
+```
+
+At position 0 they agree, which is why every earlier probe missed it and why
+the new rows ask both at a NON-ZERO position. It is an `Intrinsic`, so
+`--jdk-only` does not drop it and the defect was identical in both modes.
+
+## P2.3 Two latent defects the retirement dial exposed
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` makes `Bridge` natives on a receiver
+under that prefix yield to real bytecode under `--jdk-only`, which is how Phase
+2 prices a retirement without building anything. Armed at `java/io/File`:
+
+```text
+L4FilesSweep   DIED 119 rows early
+  NullPointerException: Cannot enter synchronized block because
+                        "this.closeLock" is null
+      at java/io/FileOutputStream.close(FileOutputStream.java:383)
+      at java/nio/file/Files.copy(Files.java:2865)
+L4StreamTailSweep   fos.write(null, 0, 1)   NPE -> no-throw
+```
+
+**Read the prefix carefully: `covers()` is `starts_with`**, so `java/io/File`
+also armed `FileOutputStream`, `FileInputStream` and `FileDescriptor`. That run
+priced the `java/io/File*` FAMILY, not `java.io.File`. Both blockers turned out
+to be in the siblings, and both are real:
+
+* **`FileOutputStream.closeLock` is never initialised** on a stream this VM
+  mints. `fsp_new_output_stream` allocates the object and wires the fd by hand;
+  the constructor never runs, so its instance initialisers never do either.
+  `FileOutputStream.close()` opens `synchronized (closeLock)`. This is the
+  **twin** of a repair that already existed — `fsp_new_input_stream` sets
+  `closeLock`, `path` and `closed` a hundred lines above, *with a comment saying
+  exactly why* — applied to one side of a pair and not the other.
+* **`writeBytes([BIIZ)V` accepted a null buffer** and wrote nothing. Its
+  `write([BII)V` twin got the NPE in part one; `writeBytes` is the door the real
+  `FileOutputStream.write(byte[],int,int)` bytecode arrives at, and it kept the
+  silent no-op.
+
+Both are invisible today, because the `close()` and `write()` natives above them
+never let the real bytecode through. Both would turn a future retirement from
+free into a crash, and both are one hunk.
+
+With them fixed the armed run is **fully green**: seven probes, 1671 lines,
+armed diffs identical to baseline. So the `java/io/File*` retirement is now
+priced and unblocked — **NOMINATION**, not taken here, because the dial's own
+doc is explicit that "an armed FAILURE is real; an armed ZERO is unreliable":
+the dial covers the doors it reaches, and a real retirement removes the
+registration so every door misses.
+
+## P2.4 `dev`'s tip did not compile, and it was two `#[cfg]` lines
+
+`cargo check -p cratonvm-native-builtins` was **17 errors** on pristine
+`origin/dev` — `cannot find type Value`, `arg_long` inaccessible,
+`state::` unresolved, across `craton_gpu.rs`, `xnio_async.rs` and
+`compression_native.rs`.
+
+The module is `gpu-offload`-only. Two new functions had been inserted **between
+an existing function's doc comment and its body**, so the
+`#[cfg(feature = "gpu-offload")]` stayed with the comment, gated the newcomer,
+and left its neighbour bare — `builtin_future_status` and
+`builtin_array_to_host`. A default build then compiled two bodies full of
+feature-only imports.
+
+Restoring the two attributes takes both arms green (default and
+`--features gpu-offload`). Not this lane's code; fixed because a red tip blocks
+every lane, which is what the scope doc's §5 asks for.
+
+Worth generalising: **an attribute belongs to the item that follows it, and
+inserting an item after a doc comment silently steals it.** Nothing warns.
+
+
+## P2.7 `dev`'s tip was red a second way, and this one was a behaviour regression
+
+The `#[cfg]` repair in P2.4 made `dev` COMPILE. Running the three arms on it
+then showed two vectors failing that had passed on this lane's part-one tree:
+
+```text
+RExceptions   AssertionError: ...naming the element, not the descriptor,
+                              got: [Lcom.cratonvm.absent.NoSuchClass20260812;
+RJdkFailure   AssertionError: an array CNFE must name the element,
+                              not the descriptor: [Lcom.cratonvm.absent.NoSuchClass20260731;
+```
+
+**Proven not this lane's**, by building a CONTROL: `origin/dev` plus the
+`#[cfg]` fix and nothing else — because pristine `dev` cannot be built at all —
+and running the two vectors on it. Both failed identically there. This lane's
+part-two changes (typed buffers, `FileOutputStream`, `writeBytes`) cannot reach
+class-name rendering, and the control says so rather than the reasoning.
+
+The cause is in L5's landing (`c6ccccbc8`), whose own commit message names the
+change:
+
+> `Class.forName("[I")` resolves; `ClassLoader.loadClass("[I")` throws. This VM
+> implemented forName by DELEGATING to loader.loadClass … The real defect was
+> the delegation: forName needs no loader for an array descriptor and now
+> resolves one directly.
+
+That new direct-resolution branch builds its `ClassNotFoundException` from
+`dotted_name` — the whole descriptor. HotSpot never hands an array descriptor to
+a loader, so what fails to resolve, and what the exception reports, is the
+COMPONENT:
+
+```text
+Class.forName("[Lp.X;")    HotSpot  CNFE msg="p.X"
+Class.forName("[[Lp.X;")   HotSpot  CNFE msg="p.X"    (every dimension stripped)
+```
+
+Fixed by stripping the dimensions and the `L…;` wrapper before building the
+message. Both vectors pass.
+
+**Two lessons, and the second is the one that cost this lane a build.**
+
+A new branch that BYPASSES a delegation inherits every contract the delegation
+used to satisfy. L5's change was right — the two doors genuinely disagree — and
+the message shape came along for the ride, unasked, because it had previously
+been produced by the loader it no longer calls.
+
+And: **this lane pushed a merge it had not built.** Part one's gates and three
+arms were green on `87fc7eeb7`; `origin/dev` then moved, the merge was taken,
+only the docs changed after it, and the result was pushed without a rebuild. The
+merge is what carried both of dev's reds in. That is exactly what the scope
+doc's landing protocol says to do and this lane did not: **re-run the gate set
+on the MERGED tree, not on the tree you tested before the merge.**
+
+## P2.5 What is left, and who it belongs to
+
+Of the 159 never-reached rows, after this part:
+
+| slice | rows | disposition |
+| --- | ---: | --- |
+| typed buffers + `Buffer` base | ~50 | **covered now** by `L4TypedBufferSweep` |
+| `java/io/UnixFileSystem` | 12 | **covered indirectly** — the armed run drives all 12 through `java.io.File`'s real bytecode, 190 invocations, 0-diff |
+| `java/nio/Buffer$2`, `java/io/FileDescriptor$1` | 22 | `SharedSecrets` access bridges, reachable only from JDK-internal callers — adjacent, not L4's |
+| `java/nio/channels/{Socket,ServerSocket,Datagram}Channel` | ~30 | network-shaped and unclaimed; `AsynchronousFileChannel` is explicitly L6's |
+| `java.io` exception classes | 86 | the shared `Throwable` table, one table serving every package |
+| the rest | ~40 | `Files`/`Path` charset and `Iterable` overloads, `FilterOutputStream`, `MappedByteBuffer` |
+
+## P2.6 Final state
+
+```text
+2117 differential rows across six probes, both modes
+2116 identical to HotSpot 25.0.4+7
+   1 residual — FileInputStream.skip past EOF (§4.3), contract-legal,
+     and a resolution finding no registrar edit can move
+```
+
+Plus four probes already in the tree re-run as a control on every binary:
+`TailFamilySweep`, `IoSystemSweep`, `FilePathSweep` all 0, `FilesSweep` 0 apart
+from the random temp-directory name it prints itself.

@@ -1464,6 +1464,14 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
+// GATE RESTORED. This module is `gpu-offload`-only (see the module doc),
+// and this function lost its `#[cfg]` when a NEW function was inserted
+// between its doc comment and its body: the attribute stayed with the
+// comment, so it gated the newcomer and this one was left bare. A default
+// build then compiled a body full of `gpu-offload`-only imports --
+// `Value`, `arg_long`, `state::` -- and `cargo check -p
+// cratonvm-native-builtins` was 16 errors on dev's tip.
+#[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
@@ -1899,6 +1907,14 @@ fn builtin_array_to_host_into(
     Ok(Some(Value::Int(1)))
 }
 
+// GATE RESTORED. This module is `gpu-offload`-only (see the module doc),
+// and this function lost its `#[cfg]` when a NEW function was inserted
+// between its doc comment and its body: the attribute stayed with the
+// comment, so it gated the newcomer and this one was left bare. A default
+// build then compiled a body full of `gpu-offload`-only imports --
+// `Value`, `arg_long`, `state::` -- and `cargo check -p
+// cratonvm-native-builtins` was 16 errors on dev's tip.
+#[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],

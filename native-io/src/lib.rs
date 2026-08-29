@@ -2721,8 +2721,22 @@ fn native_fos_write_bytes_ignore_append(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null buffer is an NPE, the same as at the `write([BII)V` door next to
+    // it. The two were repaired apart: `write` got the check and `writeBytes`,
+    // which is where the REAL `FileOutputStream.write(byte[],int,int)`
+    // bytecode arrives, kept the silent no-op. MEASURED with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/File`, which makes `write` yield
+    // and routes the call here: `fos.write(null, 0, 1)` went from NPE back to
+    // no-throw. Latent while the `write` override stands, and a lie about a
+    // write the moment it does not.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         _ => return Ok(None),
     };
     let off_i = match args.get(2) {
