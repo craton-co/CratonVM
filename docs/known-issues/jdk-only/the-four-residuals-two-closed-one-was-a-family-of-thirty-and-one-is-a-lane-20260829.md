@@ -193,7 +193,90 @@ could have produced — a defect on its own terms, needing no oracle.
 interface is invisible to it. Both statements are true of the `tcnetssl` arm at
 once: the DoD predicate holds and the object model is violated.
 
-### Why it is not fixed here
+### The FFM half has its own page, written the same day
+
+`arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md`
+landed on `dev` while this lane was measuring, and it is the deeper treatment of
+the FFM family: 59 rows, every `Arena` factory and every segment producer, and
+the consequence this page did not have — `jdk.incubator.vector`'s
+`fromMemorySegment0Template` opens with `checkcast
+jdk/internal/foreign/AbstractMemorySegmentImpl`, which no interface stamp can
+satisfy. Read that page for FFM; this section is the general species and the
+instrument.
+
+The two agree where they overlap, including the finding that `Arena.ofConfined()`
+is wrong in BOTH modes, reached independently.
+
+**They differ on one point of method, and both are right for their subject.**
+That page deliberately does not assert the class NAME — for FFM the concrete
+class is an implementation token the two VMs may legally disagree on. This
+lane's `AbstractReceiverSweep` prints names and diffs them, because its subject
+is 29 factories across `java.nio`, `java.security` and the platform singletons,
+where the JDK's answer often IS the contract. In both probes the oracle-free
+half is the same and is the one that matters: `isInterface || isAbstract` is a
+defect on its own terms, with no oracle needed.
+
+### The gap is now closed — and the population is 31, not 7
+
+`try_alloc_concurrent_synthetic`, the funnel natives use to mint stand-in
+receivers, now asks `instantiable`'s predicate and warns once per class when the
+answer is no. It is the funnel both the segment fallback and the `Arena`
+carriers go through, it already reads `class_num_total_fields` unconditionally,
+and it is already `#[track_caller]` — so the requester `file:line` costs
+nothing, and this is not on the per-object hot path that `layout_alias` has to
+buy a flag to observe.
+
+Run over the five definition-of-done arms under `--jdk-only`, it names **31
+distinct classes**, on every one of which the same report says
+`compatibility_classes: 0`:
+
+```text
+java/nio/file/Path                     interface  phases_late/nio_file.rs:9429
+java/nio/file/FileSystem               abstract   phases_late/nio_file.rs:12229
+java/nio/file/spi/FileSystemProvider   abstract   phases_late/nio_file.rs:13334
+java/nio/file/attribute/FileAttribute  interface  phases_late/nio_file.rs:22845
+java/lang/invoke/MethodHandle          abstract   lang_invoke.rs:9894
+java/lang/invoke/VarHandle             abstract   lang_invoke.rs:2821
+java/lang/foreign/Arena                interface  phases_late/foreign_ffm.rs:864
+java/lang/foreign/MemorySegment        interface  panama.rs:124
+jdk/internal/foreign/MemorySessionImpl abstract   phases_late/foreign_ffm.rs:759
+java/lang/reflect/ParameterizedType    interface  generics.rs:519
+java/lang/reflect/GenericArrayType     interface  generics.rs:730
+java/lang/reflect/TypeVariable         interface  generics.rs:896
+java/lang/StackWalker$StackFrame       interface  phases_late/reflect_invoke.rs:2641
+java/security/MessageDigest            abstract   jca/message_digest.rs:235
+java/security/Provider                 abstract   jca/provider_chain.rs:338
+java/security/PrivateKey               interface  keystore.rs:2883
+javax/net/ssl/SSLSocket                abstract   net_phase_e.rs:15683
+javax/net/ssl/SSLSocketFactory         abstract   net_phase_e.rs:15264
+javax/net/ssl/SSLSession               interface  t27_tls.rs:15857
+javax/net/ssl/SSLSessionContext        interface  net_phase_e.rs:1035
+java/util/stream/Stream                interface  phases_late/reflect_invoke.rs:2731
+java/util/stream/IntStream             interface  lang_string.rs:13095
+java/util/ResourceBundle               abstract   locale_resources.rs:1780
+java/net/JarURLConnection              abstract   net_phase_e.rs:10631
+java/lang/Runnable                     interface  t27_tls.rs:16429
+… and the six java.lang.management / com.sun.management MXBean interfaces
+```
+
+**Two numbers, two questions, and they must not be conflated.** The census
+counts ALLOCATIONS: some of these objects may never escape the native that made
+them, and an interface-classed object nobody outside sees is a latent defect
+rather than a live one. `probes/AbstractReceiverSweep`'s **7** are the ones a
+FACTORY hands back — confirmed reachable from application code. The census says
+where to look; the probe says which ones a program can already trip over.
+
+What this does not do is put the species in the report. A new `JdkOnlyViolation`
+variant is a wire-format change — `kind()` is the documented `"kind"` field of
+every row, `difftest/src/census.rs` tallies by exactly that string, and
+`jfr/src/jdk_only.rs` holds a closed label vocabulary with its own schema
+version. Four crates and a schema bump, and a half-added kind (recorded but not
+tallied, or tallied but not labelled) is worse than none. `warn!` reaches
+stderr, which `probes/dodscreen-linux.sh` already keeps per arm, so the screen
+can see it today; promoting it to a row is the next step and now has a
+population to justify it.
+
+### Why the FFM carriers are still not fixed here
 
 The tree already has both primitives — `instantiable::first_instantiable` to
 pick a concrete class, and `appended_slots::base_for_class` to keep private

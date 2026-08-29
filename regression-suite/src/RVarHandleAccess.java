@@ -195,6 +195,52 @@ public final class RVarHandleAccess {
         eq("getAndAdd", 42, (int) VI.getAndAdd(h, 5));
         eq("getAndAdd result", 47, (int) VI.get(h));
 
+        // 3b. compareAndSet on a REFERENCE field.
+        //
+        // Separate from the `int` CAS above because the payload path is
+        // different, not because the API is: a reference CAS fires the SATB
+        // pre-barrier on `expected` BEFORE the store and the post
+        // `write_barrier` only on success, and it is the shape
+        // `CompletableFuture.tryPushStack` runs on every push.
+        //
+        // Warmed in a loop so the compiled route is the one under test — a
+        // handful of calls would measure the interpreter and say nothing about
+        // the bind. The alternation is deliberate: a CAS that always writes the
+        // value already there would pass against an implementation that never
+        // stores at all.
+        // Save and restore: a later section asserts what `ref` holds, so this
+        // block must leave the field exactly as it found it.
+        String savedRef = (String) VR.get(h);
+        String sa = "alpha";
+        String sb = "beta";
+        VR.set(h, sa);
+        int hits = 0;
+        int misses = 0;
+        for (int n = 0; n < WARM; n++) {
+            String cur = (n & 1) == 0 ? sa : sb;
+            String nxt = (n & 1) == 0 ? sb : sa;
+            if (VR.compareAndSet(h, cur, nxt)) {
+                hits++;
+            }
+            // A stale expected value must NOT swap, and must not disturb the
+            // field either — the miss path still runs the pre-barrier.
+            if (VR.compareAndSet(h, "never-stored", sa)) {
+                misses++;
+            }
+        }
+        eq("ref CAS hits", WARM, hits);
+        eq("ref CAS misses swapped", 0, misses);
+        eq("ref CAS final", sa, (String) VR.get(h));
+        // null is a legal reference operand on both sides of the compare.
+        eq("ref CAS to null", Boolean.TRUE, VR.compareAndSet(h, sa, null));
+        // `eq` compares with `expected.equals(actual)`, so a null EXPECTED
+        // would NPE inside the harness rather than assert anything. Publish the
+        // nullness as a boolean instead.
+        eq("ref CAS null read", Boolean.TRUE, VR.get(h) == null);
+        eq("ref CAS from null", Boolean.TRUE, VR.compareAndSet(h, null, sb));
+        eq("ref CAS from null read", sb, (String) VR.get(h));
+        VR.set(h, savedRef);
+
         // 4. A static-field handle has no receiver coordinate. If the fast
         //    path ever claimed one it would read slot N of the *handle*.
         int st = 0;

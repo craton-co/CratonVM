@@ -1,6 +1,10 @@
-# L2 residuals — the write path is priced now, and what that leaves
+# L2 residuals — both priced now, and the one item that is not this lane's
 
-**Status: OPEN, two items, neither a correctness question.** 2026-08-28. The
+**Status: OPEN, ONE item, and it is not in this lane's families.** N1 and N2
+are both answered with numbers and are kept below as the record of what the
+numbers were; N3 stands as a guard. The live item is §4.
+
+**Superseded status line:** OPEN, two items, neither a correctness question. 2026-08-28. The
 correctness half is closed and recorded in the retired
 `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up: 747
 probe rows, 0 differing lines against HotSpot `jdk-25.0.4+7` in both
@@ -70,7 +74,7 @@ path reads `coder` where the synthetic one had nothing to read. Whether that is
 for the whole measurement, which is stated because it is the reason no stronger
 claim is made.
 
-## N2 — `java/lang/StringBuilder`'s own 62 rows are a candidate retirement, DECLINED
+## N2 — ANSWERED: the retirement is correct and costs 2.0x-3.4x, so it stays DECLINED
 
 `java.lang.StringBuffer`'s 62 registrations were retired because every one of its
 methods is a `synchronized` delegation to `super` or a body touching only its own
@@ -78,14 +82,37 @@ methods is a `synchronized` delegation to `super` or a body touching only its ow
 so the same argument applies to its 62 rows — and it would halve this family's
 remaining shadow surface.
 
-The throughput objection is now weaker than it was, because N1 has its number:
-the write path costs nothing this instrument can resolve. What is left is the
-second reason, which N1 does not touch: `java/lang/StringBuilder` is the class
-the interpreter's `JitIntrinsic::StringBuilder*` door keys on
-(`native-builtins/src/intrinsics/mod.rs` maps `("java/lang/StringBuilder",
-"append", …)` and seven siblings). Retiring the registrations without deciding
-what happens to that door is a change with two moving parts, and this lane did
-not take it.
+It was measured instead of argued. `CRATONVM_ENFORCE_NATIVE_SHADOW` scoped to
+the three classes IS the retirement minus the registration edit — checked, not
+assumed: armed, the families go from 39 `native-won` / 36 `bytecode-won` to
+**0 / 67**, with 38 triples flipping outcome.
+
+**Correctness: free.** `RStringBuilderContent` passes all 118 checks armed
+(`WORKER-3-NOTE-3` §3 measured it dying after 56 with an `ArrayStoreException`),
+`RStrings` / `RJdkStringCodePoints` / `RJitStringLayout` all pass armed, the
+747-row probe is **0-diff ARMED against HotSpot**, and the whole `--jdk-only`
+corpus is **111/112** armed.
+
+**Throughput: 2.0x-3.4x.** Same dial, same binary, ABBA over four rounds, on a
+host at load average 6:
+
+```text
+appendString   1375 -> 2774   2.02x     charAt      5482 -> 18691   3.41x
+appendChar      914 -> 2358   2.58x     inflating   2876 ->  5779   2.01x
+appendInt       954 -> 2404   2.52x     toString      28 ->    32   ranges overlap
+```
+
+Five of six separate cleanly — non-overlapping ranges, eight samples each way.
+`toString` is the exception and it explains the rest: it is the one shape where
+the native and the bytecode do the same amount of work, so it is the one shape
+where the dispatch route does not decide the cost.
+
+**So the registrations stay, for a measured reason rather than a cautious one.**
+The second objection stands untouched: `java/lang/StringBuilder` is the class the
+interpreter's `JitIntrinsic::StringBuilder*` door keys on
+(`native-builtins/src/intrinsics/mod.rs`), so a retirement has two moving parts.
+A future lane that wants these rows gone needs a JIT intrinsic for the bytecode
+path, not a re-run of this measurement.
 
 ## N3 — three methods are correct because the layout is, not because anyone registered them
 
@@ -110,3 +137,35 @@ against a layout the VM may not have. Read the class's public API against the
 registrar's list, not only the report. For this family the gap was six methods;
 three were broken and three were fine, and no instrument in this campaign would
 have told them apart.
+
+---
+
+## 4 — the LIVE item, and it is not this lane's: `RJdkEnumerations`
+
+The scope brief's known-red list reads *"`RJdkEnumerations` — dev's `a0168ed03`,
+bisected, recorded"*, and its table records L6 as having FIXED the
+`ConcurrentHashMap.elements()` mechanism behind that. Under `--jdk-only` the
+vector still fails, and it is neither of those things. MEASURED on the final
+binary, running the vector directly:
+
+```text
+unarmed  rc=1  NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
+armed    rc=1  NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
+```
+
+Identical with the builder enforcement dial armed and unarmed, so it is not a
+string item at all. It is a **fabricated compatibility class that `--jdk-only`
+refuses** — the Phase-1 shape ("a fabricated receiver kills its caller"), not a
+Phase-2 shadow-retirement one — and it is the last red on the `--jdk-only` and
+`SUITE=all` arms that every lane has been writing off as known.
+
+**Before starting: the obvious mint site is not the one.**
+`native-collections/src/lib.rs:7206` (`alloc_arraylist_iterator`) already carries
+the refusal landing, added for exactly this symptom and documented there at
+length — it falls back to `real_snapshot_iterator` over an exact-length copy. So
+the surviving request comes from elsewhere; `grep AL_VIEW_ITR_CLASS` leaves the
+three `r.register(AL_VIEW_ITR_CLASS, …)` rows as the candidates, which is a
+native registered on a fabricated class NAME, where the name may be resolved for
+DISPATCH rather than allocated.
+
+**Unowned.** L3 owned `java.util` and is closed.
