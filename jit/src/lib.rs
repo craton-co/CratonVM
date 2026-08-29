@@ -26639,6 +26639,30 @@ mod tests {
     /// the background tiering door published FOR the wrapped entry was handed
     /// to callers that supply no monitor. A gate in front of a slow path guards
     /// nothing once the fast path can answer.
+
+    /// A copy of `src` with every ASCII whitespace character removed, for
+    /// witnesses that must survive `cargo fmt`.
+    ///
+    /// A source witness exists to say "this guard is still in the code". When
+    /// it anchors on an exact string it also, silently, asserts how that string
+    /// is WRAPPED — and then a formatting pass makes it fail while reporting
+    /// that the guard is gone. `3de6b9c64` did exactly that to
+    /// `the_dispatch_helpers_jit_cache_arm_refuses_a_wrapped_entry_body`:
+    /// `jit_cache.get(` became `jit_cache\n    .get(`, the witness stopped
+    /// matching, and its message said the arm "must still exist" about an arm
+    /// that had not changed at all.
+    ///
+    /// Stripping whitespace collapses every legal formatting of the same
+    /// expression onto one string, so the assertion is about the code.
+    ///
+    /// It does NOT strip comments, and it must not: matching the CODE form is
+    /// how these witnesses avoid passing against a deleted check that a nearby
+    /// comment still describes. The patterns below all contain punctuation no
+    /// prose carries (`|compiled|!`), which is what keeps that true.
+    fn code_only(src: &str) -> String {
+        src.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+    }
+
     #[test]
     fn the_callee_cache_fast_path_refuses_a_wrapped_entry_body() {
         let src = std::fs::read_to_string(format!(
@@ -26646,12 +26670,19 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .expect("read jit_bridge.rs");
+        let flat = code_only(&src);
+        assert!(
+            flat.len() > 100_000,
+            "jit_bridge.rs collapsed to {} chars — the read did not reach the \
+             file, so everything below would pass vacuously",
+            flat.len()
+        );
 
-        let at = src
-            .find("if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id)")
+        let at = flat
+            .find("ifletSome(compiled)=jit_cache.get(class_name,method_name,descriptor,probe_class_id)")
             .expect("the callee `jit_cache` fast path must still exist");
-        let end = src[at..]
-            .find("return Some((compiled, entry, needs_ctx));")
+        let end = flat[at..]
+            .find("returnSome((compiled,entry,needs_ctx));")
             .map(|off| at + off)
             .expect("the fast path must still hand back an entry");
         // The CODE form, not the bare identifier: this arm carries an
@@ -26659,7 +26690,7 @@ mod tests {
         // let the witness pass against a deleted check. The sibling witness
         // below was caught doing exactly that.
         assert!(
-            src[at..end].contains("if compiled.requires_wrapped_entry"),
+            flat[at..end].contains("ifcompiled.requires_wrapped_entry"),
             "`try_jit_compile_callee`'s `jit_cache` fast path hands back a compiled \
              entry without asking `requires_wrapped_entry`. Every caller of this \
              function CALLs that entry raw, with no monitor."
@@ -26688,17 +26719,35 @@ mod tests {
         // that only inspects `has_indy_trap` and never hands out an entry, and
         // matching that one would make this witness pass while the real arm
         // went unguarded.
-        let at = src
-            .match_indices("if let Some(compiled) = jit_cache.get(")
-            .map(|(i, _)| i)
-            .find(|&i| src[i..(i + 200).min(src.len())].contains("info.class_name"))
+        let flat = code_only(&src);
+        assert!(
+            flat.len() > 100_000,
+            "helpers.rs collapsed to {} chars — the read did not reach the file, \
+             so everything below would pass vacuously",
+            flat.len()
+        );
+
+        // The arm is identified by what it reads (`info.*`, the dispatch site's
+        // own metadata), which is what distinguishes it from the two other
+        // `requires_wrapped_entry` filters in this file.
+        let at = flat
+            .find("ifletSome(compiled)=jit_cache.get(info.class_name,info.method_name,info.descriptor,info_class_id,)")
             .expect("the dispatch helper's jit_cache arm must still exist");
-        let window = &src[at..(at + 1400).min(src.len())];
+
+        // ORDERING, not proximity. The old form asked whether the guard
+        // appeared within 1400 characters, which says nothing about whether it
+        // gates anything. What matters is that the filter runs BEFORE the
+        // `DISPATCH_CACHE` insert: serving a synchronized body once is bad, and
+        // caching it makes every later call at the site run unlocked too.
+        let cache_at = flat[at..]
+            .find("DISPATCH_CACHE.with(")
+            .map(|off| at + off)
+            .expect("the arm must still populate DISPATCH_CACHE");
         // The CODE form. Matching the bare identifier passed against a
         // `.filter(|_c| true)` because the explanatory comment above the
         // filter still named the field -- a probe that could not fail.
         assert!(
-            window.contains("!compiled.requires_wrapped_entry"),
+            flat[at..cache_at].contains(".filter(|compiled|!compiled.requires_wrapped_entry)"),
             "`jit_invoke_dispatch`'s `jit_cache` arm fills `DISPATCH_CACHE` with a \
              raw entry without asking `requires_wrapped_entry`"
         );
