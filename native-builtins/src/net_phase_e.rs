@@ -3279,10 +3279,34 @@ pub(crate) fn uri_percent_decode_units(input: &[u16]) -> Vec<u16> {
     if !input.contains(&u16::from(b'%')) {
         return input.to_vec();
     }
+    let open = u16::from(b'[');
+    let close = u16::from(b']');
     let mut out: Vec<u16> = Vec::with_capacity(input.len());
     let mut i = 0;
+    // INSIDE `[...]` A `%` IS LITERAL.
+    //
+    // `java.net.URI.decode(String)` is `decode(s, true)` — its parameter is
+    // named `ignorePercentInBrackets` — and every decoded accessor reaches it
+    // through that one entry point. The exemption is RFC 6874's: the `%` of a
+    // zone identifier `%25eth0` is part of the literal address, and decoding it
+    // destroys the only thing separating a zone id from a percent-escape.
+    //
+    // MEASURED against HotSpot 25.0.4+7 by
+    // `apps/probes/UriRecompositionSweep.java`:
+    //
+    //   URI.create("http://[fe80::1%25eth0]/a").getAuthority()
+    //     HotSpot   [fe80::1%25eth0]
+    //     was       [fe80::1%eth0]
+    //
+    // and `getSchemeSpecificPart()` beside it, through this same helper.
+    let mut in_brackets = false;
     while i < input.len() {
-        if input[i] == u16::from(b'%') {
+        if input[i] == open {
+            in_brackets = true;
+        } else if input[i] == close {
+            in_brackets = false;
+        }
+        if input[i] == u16::from(b'%') && !in_brackets {
             let mut bytes: Vec<u8> = Vec::new();
             let mut j = i;
             while j + 2 < input.len() && input[j] == u16::from(b'%') {
@@ -3510,10 +3534,24 @@ fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFai
 
     let absolute = path.first() == Some(&slash);
     let segs: Vec<&[u16]> = path.split(|&c| c == slash).collect();
-    // A path whose final segment is "." or ".." resolves to a directory, so
-    // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
-    let trailing_slash =
-        path.last() == Some(&slash) || segs.last().is_some_and(|l| is_dot(l) || is_dotdot(l));
+    // A path whose final segment is "." or ".." resolves to a directory, so the
+    // output ends with '/' — but ONLY when that segment was CONSUMED.
+    //
+    // The `..` that this function deliberately KEEPS (see the DEVIATION note
+    // below) is an ordinary segment in the result, and the JDK's `join` does
+    // not put a separator after it. MEASURED against HotSpot 25.0.4+7 by
+    // `apps/probes/UriRecompositionSweep.java`:
+    //
+    //   URI.create("http://host/a/b").resolve("../..")   http://host/..   was http://host/../
+    //   URI.create("..").normalize()                     ..               was ../
+    //   URI.create(".").normalize()                      <empty>          was /
+    //
+    // The last row is the second half of the rule: a relative path whose
+    // segments all vanish is the EMPTY string, not "/". `trailing_owed` is
+    // therefore resolved against the finished `out` rather than against the
+    // input alone.
+    let final_dot_segment = segs.last().is_some_and(|l| is_dot(l) || is_dotdot(l));
+    let ended_with_slash = path.last() == Some(&slash);
     let mut out: Vec<&[u16]> = Vec::new();
     for seg in &segs {
         if seg.is_empty() || is_dot(seg) {
@@ -3554,7 +3592,11 @@ fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFai
         }
         result.extend_from_slice(seg);
     }
-    if trailing_slash && result.last() != Some(&slash) {
+    // The final `.`/`..` was consumed unless it is still standing at the end of
+    // `out` — which only a KEPT `..` can be.
+    let kept_final_dotdot = final_dot_segment && out.last().is_some_and(|l| is_dotdot(l));
+    let trailing_slash = ended_with_slash || (final_dot_segment && !kept_final_dotdot);
+    if trailing_slash && !out.is_empty() && result.last() != Some(&slash) {
         result.push(slash);
     }
     Ok(result)
@@ -3605,7 +3647,32 @@ pub(crate) fn uri_split(
     };
     let (authority, path) = if let Some(after) = without_query.strip_prefix("//") {
         let end = after.find('/').unwrap_or(after.len());
-        (Some(after[..end].to_string()), after[end..].to_string())
+        if end == 0 {
+            // AN EMPTY AUTHORITY IS NOT AN AUTHORITY.
+            //
+            // `java.net.URI.parseHierarchical` scans the authority region and,
+            // when it is empty, leaves `authority` NULL and lets the rest be
+            // the path — it does not record a present-but-empty authority.
+            // This returned `Some("")` instead, and `uri_recompose` emits `//`
+            // for any `Some`, so every path that RECOMPOSES kept a `///` the
+            // JDK drops:
+            //
+            //   URI.create("file:///C:/tmp/f.txt").resolve("x")
+            //     HotSpot   file:/C:/tmp/x
+            //     was       file:///C:/tmp/x
+            //
+            // The accessors were already right — both VMs answer
+            // `getAuthority() == null` for `file:///a`, and `toString()` of the
+            // parsed URI is the input text either way — so this was visible
+            // ONLY through an operation that rebuilds the string. That is why
+            // `uri-resolve-folded-a-reference-into-the-host-…-20260826.md` §4
+            // saw a single row and deferred it as not worth the blast radius:
+            // its probe asked one. `UriRecompositionSweep` asks 1258 and finds
+            // **26**, every one of them a `resolve` off an empty-authority base.
+            (None, after.to_string())
+        } else {
+            (Some(after[..end].to_string()), after[end..].to_string())
+        }
     } else {
         (None, without_query.to_string())
     };
@@ -4957,7 +5024,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             let base = uri_raw_string(ctx, this);
             let reference = match args.get(1) {
                 Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
-                _ => return Ok(Some(Value::Object(Some(this)))),
+                // A null argument is a NullPointerException, not the
+                // receiver. The JDK dereferences the argument's own fields
+                // before any resolution happens, so answering `this` is a
+                // fabricated success a caller cannot tell from a no-op.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
             };
             let resolved = uri_resolve_ref(&base, &reference)?;
             Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
@@ -4982,6 +5058,33 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // parseServerAuthority() -> `this` when the authority is server-based, and
+    // a URISyntaxException naming the offending character when it is not.
+    //
+    // It had NO registration, so real `java.net.URI` bytecode ran against a
+    // synthetic receiver whose parsed fields it could not see, and the method
+    // silently answered the receiver for every input. MEASURED against HotSpot
+    // 25.0.4+7 by `apps/probes/UriRecompositionSweep.java`:
+    // `URI.create("http://host:x/a").parseServerAuthority()` is
+    // `Illegal character in port number at index 12` there and was the URI
+    // itself here — a refusal turned into a value, which is the shape a caller
+    // uses this method precisely to avoid.
+    r.register(
+        uri,
+        "parseServerAuthority",
+        "()Ljava/net/URI;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = uri_raw_string(ctx, this);
+            if let Some(fail) = crate::uri_server_authority_fail(&raw) {
+                if let Some(exc) = crate::uri_syntax_exception_pub(ctx, &raw, &fail) {
+                    return Err(exc);
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+
     // relativize(URI) -> JDK-compatible prefix relativization for hierarchical
     // URIs. Real bytecode reads URI internals that our synthetic constructors do
     // not always populate, so run this from the raw text instead.
@@ -4993,7 +5096,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let other = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(Some(this)))),
+                // A null argument is a NullPointerException, not the
+                // receiver. The JDK dereferences the argument's own fields
+                // before any resolution happens, so answering `this` is a
+                // fabricated success a caller cannot tell from a no-op.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into())
+                }
             };
             // G75-1 N3, the last diverging row of that probe. `relativize` is
             // not an accessor: it REBUILDS a path from segments rather than
@@ -5087,6 +5199,32 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             };
             if let Some(pos) = illegal {
                 return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
+            }
+            // `URI.create` is `new URI(str)` with the checked exception
+            // translated, so it owes the same refusals in the same order.
+            if let Some(pos) = crate::uri_expected_authority_fail_index(&s) {
+                return Err(iae(format!("Expected authority at index {pos}: {s}")));
+            }
+            // The bracketed-authority check the CONSTRUCTOR already runs. Both
+            // doors owe the same refusals — `URI.create` is documented as
+            // `new URI(str)` with the checked exception translated — and this
+            // one was only on the constructor, so `http://[::1/a` was refused
+            // by `new URI` and accepted here.
+            // The SAME closing-bracket rule the constructor runs, reached
+            // through the function it was extracted into rather than a second
+            // copy of it.
+            if let Some(pos) = crate::uri_closing_bracket_fail_index(&s) {
+                return Err(iae(format!(
+                    "Expected closing bracket for IPv6 address at index {pos}: {s}"
+                )));
+            }
+            if crate::nbflags().uri_strict_chars {
+                if let Some(fail) = crate::uri_ipv6_authority_fail(&s) {
+                    return Err(iae(match fail.index {
+                        Some(pos) => format!("{} at index {pos}: {s}", fail.reason),
+                        None => format!("{}: {s}", fail.reason),
+                    }));
+                }
             }
             if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
                 return Err(iae(format!(

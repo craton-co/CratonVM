@@ -1133,13 +1133,39 @@ fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Blocking remove with timeout in milliseconds.
-    let timeout_ms = match args.get(1) {
-        Some(Value::Long(v)) => *v as u64,
-        Some(Value::Int(v)) => *v as u64,
+    //
+    // `ReferenceQueue.remove(long)`'s first statement is
+    // `if (timeout < 0) throw new IllegalArgumentException("Negative timeout
+    // value")`, and the cast below is why that mattered: `*v as u64` turns -1
+    // into `u64::MAX`, so a negative timeout did not refuse and did not return
+    // -- it WAITED FOREVER. `apps/probes/RefFamilySweep.java` found it the way
+    // hangs are found, by its own output stopping: 54 rows written against
+    // HotSpot's 60, with the missing six after `remove with a negative
+    // timeout`.
+    let timeout_signed = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
         _ => 0,
     };
+    if timeout_signed < 0 {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/lang/IllegalArgumentException",
+            "Negative timeout value",
+        ));
+    }
+    let timeout_ms = timeout_signed as u64;
+    // ZERO MEANS NO TIMEOUT, not "poll once". Same convention as
+    // `Object.wait(0)`, and the JDK spells it in `remove`'s own body:
+    // `long start = (timeout == 0) ? 0 : System.nanoTime()`, then
+    // `lock.await(timeout)` with a zero that waits indefinitely. This returned
+    // `poll()`'s answer instead, so a caller asking to block until something
+    // arrives got an immediate null.
+    //
+    // The blocking overload is the correct implementation and already exists,
+    // so this is a delegation rather than a second copy of the wait loop.
     if timeout_ms == 0 {
-        return native_rq_poll(ctx, args);
+        return native_rq_remove_blocking(ctx, args);
     }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,

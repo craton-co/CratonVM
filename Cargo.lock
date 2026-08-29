@@ -513,6 +513,7 @@ name = "cratonvm-cuda-bridge"
 version = "0.3.0"
 dependencies = [
  "bytemuck",
+ "cratonvm-types",
  "cudarc",
  "thiserror",
  "tracing",

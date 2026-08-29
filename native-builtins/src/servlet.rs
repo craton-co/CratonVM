@@ -7412,11 +7412,36 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 },
             )))
         });
+        // `flip`/`clear`/`rewind` DISCARD THE MARK. These two bodies are the
+        // `ByteBuffer` twins forty lines up with the `s2_bb_set_mark` line
+        // dropped, and the omission is invisible from this class's own
+        // methods: `mark()` and `reset()` are NOT registered for the typed
+        // buffers, so the real `Buffer` bytecode sets and reads the real
+        // `mark` field while these natives move position and limit in the
+        // side slots. Nothing reconciles them.
+        //
+        //   IntBuffer ib = ...;  Buffer b = ib;
+        //   b.mark(); b.flip(); b.reset();
+        //     HotSpot   InvalidMarkException
+        //     this VM   no throw, and the position silently jumps back into
+        //               a region flip just excluded
+        //
+        // MEASURED with `apps/probes/L4BridgeSweep.java` on Short/Int/Long/
+        // Float/DoubleBuffer, heap and view arms alike -- 11 rows. `ByteBuffer`
+        // was green because its twin has the line, and `CharBuffer` because
+        // `charset_buffers.rs` has it too; this loop is the one copy that
+        // never got it.
+        //
+        // Only reachable through a `Buffer`-typed reference, since that is the
+        // only spelling javac emits for `()Ljava/nio/Buffer;` -- which is why
+        // 501 rows of `L4TypedBufferSweep` over these exact classes never saw
+        // it.
         r.register(cls, "flip", "()Ljava/nio/Buffer;", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let pos = s2_bb_pos(ctx, this);
             ctx.set_field(this, BB_LIMIT, Value::Int(pos));
             ctx.set_field(this, BB_POS, Value::Int(0));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         r.register(cls, "clear", "()Ljava/nio/Buffer;", |ctx, args| {
@@ -7424,6 +7449,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let cap = s2_bb_cap(ctx, this);
             ctx.set_field(this, BB_POS, Value::Int(0));
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
+            s2_bb_set_mark(ctx, this, -1);
             Ok(Some(Value::Object(Some(this))))
         });
         // The element type differs per family, and this loop registered all

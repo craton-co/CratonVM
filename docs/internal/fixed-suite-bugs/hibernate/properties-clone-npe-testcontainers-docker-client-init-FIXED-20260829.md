@@ -116,6 +116,18 @@ failing quietly instead of loudly. Loudly is how this was found.
   Postgres container, zero NPEs in the log
 * `regression-suite/run.sh` **75/75**
 
+### Is there a third?
+
+No. Brace-matched over `Properties.java`, **29** methods have a body that
+touches the `map` field. **27** are natively overridden in
+`register_properties_sidetable` / `phases_early`. The two that are not are
+`toString` and `hashCode` — both `return map.something()` — and both are
+nonetheless correct on every receiver shape, including a fresh
+`new Properties()` whose `map` is null. That is unexplained rather than
+designed, so it is written down here: if either ever starts throwing the
+null-`map` NPE, it is the same defect and the same one-line cure, and the
+enumeration above is where to start.
+
 `RPropertiesClone` asserts CONTENTS and independence in BOTH directions across
 all three receiver shapes. That is deliberate: a clone that aliased the
 original's backing, or that came back empty, passes any "did it throw" check,
@@ -123,19 +135,63 @@ and both were live failure modes here — the shallow copy aliases `map` unless
 the override replaces it, and the side-table is keyed by object identity, so a
 clone starts with an empty one unless the override replicates it.
 
-## The one question left open, and why it does not matter
+## Was it a regression? Yes — UNCOVERED, not caused, by a correctness fix
 
-The report asked whether this was a regression. A binary from another worktree
-built earlier the same day did **not** reproduce it — same null `map`, yet all
-eight clone cases passed — which points at a change in how `Properties.clone()`
-resolves rather than at the null `map` itself. That binary's source commit
-could not be confirmed (its worktree HEAD had moved since the build), and
-neither its HEAD nor the dev tip has ever carried a `clone` override, so the
-window was not pinned and no claim is made here.
+The null `map` is long-standing. What changed is what `new ConcurrentHashMap<>
+(null)` does, and it changed 12 hours before the report.
 
-It does not matter to the fix: an explicit registration is immune to whichever
-routing decision let the real body run. It would matter to anyone who sees this
-signature reappear on an OLDER commit — which is what `RPropertiesClone` is for.
+`Properties.clone()`'s second statement is `clone.map = new ConcurrentHashMap<>
+(map)`. `ConcurrentHashMap(Map m)` is `this.sizeCtl = DEFAULT_CAPACITY;
+putAll(m);`, and CratonVM serves that constructor with
+`native_chm_init_from_map`. Until 2026-08-28 that body **answered an empty map
+for a null source** instead of throwing. Its own comment now records what it
+used to do:
+
+> `ConcurrentHashMap(Map m)` … `putAll` opens by calling `m.size()`, so a null
+> source is an NPE BEFORE the map is usable. **This body answered an empty map
+> instead** — the shape `phase-2-worklist` records as the worst a refusal can
+> take, because the caller does not learn it passed null until much later.
+
+So `clone.map = new ConcurrentHashMap<>(null)` quietly produced an empty CHM,
+`clone()` returned normally, and the clone was even CORRECT — every Properties
+reader in this VM is native and reads the side-table, which `Object.clone`
+replicates. The defect was fully masked.
+
+`c8f47f9a5` (**L6 concurrency lane, 2026-08-28 23:36 UTC** — "508 differential
+rows, 30 defects, all four families 0-diff") added the null rejection, correctly
+and to match HotSpot. The next morning `Properties.clone()` began throwing, and
+the report was filed.
+
+Three checks pin it:
+
+* a binary that predates `c8f47f9a5` answers `new ConcurrentHashMap<>(null)`
+  with an empty map, `new HashMap<>(null)` likewise, and `chm.putAll(null)`
+  without throwing — where HotSpot raises NPE for all three — and on that same
+  binary all eight `clone` shapes pass, including the two that fail on `dev`.
+* `replaceAll` fails on BOTH sides, before and after. It is
+  `map.replaceAll(function)` — a direct null-receiver dereference with no
+  constructor argument for anything to be lenient about. That asymmetry is the
+  tell, and it is what rules out any theory based on `clone` being dispatched
+  differently.
+* the traced statement is the one the report's trace names.
+  `Properties.java:1526` IS `clone.map = new ConcurrentHashMap<>(map)`; the NPE
+  has no `ConcurrentHashMap` frame above it because the constructor is served by
+  a native.
+
+**`c8f47f9a5` was right to land.** It replaced a silent wrong answer with the
+JDK's own behaviour. It is named here as the uncovering change, not as a
+mistake — the defect it exposed is the one this page is about, and it had been
+latent for as long as the synthetic Properties has existed.
+
+A caution for whoever reads this next: do NOT date a binary by its worktree's
+HEAD. The one used above had moved since it was built, and an earlier attempt to
+date it by two unrelated L3-lane markers pointed at the wrong lane entirely. The
+only marker that settles it is the presence of the behaviour under test —
+here, whether `new ConcurrentHashMap<>(null)` throws.
+
+None of this changes the fix. An explicit registration does not read `map` at
+all, so it is immune both to the null and to whatever the CHM constructor does
+with it. `RPropertiesClone` is what makes the question moot going forward.
 
 ## Repro (pre-fix)
 

@@ -420,7 +420,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_phase51_natives", 44),
     ("register_phase52_natives", 35),
     ("register_phase53_natives", 45),
-    ("register_phase54_natives", 111),
+    ("register_phase54_natives", 110),
     ("register_phase55_natives", 33),
     ("register_phase56_natives", 40),
     ("register_phase57_natives", 27),
@@ -458,7 +458,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_time_extras_natives", 1),
     ("register_time_natives", 16),
     ("register_tls_natives", 51),
-    ("register_unsafe_define_class", 2),
+    ("register_unsafe_define_class", 1),
     ("register_vector_api_natives", 0),
 ];
 

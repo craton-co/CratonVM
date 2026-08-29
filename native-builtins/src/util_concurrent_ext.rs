@@ -502,12 +502,23 @@ pub(crate) fn register_atomic_reference_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "get", "()Ljava/lang/Object;", native_atomic_ref_get);
     r.register(c, "set", "(Ljava/lang/Object;)V", native_atomic_ref_set);
     r.register(c, "lazySet", "(Ljava/lang/Object;)V", native_atomic_ref_set);
-    r.register(
-        c,
-        "compareAndSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-        native_atomic_ref_cas,
-    );
+    // Deliberately NOT registered (2026-08-29): real-JDK
+    // `AtomicReference.compareAndSet` is one line --
+    // `return VALUE.compareAndSet(this, expectedValue, newValue);` -- and that
+    // `VarHandle.compareAndSet` is now thin-direct-bound (see
+    // `performance/varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`),
+    // so running the real bytecode is now FASTER than this synthetic stub, not
+    // slower. A previous attempt at this exact change (recorded in
+    // `juc-primitives-and-composition-after-the-compile-refusals-20260828.md`,
+    // "What was tried and refuted") measured the stub WINNING (257 vs 289 ns)
+    // because at the time the CAS underneath the real bytecode was still
+    // funnel-served at ~233 ns; that arithmetic flips now that the bind exists.
+    // MEASURED (six interleaved runs, `HibfixVarHandleProbe`, kill-switch as the
+    // only difference, `--dump-native-registry` confirmed no native registered
+    // either way for this exact tuple): stub kept 519.5-543.8 ns (median 531.7),
+    // stub dropped 331.4-344.0 ns (median 332.0) -- a 1.6x win, with
+    // `AtomicInteger.incrementAndGet` unmoved (5.5-6.0 ns both arms) as the
+    // control that says this is the change and not the box.
     r.register(
         c,
         "getAndSet",
@@ -566,31 +577,6 @@ fn native_atomic_ref_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
-}
-
-fn native_atomic_ref_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
-    let expected = args.get(1).copied().unwrap_or(Value::Object(None));
-    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    if crate::nbflags().dbg_loader_trace {
-        if let Value::Object(Some(o)) = new_val {
-            let val_cid = ctx.class_id_of_object(o);
-            let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
-            if val_cn.contains("RootReference") {
-                let frames = ctx.frame_class_ids();
-                let caller_cid = frames.first().copied();
-                let caller_cn = caller_cid
-                    .and_then(|c| ctx.class_name_of_id(c))
-                    .unwrap_or_default();
-                eprintln!(
-                    "[LOADER-TRACE] native_atomic_ref_cas PRE thread={} holder_obj={:p} new_obj={:p} new_class={} new_cid={} caller_class_id={:?} caller_class={}",
-                    ctx.thread_id(), this.as_ptr(), o.as_ptr(), val_cn, val_cid.as_u32(), caller_cid, caller_cn
-                );
-            }
-        }
-    }
-    let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
-    Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
 fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -893,51 +879,26 @@ fn native_lock_support_get_blocker(
 /// clamp, is the only place the under direction survives. Dropping this line
 /// would make the detector quieter in the direction it has reported since it
 /// was written.
-/// A native is about to hand back an instance of a class `new` could never
-/// have produced.
+/// Forward to `native-api`'s uninstantiable-receiver census.
 ///
-/// JVMS §6.5 makes `new` on an ABSTRACT class or an INTERFACE an
-/// `InstantiationError`, so such a receiver is one no bytecode in any image
-/// could have created — a defect on its own terms, with no oracle needed.
-/// `native-api`'s `instantiable` module already owns that predicate; what was
-/// missing is anyone asking it at the point the object is made.
+/// The census itself deliberately does NOT live here: it needs a process-global
+/// dedup set, and `lock_discipline_ratchet` holds this crate to a raw-lock
+/// baseline because this crate re-enters the VM. `native-api`'s
+/// `instantiable::observe_uninstantiable_receiver` carries the whole rationale,
+/// and it sits next to the `ACC_INTERFACE` / `ACC_ABSTRACT` predicate it uses.
 ///
-/// MEASURED 2026-08-29 (`probes/AbstractReceiverSweep`): seven `java.lang.foreign`
-/// sites answer an interface under `--jdk-only` and one — `Arena.ofConfined()`
-/// — does so in compatible mode too, while the report those runs produced said
-/// `compatibility_classes: 0`. The predicate counts classes MINTED and this
-/// species is an allocation against a class that is perfectly real.
-///
-/// Deduped by class name: a segment-heavy workload mints thousands of these and
-/// the interesting fact is the class, once, with the native that asked.
-/// `#[track_caller]` all the way up the funnel, so the location is the NATIVE,
-/// not this line.
+/// `#[track_caller]` on every hop, so the location that reaches the census is
+/// the NATIVE that asked for the shape, not this forwarding line and not
+/// `try_alloc_concurrent_synthetic` in between — the same chain
+/// `report_layout_alias` relies on.
 #[track_caller]
 fn report_uninstantiable_receiver(
     ctx: &dyn NativeContext,
     class_name: &str,
     class_id: cratonvm_types::ClassId,
 ) {
-    use cratonvm_native_api::instantiable::{ACC_ABSTRACT, ACC_INTERFACE};
     let flags = ctx.class_access_flags(class_id);
-    if flags & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
-        return;
-    }
-    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-    if !seen.lock().insert(class_name.to_string()) {
-        return;
-    }
-    let site = core::panic::Location::caller();
-    tracing::warn!(
-        class = %class_name,
-        requester = %format!("{}:{}", site.file(), site.line()),
-        kind = if flags & ACC_INTERFACE != 0 { "interface" } else { "abstract" },
-        "a native allocated an instance of a class `new` could not produce (JVMS 6.5); \
-         the definition-of-done screen's compatibility_classes counts classes MINTED and \
-         cannot see this. Reported once per class."
-    );
+    let _ = cratonvm_native_api::instantiable::observe_uninstantiable_receiver(class_name, flags);
 }
 
 #[track_caller]

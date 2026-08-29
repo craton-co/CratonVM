@@ -893,6 +893,16 @@ pub const INVENTORY: &[E] = &[
     // three are DEFAULT-ON and read `=0` to disable, so they carry `on_key`
     // and the "0" off-word rather than an `off_key`.
     E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
+    // Declared 2026-08-29 with the branch-to-`selp` if-conversion in
+    // `jit-cuda/src/lowering/emit.rs`. OPT-IN: the transform does what it
+    // was built to do and measured slower on the kernel it was built for,
+    // so it is reachable rather than default. The companion knob sets the
+    // budget it spends, in weighted PTX instructions per converted arm
+    // pair, so one binary can sweep the curve -- picking that number by
+    // rebuilding once per point is not possible on a host that moves 2x
+    // between two runs.
+    E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "gpu-if-convert-max-ops", on_key: Some("CRATONVM_GPU_IF_CONVERT_MAX_OPS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
     // A/B lever, never a supported configuration: restore the pre-fix
     // substitution of "slot 0, tagged int" for a field site the VM-side

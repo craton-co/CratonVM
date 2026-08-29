@@ -186,6 +186,18 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # `SUITE=core 63 / 64` all gain one to their DENOMINATOR. A run that reports
 # 104/105 without naming which vector failed has not been read carefully.
 #
+# RArrayStoreLibrary landed 2026-08-29 and every denominator above gains one
+# AGAIN — `SUITE=core` reports `scheduled=76` with it and reported 75 without. It is the LIBRARY-METHOD half of the array-store
+# question RArrayStoreTiers and RArrayStoreInterfaces ask of the OPCODE:
+# Arrays.fill / Arrays.copyOf / Collection.toArray(T[]) / System.arraycopy /
+# Array.set each perform their stores inside a native, so each holds its own
+# copy of the check — and one of those copies refused a legal store into a
+# two-dimensional array, killing nine hibernate-reactive classes. MEASURED on
+# HotSpot 25.0.3+9 in the scheduled configuration: rc=0,
+# PASS RArrayStoreLibrary (114 checks), illegalRefused=10/10,
+# legalAdmitted=18/18. Falsified before landing: it was RED on the pre-fix
+# CratonVM (fails=1, s10's COLD-MESSAGE) and green after.
+#
 # It is a two-tier fixture and that is the whole point: every shape is read at
 # the first (interpreted) invocation and at the last, and the iteration at
 # which the answer moved is PUBLISHED on every row, so a wrong answer that only
@@ -201,7 +213,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # addition this branch had never scheduled. Dropping either side would
 # silently unschedule working coverage, which is the defect several of the
 # guards further down exist to catch.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RJitMapTierDiff RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RPropertiesClone RSslNullSession RSslLiveSession RSslEndpointIdentification RVarHandleAccess RStringBuilderContent RUnsafeArrayBase RLangPackages RSegmentBulkCopy RStreamToListCopy RFileChannelFastIo RAnnotationProxyGate RJdkProcessStreams RNetIfaceScope"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RJitMapTierDiff RArrayStoreTiers RArrayStoreInterfaces RArrayStoreLibrary RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RPropertiesClone RSslNullSession RSslLiveSession RSslEndpointIdentification RVarHandleAccess RStringBuilderContent RUnsafeArrayBase RLangPackages RSegmentBulkCopy RStreamToListCopy RFileChannelFastIo RAnnotationProxyGate RJdkProcessStreams RNetIfaceScope"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is

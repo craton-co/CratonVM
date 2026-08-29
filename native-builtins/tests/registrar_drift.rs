@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1225;
+const BASELINE_TOTAL_DRIFT: usize = 1223;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1358;
+const BASELINE_TOTAL_PAIRS: usize = 1356;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -537,6 +537,43 @@ const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
         "cratonvm/internal/foreign/MemorySegmentImpl",
         "reinterpret",
         "(J)Ljava/lang/foreign/MemorySegment;",
+    ),
+    // **AtomicReference.compareAndSet (1), 2026-08-29.** Collapsed by DELETION
+    // of the shipping twin, not by a merge: `7c90ec930` de-registered
+    // `util_concurrent_ext`'s copy because the method is one line on a real JDK
+    // -- `VALUE.compareAndSet(this, expectedValue, newValue)` -- and the stub
+    // had become the SLOWER of the two once the VarHandle reference CAS
+    // underneath it was bound. The baseline was not re-taken in that commit, so
+    // this row went stale and `the_drift_baseline_has_no_stale_rows` went red on
+    // `dev`.
+    //
+    // MEASURED on `--dump-native-registry`, not read off the source, on a
+    // `--features synthetic-jdk` debug binary (2026-08-29 18:34):
+    //
+    //   compareAndSet (Ljava/lang/Object;Ljava/lang/Object;)Z
+    //     registered_by = native-builtins/src/phases_early.rs:20828
+    //     owns_slot = true   kind = intrinsic   overwrote = null
+    //
+    // `overwrote = null` is the load-bearing field this list's header names: it
+    // is positive evidence that nothing registers the triple ahead of the
+    // survivor, so the duplicate is gone rather than merely losing the race.
+    // Every OTHER AtomicReference method still shows the three-row
+    // synthetic-stub / intrinsic / synthetic-stub chain and still drifts, which
+    // is the negative control sitting in the same dump.
+    //
+    // ON "BOTH MODES", which for this triple is not the usual shape.
+    // `register_phase54_atomics` is reached only through
+    // `register_synthetic_overrides`, so the survivor exists ONLY in
+    // synthetic-JDK mode. Compatible-mode and `--jdk-only` dumps from the same
+    // tree carry SEVEN AtomicReference rows and `compareAndSet` is not among
+    // them: there the JDK's own body runs, which is exactly what `7c90ec930`
+    // intended and measured as faster. So no mode is served by a drifting pair,
+    // which is what this list asserts -- one mode by the surviving native, the
+    // other two by real bytecode.
+    (
+        "java/util/concurrent/atomic/AtomicReference",
+        "compareAndSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     ),
     ("java/io/ByteArrayOutputStream", "<init>", "()V"),
     ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
@@ -1960,7 +1997,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/concurrent/atomic/AtomicLongArray", "set", "(IJ)V"),
             ("java/util/concurrent/atomic/AtomicReference", "<init>", "()V"),
             ("java/util/concurrent/atomic/AtomicReference", "<init>", "(Ljava/lang/Object;)V"),
-            ("java/util/concurrent/atomic/AtomicReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
             ("java/util/concurrent/atomic/AtomicReference", "get", "()Ljava/lang/Object;"),
             ("java/util/concurrent/atomic/AtomicReference", "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/concurrent/atomic/AtomicReference", "lazySet", "(Ljava/lang/Object;)V"),
@@ -2633,7 +2669,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "register_unsafe_define_class",
         &[
-            ("jdk/internal/misc/Unsafe", "defineAnonymousClass", "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;"),
             ("jdk/internal/misc/Unsafe", "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
         ],
     ),

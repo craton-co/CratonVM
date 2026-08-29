@@ -846,6 +846,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         // Allocate the per-buffer last_write event up front so we can
         // record it on the user stream right after the upload DMA.
         let event = std::sync::Arc::new(Event::new(ctx)?);
+        let event_for_stamp = std::sync::Arc::clone(&event);
         // Submit the H→D copy AND record `last_write` on the USER
         // stream (see `from_host_async_unchecked` / `upload_on_stream`).
         // SAFETY: this function's caller upholds the documented host lifetime;
@@ -858,6 +859,13 @@ impl<T: DeviceElem> DeviceBuffer<T> {
                 event.cu_event_raw(),
             )?
         };
+        // `upload_on_stream` recorded `event` on exactly `stream`, but
+        // it took the raw handle rather than the wrapper, so stamp the
+        // bookkeeping here. Without it every later launch on this same
+        // stream issues a `cuStreamWaitEvent` for an ordering the stream
+        // already provides -- see `EventCuda::recorded_on`.
+        #[cfg(feature = "cuda")]
+        event_for_stamp.set_recorded_on(stream.raw());
         // Surface the upload on the user `stream`'s op log for callers
         // that introspect the queue. In cuda mode `record_op` is a
         // no-op so this collapses to nothing.

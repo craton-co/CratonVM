@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 67 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 74 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -1221,3 +1221,224 @@ Stated so the next reader does not have to re-derive it:
   differently from the one measured here.
 * The `US-ASCII`/`ISO-8859-1`/`UTF-8` trio is decoded directly; every other
   charset takes the REPLACE-vs-REPORT approximation described in P3.5.
+
+
+---
+
+# PART FOUR — the rest of the covariant bridges
+
+Part three found one defect behind a covariant bridge descriptor and drew the
+general conclusion: `javac` emits `reset()Ljava/nio/Buffer;` only through a
+`Buffer`-typed reference, so those registrations are unreachable from ordinary
+code and were never dispatched to by anything in this repository.
+
+**I then fixed the one my probe happened to catch and moved on.** That is a
+finding applied to a single row. This part applies it to the population.
+
+## P4.1 Enumerating them, instead of noticing them
+
+The registry dump can name the whole set without guessing, in two shapes:
+
+* **(A) both spellings registered** — group every entry by
+  `(class, name, argument-list)` and keep the groups with more than one *return
+  type*. That is a covariant pair by construction.
+* **(B) only the base-typed spelling registered** — a single entry whose return
+  type is a supertype of the declaring class (`Ljava/nio/Buffer;`,
+  `Ljava/lang/Object;`). These are the dangerous ones and shape (A) **cannot
+  see them**: `ByteBuffer.reset()`, the original defect, is one of these, because
+  the `ByteBuffer`-typed spelling is real bytecode and only the bridge is
+  registered.
+
+Over the 2173 `java/io` + `java/nio` + `sun/nio` registrations, and after
+`L4TailSweep2` had already run:
+
+```text
+java/nio/ByteBuffer    flip   ()Ljava/nio/Buffer;   inv=0     (A)
+java/nio/ByteBuffer    mark   ()Ljava/nio/Buffer;   inv=0     (A)
+java/nio/ByteBuffer    rewind ()Ljava/nio/Buffer;   inv=0     (A)
+java/nio/DoubleBuffer  clear  ()Ljava/nio/Buffer;   inv=0     (B)
+java/nio/DoubleBuffer  flip   ()Ljava/nio/Buffer;   inv=0     (B)
+java/nio/FloatBuffer   clear/flip                   inv=0     (B)
+java/nio/IntBuffer     flip                         inv=0     (B)
+java/nio/LongBuffer    clear/flip                   inv=0     (B)
+java/nio/ShortBuffer   clear/flip                   inv=0     (B)
+    ... plus fileKey/getAttribute/value, all `-> Object`, all inv=0
+```
+
+`apps/probes/L4BridgeSweep.java` (497 rows) drives every one of them. Its whole
+instrument is one parameter declaration:
+
+```java
+static void bridges(String k, Buffer b) { ... }
+```
+
+called once per buffer class across heap, direct, read-only, view,
+`wrap(byte[])`, `slice()` and `wrap(CharSequence)` arms. **Retyping that
+parameter to the concrete buffer class silently converts the method into a test
+of a different set of registrations** — which is exactly what
+`L4TypedBufferSweep`'s 501 rows over the same classes already were.
+
+Result: **20 differing rows, seven defects.**
+
+## P4.2 One missing line, copied five ways
+
+Eleven of the twenty rows are a single omission:
+
+```rust
+// servlet.rs, the typed-buffer loop (Short/Int/Long/Float/DoubleBuffer)
+r.register(cls, "flip", "()Ljava/nio/Buffer;", |ctx, args| {
+    ctx.set_field(this, BB_LIMIT, Value::Int(pos));
+    ctx.set_field(this, BB_POS, Value::Int(0));
+    //  <- s2_bb_set_mark(ctx, this, -1);   MISSING
+```
+
+`flip`, `clear` and `rewind` are specified to **discard the mark**. The
+`ByteBuffer` twin forty lines up has the line; `charset_buffers.rs`'s
+`CharBuffer` copy has it; this loop — the one serving five classes — does not.
+
+What makes it invisible from inside the class is that `mark()` and `reset()` are
+**not registered** for the typed buffers. So the real `Buffer` bytecode sets and
+reads the real `mark` field, while these natives move position and limit in side
+slots, and nothing reconciles the two:
+
+```text
+IntBuffer ib = ...; Buffer b = ib;
+b.mark(); b.flip(); b.reset();
+  HotSpot   InvalidMarkException
+  this VM   no throw — and the position jumps back into the region flip
+            had just excluded, leaving a buffer whose reads are off the end
+```
+
+A mixed model, where one half of an object's state is ours and the other half is
+the JDK's, is only correct while every operation maintains both. This one had
+five copies of an invariant and four of them were right.
+
+`CharBuffer` is the same contract at the other end: `limit(int)` ends
+`if (mark > newLimit) mark = -1;` and ours did not, so a mark left *above* the
+new limit survived and `reset()` set the position past the limit. `position(int)`
+carries the identical two lines and is fixed here **on the argument** — the
+probe's ordering never leaves a mark above a lowered position, and I would
+rather say that than imply a green row proved it.
+
+## P4.3 A refusal in front of a measurement the class already had
+
+`FileStore.getAttribute(String)` was an unconditional throw:
+
+```rust
+|_ctx, _args| Err(RuntimeError::UnsupportedOperationException {
+    message: "no such attribute".into() }.into())
+```
+
+Thirty lines above it, `getTotalSpace()`, `getUsableSpace()` and
+`getUnallocatedSpace()` are registered and answer correctly. `getAttribute` is
+how `FileStore` is specified to expose *those same three*, and it is the only
+way to reach an attribute by name:
+
+```text
+fs.getTotalSpace()              a real byte count
+fs.getAttribute("totalSpace")   UnsupportedOperationException
+```
+
+Asking the typed accessors in the same probe is what identifies this as a defect
+in the **door** rather than in the measurement underneath it. A null name is now
+an NPE rather than a refusal — telling a caller an attribute is unsupported when
+what actually happened is that they passed nothing is a wrong answer to a
+question they did not ask.
+
+## P4.4 One file, two identities
+
+`fileKey()` exists for exactly one purpose: deciding whether two paths name the
+same file. This VM had **two producers of it that disagreed twice over.**
+
+```text
+readAttributes(f, BasicFileAttributes.class).fileKey()
+    HotSpot (dev=10301,ino=123946)  sun.nio.fs.UnixFileKey
+    this VM (dev=10301,ino=123945)  sun.nio.fs.UnixFileKey
+readAttributes(f, PosixFileAttributes.class).fileKey()
+    HotSpot (dev=10301,ino=123946)  sun.nio.fs.UnixFileKey
+    this VM (dev=66305,ino=123945)  java.lang.String
+```
+
+`0x10301 == 66305`. One producer rendered `dev` in hex — which is what
+`UnixFileKey.toString` does — and the other in decimal. Three producers of that
+string exist in the file; two were decimal.
+
+Fixing the rendering was not enough, and the probe said so: the row uses
+`Objects.equals`, and a `String` never equals a `UnixFileKey` however identically
+the two print. The basic door reaches real JDK bytecode and mints a real key;
+the posix door reaches our native, which minted a string. `fileKey()` now builds
+the real `sun.nio.fs.UnixFileKey` (or `WindowsFileKey`) through its real
+constructor, falling back to the string only where the class is absent.
+
+**A value that prints correctly and compares unequal is worse than one that does
+neither**, because it survives every eyeball check. The `toString` was the part I
+could see and the `equals` was the part callers use.
+
+## P4.5 An attribute that changes after you build it
+
+`PosixFilePermissions.asFileAttribute(perms)` stored **the caller's own set**:
+
+```java
+Set<PosixFilePermission> perms = PosixFilePermissions.fromString("rw-r-----");
+FileAttribute<?> attr = PosixFilePermissions.asFileAttribute(perms);
+attr.value() == perms      // HotSpot false, this VM true
+```
+
+The JDK closes over `Set.copyOf(perms)`. Aliasing means a later `perms.add(...)`
+retroactively changes the mode an already-constructed attribute will request —
+and since `Files.createFile(p, attr)` reads the value at *creation* time, the
+change lands on a file created afterwards with no visible cause at the site that
+made it.
+
+## P4.6 A value row that survives a refusal
+
+A probe-design note, because it cost a measurement.
+
+`p(tag, expr)` evaluates its argument *before* the call. On this probe's first
+pass `FileStore.getAttribute("totalSpace")` threw where I expected a value, the
+throw was uncaught, and **the last 14 rows — a different family entirely —
+never ran**:
+
+```text
+lines  oracle=491  strict=477  compat=477      DIFF strict=42
+```
+
+The diff counted 42 and the truth was 40-plus-a-crash. The line count beside it
+is the only reason that was visible. The probe now has `pt(tag, supplier)` — a
+value row that prints `THREW <type>` instead of ending the run — for every row
+where the *answer* is the point but a refusal is a possible outcome; `t()` stays
+for rows where the refusal **is** the point.
+
+## P4.7 What this part deliberately did not take
+
+The census also named the channel and selector families — `SocketChannel.bind`,
+`configureBlocking`, `SelectionKey.attach`/`channel`, and a fleet of
+`getOption(SocketOption)` rows, all `-> Object` or `-> SelectableChannel`, all at
+zero invocations. They carry the same descriptor shape and very likely the same
+class of defect.
+
+They are network-shaped and unclaimed by this lane (§P2.5), so this part does not
+touch them. **The census is the deliverable there**: the two queries in P4.1 run
+against any `--dump-native-registry` output and will name that population for
+whoever owns it, without their having to rediscover the mechanism.
+
+## P4.8 Final state
+
+```text
+2801 differential rows across eight L4 probes, both modes
+2800 identical to HotSpot 25.0.4+7
+   1 residual — FileInputStream.skip past EOF (§4.3), unchanged
+```
+
+and the four pre-existing family probes still 0-diff. The bridges are now
+demonstrably *reached* rather than merely fixed — the same registry query that
+found them, re-run after the probe:
+
+```text
+java/nio/ByteBuffer   flip  ()Ljava/nio/Buffer;  inv=5    (was 0)
+java/nio/IntBuffer    flip  ()Ljava/nio/Buffer;  inv=2    (was 0)
+java/nio/LongBuffer   clear ()Ljava/nio/Buffer;  inv=8    (was 0)
+    ... 9 of 10, and the tenth is a receiver-class question, not a miss:
+        `fileKey` answers on `sun/nio/fs/UnixFileAttributes` (inv=1),
+        which is the registration the fix changed.
+```
