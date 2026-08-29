@@ -139,16 +139,37 @@ fn resolve_entry(ctx: &dyn NativeContext, entry: (i32, Value)) -> Value {
 }
 
 /// `get(ClassLoader)V` — return the stored value or null.
+/// [`key_for`] with a loader argument that may legitimately be NULL.
+///
+/// A null `ClassLoader` names the BOOTSTRAP loader, which is an ordinary key in
+/// this map and the one the JDK's own users of `AbstractClassLoaderValue`
+/// (`ArchivedClassLoaders`, `ServicesCatalog`) reach for. The bodies here used
+/// to return early on it, so a mapping stored against it was unreadable.
+///
+/// The bootstrap loader is given a fixed key component distinct from any
+/// identity hash a real loader object could produce.
+fn key_for_loader(ctx: &dyn NativeContext, cl: Option<&Value>, this: ObjectRef) -> Key {
+    match cl {
+        Some(Value::Object(Some(c))) => key_for(ctx, *c, this),
+        // `clv_obj_key_for` derives its value from an identity hash and a
+        // generation counter, neither of which can reach `usize::MAX`, so this
+        // sentinel cannot collide with a real loader's key.
+        _ => (usize::MAX, clv_obj_key_for(ctx, this)),
+    }
+}
+
 fn native_aclv_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cl = match args.get(1) {
-        Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let key = key_for(ctx, cl, this);
+    // A NULL loader is the BOOTSTRAP loader: a legitimate, common key, not an
+    // absent argument. All four bodies here treated it as "no loader given"
+    // and returned early, so a value stored against the bootstrap loader could
+    // never be read back -- and `ArchivedClassLoaders`/`ServicesCatalog`, which
+    // are the JDK's own users of this class, key on exactly that loader.
+    // MEASURED by `apps/probes/JdkInternalSweep.java`.
+    let key = key_for_loader(ctx, args.get(1), this);
     let v = table().lock().get(&key).copied();
     Ok(Some(
         v.map(|e| resolve_entry(ctx, e))
@@ -164,12 +185,9 @@ fn native_aclv_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cl = match args.get(1) {
-        Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
-    };
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    let key = key_for(ctx, cl, this);
+    // The bootstrap loader is a key -- see [`native_aclv_get`].
+    let key = key_for_loader(ctx, args.get(1), this);
     // Root outside the table lock (rooted_entry only touches VM-side
     // registries, but keep the lock's critical section minimal).
     let entry = rooted_entry(ctx, value);
@@ -186,22 +204,52 @@ fn native_aclv_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(None)))
 }
 
-/// `remove(ClassLoader)V` — remove and return the previous value, or null.
+/// `remove(ClassLoader, Object)Z` — `Map.remove(key, value)` semantics: remove
+/// the mapping only if it currently holds `value`, and say whether it did.
+///
+/// This body used to be shaped for a `remove(ClassLoader)` that returns the
+/// previous value, and was NOT REGISTERED at all -- so real
+/// `AbstractClassLoaderValue.remove` bytecode ran against the real map while
+/// `get`/`putIfAbsent`/`computeIfAbsent` used this side table. The two never
+/// met: a mapping removed through the real method stayed readable through the
+/// natives.
+///
+/// Registering it is what makes the family coherent. Three of the four
+/// operations on one storage and the fourth on another is not a partial
+/// implementation, it is a contradiction -- and it is invisible until someone
+/// removes something. MEASURED by `apps/probes/JdkInternalSweep.java`.
 fn native_aclv_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cl = match args.get(1) {
-        Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
+    // The bootstrap loader is a key -- see [`native_aclv_get`].
+    let key = key_for_loader(ctx, args.get(1), this);
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    let current = table().lock().get(&key).copied();
+    let Some(entry) = current else {
+        return Ok(Some(Value::Int(0)));
     };
-    let key = key_for(ctx, cl, this);
-    let prev = table().lock().remove(&key);
-    Ok(Some(
-        prev.map(|e| resolve_entry(ctx, e))
-            .unwrap_or(Value::Object(None)),
-    ))
+    let held = resolve_entry(ctx, entry);
+    // `Map.remove(k, v)` compares with `equals`, not identity: a caller that
+    // put a `String` and removes an equal one must succeed.
+    let matches = match (held, expected) {
+        (Value::Object(Some(a)), Value::Object(Some(b))) => {
+            a == b
+                || matches!(
+                    ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(b))]),
+                    Ok(Some(Value::Int(1)))
+                )
+        }
+        (Value::Object(None), Value::Object(None)) => true,
+        _ => false,
+    };
+    if !matches {
+        return Ok(Some(Value::Int(0)));
+    }
+    table().lock().remove(&key);
+    Ok(Some(Value::Int(1)))
 }
 
 /// `computeIfAbsent(ClassLoader, BiFunction)V` — JDK source:
@@ -220,15 +268,12 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cl = match args.get(1) {
-        Some(Value::Object(Some(c))) => *c,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    let cl_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let mapping_fn = match args.get(2) {
         Some(Value::Object(Some(f))) => *f,
         // No mapping function — behave like `get`.
         _ => {
-            let key = key_for(ctx, cl, this);
+            let key = key_for_loader(ctx, args.get(1), this);
             let v = table().lock().get(&key).copied();
             return Ok(Some(
                 v.map(|e| resolve_entry(ctx, e))
@@ -240,7 +285,7 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // `cl`/`this`; identity-hash keys stay valid across the move, so the
     // post-invoke racing re-check finds the same entry (the former
     // raw-address key silently missed it after a GC).
-    let key = key_for(ctx, cl, this);
+    let key = key_for_loader(ctx, args.get(1), this);
     if let Some(existing) = table().lock().get(&key).copied() {
         return Ok(Some(resolve_entry(ctx, existing)));
     }
@@ -249,9 +294,19 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
         mapping_fn,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[Value::Object(Some(cl)), Value::Object(Some(this))],
+        &[cl_val, Value::Object(Some(this))],
     )?;
     let val = result.unwrap_or(Value::Object(None));
+    // A mapping function that answers NULL is an error, not an instruction to
+    // store null. `AbstractClassLoaderValue.Memoizer.get()` does
+    // `Objects.requireNonNull(v)` on the mapping function's result, so the JDK
+    // throws NPE and stores nothing; this stored null and returned it, so the
+    // next `computeIfAbsent` saw a "present" mapping and never recomputed.
+    // MEASURED by `apps/probes/JdkInternalSweep.java`.
+    if matches!(val, Value::Object(None)) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }
+            .into());
+    }
     let entry = rooted_entry(ctx, val);
     let mut t = table().lock();
     // Race: another caller may have raced ahead. If so, prefer the existing
@@ -291,6 +346,15 @@ pub fn register_classloader_value_sidetable(registry: &mut NativeMethodRegistry)
         "computeIfAbsent",
         "(Ljava/lang/ClassLoader;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
         native_aclv_compute_if_absent,
+    );
+    // The fourth operation on the same storage as the other three -- see
+    // [`native_aclv_remove`] for why leaving it to real bytecode was a
+    // contradiction rather than a gap.
+    registry.register(
+        class,
+        "remove",
+        "(Ljava/lang/ClassLoader;Ljava/lang/Object;)Z",
+        native_aclv_remove,
     );
     registry.set_category(__prev_cat);
 }

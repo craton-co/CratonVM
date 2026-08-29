@@ -4,7 +4,7 @@
 `/data/cvm-l2s-20260828` on the Linux build host. Oracle: HotSpot
 `jdk-25.0.4+7`, the same image CratonVM ran against.
 
-First batch of the long tail. `apps/probes/UriRecompositionSweep.java`, 1258
+First batch of the long tail. `apps/probes/UriRecompositionSweep.java`, 1256
 rows, **0 differing lines against HotSpot in both `--jdk-only` and compatible
 mode**, from 222.
 

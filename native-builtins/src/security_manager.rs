@@ -1428,7 +1428,20 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
             let result = ctx.invoke_virtual(action_cur, "run", "()Ljava/lang/Object;", &[]);
             pop_privileged_frame();
             ctx.unpin_native_roots(action_pin);
-            result
+            // A CHECKED exception comes back wrapped; an unchecked one does
+            // not. That wrapping is the entire reason this overload exists
+            // beside the `PrivilegedAction` one, and `javac` makes every caller
+            // catch `PrivilegedActionException` -- so propagating the checked
+            // exception raw threw it straight past a handler the compiler had
+            // forced them to write:
+            //
+            //   doPrivileged((PrivilegedExceptionAction<String>) () -> {
+            //       throw new IOException("checked"); })
+            //     HotSpot  PrivilegedActionException wrapping java.io.IOException
+            //     was      java.io.IOException
+            //
+            // MEASURED by `apps/probes/SecuritySurfaceSweep.java`.
+            wrap_checked_in_privileged_action_exception(ctx, result)
         },
     );
 
@@ -4064,4 +4077,66 @@ mod tests {
 
         forget_vm_security_state(vm);
     }
+}
+
+/// `PrivilegedActionException`-wrap a checked exception from a
+/// `PrivilegedExceptionAction`, leaving everything else alone.
+///
+/// "Checked" is the JDK's own test in `AccessController.doPrivileged`: a
+/// `RuntimeException` or an `Error` passes through, anything else is wrapped.
+/// The two are asked by walking the thrown object's superclass chain, which is
+/// the only classification available at this boundary -- and is the same test
+/// the compiler applies.
+///
+/// A failure to CONSTRUCT the wrapper leaves the original exception in place:
+/// losing the caller's exception in order to report a VM-internal problem with
+/// the wrapper would be strictly worse than not wrapping.
+fn wrap_checked_in_privileged_action_exception(
+    ctx: &mut dyn NativeContext,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Err(MethodCallFailed::ExceptionThrown(thrown)) = result else {
+        return result;
+    };
+    if throwable_is_unchecked(ctx, thrown) {
+        return Err(MethodCallFailed::ExceptionThrown(thrown));
+    }
+    let pin = ctx.pin_native_root(thrown);
+    let thrown_now = ctx.read_native_pin(pin, thrown);
+    let built = ctx.new_object_initialized(
+        "java/security/PrivilegedActionException",
+        "(Ljava/lang/Exception;)V",
+        &[Value::Object(Some(thrown_now))],
+    );
+    let thrown_now = ctx.read_native_pin(pin, thrown_now);
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(Value::Object(Some(wrapper)))) => {
+            Err(MethodCallFailed::ExceptionThrown(wrapper))
+        }
+        _ => Err(MethodCallFailed::ExceptionThrown(thrown_now)),
+    }
+}
+
+/// Is `thrown` a `RuntimeException` or an `Error` -- i.e. one of the two
+/// families `doPrivileged` passes through unwrapped?
+fn throwable_is_unchecked(ctx: &dyn NativeContext, thrown: ObjectRef) -> bool {
+    let mut cls = Some(ctx.class_id_of_object(thrown));
+    let mut depth = 0;
+    while let Some(c) = cls {
+        depth += 1;
+        if depth > 64 {
+            break;
+        }
+        match ctx.class_name_of_id(c).as_deref() {
+            Some("java/lang/RuntimeException") | Some("java/lang/Error") => return true,
+            // Reaching `Throwable` without meeting either means checked.
+            Some("java/lang/Throwable") | Some("java/lang/Object") => return false,
+            _ => {}
+        }
+        cls = ctx.superclass_of(c);
+    }
+    // No verdict: treat as unchecked, which preserves the pre-2026-08-29
+    // behaviour rather than inventing a wrapper for something unclassifiable.
+    true
 }
