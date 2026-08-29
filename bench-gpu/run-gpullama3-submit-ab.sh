@@ -55,7 +55,10 @@ gpu_mhz() { nvidia-smi --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/de
 # concurrent sessions and four other `rustc` processes have been observed
 # mid-measurement; a round taken against somebody else's build should be
 # visible rather than silently averaged in.
-busy() { ps -W 2>/dev/null | grep -cE 'rustc|cargo|link\.exe' || echo 0; }
+# `wc -l`, not `grep -c . || echo 0`: `grep -c` exits 1 on a zero count,
+# so the `||` fired on top of the `0` it had already printed and the
+# column showed a two-line "0/0". Same bug as wait-for-quiet.sh had.
+busy() { ps -W 2>/dev/null | grep -E 'rustc\.exe|link\.exe' | awk '{print $4}' | sort -u | wc -l; }
 
 # median submit_ms and the run's own achieved tok/s
 run() {
