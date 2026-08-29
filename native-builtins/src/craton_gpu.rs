@@ -345,6 +345,8 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
 
+    registry.register(KLASS, "futureErrorKind", "(J)I", builtin_future_error_kind);
+    registry.register(KLASS, "futureAwait", "(JJ)I", builtin_future_await);
     registry.register(KLASS, "releaseFuture", "(J)V", builtin_release_future);
     registry.register(KLASS, "releaseArray", "(J)V", builtin_release_array);
     registry.register(KLASS, "releaseExecutor", "(J)V", builtin_release_executor);
@@ -397,6 +399,13 @@ mod state {
         },
         Failed {
             message: String,
+            /// Failure category, mirrored from
+            /// `cratonvm_native_api::registry::GpuErrorKind`. The
+            /// synthetic store has no device behind it, so everything
+            /// recorded here is a resolution failure rather than a
+            /// device one — but `futureErrorKind` reads this store as
+            /// its fallback, so the field has to exist.
+            kind: cratonvm_native_api::registry::GpuErrorKind,
         },
     }
 
@@ -918,6 +927,7 @@ fn record_failed_future() -> u64 {
             h,
             state::FutureState::Failed {
                 message: STUB_FAILURE_MESSAGE.to_string(),
+                kind: cratonvm_native_api::registry::GpuErrorKind::Unknown,
             },
         );
         h
@@ -1349,6 +1359,9 @@ fn record_failed_future_with_message(message: &str) -> u64 {
             h,
             state::FutureState::Failed {
                 message: message.to_string(),
+                // Every caller of this helper failed to resolve or
+                // admit the kernel; none of them reached a device.
+                kind: cratonvm_native_api::registry::GpuErrorKind::Compile,
             },
         );
         h
@@ -1538,6 +1551,70 @@ fn builtin_future_is_done(
     Ok(Some(Value::Int(if done { 1 } else { 0 })))
 }
 
+/// `Native.futureErrorKind(long futureHandle) -> int`
+///
+/// The failure category for a failed submission, so the Java side can
+/// pick the right `GpuException` subclass without matching substrings
+/// against the driver's wording.
+///
+/// Returns one of the `GpuErrorKind` wire values: `0` unknown (also the
+/// answer for a handle that is not failed, and for an unknown handle —
+/// a caller only asks after seeing a failure, and `0` tells it to fall
+/// back to message matching, which is exactly what it did before this
+/// entry point existed).
+///
+/// Prefers the real submission registry, then the synthetic store, in
+/// the same order as `futureStatus`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_error_kind(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    if let Some(kind) = ctx.gpu_future_error_kind(handle) {
+        return Ok(Some(Value::Int(kind.as_i32())));
+    }
+    let kind = state::with(|s| match s.futures.get(&handle) {
+        Some(state::FutureState::Failed { kind, .. }) => kind.as_i32(),
+        _ => cratonvm_native_api::registry::GpuErrorKind::Unknown.as_i32(),
+    });
+    Ok(Some(Value::Int(kind)))
+}
+
+/// `Native.futureAwait(long futureHandle, long timeoutNanos) -> int`
+///
+/// Blocks until the submission reaches a terminal state or the timeout
+/// elapses. Returns `1` completed, `2` timed out, `0` unsupported.
+///
+/// A synthetic future is already terminal the moment it is recorded, so
+/// the fallback answers immediately rather than sleeping out the
+/// caller's whole timeout. An unknown handle answers `completed` for the
+/// same reason `futureStatus` reports a distinct code for it: no amount
+/// of waiting will change the answer, and reporting a timeout would send
+/// the caller round a loop that can never end.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_await(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    use cratonvm_native_api::registry::{GPU_AWAIT_COMPLETED, GPU_AWAIT_UNSUPPORTED};
+
+    let handle = arg_long(args, 0) as u64;
+    // A negative timeout would wrap to a colossal `u64`; treat anything
+    // non-positive as a pure poll.
+    let timeout_nanos = arg_long(args, 1).max(0) as u64;
+
+    let code = ctx.gpu_future_await(handle, timeout_nanos);
+    if code != GPU_AWAIT_UNSUPPORTED {
+        return Ok(Some(Value::Int(code)));
+    }
+    // Fallback: the synthetic store. Every state it can hold is
+    // terminal on arrival.
+    let known = state::with(|s| s.futures.contains_key(&handle));
+    let _ = known;
+    Ok(Some(Value::Int(GPU_AWAIT_COMPLETED)))
+}
+
 /// `Native.futureSynchronize(long futureHandle)`
 ///
 /// In stub mode futures are never `Pending` after construction, so this
@@ -1561,9 +1638,14 @@ fn builtin_future_synchronize(
     // and then dropped one frame earlier. Memoising it into the same
     // store the getter reads keeps both paths on one lookup.
     if let Some(Err(message)) = ctx.gpu_future_synchronize(handle) {
+        // Ask the real registry for the category it stamped at the
+        // point of failure; `Unknown` only if it has none.
+        let kind = ctx
+            .gpu_future_error_kind(handle)
+            .unwrap_or(cratonvm_native_api::registry::GpuErrorKind::Unknown);
         state::with(|s| {
             s.futures
-                .insert(handle, state::FutureState::Failed { message });
+                .insert(handle, state::FutureState::Failed { message, kind });
         });
     }
     Ok(None)
@@ -1675,7 +1757,7 @@ fn builtin_future_get_error_message(
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     let msg = state::with(|s| match s.futures.get(&handle) {
-        Some(state::FutureState::Failed { message }) => Some(message.clone()),
+        Some(state::FutureState::Failed { message, .. }) => Some(message.clone()),
         _ => None,
     });
     let value = match msg {
