@@ -311,11 +311,9 @@ fn alloc_singleton(
     // exactly the one getter whose helper calls that function directly, and
     // left the nine that take the real-class arm untouched -- see
     // `apps/probes/JdkInternalSweep.java`, which said so in nine rows.
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get(owner_class)
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
+    if let Some(existing) =
+        owner_singleton_handle(owner_class)
+            .and_then(|h| ctx.resolve_global_root(h))
     {
         return Ok(existing);
     }
@@ -348,17 +346,18 @@ fn publish_owner_singleton(
     obj: ObjectRef,
 ) -> ObjectRef {
     let handle = ctx.add_global_root(obj);
-    let mut roots = synthetic_singleton_roots().lock();
-    if let Some(published) = roots.get(owner_class).copied() {
-        drop(roots);
-        ctx.remove_global_root(handle);
-        if let Some(existing) = ctx.resolve_global_root(published) {
-            return existing;
+    // The map operation and the VM calls are deliberately separated: the lock is
+    // a leaf (see [`synthetic_singleton_roots`]) and every `ctx` call below runs
+    // after it has been released.
+    match claim_owner_singleton(owner_class, handle) {
+        None => obj,
+        // Lost the race -- drop ours and use theirs, so two callers cannot end
+        // up holding two different accessors for one owner.
+        Some(published) => {
+            ctx.remove_global_root(handle);
+            ctx.resolve_global_root(published).unwrap_or(obj)
         }
-        return obj;
     }
-    roots.insert(owner_class.to_string(), handle);
-    obj
 }
 
 fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Option<ObjectRef> {
@@ -395,11 +394,9 @@ fn alloc_named_synthetic_singleton(
     ctx: &mut dyn NativeContext,
     owner_class: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get(owner_class)
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
+    if let Some(existing) =
+        owner_singleton_handle(owner_class)
+            .and_then(|h| ctx.resolve_global_root(h))
     {
         return Ok(existing);
     }
@@ -410,12 +407,49 @@ fn alloc_named_synthetic_singleton(
 }
 
 /// Owner class name -> the global-root handle of its one accessor object.
+///
+/// `LockLevel::Scratch` (L0) is a LEAF: it may be taken while holding anything,
+/// and nothing may be taken while holding it. That is exactly the property this
+/// map needs and exactly the one the first version of this code broke -- it held
+/// the guard across `ctx.resolve_global_root(..)`, re-entering the VM (and so
+/// the heap and class-manager locks) from under a lock in a crate whose natives
+/// call back into Java. At L0 the order checker refuses that outright, which is
+/// stronger than `lock_discipline_ratchet` merely counting the lock.
 fn synthetic_singleton_roots(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<String, usize>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    std::collections::HashMap<String, usize>,
+> {
+    use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
     static ROOTS: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+        OrderedPlMutex<std::collections::HashMap<String, usize>>,
     > = std::sync::OnceLock::new();
-    ROOTS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    ROOTS.get_or_init(|| {
+        OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch)
+    })
+}
+
+/// The handle recorded for `owner_class`, if any.
+///
+/// A function rather than an inline `.lock().get(..)` so the guard's scope is
+/// this call and cannot extend across whatever the caller does with the result.
+/// `if let Some(h) = map.lock().get(k) { ctx.something(h) }` keeps the guard
+/// alive for the whole statement, which is how the VM came to be re-entered
+/// under this lock.
+fn owner_singleton_handle(owner_class: &str) -> Option<usize> {
+    synthetic_singleton_roots().lock().get(owner_class).copied()
+}
+
+/// Record `handle` for `owner_class` unless someone already did; returns the
+/// handle that is now published if it was NOT ours.
+fn claim_owner_singleton(owner_class: &str, handle: usize) -> Option<usize> {
+    let mut roots = synthetic_singleton_roots().lock();
+    match roots.get(owner_class).copied() {
+        Some(existing) => Some(existing),
+        None => {
+            roots.insert(owner_class.to_string(), handle);
+            None
+        }
+    }
 }
 
 fn alloc_java_nio_access_singleton(
@@ -429,11 +463,9 @@ fn alloc_java_nio_access_singleton(
     // this getter is as stable as the other nine -- `alloc_owner_instance`
     // allocates on every call, and the JDK's `getJavaNioAccess()` answers one
     // object for the life of the VM.
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get("java/nio/Buffer$2")
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
+    if let Some(existing) =
+        owner_singleton_handle("java/nio/Buffer$2")
+            .and_then(|h| ctx.resolve_global_root(h))
     {
         return Ok(existing);
     }
