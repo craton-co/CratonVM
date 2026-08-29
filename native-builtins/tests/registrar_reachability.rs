@@ -458,7 +458,14 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_time_extras_natives", 1),
     ("register_time_natives", 16),
     ("register_tls_natives", 51),
-    ("register_unsafe_define_class", 2),
+    // 2 -> 1 on 2026-08-29: `defineAnonymousClass` was retired from BOTH of
+    // its registrars (absent from JDK 17/21/25, not declared by the
+    // synthetic-JDK shape, 0 invocations in 118 corpus vectors in both
+    // modes), so this family now shares ONE triple with a shipping pass
+    // instead of two. `registrar_drift.rs`'s baseline moved in the same
+    // commit -- which is the condition this gate's own message names for
+    // when updating the number here is the whole fix.
+    ("register_unsafe_define_class", 1),
     ("register_vector_api_natives", 0),
 ];
 
