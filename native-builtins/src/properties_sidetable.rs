@@ -5297,10 +5297,16 @@ mod tests {
 
     #[test]
     fn save_convert_unicode_escaping() {
-        // escape_unicode=true escapes non-Latin chars as one `\u` per code unit.
-        assert_eq!(save_convert("\u{00e9}", false, true), "\\u00e9"); // é
+        // escape_unicode=true escapes non-Latin chars as one `\u` per code unit,
+        // in UPPER-case hex: `Properties.saveConvert` indexes a `hexDigit[]` of
+        // `'0'..'9','A'..'F'`. These three assertions were written from THIS
+        // implementation rather than from the spec and pinned the lower-case
+        // form for as long as it was wrong; `load` accepts either case, so
+        // nothing but a byte comparison against a JDK-written file could see it
+        // (MEASURED, probes/PropertiesShadowSweep 118-119).
+        assert_eq!(save_convert("\u{00e9}", false, true), "\\u00E9"); // é
                                                                       // Supplementary code point -> surrogate pair (two \u units).
-        assert_eq!(save_convert("\u{1F600}", false, true), "\\ud83d\\ude00");
+        assert_eq!(save_convert("\u{1F600}", false, true), "\\uD83D\\uDE00");
         // escape_unicode=false leaves the char literal (Writer charset encodes it).
         assert_eq!(save_convert("\u{00e9}", false, false), "\u{00e9}");
     }
@@ -5582,8 +5588,8 @@ mod tests {
         // `escape_unicode = false` is the `store(Writer)` overload, where an
         // ordinary non-ASCII char is written literally — but a lone surrogate
         // still has to be escaped, because there is no `char` to write.
-        assert_eq!(save_convert_units(&[HI], false, false), "\\ud800");
-        assert_eq!(save_convert_units(&[LO], false, true), "\\udc00");
+        assert_eq!(save_convert_units(&[HI], false, false), "\\uD800");
+        assert_eq!(save_convert_units(&[LO], false, true), "\\uDC00");
         // Round-trip: what `store` writes, `load` reads back as the same units.
         let mut text = String::new();
         text.push_str(&save_convert_units(&[b'k' as u16, HI], true, true));
@@ -5601,7 +5607,7 @@ mod tests {
         // The supplementary path must not change: two `\u` escapes, not one.
         assert_eq!(
             save_convert_units(&[0xD83D, 0xDE00], false, true),
-            "\\ud83d\\ude00"
+            "\\uD83D\\uDE00"
         );
     }
 
