@@ -2,6 +2,48 @@
 
 ## Status
 
+> ### 2026-08-29 — read this first
+>
+> **The page's own class has passed since 2026-08-24/26. What was still failing
+> on 2026-08-28 — `TestMVStoreTool` and `TestCachedQueryResults` — was failing
+> on FOUR defects, and §"Follow-up 2026-08-29" fixes all four.** In the order
+> that matters:
+>
+> 1. **The slide was discarding every byte it emptied** whenever the cursor
+>    could not follow it down, and no later sweep could rediscover them (the
+>    sweep walks the object-start registry, which the slide has just rebuilt).
+>    885 793 objects relocated per run and the largest free block was 8 184
+>    bytes.
+> 2. **The large-object end had no compactor at all** — 99–198 free blocks
+>    where one would do.
+> 3. **The TLAB refill floor** was one notch above what the free list could
+>    serve, so every refill bumped and the 128 MiB large-object reserve was
+>    spent on churn.
+> 4. **The region tripwire** meant to catch small objects leaking into that end
+>    was armed on three exits that could not fire it.
+>
+> Each has a same-binary kill switch (`CRATONVM_ZGC_PUBLISH_VACATED`,
+> `CRATONVM_ZGC_HIGH_COMPACTION`, `CRATONVM_ZGC_TLAB_STARVED_RECYCLE`) and its
+> own engagement counter on the `[GC] zgc-high-compaction:` line, because the
+> feature this work supersedes shipped reading zero for a week and the only
+> reason anyone found out is that it carried a counter.
+>
+> **One tracked class is NOT fixed, and it is where the repairs are best
+> measured.** `org.h2.test.jdbc.TestCachedQueryResults` still livelocks, and it
+> is the one class in this family that throws THOUSANDS of `OutOfMemoryError`
+> per run rather than one — so a rate is measurable. Same binary, 900 s cap:
+> **`oom=2990` on the default against `oom=6318` with all three switches off.**
+> The repairs halve it and change nothing else. It throws thousands
+> and keeps running, which is a different shape from every other class here
+> (those failed once and died), so something is catching and retrying and that
+> is not a collector question. It has its own page:
+> `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+>
+> **Everything below this box is the record of how the diagnosis got here**,
+> including three attributions this page had to withdraw. Read
+> §"What this page no longer tracks, and where it went" for where each 2026-08-28
+> row ended up.
+
 **FIXED for this class 2026-08-24. Two classes remain, on a DIFFERENT
 obligation.** `TestKillProcessWhileWriting` passes in the default configuration
 — `rc=0`, zero `OutOfMemoryError`, zero `arena allocation failed` — on three
@@ -1412,101 +1454,599 @@ item, not target selection. Anyone picking it up should start by re-reading the
 `in_low_region=false` line above rather than the frag-profile numbers: those are
 correct and actionable, and there is currently nothing that can act on them.
 
-## Still open
+## Follow-up 2026-08-29: both ends are compacted now, and the floor that fed one end to the other
 
-Ordered by what a next session should pick up first.
+Four defects, in the order a reader should take them: **the slide was losing
+every byte it emptied whenever the cursor could not follow it down**, the
+large-object end had no compactor at all, the TLAB refill floor was spending
+that end's reserve on churn, and the instrument meant to catch small objects
+leaking into that end was armed on three sites that could not fire it.
 
-> **2026-08-29: a third project hits the same class of symptom.** Spring
-> Framework's `org.springframework.http.client.SimpleClientHttpResponseTests`
-> (unrelated to H2/Hibernate, an HTTP-client test full of Mockito mocks) timed
-> out at 300s during a full-suite ZGC run, isolated and reran alone with a
-> 400s cap, still hangs. Its log carries the same
-> `zgc frag gauge: the arena is broken up` line this page's title names
-> (`95.8% free, largest servable block 0.0%`), and the guard's own
-> `occurrence` counter doubles on every subsequent firing
-> (32768 -> 1048576 -> ...) — the same exponential-retry shape as
-> `TestCachedQueryResults`'s livelock. Not integrated into this page's own
-> instrumentation or attributed to any of the specific obligations tracked
-> below (no `CRATONVM_DBG_*` census taken for this class) — recorded here
-> only as a third confirmed occurrence, so a future reader knows this defect
-> is not H2/Hibernate-specific. Repro: run that class alone with any timeout
-> above ~300s on this project's dev tip.
+### 1. A correction to §"Follow-up 2026-08-28" before anything else
 
-> **Reconciled 2026-08-28.** Three items were removed as answered by
-> measurements taken later in this page, not by anyone fixing them:
+That section closed with *"the LARGE-OBJECT end is never compacted, and that is
+the whole of `TestMVStoreTool`"*, on a reading where the failing window began
+3.9 MB above `used_low_for_compaction()` (`in_low_region=false`).
+
+The first clause was right and is now fixed. **The second does not hold on the
+2026-08-29 tip.** Same class, same `--Xmx 1g`, same 262 160-byte request:
+
+```text
+[zgc-target] recorded window start=234314432 end=234586208 width=271776
+             request=262160 used_low=1069022960 capacity=1073741824
+             in_low_region=true
+```
+
+`in_low_region=**true**`. The window placement varies run to run, so a single
+observation of it could never have carried "and that is the whole of" — which
+is the methodological point this page keeps re-learning, and the reason the
+sentence is corrected here rather than quietly dropped.
+
+What the same run does say, at the failing request, is where the wall really is:
+
+```text
+request=262160 used=1073545504 capacity=1073741824 free_list_bytes=815073056
+largest_free_block=104896 free_spans=63934
+high_cursor=1069219280 high_blocks=2 high_bytes=104984 high_max=104896
+high_reserve_unclaimed=129695184
+```
+
+`high_cursor - cursor` is **196 320 bytes**: the two ends have met. The
+large-object end holds 4.5 MB and is asked for 262 160; the reserve that exists
+to stop exactly this is **129 695 184 bytes unclaimed**, i.e. it was never
+claimed because the low end had already bumped through it. That is item 4
+below, and items 2 and 3 are what let it get there.
+
+> ### Before reading any arm of this section: `relocation_on_proven_jit=0` VOIDS a run
 >
-> * *"a second, unidentified contributor to `ACTIVE_FRAME_MAP`"* — closed by
->   the mirror-pairing repair, §"Follow-up 2026-08-26": `no_map` is 0 in all
->   five `on` arms and the reason code tracks it exactly.
-> * *"`TestMVStoreTool`'s remaining blockers are the indy bridge and the
->   cross-thread helper window"* — the indy attribution was WITHDRAWN
->   (§"Follow-up 2026-08-26 (second)"; 30/28 vs 27/33 on an idle host) and
->   the real answer is the targeted-compaction item above.
-> * *"`while_covered` is nonzero on `dev`"* — superseded by
->   §"Follow-up 2026-08-27 (second)": the oracle cannot answer that question
->   at all, and its guard was near-vacuous when the reading was taken.
+> Every repair in items 2 and 3 happens inside `relocate_stw`, and that function
+> declines outright while a compiled frame is live whose oops the cycle could
+> not prove rewritable. On a contended host that refusal fires on *every* cycle.
+> Measured here, one run of `TestMVStoreTool` at `--Xmx 1g` on this Azure box at
+> load 32:
 >
-> Listed because a stale Still-open entry is not neutral: the withdrawn indy
-> attribution alone sent one session down a two-build detour, and this page
-> is where that gets prevented.
+> ```text
+> compaction_cycles=0 objects_relocated=0
+> relocation_skipped_jit=6 relocation_on_proven_jit=0
+> ```
+>
+> That run OOM'd with `oom=4` and says **nothing** about either repair, because
+> neither ran. The same class on the same binary at load 8–19 reports
+> `relocation_on_proven_jit=4…15`.
+>
+> So: read `relocation_on_proven_jit` before reading `rc`. A run with a zero
+> there is a measurement of the host, and this page has a long history of
+> readings that turned out to be exactly that.
+>
+> **And check what the control arm actually turns off.** The first pass at the
+> A/B here ran `neither` as
+> `CRATONVM_ZGC_HIGH_COMPACTION=0 CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` — written
+> before item 2 existed, so it left the LARGEST of the four repairs switched ON
+> in the "pre-change" arm. Both arms then survived 400 s and the table said
+> nothing. A control that is missing a switch is not a control, and the tell was
+> that it agreed with the treatment too well.
 
-* **The LARGE-OBJECT end is never compacted, and that is the whole of
-  `TestMVStoreTool`.** §"Follow-up 2026-08-28". Targeted compaction now
-  exists (`CRATONVM_ZGC_TARGETED_COMPACTION=1`, opt-in) and engages ZERO
-  times, because the window that fails begins 3.9 MB above
-  `used_low_for_compaction()` and `logical_pages` builds candidates over the
-  low region only. The failing request is 262 160 bytes, above
-  `ZGC_LARGE_OBJECT_MIN`, so it is served from an end with no logical pages,
-  no relocation candidates, and `relocate_large_pages: false` besides.
-  The blocking item is making that end relocatable — logical pages over the
-  high region, or a pass that understands a bump-down region. Target
-  selection is solved and waiting on it.
-* **There is no working backstop against a wrong oop map for java locals
-  and operand spill.** The band scan's was given up 2026-08-27, and the
-  map-completeness oracle CANNOT replace it: re-pointed at
-  `fully_shadow_covered` and measured, it reports 5–6 % of every in-band word
-  as never-mapped on every workload, including `TestMultiThread`, which
-  PASSES with 1.1 M of them. Dominated by its own declared false positive (a
-  primitive whose bits look like an object header) and by dead stale slots.
-  A real backstop needs liveness the map does not carry — the
-  `LocalVariableTable` scopes, a type-aware filter, or codegen clearing
-  reference locals as they die. See §"Follow-up 2026-08-27 (second)".
-* **`TestCachedQueryResults` shows `incomplete=5`** — the first time anywhere
-  that a map refuses on its OWN claim rather than being unlocatable. Different
-  obligation from `no_map`, never investigated, and it sits alongside 9 962
-  `OutOfMemoryError` over 4 991 collections.
-* **`TestOpenClose`: `Exception in thread "main" java/lang/Object`, no captured
-  frames.** Now the ONLY thing failing this class — the fragmentation OOM is
-  gone. Already confirmed pre-existing and unrelated by the kill-switch
-  differential on 2026-08-21, and it reproduces on the fixed binary with zero
-  `OutOfMemoryError` and four `arena allocation failed`, which is as clean a
-  separation as this defect will ever get. Its own page, and now cheap to
-  reproduce.
-* **`TestMVStoreCachePerformance`: `NoSuchMethodError: 'boolean
-  org.h2.mvstore.Page$PageReference.isPersistent()'`.** Also now the only thing
-  failing that class — no OOM and no arena failure at all. A method-resolution
-  defect with nothing to do with this page; filed here only because this page
-  is what was watching the class.
-* **`-XX:+UseG1GC` fails `TestKillProcessWhileWriting`**, identically before and
-  after this work (13 `OutOfMemoryError` and a 1500 s cap on the fixed binary,
-  2 `OutOfMemoryError` in 31–43 s when this page first measured it). The face
-  varies between runs, so reproduce it several times before believing any
-  single one. Not this defect: no `arena allocation failed` in either era.
-* **The two small objects in the large-object region.** The fragmentation report
-  placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`, where
-  `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live, and they
-  are what caps `high_max` below the request. The tripwire added to
-  `Arena::alloc` fired **zero** times across a full failing run, so the low-end
-  allocation paths are not the producer. Note its reach before trusting that
-  zero: it covers the three free-list exits of `Arena::alloc` and
-  `push_block_routed`, not the TLAB fast path (whose chunks are carved from the
-  low end) and not the bump path (which cannot cross `high_cursor`). It has
-  never been seen to fire, so it is an untriggered instrument, not evidence.
-  Less urgent than it was: the class this page is about no longer reaches the
-  wall at all.
-* **The cross-thread coverage handshake decides nothing yet.** It is built,
-  default-ON, and `xt_cov=(accepted=0 refused=0 deposits=0)` on this workload —
-  no peer was ever in compiled code at a collection here. It removes a blanket
-  refusal that a genuinely many-threaded workload would hit; that claim is
-  untested because this class does not produce the condition. The engagement
-  counter is on the `[jitroots]` line precisely so nobody reads a win into it.
+### 2. The slide was LOSING what it emptied — the largest of the four
+
+This is the one that explains why compaction never produced a big hole, and it
+had been true since compaction went default-on on 2026-08-13.
+
+**Reclaim was the cursor drop and nothing else.** `Arena::compact_low_to`
+retracts the bump cursor to `new_cursor` and hands back `[new_cursor, cursor)`.
+That is the whole answer only when the cursor can reach `dest` — the top of the
+region the slide packed its survivors into. One survivor on an unselected dense
+page above it pins `new_cursor` higher, and then the bytes the slide just
+emptied are neither below the cursor nor on the free list.
+
+**And no later sweep can find them.** The sweep free-lists dead objects by
+walking the object-start REGISTRY, and the slide rebuilds that registry with the
+survivors' NEW bases a few statements later — so the old ones stop existing as
+far as every other subsystem is concerned. The space is invisible to the
+allocator for the rest of the process.
+
+The measurement that names it, `TestMVStoreTool` at `--Xmx 1g`:
+
+```text
+compaction_cycles=4 objects_relocated=885793
+...
+request=262160 free_list_bytes=706940280 largest_free_block=8184
+span_hist=8:47715 16:40407 32:80 64:138 256:1 512:1 1K:116147 2K:81414 4K:46675
+```
+
+**885 793 objects relocated, and the largest free block is 8 184 bytes.** Read
+the histogram: nothing above 4 KiB exists. A compactor that moves nearly a
+million objects per run and leaves no span bigger than a page of text is not
+compacting for the allocator's benefit at all — and the slide's own output is
+2 MiB-granular and contiguous by construction, which is exactly the shape the
+262 160-byte request needed.
+
+The caller now names the offset spans it emptied and `compact_low_to` publishes
+them. Two details are load-bearing:
+
+* **They are zeroed first.** A slid-away survivor leaves its old bytes behind
+  verbatim, including a valid-looking `ObjectHeader`; a conservative scanner
+  that met one would resurrect a corpse. That is the same contract the span
+  above `new_cursor` already had and the reason the sweep zeroes a dead
+  object's header before free-listing it.
+* **They are SCREENED against the live set at its post-slide addresses**, not
+  argued for from the page partition. A selected page above `dest` is dead by
+  construction — every survivor based on it was packed below — but an OBSTACLE
+  (an object based on an unselected page whose tail straddles into a selected
+  one) never moves, and neither does anything above the point where the slide
+  gave up on an unsizable header. One pass, a prefix maximum and a binary
+  search per page settle it. Same shape as the `live_ceiling` check beside it
+  and for the same reason: an argument that the partition is exhaustive is an
+  argument about the partition, not about what is in the span. It can only DROP
+  a span, i.e. reclaim less.
+
+**Engagement, measured on the merged tip** (`TestMVStoreTool`, `--Xmx 512m`,
+two runs, `CRATONVM_GC_STATS=1`):
+
+```text
+compaction_cycles=16 objects_relocated=3049299 relocation_on_proven_jit=16
+  vacated_spans=2579 vacated_bytes=5391509672
+compaction_cycles=24 objects_relocated=3168136 relocation_on_proven_jit=24
+  vacated_spans=4315 vacated_bytes=9023929152
+```
+
+**5.4 GB and 9.0 GB republished over a run, on a 512 MB heap** — ten to
+eighteen heaps' worth, roughly 340 MB per cycle.
+
+**Read that number for what it is.** It is the volume handed back as
+PAGE-GRANULAR spans, and a selected page can be 100 % garbage, in which case the
+sweep had already free-listed its objects one at a time. So `vacated_bytes` is
+not all newly-recovered memory: it is the sum of (a) the space the slide's own
+survivors vacated, which really was lost before — bounded by `objects_relocated`
+times the mean object, so ~19 MB per cycle here — and (b) free space that
+existed only as dust and now exists as 2 MiB blocks.
+
+(b) is not a rounding error, it is the point. `largest_free_block=8184` with
+707 MB free was the failure; a free list of the same bytes in page-sized pieces
+is a different heap. The accounting stays exact either way —
+`compact_low_to` clears the low list and rebuilds it from the kept blocks plus
+the spans, and a kept block inside a span is dropped rather than kept beside
+it — so nothing is counted or handed out twice.
+
+**The A/B, one binary, arms interleaved, and it does NOT say what a first
+reading suggests** (`TestMVStoreTool`, `--Xmx 1g`, 500 s cap, two reps):
+
+| arm | switches OFF | rc | secs | `oom` | `arena` | load |
+|---|---|---:|---:|---:|---:|---:|
+| `base` | — | 124 (cap) | 500 | **0** | 0 | 18.1 |
+| `base` | — | 124 (cap) | 500 | **0** | 0 | 16.3 |
+| `neither` | all three | 124 (cap) | 500 | **0** | 0 | 30.9 |
+| `neither` | all three | 124 (cap) | 500 | **0** | 0 | 24.1 |
+| `novac` | `PUBLISH_VACATED` only | 1 | **81** | **6** | 1 | 14.2 |
+| `novac` | `PUBLISH_VACATED` only | 1 | **60** | **6** | 1 | 9.6 |
+
+Read the third and fifth rows together. **`novac` fails 2/2 and `neither`,
+which has that same switch off AND two more besides, passes 2/2.** So this is
+not "the publication fixes the class". It is:
+
+**THE SWITCHES ARE NOT INDEPENDENT — item 4 is only safe with item 2.** The
+starved refill floor takes 8–64 KiB blocks off the free list when the bump is
+out of headroom. With item 2 supplying page-granular spans back, that is
+recycling. Without it, nothing replenishes the large end of the free list and
+the floor grinds the last of it into TLAB chunks. The failure line from a
+`novac` run says exactly that:
+
+```text
+request=9888 used=1073740088 capacity=1073741824
+free_list_bytes=797496464 largest_free_block=8184
+```
+
+**A 9 888-byte request failing with 797 MB free** — not the 262 160-byte
+large-object request this page opened on, a ten-kilobyte one. That arm reports
+`vacated_spans=0 vacated_bytes=0`, which is what the switch is for.
+
+**The page's own class, on the merged tip with all four repairs:**
+
+```text
+org.h2.test.store.TestKillProcessWhileWriting  rc=0  secs=403  oom=0  arena=0
+  compaction_cycles=47 objects_relocated=336650
+  relocation_skipped_jit=4 relocation_on_proven_jit=46
+  zgc-high-compaction: cycles=16 declined=31 objects_relocated=24
+                       bytes_copied=25166208
+                       vacated_spans=996 vacated_bytes=2082517560
+```
+
+`rc=0`, and **46 of 47 collections compacted** — the number this page spent
+2026-08-21 to 2026-08-26 getting off the floor, still there. 2.08 GB of vacated
+span republished on the way. **2/2** (the second run `rc=0 secs=351 oom=0
+arena=0`).
+
+**The corruption canary**, which is the measurement that HAD to be taken because
+item 2 hands the vacated span back to the allocator and so removes the safety
+net `TestMultiThread`'s own open stale-holder defect was standing on:
+
+```text
+org.h2.test.db.TestMultiThread  rc=0  secs=235  oom=0  arena=0
+  compaction_cycles=1 objects_relocated=3736 relocation_on_proven_jit=1
+  zgc-high-compaction: cycles=1 declined=0 vacated_spans=6 vacated_bytes=11904888
+```
+
+`rc=0`, zero `names an address the ZGC slide VACATED` reports, zero
+`ClassCastException`/`NoSuchMethodError`. **2/2** (the second `rc=0 secs=217
+oom=0 arena=0`). Two runs are not a rate — that class is flaky by its own
+page's account — but they are the runs that had to come back clean before this
+shipped, and they did.
+
+**Closed in code, not only in prose.** `recycled_chunk_size` now takes the
+publication's state and the starved floor is inert without it
+(`starved_recycle_permitted`), with a test carrying these numbers. Both default
+ON, so the shipped configuration is byte-for-byte the one measured above; this
+only affects somebody turning the publication off to bisect, and it stops that
+bisect from being worse than either endpoint.
+
+**And what the table does NOT establish**: `neither` is the pre-2026-08-29
+behaviour and it passed 2/2 here, so these runs do not show a rate improvement
+over it. They cannot: the same class on the same host, same day, on a
+pre-change binary, failed at 58 s, 63 s, 65 s, 67 s, 76 s and 127 s and passed
+past 400 s twice. **`TestMVStoreTool` is flaky on this host today**, and a
+two-rep table cannot separate a flaky pass from a fix. What this section
+therefore claims is what it measured: the mechanisms ENGAGE (the census above),
+one switch turns a passing configuration into a failing one 2/2, and the defect
+each repair names is real in the code. A rate claim needs a quiet host and
+ten reps an arm, and it is not made here.
+
+**One cost is known and deliberately not optimised yet.** The span is zeroed
+with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
+bytes — about four times what the slide itself copies — inside the pause. The
+cheaper form is the one the sweep already uses (`zgc_sweep_header_zero`): only
+the `ObjectHeader` of each address the slide vacated needs clearing, because
+"the body is only reachable through that header", and the caller has exactly
+that list in `pairs`. It is not done that way here because the safe version is
+unconditional and the cheap version depends on getting "which `from` addresses
+are above `dest` and therefore not already overwritten by a memmove" right —
+and getting that wrong zeroes a live object rather than costing a memset. Worth
+doing, worth doing with its own test.
+
+`CRATONVM_ZGC_PUBLISH_VACATED=0` is the same-binary bisect, and it is per heap
+so the A/B runs inside one test binary — which is what
+`a_slide_that_cannot_drop_the_cursor_still_frees_what_it_emptied` does: the
+control arm must reclaim **zero** to the free list, or the test proves nothing
+about the other one.
+
+> **This removes a safety net that a DIFFERENT open defect was standing on, and
+> that has to be said out loud.**
+> `bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md` is open on
+> a holder that keeps naming an address the slide vacated
+> (`receiver names an address the ZGC slide VACATED … target_still_live=true`).
+> While the vacated span was merely leaked, that stale read met a zeroed corpse
+> and surfaced as `java.lang.Object`. Now the span goes back to the allocator,
+> so the same stale read meets whatever was allocated over it — a different
+> FACE of the same defect, possibly sooner and possibly louder.
+>
+> That is not a reason to keep leaking the memory; the leak is what produced
+> the `OutOfMemoryError` this whole page is about. It IS a reason to run
+> `TestMultiThread` as the canary on every arm here and to expect its signature
+> to change, and it is why the canary is in the measurement table above rather
+> than in a follow-up.
+
+### 3. The large-object end is relocatable — `ZgcRealHeap::compact_high_region`
+
+Survivors are packed against `capacity` in DESCENDING address order (the mirror
+of the low slide's ascending walk, and just as load-bearing), and
+`Arena::compact_high_to` publishes the emptied spans as merged blocks on the
+high free list. The pairs join the low slide's, so the rewrite pass, the
+registry rebuild and the returned `PointerMap` cover both ends with one
+mechanism rather than two. A pinned large object stays put and the walk
+continues below it; the free space on its far side is preserved rather than
+dropped, which is the memory loss `Arena::compact_low_to`'s own history records
+having made once at the other end.
+
+**It engages, and here is what it does per cycle** (`CRATONVM_DBG_ZGC_HIGH=1`,
+`TestMVStoreTool`, `--Xmx 1g`):
+
+```text
+[zgc-high] region=4260384 moved=224 copied=2108760 pinned=0 spans=1
+           before=(blocks=198 bytes=1037480 largest=10880)
+           after=(blocks=1  bytes=1037480 largest=1037480)
+[zgc-high] region=4522544 moved=308 copied=1459008 pinned=0 spans=1
+           before=(blocks=110 bytes=900688  largest=241960)
+           after=(blocks=1  bytes=900688  largest=900688)
+```
+
+**99–198 blocks into one, every cycle.** The largest servable large-object
+block goes from 10 880 to 1 037 480 bytes in the first line — a request of
+262 160 is unservable before and servable after. Run totals, three runs across two binaries:
+`cycles=12 declined=3 objects_relocated=2737 bytes_copied=8800848`,
+`cycles=8 declined=8 objects_relocated=9895 bytes_copied=25959272`,
+`cycles=4 declined=20 objects_relocated=3259 bytes_copied=9003776`.
+
+Read `declined` beside `cycles`. It is the pass looking at the high end and
+finding under one large object's worth of contiguity to gain, which is the
+right answer and a different fact from not running — and it is why the
+`[GC] zgc-high-compaction:` line prints both.
+
+The engagement counters are on their own `[GC] zgc-high-compaction:` line, and
+`declined` is beside `cycles` deliberately: `cycles=0 declined=0` means the pass
+never ran, `cycles=0 declined=812` means it ran and found nothing worth doing,
+and only the first is a defect. The feature this supersedes
+(`CRATONVM_ZGC_TARGETED_COMPACTION`) shipped reading zero for a week and the
+only reason anyone found out is that it carried a counter.
+
+`CRATONVM_ZGC_HIGH_COMPACTION=0` is the same-binary bisect.
+
+### 4. A starved bump must recycle a short chunk, not eat the reserve
+
+`recycled_chunk_size`'s floor was `want / 8` unconditionally — 64 KiB against a
+512 KiB chunk, which is `ZTlabConfig::max_tlab_alloc` and a good floor while
+refusing costs one clean full-size bump.
+
+`TestMVStoreTool` fails one notch below it. From the same failure line:
+
+```text
+span_hist=8:53403 16:67817 32:1 64:1 512:1 1K:51960 2K:11501 4K:14
+          8K:63860 16K:40 32K:18 64K:1
+```
+
+815 MB free, the largest LOW block **104 896** bytes — and that one is the high
+end's; the largest low block is under 64 KiB, one notch under the floor, with
+63 860 spans of 8–16 KiB sitting unusable beneath it. So every TLAB refill in
+the process bumped. The cursor reached capacity. `Arena::alloc`'s last-resort
+arm then spent the whole 128 MiB large-object reserve on TLAB churn — that is
+the `high_reserve_unclaimed=129695184` above — and the 262 160-byte request the
+reserve exists to serve had nowhere left to go.
+
+"Is a short chunk worth taking?" has two answers and they turn on what refusing
+costs. With bump headroom, refusing buys a clean full-size bump and the short
+chunk is pure churn. With none, refusing does not buy a full chunk: it walks
+straight down to the arm that eats the reserve. The chunk is taken either way;
+the only question is out of WHICH space. Below the preferred floor the decision
+now consults `Arena::low_bump_headroom`, with a hard `want / 64` floor so dust
+is still refused and `need` still bounding both regimes.
+
+`CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` is the same-binary bisect.
+`CRATONVM_ZGC_TLAB=0` is NOT a substitute for it — that turns the whole
+thread-local buffer off and changes the allocation path, the free-list shape and
+the run time (561 s against 103 s), so an arm that differs by it differs by far
+more than this one decision.
+
+### 5. The region tripwire was armed on three sites that could not fire it
+
+§"Still open" has carried *"the two small objects in the large-object region"*
+since this page was filed, with the note that the tripwire *"fired zero times
+across a full failing run"* and the correct warning that this makes it *"an
+untriggered instrument, not evidence"*.
+
+It could not have fired. `note_region_leak` sat on `Arena::alloc`'s three LOW
+free-list exits, and a low tier only ever returns an offset below `high_cursor`,
+so `is_high` is false at all three **by construction**. The one exit that can
+return a high offset — `alloc`'s last-resort `high_fit`, which spends the
+large-object end's own free list rather than raise `OutOfMemoryError` — had no
+tripwire at all. It is armed now, as `high-free-list-last-resort`, with a test
+that exhausts the low end and watches the counter move.
+
+Still not a refusal, and it should not become one: refusing would trade a
+fragmentation hazard for an `OutOfMemoryError` on a heap that has bytes. What
+changed the balance is that the damage is no longer PERMANENT — item 2 packs a
+small survivor up there against the top with everything else, so it stops
+walling the region at the next relocating cycle.
+
+(Item numbering: item 2 is the vacated-span publication; the high-end compactor
+is item 3. The sentence above means both, because a small object up there is
+only re-packed by the high-end pass.)
+
+### 6. `CRATONVM_ZGC_TARGETED_COMPACTION` records a window nothing consumes
+
+Measured with the flag ON, and it is a finding about that feature rather than
+about this class: `targeted_pages=0` even though the window it recorded was
+`in_low_region=true` and therefore reachable by `logical_pages`.
+
+The `[zgc-target] recorded` line appears once in the whole run, and
+`[zgc-target] consumed` never appears. `record_compaction_target` fires on the
+allocation failure, and on this class the allocation failure is what **ends the
+run** — the last `[zgc-high]` line is one line above the first
+`arena allocation failed`. A target recorded at the failure that raises
+`OutOfMemoryError` has no next cycle to consume it.
+
+So the feature's own engagement number was never going to be non-zero on this
+family, for a reason unrelated to the one §"Follow-up 2026-08-28" gave. It stays
+default-OFF.
+
+### 7. The oop-map backstop exists now, and it is the CLASS FILE's verifier
+
+§"Follow-up 2026-08-27 (second)" withdrew the map-completeness oracle as a
+backstop and closed with: *"a backstop that can tell a dead slot from a live one
+without the map does not exist yet."*
+
+**Asking the JIT's own model would have been circular** — the oop map IS its
+output, so "the map does not name this slot" and "the model says it is not live
+here" are the same sentence. `classloading::type_maps` is a different oracle
+with a different provenance: what `bytecode_verifier` retains from the JVMS
+§4.10.1 StackMapTable walk, i.e. **javac's claim** about the type of every local
+at every instruction start. It answers both of the oracle's declared false
+positives at once — a primitive local is not an oop there, and an out-of-scope
+local is `Top`.
+
+Every never-mapped word in a java local is now classified against it. Measured,
+`CRATONVM_DBG_VERIFY_OOP_MAPS=1`, on the 2026-08-29 tip:
+
+| class | `verifier_oop` | `verifier_not_oop` | `verifier_unknown` | name index |
+|---|---:|---:|---:|---|
+| `TestMVStoreTool` | **0** | 40 | 198 | 762 names, 0 collisions |
+| `TestMultiThread` (PASSES) | **262** | **847 347** | 1 284 994 | 1 215 names, 0 collisions |
+
+Read the second row against what this page recorded on 2026-08-27:
+**1 108 464 never-mapped words on that class, 670 474 of them in frames
+asserting shadow coverage, on a run that PASSES.** The verifier refutes
+**847 347** of them outright and leaves **262** corroborated. That is the
+difference between a counter and a lead: 262 sites, each with a method and a
+bci, is a list somebody can work; a million is a number nobody can act on, which
+is exactly why that section withdrew it.
+
+`TestMVStoreTool`'s **zero** is the strong result the oracle's own doc says to
+look for.
+
+Three things this does NOT claim:
+
+* **`verifier_unknown` is large and that is honest, not a rounding error.** It
+  is every refusal to answer — an INLINED frame (a spliced callee's locals share
+  the region and the bci belongs to the callee's bytecode, so the outer map read
+  at that pc is a different method's types), a slot outside the java locals
+  (operand spill is indexed by runtime depth, which the frame does not carry),
+  a pc with no row, a name the index cannot resolve. Counting them separately is
+  the point: a backstop whose "no gap" silently includes "could not look" is the
+  vacuous green this page has spent a week avoiding.
+* **262 corroborated hits on a PASSING class is a lead, not a verdict.** They
+  may be live references the conservative band scan is still catching, or
+  genuine gaps that happen not to bite. What changed is that there are 262 of
+  them to look at rather than a million.
+* The index is name-keyed and cannot tell two loaders' versions of one class
+  apart. `0 collisions` on both runs is why the numbers above are trustworthy;
+  a non-zero there discounts the run.
+
+### 8. The cross-thread coverage handshake DOES decide something — on a
+### many-threaded class
+
+§"Still open" carried: *"The cross-thread coverage handshake decides nothing
+yet. It is built, default-ON, and `xt_cov=(accepted=0 refused=0 deposits=0)` on
+this workload — no peer was ever in compiled code at a collection here. It
+removes a blanket refusal that a genuinely many-threaded workload would hit;
+that claim is untested because this class does not produce the condition."*
+
+Run on a class that DOES produce the condition — `org.h2.test.db.TestMultiThread`,
+`CRATONVM_DBG_JIT_ROOTSCAN=1`, 2026-08-29 tip:
+
+```text
+frame_cov=(no_slot=0 misaligned=0 no_map=6 incomplete=0 ok=372)
+xt_cov=(accepted=1 refused=8 deposits=26)
+```
+
+**26 deposits, 1 accepted, 8 refused.** The handshake is consulted, and it both
+admits and refuses. The residual was never "it is broken", it was "nobody has
+run it on a workload that reaches it"; this is that run. `rc=0` on the same run.
+
+`no_map=6 of 378` on the same line, and `incomplete=0` — that class is not where
+the §"Follow-up 2026-08-27" `incomplete` residual lives.
+
+### 9. `incomplete=5` does not reproduce — and the handshake names what does
+
+The residual read *"`TestCachedQueryResults` shows `incomplete=5` — the first
+time anywhere that a map refuses on its OWN claim rather than being
+unlocatable."* Re-run on the 2026-08-29 tip with `CRATONVM_DBG_JIT_ROOTSCAN=1`:
+
+```text
+frame_cov=(no_slot=0 misaligned=0 no_map=77 incomplete=0 ok=6962)
+xt_cov=(accepted=0 refused=1730 deposits=469)
+```
+
+**`incomplete=0`.** It does not reproduce.
+
+And the line beside it is the real finding for that class: **the cross-thread
+handshake refuses 1 730 times and accepts 0**, against `accepted=1 refused=8`
+on `TestMultiThread`, which passes. A cycle the handshake refuses does not
+relocate at all, so none of the four repairs above runs on it. That is where
+`TestCachedQueryResults` should be attacked, and it is on its own page now.
+
+And the eight-bucket census the flag was there for, run on the same class
+(`CRATONVM_DBG_OOPCOV=1`):
+
+```text
+scauses(gate=0 desync=0 marks=83 scratch=0 locals64=0
+        dataflow=151 nopush=0 inline_scope=5)
+```
+
+**`dataflow=151` and `marks=83` are the whole of it.** The forward "must be
+oop" dataflow never reaching a bytecode pc (so there is no local oop mask to
+publish from), and the operand-stack oop marks not being exact at the safepoint
+(a revived dead-code merge reconstructing the stack at a nonzero depth). Not the
+gate, not a missing push, not a slot count. Two shapes to attack, both in the
+compiler rather than the collector.
+
+### 10. …and the census below is still the instrument for it
+
+§"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the
+first time anywhere that a map refuses on its OWN claim rather than being
+unlocatable. Different obligation from `no_map`, never investigated."*
+
+The obligation is `OopMapEntry::moving_young_coverage_complete`: the JIT itself
+recorded, at compile time, that the shadow-stack publication for that safepoint
+was not complete enough for relocation. That is the HONEST refusal — the
+mechanism working, not failing — and **the reason is already censused, in eight
+buckets**, by `x64::safepoint::shadow_incomplete_cause` (gate off, mark-vector
+desync, inexact operand marks, an oop in a scratch or XMM slot, more than 64
+locals, the local-oop dataflow never reaching the pc, no push emitted, an
+unmapped inline scope). `CRATONVM_DBG_OOPCOV=1` prints it per method, beside
+the exact `bytecode_pc`s whose shadow claim is false.
+
+So the residual was "nobody has run the flag", not "there is no way to ask".
+Recorded here so the next reader spends a run rather than an instrument.
+
+## What this page no longer tracks, and where it went
+
+Every row that was open on 2026-08-28 is accounted for here. Three were the
+defects §"Follow-up 2026-08-29" fixed; four were never this defect and now have
+their own pages; one was closed by a measurement rather than by anybody fixing
+it.
+
+### Fixed on 2026-08-29 — see §"Follow-up 2026-08-29"
+
+* **The LARGE-OBJECT end is never compacted.** `ZgcRealHeap::compact_high_region`
+  packs that end against `capacity` and merges its holes; measured at 99–198
+  free blocks into ONE, per cycle, on `TestMVStoreTool`.
+  `CRATONVM_ZGC_HIGH_COMPACTION=0` reverts it.
+* **The two small objects in the large-object region.** The tripwire that read
+  zero could not have fired: it was armed on three exits that return low
+  offsets by construction, and not on the one exit that can return a high one.
+  Armed, with a test. The damage is also no longer permanent, because the
+  high-end compactor packs such an object against the top with everything else.
+* **…and the two nobody had listed**, both found while measuring the two above:
+  the slide was discarding every byte it emptied whenever the cursor could not
+  follow it down (`CRATONVM_ZGC_PUBLISH_VACATED=0`), and the TLAB refill floor
+  was spending the large-object reserve on churn one notch above what the free
+  list could serve (`CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0`).
+
+### Closed by measurement, not by a fix
+
+* **There is no working backstop against a wrong oop map for java locals and
+  operand spill.** There is one now, and it is not the map-completeness oracle
+  this page withdrew on 2026-08-27 — that counter reads 5–6 % of every in-band
+  word on every workload and cannot be one. The oracle now classifies each
+  never-mapped word against the CLASS FILE's own verifier type maps
+  (`classloading::type_maps`, retained from the JVMS §4.10.1 StackMapTable
+  walk), which is an independent oracle and answers both declared false
+  positives at once: a primitive local is not an oop there, and an out-of-scope
+  local is `Top`. `verifier_oop` is the actionable number, `verifier_not_oop`
+  the subtracted false positives, and `verifier_unknown` every refusal to
+  answer — an inlined frame, a non-local slot, a pc with no row, a name the
+  index cannot resolve — counted rather than folded in, because a backstop
+  whose "no gap" silently includes "could not look" is the vacuous green this
+  page has been avoiding all along. Behind `CRATONVM_DBG_VERIFY_OOP_MAPS`.
+  **Measured**: `verifier_oop=0` on `TestMVStoreTool`, and on `TestMultiThread`
+  — where this page recorded 1 108 464 never-mapped words — the verifier
+  refutes **847 347** and leaves **262**. See §"Follow-up 2026-08-29" §7.
+* **The cross-thread coverage handshake decided nothing** — because nothing
+  had run it on a workload that reaches the condition. Run on
+  `org.h2.test.db.TestMultiThread`: `xt_cov=(accepted=1 refused=8
+  deposits=26)`, `rc=0`. It is consulted, and it both admits and refuses. See
+  §"Follow-up 2026-08-29" §8.
+* **`CRATONVM_ZGC_TARGETED_COMPACTION` engages zero times**, and §"Follow-up
+  2026-08-29" §6 says why in a way §"Follow-up 2026-08-28" could not: the
+  target is recorded on the allocation failure, and on this family the
+  allocation failure is what ends the run. It stays default-OFF, superseded by
+  the two compactors rather than fixed.
+
+### Never this defect — split out with their own pages
+
+| row | page |
+|---|---|
+| `TestOpenClose`: `Exception in thread "main" java/lang/Object`, no frames — and on 2026-08-29 an MVStore-writer OOM alongside it, on a run where the slide fired ONCE in 17 collections | `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md` |
+| `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER — **PASSES 1/1 on 2026-08-29** (`rc=0`, and the slide never ran, so the run does not exercise the path it would live on) | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
+| `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` | `bug-h2-testkillprocesswhilewriting-g1-oom-20260829.md` |
+| the same fragmentation symptom in Spring Framework and Hibernate, never censused | `../gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md` |
+| `TestCachedQueryResults`: still a LIVELOCK, `oom=2990` in 900 s on the fixed tip against 18 048 in 1 500 s before — a 3.6× lower rate and the same outcome | `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` |
+
+The last row is the one that matters most, and it is the reason this page
+retires with a caveat rather than a clean sweep: **`TestCachedQueryResults` is
+not fixed.** It throws thousands of `OutOfMemoryError` and keeps running, which
+is a different shape from every other class here — those failed once and died.
+Something catches and retries, and that is not a collector question. A rate
+improvement on a livelock is not a fix and this page does not claim one.
+
+The others were already labelled "not this defect" here, with a measurement
+behind the label; splitting them out is what stops this page's Status line from
+being read as a verdict on them. The G1 one in particular has a five-arm
+interleaved A/B behind it and is identical before and after every repair on
+this page.
