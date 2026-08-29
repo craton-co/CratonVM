@@ -357,7 +357,7 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
+| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED TWICE, INDEPENDENTLY, AND THE TWO AGREE.** Behaviour is FIXED (9 defects, 199 rows) -- see `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`, which is the record of this defect and sizes the identity residual across FIVE class families. The MECHANISM and the contract question are in `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md`: the carrier is minted through `try_ensure_synthetic_class`, the door `--jdk-only` refuses by design, so strict falls back to the interface. **Still OPEN, and the blocker is a CONTRACT decision, not a patch** -- is the VM's carrier a compatibility stand-in or its own allocation shape? |
 | **The BEHAVIOURAL half of the same surface: CLOSED 2026-08-29.** 199 differential rows over the segment/arena/layout API (`apps/probes/FfmSegmentSweep.java`) found **nine defects that are not identity** and every one is now 0-diff in both modes: a native `asReadOnly()` segment ACCEPTED WRITES; `ByteOrder` was minted per call so `ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()` was false; `Arena.global().close()` succeeded; `allocate(-1)`, two bad alignments and `ofArray(null)` did not refuse; and `s.asSlice(0, s.byteSize()).equals(s)` was false. The identity rows to the left are what REMAINS after those. | **DONE** — `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`. It also measures what the identity defect does NOT break: `isInstance`, `instanceof`, `isAssignableFrom` and a class-keyed `HashMap` round-trip all answer correctly on an interface-classed segment, in both modes — so the contract decision to the left is a decision about identity alone. || ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
@@ -536,30 +536,46 @@ Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
   was not. And a failure rate that climbs with load is a race in someone's code,
   not noise to be re-run away — here, ours.
 
-### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+### A gate was red on `dev` for ~5 hours on 2026-08-29 — CLOSED, kept for the technique
 
-`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
-`origin/dev` as of `a5c67dcda`:
+`cargo test -p cratonvm-native-builtins --lib` was 4176 passed, **1 failed**
+between `5a6348d28` and `b5a784fee`:
+`properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot`,
+naming `native_properties_clone` and `native_properties_replace_all`. Both the
+guard and the two functions it names landed in the SAME commit. Fixed by the
+owning lane, which took the exit this row argued for — reading the ORDERED
+snapshot — rather than adding the pair to `ALLOWED`.
+
+**The reusable part is how ownership was settled: without a build.** The test is
+a source witness over ONE file (`include_str!("properties_sidetable.rs")`), so
+its verdict is a pure function of that file's bytes, and
+`git diff origin/dev -- <that file>` came back empty. That is a proof, not an
+inference, and it costs a second. Reach for it before rebuilding a pristine
+`dev` — and note it only works because the witness reads a fixed path; a witness
+that scans a directory has to be re-run.
+
+**Both halves of the list matter.** This section lists known-red VECTORS, and a
+lane that runs the gates first had nothing to check a gate red against.
+
+**And a second one is OPEN as of `ff92ca9a4` (2026-08-29 evening).** Same test,
+different row:
 
 ```
-properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
-  these functions read the UNORDERED side-table snapshot:
-  ["native_properties_clone", "native_properties_replace_all"]
+cargo test -p cratonvm-native-builtins --test registrar_drift   (also with --features management)
+  the_drift_baseline_has_no_stale_rows
+  STALE BASELINE — 1 recorded drift pair(s) no longer drift.
+    register_phase54_atomics
+      java/util/concurrent/atomic/AtomicReference.compareAndSet(Ljava/lang/Object;Ljava/lang/Object;)Z
 ```
 
-**It is not your merge, and you can prove that without building anything.** The
-test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
-— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
-native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
-touched it, which makes the red identical to pristine `dev`'s.
-
-It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
-new guard it is: the guard and the two functions it names landed in the same
-commit. Left for that lane rather than silenced here, because the guard's two
-exits are not equivalent and picking between them is a behavioural call, not a
-gate-quieting one — `Properties.clone()` hands its key order to Java through
-`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
-that order, so "add it to ALLOWED" would be the wrong exit for both.
+It arrived with `7c90ec930` ("de-register the now-slower `AtomicReference
+.compareAndSet` stub"), which collapsed the pair and did not regenerate the
+baseline — the failure text says to do both in one commit. `registrar_drift.rs`,
+`phases_early.rs` and `vm/src/jit/helpers.rs` are byte-identical to `origin/dev`
+on any branch that has not touched them, which is how to tell it from yours.
+Left for that lane: the fix is to move the triple to `FIXED_NOT_DRIFTING` with
+`--dump-native-registry` evidence, which is a claim about their change, not
+about the gate.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.

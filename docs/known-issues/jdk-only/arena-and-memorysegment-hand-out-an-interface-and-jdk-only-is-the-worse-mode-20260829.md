@@ -1,83 +1,40 @@
-# `Arena` and `MemorySegment` hand out an INTERFACE as an instance's class — and `--jdk-only` is the worse mode
+# The interface-classed FFM family: which door mints the carrier, and why `--jdk-only` refuses it
 
-**Status: OPEN, fully diagnosed, deliberately NOT fixed.** 2026-08-29. The
-blocker is a contract decision, not a missing patch, and §4 says exactly what
-the decision is.
+**Read
+[`ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`](ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md)
+first — it is the record of this defect.** 199 rows, nine behavioural defects
+fixed, and the identity residual sized across five class families rather than
+the two this page reached.
 
-`HANDOFF-20260828-SCOPE.md` §4 carries this as a one-line row: *"`Arena`/
-`MemorySegment` report an INTERFACE as an instance's class — `panama.rs`,
-unclaimed, closest to L1"*. This page is that row measured.
+This page is what it does not carry: **the mechanism, and the contract question
+underneath it.** It was written the same day, independently, from the L1 lane,
+and the two agree on every overlapping row — which is worth saying, because two
+records of one defect are usually a contradiction waiting to be found.
 
 ---
 
-## 1. What was measured
+## 1. Where the two agree
 
-`SegmentClassProbe` — 59 rows, HotSpot 25.0.4+7 as oracle, both CratonVM modes.
-It asks only what a caller can rely on (`isInterface`, `isAbstract`,
-`instanceof`), never the class NAME, because a name is an implementation token
-the two VMs may legally disagree on.
+Measured here with `SegmentClassProbe` (59 rows, HotSpot 25.0.4+7, both modes):
 
-| receiver | HotSpot | CratonVM compatible | CratonVM `--jdk-only` |
+| receiver | HotSpot | compatible | `--jdk-only` |
 | --- | --- | --- | --- |
-| `Arena.ofConfined()` | concrete | **INTERFACE** | **INTERFACE** |
-| `Arena.ofShared()` | concrete | **INTERFACE** | **INTERFACE** |
-| `Arena.ofAuto()` | concrete | **INTERFACE** | **INTERFACE** |
-| `Arena.global()` | concrete | **INTERFACE** | **INTERFACE** |
-| `MemorySegment.ofArray(byte[] / int[] / long[])` | concrete | concrete | **INTERFACE** |
-| `arena.allocate(n)` | concrete | concrete | **INTERFACE** |
-| `segment.asSlice(..)` | concrete | concrete | **INTERFACE** |
-| `segment.reinterpret(..)` | concrete | concrete | **INTERFACE** |
-| `MemorySegment.NULL` | concrete | concrete | **INTERFACE** |
+| all four `Arena` factories | concrete | **interface** | **interface** |
+| every `MemorySegment` door | concrete | concrete | **interface** |
 
-Every one of these also reports `isAbstract = true`, because an interface is.
+Same split the FFM record's §4 reports from 199 rows: compatible instantiates a
+fabrication, strict refuses it and lands on the interface, and the families with
+no fabricated carrier to fall back from are interface-classed in *both* modes.
+Independent probes, same answer.
 
-**Real Java cannot produce an instance whose class is an interface**, and the
-JDK's own FFM consumers depend on that. `jdk.incubator.vector`'s
-`fromMemorySegment0Template` / `intoMemorySegment0Template` open with
-`checkcast jdk/internal/foreign/AbstractMemorySegmentImpl`, which no interface
-stamp can satisfy — the failure `panama.rs`'s own doc block records GPULlama3's
-first `matmul` dying on.
+Everything else this probe asked passed in both modes — `byteSize`, int and long
+round-trips, slice sizing, and five refusals including a read through a closed
+arena and a double `close`. The carriers work; their advertised class is
+impossible.
 
-**Everything else in the probe passes**, in both modes: `byteSize`, the int and
-long round-trips through an allocated segment, slice sizing, and the five
-refusals (slice past the end, negative slice offset, read past the end, read
-through a closed arena, double `close`). The carriers work. It is their
-advertised class that is impossible.
+## 2. What this page adds: the mechanism is one line
 
----
-
-## 2. Two halves, and only one of them was ever fixed
-
-**The `MemorySegment` half was fixed on 2026-08-22** — `panama.rs` introduced
-`CRATON_SEGMENT_CLASS = "cratonvm/internal/foreign/MemorySegmentImpl"`, a
-concrete carrier with zero declared fields, and its doc block records the two
-alternatives that were rejected with measured reasons (reusing
-`NativeMemorySegmentImpl` puts `ptr` where `length` is read; a fabricated
-subclass of `AbstractMemorySegmentImpl` gets `first_field_index: 0` and aliases
-the superclass's three fields onto slots 0/1/2).
-
-**The `Arena` half was not.** All four factories still allocate with the
-interface's own name:
-
-```rust
-r.register(arena, "ofAuto", "()Ljava/lang/foreign/Arena;", |ctx, _| {
-    let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
-```
-
-`panama.rs:786, 795, 808, 823` — `global`, `ofAuto`, `ofConfined`, `ofShared`.
-
-So the scope doc's row is right about `Arena` and stale about `MemorySegment`
-in compatible mode — and, as §3 shows, right about `MemorySegment` again under
-`--jdk-only`.
-
----
-
-## 3. `--jdk-only` reverts the fix, and the mechanism is one line
-
-This is the interesting half, and it is the reverse of this campaign's standing
-finding that strict mode is the more correct one.
-
-`craton_segment_class_id` resolves the carrier like this:
+`craton_segment_class_id` in `panama.rs` resolves the carrier like this:
 
 ```rust
 match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
@@ -87,87 +44,66 @@ match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
 ```
 
 `try_ensure_synthetic_class` is the door that mints **compatibility
-stand-ins** — by its own doc, *"the one thing `--jdk-only` forbids"*. Under
-strict mode it refuses, `.ok()?` returns `None`, and the caller falls back to
-stamping the interface.
+stand-ins** — by its own doc, *"the one thing `--jdk-only` forbids"*. Strict
+refuses, `.ok()?` yields `None`, and the caller falls back to stamping the
+interface.
 
 **So the fix for the interface stamp is itself a fabrication, and the mode whose
-whole purpose is to refuse fabrications refuses it — landing back on the exact
-defect the fabrication was introduced to cure.** That is the same shape as
-`a-refused-syntheticstub-falls-through-to-an-older-native-not-to-bytecode`:
-a refusal whose fallback is the older wrong answer rather than a refusal.
+purpose is to refuse fabrications refuses it — landing back on the exact defect
+the fabrication was introduced to cure.** Same shape as
+`a-refused-syntheticstub-falls-through-to-an-older-native-not-to-bytecode`: a
+refusal whose fallback is the older wrong answer rather than a refusal.
 
----
-
-## 4. Why this is not fixed here — the decision, stated
+## 3. The contract question, stated so it can be decided once
 
 There is a one-line change that makes the strict column match the compatible
-one: mint the carrier through `ensure_generated_class` instead. That door is for
-*"the classes a conforming JVM creates without any class file — array-adjacent
-shapes, lambda and proxy implementation classes and their superclasses,
-reflection accessors, and the VM's own internal allocation shapes"*, and it
-*"never refuses and never records a violation"*.
+one: mint through `ensure_generated_class`, which *"never refuses and never
+records a violation"* and is documented for *"the VM's own internal allocation
+shapes"*.
 
 **Its doc also says, in bold, do not reach for it to silence a refusal** —
 *"Contract §11's zero-stub census becomes unfalsifiable if a compatibility
 stand-in is minted through this door: the substitution continues and the report
 goes green."*
 
-That is precisely what this change would be, unless the answer to one question
-is yes:
+So the whole family reduces to one question:
 
-> **Is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in,
-> or the VM's own internal allocation shape?**
+> Is `cratonvm/internal/foreign/MemorySegmentImpl` a **compatibility stand-in**,
+> or **the VM's own internal allocation shape**?
 
-Both readings are defensible and they give opposite instructions:
+* **A stand-in.** It exists because this VM does not implement the JDK's FFM
+  implementation classes, and the definition of done is *"no fabricated class
+  instantiated, whatever its package"*. On this reading strict is **right** to
+  refuse it, the compatible carrier is itself a DoD violation (which the FFM
+  record's §4 confirms: any program touching FFM has
+  `compatibility_classes > 0`), and the bug is that the refusal's fallback is an
+  interface instead of a loud refusal.
+* **An allocation shape.** It stands in for no JDK class and claims to be none;
+  it carries zero declared fields and exists only so an instance has a concrete
+  class. The alternative is not "more honest" — it is impossible in Java and
+  breaks every JDK `checkcast`.
 
-* **A stand-in.** It exists because CratonVM does not implement the JDK's FFM
-  implementation classes. The definition of done is *"no fabricated class
-  instantiated, whatever its package"* — and `cratonvm/internal/...` is
-  fabricated by that definition. On this reading strict mode is **right** to
-  refuse it, the compatible mode's carrier is itself a DoD violation, and the
-  bug is that the refusal's fallback is an interface instead of a loud refusal
-  of the operation.
-* **An allocation shape.** It stands in for no JDK class and claims to be none.
-  It carries zero declared fields and exists so that an instance has a concrete
-  class at all. The alternative it replaced is not "more honest" — it is
-  impossible in Java and breaks every JDK `checkcast`.
+**Not decided here.** It is a contract question about the campaign's own
+definition of done, it changes what the zero-stub census means, and the lane
+brief's instruction for this shape is explicit: *"prefer recording a measured
+finding over a speculative repair, and say which you did."*
 
-**I did not take that decision.** It is a contract question about the
-campaign's own definition of done, it changes what the zero-stub census means,
-and the lane brief's instruction for this shape is explicit: *"a defect you
-find here may not be safe to fix in isolation. Prefer recording a measured
-finding over a speculative repair, and say which you did."* This is a record.
+**Also not done: fixing the `Arena` half alone.** All four factories
+(`panama.rs:786/795/808/823`) allocate with `"java/lang/foreign/Arena"`, the
+interface's own name, and giving them the carrier `MemorySegment` got would
+improve compatible mode and no-op in strict — but it half-applies a change whose
+strict behaviour is the open question.
 
-**What I also did not do: fix the `Arena` half alone.** Giving `Arena` the same
-carrier the segment has would be a strict improvement in compatible mode and a
-no-op in strict — but it half-applies a change whose strict behaviour is the
-open question, and a half-applied change is worse than either endpoint.
+## 4. For whoever takes it
 
----
+Answer §3 once and both halves follow. If the answer is "allocation shape", the
+change is the door swap plus an `Arena` carrier, and the check is this page's
+table going all-concrete. If it is "stand-in", the change is at the fallback: a
+refused carrier must refuse the OPERATION rather than hand back an
+interface-stamped object, and the DoD screen should then flag the compatible
+carrier too.
 
-## 5. For whoever takes it
-
-* The two halves are **one defect with one blocker**. Answer §4's question once
-  and both halves follow; `Arena` needs the same carrier treatment
-  `MemorySegment` got, at `panama.rs:786/795/808/823`.
-* If the answer is "allocation shape", the change is the door swap plus an
-  `Arena` carrier, and the check is this probe's table going all-`false`.
-* If the answer is "stand-in", the change is at the fallback: a refused carrier
-  must refuse the OPERATION, not hand back an interface-stamped object — and
-  the DoD screen should then flag the compatible-mode carrier too.
-* The probe is not in the tree: `probes/` was deleted wholesale on 2026-08-29
-  (`3b2901531`, 867 files). `SegmentClassProbe.java` lives on the Linux build
-  host at `/data/l1u-probes/`, and is quoted in full in this page's history.
-
-## Reproduce
-
-```bash
-javac -d out SegmentClassProbe.java
-java -cp out SegmentClassProbe                                  # oracle
-cratonvm --java-home "$JDK" -cp out SegmentClassProbe            # compatible
-cratonvm --java-home "$JDK" --jdk-only -cp out SegmentClassProbe # strict
-```
-
-59 rows each. Diff the strict arm against the compatible one — the mode drift is
-the finding, and it is 68 lines.
+`SegmentClassProbe.java` is not in the tree — `probes/` was deleted wholesale on
+2026-08-29 (`3b2901531`, 867 files). It is on the Linux build host at
+`/data/l1u-probes/`, and the FFM record's own `FfmSegmentSweep` covers the same
+ground more thoroughly from `apps/probes/`.
