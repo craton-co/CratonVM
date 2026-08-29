@@ -347,11 +347,11 @@ that never started a flight recording — which, per the LIVENESS block in
 `jfr/src/lib.rs`, is every run today.
 
 The bytes are the **JDK's own** chunk format, which is what makes the JMC
-caveat below meaningful. Until 2026-08-13 this called `dump::dump_to_file` —
-CratonVM's internal format — and the JMC user this section is written for got
-`IOException: Unknown string encoding 17` instead of a timeline. `jfr/src/dump.rs`
-still owns that internal format and its matching Rust reader; see the module
-docs at the top of `jfr/src/jdk_chunk.rs` for why the two coexist.
+caveat below meaningful: a JMC user opening the dump gets a real timeline
+rather than an `IOException: Unknown string encoding 17` from CratonVM's own
+internal format. `jfr/src/dump.rs` still owns that internal format and its
+matching Rust reader; see the module docs at the top of `jfr/src/jdk_chunk.rs`
+for why the two coexist.
 
 Three event types:
 

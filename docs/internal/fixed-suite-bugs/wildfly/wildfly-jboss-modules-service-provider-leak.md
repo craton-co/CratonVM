@@ -44,7 +44,7 @@ Two real, unrelated WildFly modules were used as the canonical leak pair
 (same shape as the original `infinispan`/`core-management`/`jmx` collision):
 `org.jboss.as.jmx` and `org.wildfly.extension.core-management`. Neither
 depends on the other; each ships its own
-`META-INF/services/org.jboss.as.controller.Extension` descriptor naming a
+`../../../../apps/META-INF/services/org.jboss.as.controller.Extension` descriptor naming a
 different provider (`org.jboss.as.jmx.JMXExtension` and
 `org.wildfly.extension.core.management.CoreManagementExtension`
 respectively, confirmed by extracting both descriptors from their real
@@ -55,7 +55,7 @@ scoped on `dev`:**
 
 - `native_module_classloader_find_resources` (`../../../../native-builtins/src/jboss_module_loader.rs`)
   only falls back to the process-wide classpath when the resource is
-  *not* `is_module_private_resource` (i.e. not under `META-INF/services/`).
+  *not* `is_module_private_resource` (i.e. not under `../../../../apps/META-INF/services/`).
   Service descriptors always resolve through `module_service_roots`, which
   only walks the module's own resource roots plus deps that opt in with
   `services="import"|"export"` — confirmed by the existing

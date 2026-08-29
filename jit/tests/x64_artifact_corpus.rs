@@ -246,10 +246,7 @@ impl Case {
         }
     }
 
-    fn compile_with(
-        &self,
-        helpers: &JitRuntimeHelpers,
-    ) -> Option<cratonvm_jit::CompiledMethod> {
+    fn compile_with(&self, helpers: &JitRuntimeHelpers) -> Option<cratonvm_jit::CompiledMethod> {
         let code_len = self.code.len();
         compile(
             &self.code,
@@ -695,8 +692,18 @@ fn corpus() -> Vec<Case> {
         c.push(Case::new(&format!("double/{name}"), 4, 4, double_binop(op)));
     }
     c.push(Case::new("double/dneg", 2, 2, vec![0x26, 0x77, 0xaf]));
-    c.push(Case::new("double/dcmpl", 4, 4, vec![0x26, 0x28, 0x97, 0xac]));
-    c.push(Case::new("double/dcmpg", 4, 4, vec![0x26, 0x28, 0x98, 0xac]));
+    c.push(Case::new(
+        "double/dcmpl",
+        4,
+        4,
+        vec![0x26, 0x28, 0x97, 0xac],
+    ));
+    c.push(Case::new(
+        "double/dcmpg",
+        4,
+        4,
+        vec![0x26, 0x28, 0x98, 0xac],
+    ));
 
     // --- conversions --------------------------------------------------------
     c.push(Case::new("conv/i2b", 1, 1, conv_to_int(&[0x91])));
@@ -739,7 +746,12 @@ fn corpus() -> Vec<Case> {
     );
 
     // --- stack shuffles -----------------------------------------------------
-    c.push(Case::new("stack/dup_add", 1, 1, vec![0x1a, 0x59, 0x60, 0xac]));
+    c.push(Case::new(
+        "stack/dup_add",
+        1,
+        1,
+        vec![0x1a, 0x59, 0x60, 0xac],
+    ));
     c.push(Case::new(
         "stack/dup_x1",
         2,
@@ -752,12 +764,7 @@ fn corpus() -> Vec<Case> {
         2,
         vec![0x1a, 0x1b, 0x5f, 0x64, 0xac],
     ));
-    c.push(Case::new(
-        "stack/pop",
-        2,
-        2,
-        vec![0x1a, 0x1b, 0x57, 0xac],
-    ));
+    c.push(Case::new("stack/pop", 2, 2, vec![0x1a, 0x1b, 0x57, 0xac]));
     c.push(Case::new(
         "stack/dup2_cat2",
         2,
@@ -776,7 +783,12 @@ fn corpus() -> Vec<Case> {
     // `pop2` was unimplemented — the cat-1 case above recorded REFUSED for just
     // as long, but a differ only reports, it does not fail.
     // lload_0 / pop2 / iconst_0 / ireturn
-    c.push(Case::new("stack/pop2_cat2", 2, 2, vec![0x1e, 0x58, 0x03, 0xac]));
+    c.push(Case::new(
+        "stack/pop2_cat2",
+        2,
+        2,
+        vec![0x1e, 0x58, 0x03, 0xac],
+    ));
     // dup2_x1 FORM-2, the `return this.doubleField = value;` shape, minus the
     // putfield so the case needs no constant pool:
     // aload_0 / dload_1 / dup2_x1 / dreturn
@@ -885,12 +897,8 @@ fn corpus() -> Vec<Case> {
         3,
         counted_loop(&[0x1c, 0x06, 0x68]),
     ));
-    c.push(
-        Case::new("loop/unroll_hint4", 1, 3, counted_loop(&[0x1c])).unroll(vec![(4, 4)]),
-    );
-    c.push(
-        Case::new("loop/unroll_hint8", 1, 3, counted_loop(&[0x1c])).unroll(vec![(4, 8)]),
-    );
+    c.push(Case::new("loop/unroll_hint4", 1, 3, counted_loop(&[0x1c])).unroll(vec![(4, 4)]));
+    c.push(Case::new("loop/unroll_hint8", 1, 3, counted_loop(&[0x1c])).unroll(vec![(4, 8)]));
     // nested loop
     {
         let inner = counted_loop(&[0x1c]);
@@ -932,29 +940,24 @@ fn corpus() -> Vec<Case> {
         4,
         cat2_accum_loop(0x09, 0x40, 0x1f, 0x85, 0x61, 0xad),
     ));
-    c.push(Case::new(
-        "loop/float_accum",
-        1,
-        3,
-        {
-            let mut v = vec![0x0b, 0x3c, 0x03, 0x3d]; // f = 0; i = 0
-            let head = v.len();
-            v.extend_from_slice(&[0x1c, 0x1a]);
-            let cmp_at = v.len();
-            v.extend_from_slice(&[0xa2, 0x00, 0x00]);
-            v.extend_from_slice(&[0x23, 0x1c, 0x86, 0x62, 0x3c]);
-            v.extend_from_slice(&[0x84, 0x02, 0x01]);
-            let goto_at = v.len();
-            let back = head as i32 - goto_at as i32;
-            v.extend_from_slice(&[0xa7, (back >> 8) as u8, back as u8]);
-            let exit = v.len();
-            let fwd = exit as i32 - cmp_at as i32;
-            v[cmp_at + 1] = (fwd >> 8) as u8;
-            v[cmp_at + 2] = fwd as u8;
-            v.extend_from_slice(&[0x23, 0xae]);
-            v
-        },
-    ));
+    c.push(Case::new("loop/float_accum", 1, 3, {
+        let mut v = vec![0x0b, 0x3c, 0x03, 0x3d]; // f = 0; i = 0
+        let head = v.len();
+        v.extend_from_slice(&[0x1c, 0x1a]);
+        let cmp_at = v.len();
+        v.extend_from_slice(&[0xa2, 0x00, 0x00]);
+        v.extend_from_slice(&[0x23, 0x1c, 0x86, 0x62, 0x3c]);
+        v.extend_from_slice(&[0x84, 0x02, 0x01]);
+        let goto_at = v.len();
+        let back = head as i32 - goto_at as i32;
+        v.extend_from_slice(&[0xa7, (back >> 8) as u8, back as u8]);
+        let exit = v.len();
+        let fwd = exit as i32 - cmp_at as i32;
+        v[cmp_at + 1] = (fwd >> 8) as u8;
+        v[cmp_at + 2] = fwd as u8;
+        v.extend_from_slice(&[0x23, 0xae]);
+        v
+    }));
     c.push(Case::new(
         "loop/two_double_accums",
         1,
@@ -1026,7 +1029,11 @@ fn corpus() -> Vec<Case> {
         v[cmp_at + 2] = fwd as u8;
         v.extend_from_slice(&[0x1b, 0xac]);
         c.push(Case::new("array/sum_loop", 1, 3, v.clone()).heap());
-        c.push(Case::new("array/sum_loop_unroll", 1, 3, v).heap().unroll(vec![(4, 4)]));
+        c.push(
+            Case::new("array/sum_loop_unroll", 1, 3, v)
+                .heap()
+                .unroll(vec![(4, 4)]),
+        );
     }
     // array fill loop (bulk-store preheader candidate)
     {
@@ -1180,10 +1187,15 @@ fn corpus() -> Vec<Case> {
             .news(vec![(0, 55, 32, false, false)]),
     );
     c.push(
-        Case::new("new/inline_tlab", 0, 2, vec![0xbb, 0x00, 0x07, 0x4b, 0x2a, 0xb0])
-            .heap()
-            .tlab()
-            .news(vec![(0, 55, 32, true, false)]),
+        Case::new(
+            "new/inline_tlab",
+            0,
+            2,
+            vec![0xbb, 0x00, 0x07, 0x4b, 0x2a, 0xb0],
+        )
+        .heap()
+        .tlab()
+        .news(vec![(0, 55, 32, true, false)]),
     );
     c.push(
         Case::new(
@@ -1222,22 +1234,17 @@ fn corpus() -> Vec<Case> {
         300,
         vec![0xc4, 0x84, 0x00, 0x00, 0x00, 0x05, 0x1a, 0xac],
     ));
-    c.push(Case::new(
-        "misc/many_locals",
-        1,
-        64,
-        {
-            let mut v = vec![0x1a];
-            for i in 1..40u8 {
-                v.push(0x36); // istore <i>
-                v.push(i);
-                v.push(0x15); // iload <i>
-                v.push(i);
-            }
-            v.push(0xac);
-            v
-        },
-    ));
+    c.push(Case::new("misc/many_locals", 1, 64, {
+        let mut v = vec![0x1a];
+        for i in 1..40u8 {
+            v.push(0x36); // istore <i>
+            v.push(i);
+            v.push(0x15); // iload <i>
+            v.push(i);
+        }
+        v.push(0xac);
+        v
+    }));
     c.push(Case::new("misc/deep_stack", 1, 2, {
         let mut v = vec![0x1a];
         for _ in 0..24 {

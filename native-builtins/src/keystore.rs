@@ -63,8 +63,8 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
+use crate::try_alloc_concurrent_synthetic;
 
 // ---------------------------------------------------------------------------
 // Public model
@@ -467,9 +467,7 @@ fn secret_alg_name(alg: &p12::AlgorithmIdentifier) -> String {
     match alg {
         p12::AlgorithmIdentifier::OtherAlg(other) => secret_key_alg_name(&other.algorithm_type),
         p12::AlgorithmIdentifier::Sha1 => "SHA1".to_string(),
-        p12::AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => {
-            "PBEWithSHA1AndRC2_40".to_string()
-        }
+        p12::AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => "PBEWithSHA1AndRC2_40".to_string(),
         p12::AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(_) => {
             "PBEWithSHA1AndDESede".to_string()
         }
@@ -914,7 +912,9 @@ fn ber_header<'a>(src: &'a [u8], pos: &mut usize) -> Result<BerHeader<'a>, Strin
         }
     }
     let ident = &src[ident_start..*pos];
-    let l0 = *src.get(*pos).ok_or_else(|| "truncated length".to_string())?;
+    let l0 = *src
+        .get(*pos)
+        .ok_or_else(|| "truncated length".to_string())?;
     *pos += 1;
     let len = if l0 == BER_INDEFINITE {
         None
@@ -3059,12 +3059,10 @@ pub(crate) fn engine_get_certificate_chain(
             crate::util_concurrent_ext::refused_class(ctx, "java/security/cert/X509Certificate", 8)?
         }
     };
-    let arr = crate::util_concurrent_ext::build_rooted_ref_array(
-        ctx,
-        cls_id,
-        chain.len(),
-        |ctx, i| make_x509_mirror(ctx, &alias, &chain[i]),
-    )?;
+    let arr =
+        crate::util_concurrent_ext::build_rooted_ref_array(ctx, cls_id, chain.len(), |ctx, i| {
+            make_x509_mirror(ctx, &alias, &chain[i])
+        })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -3213,8 +3211,8 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     //
     // Note the rendered date is the LOCAL-time face of epoch 0, which is what
     // made it read like a real timestamp rather than a default.
-    let Some(ms) = keystore_lookup(id)
-        .and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms))
+    let Some(ms) =
+        keystore_lookup(id).and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms))
     else {
         return Ok(Some(Value::Object(None)));
     };
@@ -3356,7 +3354,8 @@ pub(crate) fn engine_set_key_entry(
     // `Key.getFormat()` is the spec-defined discriminator ("RAW" for a secret
     // key, "PKCS#8" for a private key) and costs one virtual call, so ask it
     // rather than plumbing interface-identity checks through the native API.
-    if string_from_virtual(ctx, key, "getFormat", "()Ljava/lang/String;").as_deref() == Some("RAW") {
+    if string_from_virtual(ctx, key, "getFormat", "()Ljava/lang/String;").as_deref() == Some("RAW")
+    {
         if !spi_supports_secret_keys(ctx, this) {
             return Err(crate::phases_early::throw_jca_exc(
                 ctx,
@@ -3368,9 +3367,8 @@ pub(crate) fn engine_set_key_entry(
         if raw.is_empty() {
             return Ok(None);
         }
-        let key_algorithm =
-            string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;")
-                .unwrap_or_else(|| "AES".to_string());
+        let key_algorithm = string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;")
+            .unwrap_or_else(|| "AES".to_string());
         if let Err(failure) = require_encodable_secret_alg(ctx, &key_algorithm) {
             return Err(failure);
         }
@@ -4570,7 +4568,10 @@ mod tests {
     //! synthetic keystores produced specifically for this test (a single
     //! self-signed leaf + one trusted-cert entry, both ≤ 4 KiB).
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     use super::*;
 
@@ -4974,7 +4975,9 @@ mod tests {
     /// would have passed against the "RAW" bug.
     #[test]
     fn pkcs12_round_trips_a_secret_key_with_its_algorithm() {
-        let key = [0u8, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105];
+        let key = [
+            0u8, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105,
+        ];
         let store = store_of(vec![secret_entry("ske", &key, "AES")]);
         let der = write_pkcs12(&store, b"changeit").expect("write");
         let back = load_pkcs12(&der, b"changeit").expect("load");
@@ -5002,7 +5005,10 @@ mod tests {
         // The identifier itself sits INSIDE the encrypted SecretBag, so assert
         // it at the table rather than by scanning the ciphertext.
         assert_eq!(
-            secret_key_alg_oid("DESede").unwrap().components().as_slice(),
+            secret_key_alg_oid("DESede")
+                .unwrap()
+                .components()
+                .as_slice(),
             &[1u64, 3, 14, 3, 2, 17]
         );
         let der = write_pkcs12(&store, b"changeit").expect("write");
@@ -5087,7 +5093,10 @@ mod tests {
     fn pkcs12_refuses_a_secret_key_algorithm_it_cannot_encode() {
         let store = store_of(vec![secret_entry("x", &[0u8; 16], "ChaCha20")]);
         let err = write_pkcs12(&store, b"pw").expect_err("must not invent an OID");
-        assert!(err.contains("ChaCha20"), "message names the algorithm: {err}");
+        assert!(
+            err.contains("ChaCha20"),
+            "message names the algorithm: {err}"
+        );
     }
 
     /// A name this VM only READS (`AlgorithmId.getName()` is asymmetric for
@@ -5098,7 +5107,10 @@ mod tests {
         assert!(secret_key_alg_oid("DES/CBC").is_some());
         assert!(secret_key_alg_oid("RC2/CBC/PKCS5Padding").is_some());
         assert!(secret_key_alg_oid("1.2.840.113549.3.7").is_some());
-        assert!(secret_key_alg_oid("aes").is_some(), "names are case-insensitive");
+        assert!(
+            secret_key_alg_oid("aes").is_some(),
+            "names are case-insensitive"
+        );
         assert!(secret_key_alg_oid("not an algorithm").is_none());
         assert!(
             secret_key_alg_oid("9.99.1").is_none(),

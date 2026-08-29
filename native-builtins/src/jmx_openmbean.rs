@@ -100,10 +100,10 @@
 
 use crate::try_alloc_concurrent_synthetic;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::cell::RefCell;
-use cratonvm_types::error::MethodCallFailed;
 
 /// Internal name of `java.lang.Object`.
 const OBJECT_INTERNAL: &str = "java/lang/Object";
@@ -882,7 +882,10 @@ fn invoke_reflect_type_array(
     }
 }
 
-fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_mapping_for_type_object(
+    ctx: &mut dyn NativeContext,
+    type_obj: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(type_obj);
     let type_obj = ctx.read_native_pin(pin, type_obj);
     let mapping = match native_mapping_for_type(
@@ -1162,7 +1165,10 @@ fn resolve_type_name(ctx: &dyn NativeContext, type_obj: ObjectRef) -> Option<Str
 ///   here — `OpenConverter` only reads `openType` for cache hits).
 /// - `openClass` = `CompositeData.class` (the standard open class for
 ///   composite mappings).
-fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_composite_mapping(
+    ctx: &mut dyn NativeContext,
+    schema: &CompositeSchema,
+) -> Result<ObjectRef, MethodCallFailed> {
     // CompositeMapping fields match MXBeanMapping (identity layout) +
     // a CompositeType in the openType slot.
     let m = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3)?;
@@ -1202,7 +1208,10 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
 /// The synthetic CompositeType passes structural identity checks done
 /// by `OpenConverter.cacheIfRecursive` and avoids re-entering the
 /// recursive type analysis.
-fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_composite_type(
+    ctx: &mut dyn NativeContext,
+    schema: &CompositeSchema,
+) -> Result<ObjectRef, MethodCallFailed> {
     let ct = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8)?;
     // Pin each fresh object across the subsequent allocating calls
     // (`create_string` / `ensure_class_initialized` / `new_ref_array`) — a
@@ -1358,86 +1367,86 @@ pub fn register_jmx_openmbean_natives_with(
     // Defence in depth: short-circuit the OpenType recursion at the
     // mapping factory level too, so plain MBeans don't hit it.
     if synthetic_mapping {
-    // Defence in depth: if a path still reaches ConvertingMethod.from
-    // with an Object method (e.g. tests bypass the introspector),
-    // short-circuit by returning null.
-    //
-    // Inside the gate: this override installs an IDENTITY return mapping, so
-    // leaving it registered would keep `getAttribute` handing back the raw
-    // Java value even with the mapping factory restored. The Object-method
-    // filter it also provides is already covered by the `getMethods`
-    // registrations above, which stay unconditional.
-    registry.register(
-        "com/sun/jmx/mbeanserver/ConvertingMethod",
-        "from",
-        "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
-        native_converting_method_from,
-    );
-    registry.register(
+        // Defence in depth: if a path still reaches ConvertingMethod.from
+        // with an Object method (e.g. tests bypass the introspector),
+        // short-circuit by returning null.
+        //
+        // Inside the gate: this override installs an IDENTITY return mapping, so
+        // leaving it registered would keep `getAttribute` handing back the raw
+        // Java value even with the mapping factory restored. The Object-method
+        // filter it also provides is already covered by the `getMethods`
+        // registrations above, which stay unconditional.
+        registry.register(
+            "com/sun/jmx/mbeanserver/ConvertingMethod",
+            "from",
+            "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
+            native_converting_method_from,
+        );
+        registry.register(
         "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
         "mappingForType",
         "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
         native_mapping_for_type,
     );
-    registry.register(
+        registry.register(
         "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
         "mappingForType",
         "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
         native_mapping_for_type,
     );
-    // The `private` makeMapping internal — we override it too so that
-    // any caller that goes through `mappingForType`'s synchronized
-    // wrapper still hits our short-circuit.
-    registry.register(
+        // The `private` makeMapping internal — we override it too so that
+        // any caller that goes through `mappingForType`'s synchronized
+        // wrapper still hits our short-circuit.
+        registry.register(
         "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
         "makeMapping",
         "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
         native_mapping_for_type,
     );
 
-    // T19.M1 follow-up: `MXBeanMapping.toOpenValue`/`fromOpenValue` are
-    // ABSTRACT on the base class (see MXBeanMapping.java) -- every synthetic
-    // mapping instance we hand back from `native_mapping_for_type` /
-    // `alloc_identity_mapping` / `alloc_composite_mapping` above is allocated
-    // with class name `com/sun/jmx/mbeanserver/MXBeanMapping` itself (not a
-    // real concrete subclass), so calling either method on one threw
-    // `AbstractMethodError: ... has no Code attribute` the first time a real
-    // attribute/operation VALUE (not just MBeanInfo structure) needed
-    // conversion -- e.g. `MemoryMXBean.getHeapMemoryUsage()` accessed through
-    // a `MXBeanProxy`, once platform-MXBean registration (T19 registration
-    // fix) let real bytecode reach this far for the first time.
-    //
-    // Registering these two directly on the abstract `MXBeanMapping` class
-    // name only ever intercepts OUR synthetic instances: any real JDK
-    // subclass (from `DefaultMXBeanMappingFactory`'s permanent mappings for
-    // String/Integer/etc.) has its own concrete Code-attributed override,
-    // which virtual dispatch resolves first -- same "safe fallback on an
-    // abstract/interface type" pattern already used for `JavaLangAccess`
-    // elsewhere in this codebase.
-    //
-    // Identity passthrough is deliberately the whole implementation: our
-    // mappings are only ever consumed by a `toOpenValue` call on the
-    // MBeanServer side immediately followed by a `fromOpenValue` call on the
-    // client/proxy side of the SAME in-process round trip (there is no wire
-    // protocol in between for the `MBeanServerConnection` used by these
-    // tests), so handing the original Java value straight through
-    // unconverted reproduces the exact value the caller expects without
-    // needing a real `CompositeType`/`CompositeData` implementation. This
-    // matches the design this module's own header already documented
-    // ("fromOpenValue and toOpenValue are no-op identity stubs") -- that
-    // claim just was not backed by an actual registration until now.
-    registry.register(
-        "com/sun/jmx/mbeanserver/MXBeanMapping",
-        "toOpenValue",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_mxbean_mapping_identity,
-    );
-    registry.register(
-        "com/sun/jmx/mbeanserver/MXBeanMapping",
-        "fromOpenValue",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_mxbean_mapping_identity,
-    );
+        // T19.M1 follow-up: `MXBeanMapping.toOpenValue`/`fromOpenValue` are
+        // ABSTRACT on the base class (see MXBeanMapping.java) -- every synthetic
+        // mapping instance we hand back from `native_mapping_for_type` /
+        // `alloc_identity_mapping` / `alloc_composite_mapping` above is allocated
+        // with class name `com/sun/jmx/mbeanserver/MXBeanMapping` itself (not a
+        // real concrete subclass), so calling either method on one threw
+        // `AbstractMethodError: ... has no Code attribute` the first time a real
+        // attribute/operation VALUE (not just MBeanInfo structure) needed
+        // conversion -- e.g. `MemoryMXBean.getHeapMemoryUsage()` accessed through
+        // a `MXBeanProxy`, once platform-MXBean registration (T19 registration
+        // fix) let real bytecode reach this far for the first time.
+        //
+        // Registering these two directly on the abstract `MXBeanMapping` class
+        // name only ever intercepts OUR synthetic instances: any real JDK
+        // subclass (from `DefaultMXBeanMappingFactory`'s permanent mappings for
+        // String/Integer/etc.) has its own concrete Code-attributed override,
+        // which virtual dispatch resolves first -- same "safe fallback on an
+        // abstract/interface type" pattern already used for `JavaLangAccess`
+        // elsewhere in this codebase.
+        //
+        // Identity passthrough is deliberately the whole implementation: our
+        // mappings are only ever consumed by a `toOpenValue` call on the
+        // MBeanServer side immediately followed by a `fromOpenValue` call on the
+        // client/proxy side of the SAME in-process round trip (there is no wire
+        // protocol in between for the `MBeanServerConnection` used by these
+        // tests), so handing the original Java value straight through
+        // unconverted reproduces the exact value the caller expects without
+        // needing a real `CompositeType`/`CompositeData` implementation. This
+        // matches the design this module's own header already documented
+        // ("fromOpenValue and toOpenValue are no-op identity stubs") -- that
+        // claim just was not backed by an actual registration until now.
+        registry.register(
+            "com/sun/jmx/mbeanserver/MXBeanMapping",
+            "toOpenValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_mxbean_mapping_identity,
+        );
+        registry.register(
+            "com/sun/jmx/mbeanserver/MXBeanMapping",
+            "fromOpenValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_mxbean_mapping_identity,
+        );
     } // end if synthetic_mapping
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
@@ -1510,7 +1519,8 @@ pub(crate) fn build_composite_data(
     let composite_type_pin = composite_type.map(|o| ctx.pin_native_root(o));
     let map = build_string_keyed_map(ctx, items)?;
     let map_pin = ctx.pin_native_root(map);
-    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4)?;
+    let obj =
+        try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4)?;
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let composite_type = match (composite_type_pin, composite_type) {
@@ -1528,7 +1538,10 @@ pub(crate) fn build_composite_data(
 /// Build a `java.util.HashMap` populated with the given String→Value pairs.
 /// Falls back to a synthetic 2-slot map (data array + size) when
 /// `HashMap.put` cannot be invoked (unit-test mock).
-fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> Result<ObjectRef, MethodCallFailed> {
+fn build_string_keyed_map(
+    ctx: &mut dyn NativeContext,
+    items: &[(String, Value)],
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref-valued item BEFORE the first allocation below — the
     // per-item `create_string`/`put` calls allocate, and a moving young GC
     // there would relocate the not-yet-stored values (native stale-local
@@ -1958,7 +1971,8 @@ pub(crate) fn build_tabular_data(
     let tabular_type_pin = tabular_type.map(|o| ctx.pin_native_root(o));
     let map = build_string_keyed_map(ctx, &[])?;
     let map_pin = ctx.pin_native_root(map);
-    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4)?;
+    let obj =
+        try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4)?;
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let tabular_type = match (tabular_type_pin, tabular_type) {
@@ -2131,11 +2145,14 @@ fn alloc_mapped_mxbean_type(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::Value;
 
     #[test]

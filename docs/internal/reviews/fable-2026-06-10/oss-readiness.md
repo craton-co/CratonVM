@@ -68,7 +68,7 @@ BouncyCastle, (c) The Legion of the Bouncy Castle Inc.` line), and add a `THIRD-
 `cratonvm-native-builtins` crate, so the attribution travels with the published artifact.
 
 ### Blocker — vendored LGPL Hibernate file at repo root
-`META-INF/services/jakarta.persistence.spi.PersistenceProvider` (tracked, at the repo root) is a
+`../../../../apps/META-INF/services/jakarta.persistence.spi.PersistenceProvider` (tracked, at the repo root) is a
 **Hibernate file carrying an LGPL v2.1-or-later header** (`License: GNU Lesser General Public License
 (LGPL), version 2.1 or later. See the lgpl.txt file...`). It even references a `lgpl.txt` that does
 not exist in the tree. Shipping an LGPL-headered third-party file at the root of an Apache-2.0 repo
@@ -297,7 +297,7 @@ surface at package time. (Cannot be executed in this read-only audit.)
    + crate-content risk.
 2. Attribute the verbatim BouncyCastle ports (`bc_aes.rs`, `bc_chacha.rs`, `bc_newhope*.rs`) and add a
    third-party notice; correct the sole-Craton-copyright / Apache-2.0 mislabel.
-3. Resolve the LGPL Hibernate file at repo root (`META-INF/services/...PersistenceProvider`).
+3. Resolve the LGPL Hibernate file at repo root (`../../../../apps/META-INF/services/...PersistenceProvider`).
 4. Activate CI: move workflows into `.github/workflows/`; fix the broken README CI badge; fix the
    self-contradictory `.wf/README.md`.
 5. Set a per-crate publish policy (`publish = false` on `cuda-bridge`/`jit-cuda`/`craton-gpu`/

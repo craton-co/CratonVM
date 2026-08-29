@@ -147,7 +147,10 @@ mod tests {
 
         let strict = ExecutionPolicy::jdk_only();
         assert_eq!(strict.compatibility_mode, CompatibilityMode::JdkOnly);
-        assert!(strict.real_jdk, "--jdk-only always implies a real JDK image");
+        assert!(
+            strict.real_jdk,
+            "--jdk-only always implies a real JDK image"
+        );
         assert!(strict.is_jdk_only());
     }
 
@@ -156,7 +159,10 @@ mod tests {
     /// strict.
     #[test]
     fn execution_policy_default_is_compatible_real_jdk() {
-        assert_eq!(ExecutionPolicy::default(), ExecutionPolicy::compatible(true));
+        assert_eq!(
+            ExecutionPolicy::default(),
+            ExecutionPolicy::compatible(true)
+        );
         assert!(!ExecutionPolicy::default().is_jdk_only());
         assert!(ExecutionPolicy::default().real_jdk);
     }

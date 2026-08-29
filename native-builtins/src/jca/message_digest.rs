@@ -39,7 +39,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, compute_digest, obj_arg};
+use crate::{compute_digest, obj_arg, try_alloc_concurrent_synthetic};
 
 // C14 fix: the previous implementation keyed the side-table on `ObjectRef`,
 // whose `Hash` impl derives from the raw pointer (`self.ptr.as_ptr() as usize`,
@@ -189,7 +189,8 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // ahead of a third-party one is a JDK provider this crate services
     // natively, so reaching here means only a third-party provider can serve it.
     if !algorithm_supported(&algo_raw) {
-        if let Some(p) = crate::jca::provider_chain::find_service_provider("MessageDigest", &algo_raw)
+        if let Some(p) =
+            crate::jca::provider_chain::find_service_provider("MessageDigest", &algo_raw)
         {
             if let Some(engine) = crate::jca::provider_chain::build_third_party_engine(
                 ctx,
@@ -288,10 +289,7 @@ fn md_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 /// before the algorithm, so an unregistered name is `NoSuchProviderException`
 /// and an empty one is `IllegalArgumentException` — see
 /// `provider_chain::check_named_provider_arg`.
-fn md_get_instance_with_provider(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn md_get_instance_with_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     crate::jca::provider_chain::check_named_provider_arg(
         ctx,
         args,
@@ -388,7 +386,8 @@ fn md_get_instance_with_provider(
         }
     }
     let md = md_get_instance_named(ctx, &algo)?;
-    if let (Some(provider), Some(Value::Object(Some(obj)))) = (requested_provider.as_deref(), md.as_ref())
+    if let (Some(provider), Some(Value::Object(Some(obj)))) =
+        (requested_provider.as_deref(), md.as_ref())
     {
         crate::jca::provider_chain::record_requested_provider(ctx, *obj, provider);
     }
@@ -550,7 +549,12 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         };
         let off = args.get(2).copied().unwrap_or(Value::Int(0));
         let len = args.get(3).copied().unwrap_or(Value::Int(0));
-        return ctx.invoke_virtual(this, "engineUpdate", "([BII)V", &[Value::Object(arr), off, len]);
+        return ctx.invoke_virtual(
+            this,
+            "engineUpdate",
+            "([BII)V",
+            &[Value::Object(arr), off, len],
+        );
     }
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
@@ -1042,9 +1046,12 @@ fn md_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn algorithm_supported_accepts_known_set() {

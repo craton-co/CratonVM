@@ -714,7 +714,13 @@ fn native_antlr_array_prediction_context_init_singleton(
     scope.set_array_element(states_arr, 0, Value::Int(return_state));
     let hash = antlr_calculate_array_hash(&mut *scope, parents_arr, states_arr);
     antlr_init_prediction_context_base(&mut *scope, this, hash);
-    antlr_set_field_value(&mut *scope, this, "parents", 2, Value::Object(Some(parents_arr)));
+    antlr_set_field_value(
+        &mut *scope,
+        this,
+        "parents",
+        2,
+        Value::Object(Some(parents_arr)),
+    );
     antlr_set_field_value(
         &mut *scope,
         this,
@@ -1261,7 +1267,9 @@ fn antlr_arraylist_append(
 }
 
 fn antlr_is_java_arraylist(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/util/ArrayList")
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+        == Some("java/util/ArrayList")
 }
 
 fn antlr_atn_state_transitions(
@@ -1557,11 +1565,11 @@ fn native_antlr_parser_can_drop_loop_entry_edge(
         };
         let edge_h = scope.root(edge);
         let epsilon_args = [Value::Object(Some(scope.get(&edge_h)))];
-        let edge_is_epsilon =
-            match native_antlr_transition_is_epsilon(&mut *scope, &epsilon_args)? {
-                Some(Value::Int(v)) => v != 0,
-                _ => false,
-            };
+        let edge_is_epsilon = match native_antlr_transition_is_epsilon(&mut *scope, &epsilon_args)?
+        {
+            Some(Value::Int(v)) => v != 0,
+            _ => false,
+        };
         if !edge_is_epsilon {
             return Ok(Some(Value::Int(0)));
         }
@@ -1598,13 +1606,11 @@ fn native_antlr_parser_can_drop_loop_entry_edge(
                 };
                 let target_edge_h = scope.root(target_edge);
                 let target_epsilon_args = [Value::Object(Some(scope.get(&target_edge_h)))];
-                let target_edge_is_epsilon = match native_antlr_transition_is_epsilon(
-                    &mut *scope,
-                    &target_epsilon_args,
-                )? {
-                    Some(Value::Int(v)) => v != 0,
-                    _ => false,
-                };
+                let target_edge_is_epsilon =
+                    match native_antlr_transition_is_epsilon(&mut *scope, &target_epsilon_args)? {
+                        Some(Value::Int(v)) => v != 0,
+                        _ => false,
+                    };
                 let target_edge = scope.get(&target_edge_h);
                 let state = scope.get(&state_h);
                 if target_edge_is_epsilon
@@ -2464,7 +2470,11 @@ fn antlr_parser_rule_transition(
         Value::Object(Some(target)),
         Value::Object(Some(scope.get(&new_context_h))),
     ];
-    Ok(Some(antlr_alloc_atn_config(&mut *scope, names, &ctor_args)?))
+    Ok(Some(antlr_alloc_atn_config(
+        &mut *scope,
+        names,
+        &ctor_args,
+    )?))
 }
 
 fn antlr_parser_transition_delegate_descriptor(
@@ -2778,10 +2788,7 @@ impl AntlrClosureRoots {
     /// Current addresses of all four. Nested scopes read the same per-thread
     /// slot table, so an inner scope resolves these handles just as well.
     #[inline]
-    fn read(
-        &self,
-        scope: &NativeHandleScope<'_>,
-    ) -> (ObjectRef, ObjectRef, ObjectRef, ObjectRef) {
+    fn read(&self, scope: &NativeHandleScope<'_>) -> (ObjectRef, ObjectRef, ObjectRef, ObjectRef) {
         (
             scope.get(&self.simulator),
             scope.get(&self.config),
@@ -2839,12 +2846,7 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                             let next_config_h = scope.root(next_config);
                             (simulator, config, configs, closure_busy) = roots.read(scope);
                             let next_config = scope.get(&next_config_h);
-                            antlr_parser_add_config(
-                                &mut **scope,
-                                simulator,
-                                configs,
-                                next_config,
-                            )?;
+                            antlr_parser_add_config(&mut **scope, simulator, configs, next_config)?;
                         } else {
                             (simulator, config, configs, closure_busy) = roots.read(scope);
                             antlr_parser_closure_impl(
@@ -2861,8 +2863,11 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                         }
                     } else {
                         (simulator, config, configs, closure_busy) = roots.read(scope);
-                        let Some(return_state_obj) =
-                            antlr_parser_atn_state_by_number(&mut **scope, simulator, return_state)?
+                        let Some(return_state_obj) = antlr_parser_atn_state_by_number(
+                            &mut **scope,
+                            simulator,
+                            return_state,
+                        )?
                         else {
                             continue;
                         };
@@ -2874,8 +2879,7 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                         let Some(context) = antlr_atn_config_context(&mut **scope, config) else {
                             continue;
                         };
-                        let parent =
-                            antlr_prediction_context_parent(&mut **scope, context, index);
+                        let parent = antlr_prediction_context_parent(&mut **scope, context, index);
                         let semantic_context =
                             antlr_atn_config_semantic_context(&mut **scope, config);
                         let alt = antlr_atn_config_alt(&mut **scope, config);
@@ -2887,8 +2891,7 @@ fn antlr_parser_closure_checking_stop_state_unrooted(
                             Value::Object(parent),
                             Value::Object(semantic_context),
                         ];
-                        let next_config =
-                            antlr_alloc_atn_config(&mut **scope, names, &ctor_args)?;
+                        let next_config = antlr_alloc_atn_config(&mut **scope, names, &ctor_args)?;
                         let next_config_h = scope.root(next_config);
                         (simulator, config, configs, closure_busy) = roots.read(scope);
                         let next_config = scope.get(&next_config_h);
@@ -3058,7 +3061,13 @@ fn antlr_parser_closure_unrooted(
                 continue;
             }
             (simulator, config, configs, closure_busy) = roots.read(&scope);
-            antlr_set_field_value(&mut *scope, configs, "dipsIntoOuterContext", 6, Value::Int(1));
+            antlr_set_field_value(
+                &mut *scope,
+                configs,
+                "dipsIntoOuterContext",
+                6,
+                Value::Int(1),
+            );
             next_depth = next_depth.saturating_sub(1);
         } else {
             let transition = scope.get(&transition_h);
@@ -3521,8 +3530,7 @@ fn antlr_parser_remove_all_configs_not_in_rule_stop_state(
                             Value::Object(Some(scope.get(&config_h))),
                             Value::Object(Some(stop_state)),
                         ];
-                        let next_config =
-                            antlr_alloc_atn_config(&mut *scope, names, &ctor_args)?;
+                        let next_config = antlr_alloc_atn_config(&mut *scope, names, &ctor_args)?;
                         let next_config_h = scope.root(next_config);
                         let result = scope.get(&result_h);
                         let simulator = scope.get(&simulator_h);
@@ -3613,8 +3621,7 @@ fn native_antlr_parser_compute_reach_set(
                 continue;
             };
             let this = scope.get(&this_h);
-            let Some(target) =
-                antlr_parser_reachable_target(&mut *scope, this, transition, token)?
+            let Some(target) = antlr_parser_reachable_target(&mut *scope, this, transition, token)?
             else {
                 continue;
             };
@@ -4577,12 +4584,7 @@ fn native_antlr_lexer_atn_config_init(
                 );
                 let this = scope.get(&this_h);
                 let lexer_action_executor = executor_h.as_ref().map(|handle| scope.get(handle));
-                antlr_lexer_atn_config_set_fields(
-                    &mut *scope,
-                    this,
-                    lexer_action_executor,
-                    false,
-                );
+                antlr_lexer_atn_config_set_fields(&mut *scope, this, lexer_action_executor, false);
             } else {
                 // The current ANTLR runtime has no 4-argument copy constructor
                 // on LexerATNConfig. Keep this branch explicit for descriptor
@@ -4893,18 +4895,16 @@ fn antlr_atn_config_set_equals(
     }
     let a = scope.get(&a_h);
     let b = scope.get(&b_h);
-    Ok(
-        antlr_int_field(&mut *scope, a, "fullCtx", 7)
-            == antlr_int_field(&mut *scope, b, "fullCtx", 7)
-            && antlr_int_field(&mut *scope, a, "uniqueAlt", 3)
-                == antlr_int_field(&mut *scope, b, "uniqueAlt", 3)
-            && antlr_ref_field(&mut *scope, a, "conflictingAlts", 4)
-                == antlr_ref_field(&mut *scope, b, "conflictingAlts", 4)
-            && antlr_int_field(&mut *scope, a, "hasSemanticContext", 5)
-                == antlr_int_field(&mut *scope, b, "hasSemanticContext", 5)
-            && antlr_int_field(&mut *scope, a, "dipsIntoOuterContext", 6)
-                == antlr_int_field(&mut *scope, b, "dipsIntoOuterContext", 6),
-    )
+    Ok(antlr_int_field(&mut *scope, a, "fullCtx", 7)
+        == antlr_int_field(&mut *scope, b, "fullCtx", 7)
+        && antlr_int_field(&mut *scope, a, "uniqueAlt", 3)
+            == antlr_int_field(&mut *scope, b, "uniqueAlt", 3)
+        && antlr_ref_field(&mut *scope, a, "conflictingAlts", 4)
+            == antlr_ref_field(&mut *scope, b, "conflictingAlts", 4)
+        && antlr_int_field(&mut *scope, a, "hasSemanticContext", 5)
+            == antlr_int_field(&mut *scope, b, "hasSemanticContext", 5)
+        && antlr_int_field(&mut *scope, a, "dipsIntoOuterContext", 6)
+            == antlr_int_field(&mut *scope, b, "dipsIntoOuterContext", 6))
 }
 
 fn native_antlr_atn_config_set_equals(
@@ -5391,8 +5391,7 @@ fn antlr_merge_singletons(
     }
 
     let (a, b, _) = roots!();
-    if let Some(root_merge) =
-        antlr_merge_root_contexts(&mut *scope, names, a, b, root_is_wildcard)?
+    if let Some(root_merge) = antlr_merge_root_contexts(&mut *scope, names, a, b, root_is_wildcard)?
     {
         let root_merge_h = scope.root(root_merge);
         let (a, b, merge_cache) = roots!();
@@ -5455,12 +5454,8 @@ fn antlr_merge_singletons(
         if a_state > b_state {
             states = [b_state, a_state];
         }
-        let merged = antlr_create_array_context(
-            &mut *scope,
-            names,
-            &[Some(parent), Some(parent)],
-            &states,
-        )?;
+        let merged =
+            antlr_create_array_context(&mut *scope, names, &[Some(parent), Some(parent)], &states)?;
         let merged_h = scope.root(merged);
         let (a, b, merge_cache) = roots!();
         let merged = scope.get(&merged_h);
@@ -5652,8 +5647,7 @@ fn antlr_merge_arrays(
 
     if merged_parents.len() == 1 && merged_parents.len() < a_states.len() + b_states.len() {
         let parent = merged_parents[0].as_ref().map(|handle| scope.get(handle));
-        let merged =
-            antlr_create_singleton_context(&mut *scope, names, parent, merged_states[0])?;
+        let merged = antlr_create_singleton_context(&mut *scope, names, parent, merged_states[0])?;
         let merged_h = scope.root(merged);
         let (a, b, merge_cache) = roots!();
         let merged = scope.get(&merged_h);
@@ -6848,10 +6842,13 @@ pub(crate) fn register_antlr_prediction_context_intrinsics(registry: &mut Native
 
 #[cfg(test)]
 mod antlr_prediction_context_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     /// Guard: this module must never go back to the raw pin trio.
@@ -7893,10 +7890,18 @@ mod antlr_prediction_context_tests {
             .find(HIBERNATE_NAVIGABLE_PATH, "equals", "(Ljava/lang/Object;)Z")
             .is_some());
         assert!(registry
-            .find(HIBERNATE_NAVIGABLE_PATH, "getParent", "()Lorg/hibernate/spi/NavigablePath;")
+            .find(
+                HIBERNATE_NAVIGABLE_PATH,
+                "getParent",
+                "()Lorg/hibernate/spi/NavigablePath;"
+            )
             .is_some());
         assert!(registry
-            .find(HIBERNATE_NAVIGABLE_PATH, "getRealParent", "()Lorg/hibernate/spi/NavigablePath;")
+            .find(
+                HIBERNATE_NAVIGABLE_PATH,
+                "getRealParent",
+                "()Lorg/hibernate/spi/NavigablePath;"
+            )
             .is_some());
         assert!(registry
             .find(

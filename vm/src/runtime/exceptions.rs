@@ -3152,7 +3152,10 @@ mod tests {
         let error = RuntimeError::aioobe(9, 4);
         if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = error {
             assert_eq!(index, 9);
-            assert_eq!(message.as_deref(), Some("Index 9 out of bounds for length 4"));
+            assert_eq!(
+                message.as_deref(),
+                Some("Index 9 out of bounds for length 4")
+            );
         } else {
             panic!("wrong variant");
         }
@@ -3393,7 +3396,10 @@ mod helpful_npe_tests {
     #[test]
     fn nsme_message_matches_hotspot() {
         // 'Lib Lib.widen(boolean)'
-        assert_eq!(nsme_message("Lib", "widen", "(Z)LLib;"), "'Lib Lib.widen(boolean)'");
+        assert_eq!(
+            nsme_message("Lib", "widen", "(Z)LLib;"),
+            "'Lib Lib.widen(boolean)'"
+        );
         // 'long Lib.calc(int, java.lang.String[], double[][])'
         assert_eq!(
             nsme_message("Lib", "calc", "(I[Ljava/lang/String;[[D)J"),
@@ -3418,7 +3424,9 @@ mod helpful_npe_tests {
             "(Z)V",
         );
         assert!(
-            msg.contains("org.springframework.data.r2dbc.mapping.R2dbcMappingContext.setForceQuote("),
+            msg.contains(
+                "org.springframework.data.r2dbc.mapping.R2dbcMappingContext.setForceQuote("
+            ),
             "analyzer-visible prefix missing from {msg}"
         );
     }

@@ -2408,11 +2408,11 @@ impl VmHeap {
     ) {
         if let VmHeap::G1(g1) = self {
             g1.remark(stw, roots); // remark marks roots + drains SATB
-            // The worker (spawned by `g1_start_concurrent_mark` just before
-            // this) may have already drained the initially-empty worklist and
-            // parked with `quiesced=true`. These roots seed real work, so wake
-            // it and clear the premature quiescence — otherwise the completion
-            // poll could fire before the seeded graph is marked.
+                                   // The worker (spawned by `g1_start_concurrent_mark` just before
+                                   // this) may have already drained the initially-empty worklist and
+                                   // parked with `quiesced=true`. These roots seed real work, so wake
+                                   // it and clear the premature quiescence — otherwise the completion
+                                   // poll could fire before the seeded graph is marked.
             if let Some(ctrl) = g1.concurrent_mark.lock().as_ref() {
                 ctrl.notify_work_available();
             }
@@ -2806,9 +2806,7 @@ impl VmHeap {
             // previous attempt at this optimisation WAS inert, so `hits` is the
             // only thing that separates them. `disabled=true` means an owner was
             // registered with no class id and the gate has failed safe.
-            for (name, hits, misses, disabled) in
-                crate::external_roots::provider_gate_stats()
-            {
+            for (name, hits, misses, disabled) in crate::external_roots::provider_gate_stats() {
                 eprintln!(
                     "[GC] zgc-overlay-gate: provider={name} hits={hits}                      misses={misses} disabled={disabled}",
                 );
@@ -3005,8 +3003,7 @@ impl VmHeap {
         // when non-zero, because zero is the expected reading and a line that
         // is always there stops being read.
         {
-            let n = crate::heap::COMPACT_OOP_MAP_MISSING
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let n = crate::heap::COMPACT_OOP_MAP_MISSING.load(std::sync::atomic::Ordering::Relaxed);
             if n != 0 {
                 eprintln!(
                     "[GC] compact_oop_map_missing={n} — MARKING FAIL-OPEN: that many \
@@ -4590,9 +4587,11 @@ mod concurrent_mark_controller_tests {
         // 8-byte aligned so only the region-bounds check (not the alignment
         // check) is exercised — the observed all-ones sentinel fails both,
         // and either failure mode must be rejected the same way.
-        let sentinel = unsafe { ObjectRef::from_raw_nonnull(
-            std::ptr::NonNull::new(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8).unwrap(),
-        ) };
+        let sentinel = unsafe {
+            ObjectRef::from_raw_nonnull(
+                std::ptr::NonNull::new(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8).unwrap(),
+            )
+        };
 
         assert_eq!(heap.kind_of(sentinel), ObjectKind::Object);
         assert_eq!(heap.element_type_of(sentinel), ArrayElementType::Reference);
@@ -4612,7 +4611,9 @@ mod concurrent_mark_controller_tests {
     #[test]
     fn load_and_forward_rejects_a_forwarding_target_outside_every_region() {
         let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
-        let obj = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8).unwrap();
+        let obj = heap
+            .try_alloc_object(cratonvm_types::ClassId::new(0), 8)
+            .unwrap();
         // SAFETY: test-only corruption of a live header to simulate the
         // observed implausible-header family (see `old_gen::scan_region`'s
         // `validate_header_tags_or_desync`) reaching the forwarding word.

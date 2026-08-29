@@ -462,7 +462,10 @@ mod tests {
             "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
         ));
         let msg = b"Cryptographic Forum Research Group";
-        assert_eq!(hexstr(&poly1305(&k, msg)), "a8061dc1305136c6c22b8baf0c0127a9");
+        assert_eq!(
+            hexstr(&poly1305(&k, msg)),
+            "a8061dc1305136c6c22b8baf0c0127a9"
+        );
     }
 
     /// RFC 8439 §2.6.2 — the AEAD's one-time key generation.
@@ -575,12 +578,18 @@ mod tests {
              656374726f6e696320636f6d6d756e69636174696f6e73206d61646520617420616e792074696d65206f72\
              20706c6163652c207768696368206172652061646472657373656420746f",
         );
-        assert_eq!(hexstr(&poly1305(&k, &msg)), "36e5f6b5c5e06070f0efca96227a863e");
+        assert_eq!(
+            hexstr(&poly1305(&k, &msg)),
+            "36e5f6b5c5e06070f0efca96227a863e"
+        );
 
         // §A.3 #3: s = 0, so the tag is the reduced accumulator alone.
         let mut k3 = [0u8; 32];
         k3[..16].copy_from_slice(&hex("36e5f6b5c5e06070f0efca96227a863e"));
-        assert_eq!(hexstr(&poly1305(&k3, &msg)), "f3477e7cd95417af89a6b8794c310cf0");
+        assert_eq!(
+            hexstr(&poly1305(&k3, &msg)),
+            "f3477e7cd95417af89a6b8794c310cf0"
+        );
     }
 
     /// The counter is honoured, and it is what makes ChaCha20 seekable: the
@@ -620,7 +629,9 @@ mod tests {
         let reference = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&n);
 
-        for len in [0usize, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 200] {
+        for len in [
+            0usize, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 200,
+        ] {
             let pt: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             for aad_len in [0usize, 1, 15, 16, 17, 48] {
                 let aad: Vec<u8> = (0..aad_len).map(|i| (i * 11 + 5) as u8).collect();
@@ -628,7 +639,13 @@ mod tests {
                 let mut ours = ct.clone();
                 ours.extend_from_slice(&tag);
                 let theirs = reference
-                    .encrypt(nonce, Payload { msg: &pt, aad: &aad })
+                    .encrypt(
+                        nonce,
+                        Payload {
+                            msg: &pt,
+                            aad: &aad,
+                        },
+                    )
                     .expect("reference encrypt");
                 assert_eq!(
                     hexstr(&ours),

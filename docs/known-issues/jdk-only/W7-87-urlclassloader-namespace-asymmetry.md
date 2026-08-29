@@ -285,7 +285,7 @@ find them again, roughly in descending order of sharpness.
 | `lang_class.rs` `native_class_for_name` | `Class.forName(n, init, bareUCL)` loses the "the JVM already knows this loader defined it" fast path |
 | `lang_class.rs` `wrap_annotation_in_real_proxy` | an annotation loaded by a bare `URLClassLoader` gets a proxy reporting the app loader — the `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader` shape, one loader kind short |
 | `lang_system.rs` `preload_supertypes_via_loader` | the `defineClass1/2` route skips the initiating-loader supertype preload (the `ucl_try_define_local_class` route uses the ungated `preload_isolated_loader_supertypes`, so only that road is affected) |
-| `service_loader.rs` `usable_loader`, and two sites in `discover_providers` | `ServiceLoader.load(S, new URLClassLoader(urls))` never drives that loader; providers and `META-INF/services` descriptors reachable only through its URLs are silently dropped to the flat `-cp` scan |
+| `service_loader.rs` `usable_loader`, and two sites in `discover_providers` | `ServiceLoader.load(S, new URLClassLoader(urls))` never drives that loader; providers and `../../../apps/META-INF/services` descriptors reachable only through its URLs are silently dropped to the flat `-cp` scan |
 | `phases_late/jar_manifest.rs` `spring_class_utils_for_name_impl` | `ClassUtils.forName` collapses onto the loader-blind global resolution, busting `Class`-identity-keyed caches |
 | `spring_startup_bootstrap.rs` `resolve_class_id_via_tccl` | returns `None` for a bare-`URLClassLoader` TCCL, so resolution falls to the global table |
 

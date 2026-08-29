@@ -45,7 +45,6 @@ fn real_jdk_vm() -> Option<Vm> {
     ))
 }
 
-
 macro_rules! require_class_library {
     () => {
         if real_jdk_vm().is_none() {

@@ -1150,7 +1150,10 @@ impl<'a> Emitter<'a> {
             .locals
             .0
             .iter()
-            .map(|slot| slot.as_ref().is_some_and(|r| adoptable(r, &occurrences, self)))
+            .map(|slot| {
+                slot.as_ref()
+                    .is_some_and(|r| adoptable(r, &occurrences, self))
+            })
             .collect();
         drop(occurrences);
 
@@ -1598,7 +1601,7 @@ impl<'a> Emitter<'a> {
             // which happens only for the collapsed float-sqrt triple.
             0x90 if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) => {}
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
-            0x91 => self.conv_truncate_i32(8)?,                            // i2b
+            0x91 => self.conv_truncate_i32(8)?,                               // i2b
             // i2c — Java `char` is an UNSIGNED 16-bit value, so JVMS i2c
             // zero-extends the low 16 bits (not sign-extends like i2b/i2s).
             // Route through the zero-extending helper so e.g. 0xFFFF maps
@@ -1964,8 +1967,8 @@ impl<'a> Emitter<'a> {
             // `float_sqrt_triple_at`), and the whole thing collapses to one
             // `sqrt.rn.f32`. Otherwise the operand really is a double and
             // the f64 square root is what the program asked for.
-            Some(MathIntrinsic::SqrtF64) if self.stack.0.last().map(|r| r.kind)
-                == Some(RegKind::F32) =>
+            Some(MathIntrinsic::SqrtF64)
+                if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) =>
             {
                 self.unop_f32("sqrt.rn.f32")
             }
@@ -2037,7 +2040,12 @@ impl<'a> Emitter<'a> {
             scaled.name, x32.name
         )
         .unwrap();
-        writeln!(self.body, "    ex2.approx.f32 {}, {};", result.name, scaled.name).unwrap();
+        writeln!(
+            self.body,
+            "    ex2.approx.f32 {}, {};",
+            result.name, scaled.name
+        )
+        .unwrap();
         let widened = self.regs.fresh_reg(RegKind::F64);
         writeln!(
             self.body,

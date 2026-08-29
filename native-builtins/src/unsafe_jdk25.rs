@@ -138,13 +138,15 @@ pub fn native_unsafe_copy_swap_memory(
     if src_obj.is_none() && dest_obj.is_none() {
         let mut buf = vec![0u8; bytes];
         if !crate::unsafe_arena_copy_out(src_offset as i64, &mut buf) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!(
-                    "Unsafe.copySwapMemory: source 0x{:x} is not in any live arena",
-                    src_offset
-                ),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.copySwapMemory: source 0x{:x} is not in any live arena",
+                        src_offset
+                    ),
+                }
+                .into(),
+            );
         }
         if elem_size >= 2 {
             for chunk in buf.chunks_mut(elem_size) {
@@ -152,13 +154,15 @@ pub fn native_unsafe_copy_swap_memory(
             }
         }
         if !crate::unsafe_arena_copy_in(dest_offset as i64, &buf) {
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!(
-                    "Unsafe.copySwapMemory: destination 0x{:x} is not in any live arena",
-                    dest_offset
-                ),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.copySwapMemory: destination 0x{:x} is not in any live arena",
+                        dest_offset
+                    ),
+                }
+                .into(),
+            );
         }
         return Ok(None);
     }
@@ -289,8 +293,6 @@ pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use crate::{
@@ -299,6 +301,11 @@ mod tests {
         native_unsafe_fence, native_unsafe_get_int, native_unsafe_get_int_volatile,
         native_unsafe_get_long, native_unsafe_put_int, native_unsafe_put_int_volatile,
         native_unsafe_put_long,
+    };
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
     use cratonvm_types::{ClassId, ObjectRef, Value};
 

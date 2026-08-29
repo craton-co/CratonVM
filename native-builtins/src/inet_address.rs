@@ -107,7 +107,11 @@ fn resolve_addrs(host: &str) -> Result<Vec<IpAddr>, MethodCallFailed> {
     Ok(out)
 }
 
-fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAddr) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_inet_address_mirror(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    ip: &IpAddr,
+) -> Result<ObjectRef, MethodCallFailed> {
     // `java.net.Inet4Address` / `Inet6Address` are real bootstrap classes:
     // their instance slots 0/1 are the inherited `holder` reference fields,
     // NOT `hostName` / `address` Strings. `alloc_inet_address_external`
@@ -122,7 +126,11 @@ fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAdd
     // `host` is whatever the caller passed to `getByName`/`getAllByName`: a
     // NAME to remember, or a numeric literal that the JDK remembers nothing
     // about (`getByName("127.0.0.1").toString()` is `/127.0.0.1`).
-    Ok(crate::net_phase_e::alloc_inet_address_for_input(ctx, host, &ip.to_string())?)
+    Ok(crate::net_phase_e::alloc_inet_address_for_input(
+        ctx,
+        host,
+        &ip.to_string(),
+    )?)
 }
 
 fn read_string_arg(
@@ -634,7 +642,13 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // The public `getAllByName` etc. are owned by `net_phase_e.rs`. Here we
     // register the static `init` symbol that real-JDK's `InetAddress.<clinit>`
     // calls to pull in the address-impl singletons.
-    r.register_with_kind(INET_ADDRESS, "init", "()V", |_ctx, _args| Ok(None), NativeKind::Bridge);
+    r.register_with_kind(
+        INET_ADDRESS,
+        "init",
+        "()V",
+        |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
+    );
     // Real-JDK also exposes `lookupAllHostAddr` directly on InetAddress via
     // the package-private impl-delegate path — register it here so callers
     // that bypass the public `getAllByName` (e.g. internal JDK code) still
@@ -692,12 +706,20 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // native `init()V` invoked from their own `<clinit>` (Inet4Address.java
     // line 144, Inet6Address.java line 394). The `*Impl` versions are
     // already registered above; these are the top-level (non-Impl) ones.
-    r.register_with_kind("java/net/Inet4Address", "init", "()V", |_ctx, _args| {
-        Ok(None)
-    }, NativeKind::Bridge);
-    r.register_with_kind("java/net/Inet6Address", "init", "()V", |_ctx, _args| {
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        "java/net/Inet4Address",
+        "init",
+        "()V",
+        |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        "java/net/Inet6Address",
+        "init",
+        "()V",
+        |_ctx, _args| Ok(None),
+        NativeKind::Bridge,
+    );
 
     // Touch CString so the `use std::ffi::CString;` import isn't dead in the
     // (rare) builds that cull both `unix` and `windows`.
@@ -711,9 +733,12 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn resolve_localhost_returns_at_least_one_address() {

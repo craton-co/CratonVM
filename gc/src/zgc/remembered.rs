@@ -246,8 +246,7 @@ const _: () = assert!(cratonvm_types::SLOT_SIZE % Z_REMSET_GRAIN_BYTES == 0);
 const _: () = assert!(cratonvm_types::ARRAY_DATA_OFFSET % Z_REMSET_GRAIN_BYTES == 0);
 // The legacy reference WORD sits at `cell + FIELD_CELL_PAYLOAD64_OFFSET`, not
 // at the cell base, so that displacement must be on the grid too.
-const _: () =
-    assert!(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET % Z_REMSET_GRAIN_BYTES == 0);
+const _: () = assert!(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET % Z_REMSET_GRAIN_BYTES == 0);
 
 /// Bits in one bitmap word.
 pub const Z_REMSET_BITS_PER_WORD: usize = 64;
@@ -723,8 +722,7 @@ impl ZRememberedSet {
     /// [`CardTable::retained_bytes`](crate::card_table::CardTable::retained_bytes),
     /// which measures the same thing for the card-table representation.
     pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + 2 * self.word_count * std::mem::size_of::<AtomicU64>()
+        std::mem::size_of::<Self>() + 2 * self.word_count * std::mem::size_of::<AtomicU64>()
     }
 
     /// Snapshot of this set's counters.
@@ -1718,7 +1716,8 @@ impl ZStoreBarrier {
 
         // A null store creates no edge.
         if stored_value == 0 {
-            self.filtered_value_not_young.fetch_add(1, Ordering::Relaxed);
+            self.filtered_value_not_young
+                .fetch_add(1, Ordering::Relaxed);
             return ZStoreBarrierOutcome::Filtered;
         }
 
@@ -1731,7 +1730,8 @@ impl ZStoreBarrier {
         // Old→old edges are found by the old-generation trace, not by the
         // remembered set.
         if !ctx.is_young(stored_value) {
-            self.filtered_value_not_young.fetch_add(1, Ordering::Relaxed);
+            self.filtered_value_not_young
+                .fetch_add(1, Ordering::Relaxed);
             return ZStoreBarrierOutcome::Filtered;
         }
 
@@ -1900,9 +1900,7 @@ impl ZStoreBarrier {
             filtered_value_not_young: self.filtered_value_not_young.load(Ordering::Relaxed),
             remembered_precise: self.remembered_precise.load(Ordering::Relaxed),
             remembered_coarse: self.remembered_coarse.load(Ordering::Relaxed),
-            promotion_fields_remembered: self
-                .promotion_fields_remembered
-                .load(Ordering::Relaxed),
+            promotion_fields_remembered: self.promotion_fields_remembered.load(Ordering::Relaxed),
             promotions: self.promotions.load(Ordering::Relaxed),
         }
     }
@@ -2028,7 +2026,10 @@ mod tests {
     #[test]
     fn out_of_range_offset_is_rejected_not_silently_recorded() {
         let rs = ZRememberedSet::new(0, 4096);
-        assert!(!rs.remember(4096), "exactly at the page end is out of range");
+        assert!(
+            !rs.remember(4096),
+            "exactly at the page end is out of range"
+        );
         assert!(!rs.remember(999_999));
         assert_eq!(rs.bits_set(), 0);
         assert!(!rs.is_remembered(4096));
@@ -2463,10 +2464,7 @@ mod tests {
                 for i in 0..256usize {
                     let page_id = ((i + t) % 4) as u64;
                     let offset = (i * THREADS + t) * Z_REMSET_GRAIN_BYTES;
-                    assert_eq!(
-                        table.remember(page_id, offset),
-                        ZRememberOutcome::Precise,
-                    );
+                    assert_eq!(table.remember(page_id, offset), ZRememberOutcome::Precise,);
                 }
             }));
         }
@@ -2497,10 +2495,7 @@ mod tests {
         assert_eq!(c.old_page_count(), 4);
         assert_eq!(c.page_of(OLD_BASE), Some((0, 0)));
         assert_eq!(c.page_of(OLD_BASE + 64), Some((0, 64)));
-        assert_eq!(
-            c.page_of(OLD_BASE + OLD_PAGE as u64 + 8),
-            Some((1, 8)),
-        );
+        assert_eq!(c.page_of(OLD_BASE + OLD_PAGE as u64 + 8), Some((1, 8)),);
         assert_eq!(c.page_base(2), OLD_BASE + 2 * OLD_PAGE as u64);
         assert_eq!(c.page_of(YOUNG_BASE), None, "young pages have no rset");
         assert_eq!(c.page_of(OLD_BASE + OLD_SIZE), None);
@@ -2924,7 +2919,11 @@ mod tests {
         }
         for page_id in 0..4u64 {
             let set = barrier.table().get(page_id).expect("registered");
-            assert_eq!(set.bits_set(), 1, "page {page_id} holds exactly its own edge");
+            assert_eq!(
+                set.bits_set(),
+                1,
+                "page {page_id} holds exactly its own edge"
+            );
             assert!(set.is_remembered(128));
         }
     }
@@ -2962,10 +2961,10 @@ mod tests {
         let promoted = OLD_BASE + OLD_PAGE as u64 + 1024;
         let h = cratonvm_types::HEADER_SIZE;
         let outgoing: Vec<(usize, u64)> = vec![
-            (h, YOUNG_BASE + 0x40),            // young  -> remember
-            (h + 8, OLD_BASE + 0x20),          // old    -> skip
-            (h + 16, 0),                       // null   -> skip
-            (h + 24, YOUNG_BASE + 0x900),      // young  -> remember
+            (h, YOUNG_BASE + 0x40),       // young  -> remember
+            (h + 8, OLD_BASE + 0x20),     // old    -> skip
+            (h + 16, 0),                  // null   -> skip
+            (h + 24, YOUNG_BASE + 0x900), // young  -> remember
         ];
 
         assert_eq!(barrier.on_promote(&c, promoted, &outgoing), 2);
@@ -2974,7 +2973,10 @@ mod tests {
         assert!(page1.is_remembered(1024 + h));
         assert!(page1.is_remembered(1024 + h + 24));
         assert!(!page1.is_remembered(1024 + h + 8), "old referent, no edge");
-        assert!(!page1.is_remembered(1024 + h + 16), "null referent, no edge");
+        assert!(
+            !page1.is_remembered(1024 + h + 16),
+            "null referent, no edge"
+        );
         assert_eq!(page1.bits_set(), 2);
 
         let stats = barrier.stats();
@@ -2998,10 +3000,7 @@ mod tests {
         // An address outside the old range: constraint 1 on `on_promote` was
         // violated (the caller passed the pre-copy source address).
         let bogus = YOUNG_BASE + 512;
-        assert_eq!(
-            barrier.on_promote(&c, bogus, &[(0, YOUNG_BASE)]),
-            0,
-        );
+        assert_eq!(barrier.on_promote(&c, bogus, &[(0, YOUNG_BASE)]), 0,);
         assert_eq!(barrier.stats().promotion_fields_remembered, 0);
         assert_eq!(barrier.table().total_bits_set(), 0);
     }

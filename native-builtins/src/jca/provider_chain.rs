@@ -51,7 +51,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use rustc_hash::FxHashMap;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Provider chain — process-wide mutable list mirroring HotSpot's default
@@ -611,7 +611,10 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(arr))))
 }
 
-fn security_get_providers_filtered(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn security_get_providers_filtered(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let filter = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -622,7 +625,8 @@ fn security_get_providers_filtered(ctx: &mut dyn NativeContext, args: &[Value]) 
     if type_str.is_empty() || algorithm.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    let matches: Vec<(String, f64, &'static str)> = snapshot().into_iter()
+    let matches: Vec<(String, f64, &'static str)> = snapshot()
+        .into_iter()
         .filter(|(name, _, _)| get_service_entry(name, type_str, algorithm).is_some())
         .collect();
     if matches.is_empty() {
@@ -861,9 +865,16 @@ fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option
     // and both parses produce the same map — and strictly cheaper than the
     // alternative of holding a lock across a filesystem read.
     static FILE_PROPS: std::sync::OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<Option<std::collections::HashMap<String, String>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<
+            Option<std::collections::HashMap<String, String>>,
+        >,
     > = std::sync::OnceLock::new();
-    let cell = FILE_PROPS.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(None, cratonvm_types::lock_order::LockLevel::Scratch));
+    let cell = FILE_PROPS.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            None,
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    });
     if let Some(answer) = {
         let guard = cell.lock();
         guard.as_ref().map(|m| m.get(key).cloned())
@@ -1111,8 +1122,12 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Object(Some(p)) => service_has_named_layout(ctx, this, p),
         // A null provider cannot be read back distinguishably. Fall back to
         // asking whether the receiver kept the `className` we just wrote.
-        _ => matches!(ctx.get_field_by_name(this, "className"), Value::Object(Some(_)))
-            && matches!(class_name, Value::Object(Some(_))),
+        _ => {
+            matches!(
+                ctx.get_field_by_name(this, "className"),
+                Value::Object(Some(_))
+            ) && matches!(class_name, Value::Object(Some(_)))
+        }
     };
     if !named_layout {
         let nfields = ctx.object_num_fields(this);
@@ -1606,9 +1621,7 @@ fn engine_delegate_shape(engine_class: &str) -> Option<(&'static str, &'static s
 /// also implements `Cloneable` gets a `MessageDigest` whose `clone()` throws
 /// `CloneNotSupportedException` where HotSpot would clone — recorded as the
 /// known residual of this fix rather than silently accepted.
-fn engine_delegate_shape_with_provider(
-    engine_class: &str,
-) -> Option<(&'static str, &'static str)> {
+fn engine_delegate_shape_with_provider(engine_class: &str) -> Option<(&'static str, &'static str)> {
     match engine_class {
         "java/security/MessageDigest" => Some((
             "java/security/MessageDigest$Delegate",
@@ -1974,15 +1987,13 @@ fn put_service_attribute(provider: &str, type_str: &str, algorithm: &str, attr: 
     let algo_n = normalize_algo(algorithm);
     let mut s = services().lock();
     let map = s.entry(provider.to_string()).or_default();
-    let entry = map
-        .entry((type_n, algo_n))
-        .or_insert_with(|| ServiceEntry {
-            type_str: type_str.to_string(),
-            algorithm: algorithm.to_string(),
-            class_name: String::new(),
-            key: format!("{type_str}.{algorithm}"),
-            attributes: Vec::new(),
-        });
+    let entry = map.entry((type_n, algo_n)).or_insert_with(|| ServiceEntry {
+        type_str: type_str.to_string(),
+        algorithm: algorithm.to_string(),
+        class_name: String::new(),
+        key: format!("{type_str}.{algorithm}"),
+        attributes: Vec::new(),
+    });
     if let Some(slot) = entry
         .attributes
         .iter_mut()
@@ -2007,8 +2018,29 @@ fn seed_direct_native_engine_services() {
     // order. `every_advertised_sun_message_digest_is_serviceable` is now the
     // ratchet that keeps this array and that predicate one set.
     // W7-63-jca-advertise-vs-serve.md.
-    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512", "SHAKE128-256", "SHAKE256-512"] {
-        put_service(SUN, "MessageDigest", algorithm, "sun.security.provider.Native");
+    for algorithm in [
+        "MD2",
+        "MD5",
+        "SHA-1",
+        "SHA-224",
+        "SHA-256",
+        "SHA-384",
+        "SHA-512",
+        "SHA-512/224",
+        "SHA-512/256",
+        "SHA3-224",
+        "SHA3-256",
+        "SHA3-384",
+        "SHA3-512",
+        "SHAKE128-256",
+        "SHAKE256-512",
+    ] {
+        put_service(
+            SUN,
+            "MessageDigest",
+            algorithm,
+            "sun.security.provider.Native",
+        );
     }
     // SUN's `MessageDigest` ALIASES, enumerated from
     // `Security.getProvider("SUN").keySet()` on HotSpot 25 rather than
@@ -2110,21 +2142,50 @@ fn seed_direct_native_engine_services() {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
     for algorithm in ["DRBG", "SHA1PRNG"] {
-        put_service(SUN, "SecureRandom", algorithm, "sun.security.provider.SecureRandom");
+        put_service(
+            SUN,
+            "SecureRandom",
+            algorithm,
+            "sun.security.provider.SecureRandom",
+        );
     }
-    for algorithm in ["DSA", "SHA1withDSA", "SHA256withDSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+    for algorithm in [
+        "DSA",
+        "SHA1withDSA",
+        "SHA256withDSA",
+        "ML-DSA",
+        "ML-DSA-44",
+        "ML-DSA-65",
+        "ML-DSA-87",
+    ] {
         put_service(SUN, "Signature", algorithm, "sun.security.provider.Native");
     }
     put_alias(SUN, "Signature", "DSS", "DSA");
 
     const RSA: &str = "SunRsaSign";
     for algorithm in ["RSA", "RSASSA-PSS"] {
-        put_service(RSA, "KeyFactory", algorithm, "sun.security.rsa.RSAKeyFactory");
+        put_service(
+            RSA,
+            "KeyFactory",
+            algorithm,
+            "sun.security.rsa.RSAKeyFactory",
+        );
     }
     for algorithm in [
-        "MD2withRSA", "MD5withRSA", "SHA1withRSA", "SHA224withRSA", "SHA256withRSA",
-        "SHA384withRSA", "SHA512withRSA", "SHA512/224withRSA", "SHA512/256withRSA",
-        "SHA3-224withRSA", "SHA3-256withRSA", "SHA3-384withRSA", "SHA3-512withRSA", "RSASSA-PSS",
+        "MD2withRSA",
+        "MD5withRSA",
+        "SHA1withRSA",
+        "SHA224withRSA",
+        "SHA256withRSA",
+        "SHA384withRSA",
+        "SHA512withRSA",
+        "SHA512/224withRSA",
+        "SHA512/256withRSA",
+        "SHA3-224withRSA",
+        "SHA3-256withRSA",
+        "SHA3-384withRSA",
+        "SHA3-512withRSA",
+        "RSASSA-PSS",
     ] {
         put_service(RSA, "Signature", algorithm, "sun.security.rsa.RSASignature");
     }
@@ -2260,12 +2321,22 @@ fn seed_direct_native_engine_services() {
     // the engine arm, not the string.
     // W7-63-jca-advertise-vs-serve.md.
     for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
-        put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
+        put_service(
+            JCE,
+            "KeyFactory",
+            algorithm,
+            "com.sun.crypto.provider.ML_KEM_Impls$KF",
+        );
     }
     // Finite-field Diffie-Hellman, registered under the name HotSpot uses.
     // `DH` is an ALIAS there, not a service, which is why the advertised list
     // names `DiffieHellman` while every caller types `DH`.
-    put_service(JCE, "KeyFactory", "DiffieHellman", "com.sun.crypto.provider.DHKeyFactory");
+    put_service(
+        JCE,
+        "KeyFactory",
+        "DiffieHellman",
+        "com.sun.crypto.provider.DHKeyFactory",
+    );
     put_alias(JCE, "KeyFactory", "DH", "DiffieHellman");
     // SunJCE's own aliases. Aliases are excluded from
     // `Security.getAlgorithms` (their property key is `Alg.Alias.Cipher.X`, not
@@ -2301,18 +2372,48 @@ fn seed_direct_native_engine_services() {
     if cfg!(target_os = "windows") {
         const MSCAPI: &str = "SunMSCAPI";
         for algorithm in ["RSA", "RSA/ECB/PKCS1Padding"] {
-            put_service(MSCAPI, "Cipher", algorithm, "sun.security.mscapi.CRSACipher");
+            put_service(
+                MSCAPI,
+                "Cipher",
+                algorithm,
+                "sun.security.mscapi.CRSACipher",
+            );
         }
-        put_service(MSCAPI, "SecureRandom", "Windows-PRNG", "sun.security.mscapi.PRNG");
+        put_service(
+            MSCAPI,
+            "SecureRandom",
+            "Windows-PRNG",
+            "sun.security.mscapi.PRNG",
+        );
         for algorithm in [
-            "MD2withRSA", "MD5withRSA", "NONEwithRSA", "RSASSA-PSS", "SHA1withRSA",
-            "SHA256withRSA", "SHA384withRSA", "SHA512withRSA", "SHA1withECDSA",
-            "SHA224withECDSA", "SHA256withECDSA", "SHA384withECDSA", "SHA512withECDSA",
+            "MD2withRSA",
+            "MD5withRSA",
+            "NONEwithRSA",
+            "RSASSA-PSS",
+            "SHA1withRSA",
+            "SHA256withRSA",
+            "SHA384withRSA",
+            "SHA512withRSA",
+            "SHA1withECDSA",
+            "SHA224withECDSA",
+            "SHA256withECDSA",
+            "SHA384withECDSA",
+            "SHA512withECDSA",
         ] {
-            put_service(MSCAPI, "Signature", algorithm, "sun.security.mscapi.CSignature");
+            put_service(
+                MSCAPI,
+                "Signature",
+                algorithm,
+                "sun.security.mscapi.CSignature",
+            );
         }
     }
-    put_service("SunJSSE", "Signature", "MD5andSHA1withRSA", "sun.security.ssl.RSASignature");
+    put_service(
+        "SunJSSE",
+        "Signature",
+        "MD5andSHA1withRSA",
+        "sun.security.ssl.RSASignature",
+    );
     seed_measured_jdk25_provider_aliases();
     seed_retired_getalgorithms_literals();
 }
@@ -2362,19 +2463,64 @@ const MEASURED_JDK25_PROVIDER_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("SUN", "KeyFactory", "2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
     ("SUN", "KeyFactory", "2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
     ("SUN", "KeyFactory", "OID.1.2.840.10040.4.1", "DSA"),
-    ("SUN", "KeyFactory", "OID.2.16.840.1.101.3.4.3.17", "ML-DSA-44"),
-    ("SUN", "KeyFactory", "OID.2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
-    ("SUN", "KeyFactory", "OID.2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
+    (
+        "SUN",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.3.17",
+        "ML-DSA-44",
+    ),
+    (
+        "SUN",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.3.18",
+        "ML-DSA-65",
+    ),
+    (
+        "SUN",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.3.19",
+        "ML-DSA-87",
+    ),
     // SUN KeyPairGenerator -- 9 rows
     ("SUN", "KeyPairGenerator", "1.2.840.10040.4.1", "DSA"),
     ("SUN", "KeyPairGenerator", "1.3.14.3.2.12", "DSA"),
-    ("SUN", "KeyPairGenerator", "2.16.840.1.101.3.4.3.17", "ML-DSA-44"),
-    ("SUN", "KeyPairGenerator", "2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
-    ("SUN", "KeyPairGenerator", "2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.3.17",
+        "ML-DSA-44",
+    ),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.3.18",
+        "ML-DSA-65",
+    ),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.3.19",
+        "ML-DSA-87",
+    ),
     ("SUN", "KeyPairGenerator", "OID.1.2.840.10040.4.1", "DSA"),
-    ("SUN", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.3.17", "ML-DSA-44"),
-    ("SUN", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
-    ("SUN", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.3.17",
+        "ML-DSA-44",
+    ),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.3.18",
+        "ML-DSA-65",
+    ),
+    (
+        "SUN",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.3.19",
+        "ML-DSA-87",
+    ),
     // SUN Signature -- 17 rows
     ("SUN", "Signature", "1.2.840.10040.4.3", "SHA1withDSA"),
     ("SUN", "Signature", "1.3.14.3.2.13", "SHA1withDSA"),
@@ -2382,19 +2528,49 @@ const MEASURED_JDK25_PROVIDER_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("SUN", "Signature", "2.16.840.1.101.3.4.3.17", "ML-DSA-44"),
     ("SUN", "Signature", "2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
     ("SUN", "Signature", "2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
-    ("SUN", "Signature", "2.16.840.1.101.3.4.3.2", "SHA256withDSA"),
+    (
+        "SUN",
+        "Signature",
+        "2.16.840.1.101.3.4.3.2",
+        "SHA256withDSA",
+    ),
     ("SUN", "Signature", "DSAWithSHA1", "SHA1withDSA"),
     ("SUN", "Signature", "OID.1.2.840.10040.4.3", "SHA1withDSA"),
-    ("SUN", "Signature", "OID.2.16.840.1.101.3.4.3.17", "ML-DSA-44"),
-    ("SUN", "Signature", "OID.2.16.840.1.101.3.4.3.18", "ML-DSA-65"),
-    ("SUN", "Signature", "OID.2.16.840.1.101.3.4.3.19", "ML-DSA-87"),
-    ("SUN", "Signature", "OID.2.16.840.1.101.3.4.3.2", "SHA256withDSA"),
+    (
+        "SUN",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.17",
+        "ML-DSA-44",
+    ),
+    (
+        "SUN",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.18",
+        "ML-DSA-65",
+    ),
+    (
+        "SUN",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.19",
+        "ML-DSA-87",
+    ),
+    (
+        "SUN",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.2",
+        "SHA256withDSA",
+    ),
     ("SUN", "Signature", "SHA-1/DSA", "SHA1withDSA"),
     ("SUN", "Signature", "SHA/DSA", "SHA1withDSA"),
     ("SUN", "Signature", "SHA1/DSA", "SHA1withDSA"),
     ("SUN", "Signature", "SHAwithDSA", "SHA1withDSA"),
     // SunEC AlgorithmParameters -- 1 rows
-    ("SunEC", "AlgorithmParameters", "OID.1.2.840.10045.2.1", "EC"),
+    (
+        "SunEC",
+        "AlgorithmParameters",
+        "OID.1.2.840.10045.2.1",
+        "EC",
+    ),
     // SunEC KeyAgreement -- 4 rows
     ("SunEC", "KeyAgreement", "1.3.101.110", "X25519"),
     ("SunEC", "KeyAgreement", "1.3.101.111", "X448"),
@@ -2422,138 +2598,653 @@ const MEASURED_JDK25_PROVIDER_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("SunEC", "KeyPairGenerator", "OID.1.3.101.113", "Ed448"),
     // SunEC Signature -- 22 rows
     ("SunEC", "Signature", "1.2.840.10045.4.1", "SHA1withECDSA"),
-    ("SunEC", "Signature", "1.2.840.10045.4.3.1", "SHA224withECDSA"),
-    ("SunEC", "Signature", "1.2.840.10045.4.3.2", "SHA256withECDSA"),
-    ("SunEC", "Signature", "1.2.840.10045.4.3.3", "SHA384withECDSA"),
-    ("SunEC", "Signature", "1.2.840.10045.4.3.4", "SHA512withECDSA"),
+    (
+        "SunEC",
+        "Signature",
+        "1.2.840.10045.4.3.1",
+        "SHA224withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "1.2.840.10045.4.3.2",
+        "SHA256withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "1.2.840.10045.4.3.3",
+        "SHA384withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "1.2.840.10045.4.3.4",
+        "SHA512withECDSA",
+    ),
     ("SunEC", "Signature", "1.3.101.112", "Ed25519"),
     ("SunEC", "Signature", "1.3.101.113", "Ed448"),
-    ("SunEC", "Signature", "2.16.840.1.101.3.4.3.10", "SHA3-256withECDSA"),
-    ("SunEC", "Signature", "2.16.840.1.101.3.4.3.11", "SHA3-384withECDSA"),
-    ("SunEC", "Signature", "2.16.840.1.101.3.4.3.12", "SHA3-512withECDSA"),
-    ("SunEC", "Signature", "2.16.840.1.101.3.4.3.9", "SHA3-224withECDSA"),
-    ("SunEC", "Signature", "OID.1.2.840.10045.4.1", "SHA1withECDSA"),
-    ("SunEC", "Signature", "OID.1.2.840.10045.4.3.1", "SHA224withECDSA"),
-    ("SunEC", "Signature", "OID.1.2.840.10045.4.3.2", "SHA256withECDSA"),
-    ("SunEC", "Signature", "OID.1.2.840.10045.4.3.3", "SHA384withECDSA"),
-    ("SunEC", "Signature", "OID.1.2.840.10045.4.3.4", "SHA512withECDSA"),
+    (
+        "SunEC",
+        "Signature",
+        "2.16.840.1.101.3.4.3.10",
+        "SHA3-256withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "2.16.840.1.101.3.4.3.11",
+        "SHA3-384withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "2.16.840.1.101.3.4.3.12",
+        "SHA3-512withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "2.16.840.1.101.3.4.3.9",
+        "SHA3-224withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.1.2.840.10045.4.1",
+        "SHA1withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.1.2.840.10045.4.3.1",
+        "SHA224withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.1.2.840.10045.4.3.2",
+        "SHA256withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.1.2.840.10045.4.3.3",
+        "SHA384withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.1.2.840.10045.4.3.4",
+        "SHA512withECDSA",
+    ),
     ("SunEC", "Signature", "OID.1.3.101.112", "Ed25519"),
     ("SunEC", "Signature", "OID.1.3.101.113", "Ed448"),
-    ("SunEC", "Signature", "OID.2.16.840.1.101.3.4.3.10", "SHA3-256withECDSA"),
-    ("SunEC", "Signature", "OID.2.16.840.1.101.3.4.3.11", "SHA3-384withECDSA"),
-    ("SunEC", "Signature", "OID.2.16.840.1.101.3.4.3.12", "SHA3-512withECDSA"),
-    ("SunEC", "Signature", "OID.2.16.840.1.101.3.4.3.9", "SHA3-224withECDSA"),
+    (
+        "SunEC",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.10",
+        "SHA3-256withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.11",
+        "SHA3-384withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.12",
+        "SHA3-512withECDSA",
+    ),
+    (
+        "SunEC",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.9",
+        "SHA3-224withECDSA",
+    ),
     // SunJCE AlgorithmParameters -- 25 rows
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.1.7", "OAEP"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.12.1.1", "PBEWithSHA1AndRC4_128"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.12.1.2", "PBEWithSHA1AndRC4_40"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.12.1.3", "PBEWithSHA1AndDESede"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.12.1.5", "PBEWithSHA1AndRC2_128"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.12.1.6", "PBEWithSHA1AndRC2_40"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.5.13", "PBES2"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.5.3", "PBEWithMD5AndDES"),
-    ("SunJCE", "AlgorithmParameters", "1.2.840.113549.1.9.16.3.18", "ChaCha20-Poly1305"),
-    ("SunJCE", "AlgorithmParameters", "2.16.840.1.101.3.4.1", "AES"),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.1.7",
+        "OAEP",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.12.1.1",
+        "PBEWithSHA1AndRC4_128",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.12.1.2",
+        "PBEWithSHA1AndRC4_40",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.12.1.3",
+        "PBEWithSHA1AndDESede",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.12.1.5",
+        "PBEWithSHA1AndRC2_128",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.12.1.6",
+        "PBEWithSHA1AndRC2_40",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.5.13",
+        "PBES2",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.5.3",
+        "PBEWithMD5AndDES",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "1.2.840.113549.1.9.16.3.18",
+        "ChaCha20-Poly1305",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "2.16.840.1.101.3.4.1",
+        "AES",
+    ),
     ("SunJCE", "AlgorithmParameters", "DH", "DiffieHellman"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.1.7", "OAEP"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.12.1.1", "PBEWithSHA1AndRC4_128"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.12.1.2", "PBEWithSHA1AndRC4_40"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.12.1.3", "PBEWithSHA1AndDESede"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.12.1.5", "PBEWithSHA1AndRC2_128"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.12.1.6", "PBEWithSHA1AndRC2_40"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.5.13", "PBES2"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.5.3", "PBEWithMD5AndDES"),
-    ("SunJCE", "AlgorithmParameters", "OID.1.2.840.113549.1.9.16.3.18", "ChaCha20-Poly1305"),
-    ("SunJCE", "AlgorithmParameters", "OID.2.16.840.1.101.3.4.1", "AES"),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.1.7",
+        "OAEP",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.12.1.1",
+        "PBEWithSHA1AndRC4_128",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.12.1.2",
+        "PBEWithSHA1AndRC4_40",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.12.1.3",
+        "PBEWithSHA1AndDESede",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.12.1.5",
+        "PBEWithSHA1AndRC2_128",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.12.1.6",
+        "PBEWithSHA1AndRC2_40",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.5.13",
+        "PBES2",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.5.3",
+        "PBEWithMD5AndDES",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.1.2.840.113549.1.9.16.3.18",
+        "ChaCha20-Poly1305",
+    ),
+    (
+        "SunJCE",
+        "AlgorithmParameters",
+        "OID.2.16.840.1.101.3.4.1",
+        "AES",
+    ),
     ("SunJCE", "AlgorithmParameters", "PBE", "PBEWithMD5AndDES"),
     ("SunJCE", "AlgorithmParameters", "TripleDES", "DESede"),
     // SunJCE Cipher -- 43 rows
-    ("SunJCE", "Cipher", "1.2.840.113549.1.9.16.3.18", "ChaCha20-Poly1305"),
+    (
+        "SunJCE",
+        "Cipher",
+        "1.2.840.113549.1.9.16.3.18",
+        "ChaCha20-Poly1305",
+    ),
     ("SunJCE", "Cipher", "1.2.840.113549.3.4", "ARCFOUR"),
     ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1", "AES"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.1", "AES_128/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.2", "AES_128/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.21", "AES_192/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.22", "AES_192/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.23", "AES_192/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.24", "AES_192/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.25", "AES_192/KW/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.26", "AES_192/GCM/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.3", "AES_128/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.4", "AES_128/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.41", "AES_256/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.42", "AES_256/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.43", "AES_256/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.44", "AES_256/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.45", "AES_256/KW/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.46", "AES_256/GCM/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.5", "AES_128/KW/NoPadding"),
-    ("SunJCE", "Cipher", "2.16.840.1.101.3.4.1.6", "AES_128/GCM/NoPadding"),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.1",
+        "AES_128/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.2",
+        "AES_128/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.21",
+        "AES_192/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.22",
+        "AES_192/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.23",
+        "AES_192/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.24",
+        "AES_192/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.25",
+        "AES_192/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.26",
+        "AES_192/GCM/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.3",
+        "AES_128/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.4",
+        "AES_128/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.41",
+        "AES_256/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.42",
+        "AES_256/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.43",
+        "AES_256/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.44",
+        "AES_256/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.45",
+        "AES_256/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.46",
+        "AES_256/GCM/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.5",
+        "AES_128/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "2.16.840.1.101.3.4.1.6",
+        "AES_128/GCM/NoPadding",
+    ),
     ("SunJCE", "Cipher", "AESWrapPad", "AES/KWP/NoPadding"),
-    ("SunJCE", "Cipher", "OID.1.2.840.113549.1.9.16.3.18", "ChaCha20-Poly1305"),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.1.2.840.113549.1.9.16.3.18",
+        "ChaCha20-Poly1305",
+    ),
     ("SunJCE", "Cipher", "OID.1.2.840.113549.3.4", "ARCFOUR"),
     ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1", "AES"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.1", "AES_128/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.2", "AES_128/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.21", "AES_192/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.22", "AES_192/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.23", "AES_192/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.24", "AES_192/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.25", "AES_192/KW/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.26", "AES_192/GCM/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.3", "AES_128/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.4", "AES_128/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.41", "AES_256/ECB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.42", "AES_256/CBC/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.43", "AES_256/OFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.44", "AES_256/CFB/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.45", "AES_256/KW/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.46", "AES_256/GCM/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.5", "AES_128/KW/NoPadding"),
-    ("SunJCE", "Cipher", "OID.2.16.840.1.101.3.4.1.6", "AES_128/GCM/NoPadding"),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.1",
+        "AES_128/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.2",
+        "AES_128/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.21",
+        "AES_192/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.22",
+        "AES_192/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.23",
+        "AES_192/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.24",
+        "AES_192/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.25",
+        "AES_192/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.26",
+        "AES_192/GCM/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.3",
+        "AES_128/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.4",
+        "AES_128/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.41",
+        "AES_256/ECB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.42",
+        "AES_256/CBC/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.43",
+        "AES_256/OFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.44",
+        "AES_256/CFB/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.45",
+        "AES_256/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.46",
+        "AES_256/GCM/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.5",
+        "AES_128/KW/NoPadding",
+    ),
+    (
+        "SunJCE",
+        "Cipher",
+        "OID.2.16.840.1.101.3.4.1.6",
+        "AES_128/GCM/NoPadding",
+    ),
     // SunJCE KEM -- 3 rows
     ("SunJCE", "KEM", "OID.2.16.840.1.101.3.4.4.1", "ML-KEM-512"),
     ("SunJCE", "KEM", "OID.2.16.840.1.101.3.4.4.2", "ML-KEM-768"),
     ("SunJCE", "KEM", "OID.2.16.840.1.101.3.4.4.3", "ML-KEM-1024"),
     // SunJCE KeyAgreement -- 2 rows
-    ("SunJCE", "KeyAgreement", "1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "KeyAgreement", "OID.1.2.840.113549.1.3.1", "DiffieHellman"),
+    (
+        "SunJCE",
+        "KeyAgreement",
+        "1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "KeyAgreement",
+        "OID.1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
     // SunJCE KeyFactory -- 8 rows
-    ("SunJCE", "KeyFactory", "1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "KeyFactory", "2.16.840.1.101.3.4.4.1", "ML-KEM-512"),
-    ("SunJCE", "KeyFactory", "2.16.840.1.101.3.4.4.2", "ML-KEM-768"),
-    ("SunJCE", "KeyFactory", "2.16.840.1.101.3.4.4.3", "ML-KEM-1024"),
-    ("SunJCE", "KeyFactory", "OID.1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "KeyFactory", "OID.2.16.840.1.101.3.4.4.1", "ML-KEM-512"),
-    ("SunJCE", "KeyFactory", "OID.2.16.840.1.101.3.4.4.2", "ML-KEM-768"),
-    ("SunJCE", "KeyFactory", "OID.2.16.840.1.101.3.4.4.3", "ML-KEM-1024"),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "OID.1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+    ),
+    (
+        "SunJCE",
+        "KeyFactory",
+        "OID.2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+    ),
     // SunJCE KeyGenerator -- 15 rows
-    ("SunJCE", "KeyGenerator", "1.2.840.113549.2.10", "HmacSHA384"),
-    ("SunJCE", "KeyGenerator", "1.2.840.113549.2.11", "HmacSHA512"),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "1.2.840.113549.2.10",
+        "HmacSHA384",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "1.2.840.113549.2.11",
+        "HmacSHA512",
+    ),
     ("SunJCE", "KeyGenerator", "1.2.840.113549.2.7", "HmacSHA1"),
     ("SunJCE", "KeyGenerator", "1.2.840.113549.2.8", "HmacSHA224"),
     ("SunJCE", "KeyGenerator", "1.2.840.113549.2.9", "HmacSHA256"),
     ("SunJCE", "KeyGenerator", "1.2.840.113549.3.4", "ARCFOUR"),
     ("SunJCE", "KeyGenerator", "2.16.840.1.101.3.4.1", "AES"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.2.10", "HmacSHA384"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.2.11", "HmacSHA512"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.2.7", "HmacSHA1"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.2.8", "HmacSHA224"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.2.9", "HmacSHA256"),
-    ("SunJCE", "KeyGenerator", "OID.1.2.840.113549.3.4", "ARCFOUR"),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.2.10",
+        "HmacSHA384",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.2.11",
+        "HmacSHA512",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.2.7",
+        "HmacSHA1",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.2.8",
+        "HmacSHA224",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.2.9",
+        "HmacSHA256",
+    ),
+    (
+        "SunJCE",
+        "KeyGenerator",
+        "OID.1.2.840.113549.3.4",
+        "ARCFOUR",
+    ),
     ("SunJCE", "KeyGenerator", "OID.2.16.840.1.101.3.4.1", "AES"),
     ("SunJCE", "KeyGenerator", "TripleDES", "DESede"),
     // SunJCE KeyPairGenerator -- 8 rows
-    ("SunJCE", "KeyPairGenerator", "1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "KeyPairGenerator", "2.16.840.1.101.3.4.4.1", "ML-KEM-512"),
-    ("SunJCE", "KeyPairGenerator", "2.16.840.1.101.3.4.4.2", "ML-KEM-768"),
-    ("SunJCE", "KeyPairGenerator", "2.16.840.1.101.3.4.4.3", "ML-KEM-1024"),
-    ("SunJCE", "KeyPairGenerator", "OID.1.2.840.113549.1.3.1", "DiffieHellman"),
-    ("SunJCE", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.4.1", "ML-KEM-512"),
-    ("SunJCE", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.4.2", "ML-KEM-768"),
-    ("SunJCE", "KeyPairGenerator", "OID.2.16.840.1.101.3.4.4.3", "ML-KEM-1024"),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "OID.1.2.840.113549.1.3.1",
+        "DiffieHellman",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+    ),
+    (
+        "SunJCE",
+        "KeyPairGenerator",
+        "OID.2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+    ),
     // SunJCE Mac -- 22 rows
     ("SunJCE", "Mac", "1.2.840.113549.2.10", "HmacSHA384"),
     ("SunJCE", "Mac", "1.2.840.113549.2.11", "HmacSHA512"),
@@ -2573,69 +3264,334 @@ const MEASURED_JDK25_PROVIDER_ALIASES: &[(&str, &str, &str, &str)] = &[
     ("SunJCE", "Mac", "OID.1.2.840.113549.2.7", "HmacSHA1"),
     ("SunJCE", "Mac", "OID.1.2.840.113549.2.8", "HmacSHA224"),
     ("SunJCE", "Mac", "OID.1.2.840.113549.2.9", "HmacSHA256"),
-    ("SunJCE", "Mac", "OID.2.16.840.1.101.3.4.2.13", "HmacSHA3-224"),
-    ("SunJCE", "Mac", "OID.2.16.840.1.101.3.4.2.14", "HmacSHA3-256"),
-    ("SunJCE", "Mac", "OID.2.16.840.1.101.3.4.2.15", "HmacSHA3-384"),
-    ("SunJCE", "Mac", "OID.2.16.840.1.101.3.4.2.16", "HmacSHA3-512"),
+    (
+        "SunJCE",
+        "Mac",
+        "OID.2.16.840.1.101.3.4.2.13",
+        "HmacSHA3-224",
+    ),
+    (
+        "SunJCE",
+        "Mac",
+        "OID.2.16.840.1.101.3.4.2.14",
+        "HmacSHA3-256",
+    ),
+    (
+        "SunJCE",
+        "Mac",
+        "OID.2.16.840.1.101.3.4.2.15",
+        "HmacSHA3-384",
+    ),
+    (
+        "SunJCE",
+        "Mac",
+        "OID.2.16.840.1.101.3.4.2.16",
+        "HmacSHA3-512",
+    ),
     // SunJCE SecretKeyFactory -- 14 rows
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.12.1.1", "PBEWithSHA1AndRC4_128"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.12.1.2", "PBEWithSHA1AndRC4_40"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.12.1.3", "PBEWithSHA1AndDESede"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.12.1.5", "PBEWithSHA1AndRC2_128"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.12.1.6", "PBEWithSHA1AndRC2_40"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.5.12", "PBKDF2WithHmacSHA1"),
-    ("SunJCE", "SecretKeyFactory", "1.2.840.113549.1.5.3", "PBEWithMD5AndDES"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.12.1.1", "PBEWithSHA1AndRC4_128"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.12.1.2", "PBEWithSHA1AndRC4_40"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.12.1.3", "PBEWithSHA1AndDESede"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.12.1.5", "PBEWithSHA1AndRC2_128"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.12.1.6", "PBEWithSHA1AndRC2_40"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.5.12", "PBKDF2WithHmacSHA1"),
-    ("SunJCE", "SecretKeyFactory", "OID.1.2.840.113549.1.5.3", "PBEWithMD5AndDES"),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.12.1.1",
+        "PBEWithSHA1AndRC4_128",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.12.1.2",
+        "PBEWithSHA1AndRC4_40",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.12.1.3",
+        "PBEWithSHA1AndDESede",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.12.1.5",
+        "PBEWithSHA1AndRC2_128",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.12.1.6",
+        "PBEWithSHA1AndRC2_40",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.5.12",
+        "PBKDF2WithHmacSHA1",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "1.2.840.113549.1.5.3",
+        "PBEWithMD5AndDES",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.12.1.1",
+        "PBEWithSHA1AndRC4_128",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.12.1.2",
+        "PBEWithSHA1AndRC4_40",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.12.1.3",
+        "PBEWithSHA1AndDESede",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.12.1.5",
+        "PBEWithSHA1AndRC2_128",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.12.1.6",
+        "PBEWithSHA1AndRC2_40",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.5.12",
+        "PBKDF2WithHmacSHA1",
+    ),
+    (
+        "SunJCE",
+        "SecretKeyFactory",
+        "OID.1.2.840.113549.1.5.3",
+        "PBEWithMD5AndDES",
+    ),
     // SunRsaSign KeyFactory -- 6 rows
     ("SunRsaSign", "KeyFactory", "1.2.840.113549.1.1", "RSA"),
     ("SunRsaSign", "KeyFactory", "1.2.840.113549.1.1.1", "RSA"),
-    ("SunRsaSign", "KeyFactory", "1.2.840.113549.1.1.10", "RSASSA-PSS"),
+    (
+        "SunRsaSign",
+        "KeyFactory",
+        "1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
     ("SunRsaSign", "KeyFactory", "OID.1.2.840.113549.1.1", "RSA"),
-    ("SunRsaSign", "KeyFactory", "OID.1.2.840.113549.1.1.10", "RSASSA-PSS"),
+    (
+        "SunRsaSign",
+        "KeyFactory",
+        "OID.1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
     ("SunRsaSign", "KeyFactory", "PSS", "RSASSA-PSS"),
     // SunRsaSign KeyPairGenerator -- 6 rows
-    ("SunRsaSign", "KeyPairGenerator", "1.2.840.113549.1.1", "RSA"),
-    ("SunRsaSign", "KeyPairGenerator", "1.2.840.113549.1.1.1", "RSA"),
-    ("SunRsaSign", "KeyPairGenerator", "1.2.840.113549.1.1.10", "RSASSA-PSS"),
-    ("SunRsaSign", "KeyPairGenerator", "OID.1.2.840.113549.1.1", "RSA"),
-    ("SunRsaSign", "KeyPairGenerator", "OID.1.2.840.113549.1.1.10", "RSASSA-PSS"),
+    (
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "1.2.840.113549.1.1",
+        "RSA",
+    ),
+    (
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "1.2.840.113549.1.1.1",
+        "RSA",
+    ),
+    (
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
+    (
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "OID.1.2.840.113549.1.1",
+        "RSA",
+    ),
+    (
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "OID.1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
     ("SunRsaSign", "KeyPairGenerator", "PSS", "RSASSA-PSS"),
     // SunRsaSign Signature -- 30 rows
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.10", "RSASSA-PSS"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.11", "SHA256withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.12", "SHA384withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.13", "SHA512withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.14", "SHA224withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.15", "SHA512/224withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.16", "SHA512/256withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.2", "MD2withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.4", "MD5withRSA"),
-    ("SunRsaSign", "Signature", "1.2.840.113549.1.1.5", "SHA1withRSA"),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.11",
+        "SHA256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.12",
+        "SHA384withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.13",
+        "SHA512withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.14",
+        "SHA224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.15",
+        "SHA512/224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.16",
+        "SHA512/256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.2",
+        "MD2withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.4",
+        "MD5withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "1.2.840.113549.1.1.5",
+        "SHA1withRSA",
+    ),
     ("SunRsaSign", "Signature", "1.3.14.3.2.29", "SHA1withRSA"),
-    ("SunRsaSign", "Signature", "2.16.840.1.101.3.4.3.13", "SHA3-224withRSA"),
-    ("SunRsaSign", "Signature", "2.16.840.1.101.3.4.3.14", "SHA3-256withRSA"),
-    ("SunRsaSign", "Signature", "2.16.840.1.101.3.4.3.15", "SHA3-384withRSA"),
-    ("SunRsaSign", "Signature", "2.16.840.1.101.3.4.3.16", "SHA3-512withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.10", "RSASSA-PSS"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.11", "SHA256withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.12", "SHA384withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.13", "SHA512withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.14", "SHA224withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.15", "SHA512/224withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.16", "SHA512/256withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.2", "MD2withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.4", "MD5withRSA"),
-    ("SunRsaSign", "Signature", "OID.1.2.840.113549.1.1.5", "SHA1withRSA"),
-    ("SunRsaSign", "Signature", "OID.2.16.840.1.101.3.4.3.13", "SHA3-224withRSA"),
-    ("SunRsaSign", "Signature", "OID.2.16.840.1.101.3.4.3.14", "SHA3-256withRSA"),
-    ("SunRsaSign", "Signature", "OID.2.16.840.1.101.3.4.3.15", "SHA3-384withRSA"),
-    ("SunRsaSign", "Signature", "OID.2.16.840.1.101.3.4.3.16", "SHA3-512withRSA"),
+    (
+        "SunRsaSign",
+        "Signature",
+        "2.16.840.1.101.3.4.3.13",
+        "SHA3-224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "2.16.840.1.101.3.4.3.14",
+        "SHA3-256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "2.16.840.1.101.3.4.3.15",
+        "SHA3-384withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "2.16.840.1.101.3.4.3.16",
+        "SHA3-512withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.10",
+        "RSASSA-PSS",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.11",
+        "SHA256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.12",
+        "SHA384withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.13",
+        "SHA512withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.14",
+        "SHA224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.15",
+        "SHA512/224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.16",
+        "SHA512/256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.2",
+        "MD2withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.4",
+        "MD5withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.1.2.840.113549.1.1.5",
+        "SHA1withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.13",
+        "SHA3-224withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.14",
+        "SHA3-256withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.15",
+        "SHA3-384withRSA",
+    ),
+    (
+        "SunRsaSign",
+        "Signature",
+        "OID.2.16.840.1.101.3.4.3.16",
+        "SHA3-512withRSA",
+    ),
     ("SunRsaSign", "Signature", "PSS", "RSASSA-PSS"),
 ];
 
@@ -2649,7 +3605,6 @@ fn seed_measured_jdk25_provider_aliases() {
         put_alias(provider, engine, alias, canonical);
     }
 }
-
 
 /// W4-3 — the engine services that were only ever asserted by the retired
 /// `Security.getAlgorithms` literal table in
@@ -2729,10 +3684,22 @@ fn seed_retired_getalgorithms_literals() {
             "HmacSHA512/256",
             "com.sun.crypto.provider.HmacCore$HmacSHA512_256",
         ),
-        ("HmacSHA3-224", "com.sun.crypto.provider.HmacCore$HmacSHA3_224"),
-        ("HmacSHA3-256", "com.sun.crypto.provider.HmacCore$HmacSHA3_256"),
-        ("HmacSHA3-384", "com.sun.crypto.provider.HmacCore$HmacSHA3_384"),
-        ("HmacSHA3-512", "com.sun.crypto.provider.HmacCore$HmacSHA3_512"),
+        (
+            "HmacSHA3-224",
+            "com.sun.crypto.provider.HmacCore$HmacSHA3_224",
+        ),
+        (
+            "HmacSHA3-256",
+            "com.sun.crypto.provider.HmacCore$HmacSHA3_256",
+        ),
+        (
+            "HmacSHA3-384",
+            "com.sun.crypto.provider.HmacCore$HmacSHA3_384",
+        ),
+        (
+            "HmacSHA3-512",
+            "com.sun.crypto.provider.HmacCore$HmacSHA3_512",
+        ),
     ] {
         put_service(JCE, "Mac", algorithm, class_name);
     }
@@ -2754,9 +3721,15 @@ fn seed_retired_getalgorithms_literals() {
     // only the registry the two modes share disagreed.
     for (algorithm, class_name) in [
         ("AES", "com.sun.crypto.provider.AESKeyGenerator"),
-        ("ARCFOUR", "com.sun.crypto.provider.KeyGeneratorCore$ARCFOURKeyGenerator"),
+        (
+            "ARCFOUR",
+            "com.sun.crypto.provider.KeyGeneratorCore$ARCFOURKeyGenerator",
+        ),
         ("Blowfish", "com.sun.crypto.provider.BlowfishKeyGenerator"),
-        ("ChaCha20", "com.sun.crypto.provider.KeyGeneratorCore$ChaCha20KeyGenerator"),
+        (
+            "ChaCha20",
+            "com.sun.crypto.provider.KeyGeneratorCore$ChaCha20KeyGenerator",
+        ),
         ("DES", "com.sun.crypto.provider.DESKeyGenerator"),
         ("DESede", "com.sun.crypto.provider.DESedeKeyGenerator"),
         ("HmacMD5", "com.sun.crypto.provider.HmacMD5KeyGenerator"),
@@ -2777,7 +3750,10 @@ fn seed_retired_getalgorithms_literals() {
             "HmacSHA512",
             "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512",
         ),
-        ("RC2", "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator"),
+        (
+            "RC2",
+            "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator",
+        ),
     ] {
         put_service(JCE, "KeyGenerator", algorithm, class_name);
     }
@@ -2840,7 +3816,10 @@ fn seed_builtin_keypairgenerator_services() {
         "sun.security.rsa.RSAKeyPairGenerator$PSS",
     );
     for (algorithm, class_name) in [
-        ("Ed25519", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed25519"),
+        (
+            "Ed25519",
+            "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed25519",
+        ),
         ("Ed448", "sun.security.ec.ed.EdDSAKeyPairGenerator$Ed448"),
         ("EdDSA", "sun.security.ec.ed.EdDSAKeyPairGenerator"),
         ("X25519", "sun.security.ec.XDHKeyPairGenerator$X25519"),
@@ -3825,10 +4804,16 @@ fn make_service(
     let algo_s = ctx.read_native_pin(algo_pin, algo_s0);
     let class_s = ctx.read_native_pin(class_pin, class_s0);
 
-    let aliases = empty_collection_value(ctx, "emptyList", "()Ljava/util/List;", "java/util/ArrayList")?;
+    let aliases = empty_collection_value(
+        ctx,
+        "emptyList",
+        "()Ljava/util/List;",
+        "java/util/ArrayList",
+    )?;
     let svc = ctx.read_native_pin(svc_pin, svc0);
     ctx.set_field_by_name(svc, "aliases", aliases);
-    let attributes = empty_collection_value(ctx, "emptyMap", "()Ljava/util/Map;", "java/util/HashMap")?;
+    let attributes =
+        empty_collection_value(ctx, "emptyMap", "()Ljava/util/Map;", "java/util/HashMap")?;
     let svc = ctx.read_native_pin(svc_pin, svc0);
     ctx.set_field_by_name(svc, "attributes", attributes);
 
@@ -4146,10 +5131,7 @@ fn provider_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 /// `Properties.stringPropertyNames()` — every row here has a String key and a
 /// String value, so it is the same set as `keySet`.
-fn provider_string_property_names(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn provider_string_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     provider_key_set(ctx, args)
 }
 
@@ -4451,10 +5433,7 @@ fn provider_service_class_name_from_registry(
 /// `Provider.Service.getAttribute(String)` — answered from the attribute rows
 /// the provider actually `put`, case-insensitively as the JDK's own `UString`
 /// key is.
-fn provider_service_get_attribute(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn provider_service_get_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(svc))) = args.first() else {
         return Ok(Some(Value::Object(None)));
     };
@@ -4500,10 +5479,7 @@ fn provider_service_get_class_name(
 /// `Provider$Service.toString()` must remain safe for the synthetic service
 /// records returned by the provider chain.  The JDK implementation reaches
 /// fields that synthetic records deliberately do not initialize.
-fn provider_service_to_string(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn provider_service_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let type_str = provider_service_string_field(ctx, this, "type", 0).unwrap_or_default();
     let algorithm = provider_service_string_field(ctx, this, "algorithm", 1).unwrap_or_default();
@@ -4513,7 +5489,9 @@ fn provider_service_to_string(
     let class_name = provider_service_string_field(ctx, this, "className", 3)
         .or_else(|| provider_service_class_name_from_registry(ctx, this))
         .unwrap_or_default();
-    let value = ctx.create_string(&format!("{provider}: {type_str}.{algorithm} -> {class_name}"));
+    let value = ctx.create_string(&format!(
+        "{provider}: {type_str}.{algorithm} -> {class_name}"
+    ));
     Ok(Some(Value::Object(Some(value))))
 }
 
@@ -4796,7 +5774,9 @@ pub(crate) fn check_provider_ownership(
         return Ok(());
     }
     let message = match wording {
-        ProviderArgWording::Shared => format!("no such algorithm: {algorithm} for provider {provider}"),
+        ProviderArgWording::Shared => {
+            format!("no such algorithm: {algorithm} for provider {provider}")
+        }
         ProviderArgWording::Cipher => format!("No such algorithm: {algorithm}"),
     };
     Err(throw_no_such_algorithm(ctx, &message))
@@ -5193,10 +6173,7 @@ fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
 /// override in `phases_early`, which deliberately shadows the registry-backed
 /// registration in that mode and therefore has to make the same answer in the
 /// same shape.
-pub(crate) fn wrap_unmodifiable_public(
-    ctx: &mut dyn NativeContext,
-    set: ObjectRef,
-) -> ObjectRef {
+pub(crate) fn wrap_unmodifiable_public(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
     wrap_unmodifiable(ctx, set)
 }
 
@@ -5246,7 +6223,10 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the caller's own `Provider` constructor set — otherwise a fresh synthetic
 /// built from the seed-list entry (or a generic `USER_PROVIDER_COVERAGE`
 /// synthetic if `name` isn't in the seed list at all).
-pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn resolve_or_make_provider(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(real) = resolve_real_provider(ctx, name) {
         return Ok(real);
     }
@@ -6008,7 +6988,12 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register(prov, "entrySet", "()Ljava/util/Set;", provider_entry_set);
     r.register(prov, "values", "()Ljava/util/Collection;", provider_values);
     r.register(prov, "keys", "()Ljava/util/Enumeration;", provider_keys);
-    r.register(prov, "elements", "()Ljava/util/Enumeration;", provider_elements);
+    r.register(
+        prov,
+        "elements",
+        "()Ljava/util/Enumeration;",
+        provider_elements,
+    );
     r.register(
         prov,
         "stringPropertyNames",
@@ -6252,9 +7237,12 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// The seed chain is PER-PLATFORM: `SunMSCAPI` wraps the Windows CryptoAPI
     /// and ships only in the Windows JDK, so HotSpot 25 answers thirteen
@@ -7001,7 +7989,9 @@ mod tests {
                 "{alias} must resolve through the alias map to {canonical}"
             );
             assert!(
-                !advertised.iter().any(|(_, a)| a.eq_ignore_ascii_case(alias)),
+                !advertised
+                    .iter()
+                    .any(|(_, a)| a.eq_ignore_ascii_case(alias)),
                 "{alias} is an ALIAS and must stay out of Security.getAlgorithms, \
                  which is where HotSpot keeps it"
             );
@@ -7200,9 +8190,7 @@ mod tests {
             rows.len()
         );
         let find = |key: &str| -> Option<String> {
-            rows.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
+            rows.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
         };
         // A SERVICE row: `<Type>.<Algorithm>` in the provider's spelling.
         let digest = find("MessageDigest.SHA-256")
@@ -7220,10 +8208,7 @@ mod tests {
         );
         // The upper-cased forms must NOT appear — that is what rendering
         // from the normalised lookup key would have produced.
-        for mangled in [
-            "ALG.ALIAS.MESSAGEDIGEST.SHA1",
-            "MESSAGEDIGEST.SHA-256",
-        ] {
+        for mangled in ["ALG.ALIAS.MESSAGEDIGEST.SHA1", "MESSAGEDIGEST.SHA-256"] {
             assert!(
                 find(mangled).is_none(),
                 "{mangled} is a normalised LOOKUP key, not a property key"
@@ -7322,8 +8307,21 @@ mod tests {
         // ALIAS of `DiffieHellman` (aliases resolve but are not advertised),
         // and registers no `ECDSA` generator at all.
         for algorithm in [
-            "RSA", "RSASSA-PSS", "EC", "DSA", "Ed25519", "Ed448", "EdDSA", "X25519", "X448",
-            "XDH", "ML-DSA", "ML-DSA-44", "ML-KEM", "ML-KEM-512", "DiffieHellman",
+            "RSA",
+            "RSASSA-PSS",
+            "EC",
+            "DSA",
+            "Ed25519",
+            "Ed448",
+            "EdDSA",
+            "X25519",
+            "X448",
+            "XDH",
+            "ML-DSA",
+            "ML-DSA-44",
+            "ML-KEM",
+            "ML-KEM-512",
+            "DiffieHellman",
         ] {
             assert!(
                 crate::jca::key_factory::kpg_get_instance_offers(algorithm),
@@ -7408,11 +8406,7 @@ mod tests {
              each truthful about THEMSELVES, which is the invariant, not that they \
              agree with each other"
         );
-        for param_set in [
-            "ML-DSA-44",
-            "ML-DSA-65",
-            "ML-DSA-87",
-        ] {
+        for param_set in ["ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
             assert!(
                 get_service_entry("SUN", "KeyFactory", param_set).is_some(),
                 "{param_set} is serviceable and must stay advertised"
@@ -7506,8 +8500,19 @@ mod tests {
         let _lock = reset_service_state_for_tests();
         seed_direct_native_engine_services();
         for implemented in [
-            "AES", "ARCFOUR", "Blowfish", "ChaCha20", "DES", "DESede", "HmacMD5", "HmacSHA1",
-            "HmacSHA224", "HmacSHA256", "HmacSHA384", "HmacSHA512", "RC2",
+            "AES",
+            "ARCFOUR",
+            "Blowfish",
+            "ChaCha20",
+            "DES",
+            "DESede",
+            "HmacMD5",
+            "HmacSHA1",
+            "HmacSHA224",
+            "HmacSHA256",
+            "HmacSHA384",
+            "HmacSHA512",
+            "RC2",
         ] {
             assert!(
                 get_service_entry("SunJCE", "KeyGenerator", implemented).is_some(),

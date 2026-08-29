@@ -289,7 +289,9 @@ fn decl_name(line: &str) -> Option<(&'static str, String)> {
             rest = r.trim_start();
         }
     }
-    for kw in ["fn ", "struct ", "enum ", "trait ", "type ", "const ", "static "] {
+    for kw in [
+        "fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ",
+    ] {
         if let Some(after) = rest.strip_prefix(kw) {
             let name: String = after
                 .chars()
@@ -566,5 +568,8 @@ fn a_cfg_test_inside_a_comment_opens_no_region() {
     let src = "// #[cfg(test)] is discussed here\npub fn live() {}\n";
     let (prod, test) = split_regions(src);
     assert!(prod.iter().any(|l| l.contains("pub fn live")));
-    assert!(test.is_empty(), "no region should have opened, got {test:?}");
+    assert!(
+        test.is_empty(),
+        "no region should have opened, got {test:?}"
+    );
 }

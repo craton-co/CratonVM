@@ -932,9 +932,12 @@ mod os_lock {
 
     #[cfg(test)]
     mod tests {
-        #[allow(unused_imports)]
-        use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
         use super::range_len;
+        #[allow(unused_imports)]
+        use cratonvm_native_api::{
+            NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+            NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+        };
 
         #[test]
         fn whole_file_size_zero_locks_max_range() {
@@ -1204,17 +1207,41 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         ("pread0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pread0),
         ("readv0", "(Ljava/io/FileDescriptor;JI)J", native_fd_readv0),
         ("write0", "(Ljava/io/FileDescriptor;JI)I", native_fd_write0),
-        ("pwrite0", "(Ljava/io/FileDescriptor;JIJ)I", native_fd_pwrite0),
-        ("writev0", "(Ljava/io/FileDescriptor;JI)J", native_fd_writev0),
+        (
+            "pwrite0",
+            "(Ljava/io/FileDescriptor;JIJ)I",
+            native_fd_pwrite0,
+        ),
+        (
+            "writev0",
+            "(Ljava/io/FileDescriptor;JI)J",
+            native_fd_writev0,
+        ),
         ("size0", "(Ljava/io/FileDescriptor;)J", native_fd_size0),
         ("seek0", "(Ljava/io/FileDescriptor;J)J", native_fd_seek0),
         // `force0` is registered by `file_channel.rs::register_file_channel_real`
         // (real fsync via `std::fs::File::sync_all` / `sync_data`).
-        ("truncate0", "(Ljava/io/FileDescriptor;J)I", native_fd_truncate0),
-        ("available0", "(Ljava/io/FileDescriptor;)I", native_fd_available0),
-        ("isOther0", "(Ljava/io/FileDescriptor;)Z", native_fd_isother0),
+        (
+            "truncate0",
+            "(Ljava/io/FileDescriptor;J)I",
+            native_fd_truncate0,
+        ),
+        (
+            "available0",
+            "(Ljava/io/FileDescriptor;)I",
+            native_fd_available0,
+        ),
+        (
+            "isOther0",
+            "(Ljava/io/FileDescriptor;)Z",
+            native_fd_isother0,
+        ),
         ("lock0", "(Ljava/io/FileDescriptor;ZJJZ)I", native_fd_lock0),
-        ("release0", "(Ljava/io/FileDescriptor;JJ)V", native_fd_release0),
+        (
+            "release0",
+            "(Ljava/io/FileDescriptor;JJ)V",
+            native_fd_release0,
+        ),
         // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0 are
         // registered by `file_channel.rs::register_file_channel_real` (real
         // memmap2 / sendfile / fsync implementations). They were previously
@@ -1236,9 +1263,17 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // `CharBuffer` descriptor matches nothing. Left ambient on purpose.
     const FD_UNADJUDICATED: &[(&str, &str, NativeCallback)] = &[
         ("write0", "(Ljava/io/FileDescriptor;JIZ)I", native_fd_write0),
-        ("writev0", "(Ljava/io/FileDescriptor;JIZ)J", native_fd_writev0),
+        (
+            "writev0",
+            "(Ljava/io/FileDescriptor;JIZ)J",
+            native_fd_writev0,
+        ),
         ("close0", "(Ljava/io/FileDescriptor;)V", native_fd_close0),
-        ("preClose0", "(Ljava/io/FileDescriptor;)V", native_fd_preclose0),
+        (
+            "preClose0",
+            "(Ljava/io/FileDescriptor;)V",
+            native_fd_preclose0,
+        ),
         ("duplicateHandle", "(J)J", native_fd_duplicate_handle),
         (
             "setDirect0",
@@ -1255,7 +1290,11 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // really does take a `CharBuffer` there; on Unix it takes only the
     // descriptor — see `register_nio_setdirect_unix` below).
     for (name, desc, cb) in FD_UNADJUDICATED {
-        let backed: &[&str] = if *name == "preClose0" { &[] } else { &[FD_LEAF] };
+        let backed: &[&str] = if *name == "preClose0" {
+            &[]
+        } else {
+            &[FD_LEAF]
+        };
         register_fd_native(r, name, desc, *cb, backed);
     }
     // Real JDK 25 declares `FileDispatcherImpl.init0()` (confirmed via javap),
@@ -1318,9 +1357,27 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // --- IOUtil ---
     let iou = "sun/nio/ch/IOUtil";
     r.register_with_kind(iou, "iovMax", "()I", native_iou_iov_max, NativeKind::Bridge);
-    r.register_with_kind(iou, "writevMax", "()J", native_iou_write_max_size, NativeKind::Bridge);
-    r.register_with_kind(iou, "fdLimit", "()I", native_iou_fd_limit, NativeKind::Bridge);
-    r.register_with_kind(iou, "initIDs", "()V", native_iou_init_ids, NativeKind::Bridge);
+    r.register_with_kind(
+        iou,
+        "writevMax",
+        "()J",
+        native_iou_write_max_size,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        iou,
+        "fdLimit",
+        "()I",
+        native_iou_fd_limit,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        iou,
+        "initIDs",
+        "()V",
+        native_iou_init_ids,
+        NativeKind::Bridge,
+    );
     r.set_category(__prev_cat);
 }
 

@@ -75,7 +75,7 @@ A neighbouring gate covers the case where the compile produces *nothing*:
 
 ### 2. Making the exit state checkable — **DONE**
 
-> `probes/OsrExitDifferentialProbe.java` +
+> `apps/probes/OsrExitDifferentialProbe.java` +
 > `regression-suite/perf/osr-exit-differential.sh`. Fifteen arms byte-identical
 > to HotSpot, with the forced-exit arms taking real entries and real exits
 > (88 entered / 86 exited, all at a true loop boundary), and the historical
@@ -93,7 +93,7 @@ The forcing half is already built and declared: `CRATONVM_OSR_EXIT_TEST`
 (unconditional bail at the loop header) and `CRATONVM_OSR_EXIT_AFTER=N` (bail at
 iteration *N*), both default-off. What is missing is the differential: a probe
 that counts iterations and compares the JIT-with-forced-exit arm against
-HotSpot and `--nojit`. `probes/OsrDeadLocalProbe.java` is the right shape to
+HotSpot and `--nojit`. `apps/probes/OsrDeadLocalProbe.java` is the right shape to
 copy — an FNV-1a accumulator over everything a mis-seeded entry could disturb,
 compared across three arms.
 
@@ -128,7 +128,7 @@ They reach `MetricsSummary` (and its `to_json`) beside `bailout_categories` and
 
 ### What the instrumented sites saw immediately
 
-`probes/OsrDeadLocalProbe` on the release binary, 2026-08-03:
+`apps/probes/OsrDeadLocalProbe` on the release binary, 2026-08-03:
 
 | | |
 |---|---|

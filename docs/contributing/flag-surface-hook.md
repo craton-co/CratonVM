@@ -20,8 +20,8 @@ three, and that has never been the gap. The gap is *when*.
 
 This repository is worked in dozens of local worktrees whose branches are
 merged into `dev` and pushed directly. CI therefore runs **after** `dev` has
-already moved: it can report red, it cannot prevent it. On 2026-08-11 four
-undeclared flags reached `dev` in a single day —
+already moved: it can report red, it cannot prevent it. Four undeclared flags
+have reached `dev` in a single day before —
 `CRATONVM_SYNTHETIC_MXBEAN_MAPPING`, `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING`,
 `CRATONVM_DBG_OVERLAY_GATE` and
 `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` — each found by whoever branched

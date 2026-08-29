@@ -436,13 +436,13 @@ fn transfer(
     }
 
     match op {
-        0x00 => {}                                  // nop
-        0x01 => push!(StackKind::Ref),              // aconst_null
-        0x02..=0x08 => push!(StackKind::Int),       // iconst_m1..iconst_5
-        0x09 | 0x0a => push!(StackKind::Long),      // lconst_0/1
-        0x0b..=0x0d => push!(StackKind::Float),     // fconst_0..2
-        0x0e | 0x0f => push!(StackKind::Double),    // dconst_0/1
-        0x10 | 0x11 => push!(StackKind::Int),       // bipush / sipush
+        0x00 => {}                               // nop
+        0x01 => push!(StackKind::Ref),           // aconst_null
+        0x02..=0x08 => push!(StackKind::Int),    // iconst_m1..iconst_5
+        0x09 | 0x0a => push!(StackKind::Long),   // lconst_0/1
+        0x0b..=0x0d => push!(StackKind::Float),  // fconst_0..2
+        0x0e | 0x0f => push!(StackKind::Double), // dconst_0/1
+        0x10 | 0x11 => push!(StackKind::Int),    // bipush / sipush
         0x12 | 0x13 => {
             // ldc / ldc_w: a String or Class literal is a ref; a numeric
             // literal is `CONSTANT_Integer` or `CONSTANT_Float`, and the
@@ -468,26 +468,26 @@ fn transfer(
                 StackKind::Long
             });
         }
-        0x15 => push!(StackKind::Int),     // iload
-        0x16 => push!(StackKind::Long),    // lload
-        0x17 => push!(StackKind::Float),   // fload
-        0x18 => push!(StackKind::Double),  // dload
-        0x19 => push!(StackKind::Ref),     // aload
-        0x1a..=0x1d => push!(StackKind::Int),    // iload_0..3
-        0x1e..=0x21 => push!(StackKind::Long),   // lload_0..3
-        0x22..=0x25 => push!(StackKind::Float),  // fload_0..3
-        0x26..=0x29 => push!(StackKind::Double), // dload_0..3
-        0x2a..=0x2d => push!(StackKind::Ref),    // aload_0..3
-        0x2e => replace!(2, StackKind::Int),     // iaload
-        0x2f => replace!(2, StackKind::Long),    // laload
-        0x30 => replace!(2, StackKind::Float),   // faload
-        0x31 => replace!(2, StackKind::Double),  // daload
-        0x32 => replace!(2, StackKind::Ref),     // aaload
+        0x15 => push!(StackKind::Int),              // iload
+        0x16 => push!(StackKind::Long),             // lload
+        0x17 => push!(StackKind::Float),            // fload
+        0x18 => push!(StackKind::Double),           // dload
+        0x19 => push!(StackKind::Ref),              // aload
+        0x1a..=0x1d => push!(StackKind::Int),       // iload_0..3
+        0x1e..=0x21 => push!(StackKind::Long),      // lload_0..3
+        0x22..=0x25 => push!(StackKind::Float),     // fload_0..3
+        0x26..=0x29 => push!(StackKind::Double),    // dload_0..3
+        0x2a..=0x2d => push!(StackKind::Ref),       // aload_0..3
+        0x2e => replace!(2, StackKind::Int),        // iaload
+        0x2f => replace!(2, StackKind::Long),       // laload
+        0x30 => replace!(2, StackKind::Float),      // faload
+        0x31 => replace!(2, StackKind::Double),     // daload
+        0x32 => replace!(2, StackKind::Ref),        // aaload
         0x33..=0x35 => replace!(2, StackKind::Int), // baload / caload / saload
-        0x36..=0x3a => pop!(1),                  // istore/lstore/fstore/dstore/astore
-        0x3b..=0x4e => pop!(1),                  // *store_0..3
-        0x4f..=0x56 => pop!(3),                  // *astore
-        0x57 => pop!(1),                         // pop
+        0x36..=0x3a => pop!(1),                     // istore/lstore/fstore/dstore/astore
+        0x3b..=0x4e => pop!(1),                     // *store_0..3
+        0x4f..=0x56 => pop!(3),                     // *astore
+        0x57 => pop!(1),                            // pop
         0x58 => {
             // pop2: one cat-2 entry, or two cat-1 entries.
             let top = *s.last()?;
@@ -633,7 +633,11 @@ fn transfer(
                 if s.len() < 3 {
                     return None;
                 }
-                let depth = if s[s.len() - 3].is_category_2()? { 3 } else { 4 };
+                let depth = if s[s.len() - 3].is_category_2()? {
+                    3
+                } else {
+                    4
+                };
                 if s.len() < depth {
                     return None;
                 }
@@ -686,7 +690,10 @@ fn transfer(
             *inputs.static_types.get(&pc)?
         )), // getstatic
         0xb3 => pop!(1),                                                 // putstatic
-        0xb4 => replace!(1, StackKind::from_descriptor_byte(*inputs.field_types.get(&pc)?)), // getfield
+        0xb4 => replace!(
+            1,
+            StackKind::from_descriptor_byte(*inputs.field_types.get(&pc)?)
+        ), // getfield
         0xb5 => pop!(2),                                                 // putfield
         0xb6..=0xba => {
             let (args, ret) = *inputs.calls.get(&pc)?;
@@ -696,10 +703,10 @@ fn transfer(
                 push!(StackKind::from_descriptor_byte(ret));
             }
         }
-        0xbb => push!(StackKind::Ref),           // new
+        0xbb => push!(StackKind::Ref),              // new
         0xbc | 0xbd => replace!(1, StackKind::Ref), // newarray / anewarray
-        0xbe => replace!(1, StackKind::Int),     // arraylength
-        0xbf => pop!(1),                         // athrow
+        0xbe => replace!(1, StackKind::Int),        // arraylength
+        0xbf => pop!(1),                            // athrow
         0xc0 => {
             // checkcast — leaves the ref in place (and proves it is one).
             if s.is_empty() {
@@ -740,7 +747,11 @@ fn transfer(
 mod tests {
     use super::*;
 
-    fn no_meta() -> (FxHashSet<usize>, FxHashMap<usize, u8>, FxHashMap<usize, (usize, u8)>) {
+    fn no_meta() -> (
+        FxHashSet<usize>,
+        FxHashMap<usize, u8>,
+        FxHashMap<usize, (usize, u8)>,
+    ) {
         (
             FxHashSet::default(),
             FxHashMap::default(),
@@ -788,7 +799,6 @@ mod tests {
         };
         analyze(code, code.len(), &inputs)
     }
-
 
     /// [`run`] with exception-handler entry points seeded.
     fn run_with_handlers(

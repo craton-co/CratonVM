@@ -57,7 +57,7 @@ fail. Citations use `path:line`.
 
 **(a) Java APIs.** Liquibase 4.x:
 - `javax.xml.parsers.DocumentBuilderFactory.newInstance()` → SAX-style walk of `db.changelog.xml`.
-- `DriverManager.getDriver("jdbc:h2:...")` after H2 driver auto-registers via `META-INF/services/java.sql.Driver`.
+- `DriverManager.getDriver("jdbc:h2:...")` after H2 driver auto-registers via `../../../apps/META-INF/services/java.sql.Driver`.
 - `Connection.prepareStatement` → DDL execution.
 
 **(b) Today's code path.**
@@ -107,9 +107,9 @@ RuntimeDelegate result = ServiceLoader.load(RuntimeDelegate.class)
     .findFirst().orElse(null);
 ```
 
-**(b) Today's code path.** ServiceLoader closure: `native-builtins/src/service_loader.rs::discover_providers`. Walks `META-INF/services/jakarta.ws.rs.ext.RuntimeDelegate` resources via `find_all_resource_bytes`. ✅ DONE per WP1.8/WP7.1.
+**(b) Today's code path.** ServiceLoader closure: `native-builtins/src/service_loader.rs::discover_providers`. Walks `../../../apps/META-INF/services/jakarta.ws.rs.ext.RuntimeDelegate` resources via `find_all_resource_bytes`. ✅ DONE per WP1.8/WP7.1.
 
-**(c) What will fail.** RESTEasy's JAR ships `META-INF/services/jakarta.ws.rs.ext.RuntimeDelegate` listing `org.jboss.resteasy.specimpl.ResteasyProviderFactoryImpl`. Our discover_providers will find the descriptor and return the FQN. But we don't yet wire the **`Class.forName(fqn).getDeclaredConstructor().newInstance()` chain through to a `RuntimeDelegate` synthetic** — `ServiceLoader.iterator().next()` is supposed to return a real instance, not a string. Audit: `service_loader.rs` only stores FQNs in the `ServiceLoader` synthetic; instantiation happens lazily in pure-Java `ServiceLoader$LazyClassPathLookupIterator.nextProviderClass`. If `Class.forName` works for the RESTEasy-JAR-loaded class, this is fine. **Confidence: needs WP8.10 to land first to confirm.**
+**(c) What will fail.** RESTEasy's JAR ships `../../../apps/META-INF/services/jakarta.ws.rs.ext.RuntimeDelegate` listing `org.jboss.resteasy.specimpl.ResteasyProviderFactoryImpl`. Our discover_providers will find the descriptor and return the FQN. But we don't yet wire the **`Class.forName(fqn).getDeclaredConstructor().newInstance()` chain through to a `RuntimeDelegate` synthetic** — `ServiceLoader.iterator().next()` is supposed to return a real instance, not a string. Audit: `service_loader.rs` only stores FQNs in the `ServiceLoader` synthetic; instantiation happens lazily in pure-Java `ServiceLoader$LazyClassPathLookupIterator.nextProviderClass`. If `Class.forName` works for the RESTEasy-JAR-loaded class, this is fine. **Confidence: needs WP8.10 to land first to confirm.**
 
 ### 1.6 Weld CDI — `Bean<?>` proxies via Weld bytecode generator
 

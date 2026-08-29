@@ -229,7 +229,9 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[jit_ir_exception_stub_throw_bci] javac could not be executed: {e}; skipping");
+            eprintln!(
+                "[jit_ir_exception_stub_throw_bci] javac could not be executed: {e}; skipping"
+            );
             return None;
         }
     };

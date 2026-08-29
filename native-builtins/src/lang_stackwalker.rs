@@ -519,7 +519,13 @@ fn populate_sfi(
             ctx.set_field(ste, 3, Value::Int(entry.line_number));
         }
     }
-    sfi_set(ctx, sf, "ste", layout.map(|l| l.ste), Value::Object(Some(ste)));
+    sfi_set(
+        ctx,
+        sf,
+        "ste",
+        layout.map(|l| l.ste),
+        Value::Object(Some(ste)),
+    );
 
     // `declaring_class_native` fast-path reads `SF_DECL_INTERNAL` — on the
     // real class this aliases `contScope` (slot 5); we stash the '/'-form
@@ -1015,7 +1021,9 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
-            return Ok(Some(crate::lang_misc::ste_read_field(ctx, ste, "fileName", 2)));
+            return Ok(Some(crate::lang_misc::ste_read_field(
+                ctx, ste, "fileName", 2,
+            )));
         }
         Ok(Some(ctx.get_field(this, SF_FILENAME)))
     });
@@ -1392,9 +1400,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             // resolve used. Reading it here keeps this arm answering for a
             // carrier whose mirror has not been materialised yet, which is the
             // normal state for every frame a walk did not inspect.
-            if let Some(cid) =
-                crate::phases_late::reflect_invoke::p59_frame_class_id(ctx, this)
-            {
+            if let Some(cid) = crate::phases_late::reflect_invoke::p59_frame_class_id(ctx, this) {
                 return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
             }
         }
@@ -1524,73 +1530,79 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // `type` is left as the descriptor String, which is a shape the JDK itself
     // uses: `getDescriptor()` returns it as-is and `getMethodType()` inflates a
     // String `type` into a `MethodType` on demand.
-    registry.register_with_kind(sfi, "expandStackFrameInfo", "()V", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        // Already expanded — the real native is idempotent and re-entered on
-        // every `getDescriptor()` call.
-        if matches!(ctx.get_field_by_name(this, "type"), Value::Object(Some(_))) {
-            return Ok(None);
-        }
-        // Only fill the slot when it can legally hold a String. HotSpot's own
-        // `expandStackFrameInfo` stores the method's signature String in the
-        // `Object type` field (the layout recorded in `populate_sfi`'s comment:
-        // `String name; Object type; int bci;`) and lets `getMethodType()`
-        // inflate it on demand, which is what this mirrors. If some JDK build
-        // instead declares `type` as a `MethodType`, or the carrier has no such
-        // field at all (our synthetic 6-slot layout), bail rather than writing a
-        // value of the wrong type into a typed slot.
-        let this_class = ctx.class_id_of_object(this);
-        let type_field_desc = ctx
-            .declared_fields(this_class)
-            .into_iter()
-            .find(|f| f.name == "type")
-            .map(|f| f.descriptor);
-        match type_field_desc.as_deref() {
-            Some("Ljava/lang/Object;") | Some("Ljava/lang/String;") => {}
-            _ => return Ok(None),
-        }
-        let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        if internal.is_empty() {
-            return Ok(None);
-        }
-        let method_name = match ctx.get_field_by_name(this, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => match ctx.get_field(this, SF_METHODNAME) {
+    registry.register_with_kind(
+        sfi,
+        "expandStackFrameInfo",
+        "()V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            // Already expanded — the real native is idempotent and re-entered on
+            // every `getDescriptor()` call.
+            if matches!(ctx.get_field_by_name(this, "type"), Value::Object(Some(_))) {
+                return Ok(None);
+            }
+            // Only fill the slot when it can legally hold a String. HotSpot's own
+            // `expandStackFrameInfo` stores the method's signature String in the
+            // `Object type` field (the layout recorded in `populate_sfi`'s comment:
+            // `String name; Object type; int bci;`) and lets `getMethodType()`
+            // inflate it on demand, which is what this mirrors. If some JDK build
+            // instead declares `type` as a `MethodType`, or the carrier has no such
+            // field at all (our synthetic 6-slot layout), bail rather than writing a
+            // value of the wrong type into a typed slot.
+            let this_class = ctx.class_id_of_object(this);
+            let type_field_desc = ctx
+                .declared_fields(this_class)
+                .into_iter()
+                .find(|f| f.name == "type")
+                .map(|f| f.descriptor);
+            match type_field_desc.as_deref() {
+                Some("Ljava/lang/Object;") | Some("Ljava/lang/String;") => {}
+                _ => return Ok(None),
+            }
+            let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
-            },
-        };
-        if method_name.is_empty() {
-            return Ok(None);
-        }
-        let Some(class_id) = ctx.class_id_by_name(&internal) else {
-            return Ok(None);
-        };
-        let descriptor = ctx
-            .declared_methods(class_id)
-            .into_iter()
-            .find(|m| m.name == method_name)
-            .map(|m| m.descriptor);
-        let Some(desc) = descriptor else {
-            return Ok(None);
-        };
-        // GC-SAFETY: `create_string` allocates and can relocate `this` under the
-        // moving collector, so pin the frame and re-read it through the pin
-        // before the (allocation-free) field write. Nothing allocates after the
-        // string, so the string itself cannot move before it is stored.
-        let pin = ctx.pin_native_root(this);
-        let desc_str = ctx.create_string(&desc);
-        let this = ctx.read_native_pin(pin, this);
-        ctx.set_field_by_name(this, "type", Value::Object(Some(desc_str)));
-        ctx.unpin_native_roots(pin);
-        Ok(None)
-    }, NativeKind::Bridge);
+            };
+            if internal.is_empty() {
+                return Ok(None);
+            }
+            let method_name = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => match ctx.get_field(this, SF_METHODNAME) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+            };
+            if method_name.is_empty() {
+                return Ok(None);
+            }
+            let Some(class_id) = ctx.class_id_by_name(&internal) else {
+                return Ok(None);
+            };
+            let descriptor = ctx
+                .declared_methods(class_id)
+                .into_iter()
+                .find(|m| m.name == method_name)
+                .map(|m| m.descriptor);
+            let Some(desc) = descriptor else {
+                return Ok(None);
+            };
+            // GC-SAFETY: `create_string` allocates and can relocate `this` under the
+            // moving collector, so pin the frame and re-read it through the pin
+            // before the (allocation-free) field write. Nothing allocates after the
+            // string, so the string itself cannot move before it is stored.
+            let pin = ctx.pin_native_root(this);
+            let desc_str = ctx.create_string(&desc);
+            let this = ctx.read_native_pin(pin, this);
+            ctx.set_field_by_name(this, "type", Value::Object(Some(desc_str)));
+            ctx.unpin_native_roots(pin);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
     // IMPLEMENTED (was an unconditional no-op). Real
     // `ClassFrameInfo.ensureRetainClassRefEnabled()` throws
     // UnsupportedOperationException unless the RETAIN_CLASS_REF bit is set in the

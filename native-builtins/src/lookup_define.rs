@@ -203,7 +203,9 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
     // `PersistentAttributeInterceptable`). Gated + only fires for a user loader
     // that has actually been assigned a namespace → byte-identical gate-off.
     if crate::classloader::loader_aware_resolution() {
-        if let Some(loader_obj) = crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
+        if let Some(loader_obj) =
+            crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32())
+        {
             if let Some(ns) = crate::classloader::peek_loader_namespace_id(ctx, loader_obj) {
                 return ns;
             }
@@ -292,7 +294,10 @@ fn resolve_lookup_supertypes(
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
-fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_lookup_for(
+    ctx: &mut dyn NativeContext,
+    lookup_mirror: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     // FULL_POWER = PUBLIC | PRIVATE | PROTECTED | PACKAGE | MODULE | ORIGINAL
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
@@ -458,10 +463,15 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 if let Value::Object(Some(mirror)) = ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF)
                 {
                     if let Some(lookup_cid) = crate::lang_class::mirror_class_id(ctx, mirror) {
-                        if let Some(loader) =
-                            crate::classloader::defining_loader_for(ctx.vm_identity(), lookup_cid.as_u32())
-                        {
-                            crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
+                        if let Some(loader) = crate::classloader::defining_loader_for(
+                            ctx.vm_identity(),
+                            lookup_cid.as_u32(),
+                        ) {
+                            crate::classloader::register_defining_loader(
+                                ctx.vm_identity(),
+                                cid.as_u32(),
+                                loader,
+                            );
                         }
                     }
                 }
@@ -558,8 +568,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Mint a unique mangled name from the class file's own `this_class` (the
     // name HotSpot uses); we pass `override_name` so the backend stamps the
     // mangled name into the class metadata.
-    let original =
-        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
+    let original = hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
@@ -782,8 +791,7 @@ fn lk_define_hidden_class_with_class_data(
 
     // Same rule as the plain variant: the label comes from the class file's
     // own `this_class`, with the lookup class name as the fallback.
-    let original =
-        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
+    let original = hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 

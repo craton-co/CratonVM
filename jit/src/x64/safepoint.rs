@@ -148,7 +148,6 @@ impl Compiler {
     // maps, the deopt snapshots and the OSR trampoline, so they are a contract
     // rather than a private detail.
 
-
     pub(super) fn emit_pre_safepoint_spill(&mut self) {
         self.emit_pre_safepoint_spill_impl(true);
     }
@@ -288,9 +287,8 @@ impl Compiler {
                 let narrow = self.oop_capable_spill_regs(arg_regs_published, rax_published);
                 self.pending_narrow_spill = narrow;
                 // Cast: `count_ones` is at most 14, well inside u64.
-                let kept = narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| {
-                    u64::from(m.count_ones())
-                });
+                let kept =
+                    narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| u64::from(m.count_ones()));
                 crate::metrics::note_spill_width(
                     kept,
                     ALL_SPILL_GPRS.len() as u64,
@@ -368,11 +366,7 @@ impl Compiler {
     /// (R10/R11 on SysV, plus unused local homes). See
     /// [`narrow_safepoint_spill_enabled`] for what that gives up and why the
     /// stale slot it leaves behind is safe.
-    fn oop_capable_spill_regs(
-        &self,
-        arg_regs_published: bool,
-        rax_published: bool,
-    ) -> Option<u16> {
+    fn oop_capable_spill_regs(&self, arg_regs_published: bool, rax_published: bool) -> Option<u16> {
         if !narrow_safepoint_spill_enabled() {
             return None;
         }
@@ -1269,15 +1263,15 @@ impl Compiler {
             // which only puts `top` back where the push found it.
             self.emit_test_r64_imm32(R11, 1);
             ovf_patch = Some(self.emit_jcc_rel32_patch(0x85)); // JNE → bail path
-            // spring-bug-10 hardening: validate savebase ∈ [base, end) BEFORE
-            // dereferencing it for the home-restore below. The observed SIGSEGV
-            // read 0xFFFF_FFFF_FFFF_FFFE from this slot — a corrupt / stale /
-            // uninitialised value that the unconditional deref then faulted on.
-            // ShadowStack layout (relative to `ss_top`): top@+0, end@+8, base@+16.
-            //   cmp R11, base ; jb  heal   (below base)
-            //   cmp R11, end  ; jae heal   (at/above end)
-            // On heal, fall back to popping `homes.len()` slots off the live
-            // `top` — never out of the backing buffer, so it cannot fault.
+                                                               // spring-bug-10 hardening: validate savebase ∈ [base, end) BEFORE
+                                                               // dereferencing it for the home-restore below. The observed SIGSEGV
+                                                               // read 0xFFFF_FFFF_FFFF_FFFE from this slot — a corrupt / stale /
+                                                               // uninitialised value that the unconditional deref then faulted on.
+                                                               // ShadowStack layout (relative to `ss_top`): top@+0, end@+8, base@+16.
+                                                               //   cmp R11, base ; jb  heal   (below base)
+                                                               //   cmp R11, end  ; jae heal   (at/above end)
+                                                               // On heal, fall back to popping `homes.len()` slots off the live
+                                                               // `top` — never out of the backing buffer, so it cannot fault.
             self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
                                                                  // SB-CRASH-04 fix: on an invalid savebase (corrupt/uninitialised —
                                                                  // the observed 0xFFFF_FFFF_FFFF_FFFE), SKIP the value-restore rather
@@ -1336,8 +1330,8 @@ impl Compiler {
             self.patch_rel32_to_here(ovf);
             self.emit_load_local(R11, self.shadow_savebase_slot_off);
             self.emit_and_r64_imm8(R11, -2); // recover the pre-push `top`
-            // Bound it before committing: an over-high `top` over-scans
-            // (harmless) but a wild one would widen the scan out of the buffer.
+                                             // Bound it before committing: an over-high `top` over-scans
+                                             // (harmless) but a wild one would widen the scan out of the buffer.
             self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
             let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
             self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end

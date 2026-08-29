@@ -149,10 +149,7 @@ fn cslm_put_survives_a_comparator_triggered_relocation() {
     // And the entry itself must be readable back. `get` runs its own search
     // over three entries: mid=1 says "sorts before" (walk right), mid=2 says
     // "equal" (found).
-    ctx.set_invoke_virtual_results(vec![
-        Ok(Some(Value::Int(-1))),
-        Ok(Some(Value::Int(0))),
-    ]);
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(-1))), Ok(Some(Value::Int(0)))]);
     let got = __test_cslm_get(&mut ctx, &[obj(map), obj(k3)]).unwrap();
     assert!(
         !matches!(got, Some(Value::Object(None))),

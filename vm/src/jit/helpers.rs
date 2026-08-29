@@ -192,7 +192,9 @@ pub mod mic_prof {
     /// hundreds of megabytes of stderr.
     pub fn trace_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some())
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some()
+        })
     }
 
     #[inline]
@@ -1436,9 +1438,8 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
             );
             b.set(true);
             if jit_borrow_site_capture_enabled() {
-                JIT_THREAD_BORROW_SITE.with(|s| {
-                    s.set(Some(Box::new(std::backtrace::Backtrace::force_capture())))
-                });
+                JIT_THREAD_BORROW_SITE
+                    .with(|s| s.set(Some(Box::new(std::backtrace::Backtrace::force_capture()))));
             }
         });
         Some((
@@ -2416,8 +2417,7 @@ fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
                     // shutdown summary: a JUnit runner ends the process with
                     // `System.exit`, so anything printed at VM shutdown is
                     // unreachable in exactly the workloads this exists for.
-                    static N: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n < 40 {
                         eprintln!(
@@ -2433,9 +2433,7 @@ fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
                             info.descriptor
                         );
                         if n + 1 == 40 {
-                            eprintln!(
-                                "[site-alias] (further hits are counted, not printed)"
-                            );
+                            eprintln!("[site-alias] (further hits are counted, not printed)");
                         }
                     }
                     m.insert(
@@ -2604,7 +2602,10 @@ unsafe fn try_mic_rust_cached_entry(
     if !mic_rust_entry_cache_enabled() || !direct_virtual_compiled_callee_entry_enabled() {
         return None;
     }
-    let key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
+    let key = (
+        jit_site_key(vm.vm_identity, info_ptr as usize),
+        receiver_cid,
+    );
     // The owner comes out WITH the entry: it is the keep-alive this map already
     // holds for exactly this raw pointer, so cloning it here spares the callee a
     // code-range registry round trip per call. See
@@ -2821,7 +2822,9 @@ unsafe fn resolve_callee_cached(
     let class_id = match info.invoke_kind {
         0 | 2 if receiver_class_id.as_u32() != 0 => Some(receiver_class_id),
         _ if info.declaring_class_id == 0 => cm.find_bootstrap_class_by_name(info.class_name),
-        _ => cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id)),
+        _ => {
+            cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id))
+        }
     }?;
     let store = cm.class_store();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
@@ -3936,7 +3939,6 @@ unsafe fn try_resume_trapped_callee(
 /// dispatch free of temporary heap allocations.
 pub(crate) const INLINE_JIT_NATIVE_ARGS: usize = 8;
 type JitDecodedArgs = smallvec::SmallVec<[Value; INLINE_JIT_NATIVE_ARGS]>;
-
 
 /// Decode a JIT dispatch helper's raw `i64` argument slice into the
 /// `Value` slice the interpreter expects. Centralised so that the slow
@@ -5176,11 +5178,7 @@ unsafe fn jit_resolve_cp_class(
 /// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
 /// referencing class and constant-pool index of this `new` site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub unsafe extern "C" fn jit_new_object_cp(
-    vm_ptr: i64,
-    holder_class_id: i64,
-    cp_idx: i64,
-) -> i64 {
+pub unsafe extern "C" fn jit_new_object_cp(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
     if vm_ptr == 0 {
         return 0;
     }
@@ -5238,11 +5236,7 @@ pub unsafe extern "C" fn jit_new_object_cp(
 /// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
 /// referencing class and constant-pool index of this `ldc` site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub unsafe extern "C" fn jit_ldc_class_cp(
-    vm_ptr: i64,
-    holder_class_id: i64,
-    cp_idx: i64,
-) -> i64 {
+pub unsafe extern "C" fn jit_ldc_class_cp(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
     if vm_ptr == 0 {
         return 0;
     }
@@ -5280,7 +5274,6 @@ pub unsafe extern "C" fn jit_ldc_class_cp(
     record_ldc_reference(vm, holder_cid, idx, mirror);
     mirror.as_ptr() as i64
 }
-
 
 // ---------------------------------------------------------------------------
 // JVMS §5.4.3 in compiled code: a constant-pool entry resolves ONCE.
@@ -5415,10 +5408,14 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
     let holder = ClassId::new(holder_class_id as u32);
     let idx = cp_idx as u16;
     if let Some(bits) = recorded_ldc_reference(vm, holder, idx) {
-        crate::runtime::interpreter::site_cache::site_stats::bump(crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_HIT);
+        crate::runtime::interpreter::site_cache::site_stats::bump(
+            crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_HIT,
+        );
         return bits;
     }
-    crate::runtime::interpreter::site_cache::site_stats::bump(crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_MISS);
+    crate::runtime::interpreter::site_cache::site_stats::bump(
+        crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_MISS,
+    );
     jit_safepoint_flush_satb(vm_ptr);
     // Cold, once per site: re-read the literal. Owned before the lock is
     // dropped, because `create_java_string` allocates and must not run under
@@ -6379,11 +6376,8 @@ unsafe fn aastore_store_is_refused(vm_ptr: i64, array_ptr: i64, val: i64) -> boo
         .get_class(vm.mem.heap.class_id_of(value_ref))
         .map(|c| c.name.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let elem_cls = crate::runtime::interpreter::cce_display_class_name(
-        vm,
-        value_ref,
-        &raw_elem_name,
-    );
+    let elem_cls =
+        crate::runtime::interpreter::cce_display_class_name(vm, value_ref, &raw_elem_name);
     if let Some((thread, _guard)) = jit_thread_mut() {
         use crate::error::MethodCallFailed;
         if let MethodCallFailed::ExceptionThrown(exc) =
@@ -7189,16 +7183,13 @@ static LEGACY_RECEIVER_CLASSES: [(
     std::sync::atomic::AtomicU32,
     std::sync::atomic::AtomicU64,
     std::sync::OnceLock<String>,
-); 16] = [
-    const {
-        (
-            std::sync::atomic::AtomicU32::new(u32::MAX),
-            std::sync::atomic::AtomicU64::new(0),
-            std::sync::OnceLock::new(),
-        )
-    };
-    16
-];
+); 16] = [const {
+    (
+        std::sync::atomic::AtomicU32::new(u32::MAX),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::OnceLock::new(),
+    )
+}; 16];
 
 /// Record one legacy receiver against its class id. `addr` must already have
 /// passed the plausibility and containment tests.
@@ -7261,7 +7252,10 @@ pub fn jit_getfield_legacy_receiver_classes() -> Vec<(String, u32, u64)> {
                 return None;
             }
             let n = count.load(Ordering::Relaxed);
-            let name = name.get().cloned().unwrap_or_else(|| "<unnamed>".to_string());
+            let name = name
+                .get()
+                .cloned()
+                .unwrap_or_else(|| "<unnamed>".to_string());
             Some((name, cid, n))
         })
         .collect()
@@ -7299,7 +7293,6 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
         words.join(", ")
     );
 }
-
 
 /// Census of which JIT helper still performs an `is_object_address` heap
 /// membership walk, and how often.
@@ -7675,8 +7668,8 @@ unsafe fn jit_getfield_impl(
             None => want.is_some() && payload64 != 0,
         };
         if interesting {
-            let n = JIT_GETFIELD_PUNNED_REF_REPORTS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n =
+                JIT_GETFIELD_PUNNED_REF_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 32 {
                 // The whole cell, not just the word that would have been
                 // dereferenced. `Value::Int` keeps its payload at
@@ -7686,7 +7679,7 @@ unsafe fn jit_getfield_impl(
                 // want completely different searches. Printing tag+p32+p64
                 // separates them in one run instead of by argument.
                 let tag = std::ptr::read_unaligned(
-                    ptr.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32,
+                    ptr.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32
                 );
                 let payload32 = std::ptr::read_unaligned(
                     ptr.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32,
@@ -9531,8 +9524,8 @@ unsafe fn jit_typecheck_resolve(
     // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
     // comparison cannot reproduce.
     jit_typecheck_trace(vm, obj_class_id, class_name, lenient, "enter", None);
-    if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
-        .filter(|_| !recv_is_array)
+    if let Some(recorded) =
+        cratonvm_jit::typecheck_target_for_site(class_name.as_ptr()).filter(|_| !recv_is_array)
     {
         let target_class_id = ClassId::new(recorded);
         let names_this_site = {
@@ -9570,8 +9563,11 @@ unsafe fn jit_typecheck_resolve(
             // annotation-proxy admission still apply — those encode their
             // relationships outside the class hierarchy, so an id comparison
             // cannot see them — but the loader-blind name walk does not.
-            if crate::runtime::interpreter::synthetic_implements_public(vm, obj_class_id, class_name)
-            {
+            if crate::runtime::interpreter::synthetic_implements_public(
+                vm,
+                obj_class_id,
+                class_name,
+            ) {
                 return true;
             }
             if crate::runtime::interpreter::annotation_proxy_satisfies_target(
@@ -10123,19 +10119,18 @@ pub unsafe extern "C" fn jit_throw_aioobe(
             );
             let num_slots =
                 std::ptr::read_unaligned(base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
-            let gc_age =
-                cratonvm_types::ObjectHeader::gc_age_of(std::ptr::read_unaligned(
-                    base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64,
-                ));
-            let gc_flags =
-                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
+            let gc_age = cratonvm_types::ObjectHeader::gc_age_of(std::ptr::read_unaligned(
+                base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64,
+            ));
+            let gc_flags = std::ptr::read_unaligned(
+                base.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8
+            );
             // Forwarding folded into the mark word (32 -> 24 shrink), so this
             // diagnostic reports the whole word: its 2-bit state distinguishes
             // NEUTRAL / THIN_LOCKED / INFLATED / FORWARDED, which is strictly
             // more than the old field could say.
-            let mark_word = std::ptr::read_unaligned(
-                base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64
-            );
+            let mark_word =
+                std::ptr::read_unaligned(base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64);
             eprintln!(
                 "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
 header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
@@ -10343,9 +10338,9 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
     let site = &*(site_ptr as *const cratonvm_jit::JitLocalHandlerSite);
     // A signal that is not yet a throwable, or no throwable at all, is not
     // ours: leave every flag alone and let the old route run.
-    if JIT_SIGNALS.with(|s| {
-        s.npe.get() || s.aioobe.get().is_some() || s.arithmetic.get() || s.deopt.get()
-    }) || cratonvm_jit::deopt::has_last_deopt()
+    if JIT_SIGNALS
+        .with(|s| s.npe.get() || s.aioobe.get().is_some() || s.arithmetic.get() || s.deopt.get())
+        || cratonvm_jit::deopt::has_last_deopt()
     {
         return -1;
     }
@@ -10389,9 +10384,7 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
         }
     };
     if index < 0 {
-        cratonvm_jit::metrics::note_local_handler(
-            cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED,
-        );
+        cratonvm_jit::metrics::note_local_handler(cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED);
         return -1;
     }
     // Committed: take the throwable and publish it where the handler's operand
@@ -10403,9 +10396,7 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
         // Unreachable: `current_jit_thread_ptr` was non-null above and this is
         // the same thread. Refuse rather than assume — a `-1` here is the
         // ordinary propagate path, which is always correct.
-        cratonvm_jit::metrics::note_local_handler(
-            cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED,
-        );
+        cratonvm_jit::metrics::note_local_handler(cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED);
         return -1;
     };
     let taken = take_jit_pending_exception(thread);
@@ -10436,22 +10427,22 @@ fn local_handler_index_slow(
             // Cast: candidate counts are single digits.
             return i as i32;
         }
-        let catch_class_id =
-            match cm.find_class_by_name_for_class(catch_name, ClassId::new(site.declaring_class_id))
-            {
-                Some(id) => id,
-                None => {
-                    drop(cm);
-                    let loaded = vm.load_class_concurrent(catch_name);
-                    cm = vm.classes.class_manager.read();
-                    match loaded {
-                        Ok(id) => id,
-                        // Unresolvable catch type: the interpreter's own search
-                        // skips it rather than treating it as a match.
-                        Err(_) => continue,
-                    }
+        let catch_class_id = match cm
+            .find_class_by_name_for_class(catch_name, ClassId::new(site.declaring_class_id))
+        {
+            Some(id) => id,
+            None => {
+                drop(cm);
+                let loaded = vm.load_class_concurrent(catch_name);
+                cm = vm.classes.class_manager.read();
+                match loaded {
+                    Ok(id) => id,
+                    // Unresolvable catch type: the interpreter's own search
+                    // skips it rather than treating it as a match.
+                    Err(_) => continue,
                 }
-            };
+            }
+        };
         if cm.is_subclass_of(exc_class_id, catch_class_id)
             || cm.is_subclass_of_by_name(exc_class_id, catch_name)
         {
@@ -10832,7 +10823,14 @@ fn admit_jit_fast_native_resolved(
     Option<cratonvm_native_api::NativeMethodId>,
 )> {
     if crate::vm::dispatch_policy(vm).is_jdk_only() {
-        return jdk_only_admit_jit_fast_native(vm, class_name, method_name, descriptor, callback, id);
+        return jdk_only_admit_jit_fast_native(
+            vm,
+            class_name,
+            method_name,
+            descriptor,
+            callback,
+            id,
+        );
     }
     Some((callback, id))
 }
@@ -10861,8 +10859,7 @@ pub fn leaf_native_hit_count() -> u64 {
 /// questions and have different expected magnitudes: this is every registered
 /// native a compiled method calls, whereas the leaf count is only the audited
 /// accessor set.
-static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Is the per-call-site native fast path for compiled code enabled?
 ///
@@ -11137,15 +11134,15 @@ fn site_cache_mode_from(raw: Option<&str>) -> SiteCacheMode {
 fn synthetic_stub_site_cache_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE_STUBS") {
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE_STUBS") {
             Ok(v) => {
                 let v = v.trim();
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             }
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 /// Does `invoke_or_native` special-case this method name BEFORE it reaches its
@@ -11488,7 +11485,11 @@ fn resolve_native_owner_for_receiver(
     receiver_class_id: Option<ClassId>,
     info: &JitInvokeInfo,
     walk_supers: bool,
-) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
+) -> Option<(
+    String,
+    cratonvm_native_api::NativeMethodId,
+    Option<&'static str>,
+)> {
     let registry = &vm.natives.native_methods;
     if let Some(id) = registry.resolve_id(dispatch_class, info.method_name, info.descriptor) {
         return Some((dispatch_class.to_string(), id, None));
@@ -11521,8 +11522,7 @@ fn resolve_native_owner_for_receiver(
     }
     while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
         let parent = cm.get_class(parent_id)?;
-        let parent_native =
-            registry.resolve_id(&parent.name, info.method_name, info.descriptor);
+        let parent_native = registry.resolve_id(&parent.name, info.method_name, info.descriptor);
         if parent
             .find_method(info.method_name, info.descriptor)
             .is_some()
@@ -11554,7 +11554,11 @@ fn resolve_signature_polymorphic_native_site(
     vm: &SharedVm,
     dispatch_class: &str,
     info: &JitInvokeInfo,
-) -> Option<(String, cratonvm_native_api::NativeMethodId, Option<&'static str>)> {
+) -> Option<(
+    String,
+    cratonvm_native_api::NativeMethodId,
+    Option<&'static str>,
+)> {
     if !crate::vm::vm_exec::is_var_handle_signature_polymorphic_receiver(dispatch_class)
         || !crate::vm::vm_exec::is_signature_polymorphic_method_name(info.method_name)
     {
@@ -12480,9 +12484,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             if let Some(result) = call_object_native_raw(
                                 vm, thread, info, receiver, args_slice, entry,
                             ) {
-                                disp_census::note(
-                                    disp_census::OUT_OBJECT_NATIVE,
-                                );
+                                disp_census::note(disp_census::OUT_OBJECT_NATIVE);
                                 return result;
                             }
                         }
@@ -12799,20 +12801,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             .get_loaded_class_id(info.class_name)
             .unwrap_or(cratonvm_types::ClassId::new(0));
         let jit_cache = vm.jit.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(
-            info.class_name,
-            info.method_name,
-            info.descriptor,
-            info_class_id,
-        )
-        // A raw CALL to the entry below supplies no monitor, so an
-        // `ACC_SYNCHRONIZED` body must not be served here — it would run
-        // unlocked and, worse, be cached in `DISPATCH_CACHE` so every later
-        // call at this site runs unlocked too. Falling through leaves the site
-        // on the interpreter route, whose `dispatch_static` /
-        // `dispatch_virtual` arms take the monitor. See
-        // `CompiledMethod::requires_wrapped_entry`.
-        .filter(|compiled| !compiled.requires_wrapped_entry)
+        if let Some(compiled) = jit_cache
+            .get(
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                info_class_id,
+            )
+            // A raw CALL to the entry below supplies no monitor, so an
+            // `ACC_SYNCHRONIZED` body must not be served here — it would run
+            // unlocked and, worse, be cached in `DISPATCH_CACHE` so every later
+            // call at this site runs unlocked too. Falling through leaves the site
+            // on the interpreter route, whose `dispatch_static` /
+            // `dispatch_virtual` arms take the monitor. See
+            // `CompiledMethod::requires_wrapped_entry`.
+            .filter(|compiled| !compiled.requires_wrapped_entry)
         {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
@@ -13350,31 +13353,31 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
                 }
             } else {
-            let r = match jit_static_owner_override(vm, info) {
-                Some(owner) => crate::vm::invoke_static_shared_on_class(
-                    vm,
-                    thread,
-                    owner,
-                    info.class_name,
-                    info.method_name,
-                    info.descriptor,
-                    &values,
-                ),
-                None => crate::vm::invoke_or_native(
-                    vm,
-                    thread,
-                    info.class_name,
-                    info.method_name,
-                    info.descriptor,
-                    &values,
-                ),
-            };
-            match r {
-                Ok(v) => v,
-                Err(e) => {
-                    return handle_jit_dispatch_error(vm, thread, e, info);
+                let r = match jit_static_owner_override(vm, info) {
+                    Some(owner) => crate::vm::invoke_static_shared_on_class(
+                        vm,
+                        thread,
+                        owner,
+                        info.class_name,
+                        info.method_name,
+                        info.descriptor,
+                        &values,
+                    ),
+                    None => crate::vm::invoke_or_native(
+                        vm,
+                        thread,
+                        info.class_name,
+                        info.method_name,
+                        info.descriptor,
+                        &values,
+                    ),
+                };
+                match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return handle_jit_dispatch_error(vm, thread, e, info);
+                    }
                 }
-            }
             }
         }
         _ => None,
@@ -13534,7 +13537,9 @@ unsafe fn try_jit_static_bytecode_callee(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(vm, thread, frame))
+    Some(crate::runtime::interpreter::execute_prebuilt_frame(
+        vm, thread, frame,
+    ))
 }
 
 /// The once-per-site half of [`try_jit_static_bytecode_callee`]. Every refusal
@@ -14315,9 +14320,12 @@ unsafe fn try_varhandle_instance_field_cas(
     let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
     // Same GC-stable key the read path files handles under.
     let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
+    let key = vm
+        .threads
+        .monitors
+        .java_identity_hash(vh, heap.identity_hash_code(vh), || {
+            heap.next_identity_hash()
+        });
     let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // The call site's declared operand types have to agree with the variable's
     // own kind, for the reason the read path checks its return type: the
@@ -14374,7 +14382,11 @@ fn varhandle_cas_operand_kinds(descriptor: &str) -> Option<(u8, u8)> {
                 if j >= bytes.len() {
                     return None;
                 }
-                i = if bytes[j] == b'L' { params[j..].find(';')? + j + 1 } else { j + 1 };
+                i = if bytes[j] == b'L' {
+                    params[j..].find(';')? + j + 1
+                } else {
+                    j + 1
+                };
                 kinds[n] = b'L';
             }
             c @ (b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D') => {
@@ -14404,7 +14416,9 @@ fn varhandle_operand_value(vm: &SharedVm, raw: i64, value_desc: u8) -> Option<Va
                 Value::Object(None)
             } else {
                 // SAFETY: validated as a live heap address before use.
-                Value::Object(Some(unsafe { vm.mem.heap.is_object_address(raw as usize) }?))
+                Value::Object(Some(unsafe {
+                    vm.mem.heap.is_object_address(raw as usize)
+                }?))
             }
         }
         b'J' => Value::Long(raw),
@@ -14518,7 +14532,6 @@ unsafe fn varhandle_instance_field_read_bits(
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // `VarHandle` read-mode thin direct-call helpers.
 //
@@ -14565,14 +14578,38 @@ const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
 /// process-stable — the same contract `INTEGER_INT_VALUE_INFO` and
 /// `PRECONDITIONS_CHECK_INDEX_INFO` are statics for.
 static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS] = [
-    vh_read_info(0, 0), vh_read_info(0, 1), vh_read_info(0, 2), vh_read_info(0, 3),
-    vh_read_info(0, 4), vh_read_info(0, 5), vh_read_info(0, 6), vh_read_info(0, 7),
-    vh_read_info(1, 0), vh_read_info(1, 1), vh_read_info(1, 2), vh_read_info(1, 3),
-    vh_read_info(1, 4), vh_read_info(1, 5), vh_read_info(1, 6), vh_read_info(1, 7),
-    vh_read_info(2, 0), vh_read_info(2, 1), vh_read_info(2, 2), vh_read_info(2, 3),
-    vh_read_info(2, 4), vh_read_info(2, 5), vh_read_info(2, 6), vh_read_info(2, 7),
-    vh_read_info(3, 0), vh_read_info(3, 1), vh_read_info(3, 2), vh_read_info(3, 3),
-    vh_read_info(3, 4), vh_read_info(3, 5), vh_read_info(3, 6), vh_read_info(3, 7),
+    vh_read_info(0, 0),
+    vh_read_info(0, 1),
+    vh_read_info(0, 2),
+    vh_read_info(0, 3),
+    vh_read_info(0, 4),
+    vh_read_info(0, 5),
+    vh_read_info(0, 6),
+    vh_read_info(0, 7),
+    vh_read_info(1, 0),
+    vh_read_info(1, 1),
+    vh_read_info(1, 2),
+    vh_read_info(1, 3),
+    vh_read_info(1, 4),
+    vh_read_info(1, 5),
+    vh_read_info(1, 6),
+    vh_read_info(1, 7),
+    vh_read_info(2, 0),
+    vh_read_info(2, 1),
+    vh_read_info(2, 2),
+    vh_read_info(2, 3),
+    vh_read_info(2, 4),
+    vh_read_info(2, 5),
+    vh_read_info(2, 6),
+    vh_read_info(2, 7),
+    vh_read_info(3, 0),
+    vh_read_info(3, 1),
+    vh_read_info(3, 2),
+    vh_read_info(3, 3),
+    vh_read_info(3, 4),
+    vh_read_info(3, 5),
+    vh_read_info(3, 6),
+    vh_read_info(3, 7),
 ];
 
 /// One entry of [`VARHANDLE_READ_INFOS`]. `num_jit_args: 2` counts the
@@ -14781,7 +14818,13 @@ unsafe fn varhandle_write_value_of(vm: &SharedVm, kind: u8, bits: i64) -> Option
 ///
 /// Called only from JIT-compiled code, with a `vm_ptr` compiled against this
 /// live VM and raw references the compiled frame is holding.
-unsafe fn varhandle_write_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, value: i64, slot: usize) {
+unsafe fn varhandle_write_direct_impl(
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    value: i64,
+    slot: usize,
+) {
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
@@ -14828,9 +14871,12 @@ unsafe fn varhandle_instance_field_write(
     // The same GC-stable key `vh_meta_get` files the handle under — see
     // `varhandle_instance_field_read_bits`, which resolves it identically.
     let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
+    let key = vm
+        .threads
+        .monitors
+        .java_identity_hash(vh, heap.identity_hash_code(vh), || {
+            heap.next_identity_hash()
+        });
     let Some(plan) = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)
     else {
         return false;
@@ -14916,14 +14962,46 @@ const VARHANDLE_WRITE_DESCRIPTORS: [&str; 9] = [
 ];
 
 /// Synthetic call sites for the cold arm of the `VarHandle` write helpers, one
-/// per slot. `static` for the same reason [`VARHANDLE_READ_INFOS`] is: 
+/// per slot. `static` for the same reason [`VARHANDLE_READ_INFOS`] is:
 /// `jit_invoke_dispatch` keys its per-site memos on `(vm_identity, info
 /// address)`, so the address has to be process-stable.
 static VARHANDLE_WRITE_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_WRITE_SLOTS] = [
-    vh_write_info(0, 0), vh_write_info(0, 1), vh_write_info(0, 2), vh_write_info(0, 3), vh_write_info(0, 4), vh_write_info(0, 5), vh_write_info(0, 6), vh_write_info(0, 7), vh_write_info(0, 8),
-    vh_write_info(1, 0), vh_write_info(1, 1), vh_write_info(1, 2), vh_write_info(1, 3), vh_write_info(1, 4), vh_write_info(1, 5), vh_write_info(1, 6), vh_write_info(1, 7), vh_write_info(1, 8),
-    vh_write_info(2, 0), vh_write_info(2, 1), vh_write_info(2, 2), vh_write_info(2, 3), vh_write_info(2, 4), vh_write_info(2, 5), vh_write_info(2, 6), vh_write_info(2, 7), vh_write_info(2, 8),
-    vh_write_info(3, 0), vh_write_info(3, 1), vh_write_info(3, 2), vh_write_info(3, 3), vh_write_info(3, 4), vh_write_info(3, 5), vh_write_info(3, 6), vh_write_info(3, 7), vh_write_info(3, 8),
+    vh_write_info(0, 0),
+    vh_write_info(0, 1),
+    vh_write_info(0, 2),
+    vh_write_info(0, 3),
+    vh_write_info(0, 4),
+    vh_write_info(0, 5),
+    vh_write_info(0, 6),
+    vh_write_info(0, 7),
+    vh_write_info(0, 8),
+    vh_write_info(1, 0),
+    vh_write_info(1, 1),
+    vh_write_info(1, 2),
+    vh_write_info(1, 3),
+    vh_write_info(1, 4),
+    vh_write_info(1, 5),
+    vh_write_info(1, 6),
+    vh_write_info(1, 7),
+    vh_write_info(1, 8),
+    vh_write_info(2, 0),
+    vh_write_info(2, 1),
+    vh_write_info(2, 2),
+    vh_write_info(2, 3),
+    vh_write_info(2, 4),
+    vh_write_info(2, 5),
+    vh_write_info(2, 6),
+    vh_write_info(2, 7),
+    vh_write_info(2, 8),
+    vh_write_info(3, 0),
+    vh_write_info(3, 1),
+    vh_write_info(3, 2),
+    vh_write_info(3, 3),
+    vh_write_info(3, 4),
+    vh_write_info(3, 5),
+    vh_write_info(3, 6),
+    vh_write_info(3, 7),
+    vh_write_info(3, 8),
 ];
 
 /// One entry of [`VARHANDLE_WRITE_INFOS`]. `num_jit_args: 3` counts the
@@ -15236,11 +15314,9 @@ impl DirectNativeShadow {
     /// registration that does not run.
     pub const fn triple(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            DirectNativeShadow::ThreadCurrentThread => (
-                "java/lang/Thread",
-                "currentThread",
-                "()Ljava/lang/Thread;",
-            ),
+            DirectNativeShadow::ThreadCurrentThread => {
+                ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;")
+            }
             DirectNativeShadow::PreconditionsCheckIndex => (
                 "jdk/internal/util/Preconditions",
                 "checkIndex",
@@ -15251,11 +15327,9 @@ impl DirectNativeShadow {
                 "reachabilityFence",
                 "(Ljava/lang/Object;)V",
             ),
-            DirectNativeShadow::IntegerValueOf => (
-                "java/lang/Integer",
-                "valueOf",
-                "(I)Ljava/lang/Integer;",
-            ),
+            DirectNativeShadow::IntegerValueOf => {
+                ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")
+            }
             DirectNativeShadow::IntegerIntValue => ("java/lang/Integer", "intValue", "()I"),
             DirectNativeShadow::HashMapGet => (
                 "java/util/HashMap",
@@ -15290,9 +15364,7 @@ impl DirectNativeShadow {
     pub const fn helper_symbol(self) -> &'static str {
         match self {
             DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
-            DirectNativeShadow::PreconditionsCheckIndex => {
-                "jit_preconditions_check_index_direct"
-            }
+            DirectNativeShadow::PreconditionsCheckIndex => "jit_preconditions_check_index_direct",
             DirectNativeShadow::ReachabilityFence => "jit_reachability_fence_direct",
             DirectNativeShadow::IntegerValueOf => "jit_integer_value_of_direct",
             DirectNativeShadow::IntegerIntValue => "jit_integer_int_value_direct",
@@ -15326,9 +15398,7 @@ impl DirectNativeShadow {
             DirectNativeShadow::ReachabilityFence => {
                 jit_reachability_fence_direct as *const () as usize
             }
-            DirectNativeShadow::IntegerValueOf => {
-                jit_integer_value_of_direct as *const () as usize
-            }
+            DirectNativeShadow::IntegerValueOf => jit_integer_value_of_direct as *const () as usize,
             DirectNativeShadow::IntegerIntValue => {
                 jit_integer_int_value_direct as *const () as usize
             }
@@ -15878,7 +15948,9 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                 // Descriptor-typed write (`Long.value`, field 0, `J`) — this
                 // cold arm's allocator may pick a non-legacy layout, so keep
                 // the layout-aware store.
-                vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                vm.mem
+                    .heap
+                    .set_field_as(object, 0, Value::Long(value), b'J');
                 thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
             }
@@ -16050,11 +16122,12 @@ unsafe fn direct_receiver_facts(vm: &SharedVm, raw: usize) -> Option<(u32, i32)>
     // mark word cannot hold a hash, so the heap answer alone is the wrong key
     // for any side table the natives maintain.
     let heap = &vm.mem.heap;
-    let identity = vm.threads.monitors.java_identity_hash(
-        object,
-        heap.identity_hash_code(object),
-        || heap.next_identity_hash(),
-    );
+    let identity =
+        vm.threads
+            .monitors
+            .java_identity_hash(object, heap.identity_hash_code(object), || {
+                heap.next_identity_hash()
+            });
     if class_id != 0 {
         let slot = DIRECT_RECEIVER_MEMO_NEXT.with(|c| {
             let i = c.get();
@@ -16302,11 +16375,7 @@ static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
 ///
 /// # Safety
 /// Called only from JIT-compiled code with a live `vm_ptr`.
-pub unsafe extern "C" fn jit_md_update_byte_direct(
-    vm_ptr: i64,
-    receiver: i64,
-    value: i64,
-) -> i64 {
+pub unsafe extern "C" fn jit_md_update_byte_direct(vm_ptr: i64, receiver: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
         set_jit_pending_npe();
@@ -16338,7 +16407,8 @@ pub unsafe extern "C" fn jit_md_update_byte_direct(
         // Cast: only the low 8 bits are the Java `byte`; the operand stack
         // widened it to int.
         if !cratonvm_native_builtins::jca::message_digest::update_fastpath::append_byte(
-            key, value as u8,
+            key,
+            value as u8,
         ) {
             break 'fast;
         }
@@ -18317,7 +18387,14 @@ unsafe fn try_lambda_site_direct_call(
     }
     if let Some((mic_ptr, pic_ptr)) = ic_slots {
         install_lambda_inline_cache(
-            vm, &site, receiver_ref, receiver_class_id, &code, vm_ptr, mic_ptr, pic_ptr,
+            vm,
+            &site,
+            receiver_ref,
+            receiver_class_id,
+            &code,
+            vm_ptr,
+            mic_ptr,
+            pic_ptr,
         );
     }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
@@ -18438,11 +18515,7 @@ unsafe fn try_lambda_site_direct_call(
 /// Off unless `CRATONVM_JIT_LAMBDA_CONST_PROBE` is set, and a no-op for the
 /// overwhelming majority of sites, whose bodies are not constants. See
 /// `const_int_return_of`.
-fn screen_const_return(
-    site: &crate::runtime::interpreter::LambdaJitSite,
-    raw: i64,
-    arm: &str,
-) {
+fn screen_const_return(site: &crate::runtime::interpreter::LambdaJitSite, raw: i64, arm: &str) {
     if !crate::runtime::env_cache::jit_lambda_const_probe() {
         return;
     }
@@ -19130,14 +19203,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // The semantics are unchanged: a load that already equals `epoch_now`
     // proves the slot was populated after the most recent redefinition, which
     // is exactly what the `swap`'s `prev == epoch_now` arm concluded.
-    let redefine_jit_quiesced =
-        if mic.redefine_epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_now {
-            false
-        } else {
-            mic.redefine_epoch
-                .swap(epoch_now, std::sync::atomic::Ordering::AcqRel)
-                != epoch_now
-        };
+    let redefine_jit_quiesced = if mic
+        .redefine_epoch
+        .load(std::sync::atomic::Ordering::Acquire)
+        == epoch_now
+    {
+        false
+    } else {
+        mic.redefine_epoch
+            .swap(epoch_now, std::sync::atomic::Ordering::AcqRel)
+            != epoch_now
+    };
     if redefine_jit_quiesced {
         mic.clear_compiled_entry();
         if pic_ptr != 0 {
@@ -19190,9 +19266,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // into at all, which is a separate and much larger piece of work; this is
     // the part that can be taken off the Rust route without touching codegen.
     if cached_cid != receiver_cid && receiver_is_plain_object && !redefine_jit_quiesced {
-        if let Some(rc) = try_mic_rust_cached_entry(
-            vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
-        ) {
+        if let Some(rc) =
+            try_mic_rust_cached_entry(vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice)
+        {
             disp_census::note(disp_census::MIC_RUST_CACHE);
             return rc;
         }
@@ -19357,7 +19433,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // See `try_mic_rust_cached_entry`.
         if cacheable_receiver && globally_named && !redefine_jit_quiesced {
             if let Some(rc) = try_mic_rust_cached_entry(
-                vm, thread, info, info_ptr, receiver_cid, vm_ptr, args_slice,
+                vm,
+                thread,
+                info,
+                info_ptr,
+                receiver_cid,
+                vm_ptr,
+                args_slice,
             ) {
                 return rc;
             }
@@ -19413,14 +19495,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `MIC_COMPILE_DECLINED` — the probe below is the single most expensive
         // thing on this arm and it answered `None` on every one of 6.59 M calls
         // in the measured run.
-        let declined_key = (jit_site_key(vm.vm_identity, info_ptr as usize), receiver_cid);
-        let skip_probe = MIC_COMPILE_DECLINED.with(|m| match m.borrow_mut().get_mut(&declined_key) {
-            Some(n) => {
-                *n = n.wrapping_add(1);
-                *n % MIC_COMPILE_PROBE_RETRY != 0
-            }
-            None => false,
-        });
+        let declined_key = (
+            jit_site_key(vm.vm_identity, info_ptr as usize),
+            receiver_cid,
+        );
+        let skip_probe =
+            MIC_COMPILE_DECLINED.with(|m| match m.borrow_mut().get_mut(&declined_key) {
+                Some(n) => {
+                    *n = n.wrapping_add(1);
+                    *n % MIC_COMPILE_PROBE_RETRY != 0
+                }
+                None => false,
+            });
         if skip_probe {
             note_cached_entry_arm(&MIC_COMPILE_PROBE_MEMO_SKIPS);
         }
@@ -20479,11 +20565,15 @@ mod tests {
 
             // The application loader's copy — what the global name→id map
             // answers with, and what the old by-name dispatch would pick.
-            let app_copy = cm.try_ensure_synthetic_class(OWNER, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            let app_copy = cm
+                .try_ensure_synthetic_class(OWNER, 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // The forked loader's copy: fabricated under its own name, renamed,
             // then given that loader's identity and name registration.
-            let fork_copy = cm.try_ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            let fork_copy = cm
+                .try_ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_copy)
                 .expect("just fabricated")
@@ -20495,17 +20585,23 @@ mod tests {
             cm.register_class_name(FORK, OWNER, fork_copy);
 
             // The call SITE's class, once inside the fork and once outside it.
-            let fork_caller = cm.try_ensure_synthetic_class("cratonvm/test/ForkCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            let fork_caller = cm
+                .try_ensure_synthetic_class("cratonvm/test/ForkCaller", 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_caller)
                 .expect("just fabricated")
                 .loader_id = FORK;
             cm.register_class_name(FORK, "cratonvm/test/ForkCaller", fork_caller);
-            let app_caller = cm.try_ensure_synthetic_class("cratonvm/test/AppCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            let app_caller = cm
+                .try_ensure_synthetic_class("cratonvm/test/AppCaller", 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // A name only ONE loader ever defined — the overwhelmingly common
             // case, and the one that must stay on the old path.
-            let lonely = cm.try_ensure_synthetic_class(LONELY, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+            let lonely = cm
+                .try_ensure_synthetic_class(LONELY, 0)
+                .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             (app_copy, fork_copy, fork_caller, app_caller, lonely)
         };
@@ -20894,10 +20990,7 @@ mod tests {
         assert_eq!(peek_jit_athrow_bci(), 17);
 
         let drained = take_all_jit_signals(&mut t);
-        assert_eq!(
-            drained.exception.map(|o| o.as_ptr() as usize),
-            Some(0x4200)
-        );
+        assert_eq!(drained.exception.map(|o| o.as_ptr() as usize), Some(0x4200));
         assert_eq!(drained.athrow_bci, 17);
         assert_eq!(
             peek_jit_athrow_bci(),
@@ -21275,8 +21368,12 @@ mod tests {
             let mut m = dc.borrow_mut();
             *m.entry(key_a).or_insert(0) += 5;
         });
-        let (a, b) = DISPATCH_COUNTER
-            .with(|dc| (dc.borrow().get(&key_a).copied(), dc.borrow().get(&key_b).copied()));
+        let (a, b) = DISPATCH_COUNTER.with(|dc| {
+            (
+                dc.borrow().get(&key_a).copied(),
+                dc.borrow().get(&key_b).copied(),
+            )
+        });
         DISPATCH_COUNTER.with(|dc| dc.borrow_mut().clear());
         assert_eq!(a, Some(5));
         assert_eq!(b, None, "hotness counted in VM A must not tier up VM B");
@@ -21318,7 +21415,11 @@ mod tests {
         DISPATCH_CACHE.with(|c| {
             c.borrow_mut().insert(
                 key,
-                DispatchCache { entry: 0xdead_beef, needs_context: false, owner: None },
+                DispatchCache {
+                    entry: 0xdead_beef,
+                    needs_context: false,
+                    owner: None,
+                },
             );
         });
         DISPATCH_COUNTER.with(|c| {
@@ -21333,7 +21434,11 @@ mod tests {
         VIRTUAL_DISPATCH_CACHE.with(|c| {
             c.borrow_mut().insert(
                 vkey,
-                DispatchCache { entry: 0xfeed_face, needs_context: true, owner: None },
+                DispatchCache {
+                    entry: 0xfeed_face,
+                    needs_context: true,
+                    owner: None,
+                },
             );
         });
         VIRTUAL_DISPATCH_COUNTER.with(|c| {
@@ -21359,8 +21464,7 @@ mod tests {
                     callback: (|_ctx: &mut dyn cratonvm_native_api::NativeContext,
                                 _args: &[Value]| {
                         unreachable!("this test stores the callback, it never calls it")
-                    })
-                        as cratonvm_native_api::NativeCallback,
+                    }) as cratonvm_native_api::NativeCallback,
                     kind: ObjectNativeKind::HashMap,
                     native_id: None,
                 },
@@ -22201,13 +22305,17 @@ mod tests {
         // is what makes this helper usable for primitive fields at all, and
         // breaking it would be a far larger bug than the one being fixed.
         let as_primitive = unsafe { jit_getfield(vm_ptr, obj_ptr, 1) };
-        assert_eq!(as_primitive, 1, "a primitive load still returns its payload");
+        assert_eq!(
+            as_primitive, 1,
+            "a primitive load still returns its payload"
+        );
 
         // A caller that WILL dereference gets null.
         let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false) as i64;
         let as_reference = unsafe { jit_getfield(vm_ptr, obj_ptr, ref_arg) };
         assert_eq!(
-            as_reference, 0,
+            as_reference,
+            0,
             "a reference load returned {as_primitive}, which compiled code \
              dereferences at {:#x}",
             as_primitive + 4
@@ -22221,7 +22329,10 @@ mod tests {
         // The flag must not disturb the case it exists to protect: a real
         // reference still comes back as its own pointer, and null as 0.
         let other = vm_box.mem.heap.alloc_object(ClassId::new(0), 1);
-        vm_box.mem.heap.set_field(obj, 0, Value::Object(Some(other)));
+        vm_box
+            .mem
+            .heap
+            .set_field(obj, 0, Value::Object(Some(other)));
         let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
         assert_eq!(
             unsafe { jit_getfield(vm_ptr, obj_ptr, arg0) },
@@ -22400,9 +22511,7 @@ mod tests {
                         if i >= MAX_ITERATIONS {
                             break;
                         }
-                        if i & PROGRESS_POLL_MASK == 0
-                            && interleaved.load(Ordering::Acquire)
-                        {
+                        if i & PROGRESS_POLL_MASK == 0 && interleaved.load(Ordering::Acquire) {
                             break;
                         }
                     }
@@ -23430,9 +23539,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
             jit_dbb_put_byte_direct as *const () as usize,
             jit_dbb_get_byte_direct as *const () as usize,
         );
-        cratonvm_jit::set_md_update_byte_direct_fn(
-            jit_md_update_byte_direct as *const () as usize,
-        );
+        cratonvm_jit::set_md_update_byte_direct_fn(jit_md_update_byte_direct as *const () as usize);
         cratonvm_jit::set_reachability_fence_direct_fn(
             jit_reachability_fence_direct as *const () as usize,
         );
@@ -23446,10 +23553,9 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_varhandle_write_direct_fns(&varhandle_write_direct_fns());
     }
 
-    let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
-        vm_for_helpers
-            .and_then(|shared| shared.mem.heap.jit_card_table_info())
-            .unwrap_or((0, 0, 0));
+    let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) = vm_for_helpers
+        .and_then(|shared| shared.mem.heap.jit_card_table_info())
+        .unwrap_or((0, 0, 0));
 
     let helpers = JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
@@ -24358,10 +24464,16 @@ mod jit_native_dispatch_profile {
         // per-thread `Mutex` over a `Vec`. It runs twice per uncontended
         // `ReentrantLock.lock()`/`unlock()` pair.
         let registry = &shared.threads.thread_registry;
-        rung("ThreadRegistry::set_jmx_owned_synchronizer (acquire+release)", || {
-            registry.set_jmx_owned_synchronizer(Some(crate::threading::jvm_thread::ThreadId(0)), recv);
-            registry.set_jmx_owned_synchronizer(None, recv);
-        });
+        rung(
+            "ThreadRegistry::set_jmx_owned_synchronizer (acquire+release)",
+            || {
+                registry.set_jmx_owned_synchronizer(
+                    Some(crate::threading::jvm_thread::ThreadId(0)),
+                    recv,
+                );
+                registry.set_jmx_owned_synchronizer(None, recv);
+            },
+        );
         // The own-handle form, for the same acquire/release pair. A bare
         //  has no registered thread, so the handle is built here
         // rather than fetched — which is what the owning thread holds.
@@ -25177,12 +25289,7 @@ pub unsafe extern "C" fn jit_ffm_segment_get(
 ///
 /// # Safety
 /// Called from JIT-compiled code. `seg` is an object reference or 0.
-pub unsafe extern "C" fn jit_ffm_segment_set(
-    seg: i64,
-    index: i64,
-    kind: i64,
-    value: i64,
-) -> i64 {
+pub unsafe extern "C" fn jit_ffm_segment_set(seg: i64, index: i64, kind: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     let Some(width) = ffm_kind_width(kind) else {
         cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
@@ -25203,15 +25310,9 @@ pub unsafe extern "C" fn jit_ffm_segment_set(
     // completed a WRITE to this carrier at this epoch.
     match kind {
         FFM_KIND_BYTE => std::ptr::write_unaligned(addr as *mut u8, value as u8),
-        FFM_KIND_SHORT | FFM_KIND_CHAR => {
-            std::ptr::write_unaligned(addr as *mut u16, value as u16)
-        }
-        FFM_KIND_INT | FFM_KIND_FLOAT => {
-            std::ptr::write_unaligned(addr as *mut u32, value as u32)
-        }
-        FFM_KIND_LONG | FFM_KIND_DOUBLE => {
-            std::ptr::write_unaligned(addr as *mut i64, value)
-        }
+        FFM_KIND_SHORT | FFM_KIND_CHAR => std::ptr::write_unaligned(addr as *mut u16, value as u16),
+        FFM_KIND_INT | FFM_KIND_FLOAT => std::ptr::write_unaligned(addr as *mut u32, value as u32),
+        FFM_KIND_LONG | FFM_KIND_DOUBLE => std::ptr::write_unaligned(addr as *mut i64, value),
         _ => {
             cratonvm_native_builtins::ffm_fast::note_fast_consult(false);
             return 0;

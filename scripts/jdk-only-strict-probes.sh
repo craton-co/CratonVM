@@ -107,14 +107,15 @@
 # name that fixture in the leg's ALLOW_DEGRADED_FIXTURES with a reason in the
 # workflow comment -- do not leave the leg red.
 #
-# WHY THIS SCRIPT IN PARTICULAR. `probes/` is scheduled by nothing else:
-# `grep -c 'probes/' regression-suite/run.sh` is 0 (re-verified 2026-08-12), so
-# no SUITE= value of the regression suite runs a single probe. This script and
-# scripts/jdk-only-census.sh are the only scheduled consumers of the 449-file
-# probe corpus, and this script is the only one that runs a HotSpot control.
-# When its JNI and agent sections switch themselves off, the JNI boundary and
-# instrumentation under --jdk-only are covered by NOTHING, anywhere, and no
-# suite run at any SUITE= value would notice.
+# WHY THIS SCRIPT IN PARTICULAR. `apps/probes/` (formerly the repo-root
+# `probes/`) is scheduled by nothing else: `grep -c 'probes/'
+# regression-suite/run.sh` is 0, so no SUITE= value of the regression suite
+# runs a single probe. This script and scripts/jdk-only-census.sh are the only
+# scheduled consumers of the probe corpus, and this script is the only one
+# that runs a HotSpot control. When its JNI and agent sections switch
+# themselves off, the JNI boundary and instrumentation under --jdk-only are
+# covered by NOTHING, anywhere, and no suite run at any SUITE= value would
+# notice.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -322,16 +323,16 @@ PROBE_LIST="${PROBE_LIST:-JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlat
 
 SRCS=""
 for p in $PROBE_LIST; do
-  if [ ! -f "$ROOT/probes/$p.java" ]; then
-    echo "ERROR: probes/$p.java does not exist."
+  if [ ! -f "$ROOT/apps/probes/$p.java" ]; then
+    echo "ERROR: apps/probes/$p.java does not exist."
     exit 3
   fi
-  SRCS="$SRCS $ROOT/probes/$p.java"
+  SRCS="$SRCS $ROOT/apps/probes/$p.java"
 done
 # The agent is compiled with the probes so JdkOnlyPlatformProbe's reflective
 # lookup has something to find; it is never listed as a probe itself.
-if [ -f "$ROOT/probes/JdkOnlyProbeAgent.java" ]; then
-  SRCS="$SRCS $ROOT/probes/JdkOnlyProbeAgent.java"
+if [ -f "$ROOT/apps/probes/JdkOnlyProbeAgent.java" ]; then
+  SRCS="$SRCS $ROOT/apps/probes/JdkOnlyProbeAgent.java"
 fi
 
 echo "== compiling the strict corpus =="
@@ -369,7 +370,7 @@ if [ -f "$OUT/classes/JdkOnlyProbeAgent.class" ]; then
     DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-jar"
   fi
 else
-  # Reached when probes/JdkOnlyProbeAgent.java is absent or did not produce a
+  # Reached when apps/probes/JdkOnlyProbeAgent.java is absent or did not produce a
   # class. This path used to print NOTHING at all -- quieter even than the
   # WARNING above, and with the identical effect on coverage.
   echo "WARNING: no JdkOnlyProbeAgent.class under $OUT/classes; no agent jar was"
@@ -383,7 +384,7 @@ fi
 # per-toolchain artefact and a stale committed one would be loaded by all three
 # arms without anyone noticing it no longer matched the C.
 JNI_ARG=""
-JNI_SRC="$ROOT/probes/jdkonly_jni_probe.c"
+JNI_SRC="$ROOT/apps/probes/jdkonly_jni_probe.c"
 if [ -f "$JNI_SRC" ]; then
   case "$(uname -s 2>/dev/null || echo unknown)" in
     Darwin) JNI_LIB="$OUT/libcratonjniprobe.dylib"; JNI_OS=darwin ;;

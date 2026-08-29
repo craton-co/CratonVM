@@ -95,7 +95,9 @@ fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
 
     for &(name, descriptor) in shadowing {
         assert!(
-            registry.find("java/lang/String", name, descriptor).is_none(),
+            registry
+                .find("java/lang/String", name, descriptor)
+                .is_none(),
             "java/lang/String.{name}{descriptor} is registered in a real-JDK registry again. \
              The JDK 25 image declares it with a `Code` attribute, so a registered `Bridge` in \
              front of it is contract §1.4's `NativeShadowsBytecode` — and, measured against \
@@ -223,7 +225,6 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
     }
 }
 
-
 /// The EXACT set of `java/lang/String` registrations that survive into a
 /// real-JDK registry -- two-sided, so the set cannot drift in either direction
 /// without somebody adjudicating the change.
@@ -319,7 +320,6 @@ Intrinsic replaceFirst(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;\n
 Intrinsic transform(Ljava/util/function/Function;)Ljava/lang/Object;\n\
 Intrinsic valueOf(I)Ljava/lang/String;\n\
 Intrinsic valueOf(Ljava/lang/Object;)Ljava/lang/String;";
-
 
 /// The surviving JIT `StringLatin1.toLowerCase` direct bind is legal only
 /// because that triple is a registered `NativeKind::Intrinsic`. Pin it.

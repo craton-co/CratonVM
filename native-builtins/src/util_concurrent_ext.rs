@@ -1089,10 +1089,7 @@ pub(crate) fn try_alloc_concurrent_synthetic(
 /// W7-59-layout-detector-coverage.md §2.1 already counted fifteen copies of.
 /// Kept as a name because this crate's call sites read better with it and
 /// because deleting it would churn them for nothing.
-pub(crate) fn appended_slot_base_for_class(
-    ctx: &mut dyn NativeContext,
-    class_name: &str,
-) -> usize {
+pub(crate) fn appended_slot_base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
     cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
 }
 
@@ -3501,8 +3498,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 // 2-field layout, matching phase 60 / SubmissionPublisher.subscribe:
                 // 0 = cancelled flag, 1 = accumulated demand (Long). The second
                 // slot is what makes `request(n)` above observable.
-                let sub =
-                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
+                let sub = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/concurrent/Flow$Subscription",
+                    2,
+                )?;
                 ctx.set_field(sub, 0, Value::Int(0)); // cancelled flag
                 ctx.set_field(sub, 1, Value::Long(0)); // demand
                 let _ = ctx.invoke_virtual(
@@ -5932,7 +5932,10 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // view obtained before a GC must unlock against the SAME slot afterwards;
     // `parent.as_ptr()` shifts under a moving collector and the lock/unlock
     // pair would diverge, deadlocking the lock or corrupting a neighbour slot.
-    fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<usize>, MethodCallFailed> {
+    fn rwl_parent_addr(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+    ) -> Result<Option<usize>, MethodCallFailed> {
         match ctx.get_field(this, 0) {
             Value::Object(Some(parent)) => Ok(Some(gc_stable_lock_key(ctx, parent)?)),
             _ => Ok(None),
@@ -6278,7 +6281,10 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
 // Pattern-A fix (bug nb-lib-gckeys §1): key the StampedLock state table by a
 // GC-stable identity (see `gc_stable_lock_key`) instead of the raw, moving
 // heap address that the lock/unlock pair could disagree on across a GC.
-fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<usize>, MethodCallFailed> {
+fn stamped_addr(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<usize>, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(o))) => Ok(Some(gc_stable_lock_key(ctx, *o)?)),
         _ => Ok(None),
@@ -6292,7 +6298,10 @@ fn stamped_obj(args: &[Value]) -> Option<ObjectRef> {
     }
 }
 
-fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<usize, MethodCallFailed> {
+fn stamped_addr_for_obj(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<usize, MethodCallFailed> {
     Ok(gc_stable_lock_key(ctx, obj)?)
 }
 
@@ -6710,7 +6719,9 @@ fn native_stamped_try_convert_to_optimistic(
     let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
-        eprintln!("[SL-DBG] tryConvertToOptimisticRead addr={addr:#x} stamp={stamp} -> {converted}");
+        eprintln!(
+            "[SL-DBG] tryConvertToOptimisticRead addr={addr:#x} stamp={stamp} -> {converted}"
+        );
     }
     Ok(Some(Value::Long(converted)))
 }
@@ -7617,12 +7628,15 @@ pub(crate) fn native_sync_collection_add(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[elem],
+        |ctx, this, a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &a[..1]),
             None => Ok(Some(Value::Int(0))),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_collection_contains(
@@ -7631,12 +7645,15 @@ pub(crate) fn native_sync_collection_contains(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[elem],
+        |ctx, this, a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "contains", "(Ljava/lang/Object;)Z", &a[..1]),
             None => Ok(Some(Value::Int(0))),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_collection_remove(
@@ -7645,12 +7662,15 @@ pub(crate) fn native_sync_collection_remove(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    with_sync_mutex(ctx, this, &[elem], |ctx, this, a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[elem],
+        |ctx, this, a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "remove", "(Ljava/lang/Object;)Z", &a[..1]),
             None => Ok(Some(Value::Int(0))),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_collection_size(
@@ -7658,12 +7678,15 @@ pub(crate) fn native_sync_collection_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[],
+        |ctx, this, _a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "size", "()I", &[]),
             None => Ok(Some(Value::Int(0))),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_collection_is_empty(
@@ -7671,12 +7694,15 @@ pub(crate) fn native_sync_collection_is_empty(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[],
+        |ctx, this, _a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "isEmpty", "()Z", &[]),
             None => Ok(Some(Value::Int(1))),
-        }
-    })
+        },
+    )
 }
 
 /// NOT synchronized, deliberately: `SynchronizedCollection.iterator()` is the
@@ -7700,15 +7726,18 @@ pub(crate) fn native_sync_collection_to_array(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    with_sync_mutex(ctx, this, &[], |ctx, this, _a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[],
+        |ctx, this, _a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, "toArray", "()[Ljava/lang/Object;", &[]),
             None => {
                 let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 Ok(Some(Value::Object(Some(empty))))
             }
-        }
-    })
+        },
+    )
 }
 
 /// Forward one `Collections$Synchronized{Collection,Set}` method to the wrapped
@@ -7768,12 +7797,15 @@ pub(crate) fn sync_collection_delegate(
         };
     }
     let rest: Vec<Value> = args[1..].to_vec();
-    with_sync_mutex(ctx, this, &rest, |ctx, this, a| {
-        match sync_collection_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &rest,
+        |ctx, this, a| match sync_collection_backing(ctx, this) {
             Some(c) => ctx.invoke_virtual(c, method, descriptor, a),
             None => Ok(fallback),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_map_init(
@@ -7809,8 +7841,11 @@ pub(crate) fn native_sync_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -
     let this = obj_arg(args, 0)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    with_sync_mutex(ctx, this, &[key, value], |ctx, this, a| {
-        match sync_map_backing(ctx, this) {
+    with_sync_mutex(
+        ctx,
+        this,
+        &[key, value],
+        |ctx, this, a| match sync_map_backing(ctx, this) {
             Some(m) => ctx.invoke_virtual(
                 m,
                 "put",
@@ -7818,8 +7853,8 @@ pub(crate) fn native_sync_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -
                 &a[..2],
             ),
             None => Ok(Some(Value::Object(None))),
-        }
-    })
+        },
+    )
 }
 
 pub(crate) fn native_sync_map_contains_key(
@@ -7844,9 +7879,12 @@ pub(crate) fn native_sync_map_remove(
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     with_sync_mutex(ctx, this, &[key], |ctx, this, a| {
         match sync_map_backing(ctx, this) {
-            Some(m) => {
-                ctx.invoke_virtual(m, "remove", "(Ljava/lang/Object;)Ljava/lang/Object;", &a[..1])
-            }
+            Some(m) => ctx.invoke_virtual(
+                m,
+                "remove",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &a[..1],
+            ),
             None => Ok(Some(Value::Object(None))),
         }
     })
@@ -8610,7 +8648,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock: hold count should become 1
@@ -8629,7 +8668,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         let result = native_rl_try_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8642,7 +8682,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock twice -- should increment hold count to 2
@@ -8668,7 +8709,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8686,7 +8728,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8712,7 +8755,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8741,7 +8785,9 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_to_zero_triggers_notify() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
+        let cdl =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)
+                .unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(2)]).unwrap();
 
         assert_eq!(cdl_count(&mut ctx, cdl), 2);
@@ -8757,7 +8803,9 @@ mod concurrency_tests {
     #[test]
     fn cdl_await_returns_when_count_is_zero() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
+        let cdl =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)
+                .unwrap();
         // Init with count=0 means await should return immediately
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(0)]).unwrap();
 
@@ -8769,7 +8817,9 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_below_zero_stays_at_zero() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
+        let cdl =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)
+                .unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(1)]).unwrap();
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
@@ -8787,7 +8837,8 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_decrements_permits() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
+        let sem =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         assert_eq!(sem_permits(&mut ctx, sem), 3);
@@ -8799,7 +8850,8 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
+        let sem =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
@@ -8809,7 +8861,8 @@ mod concurrency_tests {
     #[test]
     fn sem_release_increments_and_notifies() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
+        let sem =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(1)]).unwrap();
 
         // Release adds a permit (calls monitor_notify internally)
@@ -8820,7 +8873,8 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_no_permits_returns_zero() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
+        let sem =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(0)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8831,7 +8885,8 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_permits_succeeds() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
+        let sem =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(5)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8991,7 +9046,10 @@ mod concurrency_tests {
         // Real JDK layout: a write stamp's mode field is WBIT (128). It used
         // to be bit 0, which made `StampedLock.isWriteLockStamp` — real JDK
         // bytecode, since nothing registers it — call this a READ stamp.
-        assert!(matches!(stamp, Value::Long(v) if v & 255 == 128), "got {stamp:?}");
+        assert!(
+            matches!(stamp, Value::Long(v) if v & 255 == 128),
+            "got {stamp:?}"
+        );
         // `unlockWrite` now CHECKS its stamp, so it must be the real one.
         native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
 
@@ -9492,7 +9550,11 @@ mod concurrency_tests {
             Value::Long(v) => {
                 assert!(v != 0, "conversion to read should succeed");
                 // Downgrade leaves exactly one reader, so `& ABITS == 1`.
-                assert_eq!(v & 255, 1, "converted read stamp must be a read stamp, got {v}");
+                assert_eq!(
+                    v & 255,
+                    1,
+                    "converted read stamp must be a read stamp, got {v}"
+                );
             }
             _ => panic!("expected Long"),
         }
@@ -9515,7 +9577,8 @@ mod concurrency_tests {
         // Verify that ReentrantLock lock/unlock cycle works with monitor-based contention
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9534,7 +9597,8 @@ mod concurrency_tests {
         // In single-threaded mock, monitor_wait returns immediately → not timed out
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9561,7 +9625,8 @@ mod concurrency_tests {
     fn m18_cond_await_nanos_returns_remaining() {
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9594,8 +9659,12 @@ mod concurrency_tests {
     fn m18_cowal_iterator_snapshot_isolation() {
         // CopyOnWriteArrayList iterator should see a snapshot, not live data
         let mut ctx = make_ctx();
-        let cowal =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2).unwrap();
+        let cowal = try_alloc_concurrent_synthetic(
+            &mut ctx,
+            "java/util/concurrent/CopyOnWriteArrayList",
+            2,
+        )
+        .unwrap();
         cratonvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))])
             .unwrap();
 
@@ -9685,7 +9754,11 @@ mod concurrency_tests {
                 _ => panic!("expected Long"),
             };
             assert!(cur > prev_stamp, "stamp should monotonically increase");
-            assert_eq!(cur & 255, 0, "stamp must be optimistic after unlock, got {cur}");
+            assert_eq!(
+                cur & 255,
+                0,
+                "stamp must be optimistic after unlock, got {cur}"
+            );
             prev_stamp = cur;
         }
     }
@@ -9940,7 +10013,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9976,7 +10050,8 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)
+                .unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -10014,7 +10089,9 @@ mod concurrency_tests {
     #[test]
     fn rd8_completable_future_exceptional_passthrough() {
         let mut ctx = make_ctx();
-        let cf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4).unwrap();
+        let cf =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4)
+                .unwrap();
         let err_msg = ctx.create_string("boom");
         ctx.set_field(cf, FUT_FIELD_RESULT, Value::Object(Some(err_msg)));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(2));
@@ -10155,7 +10232,6 @@ mod concurrency_tests {
     }
 }
 
-
 /// The legacy synthetic `ReentrantLock` / `Lock` / `Condition` / `Semaphore`
 /// natives, split out of [`register_concurrent_natives`] so they have a name.
 ///
@@ -10173,135 +10249,130 @@ mod concurrency_tests {
 /// test registry can now opt in the same way `CRATONVM_SYNTHETIC_AQS=1` does
 /// at runtime.
 pub fn register_synthetic_aqs_natives(registry: &mut NativeMethodRegistry) {
-        // --- ReentrantLock ---
-        let rl = "java/util/concurrent/locks/ReentrantLock";
-        registry.register(rl, "<init>", "()V", native_rl_init);
-        registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
-        registry.register(rl, "lock", "()V", native_rl_lock);
-        registry.register(rl, "lockInterruptibly", "()V", native_rl_lock); // simplified
-        registry.register(rl, "unlock", "()V", native_rl_unlock);
-        registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            rl,
-            "tryLock",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_rl_try_lock_timeout,
-        );
-        registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
-        registry.register(
-            rl,
-            "isHeldByCurrentThread",
-            "()Z",
-            native_rl_is_held_by_current_thread,
-        );
-        registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
-        registry.register(rl, "isFair", "()Z", native_rl_is_fair);
-        registry.register(
-            rl,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
-        registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
+    // --- ReentrantLock ---
+    let rl = "java/util/concurrent/locks/ReentrantLock";
+    registry.register(rl, "<init>", "()V", native_rl_init);
+    registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
+    registry.register(rl, "lock", "()V", native_rl_lock);
+    registry.register(rl, "lockInterruptibly", "()V", native_rl_lock); // simplified
+    registry.register(rl, "unlock", "()V", native_rl_unlock);
+    registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
+    registry.register(
+        rl,
+        "tryLock",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_rl_try_lock_timeout,
+    );
+    registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
+    registry.register(
+        rl,
+        "isHeldByCurrentThread",
+        "()Z",
+        native_rl_is_held_by_current_thread,
+    );
+    registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
+    registry.register(rl, "isFair", "()Z", native_rl_is_fair);
+    registry.register(
+        rl,
+        "newCondition",
+        "()Ljava/util/concurrent/locks/Condition;",
+        native_rl_new_condition,
+    );
+    registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
 
-        // Also register under Lock interface
-        let lock = "java/util/concurrent/locks/Lock";
-        registry.register(lock, "lock", "()V", native_rl_lock);
-        registry.register(lock, "unlock", "()V", native_rl_unlock);
-        registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            lock,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
+    // Also register under Lock interface
+    let lock = "java/util/concurrent/locks/Lock";
+    registry.register(lock, "lock", "()V", native_rl_lock);
+    registry.register(lock, "unlock", "()V", native_rl_unlock);
+    registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
+    registry.register(
+        lock,
+        "newCondition",
+        "()Ljava/util/concurrent/locks/Condition;",
+        native_rl_new_condition,
+    );
 
-        // --- Condition ---
-        let cond = "java/util/concurrent/locks/Condition";
-        registry.register(cond, "await", "()V", native_cond_await);
-        registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
-        registry.register(
-            cond,
-            "await",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_cond_await_timeout,
-        );
-        registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
-        registry.register(
-            cond,
-            "awaitUntil",
-            "(Ljava/util/Date;)Z",
-            native_cond_await_until,
-        );
-        registry.register(cond, "signal", "()V", native_cond_signal);
-        registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+    // --- Condition ---
+    let cond = "java/util/concurrent/locks/Condition";
+    registry.register(cond, "await", "()V", native_cond_await);
+    registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
+    registry.register(
+        cond,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_cond_await_timeout,
+    );
+    registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
+    registry.register(
+        cond,
+        "awaitUntil",
+        "(Ljava/util/Date;)Z",
+        native_cond_await_until,
+    );
+    registry.register(cond, "signal", "()V", native_cond_signal);
+    registry.register(cond, "signalAll", "()V", native_cond_signal_all);
 
-        let sem = "java/util/concurrent/Semaphore";
-        registry.register(sem, "<init>", "(I)V", native_sem_init);
-        registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
-        registry.register(sem, "acquire", "()V", native_sem_acquire);
-        registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
-        registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
-        // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
-        // once; retain this synthetic-mode overload.
-        registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
-        registry.register(sem, "release", "()V", native_sem_release);
-        registry.register(sem, "release", "(I)V", native_sem_release_n);
-        registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
-        registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-        registry.register(
-            sem,
-            "tryAcquire",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_sem_try_acquire_timeout,
-        );
-        registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
-        registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
-        registry.register(sem, "isFair", "()Z", native_sem_is_fair);
-        registry.register(
-            sem,
-            "toString",
-            "()Ljava/lang/String;",
-            native_sem_to_string,
-        );
+    let sem = "java/util/concurrent/Semaphore";
+    registry.register(sem, "<init>", "(I)V", native_sem_init);
+    registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
+    registry.register(sem, "acquire", "()V", native_sem_acquire);
+    registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
+    registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
+    // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
+    // once; retain this synthetic-mode overload.
+    registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
+    registry.register(sem, "release", "()V", native_sem_release);
+    registry.register(sem, "release", "(I)V", native_sem_release_n);
+    registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
+    registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+    registry.register(
+        sem,
+        "tryAcquire",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        native_sem_try_acquire_timeout,
+    );
+    registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
+    registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
+    registry.register(sem, "isFair", "()Z", native_sem_is_fair);
+    registry.register(
+        sem,
+        "toString",
+        "()Ljava/lang/String;",
+        native_sem_to_string,
+    );
 
-        // --- ReentrantReadWriteLock ---
-        //
-        // Never had natives at all: `ClassManager` declares the layout
-        // (`ReentrantReadWriteLock` = 3 fields, `$ReadLock`/`$WriteLock` = 1)
-        // but nothing implemented it, so synthetic mode answered
-        // `NoSuchMethodError: ReentrantReadWriteLock.readLock()` — the last of
-        // the `JucComplete` lock failures.
-        let rwl = RWL_CLASS;
-        registry.register(rwl, "<init>", "()V", native_rwl_init);
-        registry.register(rwl, "<init>", "(Z)V", native_rwl_init_fair);
-        registry.register(
-            rwl,
-            "readLock",
-            "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;",
-            native_rwl_read_lock,
-        );
-        registry.register(
-            rwl,
-            "writeLock",
-            "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;",
-            native_rwl_write_lock,
-        );
-        registry.register(rwl, "isFair", "()Z", native_rwl_is_fair);
-        registry.register(rwl, "getReadLockCount", "()I", native_rwl_read_count);
-        registry.register(
-            rwl,
-            "isWriteLocked",
-            "()Z",
-            native_rwl_is_write_locked,
-        );
-        registry.register(rwl, "getWriteHoldCount", "()I", native_rwl_write_hold_count);
-        for view in [RWL_READ_VIEW, RWL_WRITE_VIEW] {
-            registry.register(view, "lock", "()V", native_rwl_view_lock);
-            registry.register(view, "lockInterruptibly", "()V", native_rwl_view_lock);
-            registry.register(view, "unlock", "()V", native_rwl_view_unlock);
-            registry.register(view, "tryLock", "()Z", native_rwl_view_try_lock);
-        }
+    // --- ReentrantReadWriteLock ---
+    //
+    // Never had natives at all: `ClassManager` declares the layout
+    // (`ReentrantReadWriteLock` = 3 fields, `$ReadLock`/`$WriteLock` = 1)
+    // but nothing implemented it, so synthetic mode answered
+    // `NoSuchMethodError: ReentrantReadWriteLock.readLock()` — the last of
+    // the `JucComplete` lock failures.
+    let rwl = RWL_CLASS;
+    registry.register(rwl, "<init>", "()V", native_rwl_init);
+    registry.register(rwl, "<init>", "(Z)V", native_rwl_init_fair);
+    registry.register(
+        rwl,
+        "readLock",
+        "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;",
+        native_rwl_read_lock,
+    );
+    registry.register(
+        rwl,
+        "writeLock",
+        "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;",
+        native_rwl_write_lock,
+    );
+    registry.register(rwl, "isFair", "()Z", native_rwl_is_fair);
+    registry.register(rwl, "getReadLockCount", "()I", native_rwl_read_count);
+    registry.register(rwl, "isWriteLocked", "()Z", native_rwl_is_write_locked);
+    registry.register(rwl, "getWriteHoldCount", "()I", native_rwl_write_hold_count);
+    for view in [RWL_READ_VIEW, RWL_WRITE_VIEW] {
+        registry.register(view, "lock", "()V", native_rwl_view_lock);
+        registry.register(view, "lockInterruptibly", "()V", native_rwl_view_lock);
+        registry.register(view, "unlock", "()V", native_rwl_view_unlock);
+        registry.register(view, "tryLock", "()Z", native_rwl_view_try_lock);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10360,9 +10431,7 @@ pub fn forget_vm_rwl_state(vm_identity: usize) {
 }
 
 fn rwl_with<R>(key: RlKey, f: impl FnOnce(&mut RwlState) -> R) -> R {
-    let mut table = rwl_state_table()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut table = rwl_state_table().lock().unwrap_or_else(|e| e.into_inner());
     f(table.entry(key).or_default())
 }
 
@@ -10383,11 +10452,7 @@ fn native_rwl_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     rwl_init_common(ctx, args, fair)
 }
 
-fn rwl_init_common(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    fair: bool,
-) -> MethodCallResult {
+fn rwl_init_common(ctx: &mut dyn NativeContext, args: &[Value], fair: bool) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -10494,10 +10559,7 @@ fn native_rwl_write_hold_count(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 /// Resolve a `$ReadLock`/`$WriteLock` view to `(owner, is_write)`.
-fn rwl_view_target(
-    ctx: &mut dyn NativeContext,
-    view: ObjectRef,
-) -> Option<(ObjectRef, bool)> {
+fn rwl_view_target(ctx: &mut dyn NativeContext, view: ObjectRef) -> Option<(ObjectRef, bool)> {
     let owner = match ctx.get_field(view, RWL_VIEW_FIELD_OWNER) {
         Value::Object(Some(o)) => o,
         _ => return None,

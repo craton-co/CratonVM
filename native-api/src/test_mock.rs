@@ -59,9 +59,9 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::ffi::UpcallEntry;
 use crate::registry::{
-    AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess,
-    NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
-    StackTraceEntry,
+    AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeClassAccess,
+    NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess,
+    NativeSystemAccess, NativeThreadAccess, StackTraceEntry,
 };
 
 /// Composite key for the field store.
@@ -294,7 +294,6 @@ fn shared_fd_table() -> &'static crate::fd_table::FileDescriptorTable {
 }
 
 impl NativeClassAccess for MockNativeContext {
-
     // --------------------------------------------------------------
     // Class loading + invocation — no real loader, all stubs.
     // --------------------------------------------------------------
@@ -462,7 +461,6 @@ impl NativeClassAccess for MockNativeContext {
 }
 
 impl NativeInvokeAccess for MockNativeContext {
-
     fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
         Ok(None)
     }
@@ -490,7 +488,6 @@ impl NativeInvokeAccess for MockNativeContext {
 }
 
 impl NativeHeapAccess for MockNativeContext {
-
     fn new_object(&mut self, _c: &str) -> MethodCallResult {
         Ok(Some(Value::Object(Some(self.fresh_object_ref()))))
     }
@@ -666,8 +663,7 @@ impl NativeHeapAccess for MockNativeContext {
         // witness needs the receiver's `ClassId` to be its own, not a constant.
         let obj = self.fresh_object_ref();
         // SAFETY: single-threaded test code.
-        unsafe { &mut *self.object_classes.get() }
-            .insert(obj.as_ptr() as usize, (c, num_fields));
+        unsafe { &mut *self.object_classes.get() }.insert(obj.as_ptr() as usize, (c, num_fields));
         obj
     }
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -714,8 +710,6 @@ impl NativeHeapAccess for MockNativeContext {
 }
 
 impl NativeThreadAccess for MockNativeContext {
-
-
     // --------------------------------------------------------------
     // Threading — single-threaded stubs.
     // --------------------------------------------------------------
@@ -775,8 +769,6 @@ impl NativeThreadAccess for MockNativeContext {
 }
 
 impl NativeExceptionAccess for MockNativeContext {
-
-
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
@@ -788,8 +780,6 @@ impl NativeExceptionAccess for MockNativeContext {
 impl NativeGpuAccess for MockNativeContext {}
 
 impl NativeSystemAccess for MockNativeContext {
-
-
     fn record_printed_value(&mut self, _v: Value) {}
     fn record_printed_line(&mut self, _t: String) {}
     fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
@@ -837,9 +827,6 @@ impl NativeSystemAccess for MockNativeContext {
         None
     }
 }
-
-
-
 
 // `Send` is auto-derived (every field is `Send`). We deliberately do NOT
 // implement `Sync` — the `UnsafeCell` interiors would race under any real

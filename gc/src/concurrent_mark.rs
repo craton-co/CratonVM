@@ -26,8 +26,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_COMPACT, GC_FLAG_MARKED,
-    ARRAY_DATA_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -425,8 +425,7 @@ pub struct ConcurrentMarker {
 /// was reclaimed or relocated between remark and the sweep. Non-zero means the
 /// two old-gen collectors are interleaving; the cycle reclaimed nothing, which
 /// is the safe half of that race.
-pub static SWEEP_EPOCH_ABORTS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static SWEEP_EPOCH_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ConcurrentMarker {
     /// Create a new concurrent marker for a heap region with PRIVATE SATB
@@ -867,7 +866,8 @@ impl ConcurrentMarker {
                 // Reference array: compact 8-byte pointer per element.
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
-                    let slot_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
+                    let slot_ptr =
+                        unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     // SAFETY: slot_ptr points to a valid 8-byte reference element in the array.
                     let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                     if raw != 0 {
@@ -1008,8 +1008,12 @@ impl ConcurrentMarker {
                 // G1/ZGC-only path, which is where the JSON/XML SIGSEGV pattern
                 // lives. Corrupt cells decode to `Value::Object(None)`, which this
                 // loop skips, and are counted by the cell census.
-                let value =
-                    unsafe { crate::heap::read_value_cell_checked(slot_ptr as *const Value, "concurrent_mark::scan_object") };
+                let value = unsafe {
+                    crate::heap::read_value_cell_checked(
+                        slot_ptr as *const Value,
+                        "concurrent_mark::scan_object",
+                    )
+                };
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
@@ -1102,9 +1106,7 @@ impl ConcurrentMarkHeaderSnapshot {
                 // this snapshots possibly-corrupt memory, and an
                 // out-of-range discriminant must survive to be rejected
                 // rather than being UB at the point of the read.
-                kind_tag: ObjectHeader::kind_tag(
-                    (*header).mark_word.load(Ordering::Relaxed),
-                ),
+                kind_tag: ObjectHeader::kind_tag((*header).mark_word.load(Ordering::Relaxed)),
                 element_tag: ObjectHeader::element_type_tag(
                     (*header).mark_word.load(Ordering::Relaxed),
                 ),

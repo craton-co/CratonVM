@@ -45,7 +45,9 @@ pub fn enabled() -> bool {
 #[inline]
 pub fn native_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ECWATCH_NATIVE").is_some())
+    *E.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ECWATCH_NATIVE").is_some()
+    })
 }
 
 /// table of `(holder, field_idx, expected_pointer, holder_class_id)`. The
@@ -109,8 +111,7 @@ fn slot_addr(holder: ObjectRef, idx: u32) -> usize {
 
     let header = unsafe { &*(holder.as_ptr() as *const ObjectHeader) };
     if is_compact_object(header) {
-        if let Some(layout) =
-            class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
+        if let Some(layout) = class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
         {
             if let Some(offset) = layout.field_offset(idx as usize) {
                 return header_base(holder) + offset as usize;
@@ -166,8 +167,8 @@ pub fn detect(vm: usize) -> Vec<(usize, u32, usize, usize)> {
                 header.class_id.as_u32(),
                 header.num_slots(),
             )
-                .and_then(|layout| layout.field_is_ref(idx as usize))
-                .unwrap_or(false);
+            .and_then(|layout| layout.field_is_ref(idx as usize))
+            .unwrap_or(false);
 
         if is_compact_slot {
             let now = unsafe { std::ptr::read(slot_ptr as *const usize) };

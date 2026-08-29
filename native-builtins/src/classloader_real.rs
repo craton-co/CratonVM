@@ -127,7 +127,10 @@ static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// blocked the cglib probe (a `ClassLoader` subclass calling
 /// `defineClass`). Build the same non-null `defaultDomain` shape here
 /// so the real JDK `defineClass` bytecode path runs cleanly.
-fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+fn init_classloader_common_fields(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     // GC-safety: every `alloc_concurrent_synthetic`/`new_object`/`invoke` call
     // below can trigger a moving GC; `this` (and, briefly, `cs`) are each
     // reused repeatedly across multiple such hazards, unpinned otherwise.
@@ -162,17 +165,20 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
 
     // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
     // `getfield packages → values()` and would NPE on null.
-    let packages = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+    let packages =
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
 
     // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
-    let pkg2certs = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+    let pkg2certs =
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
 
     // `parallelLockMap` — used by `getClassLoadingLock`.
-    let lock_map = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
+    let lock_map =
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
 
@@ -928,7 +934,9 @@ fn cl_real_load_class(
                 1,
                 &name,
             );
-            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc?,
+            ));
         }
     }
 
@@ -1143,7 +1151,12 @@ pub(crate) fn no_class_def_found_error(
 /// delegation answer with a synthetic stub again, as it did before 2026-07-27.
 fn stub_may_answer_load_class() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_CL_STUB_DELEGATION")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// W7-26 R1 — narrow a loader-ladder swallow to the shape the JDK's own

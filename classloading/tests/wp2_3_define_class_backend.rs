@@ -743,7 +743,10 @@ fn defining_real_bytecode_upgrades_existing_enterprise_stub_in_place() {
     let stub_id = cm.load_class(name).expect("stub fallback must succeed");
     {
         let stub = cm.class_store.get(stub_id).expect("stub registered");
-        assert!(stub.origin.is_compatibility_stub(), "must be fabricated as a stub");
+        assert!(
+            stub.origin.is_compatibility_stub(),
+            "must be fabricated as a stub"
+        );
         assert!(
             stub.methods.is_empty(),
             "synthetic stub must have no real methods"

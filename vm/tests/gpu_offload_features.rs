@@ -433,10 +433,10 @@ fn release_submission_on_unknown_handle_is_a_safe_no_op() {
     );
     release_submission(u64::MAX);
     release_submission(u64::MAX); // idempotent
-    // The assertion this test was missing. Two bare calls could only fail by
-    // panicking; "safe no-op" also means the release must not LEAVE anything
-    // behind — a release path that inserted a tombstone, or that mutated the
-    // table under an unknown key, would pass the old body and fail here.
+                                  // The assertion this test was missing. Two bare calls could only fail by
+                                  // panicking; "safe no-op" also means the release must not LEAVE anything
+                                  // behind — a release path that inserted a tombstone, or that mutated the
+                                  // table under an unknown key, would pass the old body and fail here.
     assert!(
         lookup_submission(u64::MAX).is_none(),
         "releasing an unknown handle must leave the submission table unchanged"

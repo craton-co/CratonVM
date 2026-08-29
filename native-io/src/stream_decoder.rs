@@ -1006,9 +1006,12 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn utf8_complete_prefix_ascii() {
@@ -1168,11 +1171,7 @@ mod tests {
 
     /// Build a StreamDecoder-shaped mock object over `bytes`, with a fresh
     /// `sd_table` entry for `charset`.
-    fn decoder_over(
-        ctx: &mut MockNativeContext,
-        bytes: &[u8],
-        charset: &str,
-    ) -> ObjectRef {
+    fn decoder_over(ctx: &mut MockNativeContext, bytes: &[u8], charset: &str) -> ObjectRef {
         let is = ctx.alloc_object(1);
         let this = ctx.alloc_object(4);
         ctx.set_field_by_name(this, "in", Value::Object(Some(is)));
@@ -1198,9 +1197,7 @@ mod tests {
         for _ in 0..64 {
             match native_sd_read(ctx, &[Value::Object(Some(this))]) {
                 Ok(Some(Value::Int(-1))) => break,
-                Ok(Some(Value::Int(c))) => {
-                    out.push(char::from_u32(c as u32).unwrap_or('\u{fffd}'))
-                }
+                Ok(Some(Value::Int(c))) => out.push(char::from_u32(c as u32).unwrap_or('\u{fffd}')),
                 _ => break,
             }
         }

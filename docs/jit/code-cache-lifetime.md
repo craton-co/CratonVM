@@ -246,8 +246,7 @@ after the body was unmapped. Because `lookup_jit_method_name` returned the
 *first* covering range, a crash inside a **new** body at a recycled address was
 reported under the **dead** body's name. A crash report that names the wrong
 method is worse than one that names none, because it is believed; that is
-precisely the failure this registry exists to prevent, and precisely the class
-of mistake `jit-wild-jump-page-aligned-pc-20260728` cost a session to.
+precisely the failure this registry exists to prevent.
 
 Fixed on both axes: `unregister_jit_method_name` is called from
 `CompiledMethod::drop`, and both lookups now search from the end so the newest

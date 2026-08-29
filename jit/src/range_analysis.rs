@@ -304,8 +304,16 @@ impl Range {
             None => return self,
             Some(v) => v,
         };
-        let lo = if bl < al { self.width.min() } else { al.min(bl) };
-        let hi = if bh > ah { self.width.max() } else { ah.max(bh) };
+        let lo = if bl < al {
+            self.width.min()
+        } else {
+            al.min(bl)
+        };
+        let hi = if bh > ah {
+            self.width.max()
+        } else {
+            ah.max(bh)
+        };
         Range::exact(self.width, lo, hi)
     }
 
@@ -966,7 +974,10 @@ mod tests {
         let ok = r(0, i32::MAX as i64 - 1).add_no_wrap(Range::constant(W, 1));
         assert_eq!(ok, Some(r(1, i32::MAX as i64)));
         // [0, MAX] + 1 is not.
-        assert_eq!(r(0, i32::MAX as i64).add_no_wrap(Range::constant(W, 1)), None);
+        assert_eq!(
+            r(0, i32::MAX as i64).add_no_wrap(Range::constant(W, 1)),
+            None
+        );
         assert!(r(0, i32::MAX as i64).add(Range::constant(W, 1)).is_top());
     }
 

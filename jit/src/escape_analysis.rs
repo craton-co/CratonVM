@@ -1826,10 +1826,7 @@ fn find_scalar_replacements(
                     // disagree. Refuse either way — see
                     // `find_identity_observations` for the two-phase story that
                     // makes a synchronized object replaceable.
-                    Op::MonitorEnter
-                    | Op::MonitorExit
-                    | Op::MonitorWait
-                    | Op::MonitorNotify => {
+                    Op::MonitorEnter | Op::MonitorExit | Op::MonitorWait | Op::MonitorNotify => {
                         refusal = Some(ScalarRefusal::MonitorOperation);
                         can_replace = false;
                         break;
@@ -2429,12 +2426,9 @@ fn unattributable_monitors(graph: &Graph) -> Vec<NodeId> {
     live_monitor_nodes(graph)
         .into_iter()
         .filter(|&m| {
-            graph.nodes[m]
-                .inputs
-                .first()
-                .map_or(true, |&operand| {
-                    ref_operand_origin(graph, operand) == OperandOrigin::Unknown
-                })
+            graph.nodes[m].inputs.first().map_or(true, |&operand| {
+                ref_operand_origin(graph, operand) == OperandOrigin::Unknown
+            })
         })
         .collect()
 }
@@ -3706,7 +3700,13 @@ mod tests {
     #[test]
     fn test_array_returned_global_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 10, length: None }, vec![]);
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 10,
+                length: None,
+            },
+            vec![],
+        );
         g.nodes[1].inputs.push(arr);
         g.nodes[arr].uses.push(1);
         let result = analyze_escapes(&g);
@@ -3719,7 +3719,13 @@ mod tests {
     #[test]
     fn test_array_local_no_escape() {
         let mut g = Graph::new();
-        let arr = g.add_node(Op::NewArray { element_type: 5, length: None }, vec![]);
+        let arr = g.add_node(
+            Op::NewArray {
+                element_type: 5,
+                length: None,
+            },
+            vec![],
+        );
         let _len = g.add_node(Op::ArrayLength, vec![arr]);
         let result = analyze_escapes(&g);
         assert_eq!(result.escape_states.get(&arr), Some(&EscapeState::NoEscape));
@@ -5468,12 +5474,10 @@ mod tests {
         let state = *result.escape_states.get(&alloc).expect("classified");
         assert!(state.may_escape());
         assert_eq!(state, EscapeState::ArgEscape);
-        assert!(
-            result
-                .scalar_replaceable
-                .iter()
-                .all(|s| s.alloc_node != alloc)
-        );
+        assert!(result
+            .scalar_replaceable
+            .iter()
+            .all(|s| s.alloc_node != alloc));
     }
 
     /// The paired POSITIVE for both escape rules: an object that is neither
@@ -5636,7 +5640,10 @@ mod tests {
             "waiting on a local object does not publish it — this is not an \
              escape question"
         );
-        assert!(r.elide_locks.is_empty(), "MUST NOT elide a waited-on monitor");
+        assert!(
+            r.elide_locks.is_empty(),
+            "MUST NOT elide a waited-on monitor"
+        );
         assert!(r.lock_elisions.is_empty());
         assert!(r.lock_coarsening.is_empty());
         assert!(r.lock_refusals.contains(&(o, LockRefusal::WaitOrNotify)));
@@ -6084,10 +6091,7 @@ mod tests {
         let _x2 = g.add_node(Op::MonitorExit, vec![o]);
 
         let r = analyze_escapes(&g);
-        assert!(r
-            .lock_coarsening
-            .iter()
-            .all(|plan| plan.object != o));
+        assert!(r.lock_coarsening.iter().all(|plan| plan.object != o));
         assert!(r.lock_refusals.contains(&(o, LockRefusal::ObservableGap)));
     }
 
@@ -6108,7 +6112,9 @@ mod tests {
         assert!(!program_order_proves_dominance(&g));
         let r = analyze_escapes(&g);
         assert!(r.lock_coarsening.is_empty());
-        assert!(r.lock_refusals.contains(&(o, LockRefusal::NoDominanceProof)));
+        assert!(r
+            .lock_refusals
+            .contains(&(o, LockRefusal::NoDominanceProof)));
         assert_eq!(
             r.elide_locks,
             vec![e1, x1, e2, x2],

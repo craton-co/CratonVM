@@ -556,10 +556,17 @@ const X500_DER_MAX_ENTRIES: usize = 4096;
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both callers evaluate
 /// `ctx.identity_hash_code` into a local BEFORE acquiring, and the bodies under
 /// the guard are map operations on `Vec<u8>` only.
-fn x500_der_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>> {
-    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn x500_der_table(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// Record the encoding this principal was built from.
@@ -746,8 +753,7 @@ fn canonical_form(groups: &[Vec<(String, String)>]) -> String {
     groups
         .iter()
         .map(|group| {
-            let mut avas: Vec<String> =
-                group.iter().map(|(k, v)| canonical_ava(k, v)).collect();
+            let mut avas: Vec<String> = group.iter().map(|(k, v)| canonical_ava(k, v)).collect();
             avas.sort();
             avas.join("+")
         })
@@ -1172,9 +1178,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn parse_dn_simple() {

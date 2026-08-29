@@ -13,7 +13,10 @@
 mod common;
 
 #[allow(unused_imports)]
-use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+use cratonvm_native_api::{
+    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+};
 
 use common::{boxed_int, build_registry, call, new_concurrent_hashmap, new_hashmap, MockCtx};
 use cratonvm_native_api::NativeContext;
@@ -124,19 +127,12 @@ fn lookup_invokes_equals_on_search_key_not_stored_key() {
         HM,
         "put",
         PUT,
-        &[
-            Value::Object(Some(hm)),
-            Value::Object(Some(stored)),
-            value,
-        ],
+        &[Value::Object(Some(hm)), Value::Object(Some(stored)), value],
     )
     .unwrap();
 
     ctx.clear_invoke_virtual_log();
-    ctx.set_invoke_virtual_results(vec![
-        Ok(Some(Value::Int(7))),
-        Ok(Some(Value::Int(1))),
-    ]);
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(7))), Ok(Some(Value::Int(1)))]);
     let got = call(
         &reg,
         &mut ctx,
@@ -192,10 +188,7 @@ fn colliding_bucket_requires_full_hash_match_before_equals() {
     .unwrap();
 
     ctx.clear_invoke_virtual_log();
-    ctx.set_invoke_virtual_results(vec![
-        Ok(Some(Value::Int(17))),
-        Ok(Some(Value::Int(1))),
-    ]);
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(17))), Ok(Some(Value::Int(1)))]);
     let got = call(
         &reg,
         &mut ctx,
@@ -214,10 +207,7 @@ fn colliding_bucket_requires_full_hash_match_before_equals() {
     );
 
     ctx.clear_invoke_virtual_log();
-    ctx.set_invoke_virtual_results(vec![
-        Ok(Some(Value::Int(17))),
-        Ok(Some(Value::Int(1))),
-    ]);
+    ctx.set_invoke_virtual_results(vec![Ok(Some(Value::Int(17))), Ok(Some(Value::Int(1)))]);
     call(
         &reg,
         &mut ctx,

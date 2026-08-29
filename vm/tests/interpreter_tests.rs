@@ -323,7 +323,12 @@ fn test_control_flow_while() {
 fn test_control_flow_switch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ControlFlow", "testSwitch", "(I)I", &[Value::Int(2)]);
+    let result = vm.invoke(
+        "cratonvm/ControlFlow",
+        "testSwitch",
+        "(I)I",
+        &[Value::Int(2)],
+    );
     corpus_check(
         &vm,
         "cratonvm/ControlFlow",
@@ -728,7 +733,12 @@ fn test_record_accessor_generation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testAccessorGeneration",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/RecordRuntime",
@@ -802,7 +812,12 @@ fn test_record_hashcode_consistent() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testHashCodeConsistent",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/RecordRuntime",
@@ -820,7 +835,12 @@ fn test_record_hashcode_different() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/RecordRuntime",
+        "testHashCodeDifferent",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/RecordRuntime",
@@ -858,7 +878,12 @@ fn test_sealed_permitted_loads() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/SealedVerify",
+        "testPermittedSubclassLoads",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/SealedVerify",
@@ -972,7 +997,12 @@ fn test_reflect_method_private_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectMethod",
+        "testPrivateSetAccessible",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectMethod",
@@ -990,7 +1020,12 @@ fn test_reflect_method_exception_wrapping() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectMethod",
+        "testExceptionWrapping",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectMethod",
@@ -1084,7 +1119,12 @@ fn test_reflect_constructor_noarg() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testNoArgConstructor",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectConstructor",
@@ -1102,7 +1142,12 @@ fn test_reflect_constructor_param() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testParamConstructor",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectConstructor",
@@ -1120,7 +1165,12 @@ fn test_reflect_constructor_exception() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectConstructor",
+        "testExceptionInConstructor",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectConstructor",
@@ -1140,7 +1190,12 @@ fn test_reflect_annotation_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testClassAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectAnnotation",
@@ -1158,7 +1213,12 @@ fn test_reflect_annotation_method() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testMethodAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectAnnotation",
@@ -1194,7 +1254,12 @@ fn test_reflect_annotation_is_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectAnnotation",
+        "testIsAnnotationPresent",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectAnnotation",
@@ -1274,7 +1339,12 @@ fn test_serialize_non_serializable_throws() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/SerializeBasic",
+        "testNonSerializableThrows",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/SerializeBasic",
@@ -1293,7 +1363,12 @@ fn test_context_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testContextClassLoader",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1312,7 +1387,12 @@ fn test_parent_delegation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testParentDelegation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1331,7 +1411,12 @@ fn test_set_context_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSetContextClassLoader",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1350,7 +1435,12 @@ fn test_class_get_class_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testClassGetClassLoader",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1373,7 +1463,12 @@ fn test_bootstrap_class_loader_is_null() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testBootstrapClassLoaderIsNull",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1391,7 +1486,12 @@ fn test_string_bootstrap_loader() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testStringBootstrapLoader",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1428,7 +1528,12 @@ fn test_platform_loader_name() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testPlatformLoaderName",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1447,7 +1552,12 @@ fn test_system_class_loader_chain() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSystemClassLoaderChain",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1466,7 +1576,12 @@ fn test_load_class_delegation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoadClassDelegation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1485,7 +1600,12 @@ fn test_load_class_for_user_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoadClassForUserClass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1504,7 +1624,12 @@ fn test_class_loader_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testClassLoaderIdentity",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1523,7 +1648,12 @@ fn test_system_class_loader_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testSystemClassLoaderIdentity",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1542,7 +1672,12 @@ fn test_loader_isolation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testLoaderIsolation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1566,7 +1701,12 @@ fn test_custom_loader_override_invoked() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testCustomLoaderOverrideInvoked", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testCustomLoaderOverrideInvoked",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1586,7 +1726,12 @@ fn test_for_name_honors_custom_loader_override() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ClassLoaderTest", "testForNameHonorsCustomLoaderOverride", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ClassLoaderTest",
+        "testForNameHonorsCustomLoaderOverride",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ClassLoaderTest",
@@ -1609,7 +1754,12 @@ fn test_method_handle_static() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testStaticMethodHandle",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1628,7 +1778,12 @@ fn test_method_handle_virtual() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testVirtualMethodHandle",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1647,7 +1802,12 @@ fn test_method_handle_constructor() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testConstructorMethodHandle",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1704,7 +1864,12 @@ fn test_var_handle_get_set() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testVarHandleGetSet",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1742,7 +1907,12 @@ fn test_method_handle_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testMethodHandleType",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1765,7 +1935,12 @@ fn test_method_handle_invoke_exact_round_trip() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testInvokeExactRoundTrip", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testInvokeExactRoundTrip",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -1788,7 +1963,12 @@ fn test_var_handle_acquire_release() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleAcquireRelease", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/MethodHandleTest",
+        "testVarHandleAcquireRelease",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/MethodHandleTest",
@@ -2128,7 +2308,12 @@ fn test_tck_instructions_float_arithmetic() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/TckInstructions",
+        "testFloatArithmetic",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/TckInstructions",
@@ -2272,7 +2457,12 @@ fn test_tck_instructions_exception_handling() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/TckInstructions", "testExceptionHandling", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/TckInstructions",
+        "testExceptionHandling",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/TckInstructions",
@@ -2330,7 +2520,12 @@ fn test_s17_method_invoke_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokePrivateViaReflection",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2348,7 +2543,12 @@ fn test_s17_method_invoke_instance() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokeInstance",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2366,7 +2566,12 @@ fn test_s17_method_invoke_type_coercion() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodInvokeTypeCoercion",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2384,7 +2589,12 @@ fn test_s17_field_get_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldGetPrivate",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2404,7 +2614,12 @@ fn test_s17_field_get_own_private_final_reference_without_set_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2422,7 +2637,12 @@ fn test_s17_field_set_private() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldSetPrivate",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2440,7 +2660,12 @@ fn test_s17_field_static_get_set() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldStaticGetSet",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2458,7 +2683,12 @@ fn test_s17_constructor_noarg() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorNoArg",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2476,7 +2706,12 @@ fn test_s17_constructor_with_args() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorWithArgs",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2494,7 +2729,12 @@ fn test_s17_constructor_set_accessible() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testConstructorSetAccessible",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2530,7 +2770,12 @@ fn test_s17_proxy_is_proxy_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testProxyIsProxyClass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2548,7 +2793,12 @@ fn test_s17_proxy_get_handler() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testProxyGetHandler",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2566,7 +2816,12 @@ fn test_s17_get_declared_methods() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredMethods",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2584,7 +2839,12 @@ fn test_s17_get_declared_fields() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredFields",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2602,7 +2862,12 @@ fn test_s17_get_declared_constructors() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredConstructors",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2620,7 +2885,12 @@ fn test_s17_get_declared_method_by_name() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testGetDeclaredMethodByName",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2638,7 +2908,12 @@ fn test_s17_method_modifiers() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodModifiers",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2656,7 +2931,12 @@ fn test_s17_field_modifiers() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldModifiers",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2674,7 +2954,12 @@ fn test_s17_method_return_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodReturnType",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2692,7 +2977,12 @@ fn test_s17_method_parameter_types() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodParameterTypes",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2710,7 +3000,12 @@ fn test_s17_method_parameter_count() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodParameterCount",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2746,7 +3041,12 @@ fn test_s17_field_declaring_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldDeclaringClass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2764,7 +3064,12 @@ fn test_s17_method_declaring_class() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testMethodDeclaringClass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/ReflectionComplete",
@@ -2786,7 +3091,12 @@ fn test_s18_custom_annotation_values() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testCustomAnnotationValues",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2804,7 +3114,12 @@ fn test_s18_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testInheritedAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2822,7 +3137,12 @@ fn test_s18_non_inherited_not_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testNonInheritedNotPresent",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2840,7 +3160,12 @@ fn test_s18_get_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testGetInheritedAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2858,7 +3183,12 @@ fn test_s18_declared_annotations_no_inherited() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testDeclaredAnnotationsNoInherited",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2876,7 +3206,12 @@ fn test_s18_overriding_inherited_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testOverridingInheritedAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2894,7 +3229,12 @@ fn test_s18_method_annotation_present() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodAnnotationPresent",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2912,7 +3252,12 @@ fn test_s18_method_annotation_identity() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationIdentity", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodAnnotationIdentity",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2930,7 +3275,12 @@ fn test_s18_method_no_annotation() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodNoAnnotation",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2948,7 +3298,12 @@ fn test_s18_parameter_annotation_count() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testParameterAnnotationCount",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2966,7 +3321,12 @@ fn test_s18_parameter_annotation_empty() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testParameterAnnotationEmpty",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/AnnotationTest",
@@ -2988,7 +3348,12 @@ fn test_s19_class_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testClassTypeParams",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3006,7 +3371,12 @@ fn test_s19_multiple_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMultipleTypeParams",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3024,7 +3394,12 @@ fn test_s19_bounded_type_param() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testBoundedTypeParam",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3042,7 +3417,12 @@ fn test_s19_generic_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testGenericSuperclass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3060,7 +3440,12 @@ fn test_s19_non_generic_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testNonGenericSuperclass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3078,7 +3463,12 @@ fn test_s19_method_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodTypeParams",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3096,7 +3486,12 @@ fn test_s19_method_generic_return_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodGenericReturnType",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3114,7 +3509,12 @@ fn test_s19_method_generic_param_types() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testMethodGenericParamTypes",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3132,7 +3532,12 @@ fn test_s19_field_generic_type() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testFieldGenericType",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3150,7 +3555,12 @@ fn test_s19_no_type_params() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testNoTypeParams",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3173,7 +3583,12 @@ fn test_s19_parameterized_superclass() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testParameterizedSuperclass", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testParameterizedSuperclass",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3193,7 +3608,12 @@ fn test_s19_parameterized_field() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testParameterizedField", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testParameterizedField",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3213,7 +3633,12 @@ fn test_s19_two_arg_parameterized_field() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testTwoArgParameterizedField", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testTwoArgParameterizedField",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3233,7 +3658,12 @@ fn test_s19_wildcard_extends_number() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testWildcardExtendsNumber", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testWildcardExtendsNumber",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",
@@ -3253,7 +3683,12 @@ fn test_s19_same_named_interface_type_variables() {
     }
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("cratonvm/GenericReflectionTest", "testSameNamedInterfaceTypeVariables", "()I", &[]);
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testSameNamedInterfaceTypeVariables",
+        "()I",
+        &[],
+    );
     corpus_check(
         &vm,
         "cratonvm/GenericReflectionTest",

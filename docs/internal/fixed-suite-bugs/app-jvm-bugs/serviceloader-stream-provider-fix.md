@@ -83,7 +83,7 @@ yielding service instances `S` (`ServiceLoader implements Iterable<S>`).
 
 1. **Provider discovery under-count** — CratonVM finds fewer providers than
    HotSpot for jimage-only SPIs (e.g. CharsetProvider → 0; FileSystemProvider →
-   1 vs 2). `discover_providers` walks classpath `META-INF/services`, not the
+   1 vs 2). `discover_providers` walks classpath `../../../../apps/META-INF/services`, not the
    full module/jimage provider set.
 2. **`DefaultClassDescriptor` undersized object layout** — once the JUnit5
    launcher runs, `org/junit/jupiter/engine/discovery/DefaultClassDescriptor`

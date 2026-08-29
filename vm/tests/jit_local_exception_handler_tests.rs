@@ -251,10 +251,7 @@ fn test_jit_two_sequential_try_catch_blocks_same_method() {
 
 fn callee_exception_shapes_class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!(
-        "{dir}/cratonvm/JitCalleeExceptionShapes.class"
-    ))
-    .exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/JitCalleeExceptionShapes.class")).exists()
 }
 
 #[test]
@@ -366,10 +363,7 @@ fn test_jit_indy_after_side_effect_no_double_execution() {
 
 fn precise_handler_frame_class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!(
-        "{dir}/cratonvm/JitPreciseHandlerFrame.class"
-    ))
-    .exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/JitPreciseHandlerFrame.class")).exists()
 }
 
 /// Every entry point returns a MISMATCH COUNT, so a duplicated loop iteration

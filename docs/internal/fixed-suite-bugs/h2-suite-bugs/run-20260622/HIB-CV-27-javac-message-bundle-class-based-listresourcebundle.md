@@ -102,8 +102,8 @@ H2's `SourceCompiler` obtains the compiler via
 Root cause: `getSystemJavaCompiler()`'s real body is
 `ServiceLoader.load(JavaCompiler.class, systemClassLoader)` then "pick the
 provider whose module is `jdk.compiler`". The `JavacTool` provider is declared
-in `jdk.compiler`'s **module-info `provides`** (NOT `META-INF/services`), and
-CratonVM's ServiceLoader discovered providers only from `META-INF/services`.
+in `jdk.compiler`'s **module-info `provides`** (NOT `../../../../../apps/META-INF/services`), and
+CratonVM's ServiceLoader discovered providers only from `../../../../../apps/META-INF/services`.
 Worse, the module registry was **empty**: the eager boot module-info scan
 registered ZERO of the 70 boot modules because
 `descriptor_from_module_attribute` resolved the Module attribute's
@@ -119,7 +119,7 @@ Fix (three parts, all on dev):
    real `requires`/`exports`/`provides`.
 2. **`native-builtins/src/service_loader.rs`** — `discover_providers` now also
    consults `ctx.service_providers_from_modules(service)` (JPMS `provides`),
-   in addition to `META-INF/services`.
+   in addition to `../../../../../apps/META-INF/services`.
 3. **`classloading/src/class_manager.rs`** — opt-out gate
    `CRATONVM_BOOT_MODULE_REGISTRY=0` skips the eager registration (restores the
    historic empty-registry / fully-permissive classpath-only mode) as a safety

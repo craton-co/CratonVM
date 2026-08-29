@@ -298,7 +298,7 @@ Pure throughput; do it after C1–C3 work.
 ### C5 — Make the marker actually scale *(new 2026-08-14, and it is the one with a number)*
 
 **Adding workers makes the pause WORSE, and even one worker costs.** Measured
-on `probes/BigLive.java` (1,000,088 live objects, `-Xmx1500m`, relocation off),
+on `apps/probes/BigLive.java` (1,000,088 live objects, `-Xmx1500m`, relocation off),
 three interleaved reps, mean of the last five cycles each:
 
 | workers | mean pause | vs serial |
@@ -347,8 +347,8 @@ alongside it.
 ## 2b. What concurrent marking actually measured — 2026-08-16
 
 Interleaved, 3 reps per arm, 8-core Azure box, JIT on (so relocation was
-refused throughout, `relocation_skipped_jit`), `probes/ZgcConcMarkProbe.java`
-at `-Xmx900m` and `probes/ZgcConcMarkThreadsProbe.java` at `-Xmx1200m`.
+refused throughout, `relocation_skipped_jit`), `apps/probes/ZgcConcMarkProbe.java`
+at `-Xmx900m` and `apps/probes/ZgcConcMarkThreadsProbe.java` at `-Xmx1200m`.
 `mark=` and `cycles_started` were read on every row, so no arm is a
 did-it-even-run guess.
 
@@ -1084,7 +1084,7 @@ days.
 
 ## 3b. What Phase G actually measured — 2026-08-17
 
-`probes/ZgcGenProbe.java`: 800,000 retained linked nodes (~134 MB live), 600
+`apps/probes/ZgcGenProbe.java`: 800,000 retained linked nodes (~134 MB live), 600
 rounds of 30,000 short-lived nodes each, and an old-to-young store into every
 16th retained node per round — 48M objects allocated, `-Xmx1200m`, idle Azure
 box, three arms **interleaved**, two reps.
@@ -1153,7 +1153,7 @@ the same thing reads as a finding.**
 
 ## 3c. C5 re-measured — the three locks were not the bottleneck
 
-`probes/BigLive.java` at width 4000 / depth 250 (~1M live nodes), `-Xmx1500m`,
+`apps/probes/BigLive.java` at width 4000 / depth 250 (~1M live nodes), `-Xmx1500m`,
 relocation off, `CRATONVM_ZGC_PARMARK` swept, interleaved, two reps. Mean pause
 per collection; `mark_kinds` was `stw-parallel:7` on every non-zero arm and
 `stw-serial:7` at zero, so every arm did what its name says.
@@ -1243,7 +1243,7 @@ that nothing called.
 
 ## 3d. G2e/G2f measured, and §3b's diagnosis corrected — 2026-08-17
 
-`probes/ZgcGenProbe.java` at `800000 30000 600` (800k retained, 600 rounds of 30k
+`apps/probes/ZgcGenProbe.java` at `800000 30000 600` (800k retained, 600 rounds of 30k
 churn), `-Xmx1200m`, `CRATONVM_ZGC_GENERATIONAL=1`, defaults otherwise. One
 binary, four env combinations, **arms interleaved**, two reps — so any drift from
 the neighbour benchmark on the host hits every arm equally. Host at load 1.8–3.2

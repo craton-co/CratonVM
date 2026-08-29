@@ -916,9 +916,10 @@ fn vs_convert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     else {
         return take_fallback(ctx);
     };
-    let (Some(to_elem), Some((from_elem, a))) =
-        (elem_code_of_mirror(ctx, to_etype).or_else(|| elem_code_of_mirror(ctx, to_class)), lanes_of(ctx, v))
-    else {
+    let (Some(to_elem), Some((from_elem, a))) = (
+        elem_code_of_mirror(ctx, to_etype).or_else(|| elem_code_of_mirror(ctx, to_class)),
+        lanes_of(ctx, v),
+    ) else {
         return take_fallback(ctx);
     };
     if a.is_empty() || to_len == 0 {
@@ -1037,8 +1038,7 @@ fn vs_from_bits_coerced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // The element type first, the vector class as the second answer: see
     // `elem_code_of_mirror` for why a primitive mirror alone is not enough.
-    let Some(elem) = elem_code_of_mirror(ctx, etype)
-        .or_else(|| elem_code_of_mirror(ctx, vm_class))
+    let Some(elem) = elem_code_of_mirror(ctx, etype).or_else(|| elem_code_of_mirror(ctx, vm_class))
     else {
         return take_fallback(ctx);
     };
@@ -1271,8 +1271,7 @@ fn vs_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     // The element type first, the vector class as the second answer: see
     // `elem_code_of_mirror` for why a primitive mirror alone is not enough.
-    let Some(elem) = elem_code_of_mirror(ctx, etype)
-        .or_else(|| elem_code_of_mirror(ctx, vm_class))
+    let Some(elem) = elem_code_of_mirror(ctx, etype).or_else(|| elem_code_of_mirror(ctx, vm_class))
     else {
         return take_fallback(ctx);
     };
@@ -1573,11 +1572,19 @@ fn vd_lanewise_binary(
     owner: &str,
     ret: &str,
 ) -> MethodCallResult {
-    let desc =
-        format!("(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;){ret}");
+    let desc = format!(
+        "(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;){ret}"
+    );
     let (Some(this), Some(op), Some(that)) = (obj_at(args, 0), obj_at(args, 1), obj_at(args, 2))
     else {
-        return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_BINARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let handled = (|| -> Option<Vec<i64>> {
         // `check(that)` in the template asserts the two share a species and
@@ -1601,17 +1608,38 @@ fn vd_lanewise_binary(
         Some(out)
     })();
     let Some(out) = handled else {
-        return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_BINARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let (cid, elem) = match template_owner(ctx, this) {
         Some(v) => v,
         None => {
-            return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args)
+            return template_fallback(
+                ctx,
+                stats::E_TMPL_BINARY,
+                owner,
+                "lanewiseTemplate",
+                &desc,
+                args,
+            )
         }
     };
     match build_vector_of(ctx, stats::E_TMPL_BINARY, cid, elem, &out) {
         Some(obj) => Ok(Some(Value::Object(Some(obj)))),
-        None => template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args),
+        None => template_fallback(
+            ctx,
+            stats::E_TMPL_BINARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        ),
     }
 }
 
@@ -1624,7 +1652,14 @@ fn vd_lanewise_unary(
 ) -> MethodCallResult {
     let desc = format!("(Ljdk/incubator/vector/VectorOperators$Unary;){ret}");
     let (Some(this), Some(op)) = (obj_at(args, 0), obj_at(args, 1)) else {
-        return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_UNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let handled = (|| -> Option<Vec<i64>> {
         let (_, elem) = template_owner(ctx, this)?;
@@ -1649,17 +1684,38 @@ fn vd_lanewise_unary(
         Some(out)
     })();
     let Some(out) = handled else {
-        return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_UNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let (cid, elem) = match template_owner(ctx, this) {
         Some(v) => v,
         None => {
-            return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args)
+            return template_fallback(
+                ctx,
+                stats::E_TMPL_UNARY,
+                owner,
+                "lanewiseTemplate",
+                &desc,
+                args,
+            )
         }
     };
     match build_vector_of(ctx, stats::E_TMPL_UNARY, cid, elem, &out) {
         Some(obj) => Ok(Some(Value::Object(Some(obj)))),
-        None => template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args),
+        None => template_fallback(
+            ctx,
+            stats::E_TMPL_UNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        ),
     }
 }
 
@@ -1728,7 +1784,14 @@ fn vd_lanewise_ternary(
         obj_at(args, 2),
         obj_at(args, 3),
     ) else {
-        return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_TERNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let handled = (|| -> Option<Vec<i64>> {
         let cid = ctx.class_id_of_object(this);
@@ -1766,17 +1829,38 @@ fn vd_lanewise_ternary(
         Some(out)
     })();
     let Some(out) = handled else {
-        return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args);
+        return template_fallback(
+            ctx,
+            stats::E_TMPL_TERNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        );
     };
     let (cid, elem) = match template_owner(ctx, this) {
         Some(v) => v,
         None => {
-            return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args)
+            return template_fallback(
+                ctx,
+                stats::E_TMPL_TERNARY,
+                owner,
+                "lanewiseTemplate",
+                &desc,
+                args,
+            )
         }
     };
     match build_vector_of(ctx, stats::E_TMPL_TERNARY, cid, elem, &out) {
         Some(obj) => Ok(Some(Value::Object(Some(obj)))),
-        None => template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args),
+        None => template_fallback(
+            ctx,
+            stats::E_TMPL_TERNARY,
+            owner,
+            "lanewiseTemplate",
+            &desc,
+            args,
+        ),
     }
 }
 
@@ -1859,7 +1943,9 @@ fn vd_lanewise_scalar(
     };
     let (cid, elem) = match template_owner(ctx, this) {
         Some(v) => v,
-        None => return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args),
+        None => {
+            return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args)
+        }
     };
     match build_vector_of(ctx, stats::E_TMPL_SCALAR, cid, elem, &out) {
         Some(obj) => Ok(Some(Value::Object(Some(obj)))),

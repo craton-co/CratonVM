@@ -11,7 +11,10 @@
 mod common;
 
 #[allow(unused_imports)]
-use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+use cratonvm_native_api::{
+    NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+};
 
 use common::{boxed_int, build_registry, call, new_linked_hashmap, MockCtx};
 use cratonvm_native_api::NativeContext;

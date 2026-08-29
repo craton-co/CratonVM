@@ -341,7 +341,9 @@ fn catalog(ctx: &mut dyn NativeContext) -> Option<Arc<TzdbCatalog>> {
     CATALOG
         .get_or_init(|| {
             let java_home = ctx.get_system_property("java.home")?;
-            let path = std::path::Path::new(&java_home).join("lib").join("tzdb.dat");
+            let path = std::path::Path::new(&java_home)
+                .join("lib")
+                .join("tzdb.dat");
             let data = std::fs::read(path).ok()?;
             parse_catalog(&data).map(Arc::new)
         })
@@ -586,8 +588,8 @@ fn transition_epoch_second(rule: &TransitionRule, year: i32) -> i64 {
         }
     };
     let difference = match rule.time_definition {
-        0 => 0,             // UTC
-        1 => -rule.offset_before, // WALL
+        0 => 0,                     // UTC
+        1 => -rule.offset_before,   // WALL
         2 => -rule.standard_offset, // STANDARD
         _ => 0,
     };
@@ -721,7 +723,11 @@ pub const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T0
 /// inside those registrations, because `date_format_fast` needs the same
 /// answer WITHOUT paying for a Java dispatch plus a native-funnel entry per
 /// format — and two copies of this rule would be two things to keep in step.
-pub fn legacy_offsets_ms(ctx: &mut dyn NativeContext, zone_id: &str, date_millis: i64) -> (i32, i32) {
+pub fn legacy_offsets_ms(
+    ctx: &mut dyn NativeContext,
+    zone_id: &str,
+    date_millis: i64,
+) -> (i32, i32) {
     match get_zone_rules(ctx, zone_id) {
         Some(rules) => legacy_offsets_ms_of(&rules, date_millis),
         // An id this catalog cannot resolve keeps the answer it always had:
@@ -1379,8 +1385,7 @@ pub fn system_zone_id(ctx: &mut dyn NativeContext, java_home: Option<&str>) -> O
             .filter(|home| !home.is_empty())?,
     };
 
-    let mut candidate =
-        platform_zone_key().and_then(|key| map_windows_zone_key(&java_home, &key));
+    let mut candidate = platform_zone_key().and_then(|key| map_windows_zone_key(&java_home, &key));
     #[cfg(unix)]
     {
         if candidate.is_none() {
@@ -1406,9 +1411,12 @@ pub fn system_zone_id(ctx: &mut dyn NativeContext, java_home: Option<&str>) -> O
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn test_catalog() -> Arc<TzdbCatalog> {
         let mut candidates = [
@@ -1424,18 +1432,21 @@ mod tests {
             .output()
         {
             let settings = String::from_utf8_lossy(&output.stderr);
-            if let Some(java_home) = settings.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix("java.home = ")
-                    .map(str::to_owned)
-            }) {
+            if let Some(java_home) = settings
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("java.home = ").map(str::to_owned))
+            {
                 candidates.push(java_home);
             }
         }
 
         let path = candidates
             .into_iter()
-            .map(|java_home| std::path::PathBuf::from(java_home).join("lib").join("tzdb.dat"))
+            .map(|java_home| {
+                std::path::PathBuf::from(java_home)
+                    .join("lib")
+                    .join("tzdb.dat")
+            })
             .find(|path| path.is_file())
             .expect(
                 "tzdb.dat not found: set JAVA_HOME_FOR_TZDB_TEST or JAVA_HOME to a complete JDK",
@@ -1446,7 +1457,11 @@ mod tests {
     }
 
     fn rules_for(cat: &TzdbCatalog, id: &str) -> ZoneRulesData {
-        let resolved = cat.aliases.get(id).cloned().unwrap_or_else(|| id.to_string());
+        let resolved = cat
+            .aliases
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string());
         let idx = *cat.region_to_rule_idx.get(&resolved).unwrap();
         parse_zone_rules(&cat.rule_bytes[idx]).unwrap()
     }
@@ -1506,7 +1521,10 @@ mod tests {
         assert_eq!(parse_fixed_gmt_offset_seconds("GMT+1"), Some(3600));
         assert_eq!(parse_fixed_gmt_offset_seconds("GMT+2"), Some(2 * 3600));
         assert_eq!(parse_fixed_gmt_offset_seconds("GMT+0800"), Some(8 * 3600));
-        assert_eq!(parse_fixed_gmt_offset_seconds("GMT-0530"), Some(-(5 * 3600 + 1800)));
+        assert_eq!(
+            parse_fixed_gmt_offset_seconds("GMT-0530"),
+            Some(-(5 * 3600 + 1800))
+        );
     }
 
     #[test]

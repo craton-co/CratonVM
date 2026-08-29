@@ -660,7 +660,10 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
     ctx.unpin_native_roots(bean_factory_pin);
 }
 
-fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn get_or_create_bean_factory(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
     // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
@@ -913,7 +916,10 @@ fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 #[allow(dead_code)]
-fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Result<Option<()>, MethodCallFailed> {
+fn install_empty_data(
+    ctx: &mut dyn NativeContext,
+    cache: ObjectRef,
+) -> Result<Option<()>, MethodCallFailed> {
     let data_class =
         "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache$Data";
 
@@ -1492,15 +1498,27 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 if let Some((declaring, name, descriptor)) =
                     crate::lang_class::method_class_name_desc(ctx, incoming)
                 {
-                    if crate::classloader::defining_loader_for(ctx.vm_identity(), declaring.as_u32()).is_none() {
+                    if crate::classloader::defining_loader_for(
+                        ctx.vm_identity(),
+                        declaring.as_u32(),
+                    )
+                    .is_none()
+                    {
                         if let Some(class_name) = ctx.class_name_of_id(declaring) {
-                            if let Some(child_declaring) = resolve_class_id_via_tccl(ctx, &class_name)
+                            if let Some(child_declaring) =
+                                resolve_class_id_via_tccl(ctx, &class_name)
                             {
                                 if child_declaring != declaring {
-                                    if let Some(meta) = ctx.declared_methods(child_declaring).into_iter().find(
-                                        |meta| meta.name == name && meta.descriptor == descriptor,
-                                    ) {
-                                        method = Some(crate::lang_class::create_method_object(ctx, &meta)?);
+                                    if let Some(meta) = ctx
+                                        .declared_methods(child_declaring)
+                                        .into_iter()
+                                        .find(|meta| {
+                                            meta.name == name && meta.descriptor == descriptor
+                                        })
+                                    {
+                                        method = Some(crate::lang_class::create_method_object(
+                                            ctx, &meta,
+                                        )?);
                                     }
                                 }
                             }
@@ -1581,7 +1599,9 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             };
             if let Some(c) = cls {
                 if let Some(cid) = ctx.class_id_from_mirror(c) {
-                    if crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()).is_none() {
+                    if crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32())
+                        .is_none()
+                    {
                         if let Some(name) = ctx.class_name_of_id(cid) {
                             if let Some(better_cid) = resolve_class_id_via_tccl(ctx, &name) {
                                 if better_cid != cid {
@@ -2333,7 +2353,10 @@ fn ccpp_dbg_enabled() -> bool {
 #[cfg(test)]
 mod ccpp_dbg_flag_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     #[test]
     fn ccpp_dbg_flag_is_latched_and_matches_environment() {
         // The `@Import` walker used to call `env::var` (which also allocates a
@@ -2533,8 +2556,10 @@ fn count_descriptor_params(desc: &str) -> i32 {
 // though callers reasonably expect `ClassUtils.isCglibProxyClass` +
 // repeated-identical-config enhancement to be stable across separate
 // `BeanFactory` instances, exactly like real CGLIB.
-fn lookup_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+fn lookup_override_subclass_cache(
+) -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2555,8 +2580,10 @@ fn lookup_method_spec_cache_key(specs: &[crate::cglib_enhancer::LookupMethodSpec
         .join(";")
 }
 
-fn replace_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+fn replace_override_subclass_cache(
+) -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2572,7 +2599,6 @@ fn replace_method_spec_cache_key(specs: &[crate::cglib_enhancer::ReplaceMethodSp
         .collect::<Vec<_>>()
         .join(";")
 }
-
 
 /// bug-B2: method-injection (`<lookup-method>` / `@Lookup`). A lookup-method
 /// bean is declared on an ABSTRACT class; the old shim refused to instantiate
@@ -2820,8 +2846,9 @@ fn try_build_method_injection(
             Some(b) if ref_ret => (true, b),
             _ => (false, None),
         };
-        let declaring_internal =
-            ctx.class_name_of_id(*decl_cid).unwrap_or_else(|| super_internal.clone());
+        let declaring_internal = ctx
+            .class_name_of_id(*decl_cid)
+            .unwrap_or_else(|| super_internal.clone());
         specs.push(crate::cglib_enhancer::LookupMethodSpec {
             name: n.clone(),
             descriptor: d.clone(),
@@ -3118,9 +3145,9 @@ fn try_build_replace_override(
                             .entry(mname)
                             .or_default()
                             .push(ReplaceOverrideCfg {
-                            type_identifiers,
-                            replacer_bean_name: rname,
-                        });
+                                type_identifiers,
+                                replacer_bean_name: rname,
+                            });
                     }
                 }
                 ctx.unpin_native_roots(arr_pin);
@@ -3899,7 +3926,10 @@ fn types_to_match_is_empty(ctx: &dyn NativeContext, args: &[Value], idx: usize) 
 /// Build (but do not throw) a `java.lang.ClassNotFoundException` for
 /// `class_name`, mirroring what `Class.forName`/`ClassLoader.loadClass`
 /// would raise for the same name.
-fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn build_class_not_found(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let exc = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1)?;
     // GC-safety: `create_string` below can trigger a collection that
     // relocates `exc`; pin it and re-read before writing into it.
@@ -3917,8 +3947,13 @@ fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Resul
 /// properly-wrapped `CannotLoadBeanClassException` real Spring's PUBLIC
 /// `resolveBeanClass` wrapper produces; see
 /// [`throw_cannot_load_bean_class_exception`] for that case.
-fn throw_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Result<MethodCallFailed, MethodCallFailed> {
-    Ok(MethodCallFailed::ExceptionThrown(build_class_not_found(ctx, class_name)?))
+fn throw_class_not_found(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(MethodCallFailed::ExceptionThrown(build_class_not_found(
+        ctx, class_name,
+    )?))
 }
 
 /// Construct and throw a real
@@ -4171,7 +4206,9 @@ pub(crate) fn wrap_as_bean_definition_store_exception(
                 Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
                 _ => None,
             };
-            let msg_val = Value::Object(Some(ctx.create_string("Validation of method overrides failed")));
+            let msg_val = Value::Object(Some(
+                ctx.create_string("Validation of method overrides failed"),
+            ));
             let exc = ctx.read_native_pin(exc_pin, exc);
             let resource_val = match (resource_val, resource_val_pin) {
                 (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
@@ -4584,7 +4621,11 @@ fn bean_class_name_loadable(ctx: &mut dyn NativeContext, cn: &str) -> bool {
 /// (see that function's doc comment for why each of the 5 steps is needed —
 /// duplicated here rather than shared so a change to m5's already-verified
 /// behavior can't accidentally affect this newer caller, or vice versa).
-fn remove_bean_definition_low_level(ctx: &mut dyn NativeContext, factory: ObjectRef, bean_name: &str) {
+fn remove_bean_definition_low_level(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    bean_name: &str,
+) {
     let factory_pin = ctx.pin_native_root(factory);
     let name_str = ctx.create_string(bean_name);
     let factory = ctx.read_native_pin(factory_pin, factory);
@@ -4682,14 +4723,22 @@ fn finish_bean_factory_initialization(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    const DESC: &str = "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V";
+    const DESC: &str =
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V";
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
     let factory = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return ctx.invoke_virtual_bytecode_only(this, "finishBeanFactoryInitialization", DESC, &args[1..]),
+        _ => {
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "finishBeanFactoryInitialization",
+                DESC,
+                &args[1..],
+            )
+        }
     };
 
     let this_pin = ctx.pin_native_root(this);
@@ -4702,9 +4751,12 @@ fn finish_bean_factory_initialization(
     // pattern in `preInstantiateSingletons`).
     let mut names: Vec<String> = Vec::new();
     let factory_r = ctx.read_native_pin(factory_pin, factory);
-    if let Ok(Some(Value::Object(Some(names_arr)))) =
-        ctx.invoke_virtual(factory_r, "getBeanDefinitionNames", "()[Ljava/lang/String;", &[])
-    {
+    if let Ok(Some(Value::Object(Some(names_arr)))) = ctx.invoke_virtual(
+        factory_r,
+        "getBeanDefinitionNames",
+        "()[Ljava/lang/String;",
+        &[],
+    ) {
         let names_arr_pin = ctx.pin_native_root(names_arr);
         let n = ctx.array_length(names_arr);
         for i in 0..n {
@@ -4962,10 +5014,13 @@ fn ccpp_process_config_bean_definitions_noop(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn build_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

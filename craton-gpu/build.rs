@@ -52,9 +52,9 @@ fn main() {
     //   3. C:/craton/gpu-java/src/main/java, then
     //      C:/craton/craton-gpu-java/src/main/java (Windows-only defaults;
     //      never consulted on Linux/macOS).
-// Each checkout root is probed in both source layouts: the current
-// aggregator one (<repo>/craton-gpu/src/main/java) and the pre-0.3.0
-// flat one (<repo>/src/main/java). See `first_existing_layout`.
+    // Each checkout root is probed in both source layouts: the current
+    // aggregator one (<repo>/craton-gpu/src/main/java) and the pre-0.3.0
+    // flat one (<repo>/src/main/java). See `first_existing_layout`.
     // If none exists, the build script emits empty paths and a warning. The
     // build never fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");

@@ -259,7 +259,7 @@ configuration `run.sh` schedules them in.
            "com.cratonvm.jdkonly.svc.internal.FactoryGreeter"])
 ```
 
-`descriptors=0` and `providers=2`. There is no `META-INF/services` descriptor
+`descriptors=0` and `providers=2`. There is no `../../../apps/META-INF/services` descriptor
 anywhere for `Greeter`; both names come from the `provides` clause in
 `regression-suite/modules/cratonvm.jdkonly.svc/module-info.java:22-24`, and that
 jar is on **`-cp`**, not on `--module-path` (the vector asserts

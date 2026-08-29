@@ -20,7 +20,7 @@ use cratonvm_types::error::{
 };
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // T8.1.1 — Thread.stop()
@@ -474,10 +474,13 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn call_native(
         registry: &NativeMethodRegistry,
@@ -566,7 +569,6 @@ mod tests {
         // Clean up
         ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
     }
-
 
     // ----- T8.1.2 Thread.suspend / resume -----
 
