@@ -3450,6 +3450,11 @@ pub fn dispatch_method_from_native_on_stream(
     // populates this (the `pthis_*` prelude has no declared index),
     // which is also the only path `WorkBound::ParamLen` is derived on.
     let mut param_lens: Vec<Option<usize>> = Vec::new();
+    // The same, for `int` SCALAR arguments, so `WorkBound::ParamScalar`
+    // can name the one that is the loop trip count. Unlike an array
+    // length this value is not bounded by anything the marshaller sees,
+    // which is exactly why the grid has to be told about it.
+    let mut param_scalars: Vec<Option<i32>> = Vec::new();
     let mut h2d_bytes: usize = 0;
     // Param-index counter for the writes-mask lookup. The non-static
     // `pthis_*` arms come first and consume slots ahead of the
@@ -3610,7 +3615,10 @@ pub fn dispatch_method_from_native_on_stream(
 
     for (i, arg) in java_args_to_marshal.iter().enumerate() {
         match arg {
-            Value::Int(v) => kernel_args = kernel_args.push_i32(*v),
+            Value::Int(v) => {
+                record_param_scalar(&mut param_scalars, i, *v);
+                kernel_args = kernel_args.push_i32(*v)
+            }
             Value::Long(v) => kernel_args = kernel_args.push_i64(*v),
             Value::Float(v) => kernel_args = kernel_args.push_f32(f32::from_bits(v.to_bits())),
             Value::Double(v) => kernel_args = kernel_args.push_f64(f64::from_bits(v.to_bits())),
@@ -3685,7 +3693,15 @@ pub fn dispatch_method_from_native_on_stream(
                 // Third: is it a boxed primitive? Java's varargs
                 // autobox `int` → Integer, etc.
                 match try_unbox_primitive(shared, *obj_ref) {
-                    Some(Value::Int(v)) => kernel_args = kernel_args.push_i32(v),
+                    Some(Value::Int(v)) => {
+                        // A boxed `Integer` is what a varargs `submit`
+                        // hands over, and it is the ONLY way GPULlama3's
+                        // dispatch site passes a scalar - so recording it
+                        // here as well as in the unboxed arm is what makes
+                        // `WorkBound::ParamScalar` usable from Java at all.
+                        record_param_scalar(&mut param_scalars, i, v);
+                        kernel_args = kernel_args.push_i32(v)
+                    }
                     Some(Value::Long(v)) => kernel_args = kernel_args.push_i64(v),
                     Some(Value::Float(v)) => kernel_args = kernel_args.push_f32(v),
                     Some(Value::Double(v)) => kernel_args = kernel_args.push_f64(v),
@@ -3893,6 +3909,33 @@ pub fn dispatch_method_from_native_on_stream(
             .flatten()
             .unwrap_or(max_array_len),
         jit_cuda::emitter::WorkBound::Literal(v) if v > 0 => v as usize,
+        // A scalar bound is the one case where the largest-array
+        // fallback is not conservative: `for (i = 0; i < n; i++)` may
+        // iterate PAST every array the kernel was handed, and a thread
+        // that is never created reaches no bounds check, so the result
+        // would be silently partial rather than a deopt. Take the max of
+        // the two, and refuse the launch outright if the scalar did not
+        // reach the marshaller - falling back to the interpreter is
+        // always correct, and this is not a path that should be
+        // reachable (`ParamScalar(idx)` is only ever emitted for a
+        // declared `int` parameter, which the loop above always records).
+        jit_cuda::emitter::WorkBound::ParamScalar(idx) => {
+            match param_scalars.get(idx as usize).copied().flatten() {
+                Some(v) => max_array_len.max(v.max(0) as usize),
+                None => {
+                    drop(token);
+                    return record_failed_submission(
+                        Some(stream.clone()),
+                        GpuErrorKind::Launch,
+                        format!(
+                            "the kernel's loop bound is `int` parameter {idx}, but no \
+                             scalar argument was marshalled at that index - \
+                             refusing to size the grid from the largest array"
+                        ),
+                    );
+                }
+            }
+        }
         _ => max_array_len,
     };
     let runtime_work: u32 = u32::try_from(work_items).unwrap_or(u32::MAX);
@@ -5760,6 +5803,15 @@ fn try_gpu_array_shape(
 /// same index `writes_param_mask` is bit-indexed by, and the one
 /// `WorkBound::ParamLen` names.
 #[cfg(feature = "gpu-offload")]
+/// Remember an `int` scalar argument's value by declared-parameter
+/// index, for [`jit_cuda::emitter::WorkBound::ParamScalar`].
+fn record_param_scalar(param_scalars: &mut Vec<Option<i32>>, index: usize, value: i32) {
+    if param_scalars.len() <= index {
+        param_scalars.resize(index + 1, None);
+    }
+    param_scalars[index] = Some(value);
+}
+
 fn record_param_len(param_lens: &mut Vec<Option<usize>>, index: usize, len: usize) {
     if param_lens.len() <= index {
         param_lens.resize(index + 1, None);

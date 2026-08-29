@@ -55,12 +55,12 @@ Every one of the 56 classes is now covered by a probe.
 | `ArrayListShadowSweep` | 164 | **0** | **0** |
 | `CollectionsShadowSweep` | 172 | **0** | **0** |
 | `UtilTailShadowSweep` | 146 | **0** | **0** |
-| `MapViewsShadowSweep` | 300 | **0** | 1 (§6.1) |
-| `TreeShadowSweep` | 232 | 2 (§6.1) | 2 (§6.1) |
+| `MapViewsShadowSweep` | 300 | **0** | **0** |
+| `TreeShadowSweep` | 232 | **0** | **0** |
 | `DequeListShadowSweep` | 172 | 1 (§6.1) | 1 (§6.1) |
-| `PqOptionalShadowSweep` | 125 | 2 (§6.1, §6.2) | 2 |
-| `LinkedSequencedShadowSweep` | 102 | 1 (§6.3) | 1 |
-| `LocaleDateTzShadowSweep` | 123 | 1 (§6.4) | 1 |
+| `PqOptionalShadowSweep` | 125 | **0** | **0** |
+| `LinkedSequencedShadowSweep` | 102 | **0** | **0** |
+| `LocaleDateTzShadowSweep` | 123 | **0** | **0** |
 | `MethodRefDoorProbe` | 25 | **0** | **0** |
 
 ## 3. The defects, by shape
@@ -397,69 +397,122 @@ directly is not the same as calling the method.**
 
 ## 6. The residuals, each with its measurement
 
-### 6.1 The snapshot-iterator families are not fail-fast — 5 rows, OPEN
+### 6.1 The snapshot-iterator families are not fail-fast — 4 of 5 rows FIXED 2026-08-29
+
+Fixed, and the fix was the CLASS, exactly as the re-diagnosis above predicted.
+Each of the four families now hands out the iterator HotSpot hands out, minted
+through one shared helper, and three of them became fail-fast for free because
+the real class declares the `expectedModCount` the third door seeds:
+
+| family | was | now | fail-fast |
+| --- | --- | --- | --- |
+| `TreeSet` | `Arrays$ArrayItr` | `TreeMap$KeyIterator` | **yes** |
+| `TreeMap.keySet()` | `Arrays$ArrayItr` | `TreeMap$KeyIterator` | **yes** |
+| `PriorityQueue` | `ArrayList$Itr` | `PriorityQueue$Itr` | **yes** |
+| `ArrayDeque` | `Arrays$ArrayItr` | `ArrayDeque$DeqIterator` | no — see below |
+
+`apps/probes/FailFastShapeProbe` is 0-diff in both modes, so the four
+iterator-class identity rows are closed as well; `TreeShadowSweep`,
+`PqOptionalShadowSweep` and `MapViewsShadowSweep` are 0-diff in both modes.
+
+Two FABRICATIONS went with it — `java/util/TreeSet$Itr` and
+`java/util/ArrayDeque$Itr`, both of which `--jdk-only` refused and landed off,
+so one receiver answered two different wrong class names depending on the mode.
+`TreeSet$Itr` survives only for `descendingIterator`, whose HotSpot class is a
+different carrier and a separate row.
+
+**Three things this cost, each of which is the same shape.** A registration and
+its force-native gate row are ONE edit: without the gate the natives are silent
+and the real bodies run, and they report the collection EXHAUSTED rather than
+erroring, so `PqOptionalShadowSweep` died at row 54 with `NoSuchElementException`
+on a three-element queue. A registration keyed on a class NOBODY PRODUCES is a
+trap armed for whoever produces one later: `java/util/PriorityQueue$Itr` had sat
+in a 2-field-snapshot registrar since before anything minted it, and won the slot
+(`owns=True inv=4`) over the registration that matched the shape actually minted.
+And the JDK can be the second producer of your carrier class:
+`ArrayDeque$DescendingIterator extends DeqIterator`, so a real descending
+iterator arrived at natives expecting a snapshot block and walked to `[]` — the
+`al_itr_alt_base` width test is now EXACT rather than a bound, and
+`al_itr_delegate_foreign` sends anything that is not ours to its own bytecode.
+
+#### The ArrayDeque row that is still open, and why it is not a size check
 
 ```text
-TreeSet      for (x : s) s.add(..)      HotSpot CME   CratonVM no-throw
-TreeSet      for (x : s) s.remove(..)   HotSpot CME   CratonVM no-throw
-ArrayDeque   for (x : d) d.add(..)      HotSpot CME   CratonVM no-throw
-PriorityQueue for (x : q) q.add(..)     HotSpot CME   CratonVM no-throw
-TreeMap.keySet()  (--jdk-only ONLY)     HotSpot CME   CratonVM no-throw
+apps/probes/DequeListShadowSweep
+  81 ad fail fast on ADD during iteration      HotSpot CME        here no-throw
+  82 ad fail fast on REMOVE during iteration   HotSpot no-throw   here no-throw
 ```
 
-**The 2026-08-29 re-diagnosis, which is the useful part of this section.** The
-first reading said the check "has nowhere to run" because the iterator is the
-real `Arrays$ArrayItr` and its `next()` is real bytecode. That is true of three
-of the five and it is not the cause. `apps/probes/FailFastShapeProbe` printed
-the iterator CLASS each family hands out, and the answer lines up exactly with
-the fail-fast column:
+**HotSpot's `ArrayDeque` is fail-fast on one and not the other.** `DeqIterator`
+detects a modification only when the ring buffer shifts under the cursor, which
+an `add` that wraps does and a `remove` from the far end does not. It also
+declares no `expectedModCount` for the third door to seed.
 
-| family | HotSpot's iterator | CratonVM's | fail-fast? |
-| --- | --- | --- | --- |
-| `TreeSet` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
-| `ArrayDeque` | `ArrayDeque$DeqIterator` | `Arrays$ArrayItr` | no |
-| `PriorityQueue` | `PriorityQueue$Itr` | `ArrayList$Itr` | no |
-| `TreeMap.keySet()` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
-| `TreeMap.values()` | `TreeMap$ValueIterator` | **`TreeMap$ValueIterator`** | **yes** |
-| `TreeMap.entrySet()` | `TreeMap$EntryIterator` | **`TreeMap$EntryIterator`** | **yes** |
-| `HashMap.values()` | `HashMap$ValueIterator` | **`HashMap$ValueIterator`** | **yes** |
-| `ArrayList` | `ArrayList$Itr` | **`ArrayList$Itr`** | **yes** |
+Giving it one was tried: its `remaining` slot is free (every declared field on a
+carrier this crate mints is unused, since the mint writes only the three
+snapshot fields past them), seeded from the source's SIZE. That closed row 81
+and OPENED row 82, because size moves for both — one wrong row traded for
+another, in the worse direction, since a spurious
+`ConcurrentModificationException` is the failure this file has already paid for
+once. Reverted. Closing row 81 needs a generation counting structural GROWTH
+rather than size, and the deque has no field to hold one.
 
-Every family that hands out its REAL iterator class is fail-fast, and every
-family that does not is not. That is one defect wearing two faces, and it means
-these five rows are not a missing check — they are **four iterator-class
-identity differences the twelve probes never asked about**, which the fail-fast
-rows are the behavioural shadow of.
+#### A FOURTH cost, found 2026-08-29 after the lane landed: one unit test left red, and the mock hole under it
 
-`native_ts_iterator`'s own comment has known the class since the L7 wave: *"No
-JDK declares `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
-behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class — and
-then hand back the snapshot through a real iterator anyway."* The refusal is
-right; the fallback is what costs the class and the check.
+`cargo test -p cratonvm-native-collections --test gc_native_pins` went red on
+`array_deque_iterator_roots_snapshot_graph_across_allocations`, deterministically,
+5/5. The lane's own verification is arms and probes — `114/114 --jdk-only,
+74/74 SUITE=core` — and neither runs this crate's Rust unit tests, so a red that
+`cargo test` catches in 0.01 s survived a full landing gate.
 
-**The fix this points at, for whoever takes it.** The mechanism already exists
-and already serves the four working rows: `VALUES_ITR_CARRIERS` maps a view
-carrier to its real iterator class, and `alloc_arraylist_iterator_as` mints that
-class with the three snapshot fields past its declared ones, refusing rather
-than fabricating when the class is not real. Pointing `TreeSet` at
-`java/util/TreeMap$KeyIterator` through that same helper gets the right class
-for two of the four rows at once — `TreeMap.keySet()` is TreeSet-carried on this
-VM, so it is one producer, not two, which is the
-`two-producers-of-one-carrier-class-is-a-failure-family` trap this would
-otherwise walk into.
+**The message named a defect that is not there.** It read
+`iterator lost backing deque: Int(-1)`, because the test hard-coded
+`get_field(iterator, 2)` against the retired fabrication's layout
+(`0 = array, 1 = cursor, 2 = backing deque`) and the real carrier's slot 2 is
+`lastRet`, which the mint sets to `-1`. `Int(-1)` in a reference slot is exactly
+the shape of the `gc::guard` "descriptor-aware field access DESTROYED the value"
+family, so the obvious reading of that panic sends the next reader after a
+coercion bug in a path that has none. The graph is fine; the test was pinning a
+contract the change deliberately replaced:
 
-That gets identity. Fail-fast additionally needs a GENERATION the third door can
-read: `al_view_generation` answers `None` for a source with no `modCount`, which
-is every one of these four. Either the natives maintain the real `modCount`
-field their family declares, or each family gets a generation of its own. The
-`modCount` route is the one that also makes real JDK bytecode agree, which is
-the campaign's direction.
+```text
+  DeqIterator[b + 0] -> ArrayList-shaped wrapper
+                           wrapper[elementData] -> Object[n + 1]
+                                                     [0..n) elements
+                                                     [n]    THE SOURCE DEQUE
+  DeqIterator[b + 1] = cursor  = 0
+  DeqIterator[b + 2] = lastRet = -1        b = object_num_fields - 3
+```
 
-Not attempted here. `native_ts_iterator` is among the most pin-dense functions
-in the crate — its own comments record two Family-1 stale-`ObjectRef` defects
-paid for in `RTreeRangeGc` — and replacing a working, GC-audited snapshot path
-is a change that wants its own build-and-arm cycle rather than a corner of
-someone else's. It is the same lane as §6.3.
+The test now WALKS that graph — trailing-three convention, the wrapper's one
+array-valued field, the array's trailing capacity slot — rather than indexing
+three slots that belong to three different classes, and asserts the carrier
+class by name so a silent return to a fabrication cannot leave it green.
+
+**The mock hole is the part worth keeping.** `MockCtx` did not override
+`class_num_total_fields`, so it used the trait default: **zero declared fields
+for every class**. That is not a neutral default here. `alloc_arraylist_iterator_as`
+mints `class_num_total_fields + 3`, and `al_itr_alt_base` recognises this crate's
+own mint by that EXACT width — behind an early-out for anything four fields or
+narrower. A carrier reporting zero is minted three wide, trips the early-out, and
+`al_itr_delegate_foreign` sends it to real bytecode, of which a mock has none.
+So `hasNext` answered `Ok(None)` and **the entire `VALUES_ITR_CARRIERS` path was
+unreachable from unit tests, silently** — the same species as the two traps
+above, one level further out: not a registration nobody produces, but a test
+context in which nobody can produce one. `MockCtx::declare_class_fields` closes
+it; the test declares `DeqIterator`'s real four (`this$0`, `cursor`,
+`remaining`, `lastRet`) and asserts the minted width is 7.
+
+Falsified before landing, twice, each against the restored source: skipping the
+source's `read_native_pin` fails the `assert_ne!` that names it, and skipping an
+element's fails on the element's class id. No production code changed.
+
+**The latent coupling this leaves.** `AL_ITR_PLAIN_MAX_FIELDS` (4) must stay
+below every carrier's mint width, i.e. below `class_num_total_fields + 3` for
+every entry in `VALUES_ITR_CARRIERS`. Today the narrowest is 4 declared fields
+(`TreeMap$KeyIterator`, `ArrayDeque$DeqIterator`), so the margin is three. A
+future carrier with one declared field would be delegated to its own bytecode
+without a word.
 
 ### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
 
@@ -485,14 +538,33 @@ consumers but the two this iterator actually reaches —
 Both guards are keyed on a `PriorityQueue` source specifically, so no source
 that exists today changes behaviour.
 
-### 6.3 `reversed()` is a snapshot, not a live view — 1 row
+### 6.3 `reversed()` is a snapshot, not a live view — FIXED 2026-08-29
 
-`LinkedHashMap.reversed()` and `LinkedHashSet.reversed()` answer the right
-elements in the right order; a write to the SOURCE after the view was taken is
-not visible in them. Measured on the map (`{c=3, a=1, b=2, d=4}` where HotSpot,
-after a later `put`, answers `{e=5, c=3, a=1, b=2, d=4}`). The JDK's are
-`ReverseOrder*View` classes; this needs the `TmViewSpec` treatment extended to
-the `LinkedHashMap` family, which is the same lane as §6.1.
+`LinkedSequencedShadowSweep` is 0-diff in both modes. Was: a write to the source
+after the view was taken was invisible — `{c=3, a=1, b=2, d=4}` where HotSpot,
+after a later `put`, answers `{e=5, c=3, a=1, b=2, d=4}`.
+
+The snapshot STAYS: this VM has no real `head`/`tail`/`before`/`after` chain for
+the JDK's `ReverseOrderLinkedHashMapView` bytecode to walk, which is why the view
+was built by hand in the first place. What changed is that it is now rebuilt on
+READ when its source has moved, which is observationally the same thing for
+everything a caller can ask.
+
+The source and the generation it was last built from live in the `lhm_overlay`
+under two reserved names, rather than in a heap field or a new side table: the
+overlay is already wired into all four collector hooks, so a source held there is
+rooted, remapped and pruned for free. `resync_reversed_map` is one line at the
+top of the eleven `LinkedHashMap` read natives and returns any other receiver
+unchanged for the price of one overlay lookup. The generation is the source's
+SIZE and can only MISS, never rebuild spuriously — a false positive would be an
+O(n) rebuild on every read.
+
+The generation is stamped BEFORE the rebuild, not after. The rebuild calls
+`native_lhm_clear` and `native_lhm_put`, and a read native reached from either
+lands back in the resync; with the old generation still recorded it would rebuild
+again, and again. The clear also drops the source marker, which stops it a second
+way — but relying on the ORDER of two side effects for termination holds only
+until someone reorders them.
 
 ### 6.4 `Currency.getDisplayName(Locale.ENGLISH)` answers the CODE — FIXED 2026-08-29
 

@@ -13723,6 +13723,76 @@ pub fn forget_vm_annotation_proxies(vm_identity: usize) {
     PROXY_LAST_INTERFACES.forget(vm_identity);
 }
 
+/// Drop every cached annotation proxy this VM's class unloading invalidated.
+///
+/// A row is `(holder_class_id, annotation_descriptor) -> proxy_instance`, and
+/// **class unloading can kill either side** — the same shape
+/// `forget_unloaded_proxy_classes` exists to handle for the generated-`$ProxyN`
+/// *class* cache, one level down at the *instance*.
+///
+/// The VALUE is the half that bites. A cached proxy is an instance of a
+/// generated `jdk/proxyN/$ProxyM`, and that class's defining loader is the
+/// annotation "container" loader — for Spring, one of the per-context
+/// isolation loaders (`OverridingClassLoader`, the cglib enhancer's). When a
+/// context is discarded its loader becomes unreachable and
+/// `ClassManager::unload_user_classes` retires the generated class with it.
+/// The cached INSTANCE survives that: it is a GC root in its own right (see
+/// [`gc_scan_annotation_proxy_roots`]), so the collector keeps the object and
+/// nothing keeps its class. Every later `getDeclaredAnnotations()` on the same
+/// holder then hits this cache, returns that instance, and resolving its class
+/// throws `NoClassDefFoundError: jdk/proxyN/$ProxyM`.
+///
+/// That is not hypothetical. `WebMvcEndpointIntegrationTests` failed exactly
+/// so in the 2026-08-29 full Spring Boot suite run: from the SECOND context
+/// refresh onward, every one of nine autoconfiguration classes logged
+/// `MergedAnnotation -- Failed to introspect annotations on class …:
+/// java.lang.NoClassDefFoundError: jdk/proxy1/$Proxy26`. Spring's
+/// `AnnotationsScanner` catches that Throwable and returns NO annotations, so
+/// `@AutoConfiguration`/`@Conditional`/`@Bean` metadata silently vanished,
+/// `WebMvcEndpointHandlerMapping` was never defined, and the class failed
+/// twice — a `NoSuchBeanDefinitionException` and a 404. Nothing recovers on
+/// its own, because the poisoned row is never evicted: the log shows the same
+/// nine classes failing on every subsequent refresh.
+///
+/// The KEY is purged on the same evidence: a row keyed on a holder class id
+/// that no longer exists can only be matched again through id reuse — which
+/// `class_manager`'s own array-cache comment records as real ("a loader id is
+/// never recycled, but a *class* id under a live loader is") — and matching by
+/// reuse would hand a fresh class the retired one's annotations.
+///
+/// `class_id_of` resolves a cached proxy's class; `None` means the ref no
+/// longer names a valid object, which is itself a reason to drop the row.
+/// Dropping is always safe: the next `getDeclaredAnnotations()` rebuilds the
+/// proxy. Returns the number of rows dropped.
+pub fn forget_unloaded_annotation_proxies(
+    vm_identity: usize,
+    dead: &rustc_hash::FxHashSet<u32>,
+    class_id_of: &dyn Fn(ObjectRef) -> Option<u32>,
+) -> usize {
+    if dead.is_empty() {
+        return 0;
+    }
+    let mut dropped: Vec<ObjectRef> = Vec::new();
+    ANNOTATION_PROXY_CACHE.with(vm_identity, |table| {
+        table.retain(|(holder, _), proxy| {
+            let keep = !dead.contains(holder)
+                && class_id_of(*proxy).is_some_and(|cid| !dead.contains(&cid));
+            if !keep {
+                dropped.push(*proxy);
+            }
+            keep
+        });
+    });
+    // The child-root table is keyed by proxy address and is what keeps a
+    // proxy's member values (Class/String/array members) rooted. A row dropped
+    // above has no reader left, so leaving its children behind would root
+    // garbage for the life of the process.
+    for proxy in &dropped {
+        forget_annotation_proxy_child_roots(vm_identity, *proxy);
+    }
+    dropped.len()
+}
+
 fn remember_annotation_proxy_child_roots(vm: usize, proxy: ObjectRef, roots: Vec<ObjectRef>) {
     ANNOTATION_PROXY_CHILD_ROOTS.with(vm, |table| {
         table.insert(proxy.as_ptr() as usize, roots);
@@ -13941,6 +14011,124 @@ fn cached_method_annotation_proxy(
         ann,
         ann_class_id,
     )
+}
+
+#[cfg(test)]
+mod annotation_proxy_cache_unload_tests {
+    use super::ObjectRef;
+
+    const A: usize = 0x1000;
+    const B: usize = 0x2000;
+
+    fn oref(addr: usize) -> ObjectRef {
+        // Never dereferenced: `forget_unloaded_annotation_proxies` only reads
+        // the address and hands it to the caller-supplied `class_id_of`, which
+        // these tests stub out.
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    fn seed(vm: usize, rows: &[(u32, &str, usize)]) {
+        super::ANNOTATION_PROXY_CACHE.with(vm, |table| {
+            table.clear();
+            for (holder, desc, addr) in rows {
+                table.insert((*holder, (*desc).to_string()), oref(*addr));
+            }
+        });
+    }
+
+    fn rows(vm: usize) -> usize {
+        super::ANNOTATION_PROXY_CACHE
+            .peek(vm, |table| table.len())
+            .unwrap_or(0)
+    }
+
+    /// The row this whole function exists for: the HOLDER is still perfectly
+    /// alive (a Spring autoconfiguration class on the app loader), and it is
+    /// the cached proxy's own generated `$ProxyN` class that the collector
+    /// retired with its per-context loader. Keeping that row is what returned
+    /// an instance of an unloaded class to `getDeclaredAnnotations()` and threw
+    /// `NoClassDefFoundError: jdk/proxy1/$Proxy26`.
+    #[test]
+    fn a_proxy_whose_generated_class_was_unloaded_is_dropped() {
+        const VM: usize = 0xA0A0;
+        seed(VM, &[(11, "Lorg/example/Ann;", A)]);
+        let dead: rustc_hash::FxHashSet<u32> = [990u32].into_iter().collect();
+        // The proxy at A is an instance of the unloaded class 990; the holder
+        // (11) is untouched.
+        let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|o| {
+            Some(if o.as_ptr() as usize == A { 990 } else { 7 })
+        });
+        assert_eq!(dropped, 1, "the row naming an unloaded proxy class must go");
+        assert_eq!(rows(VM), 0);
+    }
+
+    /// A live row is not collateral damage.
+    #[test]
+    fn a_live_row_survives_the_purge() {
+        const VM: usize = 0xA0A1;
+        seed(VM, &[(11, "Lorg/example/Ann;", A), (12, "Lorg/example/Two;", B)]);
+        let dead: rustc_hash::FxHashSet<u32> = [990u32].into_iter().collect();
+        let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|o| {
+            Some(if o.as_ptr() as usize == A { 990 } else { 7 })
+        });
+        assert_eq!(dropped, 1);
+        assert_eq!(rows(VM), 1, "the row whose proxy class is alive must stay");
+        assert!(super::ANNOTATION_PROXY_CACHE
+            .peek(VM, |t| t.contains_key(&(12u32, "Lorg/example/Two;".to_string())))
+            .unwrap_or(false));
+    }
+
+    /// The key half: a row keyed on a retired holder can only be matched again
+    /// through class-id reuse, and matching by reuse would hand a fresh class
+    /// the retired one's annotations.
+    #[test]
+    fn a_row_keyed_on_an_unloaded_holder_is_dropped_too() {
+        const VM: usize = 0xA0A2;
+        seed(VM, &[(11, "Lorg/example/Ann;", A)]);
+        let dead: rustc_hash::FxHashSet<u32> = [11u32].into_iter().collect();
+        let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|_| Some(7));
+        assert_eq!(dropped, 1);
+        assert_eq!(rows(VM), 0);
+    }
+
+    /// A ref that no longer names a valid object cannot be handed back either.
+    #[test]
+    fn a_proxy_whose_ref_no_longer_resolves_is_dropped() {
+        const VM: usize = 0xA0A3;
+        seed(VM, &[(11, "Lorg/example/Ann;", A)]);
+        let dead: rustc_hash::FxHashSet<u32> = [990u32].into_iter().collect();
+        let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|_| None);
+        assert_eq!(dropped, 1);
+        assert_eq!(rows(VM), 0);
+    }
+
+    /// An empty dead set is a no-op — every collection that unloaded nothing
+    /// must not churn a cache that is entirely valid.
+    #[test]
+    fn an_empty_dead_set_drops_nothing() {
+        const VM: usize = 0xA0A4;
+        seed(VM, &[(11, "Lorg/example/Ann;", A)]);
+        let dead: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|_| {
+            panic!("class_id_of must not be consulted for an empty dead set")
+        });
+        assert_eq!(dropped, 0);
+        assert_eq!(rows(VM), 1);
+    }
+
+    /// Another VM's rows are none of this VM's business — the same partition
+    /// the `vm_identity` scoping exists to keep.
+    #[test]
+    fn another_vms_rows_are_untouched() {
+        const MINE: usize = 0xA0A5;
+        const THEIRS: usize = 0xA0A6;
+        seed(MINE, &[(11, "Lorg/example/Ann;", A)]);
+        seed(THEIRS, &[(11, "Lorg/example/Ann;", A)]);
+        let dead: rustc_hash::FxHashSet<u32> = [990u32].into_iter().collect();
+        super::forget_unloaded_annotation_proxies(MINE, &dead, &|_| Some(990));
+        assert_eq!(rows(MINE), 0);
+        assert_eq!(rows(THEIRS), 1, "the other VM's row must survive");
+    }
 }
 
 /// GC root scan for the annotation-proxy cache (companion to

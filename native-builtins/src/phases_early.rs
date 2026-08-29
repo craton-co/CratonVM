@@ -1224,18 +1224,44 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             //
             // A null value is always storable, and a component type of
             // `java/lang/Object` accepts everything, so both short-circuit.
-            if let Value::Object(Some(v)) = val {
-                let comp = ctx.class_id_of_object(arr);
-                let actual = ctx.class_id_of_object(v);
-                if actual != comp
-                    && !ctx.is_subclass(actual, comp)
-                    && ctx.class_name_of_id(comp).as_deref() != Some("java/lang/Object")
-                {
-                    return Err(RuntimeError::ArrayStoreException {
-                        message: ctx.class_name_of_id(actual).unwrap_or_default(),
-                    }
-                    .into());
-                }
+            //
+            // THE CHECK IS THE VM'S `aastore` PREDICATE, NOT A `ClassId`
+            // COMPARISON. The `ClassId` comparison that used to stand here is
+            // wrong in BOTH directions, and the same trap is written out at
+            // length on `Arrays.copyOf`'s own store check
+            // (`native-builtins/src/lib.rs`): on a REFERENCE ARRAY the heap
+            // header's class id holds the COMPONENT class, so a value that is
+            // itself an array (`Initializer[]`) answers
+            // `org/hibernate/.../Initializer` while the destination component
+            // of an `Initializer[][]` is `[Lorg/hibernate/.../Initializer;`.
+            // They can never be equal, so EVERY legal store of an array into a
+            // two-dimensional array threw a FALSE `ArrayStoreException` naming
+            // the component. MEASURED, hibernate-reactive complete suite
+            // 2026-08-29: nine embeddable/embedded-id classes died on
+            // `EmbeddableInitializerImpl.fill`'s
+            // `Arrays.fill(Initializer[][], Initializer.EMPTY_ARRAY)` with
+            // `ArrayStoreException: org.hibernate.sql.results.graph.Initializer`
+            // — a message naming an INTERFACE, which no instance can ever have
+            // as its class, and which is the tell that the name came from a
+            // component rather than from a value.
+            //
+            // It also missed every hedge the shared predicate carries — an
+            // interface component, a `$Proxy` value, a synthetic class id, a
+            // cross-loader same-named component — each of which was paid for by
+            // its own regression. `reject_unstorable` is the one place that
+            // rule lives for a native, and it fails OPEN when the context
+            // cannot decide, so this can never manufacture a refusal.
+            //
+            // `StoreRoute::Aastore` because the JDK's own
+            // `Arrays.fill(Object[], Object)` is a plain `a[i] = val` loop, so
+            // the text it owes is `aastore`'s bare external name of the VALUE.
+            if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+                ctx,
+                arr,
+                val,
+                cratonvm_native_api::array_store::StoreRoute::Aastore,
+            ) {
+                return Err(e);
             }
             let len = ctx.array_length(arr);
             for i in 0..len {

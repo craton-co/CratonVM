@@ -48,7 +48,7 @@
 
 use crate::registry::NativeContext;
 use cratonvm_types::error::{arraycopy_message, MethodCallFailed, RuntimeError};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 /// Which JDK code path the native is standing in for, and therefore which
 /// `ArrayStoreException` text it owes.
@@ -92,18 +92,92 @@ pub fn reject_unstorable(
                 .unwrap_or_default();
             arraycopy_message::element_type_mismatch(source_component, &dst)
         }
-        StoreRoute::Aastore => {
-            // KNOWN GAP, pinned by `probes/DodArrayStoreSweep` rather than
-            // hidden: for a value that is ITSELF AN ARRAY this names the
-            // COMPONENT, because `class_id_of_object` answers the component for
-            // any array and `NativeContext` exposes no element-type accessor to
-            // rebuild the descriptor from. Throwing with a slightly imprecise
-            // name is strictly better than not throwing.
-            let vn = ctx
-                .class_name_of_id(ctx.class_id_of_object(elem))
-                .unwrap_or_default();
-            arraycopy_message::external_class_name(&vn)
-        }
+        StoreRoute::Aastore => aastore_value_external_name(&*ctx, elem),
     };
     Some(RuntimeError::ArrayStoreException { message }.into())
+}
+
+/// HotSpot's `Klass::external_name()` of the VALUE a refused `aastore` tried to
+/// store — the whole text of the `ArrayStoreException` that opcode throws.
+///
+/// # Why this is not `class_name_of_id(class_id_of_object(elem))`
+///
+/// On a reference array the heap header's class id holds the COMPONENT class,
+/// not the array's own type (stated on
+/// `vm::runtime::interpreter::typecheck::array_descriptor_of`, and again on
+/// `cce_display_class_name`, where the same trap once produced
+/// `java.lang.String cannot be cast to java.lang.String` and cost a session as
+/// a supposed class-identity split). So the raw lookup is off by exactly one
+/// array dimension for an array-valued element and right for everything else —
+/// which is why only the array shapes ever diverged.
+///
+/// This was the module's one recorded KNOWN GAP ("`NativeContext` exposes no
+/// element-type accessor to rebuild the descriptor from"). It does:
+/// [`NativeContext::object_is_array`] and
+/// [`NativeContext::heap_element_type_of`] are heap object-kind reads that do
+/// not go through the class table at all, which is exactly what the component
+/// -vs- array ambiguity needs. Same rebuild rule as `array_descriptor_of`.
+///
+/// MEASURED on HotSpot 25.0.3+9-LTS, one execution per shape so nothing is in
+/// the fast-throw regime. The durable form of these rows is
+/// `regression-suite/src/RArrayStoreLibrary.java` (`s09`, `s10`, `s08`), which
+/// diffs both VMs' own answers against each other:
+///
+/// ```text
+/// Arrays.fill((Object[]) new String[3],   Integer.valueOf(1))  ArrayStoreException: java.lang.Integer
+/// Arrays.fill((Object[]) new String[3][], new Integer[0])      ArrayStoreException: [Ljava.lang.Integer;
+/// Arrays.fill((Object[]) new I[3],        new Object())        ArrayStoreException: java.lang.Object
+/// ```
+///
+/// The middle row is the one a component-name answer gets wrong: it would say
+/// `java.lang.Integer`, naming a type the store never mentioned.
+///
+/// `Klass::external_name()` on an `ObjArrayKlass` is the dotted DESCRIPTOR
+/// (`[Ljava.lang.Integer;`), not the source form `java.lang.Integer[]` — so
+/// this deliberately does NOT route through
+/// [`arraycopy_message::external_class_name`], which renders the source form
+/// for the arraycopy sentence's benefit. The two wordings are different on
+/// purpose; `System.arraycopy`'s message really does say
+/// `java.lang.String[]` where `aastore`'s says `[Ljava.lang.String;`.
+#[must_use]
+pub fn aastore_value_external_name(ctx: &dyn NativeContext, elem: ObjectRef) -> String {
+    aastore_value_internal_name(ctx, elem).replace('/', ".")
+}
+
+/// [`aastore_value_external_name`]'s answer before the `/` -> `.` pass, in JVMS
+/// internal form (`[Ljava/lang/Integer;`, `[I`, `java/lang/String`).
+fn aastore_value_internal_name(ctx: &dyn NativeContext, elem: ObjectRef) -> String {
+    let class_name = || {
+        ctx.class_name_of_id(ctx.class_id_of_object(elem))
+            .unwrap_or_default()
+    };
+    // A context with no heap (the mocks) answers `false` here, which lands on
+    // the plain-class arm — the same answer this function gave before the array
+    // arm existed, so nothing that used to work changes shape.
+    if !ctx.object_is_array(elem) {
+        return class_name();
+    }
+    match ctx.heap_element_type_of(elem) {
+        ArrayElementType::Boolean => "[Z".to_string(),
+        ArrayElementType::Char => "[C".to_string(),
+        ArrayElementType::Float => "[F".to_string(),
+        ArrayElementType::Double => "[D".to_string(),
+        ArrayElementType::Byte => "[B".to_string(),
+        ArrayElementType::Short => "[S".to_string(),
+        ArrayElementType::Int => "[I".to_string(),
+        ArrayElementType::Long => "[J".to_string(),
+        ArrayElementType::Reference => {
+            let comp = class_name();
+            if comp.is_empty() {
+                // No component entry: `array_descriptor_of` substitutes
+                // `Object[]` for exactly this case, so say the same thing.
+                "[Ljava/lang/Object;".to_string()
+            } else if comp.starts_with('[') {
+                // Already an array class name — one more dimension.
+                format!("[{comp}")
+            } else {
+                format!("[L{comp};")
+            }
+        }
+    }
 }

@@ -2457,17 +2457,31 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // A null receiver is `Object.clone`'s NPE to raise, not ours.
         return crate::native_object_clone(ctx, args);
     };
-    // Snapshot before anything allocates: this side-table IS the store.
-    // `snapshot_kv`, not the public `snapshot_sidetable`: the latter renders
-    // each entry `to_lossy()`, and a clone must not quietly mangle a key or
-    // value whose text this VM stores faithfully but cannot render.
-    let entries = snapshot_kv(ctx, this);
+    let mut this = this;
+    // Snapshot the store. ORDERED, not the raw `snapshot_kv`: these entries
+    // become the clone's `map` backing, and `chm_extra_entries` reads that
+    // backing back when the clone enumerates — so the raw, insertion-ordered
+    // snapshot would be an enumeration order this VM hands to Java, which is
+    // exactly what `only_order_insensitive_functions_read_the_unordered_snapshot`
+    // pins against (gh-11892 was one such site).
+    //
+    // `snapshot_sidetable` is the other public reader and is not usable here:
+    // it renders each entry `to_lossy()`, and a clone must not quietly mangle
+    // a key or value whose text this VM stores faithfully but cannot render.
+    //
+    // Two lanes fixed this witness independently and met in a merge; the
+    // surviving copy is the one that also refreshes the receiver below.
+    let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
     // shallow-copies the heap fields, `defaults` included, and already knows to
     // replicate a Properties' side-table onto the clone's new identity.
-    let cloned = crate::native_object_clone(ctx, args)?;
+    //
+    // Handed the REFRESHED receiver rather than the caller's `args`:
+    // `ordered_snapshot_kv` re-enters Java (`entrySet`/`iterator`/`getKey`) and
+    // is therefore a GC point, so `args` may now name a relocated object.
+    let cloned = crate::native_object_clone(ctx, &[Value::Object(Some(this))])?;
     let Some(Value::Object(Some(clone_ref))) = cloned else {
         return Ok(cloned);
     };
@@ -2532,12 +2546,24 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // `Map.replaceAll(null)` is an NPE on HotSpot too.
         _ => return Err(props_null_put_npe()),
     };
+    let mut this = this;
     // Snapshot first: the function is free to call back into this Properties,
     // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
-    let entries = snapshot_kv(ctx, this);
+    //
+    // ORDERED, not the raw `snapshot_kv`. This loop hands the entries to a
+    // user-supplied `BiFunction` one at a time, so the iteration order is
+    // DIRECTLY observable by Java — a function that logs, counts or
+    // accumulates sees it. Reading the raw side-table order would show an
+    // order this VM would never report from `propertyNames()`/`entrySet()`,
+    // which is the divergence
+    // `only_order_insensitive_functions_read_the_unordered_snapshot` exists to
+    // prevent.
+    let entries = ordered_snapshot_kv(ctx, &mut this);
     if entries.is_empty() {
         return Ok(None);
     }
+    // Pinned AFTER the ordered snapshot, which re-enters Java and may relocate
+    // the receiver; `this` is the refreshed ref by here.
     let this_pin = ctx.pin_native_root(this);
     let func_pin = ctx.pin_native_root(func);
     for (k, v) in entries {
