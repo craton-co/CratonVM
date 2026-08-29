@@ -666,7 +666,9 @@ pub mod gpu_event_census {
         }
         ONCE.call_once(|| {
             eprintln!(
-                "[cratonvm] gpu events: created={created} recycled={recycled}                  (pool served {:.1}%); stream waits issued={issued} elided={elided}                  ({:.1}% elided)",
+                "[cratonvm] gpu events: created={created} recycled={recycled} \
+                 (pool served {:.1}%); stream waits issued={issued} \
+                 elided={elided} ({:.1}% elided)",
                 100.0 * recycled as f64 / (created + recycled).max(1) as f64,
                 100.0 * elided as f64 / (issued + elided).max(1) as f64,
             );

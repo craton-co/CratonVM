@@ -4375,11 +4375,15 @@ pub(crate) fn locate_bound(
                 return Ok(BoundSource::ParamScalar(idx));
             }
             return Err(LoweringError::UnsupportedNode(format!(
-                "loop bound is `int` parameter {idx} (local {slot}), but the                  method stores to that local, so it is not provably the                  parameter's incoming value at the loop header"
+                "loop bound is `int` parameter {idx} (local {slot}), but the \
+                 method stores to that local, so it is not provably the \
+                 parameter's incoming value at the loop header"
             )));
         }
         return Err(LoweringError::UnsupportedNode(format!(
-            "loop bound is local {slot}, but its definition is neither an              arraylength of a method parameter nor an unmodified `int`              parameter - bound is unknown"
+            "loop bound is local {slot}, but its definition is neither an \
+             arraylength of a method parameter nor an unmodified `int` \
+             parameter - bound is unknown"
         )));
     }
     // Literal bound — bipush / sipush / iconst_*

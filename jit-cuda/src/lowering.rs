@@ -219,7 +219,9 @@ fn lower_method_with_pool_impl(
                     BoundSource::ParamLen(idx) => Ok(e.materialise_param_len(idx)),
                     BoundSource::Literal(v) => Ok(e.materialise_literal_s32(v)),
                     BoundSource::ParamScalar(idx) => Err(LoweringError::UnsupportedNode(format!(
-                        "nested loop bound is `int` parameter {idx}; the 2-D                          launch grid is sized from the largest array argument                          and cannot be sized from a product of two scalars"
+                        "nested loop bound is `int` parameter {idx}; the 2-D launch \
+                         grid is sized from the largest array argument and \
+                         cannot be sized from a product of two scalars"
                     ))),
                 }
             };
@@ -423,7 +425,8 @@ fn check_every_branch_has_its_label(body: &str) -> Result<(), LoweringError> {
         }
         if !labels.contains(target) {
             return Err(LoweringError::Internal(format!(
-                "emitted `bra {target}` but no `{target}:` label - a block was                  consumed by a transform while something still branched to it"
+                "emitted `bra {target}` but no `{target}:` label - a block was \
+                 consumed by a transform while something still branched to it"
             )));
         }
     }

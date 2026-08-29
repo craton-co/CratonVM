@@ -3928,7 +3928,9 @@ pub fn dispatch_method_from_native_on_stream(
                         Some(stream.clone()),
                         GpuErrorKind::Launch,
                         format!(
-                            "the kernel's loop bound is `int` parameter {idx}, but no                              scalar argument was marshalled at that index - refusing to                              size the grid from the largest array instead"
+                            "the kernel's loop bound is `int` parameter {idx}, but no \
+                             scalar argument was marshalled at that index - \
+                             refusing to size the grid from the largest array"
                         ),
                     );
                 }
