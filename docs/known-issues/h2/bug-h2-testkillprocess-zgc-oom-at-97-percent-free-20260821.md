@@ -1596,6 +1596,28 @@ is a different heap. The accounting stays exact either way —
 the spans, and a kept block inside a span is dropped rather than kept beside
 it — so nothing is counted or handed out twice.
 
+**The A/B, one binary, one switch, arms interleaved** (`TestMVStoreTool`,
+`--Xmx 1g`, 500 s cap):
+
+| arm | rc | secs | `oom` | `arena` | load at start |
+|---|---|---:|---:|---:|---:|
+| default | 124 (cap) | 500 | **0** | **0** | 18.1 |
+| `CRATONVM_ZGC_PUBLISH_VACATED=0` | 1 | **81** | **6** | 1 | 14.2 |
+
+and the failure line from the `=0` arm is the sentence this whole page has been
+trying to write:
+
+```text
+request=9888 used=1073740088 capacity=1073741824
+free_list_bytes=797496464 largest_free_block=8184
+```
+
+**A 9 888-byte request failing with 797 MB free.** Not the 262 160-byte
+large-object request the page opened on — a ten-kilobyte one. With the slide's
+output discarded, the free list is ground to ≤ 8 KiB pieces and the heap cannot
+serve a small allocation either. That arm also reports
+`vacated_spans=0 vacated_bytes=0`, which is what the switch is for.
+
 **One cost is known and deliberately not optimised yet.** The span is zeroed
 with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
 bytes — about four times what the slide itself copies — inside the pause. The
