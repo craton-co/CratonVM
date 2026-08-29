@@ -16559,6 +16559,87 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
         }
     }
 
+    /// CUDA graphs — start recording launches on `stream_handle` instead
+    /// of issuing them. `false` on a driverless VM or a refused capture.
+    fn gpu_graph_begin_capture(&mut self, stream_handle: u64) -> bool {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_begin_capture(stream_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = stream_handle;
+            false
+        }
+    }
+
+    /// CUDA graphs — stop recording and instantiate. `0` for every
+    /// failure; zero is never a valid handle.
+    fn gpu_graph_end_capture(&mut self, stream_handle: u64) -> u64 {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_end_capture(stream_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = stream_handle;
+            0
+        }
+    }
+
+    /// CUDA graphs — one `cuGraphLaunch` of everything the graph recorded.
+    fn gpu_graph_replay(&mut self, stream_handle: u64, graph_handle: u64) -> u64 {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_replay(stream_handle, graph_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (stream_handle, graph_handle);
+            0
+        }
+    }
+
+    /// CUDA graphs — node count, or `-1` for an unknown handle.
+    fn gpu_graph_node_count(&self, graph_handle: u64) -> i32 {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_node_count(graph_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = graph_handle;
+            -1
+        }
+    }
+
+    /// CUDA graphs — free a graph. Idempotent, like every other release.
+    fn gpu_graph_release(&mut self, graph_handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_release(graph_handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = graph_handle;
+        }
+    }
+
     /// GpuStream affinity — stream-affine sibling of
     /// `gpu_dispatch_method`. Delegates to
     /// `crate::runtime::offload::dispatch_method_from_native_on_stream`
@@ -16746,6 +16827,20 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// stamps the returned bytes into the resident store before
     /// rebuilding the Java array. None means "no download
     /// needed" — either the entry is unknown or already-clean.
+    /// Phase 7 #2 counterpart of `gpu_array_download_if_dirty`: write
+    /// host bytes through a resident array's existing device pointer.
+    fn gpu_array_upload_bytes(&self, handle: u64, bytes: &[u8]) -> Option<bool> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::upload_from_bytes(handle, bytes)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (handle, bytes);
+            None
+        }
+    }
+
     fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
         #[cfg(feature = "gpu-offload")]
         {
