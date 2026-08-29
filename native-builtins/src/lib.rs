@@ -2663,7 +2663,25 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `OutputStream.write(byte[] b)` IS `write(b, 0, b.length)`, and reading
+    // `b.length` off a null reference is an NPE before any byte moves. Falling
+    // through to `Ok(None)` made the call a SILENT NO-OP: the caller writes,
+    // gets no exception, closes the stream, and believes it holds the bytes.
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java` (`f.write((byte[]) null)`).
+    // The first attempt at this fix went into `write([BII)V` -- a third
+    // overload, which no row in that probe calls. `write(byte[])`,
+    // `write(byte[],int,int)` and `write(int)` are three separate registered
+    // slots, and a null check in one of them is worth nothing to the other
+    // two: read the DESCRIPTOR the failing row dispatches on, not the method
+    // name.
     let arr = match args.get(1) {
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
@@ -10079,7 +10097,21 @@ pub fn register_essential_natives_with_shims(
                     _ => None,
                 },
             };
-            if let Some(output) = output {
+            // `new FilterOutputStream(null)` is legal -- the constructor stores
+            // whatever it is given -- and the FIRST write is where the JDK
+            // fails, on `out.write(b)`. `if let Some(..)` turned that into a
+            // no-op, so a stream with nowhere to write accepted every byte and
+            // reported success.
+            //
+            // MEASURED with `apps/probes/L4TailSweep2.java` (`new
+            // FilterOutputStream(null).write(1)`).
+            let Some(output) = output else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            };
+            {
                 let _ = ctx.invoke_virtual(
                     output,
                     "write",
@@ -10099,6 +10131,23 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            // TWO SILENT NO-OPS, both measured with
+            // `apps/probes/L4TailSweep2.java`:
+            //
+            //   fos.write((byte[]) null, 0, 1)      HotSpot NPE, this VM nothing
+            //   new FilterOutputStream(null).write  HotSpot NPE, this VM nothing
+            //
+            // `FilterOutputStream.write(byte[],int,int)` is a loop of
+            // `out.write(b[off + i])`, so a null buffer is an NPE on the array
+            // read and a null `out` is an NPE on the call. Doing nothing
+            // instead is a write that vanishes -- the caller closes the stream
+            // and believes it holds the bytes.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let output = match ctx.get_field_by_name(this, "out") {
                 Value::Object(Some(o)) => Some(o),
                 _ => match ctx.get_field(this, 0) {
@@ -10106,7 +10155,13 @@ pub fn register_essential_natives_with_shims(
                     _ => None,
                 },
             };
-            if let Some(output) = output {
+            let Some(output) = output else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            };
+            {
                 let _ = ctx.invoke_virtual(
                     output,
                     "write",
@@ -11194,17 +11249,35 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;)V",
         native_exception_init_msg,
     );
+    // These two OWN their slots -- `--dump-native-registry` says
+    // `owns_slot: true` here and `false` for the same descriptors in
+    // `lang_misc`'s measured per-class table, so this registrar is the one
+    // that decides and the table's rows are inert. They therefore have to
+    // carry the class-specific behaviour themselves.
+    //
+    // `ExceptionInInitializerError()` is `super(); initCause(null)` and
+    // `(String)` is `super(s, null)`: both leave `cause` at a REAL null rather
+    // than at the `cause == this` sentinel, so a later `initCause` on such an
+    // instance is an `IllegalStateException`. The generic bodies below write
+    // the sentinel and made it a silent success. MEASURED by
+    // `apps/probes/ThrowableFamilySweep.java`; see
+    // `lang_misc::native_exc_init_noargs_null_cause` for the disassembly.
+    //
+    // The `(Throwable)` descriptor has no duplicate here, which is why the
+    // table's fix for it took effect and these two did not -- one fix landing
+    // for one descriptor and not its neighbour is the signature of a method
+    // with more than one registrar.
     registry.register(
         "java/lang/ExceptionInInitializerError",
         "<init>",
         "()V",
-        native_exception_init_empty,
+        crate::lang_misc::native_exc_init_noargs_null_cause,
     );
     registry.register(
         "java/lang/ExceptionInInitializerError",
         "<init>",
         "(Ljava/lang/String;)V",
-        native_exception_init_msg,
+        crate::lang_misc::native_exc_init_message_null_cause,
     );
     // Surefire abnormal-shutdown path (`ForkedBooter.exit1`) schedules a
     // "last ditch" terminator thread via private method

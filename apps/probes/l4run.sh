@@ -45,11 +45,27 @@ for C in "$@"; do
   s=$?
   timeout 900 "$CV" --java-home "$JDK" -cp "$W/apps/probes/out" "$C" > "$OUT/$C.compat" 2>/dev/null
   c=$?
+  # A PROBE THAT PRINTS ITS OWN TEMP DIRECTORY DIFFS AGAINST ITSELF. Three
+  # runs mean three `Files.createTempDirectory` names, so a row that echoes an
+  # exception message carrying the path differs on every comparison and is
+  # counted as a defect that is not there:
+  #
+  #   < ... NoSuchFileException :: /tmp/filessweep12131933324456442643/nope
+  #   > ... NoSuchFileException :: /tmp/filessweep1788002238870050168/nope
+  #
+  # Collapse the random suffix of a `/tmp/<word><digits>` token, and NOTHING
+  # else: the digits have to run at least six long and follow a lowercase word
+  # directly under /tmp, so a real path difference, a number in a row value,
+  # and a differing directory NAME all still diff. Applied to all three arms
+  # identically, so it cannot hide a strict-vs-compat split either.
+  for arm in oracle strict compat; do
+    sed -i -E "s#/tmp/([a-z]{3,})[0-9]{6,}#/tmp/\1<TMP>#g" "$OUT/$C.$arm"
+  done
   echo "=== $C   rc oracle=$o strict=$s compat=$c"
   echo "    lines  oracle=$(wc -l < "$OUT/$C.oracle")  strict=$(wc -l < "$OUT/$C.strict")  compat=$(wc -l < "$OUT/$C.compat")"
-  echo "    rows   oracle $(grep '^rows ' "$OUT/$C.oracle") | strict $(grep '^rows ' "$OUT/$C.strict") | compat $(grep '^rows ' "$OUT/$C.compat")"
-  ds=$(diff "$OUT/$C.oracle" "$OUT/$C.strict" | grep -c '^[<>]')
-  dc=$(diff "$OUT/$C.oracle" "$OUT/$C.compat" | grep -c '^[<>]')
+  echo "    rows   oracle $(grep -a '^rows ' "$OUT/$C.oracle") | strict $(grep -a '^rows ' "$OUT/$C.strict") | compat $(grep -a '^rows ' "$OUT/$C.compat")"
+  ds=$(diff "$OUT/$C.oracle" "$OUT/$C.strict" | grep -ac '^[<>]')
+  dc=$(diff "$OUT/$C.oracle" "$OUT/$C.compat" | grep -ac '^[<>]')
   echo "    DIFF   strict=$ds  compat=$dc"
   diff "$OUT/$C.oracle" "$OUT/$C.strict" > "$OUT/$C.strict.diff"
   diff "$OUT/$C.oracle" "$OUT/$C.compat" > "$OUT/$C.compat.diff"

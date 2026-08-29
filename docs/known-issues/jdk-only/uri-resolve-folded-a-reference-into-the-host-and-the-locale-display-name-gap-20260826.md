@@ -1,7 +1,8 @@
 # `URI.resolve` folded a relative reference into the HOST, and `Locale` answers codes where the JDK answers names
 
-**Status: the `URI.resolve` defect is FIXED 2026-08-26.** The `Locale` gap (24
-of the 26 differences) is **OPEN and scoped** in §3.
+**Status: both `URI` defects are FIXED — §2 on 2026-08-26 and §4 on 2026-08-29.**
+The `Locale` gap (24 of the 26 differences) is the only thing still **OPEN**, and
+it is scoped in §3.
 
 ## 1. The batch
 
@@ -81,7 +82,27 @@ This is the same shape as the already-recorded
 display-name path that answers a code — and the two should probably be fixed by
 the same wiring.
 
-## 4. Also open, not fixed: an empty authority in a resolve result
+## 4. FIXED 2026-08-29 by L8 — and it was 26 rows, not one
+
+> **Closed.** `apps/probes/UriRecompositionSweep.java` is the probe this section
+> asked for: 1258 rows aimed at recomposition rather than at the value surface,
+> and **0 differing lines in both modes** after the fix. The deferral below was
+> right about the blast radius and wrong about the size — this is 26 rows, every
+> `resolve` off an empty-authority base, plus six more `URI` defects the same
+> probe found (an accepted `http://`, a trailing slash on a kept `..`, an RFC
+> 6874 zone id destroyed by decoding, a closing-bracket rule only one door
+> enforced, two null refusals that answered, and an unregistered
+> `parseServerAuthority`). The blast radius was then CHECKED rather than
+> feared: 893 rows of existing `URI` coverage across six probes, unmoved. See
+> `l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md`.
+>
+> The general lesson, since this page is where it is visible: **a deferral whose
+> stated reason is "not enough evidence to justify the risk" is a request for a
+> measurement**, and taking it cost one probe and one build.
+
+### The original section, kept
+
+
 
 ```text
 URI.create("file:///C:/tmp/f.txt").resolve("x")

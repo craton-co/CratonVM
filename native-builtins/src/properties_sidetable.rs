@@ -2417,6 +2417,185 @@ fn remove_from_properties_backend(
     }
 }
 
+/// Native `Properties.clone()Ljava/lang/Object;` — the override this module's
+/// registration header says every entry-touching method needs, and that
+/// `clone` never got.
+///
+/// The real JDK 25 body is two statements:
+///
+/// ```java
+/// Properties clone = (Properties) cloneHashtable();   // = Object.clone()
+/// clone.map = new ConcurrentHashMap<>(map);           // Properties.java:1526
+/// ```
+///
+/// The second one throws on every `Properties` this VM builds. `map` is null —
+/// **deliberately** so, per the note on `register_properties_sidetable`: the
+/// synthetic Properties keeps its entries in the identity-keyed side-table, and
+/// the inherited CHM backing "is deliberately never populated", which is why
+/// every read/write method in this module exists at all. Neither the native
+/// `<init>` nor the `System.getProperties()` synthetic allocation creates one,
+/// so a `Properties` that has never been WRITTEN through has `map == null` and
+/// any real body that dereferences it fails.
+///
+/// Measured (`PropsSurface`, 27 operations x 3 receiver shapes, diffed against
+/// HotSpot): exactly two of 81 fail, `clone` and `replaceAll`, on a fresh
+/// `new Properties()` and on `System.getProperties()` — and not on one that has
+/// been written to, because the write paths lazily create the CHM. The second
+/// NPE names the cause outright: *Cannot invoke
+/// "java.util.concurrent.ConcurrentHashMap.replaceAll(...)" because "this.map"
+/// is null*. Testcontainers hit the `clone` one on
+/// `((Properties) System.getProperties().clone())`, which `ServiceLoader`
+/// rewrapped as a `ServiceConfigurationError`, failing 138 of 191
+/// hibernate-reactive classes in one batch.
+///
+/// Note what this override does NOT do: it does not make `map` non-null in
+/// general. Leaving it null keeps every un-overridden real body failing LOUDLY
+/// — which is how this defect was found — instead of silently reading an empty
+/// map and returning a wrong answer.
+fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        // A null receiver is `Object.clone`'s NPE to raise, not ours.
+        return crate::native_object_clone(ctx, args);
+    };
+    // Snapshot before anything allocates: this side-table IS the store.
+    // `ordered_snapshot_kv`, not the public `snapshot_sidetable`: the latter
+    // renders each entry `to_lossy()`, and a clone must not quietly mangle a
+    // key or value whose text this VM stores faithfully but cannot render.
+    //
+    // ORDERED, because these entries become the CLONE's iteration order --
+    // `only_order_insensitive_functions_read_the_unordered_snapshot` is exactly
+    // this question, and it went red when this function and that witness met in
+    // a merge: each landed green from a different lane, and the unordered read
+    // here would have handed a `FxHashMap` order to every caller that walks the
+    // copy.
+    let mut this = this;
+    let entries = ordered_snapshot_kv(ctx, &mut this);
+
+    // Step 1 — precisely what the real body's `cloneHashtable()` already
+    // reaches (`Object.clone` -> `native_object_clone`). That native
+    // shallow-copies the heap fields, `defaults` included, and already knows to
+    // replicate a Properties' side-table onto the clone's new identity.
+    let cloned = crate::native_object_clone(ctx, args)?;
+    let Some(Value::Object(Some(clone_ref))) = cloned else {
+        return Ok(cloned);
+    };
+    let clone_pin = ctx.pin_native_root(clone_ref);
+
+    // Step 2 — the statement that throws, done safely. It can be neither
+    // inherited nor skipped:
+    //
+    //   * inheriting it dereferences the null `map`;
+    //   * skipping it leaves the shallow copy's `map` ALIASING the receiver's
+    //     CHM, so a later write through the clone would land in the original —
+    //     destroying the independence `clone` exists to provide. (The receiver
+    //     has a live CHM whenever it has been written through, so this is the
+    //     common case, not a corner.)
+    //
+    // Drop the aliased reference, then rebuild the clone's own backing from the
+    // entries it actually has. `mirror_loaded_entries_to_properties_backend`
+    // creates the CHM when absent, which is the same lazy construction the
+    // write paths use.
+    ctx.set_field_by_name(clone_ref, "map", Value::Object(None));
+    if !entries.is_empty() {
+        let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
+        mirror_loaded_entries_to_properties_backend(ctx, clone_ref, &entries);
+    }
+    let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
+    ctx.unpin_native_roots(clone_pin);
+    Ok(Some(Value::Object(Some(clone_ref))))
+}
+
+/// Native `Properties.replaceAll(BiFunction)V` — the second method this
+/// module's registration header covers but never listed.
+///
+/// The real JDK body is one statement, `map.replaceAll(function)`, and it fails
+/// the same way `clone` did and for the same reason. The VM says so itself:
+///
+/// ```text
+/// NullPointerException: Cannot invoke
+///   "java.util.concurrent.ConcurrentHashMap.replaceAll(java.util.function.BiFunction)"
+///   because "this.map" is null
+/// ```
+///
+/// Note why this one could NOT be fixed by making `map` non-null. An empty CHM
+/// would make `map.replaceAll(f)` succeed while replacing nothing, on a
+/// receiver whose side-table holds 54 system properties — trading a loud NPE
+/// for a silent wrong answer. The store has to be the one that actually holds
+/// the entries, which is what every other write in this module already targets.
+///
+/// Each replacement is routed through [`native_properties_put`] rather than
+/// written here, so `replaceAll` inherits — rather than re-derives — that
+/// path's three obligations: the side-table write, the mirror into the `map`
+/// CHM that generic `Map` walkers read, and the propagation to the VM's
+/// system-property store when the receiver is the `System.getProperties()`
+/// view. Re-deriving any of those is how the side-table-vs-backing asymmetry
+/// that `native_properties_clear` documents gets reintroduced.
+fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        // `Map.replaceAll(null)` is an NPE on HotSpot too.
+        _ => return Err(props_null_put_npe()),
+    };
+    // Snapshot first: the function is free to call back into this Properties,
+    // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
+    //
+    // ORDERED, because `replaceAll` VISITS the entries and the function it is
+    // handed is free to have side effects, so the order is observable -- the
+    // same question `only_order_insensitive_functions_read_the_unordered_snapshot`
+    // asks, which this function met in a merge with.
+    let mut this = this;
+    let entries = ordered_snapshot_kv(ctx, &mut this);
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let func_pin = ctx.pin_native_root(func);
+    for (k, v) in entries {
+        // Every step below can allocate and therefore relocate; re-read each
+        // reference from its pin immediately before use.
+        let k_obj = create_property_string(ctx, &k);
+        let k_pin = ctx.pin_native_root(k_obj);
+        let v_obj = create_property_string(ctx, &v);
+        let f_now = ctx.read_native_pin(func_pin, func);
+        let k_now = ctx.read_native_pin(k_pin, k_obj);
+        let applied = ctx.invoke_virtual(
+            f_now,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_now)), Value::Object(Some(v_obj))],
+        )?;
+        let new_v = match applied {
+            Some(Value::Object(Some(o))) => o,
+            // `ConcurrentHashMap` rejects a null replacement rather than
+            // removing the entry; match that instead of inventing a third
+            // behaviour.
+            _ => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(props_null_put_npe());
+            }
+        };
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let k_now = ctx.read_native_pin(k_pin, k_obj);
+        native_properties_put(
+            ctx,
+            &[
+                Value::Object(Some(this_now)),
+                Value::Object(Some(k_now)),
+                Value::Object(Some(new_v)),
+            ],
+        )?;
+        // Release just this iteration's pins; `this_pin`/`func_pin` are below
+        // `k_pin` and survive.
+        ctx.unpin_native_roots(k_pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
+}
+
 /// Native `Properties.clear()V` — empties BOTH the side-table and the real
 /// `map` CHM backing.  Without this override `clear()` ran the real bytecode
 /// that empties only the CHM, leaving the side-table (which `getProperty`/
@@ -4038,6 +4217,25 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
             "equals",
             "(Ljava/lang/Object;)Z",
             native_properties_equals,
+        );
+        // `Properties.clone()` runs real JDK bytecode whose second statement
+        // dereferences the `map` CHM this module's header explains is
+        // permanently null on a synthetic Properties. See
+        // `native_properties_clone`. Companion entry in `vm_exec.rs`'s
+        // force-native list.
+        registry.register(
+            "java/util/Properties",
+            "clone",
+            "()Ljava/lang/Object;",
+            native_properties_clone,
+        );
+        // Same root cause as `clone`, found by the same differential probe —
+        // see `native_properties_replace_all`.
+        registry.register(
+            "java/util/Properties",
+            "replaceAll",
+            "(Ljava/util/function/BiFunction;)V",
+            native_properties_replace_all,
         );
         // `Properties.store`/`save` run real JDK `store0` bytecode that iterates the
         // internal `map` ConcurrentHashMap. Our synthetic Properties keep entries in

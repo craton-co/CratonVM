@@ -1416,6 +1416,22 @@ correct and actionable, and there is currently nothing that can act on them.
 
 Ordered by what a next session should pick up first.
 
+> **2026-08-29: a third project hits the same class of symptom.** Spring
+> Framework's `org.springframework.http.client.SimpleClientHttpResponseTests`
+> (unrelated to H2/Hibernate, an HTTP-client test full of Mockito mocks) timed
+> out at 300s during a full-suite ZGC run, isolated and reran alone with a
+> 400s cap, still hangs. Its log carries the same
+> `zgc frag gauge: the arena is broken up` line this page's title names
+> (`95.8% free, largest servable block 0.0%`), and the guard's own
+> `occurrence` counter doubles on every subsequent firing
+> (32768 -> 1048576 -> ...) — the same exponential-retry shape as
+> `TestCachedQueryResults`'s livelock. Not integrated into this page's own
+> instrumentation or attributed to any of the specific obligations tracked
+> below (no `CRATONVM_DBG_*` census taken for this class) — recorded here
+> only as a third confirmed occurrence, so a future reader knows this defect
+> is not H2/Hibernate-specific. Repro: run that class alone with any timeout
+> above ~300s on this project's dev tip.
+
 > **Reconciled 2026-08-28.** Three items were removed as answered by
 > measurements taken later in this page, not by anyone fixing them:
 >
