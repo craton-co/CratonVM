@@ -9,6 +9,10 @@
 #
 # Env overrides: CV=<cratonvm.exe>  JDK=<jdk home>  ONLY="RJitGc RCrypto"
 #                TIMEOUT=<seconds>
+#                KEEP_JDK_ONLY_REPORTS=<dir>  copy the per-vector
+#                  `--jdk-only-report` files there before the run deletes them.
+#                  They are what Phase 2 adjudication reads; the census this
+#                  script prints is their summary, not a substitute.
 #
 #   CRATONVM_ARGS="--jdk-only"
 #       Extra launcher flags forwarded to every CratonVM invocation. Expanded
@@ -1080,6 +1084,24 @@ if [ -n "$STRICT_REPORT" ]; then
   if [ "$jr_found" -lt "$report_expected" ]; then
     echo "  NOTE: $((report_expected-jr_found)) vector(s) produced no report (a crash before the exit hook, or a write failure)."
     echo "    Their shadows are missing from the union above. This does NOT affect any vector's verdict."
+  fi
+  # KEEP_JDK_ONLY_REPORTS=<dir> moves the per-vector reports somewhere durable
+  # instead of deleting them.
+  #
+  # The census above is COUNTS. Adjudicating a native -- deciding whether a
+  # registration that shadows real bytecode should be retired or kept -- needs
+  # WHICH triples, in WHICH vectors, with which `outcome`, and that is only in
+  # the per-vector files. Deleting them means every adjudication pass re-runs
+  # the whole corpus before it can start reading.
+  #
+  # Opt-in and non-destructive: unset, the cleanup below is exactly what it was.
+  if [ -n "${KEEP_JDK_ONLY_REPORTS:-}" ]; then
+    if mkdir -p "$KEEP_JDK_ONLY_REPORTS" 2>/dev/null \
+       && cp "$REPORTDIR"/*.json "$KEEP_JDK_ONLY_REPORTS"/ 2>/dev/null; then
+      echo "  reports kept: $jr_found file(s) in $KEEP_JDK_ONLY_REPORTS"
+    else
+      echo "  NOTE: KEEP_JDK_ONLY_REPORTS=$KEEP_JDK_ONLY_REPORTS — could not keep the reports."
+    fi
   fi
   rm -rf "$REPORTDIR"
 fi
