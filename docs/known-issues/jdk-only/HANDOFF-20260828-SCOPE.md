@@ -256,7 +256,7 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | `panama.rs` — unclaimed, closest to L1 |
+| `Arena`/`MemorySegment`/`ValueLayout`/`StructLayout`/`SequenceLayout` report an INTERFACE as an instance's class | **BEHAVIOURALLY CLOSED 2026-08-29**, identity still open. 199 differential rows (`apps/probes/FfmSegmentSweep.java`) found **nine behavioural defects** beside the identity one — a read-only segment that accepted writes, `ByteOrder` minted per call so `order() == nativeOrder()` was false, `Arena.global().close()` succeeding, and six missing refusals — all fixed and 0-diff. The 27 remaining rows (47 under `--jdk-only`) are the identity family, and BOTH modes are wrong differently: compatible INSTANTIATES `cratonvm.internal.foreign.MemorySegmentImpl`, strict lands on the interface. Sized in `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md` §4. |
 | ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
