@@ -1914,8 +1914,8 @@ it.
 
 | row | page |
 |---|---|
-| `TestOpenClose`: `Exception in thread "main" java/lang/Object`, no frames | `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md` |
-| `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
+| `TestOpenClose`: `Exception in thread "main" java/lang/Object`, no frames — and on 2026-08-29 an MVStore-writer OOM alongside it, on a run where the slide fired ONCE in 17 collections | `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md` |
+| `TestMVStoreCachePerformance`: `NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference` RECEIVER — **PASSES 1/1 on 2026-08-29** (`rc=0`, and the slide never ran, so the run does not exercise the path it would live on) | `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
 | `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` | `bug-h2-testkillprocesswhilewriting-g1-oom-20260829.md` |
 | the same fragmentation symptom in Spring Framework and Hibernate, never censused | `../gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md` |
 | `TestCachedQueryResults`: still a LIVELOCK, `oom=2990` in 900 s on the fixed tip against 18 048 in 1 500 s before — a 3.6× lower rate and the same outcome | `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` |

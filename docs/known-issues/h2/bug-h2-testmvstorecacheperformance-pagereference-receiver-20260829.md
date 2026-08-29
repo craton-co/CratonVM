@@ -2,11 +2,26 @@
 
 ## Status
 
-**OPEN, split out 2026-08-29** from
+**OPEN BUT NOT REPRODUCED 2026-08-29**, split out from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which tracked
 this class only because it was watching it for a fragmentation defect that is
-now closed. This is not that defect: the class fails with **no
-`OutOfMemoryError` and no `arena allocation failed` at all**.
+now closed. This is not that defect: it failed with **no `OutOfMemoryError` and
+no `arena allocation failed` at all**.
+
+**And on the 2026-08-29 tip the class PASSES**, once, `--Xmx 1g`:
+
+```text
+org.h2.test.store.TestMVStoreCachePerformance  rc=0  secs=282  oom=0  arena=0
+  compaction_cycles=0 relocation_skipped_jit=6 relocation_on_proven_jit=0
+```
+
+Zero `isPersistent` / `NoSuchMethodError` occurrences in the log. Note the
+census: **the slide never ran** (`relocation_on_proven_jit=0`), so this run does
+not even exercise the relocation path a wrong-receiver defect would most likely
+live on — it is one clean run, not evidence of absence. The page is kept because
+the signature was real when it was recorded and a receiver defect that appears
+once in N runs is exactly what this family looks like; see the sibling page's
+"a clean arm is worth nothing without a base rate".
 
 ## The signature
 
