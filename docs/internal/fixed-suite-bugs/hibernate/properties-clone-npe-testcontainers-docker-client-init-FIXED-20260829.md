@@ -116,6 +116,18 @@ failing quietly instead of loudly. Loudly is how this was found.
   Postgres container, zero NPEs in the log
 * `regression-suite/run.sh` **75/75**
 
+### Is there a third?
+
+No. Brace-matched over `Properties.java`, **29** methods have a body that
+touches the `map` field. **27** are natively overridden in
+`register_properties_sidetable` / `phases_early`. The two that are not are
+`toString` and `hashCode` — both `return map.something()` — and both are
+nonetheless correct on every receiver shape, including a fresh
+`new Properties()` whose `map` is null. That is unexplained rather than
+designed, so it is written down here: if either ever starts throwing the
+null-`map` NPE, it is the same defect and the same one-line cure, and the
+enumeration above is where to start.
+
 `RPropertiesClone` asserts CONTENTS and independence in BOTH directions across
 all three receiver shapes. That is deliberate: a clone that aliased the
 original's backing, or that came back empty, passes any "did it throw" check,
@@ -123,19 +135,33 @@ and both were live failure modes here — the shallow copy aliases `map` unless
 the override replaces it, and the side-table is keyed by object identity, so a
 clone starts with an empty one unless the override replicates it.
 
-## The one question left open, and why it does not matter
+## Was it a regression? Narrowed to the L3 util lane, mechanism unconfirmed
 
-The report asked whether this was a regression. A binary from another worktree
-built earlier the same day did **not** reproduce it — same null `map`, yet all
-eight clone cases passed — which points at a change in how `Properties.clone()`
-resolves rather than at the null `map` itself. That binary's source commit
-could not be confirmed (its worktree HEAD had moved since the build), and
-neither its HEAD nor the dev tip has ever carried a `clone` override, so the
-window was not pinned and no claim is made here.
+Yes, apparently. A binary from another worktree reproduced the same null `map`
+in all the same places yet passed **all eight** clone cases. Its worktree HEAD
+had moved since the build, so its commit cannot be read off directly — but two
+independent markers date it, and both point the same way. It lacks the
+`Properties.merge` override and it renders `entrySet()` entries as
+`java.util.Map$Entry@<hash>`; the `merge` override and `native_entry_to_string`
+both landed in `567780a6c` (L3 java.util collections lane, 2026-08-28). So that
+binary predates the L3 lane, and on it `Properties.clone()` worked.
 
-It does not matter to the fix: an explicit registration is immune to whichever
-routing decision let the real body run. It would matter to anyone who sees this
-signature reappear on an OLDER commit — which is what `RPropertiesClone` is for.
+The mechanism is NOT confirmed, and one observation constrains it usefully: on
+that same binary `replaceAll` DID throw the null-`map` NPE. So real JDK
+`Properties` bytecode was already running there — `clone` alone was being served
+some other way, and stopped being. `567780a6c` touched `vm_init.rs` and
+`d32cb4200` touched `runtime/resolve/guard.rs`, which is the right shape for
+that, but neither was traced to it. Note also that `native_hashtable_clone`'s
+registration comment asserts "`Properties.clone()` is handled by the generic
+`Object.clone` native" — that has never been true of the METHOD (`Properties`
+overrides `clone`, so the force-native entry keyed on `java/util/Hashtable` can
+never match it), and a stale premise like that is the kind of thing a resolution
+change quietly stops compensating for.
+
+None of it changes the fix. An explicit registration is immune to whichever
+routing decision let the real body run, which is why the fix is a registration
+and not a repair of the routing. `RPropertiesClone` is what makes the question
+moot going forward.
 
 ## Repro (pre-fix)
 
