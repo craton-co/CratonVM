@@ -85,6 +85,11 @@ impl<T> DeviceBufferInner<T> {
         Err(DeviceError::NoDriver)
     }
 
+    /// Stub twin of the in-place upload. No driver, no buffer to write.
+    pub(crate) fn copy_from_host(&self, _host: &[T]) -> Result<()> {
+        Err(DeviceError::NoDriver)
+    }
+
     /// Stub twin of the sub-range download. No driver, so nothing to copy.
     pub(crate) fn to_host_range(&self, _dst: &mut [T], _offset: usize) -> Result<()> {
         Err(DeviceError::NoDriver)
