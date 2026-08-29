@@ -3909,6 +3909,18 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if current_thread_jit_depth() == 0 {
         return;
     }
+    // WHICH obligation the peer's own proof fails on, when it fails.
+    //
+    // `proven=false` is the shortfall that refuses the whole cycle, and a
+    // count of them cannot be acted on: the proof has SIX ways to say no
+    // (`JIT_RELOCATION_UNSUPPORTED`, `NO_PRECISE_MAP`, `MISSING_EXACT_RBP`,
+    // `FOREIGN_INNERMOST_RBP`, `ACTIVE_FRAME_MAP`, `PARENT_FRAME_MAP`) and they
+    // want completely different repairs. The per-reason counters are already
+    // maintained process-wide, so a before/after snapshot around this one call
+    // names the term without any new bookkeeping. Only taken when the debug
+    // flag is on — it is two array reads either side of a proof that already
+    // walks the stack.
+    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_fallback_reason_counts);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -3916,8 +3928,21 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if proven && depth > 0 {
         cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
     }
-    if xt_coverage_dbg() {
-        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    if let Some(before) = before {
+        let after = cratonvm_gc::gc_quiescence::moving_young_fallback_reason_counts();
+        let mut why = String::new();
+        for (i, (a, b)) in after.iter().zip(before.iter()).enumerate() {
+            if a > b {
+                if !why.is_empty() {
+                    why.push(',');
+                }
+                why.push_str(cratonvm_gc::gc_quiescence::incomplete_reason::label(i));
+            }
+        }
+        if why.is_empty() {
+            why.push_str("none");
+        }
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth} why={why}");
     }
 }
 
