@@ -15,7 +15,12 @@
 > `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up
 > and the open `l2-strings-residuals-the-migration-is-unpriced` page.
 >
-> **N2, N3, the six refusals of §4 and the §7 refusal of the `java.lang.invoke`
+> **N2 is also closed**: `H25-1` §1.4 now carries a re-measurement across all
+> three images on the build host, and five of its seven marked rows are live on a
+> supported image rather than four of six — the correction is stronger than R2
+> stated, and it was taken by running `javap` again rather than by citing R2.
+>
+> **N3, the six refusals of §4 and the §7 refusal of the `java.lang.invoke`
 > block are UNTOUCHED** and are why this page is still here. Read the body for
 > them; read this banner, not the body, for N1's status.
 

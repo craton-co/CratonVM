@@ -359,11 +359,21 @@ work does not read the retired records:
   is**, not because anyone registered them, and the probe rows are the only
   guard.
 
-`WORKER-3-NOTE-3`'s OTHER nominations are untouched by this lane and stay open on
-that page: its N2 (the `H25-1` §1.4 dead list needs the R2 correction), its N3
-(the `MethodHandle.invoke` losers in `lib.rs`) and its §7 refusal of the
-`java.lang.invoke` block as a CAPABILITY gap all stand exactly as written. **This
-lane closes its N1 only**, and that note's banner says so.
+`WORKER-3-NOTE-3`'s N2 is closed too, and by re-measurement rather than by
+citation: `H25-1` §1.4's `java/lang` dead list was checked against ONE image, and
+re-running `javap -p --system` against all three on the build host shows **five
+of its seven marked rows are live on a supported image** — `Thread.stop0`,
+`suspend0` and `resume0` are declared `native` on JDK 17, `countStackFrames` on
+17 and 21, `StringUTF16.isBigEndian` on 17 and 21. That is stronger than R2's
+"four of six". Only `Thread.destroy` and `System.runFinalizersOnExit` are absent
+everywhere. Nothing in the list changes; how it is read does, and the correction
+is now on the page itself.
+
+Its N3 (the `MethodHandle.invoke` losers in `lib.rs`) and its §7 refusal of the
+`java.lang.invoke` block as a CAPABILITY gap stand exactly as written — both are
+`java.lang.invoke`, a different family from this lane's three, and §7's refusal
+is backed by an execution rather than an image. **This lane closes N1 and N2**,
+and that note's banner says so.
 
 ---
 
