@@ -20973,7 +20973,7 @@ pub fn register_essential_natives_with_shims(
             // one: `TimeZone.getTimeZone("Not/AZone")` legitimately answers GMT
             // (measured, and reproduced here), so substituting UTC for null made
             // the fabricated answer indistinguishable from the documented one.
-            // MEASURED no-throw (apps/probes/LocaleDateTzShadowSweep 94).
+            // MEASURED no-throw (probes/LocaleDateTzShadowSweep 94).
             if matches!(args.first(), Some(Value::Object(None))) {
                 return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: None,

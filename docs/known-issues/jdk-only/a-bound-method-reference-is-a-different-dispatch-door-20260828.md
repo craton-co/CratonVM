@@ -1,8 +1,25 @@
 # A bound method reference and a lambda that makes the same call are different dispatch doors — 2026-08-28
 
+> **The `probes/` tree is no longer in the working tree.** `3b2901531`
+> (*"major doc consistency update before the realeas"*, 2026-08-29) removed 915
+> files and 126 525 lines, the whole probe corpus among them, and lane L3's
+> twelve sweeps went the same way for consistency with that decision rather
+> than surviving as the one exception. They are in history and restore in one
+> command:
+>
+> ```bash
+> for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep HashtableVectorShadowSweep ArrayListShadowSweep LinkedSequencedShadowSweep PqOptionalShadowSweep CollectionsShadowSweep LocaleDateTzShadowSweep MapViewsShadowSweep UtilTailShadowSweep MethodRefDoorProbe; do
+>   git show b97c0cc8c:apps/probes/$C.java > probes/$C.java
+> done
+> ```
+>
+> `b97c0cc8c` is the last commit that carries all twelve with their final
+> content; §7's reproduce block runs unchanged once they are back.
+
+
 **Status: OPEN.** Found by L3 (`java.util` collections) while shrinking two
 `Properties` probe rows; the defect is not in `java.util` and not in any one
-lane's files. Reproducer: `apps/probes/MethodRefDoorProbe.java`.
+lane's files. Reproducer: `probes/MethodRefDoorProbe.java`.
 
 ## The measurement
 

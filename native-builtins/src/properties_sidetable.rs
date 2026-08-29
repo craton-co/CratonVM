@@ -2047,7 +2047,7 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
     // value out of it answered null for exactly the case a caller cares about:
     // the key was mapped to something that is NOT a String, and this call is
     // about to overwrite it. MEASURED: HotSpot 42, CratonVM null
-    // (apps/probes/PropertiesShadowSweep 43).
+    // (probes/PropertiesShadowSweep 43).
     //
     // GC-SAFETY: `native_properties_get` re-enters Java (the CHM lookup), so
     // the receiver and both argument objects are pinned across it and re-read.
@@ -2263,7 +2263,7 @@ fn native_properties_compute_if_absent(
     // `ConcurrentHashMap.computeIfAbsent` opens
     // `if (key == null || mappingFunction == null) throw new NullPointerException();`
     // -- one line, both arguments. MEASURED no-throw
-    // (apps/probes/PropertiesShadowSweep 74).
+    // (probes/PropertiesShadowSweep 74).
     if matches!(args.get(2), Some(Value::Object(None))) {
         return Err(props_null_put_npe());
     }
@@ -3197,7 +3197,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Filtering to the ones this file can read as text dropped every
     // non-String key while `size()` and `containsKey()` still counted it:
     // MEASURED `[intval, strkey]` against HotSpot's `[7, 8, intval, strkey]`
-    // (apps/probes/PropertiesShadowSweep 38). A container that reports four entries
+    // (probes/PropertiesShadowSweep 38). A container that reports four entries
     // and enumerates two is worse than one that reports two.
     let this_pin = ctx.pin_native_root(this);
     let mut items: Vec<Value> = Vec::with_capacity(text_keys.len());
@@ -3290,7 +3290,7 @@ fn native_properties_property_names(
         // and the JDK reports it at the first enumeration rather than handing
         // back a filtered view no later reader can tell from a complete one.
         // MEASURED `ok [intval, strkey]` against HotSpot's
-        // `ClassCastException` (apps/probes/PropertiesShadowSweep 39).
+        // `ClassCastException` (probes/PropertiesShadowSweep 39).
         //
         // NOT the same rule as `stringPropertyNames`, which filters BY DESIGN
         // (`enumerateStringProperties` skips a non-String key AND a non-String
@@ -4320,7 +4320,7 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         // bodies that walk HashMap buckets, where a `Properties` keeps nothing --
         // and the other three were not registered at all, so real bytecode edited
         // the `map` CHM mirror while the side table kept the old entry and the two
-        // stores disagreed from then on. MEASURED (apps/probes/PropertiesShadowSweep
+        // stores disagreed from then on. MEASURED (probes/PropertiesShadowSweep
         // 137, 141, 144-147): `replace` answered null for a present key,
         // `replace(k,old,new)` and `remove(k,v)` answered false for a matching
         // pair, and `computeIfPresent(k, ->null)` left the key behind.
@@ -5306,7 +5306,7 @@ mod tests {
         // implementation rather than from the spec and pinned the lower-case
         // form for as long as it was wrong; `load` accepts either case, so
         // nothing but a byte comparison against a JDK-written file could see it
-        // (MEASURED, apps/probes/PropertiesShadowSweep 118-119).
+        // (MEASURED, probes/PropertiesShadowSweep 118-119).
         assert_eq!(save_convert("\u{00e9}", false, true), "\\u00E9"); // é
                                                                       // Supplementary code point -> surrogate pair (two \u units).
         assert_eq!(save_convert("\u{1F600}", false, true), "\\uD83D\\uDE00");
