@@ -3224,6 +3224,56 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// the given destination offset. Returns `true` on success, `false` on
     /// bounds error / wrong array kind.
     ///
+    /// Copy `src` into a primitive array's payload as raw bytes.
+    ///
+    /// Returns `false` on a bounds error, a non-array receiver, a
+    /// reference array, or a context with no bulk path.
+    ///
+    /// # Why a byte-level API rather than one per element type
+    ///
+    /// The typed helpers above cover `byte`, `char` and `int`, which is
+    /// where they were needed. Adding `float`, `double`, `long` and
+    /// `short` would be four more near-identical methods here and four
+    /// more overrides in the VM, all doing the same `copy_nonoverlapping`
+    /// once the width is known.
+    ///
+    /// The caller that needs them — GPU array marshalling — already holds
+    /// its data as a flat `Vec<u8>` in native-endian order, because that
+    /// is what a device buffer is. So the byte form is not a workaround
+    /// for it; it is the shape it actually wants, and one pair of methods
+    /// serves every primitive width.
+    ///
+    /// Native-endian, matching the `to_ne_bytes` the callers already use:
+    /// host and heap are the same machine, so this is a copy and not a
+    /// conversion.
+    ///
+    /// Reference arrays are rejected outright. Writing raw bytes over
+    /// object references would hand the collector pointers it never
+    /// issued.
+    fn write_primitive_array_bytes(
+        &mut self,
+        _arr: ObjectRef,
+        _byte_off: usize,
+        _src: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Read a primitive array's payload as raw bytes into `dst`.
+    ///
+    /// Returns the number of bytes copied, or `0` on any of the
+    /// conditions [`write_primitive_array_bytes`](Self::write_primitive_array_bytes)
+    /// rejects. Zero is unambiguous here: a caller asking for zero bytes
+    /// has nothing to do either way.
+    fn read_primitive_array_bytes(
+        &self,
+        _arr: ObjectRef,
+        _byte_off: usize,
+        _dst: &mut [u8],
+    ) -> usize {
+        0
+    }
+
     /// AUDIT 2026-05-17: symmetric to `read_char_array_into`. Used by
     /// `stream_decoder::refill` to populate the read-ahead char buffer
     /// in one shot instead of N `set_array_element` round-trips. The

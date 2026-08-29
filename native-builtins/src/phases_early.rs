@@ -7805,14 +7805,14 @@ pub(crate) fn register_currency_natives(r: &mut NativeMethodRegistry) {
             Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
             _ => String::new(),
         };
-        let name = match code.as_str() {
-            "USD" => "US Dollar",
-            "EUR" => "Euro",
-            "GBP" => "British Pound Sterling",
-            "JPY" => "Japanese Yen",
-            _ => &code,
-        };
-        let s = ctx.create_string(name);
+        // Through the SHARED helper, so this copy and the `(Locale)` overload
+        // in `locale_resources` cannot drift — which they already had:
+        // this table answered `British Pound Sterling` where HotSpot 25.0.4+7
+        // answers `British Pound` (MEASURED, `apps/probes/CurrencyNameProbe`),
+        // and it had no entry for CNY/CHF/CAD/AUD at all. Same reasoning the
+        // `getSymbol` pair above records for `cldr_currency_symbol`.
+        let name = crate::locale_resources::currency_display_name_for_default_locale(ctx, &code);
+        let s = ctx.create_string(&name);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(c, "toString", "()Ljava/lang/String;", |ctx, args| {

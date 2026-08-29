@@ -614,6 +614,24 @@ fn fill_java_array(
     element_count: usize,
     bytes: &[u8],
 ) {
+    // Bulk first. The per-element arms below are the fallback for a
+    // context with no bulk path (the mock contexts the unit tests use),
+    // and they are also what this did exclusively until 2026-08-29.
+    //
+    // That mattered more than it looks. `GpuArray.toHost` on a 1024x1024
+    // float result made 1,048,576 `set_array_element` calls at roughly
+    // 14 ns each: 14.6 ms to hand back a 4 MB array, against a 0.7 ms
+    // GEMM that produced it. The marshalling was twenty times the kernel,
+    // and it hid two real kernel optimisations inside the run-to-run
+    // noise of the end-to-end benchmark.
+    //
+    // Native-endian on both sides, so this is one memcpy.
+    let want = element_count * element_byte_width(element_type);
+    if want > 0 && bytes.len() >= want && ctx.write_primitive_array_bytes(obj, 0, &bytes[..want])
+    {
+        return;
+    }
+
     match element_type {
         ArrayElementType::Int => {
             for i in 0..element_count {
@@ -681,6 +699,24 @@ fn fill_java_array(
     }
 }
 
+/// Bytes per element of a primitive array type, or `0` for one the GPU
+/// marshalling does not handle.
+///
+/// Zero doubles as "no bulk path for this": the callers use it to decide
+/// whether a byte-level copy is even meaningful, and a reference array
+/// must never take one — writing raw bytes over object references would
+/// hand the collector pointers it never issued.
+#[cfg(feature = "gpu-offload")]
+fn element_byte_width(element_type: ArrayElementType) -> usize {
+    match element_type {
+        ArrayElementType::Byte | ArrayElementType::Boolean => 1,
+        ArrayElementType::Short | ArrayElementType::Char => 2,
+        ArrayElementType::Int | ArrayElementType::Float => 4,
+        ArrayElementType::Long | ArrayElementType::Double => 8,
+        ArrayElementType::Reference => 0,
+    }
+}
+
 /// Read every element of a Java primitive array into a flat byte buffer.
 /// Returns `(element_type, element_count, bytes)`.
 #[cfg(feature = "gpu-offload")]
@@ -690,6 +726,20 @@ fn snapshot_java_array(
 ) -> (ArrayElementType, usize, Vec<u8>) {
     let element_type = ctx.heap_element_type_of(array);
     let length = ctx.array_length(array);
+
+    // Bulk first, for the same reason as `fill_java_array`: this used to
+    // be a per-element read for every type but `int`, so uploading a
+    // weight matrix cost a VM call per element. The arms below remain the
+    // fallback for a context without the bulk path.
+    let width = element_byte_width(element_type);
+    if width > 0 && length > 0 {
+        let mut bulk = vec![0u8; length * width];
+        let got = ctx.read_primitive_array_bytes(array, 0, &mut bulk);
+        if got == bulk.len() {
+            return (element_type, length, bulk);
+        }
+    }
+
     let mut bytes = Vec::new();
     match element_type {
         ArrayElementType::Int => {

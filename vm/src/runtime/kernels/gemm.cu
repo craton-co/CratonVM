@@ -23,13 +23,8 @@
 //
 // A virtual arch (compute_) rather than a real one (sm_): the driver JITs
 // the PTX for whatever device is present, so one artifact covers Turing
-// through Blackwell instead of one per generation.
-//
-// 75 is the floor because it is the oldest CUDA 13 still supports --
-// `nvcc --list-gpu-arch` starts at compute_75, Volta having been dropped.
-// Anything older needs a CUDA 12 toolkit to regenerate, which is the
-// tradeoff: newer toolkit, narrower back-compat. Half-precision
-// arithmetic needs sm_53+, so it is not the binding constraint here.
+// through Blackwell instead of one per generation. 75 is the floor
+// because it is the oldest CUDA 13 supports.
 //
 // mod.rs fails the build if the two drift apart.
 //
@@ -38,99 +33,111 @@
 // Rather than NN/NT/TN/TT variants, each input carries a pair of strides:
 // element (i, j) of the logical matrix lives at `i*s0 + j*s1`. A
 // row-major MxK matrix is (s0, s1) = (K, 1); its transpose -- the same
-// bytes read as KxM -- is (1, M). The host computes the pair, so the
-// kernel has one code path and no branches in the inner loop.
+// bytes read as KxM -- is (1, M). One code path, no inner-loop branch.
 //
-// What this does NOT make free is coalescing. Reading a row-major matrix
-// transposed walks a column, so consecutive threads touch addresses one
-// row apart instead of adjacent ones, and the loads stop coalescing. The
-// tile still amortises it, but a transposed operand is measurably slower
-// than a non-transposed one.
+// It does not make transposition free: reading a row-major matrix
+// transposed walks a column, so the loads stop coalescing. The tile
+// amortises that but does not remove it.
 //
 // ---------------------------------------------------------------------
+// TWO TILE SIZES, SELECTED BY SHAPE
+// ---------------------------------------------------------------------
+//
+// The body below is a template so the same code emits two kernels:
+//
+//   craton_gemm_f32     64x64 block,  4x4 per thread   (SMALL)
+//   craton_gemm_f32_lg  128x128 block, 8x8 per thread  (LARGE)
+//
+// Neither wins everywhere, which is why both exist. Measured on an
+// RTX 2060, kernel time only, GFLOP/s:
+//
+//     size     4x4     8x8
+//       64     7.1     6.0
+//      128      58      43
+//      256     437     261
+//      512    1470    1296
+//     1024    1973    3112
+//
+// The large tile is 58% faster at 1024 and progressively worse below it,
+// and the reason is block count rather than anything about the inner
+// loop. A 128x128 tile covers a 256x256 problem in four blocks, which
+// leaves most of a 30-SM GPU idle; the 64x64 tile makes sixteen. Past
+// about 512 there is enough work to fill the machine either way and the
+// larger tile's arithmetic intensity -- 64 FMAs per 16 shared loads
+// against 16 per 8 -- takes over.
+//
+// The host picks by output size; see `gemm_entry` in mod.rs.
+//
 // REGISTER BLOCKING
-// ---------------------------------------------------------------------
 //
-// The first version of these kernels gave each thread one output element:
-// per step of the K loop it read one value of A and one of B from shared
-// memory and did a single fused multiply-add. Two shared loads per FMA,
-// and shared-memory bandwidth -- not the FMA units -- is what ran out.
-// Measured on an RTX 2060 it reached 108 GFLOP/s at 1024^3, about 1.7% of
-// the card's ~6.5 TFLOP/s fp32 peak.
+// Each thread computes a TM x TN block of C with those TM*TN
+// accumulators in registers, so one K step reads TM values of A and TN
+// of B and does TM*TN FMAs against them. The alternative -- one output
+// per thread -- is two shared loads per FMA, and shared bandwidth, not
+// the FMA units, is what that runs out of.
 //
-// Now each thread computes a TM x TN block of C and keeps those TM*TN
-// accumulators in registers. One step of the K loop reads TM values of A
-// and TN of B into registers, then does TM*TN FMAs against them. At 4x4
-// that is 16 FMAs per 8 shared loads instead of 1 per 2 -- a 4x cut in
-// shared traffic per flop, paid for in registers, which is where the
-// slack was.
+// HALF-TILE SPLIT
 //
-// The block tile is BM x BN of C, accumulated over the K dimension BK at
-// a time, by (BM/TM) x (BN/TN) threads.
+// A thread's rows and columns are not contiguous. They are TM/4 groups
+// of four, spread evenly across the block tile:
 //
-// Register blocking alone bought less than expected -- +19% fp32 at
-// 1024^3 -- because it exposed a second bottleneck rather than removing
-// the last one. Reading TN consecutive floats out of Bs as four scalars
-// strides the warp by 4 across 32 banks, hitting 8 of them and taking a
-// 4-way conflict on every access. The inner loop now does one 128-bit
-// load per operand instead, which is why TM and TN are 4: a float4 is
-// exactly the vector width, and both tiles are aligned so the load is
-// legal.
+//     row of group g = ty*4 + g*(BM/(TM/4))
+//
+// A 128-bit shared load is serviced in phases of eight threads, and
+// eight threads times sixteen bytes is 128 bytes -- exactly the 32
+// banks. Consecutive threads therefore have to be sixteen bytes apart
+// for a phase to sweep the banks once. Eight contiguous columns at tx*8
+// would put them thirty-two apart, spanning two bank rows, and every
+// load would take a 2-way conflict. At tx*4 the spacing is right and a
+// thread simply issues TM/4 loads instead of one.
 
 #include <cuda_fp16.h>
 
-// Block tile: each thread block computes a BM x BN patch of C.
-#define BM 64
-#define BN 64
-// K-depth staged in shared memory per iteration.
+// K-depth staged in shared memory per iteration. Shared by both shapes.
 #define BK 16
-// Thread tile: each thread computes TM x TN of that patch, in registers.
-#define TM 4
-#define TN 4
 
-// Derived: 16 x 16 = 256 threads per block, each holding 16 accumulators.
-//
-// Shared memory is BK*(BM + BN) floats = 8 KB, which against a 64 KB
-// budget leaves room for several concurrent blocks; the accumulators cost
-// 16 registers per thread plus addressing, well inside the 255-register
-// limit.
-#define THREADS_X (BN / TN)
-#define THREADS_Y (BM / TM)
-#define THREADS (THREADS_X * THREADS_Y)
+// Vector width of a shared-memory load, in floats. A float4 is 128 bits,
+// the widest shared load, and TM/TN must be multiples of it.
+#define VEC 4
 
 // -------------------------------------------------------------------------
-// C[M,N] = A[M,K] * B[K,N], row-major, fp32 in and out.
+// The kernel body, parameterised by tile shape.
 //
-// Bounds are checked on the cooperative loads and on the final store, so
-// M, N and K need not be multiples of anything. An out-of-range load
-// contributes zero, which is the identity for the accumulation -- a
-// predicate rather than a separate cleanup kernel.
+// `T` is the operand element type and `Load` converts one to float, which
+// is what lets the fp32 and fp16 kernels share every line below: the
+// operands are widened entering shared memory, so the inner product is
+// the same fp32 arithmetic either way. The accumulator is fp32 in both
+// -- summing K terms in half loses accuracy fast enough to show in
+// generated tokens at the K a transformer uses.
 // -------------------------------------------------------------------------
-extern "C" __global__ void craton_gemm_f32(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
+template <int BM, int BN, int TM, int TN, typename T, typename Load>
+__device__ __forceinline__ void gemm_body(
+    const T* __restrict__ A,
+    const T* __restrict__ B,
     float* __restrict__ C,
     int M, int N, int K,
-    int as0, int as1,      // A: element (i,p) at i*as0 + p*as1
-    int bs0, int bs1)      // B: element (p,j) at p*bs0 + j*bs1
+    int as0, int as1,
+    int bs0, int bs1,
+    Load load)
 {
+    constexpr int THREADS_X = BN / TN;
+    constexpr int THREADS_Y = BM / TM;
+    constexpr int THREADS = THREADS_X * THREADS_Y;
+    constexpr int A_GROUPS = TM / VEC;      // 128-bit loads per thread, A
+    constexpr int B_GROUPS = TN / VEC;      // ... and B
+
     // As is stored TRANSPOSED -- As[k][m], not As[m][k] -- so the inner
-    // loop's read of TM consecutive rows of A is TM consecutive floats in
-    // shared memory. Stored the other way each of those reads would
-    // stride by BK and collide on the same bank.
+    // loop's read of VEC consecutive rows of A is VEC consecutive floats.
+    // Stored the other way each read would stride by BK and collide.
     __shared__ __align__(16) float As[BK][BM];
     __shared__ __align__(16) float Bs[BK][BN];
 
-    const int tx = threadIdx.x;              // [0, THREADS_X)
-    const int ty = threadIdx.y;              // [0, THREADS_Y)
-    const int tid = ty * THREADS_X + tx;     // [0, THREADS)
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * THREADS_X + tx;
 
-    const int row0 = blockIdx.y * BM;        // first row of C this block owns
-    const int col0 = blockIdx.x * BN;        // first column
-
-    // This thread's TM x TN patch within the block's BM x BN patch.
-    const int threadRow = ty * TM;
-    const int threadCol = tx * TN;
+    const int row0 = blockIdx.y * BM;
+    const int col0 = blockIdx.x * BN;
 
     float acc[TM][TN];
     #pragma unroll
@@ -146,12 +153,11 @@ extern "C" __global__ void craton_gemm_f32(
     for (int t = 0; t < tiles; ++t) {
         const int kBase = t * BK;
 
-        // ---- cooperative load of A's tile, transposed into As ----
-        //
-        // BM*BK = 1024 elements over THREADS threads. The flat index runs
-        // kk fastest, so consecutive threads read consecutive elements of
-        // a row of A -- coalesced when A is untransposed, which is the
-        // common case.
+        // Cooperative loads. The flat index runs the contiguous dimension
+        // fastest, so consecutive threads read consecutive elements of a
+        // row -- coalesced when the operand is untransposed. Out of range
+        // contributes zero, the identity for the accumulation, so ragged
+        // M/N/K cost a predicate rather than a cleanup kernel.
         #pragma unroll
         for (int f = tid; f < BM * BK; f += THREADS) {
             const int m = f / BK;
@@ -159,14 +165,9 @@ extern "C" __global__ void craton_gemm_f32(
             const int gRow = row0 + m;
             const int gCol = kBase + kk;
             As[kk][m] = (gRow < M && gCol < K)
-                    ? A[gRow * as0 + gCol * as1]
+                    ? load(A[gRow * as0 + gCol * as1])
                     : 0.0f;
         }
-
-        // ---- cooperative load of B's tile ----
-        //
-        // BK*BN = 1024, with n fastest so consecutive threads again read
-        // consecutive elements of a row.
         #pragma unroll
         for (int f = tid; f < BK * BN; f += THREADS) {
             const int kk = f / BN;
@@ -174,33 +175,36 @@ extern "C" __global__ void craton_gemm_f32(
             const int gRow = kBase + kk;
             const int gCol = col0 + n;
             Bs[kk][n] = (gRow < K && gCol < N)
-                    ? B[gRow * bs0 + gCol * bs1]
+                    ? load(B[gRow * bs0 + gCol * bs1])
                     : 0.0f;
         }
 
         __syncthreads();
 
-        // ---- the register-blocked inner product ----
-        //
-        // TM + TN shared reads feed TM * TN fused multiply-adds. That
-        // ratio is the whole point.
         #pragma unroll
         for (int kk = 0; kk < BK; ++kk) {
-            // One 128-bit load each instead of four 32-bit ones.
-            //
-            // The scalar form read Bs[kk][tx*4 + j]: across a warp that is
-            // a stride of 4 floats, which over 32 banks lands on only
-            // 32/gcd(4,32) = 8 distinct banks and costs a 4-way conflict
-            // on every access. A float4 load is a single transaction per
-            // thread and consecutive threads cover consecutive 16-byte
-            // chunks, so the warp sweeps the banks exactly once.
-            //
-            // Legal because both tiles are __align__(16) and both
-            // threadRow and threadCol are multiples of 4 floats.
-            const float4 a4 = *reinterpret_cast<const float4*>(&As[kk][threadRow]);
-            const float4 b4 = *reinterpret_cast<const float4*>(&Bs[kk][threadCol]);
-            const float aReg[TM] = {a4.x, a4.y, a4.z, a4.w};
-            const float bReg[TN] = {b4.x, b4.y, b4.z, b4.w};
+            float aReg[TM];
+            float bReg[TN];
+            // One 128-bit load per group; the groups are spread across
+            // the tile so each load's phase sweeps the banks once.
+            #pragma unroll
+            for (int g = 0; g < A_GROUPS; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(
+                        &As[kk][ty * VEC + g * (BM / A_GROUPS)]);
+                aReg[g * VEC + 0] = v.x;
+                aReg[g * VEC + 1] = v.y;
+                aReg[g * VEC + 2] = v.z;
+                aReg[g * VEC + 3] = v.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < B_GROUPS; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(
+                        &Bs[kk][tx * VEC + g * (BN / B_GROUPS)]);
+                bReg[g * VEC + 0] = v.x;
+                bReg[g * VEC + 1] = v.y;
+                bReg[g * VEC + 2] = v.z;
+                bReg[g * VEC + 3] = v.w;
+            }
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 #pragma unroll
@@ -216,16 +220,19 @@ extern "C" __global__ void craton_gemm_f32(
         __syncthreads();
     }
 
-    // ---- store, guarded ----
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
-        const int gRow = row0 + threadRow + i;
+        // Accumulator i belongs to group i/VEC, which sits
+        // g*(BM/A_GROUPS) rows into the tile.
+        const int localRow = ty * VEC + (i / VEC) * (BM / A_GROUPS) + (i % VEC);
+        const int gRow = row0 + localRow;
         if (gRow >= M) {
             continue;
         }
         #pragma unroll
         for (int j = 0; j < TN; ++j) {
-            const int gCol = col0 + threadCol + j;
+            const int localCol = tx * VEC + (j / VEC) * (BN / B_GROUPS) + (j % VEC);
+            const int gCol = col0 + localCol;
             if (gCol < N) {
                 C[gRow * N + gCol] = acc[i][j];
             }
@@ -233,137 +240,64 @@ extern "C" __global__ void craton_gemm_f32(
     }
 }
 
+// Widening functors. Passing these rather than branching keeps the fp16
+// conversion out of the inner product entirely.
+struct LoadF32 {
+    __device__ __forceinline__ float operator()(float v) const { return v; }
+};
+struct LoadF16 {
+    __device__ __forceinline__ float operator()(__half v) const {
+        return __half2float(v);
+    }
+};
+
 // -------------------------------------------------------------------------
-// C[M,N] = A[M,K] * B[K,N] with fp16 inputs and an fp32 accumulator.
-//
-// Identical structure; the operands are converted to float as they enter
-// shared memory, so the inner product is the same fp32 arithmetic. The
-// accumulator is not negotiable: summing K terms in half loses accuracy
-// fast enough to show in generated tokens at the K a transformer uses.
-//
-// Deliberately NOT wmma/tensor cores. Those need the operand fragments in
-// a specific layout and add a correctness surface that is hard to check
-// against a CPU reference. Worth revisiting now that the shared-memory
-// bottleneck is gone, but it is a separate change with its own risks.
+// The four GEMM entry points. Small tile for shapes that would not make
+// enough 128x128 blocks to fill the device; large tile above that.
 // -------------------------------------------------------------------------
-extern "C" __global__ void craton_gemm_f16(
-    const __half* __restrict__ A,
-    const __half* __restrict__ B,
-    float* __restrict__ C,
-    int M, int N, int K,
-    int as0, int as1,      // see craton_gemm_f32 for the stride convention
-    int bs0, int bs1)
+
+extern "C" __global__ void craton_gemm_f32(
+    const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K,
+    int as0, int as1, int bs0, int bs1)
 {
-    __shared__ __align__(16) float As[BK][BM];
-    __shared__ __align__(16) float Bs[BK][BN];
+    gemm_body<64, 64, 4, 4>(A, B, C, M, N, K, as0, as1, bs0, bs1, LoadF32{});
+}
 
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int tid = ty * THREADS_X + tx;
+extern "C" __global__ void craton_gemm_f32_lg(
+    const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K,
+    int as0, int as1, int bs0, int bs1)
+{
+    gemm_body<128, 128, 8, 8>(A, B, C, M, N, K, as0, as1, bs0, bs1, LoadF32{});
+}
 
-    const int row0 = blockIdx.y * BM;
-    const int col0 = blockIdx.x * BN;
+extern "C" __global__ void craton_gemm_f16(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K,
+    int as0, int as1, int bs0, int bs1)
+{
+    gemm_body<64, 64, 4, 4>(A, B, C, M, N, K, as0, as1, bs0, bs1, LoadF16{});
+}
 
-    const int threadRow = ty * TM;
-    const int threadCol = tx * TN;
-
-    float acc[TM][TN];
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            acc[i][j] = 0.0f;
-        }
-    }
-
-    const int tiles = (K + BK - 1) / BK;
-
-    for (int t = 0; t < tiles; ++t) {
-        const int kBase = t * BK;
-
-        #pragma unroll
-        for (int f = tid; f < BM * BK; f += THREADS) {
-            const int m = f / BK;
-            const int kk = f % BK;
-            const int gRow = row0 + m;
-            const int gCol = kBase + kk;
-            As[kk][m] = (gRow < M && gCol < K)
-                    ? __half2float(A[gRow * as0 + gCol * as1])
-                    : 0.0f;
-        }
-
-        #pragma unroll
-        for (int f = tid; f < BK * BN; f += THREADS) {
-            const int kk = f / BN;
-            const int n = f % BN;
-            const int gRow = kBase + kk;
-            const int gCol = col0 + n;
-            Bs[kk][n] = (gRow < K && gCol < N)
-                    ? __half2float(B[gRow * bs0 + gCol * bs1])
-                    : 0.0f;
-        }
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            // One 128-bit load each instead of four 32-bit ones.
-            //
-            // The scalar form read Bs[kk][tx*4 + j]: across a warp that is
-            // a stride of 4 floats, which over 32 banks lands on only
-            // 32/gcd(4,32) = 8 distinct banks and costs a 4-way conflict
-            // on every access. A float4 load is a single transaction per
-            // thread and consecutive threads cover consecutive 16-byte
-            // chunks, so the warp sweeps the banks exactly once.
-            //
-            // Legal because both tiles are __align__(16) and both
-            // threadRow and threadCol are multiples of 4 floats.
-            const float4 a4 = *reinterpret_cast<const float4*>(&As[kk][threadRow]);
-            const float4 b4 = *reinterpret_cast<const float4*>(&Bs[kk][threadCol]);
-            const float aReg[TM] = {a4.x, a4.y, a4.z, a4.w};
-            const float bReg[TN] = {b4.x, b4.y, b4.z, b4.w};
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] = fmaf(aReg[i], bReg[j], acc[i][j]);
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        const int gRow = row0 + threadRow + i;
-        if (gRow >= M) {
-            continue;
-        }
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            const int gCol = col0 + threadCol + j;
-            if (gCol < N) {
-                C[gRow * N + gCol] = acc[i][j];
-            }
-        }
-    }
+extern "C" __global__ void craton_gemm_f16_lg(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K,
+    int as0, int as1, int bs0, int bs1)
+{
+    gemm_body<128, 128, 8, 8>(A, B, C, M, N, K, as0, as1, bs0, bs1, LoadF16{});
 }
 
 // -------------------------------------------------------------------------
-// Bulk fp16 -> fp32 and fp32 -> fp16 conversion.
+// Bulk fp16 <-> fp32 conversion.
 //
-// The host side needs these to move a weight tensor onto the device
-// without a per-element round trip, and to read a result back.
-// Element-wise and 1-D, so they could in principle be lowered from Java
+// Element-wise and 1-D, so these could in principle be lowered from Java
 // bytecode -- but Java has no half type, so a Java kernel would have to
 // take short[] and do the bit manipulation by hand, in a lowering that
 // has no fp16 support to lower it to.
 // -------------------------------------------------------------------------
 extern "C" __global__ void craton_h2f(
-    const __half* __restrict__ src,
-    float* __restrict__ dst,
-    int n)
+    const __half* __restrict__ src, float* __restrict__ dst, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -372,9 +306,7 @@ extern "C" __global__ void craton_h2f(
 }
 
 extern "C" __global__ void craton_f2h(
-    const float* __restrict__ src,
-    __half* __restrict__ dst,
-    int n)
+    const float* __restrict__ src, __half* __restrict__ dst, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {

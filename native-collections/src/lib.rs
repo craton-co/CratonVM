@@ -12190,6 +12190,19 @@ pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// reads a bit out of the per-`ClassId` classification memo; see
 /// `CF_TREE_MAP` and the module comment on `class_facts`.
 #[inline]
+/// True when `this` is a `java/util/PriorityQueue`.
+///
+/// By class name rather than a `receiver_facts` bit on purpose: the two callers
+/// are the values-view resync guard and the removal router, both of which run
+/// once per iterator `remove()` or once per view rebuild — not on the
+/// per-element read path the memoized bits exist for. Adding a bit would cost
+/// every classification in the crate to serve two cold sites.
+fn is_priority_queue_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .map(|n| &*n == "java/util/PriorityQueue")
+        .unwrap_or(false)
+}
+
 fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     receiver_facts(ctx, this).has(CF_TREE_MAP)
 }
@@ -17167,6 +17180,19 @@ fn resync_values_view(
         Some(s) => s,
         None => return Ok(list),
     };
+    // A QUEUE SOURCE IS NOT REBUILT HERE. `native_pq_iterator` puts a
+    // `PriorityQueue` behind this marker so its iterator's `remove()` can write
+    // through; the read direction must not follow, because `collect_entries_any`
+    // below knows the six MAP families and a queue is none of them -- it would
+    // answer nothing and rebuild the snapshot as EMPTY, on the `next()` path.
+    // The snapshot is also the only correct content: it is in heap order, taken
+    // once, exactly as `PriorityQueue$Itr` iterates.
+    //
+    // Same shape, and the same reason, as `resync_ts_view`'s
+    // `is_tree_map_receiver` guard: only a MAP source is rebuilt.
+    if is_priority_queue_receiver(&*ctx, source) {
+        return Ok(list);
+    }
     let list_pin = ctx.pin_native_root(list);
     let source_pin = ctx.pin_native_root(source);
     let list = ctx.read_native_pin(list_pin, list);
@@ -17732,6 +17758,13 @@ fn propagate_list_removal(
     source: ObjectRef,
     removed: Value,
 ) -> Result<(), MethodCallFailed> {
+    // A QUEUE SOURCE removes by VALUE through its own native, which owns the
+    // sift-down the heap invariant needs -- deleting a `PriorityQueue`'s
+    // element by index or by map-key would leave the heap unordered.
+    if is_priority_queue_receiver(&*ctx, source) {
+        let _ = native_pq_remove(ctx, &[Value::Object(Some(source)), removed])?;
+        return Ok(());
+    }
     if let Value::Object(Some(e)) = removed {
         let cls = ctx
             .class_name_of_id(ctx.class_id_of_object(e))
@@ -42630,10 +42663,14 @@ fn native_ll_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             Value::Object(Some(_)) => Some(ctx.class_id_of_object(template_ref)),
             _ => None,
         };
-        rooted_across(ctx, &mut [&mut this, &mut template_ref], |ctx| match want_comp {
-            Some(comp) => ctx.new_ref_array(comp, size),
-            None => alloc_ref_array(ctx, size),
-        })
+        rooted_across(
+            ctx,
+            &mut [&mut this, &mut template_ref],
+            |ctx| match want_comp {
+                Some(comp) => ctx.new_ref_array(comp, size),
+                None => alloc_ref_array(ctx, size),
+            },
+        )
     };
     let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
@@ -46498,10 +46535,27 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = pq_state(ctx, this);
-    // GC-safety: the allocation can move the heap buffer we copy out of.
+    // GC-safety: the allocation can move the heap buffer we copy out of -- and
+    // the receiver, which now goes into the array too, so it is rooted across
+    // the allocation alongside the buffer.
     let mut buf_ref = data.unwrap_or(this);
-    let arr = rooted_across(ctx, &mut [&mut buf_ref], |ctx| {
-        alloc_ref_array(ctx, size as usize)
+    let mut this_ref = this;
+    // ONE SLOT LONGER THAN THE SIZE, with the queue in the trailing slot: that
+    // is the `values()`-view marker `values_view_source` reads, and it is what
+    // makes `iterator().remove()` write through to the queue instead of into a
+    // disconnected snapshot. MEASURED (`apps/probes/PqOptionalShadowSweep`):
+    // `size()` answered 3 after an `iterator().remove()` where HotSpot answers
+    // 2.
+    //
+    // Nothing but this iterator can ever see the wrapper -- it is minted below,
+    // handed to the `ArrayList$Itr`, and never returned to the caller -- so the
+    // marker's blast radius is the natives THIS iterator reaches, not every
+    // consumer of the marker. Two had to learn a source can be a queue:
+    // `resync_values_view` (reached from `al_state_for_read` on every `next()`)
+    // and `propagate_list_removal`. Both changed for a `PriorityQueue` source
+    // ONLY, so no source that exists today changes behaviour.
+    let arr = rooted_across(ctx, &mut [&mut buf_ref, &mut this_ref], |ctx| {
+        alloc_ref_array(ctx, size as usize + 1)
     });
     let data = data.map(|_| buf_ref);
     if let Some(buf) = data {
@@ -46510,6 +46564,7 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_array_element(arr, i, elem);
         }
     }
+    ctx.set_array_element(arr, size as usize, Value::Object(Some(this_ref)));
     // Return an `ArrayList$Itr` over an ArrayList-shaped wrapper holding the
     // heap-order snapshot, rather than a `PriorityQueue$Itr` with the snapshot
     // in slot 0. In real-JDK mode `try_alloc_synthetic("java/util/PriorityQueue$Itr")?`
