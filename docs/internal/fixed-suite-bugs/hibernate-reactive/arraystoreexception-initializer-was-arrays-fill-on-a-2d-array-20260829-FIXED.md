@@ -67,16 +67,24 @@ The two sides can never be equal for an array-valued element, because they are
 one dimension apart by construction. That comparison is wrong in both
 directions, and it produced:
 
-1. **A false refusal.** Fixed on `dev` earlier the same day by `da5638fde`
+1. **A false refusal.** Closed on `dev` earlier the same day by `da5638fde`
    ("fix(charset): `Arrays.fill(Object[], Object)` refused a primitive-array
    component"), which was filed against `sun.nio.cs.HKSCS$Encoder.initc2b`'s
    `Arrays.fill(c2b, C2B_UNMAPPABLE)` breaking every Big5-HKSCS/MS950_HKSCS
    charset's static init. Same line, same cause, a completely different
-   symptom — and the reactive suite run that produced this page used a binary
-   built before it. **MEASURED after that fix, before any change of this
-   page's:** the exact shape, against the real `Initializer` interface on
-   hibernate-core's own classpath, passes on both VMs, and all nine classes
-   pass (table below).
+   symptom. That commit added a fallback to the shared `aastore` predicate
+   under the `ClassId` comparison, and the shared predicate answers the
+   two-dimensional shape correctly.
+
+   **MEASURED on `dev@84a98929e` BEFORE any change of this page's**: the exact
+   `EmbeddableInitializerImpl.fill` shape, against the real `Initializer`
+   interface on hibernate-core's own classpath, passes on both VMs, and all
+   nine classes pass against a live Postgres (table below). What cannot be
+   re-checked is the failing run's own binary — it lived at
+   `CratonVM/target-tomcat-parallel/release/cratonvm.exe`, which no longer
+   exists — so "the 07:24 run predated the fallback" is the explanation the
+   code supports, not something this page measured. The claim that IS measured
+   is the one that matters for the nine classes: on the tip, they pass.
 2. **A wrong message**, which `da5638fde` left standing because it only touched
    the predicate. `Arrays.fill((Object[]) new String[3][], new Integer[0])` is a
    store that SHOULD throw, and this VM named `java.lang.Integer` where HotSpot
@@ -142,7 +150,7 @@ distinguishes a gate from a decoration.
 Re-run on `dev@84a98929e` against a live Postgres via Testcontainers,
 `run-hibernate-reactive-suite.sh --shards 1`, 2026-08-29:
 
-| class | before (2026-08-29 07:24 run, pre-`da5638fde` binary) | after |
+| class | 2026-08-29 07:24 run (binary no longer available) | on `dev@84a98929e` |
 |---|---|---|
 | `EagerElementCollectionForEmbeddableEntityTypeMapTest` | FAIL 12/0 | **PASS 12/12** |
 | `EagerElementCollectionForEmbeddableTypeListTest` | FAIL 31/0 | **PASS 31/31** |
@@ -153,6 +161,27 @@ Re-run on `dev@84a98929e` against a live Postgres via Testcontainers,
 | `EmbeddedIdWithManyEagerTest` | FAIL 3/0 | **PASS 3/3** |
 | `EmbeddedIdWithManyTest` | FAIL 2/0 | **PASS 2/2** |
 | `EmbeddedIdWithOneToOneTest` | FAIL 1/0 | **PASS 1/1** |
+
+`status: PASS=9` in 4m9s. Re-run again on the binary carrying THIS page's
+change (`cratonvm-hibloc-fixed.exe`): `status: PASS=9` in 3m49s, same
+per-class `found`/`ok`. So the message repair does not disturb the nine, which
+is the only thing it could have done to them — they were already green.
+
+## "Does this reproduce on H2 too?" — the open page's fourth question
+
+MEASURED: **no ArrayStoreException appears anywhere in the same day's H2
+complete-suite run** — `apps/hib-suite-runner/runs/run-20260829-000921-passed`,
+4548 classes, `PASS=4438 FAIL=10 CRASH=1`, `grep -c ArrayStoreException
+shard-0/raw.log` = **0**. So in practice it was reactive-only.
+
+The mechanism is not, though, and the distinction matters for anyone who meets
+it again. `EmbeddableInitializerImpl` is hibernate-ORM code; the failing call
+touches no driver, no connection and no dialect; and the reduced shape
+(`RArrayStoreLibrary` `s01`) reproduces with no database at all. What decides
+whether a run meets it is which embeddable result graphs the suite happens to
+build — and, for these two runs, which binary each used. It is not a property
+of Postgres, of Vert.x, or of the reactive executor whose frame the stack
+happens to name.
 
 ## What the open page got right, and what it cost to not check
 

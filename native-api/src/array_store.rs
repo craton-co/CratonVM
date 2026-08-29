@@ -118,8 +118,10 @@ pub fn reject_unstorable(
 /// not go through the class table at all, which is exactly what the component
 /// -vs- array ambiguity needs. Same rebuild rule as `array_descriptor_of`.
 ///
-/// MEASURED on HotSpot 25.0.3+9-LTS (`scratchpad` probe `AseDoors`, one
-/// execution per shape so nothing is in the fast-throw regime):
+/// MEASURED on HotSpot 25.0.3+9-LTS, one execution per shape so nothing is in
+/// the fast-throw regime. The durable form of these rows is
+/// `regression-suite/src/RArrayStoreLibrary.java` (`s09`, `s10`, `s08`), which
+/// diffs both VMs' own answers against each other:
 ///
 /// ```text
 /// Arrays.fill((Object[]) new String[3],   Integer.valueOf(1))  ArrayStoreException: java.lang.Integer

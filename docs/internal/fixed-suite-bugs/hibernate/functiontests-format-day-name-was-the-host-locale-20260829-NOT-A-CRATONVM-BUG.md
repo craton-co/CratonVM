@@ -47,6 +47,48 @@ locale for this `format()`" — dissolves: the value is rendered by H2's
 `Locale.getDefault()`. Both JVMs read that from the OS, which is what they are
 supposed to do.
 
+## The whole class, and why the without-pair count is bigger than one
+
+MEASURED, one run each, full `FunctionTests` class through `CratonRunner`:
+
+| arm | result |
+|---|---|
+| real HotSpot, pair supplied | `found=123 started=117 ok=117 failed=0 skipped=6` |
+| CratonVM, pair supplied | `found=123 started=117 ok=117 failed=0 skipped=6` — byte-identical counts |
+| real HotSpot, no pair | `ok=99 failed=18` |
+| CratonVM, no pair | `ok=110 failed=7` |
+
+The two without-pair numbers are NOT eighteen and seven independent locale
+defects, and the difference between them is not a divergence worth chasing.
+Re-run one at a time with no pair, each in its own JVM, `testHyperbolic`,
+`testFormatTime` and `testCastFunction` all PASS
+(`ok=1 failed=0`). The class shares one `SessionFactory` and one H2 database
+across its methods, so `testFormat`'s failed assertion inside `inTransaction`
+leaves state behind and the rest of the class fails downstream of it. The clean
+per-method A/B is the four-row table above; the class-level figures are a
+cascade, and the only thing they establish is that the pair takes the class from
+red to green on BOTH VMs with matching counts.
+
+## Adding the pair costs nothing elsewhere — measured, not assumed
+
+The pair is what hibernate-orm's own build already uses, so it cannot be
+"wrong"; what it could still be is a change that flips some OTHER class from
+green to red on this host. A twelve-class locale-sensitive slice
+(`FunctionTests`, `StandardFunctionTests`, `BasicFormatterTest`,
+`DdlFormatterTest`, `LocaleMappingTests`, `CurrencyMappingTests`,
+`LocalDateTime`/`ZonedDateTime`/`OffsetDateTimeMappingTests`,
+`DateTimeParameterTest`, `MaskSensitiveInformationTest`,
+`ZonedDateTimeConverterTest`), three arms, one run each:
+
+* **`craton-en` matches `hotspot-en` on all twelve classes**, `ok`/`failed`
+  identical on every row.
+* `craton-host` (no pair) differs on exactly TWO of the twelve —
+  `FunctionTests` 110/7 and `StandardFunctionTests` 42/2. The other ten are
+  green with or without it.
+
+So the pair moves precisely the two classes the open page named and nothing
+else in the neighbourhood it could plausibly have moved.
+
 ## Why the suite was asking for the failure
 
 hibernate-orm's own Gradle build sets the pair on every test JVM:
