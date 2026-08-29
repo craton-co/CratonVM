@@ -28384,9 +28384,24 @@ fn invoke_on_class_shared_inner(
             }
         } else {
             let full_sig = format!("{class_name}.{method_name}{descriptor}");
+            // Name the mode this VM is actually in. The line used to say
+            // "real-JDK mode" unconditionally, which is wrong in the one
+            // configuration whose gaps had never been catalogued: a first
+            // `--synthetic-jdk` corpus run (2026-08-29, P4-B) produced 53
+            // distinct missing natives and every one of them claimed to come
+            // from real-JDK mode. A reader's first move on seeing that is to
+            // conclude the run was misconfigured.
+            let mode = if shared.compatibility_mode().is_jdk_only() {
+                "jdk-only mode"
+            } else if shared.config.use_synthetic_jdk {
+                "synthetic-JDK mode"
+            } else {
+                "real-JDK mode"
+            };
             tracing::warn!(
                 method = %full_sig,
-                "Missing native method in real-JDK mode"
+                mode = %mode,
+                "Missing native method"
             );
             // Record in structured audit log if enabled
             if shared.config.audit_missing_natives {
