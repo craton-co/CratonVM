@@ -1897,7 +1897,31 @@ Three things this does NOT claim:
   apart. `0 collisions` on both runs is why the numbers above are trustworthy;
   a non-zero there discounts the run.
 
-### 8. `frame_cov=(… incomplete=N …)` did not need a new instrument
+### 8. The cross-thread coverage handshake DOES decide something — on a
+### many-threaded class
+
+§"Still open" carried: *"The cross-thread coverage handshake decides nothing
+yet. It is built, default-ON, and `xt_cov=(accepted=0 refused=0 deposits=0)` on
+this workload — no peer was ever in compiled code at a collection here. It
+removes a blanket refusal that a genuinely many-threaded workload would hit;
+that claim is untested because this class does not produce the condition."*
+
+Run on a class that DOES produce the condition — `org.h2.test.db.TestMultiThread`,
+`CRATONVM_DBG_JIT_ROOTSCAN=1`, 2026-08-29 tip:
+
+```text
+frame_cov=(no_slot=0 misaligned=0 no_map=6 incomplete=0 ok=372)
+xt_cov=(accepted=1 refused=8 deposits=26)
+```
+
+**26 deposits, 1 accepted, 8 refused.** The handshake is consulted, and it both
+admits and refuses. The residual was never "it is broken", it was "nobody has
+run it on a workload that reaches it"; this is that run. `rc=0` on the same run.
+
+`no_map=6 of 378` on the same line, and `incomplete=0` — that class is not where
+the §"Follow-up 2026-08-27" `incomplete` residual lives.
+
+### 9. `frame_cov=(… incomplete=N …)` did not need a new instrument
 
 §"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the
 first time anywhere that a map refuses on its OWN claim rather than being
