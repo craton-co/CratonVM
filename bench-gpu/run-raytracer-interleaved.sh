@@ -39,7 +39,9 @@ ITERS="${ITERS:-30}"
 XMX="${XMX:-}"
 CV_HEAP=(); HS_HEAP=(); TORNADO_HEAP=()
 if [ -n "$XMX" ]; then
-  CV_HEAP=(--Xmx "$XMX"); HS_HEAP=("-Xmx$XMX"); TORNADO_HEAP=("--jvm" "-Xmx$XMX")
+  # `--jvm=-Xmx...`, joined: tornado.py's argparse reads a separate
+  # `-Xmx10g` as an option of its own and refuses the command.
+  CV_HEAP=(--Xmx "$XMX"); HS_HEAP=("-Xmx$XMX"); TORNADO_HEAP=("--jvm=-Xmx$XMX")
 fi
 # HotSpot best-of at 640x480 on this box with nothing else running. Scaled
 # by pixel count for other resolutions; the kernel is very close to linear

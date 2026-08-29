@@ -900,6 +900,10 @@ pub const INVENTORY: &[E] = &[
     // a change on this host is to run one binary both ways in the same
     // minutes.
     E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: Some("0") },
+    // The budget the same feature spends, in weighted PTX instructions per
+    // converted pair. Declared beside its switch so one binary can sweep the
+    // curve; the default lives in `jit-cuda`.
+    E { group: Group::JIT, token: "gpu-if-convert-max-ops", on_key: Some("CRATONVM_GPU_IF_CONVERT_MAX_OPS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
     // A/B lever, never a supported configuration: restore the pre-fix
     // substitution of "slot 0, tagged int" for a field site the VM-side

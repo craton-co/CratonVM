@@ -29,6 +29,8 @@ shift
 JDK="${JDK:-C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot}"
 GPU_JAR="${GPU_JAR:?set GPU_JAR to the craton-gpu annotations jar}"
 ITERS="${ITERS:-20}"
+# 11520x6480 is an `int[]` of 298 MB and every arm allocates one.
+XMX="${XMX:-8g}"
 CP="$HERE_W;$GPU_JAR"
 
 "$JDK/bin/javac" -cp "$GPU_JAR" -d "$HERE" \
@@ -40,31 +42,44 @@ if [ "$#" -eq 0 ]; then
   set -- 1920 1440 3840 2160 7680 4320
 fi
 
+# ROUNDS passes over each size, floor and tracer alternating inside a round,
+# and the MINIMUM taken per arm across rounds. Contention on this box only
+# ever makes a run slower, so a minimum is the robust estimator; a mean is
+# not, and one loaded pass through a size can otherwise put the tracer below
+# its own floor. Earlier passes on a loaded box produced exactly that, and a
+# negative fitted fixed cost with it.
+ROUNDS="${ROUNDS:-3}"
+
 tmp="$(mktemp)"
 printf '%-14s %10s %12s %12s %12s\n' resolution pixels floor_ms tracer_ms compute_ms
 while [ "$#" -ge 2 ]; do
   W="$1"; H="$2"; shift 2
   N=$((W * H))
-  # Interleaved within the size, floor first then tracer then floor again,
-  # so a drift across the pair shows up as disagreement between the two
-  # floor readings rather than as compute.
-  f1=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx 6g -cp "$CP" \
-        GpuTransferFloor "$N" "$ITERS" 2>/dev/null | best)
-  t=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx 6g -cp "$CP" \
-        RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null | best)
-  f2=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx 6g -cp "$CP" \
-        GpuTransferFloor "$N" "$ITERS" 2>/dev/null | best)
-  f=$(awk -v a="$f1" -v b="$f2" 'BEGIN { printf "%.4f", (a+0 < b+0 ? a : b) }')
-  c=$(awk -v t="$t" -v f="$f" 'BEGIN { printf "%.4f", t - f }')
-  printf '%-14s %10s %12s %12s %12s\n' "${W}x${H}" "$N" "$f" "$t" "$c"
-  echo "$N $f $t" >> "$tmp"
+  bf=""; bt=""
+  for r in $(seq 1 "$ROUNDS"); do
+    if [ $((r % 2)) -eq 1 ]; then
+      f=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx "$XMX" -cp "$CP" \
+            GpuTransferFloor "$N" "$ITERS" 2>/dev/null | best)
+      t=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx "$XMX" -cp "$CP" \
+            RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null | best)
+    else
+      t=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx "$XMX" -cp "$CP" \
+            RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null | best)
+      f=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx "$XMX" -cp "$CP" \
+            GpuTransferFloor "$N" "$ITERS" 2>/dev/null | best)
+    fi
+    bf=$(awk -v a="$bf" -v b="$f" 'BEGIN { printf "%.4f", (a == "" || b+0 < a+0) ? b : a }')
+    bt=$(awk -v a="$bt" -v b="$t" 'BEGIN { printf "%.4f", (a == "" || b+0 < a+0) ? b : a }')
+  done
+  c=$(awk -v t="$bt" -v f="$bf" 'BEGIN { printf "%.4f", t - f }')
+  printf '%-14s %10s %12s %12s %12s\n' "${W}x${H}" "$N" "$bf" "$bt" "$c"
+  echo "$N $bf $bt" >> "$tmp"
 done
 
 echo
 awk '{ n[NR]=$1; f[NR]=$2; t[NR]=$3; c++ }
      END {
        if (c < 2) { print "need at least two sizes to fit a line"; exit }
-       # Least squares on the FLOOR points: floor = fixed + per_px * n.
        for (i = 1; i <= c; i++) { sx += n[i]; sy += f[i]; sxx += n[i]*n[i]; sxy += n[i]*f[i] }
        slope = (c*sxy - sx*sy) / (c*sxx - sx*sx)
        icpt  = (sy - slope*sx) / c

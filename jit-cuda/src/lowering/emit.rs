@@ -169,23 +169,45 @@ struct IfConversion {
     join: usize,
 }
 
-/// Whether a speculated arm's emitted PTX may run unconditionally.
+/// Whether a speculated arm's emitted PTX may run unconditionally, and
+/// what it costs to do so.
 ///
 /// See [`Emitter::try_emit_if_converted`] for why this reads the PTX and
-/// not the bytecode. The line cap is not a correctness rule: both arms run
-/// on every lane, so converting a long one trades a branch the warp might
-/// never have diverged on for arithmetic it certainly will execute.
-fn speculatable(text: &str) -> bool {
-    const MAX_LINES: usize = 24;
-    let mut lines = 0usize;
+/// not the bytecode. `None` means "not speculatable at any price";
+/// `Some(cost)` is a weighted instruction count the caller compares
+/// against its budget.
+///
+/// # Why a weighted count and not a plain one
+///
+/// Both arms run on every lane, so converting trades a branch the warp
+/// might never have diverged on for arithmetic it certainly executes.
+/// Whether that is a win depends on what the arithmetic COSTS, not on how
+/// many lines it takes: the ray tracer's
+/// `disc > 0f ? (float) Math.sqrt(disc) : 1e9f` is one instruction per
+/// arm, and one of them is `sqrt.rn.f32`, which `ptxas` expands into a
+/// `MUFU.RSQ` and a Newton-Raphson chain. Speculating it on a warp whose
+/// lanes all miss the sphere -- which is most of a frame's background --
+/// buys a removed `BSSY`/`BSYNC` pair and pays for a square root nobody
+/// wanted. Measured on this kernel, the plain-count version of this
+/// screen made the compute half 56% SLOWER.
+fn speculation_cost(text: &str) -> Option<u32> {
+    /// What one instruction counts as. `1` for ordinary ALU work; the
+    /// multi-instruction expansions are what a plain count gets wrong.
+    fn weight(t: &str) -> u32 {
+        const EXPENSIVE: [&str; 7] = [
+            "sqrt.", "div.rn", "div.rz", "div.rm", "div.rp", "rcp.", "ex2.",
+        ];
+        if EXPENSIVE.iter().any(|m| t.contains(m)) {
+            16
+        } else {
+            1
+        }
+    }
+    let mut cost = 0u32;
     for line in text.lines() {
         let t = line.trim();
         if t.is_empty() {
             continue;
-        }
-        lines += 1;
-        if lines > MAX_LINES {
-            return false;
         }
         if t.ends_with(':')
             || t.starts_with('@')
@@ -200,11 +222,34 @@ fn speculatable(text: &str) -> bool {
             || t.contains("call")
             || t.contains("ret;")
         {
-            return false;
+            return None;
         }
+        cost = cost.saturating_add(weight(t));
     }
-    true
+    Some(cost)
 }
+
+/// The most a pair of speculated arms may cost, in the units
+/// [`speculation_cost`] counts.
+///
+/// `CRATONVM_GPU_IF_CONVERT_MAX_OPS` overrides it, so one binary can sweep
+/// the whole curve in one sitting -- which is the only way to pick this
+/// number on a host that does not hold a clock still between two builds.
+///
+/// The default is measured, not chosen: see
+/// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
+fn if_conversion_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT_MAX_OPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_IF_CONVERSION_BUDGET)
+    })
+}
+
+/// See [`if_conversion_budget`].
+const DEFAULT_IF_CONVERSION_BUDGET: u32 = 8;
 
 /// `CRATONVM_GPU_IF_CONVERT=0` restores the pre-2026-08-29 lowering, in
 /// which every `cond ? a : b` stayed a branch.
@@ -1147,10 +1192,13 @@ impl<'a> Emitter<'a> {
         };
 
         self.body = real_body;
+        let budget = if_conversion_budget();
+        let cost = speculation_cost(&then_text)
+            .zip(speculation_cost(&else_text))
+            .map(|(a, b)| a.saturating_add(b));
         let usable = then_ok.is_ok()
             && else_ok.is_ok()
-            && speculatable(&then_text)
-            && speculatable(&else_text)
+            && cost.is_some_and(|c| c <= budget)
             && then_state.stack.0.len() == else_state.stack.0.len();
         if !usable {
             self.stack = saved.stack;

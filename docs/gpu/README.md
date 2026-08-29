@@ -318,6 +318,33 @@ Beyond the original narrow shape, the analyzer now admits:
   `AdmissionHint::AllowIntrinsicCalls` like the `Math` table. Exact:
   widening f16 to f32 has no rounding mode to choose, denormals, NaNs
   and infinities included.
+- **A bare scalar loop bound** — `for (int i = 0; i < n; i++)` where `n`
+  is an unmodified `int` PARAMETER, not an array length. The bytecode is
+  identical to a hoisted `arr.length`, so the recognizer tells them apart
+  by what defined the local; a parameter the method stores to is still
+  rejected, because the grid is sized from the ARGUMENT while the guard
+  compares against whatever the local holds. Unlike the `.length` forms
+  this is not a free acceptance: the launch grid is otherwise sized from
+  the largest array argument and a scalar bound can exceed every one of
+  them, so `emitter::WorkBound::ParamScalar` carries the parameter index
+  to the dispatch site, which sizes the grid from
+  `max(largest array length, that parameter's runtime value)`. A 2-D
+  rectangular nest bounded by two scalars is still rejected — its trip
+  count is `rows * cols`, a product, and `WorkBound` names one parameter.
+  `EligibleScalarBound.java` is the fixture.
+- **A ternary lowered without a branch.** `cond ? a : b` becomes two
+  unconditional computations and one `selp` when both arms are single
+  basic blocks whose emitted PTX holds no label, branch, predicated
+  instruction or memory access — which is what makes running both of them
+  sound. The screen reads the emitted PTX rather than an opcode list, so
+  it cannot drift from the lowering it is judging; an array access is
+  caught by its own bounds check's branch. A nested ternary converts its
+  inner diamond and keeps the outer branch, and a short-circuit `&&` (two
+  conditional branches to one else-label) keeps both. Kernels in this tree
+  are written branchlessly on purpose and the lowerer used to turn them
+  back into branches, at 18% of the ray tracer's SASS in `BRA` plus
+  `BSSY`/`BSYNC`/`BMOV` reconvergence triples. `CRATONVM_GPU_IF_CONVERT=0`
+  restores the branching form; `EligibleTernary.java` is the fixture.
 - **`Math.exp`** → `ex2.approx.f32` of `x * log2(e)`, and only when
   `CRATONVM_GPU_APPROX_MATH=1` is set. It is the one entry in the
   table that is not bit-exact with the JDK (about 2 ULP against

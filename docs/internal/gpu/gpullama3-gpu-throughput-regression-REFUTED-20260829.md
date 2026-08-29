@@ -2,10 +2,12 @@
 
 **Status: REFUTED 2026-08-29.** There is no regression. The two binaries
 were re-measured interleaved on the same host, and the one accused of being
-42% slower is 5% FASTER. What the original record measured was this box's
-CPU boost state, sampled an hour apart in two blocks; the mechanism is
-CratonVM's GPU path being host-dispatch-bound, which this tree had already
-written down on 2026-08-23 and which is reproduced on demand below.
+42% slower is 5% FASTER. What the original record compared was two windows
+an hour apart on a host whose throughput on this workload moves by 2x
+between windows -- a larger difference than any change anyone has landed on
+this path. The mechanism underneath that is CratonVM's GPU path being
+host-dispatch-bound, which this tree wrote down on 2026-08-23 and which
+section 3 reproduces on demand.
 
 Supersedes the open record
 `gpullama3-gpu-throughput-regression-after-bulk-marshal-20260829.md`, written
@@ -29,9 +31,10 @@ byte-identical on both, so it was recorded as a pure throughput regression.
 
 Both blocks are real measurements. What makes them not an A/B is that all
 of arm A ran in one block and all of arm B in another, an hour apart, on a
-host whose CPU availability moves on that timescale — the same design flaw
+host that does not hold still for an hour — the same design flaw
 `bench-gpu/run-raytracer-interleaved.sh` exists to avoid, and whose header
-comment says so in as many words.
+comment says so in as many words. "Reproduced 5x in isolation" is not a
+defence: five consecutive runs inside one window all see that window.
 
 ## 2. The interleaved re-measurement
 
@@ -78,6 +81,18 @@ the application's own `-Dllama.craton.verbose=true`:
 13.2 tok/s is the record's regime, produced from a binary that is not
 slower, by taking CPU away from it.
 
+**That is a sufficient cause, not a proof of what happened at 09:43.**
+Later the same day, on a box with nothing else running, six interleaved
+rounds of the same pair produced arm means spanning 11.6 to 22.6 tok/s
+while a fixed single-threaded HotSpot CPU render measured in the same
+rounds held within 5% (23.0 to 24.2 ms). So the host's CPU clock is not the
+only thing that moves this workload. An idle RTX 2060 on this box sits at
+`P8` and 300 MHz against a 2100 MHz maximum, and a 32-token run is 1.4 s of
+device work; whether that ramp accounts for the rest was not separated
+here. What is established is the pair of facts that matter: the accused
+binary is not slower, and the regime the record recorded is reachable from
+host state alone.
+
 Read the two middle columns together, because they are the whole finding:
 
 * `submit_ms` is HOST time spent building the token's 453 kernel
@@ -111,7 +126,11 @@ measured effect on this workload.
 # The interleaved A/B. Never compare two GPU binaries in separate blocks
 # on this host.
 A=<pre-merge cratonvm.exe> B=<post-merge cratonvm.exe> ROUNDS=6 \
-  bash bench-out/llama-ab.sh
+  bash bench-gpu/run-gpullama3-ab.sh
+
+# The same pair on host dispatch cost alone, with a per-round CPU control,
+# a GPU clock reading, and a count of the other builds on the box.
+A=... B=... ROUNDS=6 bash bench-gpu/run-gpullama3-submit-ab.sh
 
 # The mechanism, one binary, two host states.
 cd apps/GPULlama3.java
@@ -123,6 +142,10 @@ CRATON_EXTRA="-Dllama.craton.verbose=true" \
 ## 6. The rule this cost an afternoon to re-learn
 
 A CratonVM GPU number from this box is meaningful only beside the arm it is
-being compared against, measured in the same minutes. "Reproduced 5x in
-isolation" is not a defence: five consecutive runs inside one bad window all
-see the same bad window. Interleave, or do not compare.
+being compared against, measured in the same minutes. Interleave, or do not
+compare. `bench-gpu/run-gpullama3-ab.sh` and
+`bench-gpu/run-gpullama3-submit-ab.sh` exist so that is the easy thing to
+do; the second also prints the GPU's clock and how many other compiler
+processes are running, because this machine is shared between concurrent
+sessions and four other `rustc` processes have been observed
+mid-measurement.
