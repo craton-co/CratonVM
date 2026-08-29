@@ -1711,6 +1711,11 @@ pub const INVENTORY: &[E] = &[
     // Default ON; `0` restores the condvar-only wait that lost a delivered
     // `notifyAll()`, so the fix can be interleaved against itself on ONE binary.
     E { group: Group::THREADS, token: "monitor-pending-notify", on_key: Some("CRATONVM_MONITOR_PENDING_NOTIFY"), off_key: None, off_word: Some("0") },
+    // Windows only: bound a TIMED `LockSupport.park` with a high-resolution
+    // waitable timer instead of the condvar, whose timeout is rounded up to
+    // the 15.625 ms system tick. Default ON; `0` restores the condvar wait,
+    // so the netty scheduled-task cadence can be A/B'd on ONE binary.
+    E { group: Group::THREADS, token: "win-hires-park", on_key: Some("CRATONVM_WIN_HIRES_PARK"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "jca-lenient-getinstance", on_key: Some("CRATONVM_JCA_LENIENT_GETINSTANCE"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },

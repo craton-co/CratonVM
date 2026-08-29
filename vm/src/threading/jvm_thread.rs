@@ -165,6 +165,190 @@ impl Default for GcBlockState {
 }
 
 // ---------------------------------------------------------------------------
+// win_park — accurate timed parking on Windows
+// ---------------------------------------------------------------------------
+
+/// Windows timed waits are aligned to the system clock tick (15.625 ms by
+/// default), and a parked thread's *deadline* inherits that alignment:
+/// `WaitForSingleObject`, `SleepConditionVariableSRW`, a plain waitable timer
+/// and `parking_lot`'s condvar all return at the first tick at or after the
+/// requested instant, so a 50 ms wait measures 62.5 ms. `timeBeginPeriod(1)`
+/// does NOT lift it — measured on this host, every one of those primitives sat
+/// at p50 = 62.3 ms for a 50 ms request both before and after that call, with
+/// the system-wide resolution already reported as 1 ms.
+///
+/// The one primitive that is accurate is a waitable timer created with
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (Windows 10 1803+): p50 = 50.3 ms
+/// for the same request. It is what Rust's own `std::thread::sleep` uses,
+/// which is why `Thread.sleep` was already accurate here while every
+/// `LockSupport.parkNanos` deadline was not.
+///
+/// The visible cost of the tick alignment is not a slow park — the mean is
+/// right, because a scheduler like netty's re-arms from an ABSOLUTE deadline —
+/// it is a *periodic* one: four short cycles then one long one. A 50 ms
+/// fixed-rate task fires at 62.5, 109.4, 156.3, 203.1, 250.0 ms, i.e. gaps of
+/// 46.9 ms x4 then 62.5 ms. `AutoScalingEventExecutorChooserFactoryTest`
+/// polls its group every 50 ms and asserts on a state its monitor holds for
+/// exactly one cycle; a 46.9 ms cycle is shorter than the poll, so the state
+/// can be stepped over entirely and the test reads the NEXT one.
+///
+/// So the wait is bounded by a high-resolution timer and the unpark signal by
+/// an auto-reset event, and both are waited on together.
+/// `CRATONVM_WIN_HIRES_PARK=0` reverts to the condvar path.
+#[cfg(target_os = "windows")]
+pub(crate) mod win_park {
+    use std::time::Duration;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(
+            attrs: *mut core::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> isize;
+        fn SetEvent(handle: isize) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+        fn CreateWaitableTimerExW(
+            attrs: *mut core::ffi::c_void,
+            name: *const u16,
+            flags: u32,
+            desired_access: u32,
+        ) -> isize;
+        fn SetWaitableTimer(
+            timer: isize,
+            due_time: *const i64,
+            period: i32,
+            routine: *mut core::ffi::c_void,
+            arg: *mut core::ffi::c_void,
+            resume: i32,
+        ) -> i32;
+        fn CancelWaitableTimer(timer: isize) -> i32;
+        fn WaitForMultipleObjects(
+            count: u32,
+            handles: *const isize,
+            wait_all: i32,
+            millis: u32,
+        ) -> u32;
+    }
+
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    /// `CRATONVM_WIN_HIRES_PARK=0` reverts every timed park to the condvar
+    /// path this module replaces (the pre-2026-08-29 behaviour).
+    pub(crate) fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static G: OnceLock<bool> = OnceLock::new();
+        *G.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_WIN_HIRES_PARK")
+                .map(|v| v != *"0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// An auto-reset event for one `ParkState`, or 0 if it could not be made
+    /// (every caller then takes the condvar path).
+    pub(crate) fn create_wake_event() -> isize {
+        if !enabled() {
+            return 0;
+        }
+        // SAFETY: a documented Win32 call with a null security descriptor and
+        // a null name; it only creates a kernel object and returns its handle.
+        unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) }
+    }
+
+    /// Release a handle from `create_wake_event`.
+    pub(crate) fn close(handle: isize) {
+        if handle != 0 {
+            // SAFETY: `handle` came from `CreateEventW` above and is closed
+            // exactly once, from `ParkState`'s `Drop`.
+            unsafe { CloseHandle(handle) };
+        }
+    }
+
+    /// Signal a parked thread's wake event. A signal delivered when nobody is
+    /// waiting leaves the event set, so the next timed park returns at once —
+    /// which is exactly the permit semantics `unpark` already has, and a
+    /// spurious return is in any case what `LockSupport.park` allows.
+    pub(crate) fn signal(handle: isize) {
+        if handle != 0 {
+            // SAFETY: `handle` is a live auto-reset event owned by the
+            // `ParkState` this call reached through an `Arc`.
+            unsafe { SetEvent(handle) };
+        }
+    }
+
+    thread_local! {
+        /// One high-resolution timer per parking thread, reused across parks.
+        /// `-1` means "not probed yet"; `0` means the OS refused one, so the
+        /// probe runs once per thread and never again.
+        static HIRES_TIMER: std::cell::Cell<isize> = const { std::cell::Cell::new(-1) };
+    }
+
+    /// This thread's high-resolution timer, or 0 if the OS has none.
+    fn timer() -> isize {
+        HIRES_TIMER.with(|c| {
+            let cached = c.get();
+            if cached != -1 {
+                return cached;
+            }
+            // SAFETY: documented Win32 call, null attributes and null name.
+            let h = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            c.set(h);
+            h
+        })
+    }
+
+    /// Wait until `dur` elapses or `wake_event` is signalled, whichever comes
+    /// first. Returns `false` when the accurate path is unavailable and the
+    /// caller must fall back to the condvar.
+    pub(crate) fn wait_until(wake_event: isize, dur: Duration) -> bool {
+        if wake_event == 0 || !enabled() {
+            return false;
+        }
+        let timer = timer();
+        if timer == 0 {
+            return false;
+        }
+        // A negative due time is a RELATIVE interval in 100 ns units.
+        let hundred_nanos = (dur.as_nanos() / 100).min(i64::MAX as u128) as i64;
+        let due: i64 = -hundred_nanos.max(1);
+        // SAFETY: `timer` is this thread's live timer handle and `due` points
+        // at a live local for the duration of the call.
+        let armed = unsafe {
+            SetWaitableTimer(
+                timer,
+                &due,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if armed == 0 {
+            return false;
+        }
+        let handles = [wake_event, timer];
+        // SAFETY: both handles are live for the call; `handles` is a valid
+        // two-element array and the count matches.
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        // SAFETY: same live timer handle; cancelling an already-signalled
+        // timer is defined and leaves it unsignalled for the next park.
+        unsafe { CancelWaitableTimer(timer) };
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ParkState — binary semaphore for LockSupport.park() / unpark()
 // ---------------------------------------------------------------------------
 
@@ -183,6 +367,20 @@ pub struct ParkState {
     /// late" (Java-side / protocol) from "the signal was delivered late"
     /// (VM park machinery) in the RRWL crawl/join-stall investigation.
     last_unpark_nanos: std::sync::atomic::AtomicU64,
+    /// Windows only: auto-reset event this thread's timed parks wait on
+    /// alongside a high-resolution timer, so the deadline is not rounded up
+    /// to the 15.625 ms system tick. 0 when the event could not be created
+    /// or `CRATONVM_WIN_HIRES_PARK=0` turned the path off; every timed park
+    /// then takes the condvar exactly as before. See `win_park` above.
+    #[cfg(target_os = "windows")]
+    wake_event: isize,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ParkState {
+    fn drop(&mut self) {
+        win_park::close(self.wake_event);
+    }
 }
 
 /// Cached `CRATONVM_DBG_PARKLAT` gate.
@@ -211,6 +409,8 @@ impl ParkState {
             mutex: PLMutex::new(false),
             condvar: PLCondvar::new(),
             last_unpark_nanos: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(target_os = "windows")]
+            wake_event: win_park::create_wake_event(),
         }
     }
 
@@ -227,6 +427,24 @@ impl ParkState {
         }
         match timeout {
             Some(dur) if !dur.is_zero() => {
+                // Windows: an accurate deadline needs a high-resolution timer,
+                // and staying wakeable by `unpark` needs the event waited on
+                // beside it — the condvar can be neither. The lock is released
+                // first because `unpark` takes it to set the permit and signals
+                // the event afterwards, so a signal landing in the gap leaves
+                // the auto-reset event set and the wait returns at once.
+                #[cfg(target_os = "windows")]
+                if win_park::enabled() && self.wake_event != 0 {
+                    drop(permit);
+                    let waited = win_park::wait_until(self.wake_event, dur);
+                    let mut permit = self.mutex.lock();
+                    if !waited {
+                        // No high-resolution timer on this OS build.
+                        self.condvar.wait_for(&mut permit, dur);
+                    }
+                    *permit = false;
+                    return;
+                }
                 self.condvar.wait_for(&mut permit, dur);
             }
             None => {
@@ -265,7 +483,25 @@ impl ParkState {
                         break;
                     }
                     let wait_time = remaining.min(poll);
-                    self.condvar.wait_for(&mut permit, wait_time);
+                    // Windows: same reason as `park()` above. The 5 ms slices
+                    // stay — they bound how long an interrupt that did not also
+                    // unpark can go unnoticed — but each one is now accurate,
+                    // so the last slice ends ON the deadline rather than at the
+                    // next system tick after it.
+                    #[cfg(target_os = "windows")]
+                    let accurate = if win_park::enabled() && self.wake_event != 0 {
+                        drop(permit);
+                        let waited = win_park::wait_until(self.wake_event, wait_time);
+                        permit = self.mutex.lock();
+                        waited
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let accurate = false;
+                    if !accurate {
+                        self.condvar.wait_for(&mut permit, wait_time);
+                    }
                     if *permit || interrupted.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
@@ -313,6 +549,9 @@ impl ParkState {
                 .store(parklat_now_nanos(), std::sync::atomic::Ordering::Release);
         }
         self.condvar.notify_one();
+        // A thread on the accurate path is not on the condvar; wake it too.
+        #[cfg(target_os = "windows")]
+        win_park::signal(self.wake_event);
     }
 }
 
@@ -1038,6 +1277,45 @@ mod tests {
             elapsed.as_millis() >= 40,
             "Park should have blocked for ~50ms, got {}ms",
             elapsed.as_millis()
+        );
+    }
+
+    /// A timed park must end near its deadline, not at the next system tick.
+    ///
+    /// On Windows every condvar/`WaitForSingleObject`-shaped wait is rounded up
+    /// to the 15.625 ms clock tick, so this 50 ms park measured 62.5 ms — four
+    /// short cycles then one long one for anything re-arming from an absolute
+    /// deadline, which is what walked `AutoScalingEventExecutorChooserFactoryTest`
+    /// past the state it asserts on. `win_park` bounds it with a
+    /// high-resolution waitable timer instead. The 40 ms floor of
+    /// `park_state_park_with_timeout` above cannot see any of that; this is the
+    /// ceiling that can.
+    ///
+    /// The bound is deliberately loose (a loaded CI box can delay any wakeup)
+    /// and still an order of magnitude tighter than the 15.6 ms quantum: 62 ms
+    /// was the OLD median, not an outlier, so a regression fails this on the
+    /// median run rather than needing an unlucky one. Non-Windows hosts have
+    /// no such rounding and pass it for free.
+    #[test]
+    fn park_state_timed_park_does_not_overshoot_to_the_system_tick() {
+        let ps = ParkState::new();
+        // One warm-up park: the first one on a thread creates the
+        // high-resolution timer, and that is not what is being measured.
+        ps.park(Some(std::time::Duration::from_millis(5)));
+        let mut best = std::time::Duration::from_secs(1);
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            ps.park(Some(std::time::Duration::from_millis(50)));
+            best = best.min(start.elapsed());
+        }
+        assert!(
+            best >= std::time::Duration::from_millis(45),
+            "a 50 ms park returned after only {best:?}"
+        );
+        assert!(
+            best < std::time::Duration::from_millis(58),
+            "a 50 ms park took {best:?} at best -- the deadline is being rounded \
+             up to the 15.625 ms system tick (62.5 ms was the pre-fix median)"
         );
     }
 
