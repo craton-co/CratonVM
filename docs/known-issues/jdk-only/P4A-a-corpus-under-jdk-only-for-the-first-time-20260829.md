@@ -51,7 +51,8 @@ HotSpot          196      13        9
 **A `TIMEOUT` is not a failure and is not counted as one.** 38 against HotSpot's
 9, on the same shard layout and the same load, is a statement about SPEED —
 quantified in §5, which also says how far the serial re-run of those 38 got
-(2 of them) and counts the other 36 as unmeasured.
+(3 usable verdicts, 1 withdrawn as an artefact of the re-run harness) and counts
+the other 34 as unmeasured.
 
 ## 3. The headline: `--jdk-only` introduced no failures of its own
 
@@ -181,24 +182,55 @@ single-shot, and nothing was interleaved. `docs/known-issues/` already records
 what this box does to unpaired timings. What the ratio is good for is exactly
 one thing: explaining the timeout asymmetry without attributing it to failure.
 
-**The serial re-run at 600 s is running and is NOT finished; 2 of 38 have
-verdicts.**
+**The serial re-run at 600 s was stopped after 4 of 38, and one of those four
+is withdrawn.**
 
 ```text
-org.h2.test.db.TestIndex    PASS      107s    (capped at 90s in the sharded pass)
-org.h2.test.db.TestCases    TIMEOUT   600s    (still over, at load ~17)
+org.h2.test.db.TestIndex                  PASS      107s   (capped at 90s before)
+org.h2.test.db.TestLIRSMemoryConsumption  PASS      264s   (capped at 90s before)
+org.h2.test.db.TestCases                  TIMEOUT   600s   (still over, at load ~17)
+org.h2.test.db.TestLargeBlob              FAIL        7s   WITHDRAWN — see below
 ```
 
-The remaining **36 are UNMEASURED, and are counted as unmeasured everywhere
-above** — not as passes and not as failures. Finishing them is cheap on a quiet
-host and the command is in Reproduce with `TMO=600` and a single shard; it was
-not worth several hours of a box three other lanes are using, for a completeness
-footnote to a result whose substance is in §3 and §4.
+### The re-run harness produced a failure the run it was re-running never had
 
-One thing the two verdicts do say: `TestIndex` passing at 107 s is a class the
-sharded pass called a timeout at 90 s, so at least some of the 36 are ordinary
-passes behind an unlucky cap — which is the direction that would *improve* the
-166, never worsen the 14.
+`TestLargeBlob` "failed" in 7 seconds. It did not:
+
+```text
+Caused by: java/io/IOException: pwrite0: No space left on device (os error 28)
+    at org/h2/mvstore/FileStore ... SingleFileStore.writeFully
+```
+
+The corpus runner gives each vector a working directory under `$OUT/wd` on
+`/data` — 433 G, 84 G free. My re-run script took the one-line shortcut of
+`mktemp -d`, which lands on `/`, and `/` on this box sits at **97 % with 868 M
+free**. A test that writes a multi-gigabyte BLOB has nowhere to put it. Same
+binary, same class, same flags, different filesystem — and the difference is a
+`FAIL` that looks exactly like a defect.
+
+That is the trap `docs/known-issues/` already records as "a full disk reads as a
+set of failed vectors", arriving by a new door: not a disk that filled during a
+run, but **a re-run harness that did not reproduce where the original run put
+its files**. A re-run has to copy the original's working-directory placement,
+not just its command line.
+
+**The corpus run itself is clean of this.** `No space left on device` appears in
+exactly ONE log across both arms' 436 vectors, and that one is the file this
+re-run overwrote. §3 and §4 are untouched.
+
+### What is left
+
+**34 are UNMEASURED, and are counted as unmeasured everywhere above** — not as
+passes and not as failures. Finishing them is cheap on a quiet host with a
+working directory on `/data`, and the command is in Reproduce with `TMO=600`;
+it was not worth several hours of a box three other lanes are using for a
+completeness footnote to a result whose substance is in §3 and §4.
+
+The three usable verdicts say the cap was the binding constraint for at least
+some of them — `TestIndex` at 107 s and `TestLIRSMemoryConsumption` at 264 s are
+both ordinary passes that a 90 s cap called timeouts. What they do **not**
+license is the claim that the other 34 are all passes: an unmeasured vector has
+no verdict, and `TestCases` is still over at 600 s.
 
 ## Reproduce
 
@@ -215,7 +247,11 @@ done
 python3 corpus-census.py "$OUT/rep" 218
 ```
 
-Each vector needs its own working directory: H2 tests open files by
-CWD-relative path and will collide otherwise. The runner and the census tool are
+Each vector needs its own working directory, **on a filesystem with room**.
+H2 tests open files by CWD-relative path and will collide otherwise, and some of
+them write gigabytes — `scripts/jdk-only-corpus-run.sh` puts them under `$OUT`
+for exactly that reason. `mktemp -d` lands on `/`, which on this box is at 97 %,
+and that turns `TestLargeBlob` into a 7-second `FAIL` that is really an
+`ENOSPC` (§5). The runner and the census tool are
 carried by this commit, and they live in `scripts/` rather than `probes/`
 because they are tooling over a corpus, not a probe program.

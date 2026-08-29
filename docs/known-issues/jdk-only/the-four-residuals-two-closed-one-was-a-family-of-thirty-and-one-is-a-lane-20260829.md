@@ -226,6 +226,27 @@ and it is already `#[track_caller]` — so the requester `file:line` costs
 nothing, and this is not on the per-object hot path that `layout_alias` has to
 buy a flag to observe.
 
+**The census itself lives in `native-api`, not at the funnel.** It was written
+inline in `native-builtins` and that cost the crate its 429th raw lock
+construction — `lock_discipline_ratchet` holds a baseline there because that
+crate RE-ENTERS the VM, so a `Mutex` with no `LockLevel` is a deadlock the order
+checker cannot see, and the ratchet says in as many words: do not raise the
+baseline. A diagnostic dedup set is a poor reason to spend that ceiling. It moved
+to `instantiable::observe_uninstantiable_receiver`, beside the
+`ACC_INTERFACE`/`ACC_ABSTRACT` predicate it already used, taking the shape
+`layout_alias::observe` had already established for the same problem: a plain
+`parking_lot::Mutex` (this crate's convention), a guard that lives for exactly
+one `insert`, and the `warn!` emitted with nothing held — the subscriber
+re-enters the VM.
+
+The move was verified by re-running the probe, not by re-running the ratchet.
+`#[track_caller]` propagating across a crate boundary is exactly what a move
+like this breaks, and a census that still compiles while reporting its own
+forwarding line is worse than one that is absent. After the move
+`AbstractReceiverSweep` names the same seven classes with the same requesters —
+`foreign_ffm.rs:864`, `panama.rs:124`, `lang_invoke.rs:2821` — so the location
+still resolves to the NATIVE.
+
 Run over the five definition-of-done arms under `--jdk-only`, it names **31
 distinct classes**, on every one of which the same report says
 `compatibility_classes: 0`:
