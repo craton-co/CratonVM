@@ -63,7 +63,7 @@ pub mod vtype;
 pub use class::{
     class_origin_epoch, find_field_recursive, find_field_recursive_by_descriptor,
     find_method_recursive, invokespecial_selection_start,
-    invokevirtual_private_declaring_class,
+    invokevirtual_final_declaring_class, invokevirtual_private_declaring_class,
     ArrayInfo, Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource,
     RecordComponentInfo, RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE,
     RECORD_OBJ_TO_STRING,
