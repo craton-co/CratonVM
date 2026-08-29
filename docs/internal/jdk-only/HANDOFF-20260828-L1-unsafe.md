@@ -3,8 +3,11 @@
 **Read `HANDOFF-20260828-SCOPE.md` first.** It has the method, the traps and the
 landing protocol. This doc is only what is specific to L1.
 
-**Owner: unclaimed.** Add yourself to the table in the scope doc's §0 when you
-take it. L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
+**Owner: DONE 2026-08-28** — worktree `/data/cvm-l1u-20260828`, branch
+`claude/l1-unsafe-20260828`. The result is
+`known-issues/jdk-only/l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md`:
+516 rows, 24 defects fixed, 5 recorded residual categories, 0 mode drift.
+**This brief is retired; read the record, not this page.** L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
 `h2-known-issues-206dee`) is the only lane currently running.
 
 ## Your families

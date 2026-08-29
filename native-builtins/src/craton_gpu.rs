@@ -1477,6 +1477,11 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
+/// `Native.futureStatus(long futureHandle) -> int`
+///
+/// Status codes (mirrors the Java side enum-ordinal layout in the spec):
+///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
+#[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
@@ -1981,6 +1986,7 @@ fn builtin_array_to_host_into(
     Ok(Some(Value::Int(1)))
 }
 
+#[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
