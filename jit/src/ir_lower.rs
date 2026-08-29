@@ -4860,6 +4860,17 @@ fn reloc_emit_enabled() -> bool {
                 // Build + box the deopt point for this guard (stable address,
                 // baked below). The point's frame state comes from the safepoint
                 // snapshot recorded for `bci` during IR building.
+                //
+                // Through `resume_bci`, like every other deopt this file
+                // emits. `IrBuilder::splice_guard_seen` refuses a graph that
+                // built a guard inside a splice, so today the mapping is a
+                // no-op here — but this arm was the ONLY one resolving from a
+                // raw bci, and a raw bci inside a spliced body is the exact
+                // shape that produced
+                // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+                // A fence and an asymmetry is one fence away from the bug;
+                // agreeing with the other emitters costs nothing.
+                let bci = self.resume_bci(bci);
                 let frame_state = self.resolve_frame_state_for_bci(bci);
                 let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
@@ -10161,7 +10172,17 @@ pub(crate) fn lower_inner_with_scopes(
         &slot_plan,
         helpers,
         branch_hints,
-        &[],
+        // NOT `&[]`. This argument was dropped on the floor from the day
+        // splicing landed: the parameter arrived, `Lowerer::new` got an
+        // empty slice, and `Lowerer::resume_bci` was therefore the identity
+        // in every production lowering. Every deopt inside a spliced body
+        // then recorded its RELOCATED bci — a program point that does not
+        // exist in the method's own bytecode — so the interpreter's sink
+        // found no matching deopt point, defaulted the reason to
+        // `UnreachedCode`, and refused the replay against a bci nothing
+        // could resume at. See
+        // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+        spliced_ranges,
         sr_map,
         direct_calls,
         ic_slots,
@@ -12577,6 +12598,113 @@ mod tests {
             .frame_state
             .locals
             .clone()
+    }
+
+    /// Every deopt emitted inside a SPLICED body must record the enclosing
+    /// `invoke`'s bci, never the relocated one.
+    ///
+    /// This is the regression test for the argument `lower_inner_with_scopes`
+    /// used to drop: it received `spliced_ranges` and passed `Lowerer::new` a
+    /// literal `&[]`, so `resume_bci` was the identity and every inlined deopt
+    /// named a bci that is not a program point of the method. The interpreter
+    /// then found no deopt point at that bci, defaulted the reason to
+    /// `UnreachedCode`, and refused to resume — turning netty's
+    /// `IndexOutOfBoundsException` into an `InternalError`.
+    ///
+    /// The shape is netty's, reduced: a caller whose `invokestatic` at bci 5
+    /// has been replaced by a relocated body starting at bci 9, containing an
+    /// array load whose bounds check must resume at 5.
+    #[test]
+    fn a_deopt_inside_a_spliced_body_resumes_at_the_enclosing_invoke() {
+        // caller: 0: aload_0  1: iload_1  2: <the spliced region stands in for
+        // the invoke at bci 5>  ... the graph below is hand-built, so only the
+        // bcis matter, not a decodable byte string.
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let idx = g.add(Op::Param(1), IrType::Int, vec![start], None);
+        // The array load lives at bci 36 — inside the relocated body.
+        let load = g.add(
+            Op::ArrayLoad(MemKind::Byte),
+            IrType::Int,
+            vec![ctrl, mem, arr, idx],
+            Some(36),
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], Some(8));
+        g.exit = ret;
+        // The caller's own snapshot at the invoke it replaced.
+        g.safepoints.push(SafepointSnapshot {
+            bci: 5,
+            locals: vec![arr, idx],
+            stack: vec![arr, idx],
+        });
+        let schedule = ir_schedule::schedule(&g);
+
+        // The caller's bytecode is 9 bytes; the relocated body occupies 9..43,
+        // standing in for the `invoke` at bci 5.
+        let spliced = [(9usize, 43usize, 5usize)];
+        let cm = lower_inner(
+            &g,
+            &schedule,
+            2,
+            2,
+            &no_helpers(),
+            &HashMap::new(),
+            &spliced,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("lower");
+
+        assert!(
+            !cm._deopt_point_boxes.is_empty(),
+            "the array access must emit its null/bounds guards",
+        );
+        for p in &cm._deopt_point_boxes {
+            assert_eq!(
+                p.bci, 5,
+                "a deopt at relocated bci 36 must resume at the enclosing \
+                 invoke (5), not at a bci the method does not have; got {}",
+                p.bci,
+            );
+            assert_eq!(
+                p.frame_state.bci, 5,
+                "and its frame state must be the caller's snapshot at 5",
+            );
+        }
+
+        // The control: with no spliced ranges, the same graph records the raw
+        // bci — which is what the production lowering was doing for every
+        // inlined method.
+        let cm_raw = lower_inner(
+            &g,
+            &schedule,
+            2,
+            2,
+            &no_helpers(),
+            &HashMap::new(),
+            &[],
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("lower");
+        assert!(
+            cm_raw._deopt_point_boxes.iter().all(|p| p.bci == 36),
+            "without ranges the raw bci is kept — this is the control, and it \
+             is what the bug looked like",
+        );
     }
 
     /// A division the bytecode reaches on only one arm must deopt from its

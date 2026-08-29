@@ -2211,6 +2211,71 @@ pub fn invokevirtual_private_declaring_class(
         .then_some(declaring_id)
 }
 
+/// JVMS §5.4.6 `invokevirtual` — is this site's target UNOVERRIDABLE, and if
+/// so where is it declared?
+///
+/// The third of this module's `invokevirtual`/`invokespecial` selection
+/// rules, beside [`invokevirtual_private_declaring_class`] and
+/// [`invokespecial_selection_start`]. All three answer the same shape of
+/// question — *what does dispatch at this site actually select?* — and all
+/// three are wanted by more than one compile door, which is why they live
+/// here rather than in whichever door needed them first.
+///
+/// A method is unoverridable when it is `final`, or when the class the
+/// constant pool NAMES is final, or when its declaring class is. The middle
+/// one is not redundant: the receiver must be an instance of the CP class,
+/// so if that class is final the receiver's class IS it, and selection
+/// cannot reach anywhere the resolution walk did not just look.
+///
+/// Deliberately narrower than the letter of the rule, and for stated
+/// reasons rather than by omission:
+///
+/// * `native` is excluded — a registered native has no compiled body to
+///   bind to, and the doors route natives through their own machinery.
+/// * `abstract` and `static` are excluded as impossible-by-construction
+///   (a `final abstract` method is illegal, and `invokevirtual` never names
+///   a `static` one), so a malformed classfile falls back to dispatch
+///   rather than binding.
+/// * `private` is excluded because it is the OTHER rule's answer — see
+///   [`invokevirtual_private_declaring_class`].
+///
+/// Returns the DECLARING class, which a caller must substitute for the
+/// constant pool's class name before any direct bind: the CP entry commonly
+/// names a subclass (`PooledHeapByteBuf.checkIndex`) while the body lives on
+/// the ancestor that declares it (`AbstractByteBuf`), and binding under the
+/// subclass name would key the compiled callee under a method that class
+/// does not declare.
+pub fn invokevirtual_final_declaring_class(
+    cp_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    store: &ClassStore,
+) -> Option<ClassId> {
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    let (method, declaring_id) =
+        find_method_recursive(cp_class_id, method_name, method_descriptor, store)?;
+    if method.access_flags.intersects(
+        MethodAccessFlags::ABSTRACT
+            | MethodAccessFlags::STATIC
+            | MethodAccessFlags::NATIVE
+            | MethodAccessFlags::PRIVATE,
+    ) {
+        return None;
+    }
+    let class_is_final = |id| {
+        store
+            .get(id)
+            .is_some_and(|c| c.access_flags.contains(ClassAccessFlags::FINAL))
+    };
+    if !method.access_flags.contains(MethodAccessFlags::FINAL)
+        && !class_is_final(cp_class_id)
+        && !class_is_final(declaring_id)
+    {
+        return None;
+    }
+    Some(declaring_id)
+}
+
 pub fn invokespecial_selection_start(
     caller_class_id: ClassId,
     cp_class_id: ClassId,
