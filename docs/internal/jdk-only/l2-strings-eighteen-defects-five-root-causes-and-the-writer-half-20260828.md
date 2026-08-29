@@ -309,13 +309,45 @@ only on ASCII, will report this family clean when it is not.
 
 ## 6. What this does NOT establish
 
-* **No performance measurement was taken.** `StringBuilder.append` is among the
-  hottest paths in this VM and the write path now resolves a layout per call
-  (two field reads and, for a compact receiver, a name resolution that was
-  already being paid by `sb_set_count`). The in-place append arm allocates
-  nothing and reads no whole payload, and the growth rule is unchanged, so the
-  asymptotics are the same — but that is an argument, not a number. **Nobody has
-  priced this.** See §7 N1.
+* **The performance measurement WAS taken, and the first version of the
+  migration failed it.** ABBA-interleaved, six rounds, twelve samples per arm,
+  against the exact control this branch contains (`f52fa3fa6` plus only this
+  lane's two string files, so `origin/dev`'s concurrent JIT work is out of the
+  pair): **2.0x on `append(String)`, 2.5x on `append(char)`, 2.6x on
+  `append(int)`, 3.1x on `charAt`, 3.5x on an inflating build.**
+
+  Both causes were in the helpers, not the design. Every helper re-derived the
+  layout — `sb_append_units` alone reached `sb_layout` four times, each re-reading
+  `value`, re-asking its element type, and for a compact receiver resolving
+  `coder` by NAME under the class-manager read lock — and the compact write
+  stored one array element at a time where the synthetic path it replaced used a
+  single bulk `write_char_array_from`.
+
+  `SbView` (resolve once, hand it down), `write_byte_array_from` /
+  `read_byte_array_into` for the compact payload, and reading `coder` at slot 1
+  with a self-checking fallback to the name lookup, close it:
+
+  ```text
+                  A (no migration)      B (migration)        B/A
+  appendString     960 [ 773-1021]       944 [ 793-1017]     0.98   ranges overlap
+  appendChar       522 [ 468- 592]       558 [ 458- 589]     1.07   ranges overlap
+  appendInt        582 [ 526- 639]       607 [ 567- 665]     1.04   ranges overlap
+  toString         170 [ 164- 175]        24 [  22-  30]     0.14   6.9x FASTER
+  charAt          2394 [2227-2830]      2918 [2689-3300]     1.22   ranges overlap
+  inflating       1872 [1680-2012]      2018 [1826-2125]     1.08   ranges overlap
+  ```
+
+  Five of six shapes show no difference this instrument can resolve, and
+  `toString` is 6.9x faster because a LATIN1 payload is half the bytes and they
+  come back in one bulk read. **`charAt` is the honest residual**: overlapping
+  ranges, separated medians, one extra `get_field` per call, and a host carrying
+  a load average between 8 and 16 throughout — which is why no stronger claim is
+  made. The residual page has the detail.
+
+  **The lesson is the instrument, not the number.** The first migration was
+  correct — 747 rows, 0 diffs, both modes — and 2-3.5x slower on the hottest
+  path in the VM, and nothing in the correctness gate could see that. A
+  correctness probe and a price are different instruments and a lane owes both.
 * **`StringBuffer` gained a Java frame per call** by the retirement. Same
   caveat, smaller surface.
 * **Mockito and Byte Buddy were not run.** `WORKER-3-NOTE-3` argued the
@@ -349,10 +381,10 @@ Three items, none of them a correctness question, are carried on the OPEN page
 `docs/known-issues/jdk-only/` rather than here, because a reader looking for open
 work does not read the retired records:
 
-* **N1 — the write path is unpriced.** `StringBuilder.append` is among the
-  hottest paths in this VM and this change is on it. `f52fa3fa6` — this branch's
-  own previous commit, which has the null fixes and the retirement but NOT the
-  migration — is the exact control.
+* **N1 — ANSWERED**, and the answer cost two more builds: the first migration
+  was 2.0x-3.5x slower and the second is inside the noise on five of six shapes,
+  6.9x faster on `toString`, and 22% on `charAt`'s median with overlapping
+  ranges.
 * **N2 — `java/lang/StringBuilder`'s own 62 rows are a candidate retirement,
   DECLINED**, for two stated reasons rather than guessed at.
 * **N3 — `chars`, `codePoints` and `compareTo` are correct because the layout

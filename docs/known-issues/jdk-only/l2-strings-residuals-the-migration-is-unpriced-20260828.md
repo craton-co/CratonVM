@@ -1,39 +1,74 @@
-# L2 residuals — the layout migration is landed and correct, and its price is not yet a number
+# L2 residuals — the write path is priced now, and what that leaves
 
-**Status: OPEN, three items, none of them a correctness question.** 2026-08-28.
-The correctness half is closed and recorded in the retired
-`l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up:
-747 probe rows, 0 differing lines against HotSpot `jdk-25.0.4+7` in both
+**Status: OPEN, two items, neither a correctness question.** 2026-08-28. The
+correctness half is closed and recorded in the retired
+`l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up: 747
+probe rows, 0 differing lines against HotSpot `jdk-25.0.4+7` in both
 `--jdk-only` and compatible mode, gates and the three regression arms green.
 
-This page exists because that record ends with three things a reader looking for
-open work in `docs/known-issues/` would otherwise never find.
+This page exists because that record ends with things a reader looking for open
+work in `docs/known-issues/` would otherwise never find.
 
 ---
 
-## N1 — nobody has priced the write path
+## N1 — ANSWERED, and it cost two more builds to answer honestly
 
-`StringBuilder.append` is among the hottest paths in this VM, and the write side
-now resolves the receiver's layout per call: two field reads, plus — for a
-compact receiver — a `coder` name resolution alongside the `count` one
-`sb_set_count` was already paying.
+`probes/SbLayoutBench.java` against the exact control this branch contains:
+`f52fa3fa6` has the null-contract fixes and the `StringBuffer` retirement but NOT
+the layout migration, so applying only this lane's two string files to that same
+worktree isolates the migration and leaves `origin/dev`'s concurrent JIT work out
+of the pair entirely. ABBA-interleaved, six rounds, twelve samples per arm.
 
-What is argued, not measured:
+**The first measurement said the migration was 2.0x to 3.5x SLOWER**, and it was
+right:
 
-* the in-place append arm allocates nothing and reads no whole payload, so the
-  shape of the fast path is unchanged;
-* the growth rule (`max(2 * old + 2, needed)`) is byte-for-byte the JDK's and
-  the one it replaced, so the amortised cost is unchanged;
-* `sb_set_count` gained one integer comparison on the `StringBuilder` path and a
-  `toStringCache` name resolution on the `StringBuffer` path only.
+```text
+                A (no migration)      B (first migration)     B/A
+appendString     812 ns/op             1613                   2.0x
+appendChar       408                   1020                   2.5x
+appendInt        438                   1118                   2.6x
+charAt          1316                   4050                   3.1x
+inflating       1068                   3766                   3.5x
+```
 
-**Those are arguments. There is no number.** The A/B that answers it is exact
-and cheap to set up, because this branch contains its own control:
-`f52fa3fa6` has the ten null-contract fixes and the `StringBuffer` retirement
-but NOT the migration, so an A/B against it isolates the migration and nothing
-else. Interleave ABBA and take it on an idle host or not at all — this one
-carried a load average between 8 and 20 for the whole of the session that wrote
-this.
+Two causes, both in the helpers rather than in the design:
+
+* **every helper re-derived the layout.** `sb_append_units` alone reached
+  `sb_layout` four times — directly, through `sb_count_units`, through
+  `sb_capacity_units`, and again for the coder — and each of those re-read
+  `value`, re-asked its element type, and for a compact receiver resolved
+  `coder` BY NAME under the class-manager read lock;
+* **the compact write stored one array element at a time**, where the synthetic
+  path it replaced used a single bulk `write_char_array_from`.
+  `append("abcdefgh")` went from one bulk call to eight VM dispatches, and to
+  sixteen once the builder inflated.
+
+`SbView` (one resolve, handed down), `write_byte_array_from` /
+`read_byte_array_into` for the compact payload, and reading `coder` at slot 1
+with a self-checking fallback to the name lookup, give:
+
+```text
+                A (no migration)      B (migration)           B/A
+appendString     960 [ 773-1021]       944 [ 793-1017]        0.98   ranges overlap
+appendChar       522 [ 468- 592]       558 [ 458- 589]        1.07   ranges overlap
+appendInt        582 [ 526- 639]       607 [ 567- 665]        1.04   ranges overlap
+toString         170 [ 164- 175]        24 [  22-  30]        0.14   6.9x FASTER
+charAt          2394 [2227-2830]      2918 [2689-3300]        1.22   ranges overlap
+inflating       1872 [1680-2012]      2018 [1826-2125]        1.08   ranges overlap
+```
+
+**Five of the six shapes show no difference this instrument can resolve, and
+`toString` is 6.9x faster** — a LATIN1 payload is half the bytes and they come
+back in one bulk read instead of a `get_array_element` per character.
+
+**`charAt` is the honest residual.** Its ranges overlap, so the instrument
+cannot separate the two, but its MEDIANS are separated by 22% and it is the
+noisiest shape in the set (the control's own range spans 27%). The remaining
+structural difference is exactly one extra `get_field` per call — the compact
+path reads `coder` where the synthetic one had nothing to read. Whether that is
+22% or 0% needs an idle host; this one carried a load average between 8 and 16
+for the whole measurement, which is stated because it is the reason no stronger
+claim is made.
 
 ## N2 — `java/lang/StringBuilder`'s own 62 rows are a candidate retirement, DECLINED
 
@@ -43,16 +78,14 @@ methods is a `synchronized` delegation to `super` or a body touching only its ow
 so the same argument applies to its 62 rows — and it would halve this family's
 remaining shadow surface.
 
-It was declined, twice over:
-
-* it is the hottest dispatch surface in the VM and the retirement adds a Java
-  frame per call, which is N1's question again and larger;
-* it is the class the interpreter's `JitIntrinsic::StringBuilder*` door keys on
-  (`native-builtins/src/intrinsics/mod.rs` maps `("java/lang/StringBuilder",
-  "append", …)` and friends), so retiring the registrations without deciding what
-  happens to that door is a change with two moving parts, not one.
-
-Take N1's number first.
+The throughput objection is now weaker than it was, because N1 has its number:
+the write path costs nothing this instrument can resolve. What is left is the
+second reason, which N1 does not touch: `java/lang/StringBuilder` is the class
+the interpreter's `JitIntrinsic::StringBuilder*` door keys on
+(`native-builtins/src/intrinsics/mod.rs` maps `("java/lang/StringBuilder",
+"append", …)` and seven siblings). Retiring the registrations without deciding
+what happens to that door is a change with two moving parts, and this lane did
+not take it.
 
 ## N3 — three methods are correct because the layout is, not because anyone registered them
 
