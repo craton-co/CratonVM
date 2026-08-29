@@ -62,8 +62,8 @@ implementations:
   and native method bridge).
 - **Class library strategy:** Native Rust implementations of `java.base` module
   classes, registered through the VM's native method registry.
-- **Test infrastructure:** The `.github/_disabled-workflows/jck.yml`
-  CI workflow (currently disabled — see RELEASING.md §2) and
+- **Test infrastructure:** The `.github/workflows/jck.yml`
+  CI workflow (manual `workflow_dispatch` only — see RELEASING.md §2) and
   `bench/javatest_config.jti` harness configuration are prepared and ready to
   execute once JCK access is granted.
 - **Failure tracking:** The `vm/tests/jck_harness.rs` test captures per-test
@@ -85,7 +85,7 @@ implementations:
 | License path          | OCTLA or TCK Community License |
 | Application           | **Pending application** |
 | JCK version target    | JCK 25 (Java SE 25) |
-| CI runner prepared    | Yes (`.github/_disabled-workflows/jck.yml`, currently disabled — see RELEASING.md §2) |
+| CI runner prepared    | Yes (`.github/workflows/jck.yml`, manual `workflow_dispatch` only — see RELEASING.md §2) |
 | Harness configuration | Yes (`bench/javatest_config.jti`) |
 | Test harness          | Yes (`vm/tests/jck_harness.rs`) |
 | Failure capture       | Yes (`bench/jck-failures.json`) |

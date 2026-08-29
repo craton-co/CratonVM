@@ -529,8 +529,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 // Pin across the CF alloc below — a moving young GC there would
                 // relocate `this` (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
-                let new_cf =
-                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
+                let new_cf = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/concurrent/CompletableFuture",
+                    3,
+                )?;
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(new_cf, 0, Value::Object(None));
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -569,8 +572,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 // relocate the handler's result (native stale-local family).
                 let result = result.unwrap_or(Value::Object(None));
                 let result_pin = pinned_object_value(ctx, result);
-                let new_cf =
-                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
+                let new_cf = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/concurrent/CompletableFuture",
+                    3,
+                )?;
                 let result = read_pinned_object_value(ctx, result_pin, result);
                 ctx.set_field(new_cf, 0, result);
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -652,7 +658,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
+            let es =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -672,7 +679,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/concurrent/ExecutorService;",
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(4);
-            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
+            let es =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -691,7 +699,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
+            let es =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -710,7 +719,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
+            let es =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -730,8 +740,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(1);
-            let es =
-                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4)?;
+            let es = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/util/concurrent/ScheduledExecutorService",
+                4,
+            )?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -750,7 +763,8 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newVirtualThreadPerTaskExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
+            let es =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -1343,7 +1357,11 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
     ()
 }
 
-pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p58_new_cf(
+    ctx: &mut dyn NativeContext,
+    result: Value,
+    done: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the CF alloc below — a moving young GC there would relocate
     // the result value (native stale-local family).
     let result_pin = pinned_object_value(ctx, result);
@@ -1861,7 +1879,8 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
         // Empty iterator
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
-        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2)?;
+        let itr =
+            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -2333,7 +2352,10 @@ pub(crate) fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// `ArrayList`-style 2-field synthetic: field 0 = ref array, field 1 = Int
 /// count) when the publisher's field 0 is null. `this` is pinned by the caller
 /// or pinned here across the allocation. Returns the (post-alloc) wrapper ref.
-pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn sp_wrapper_ensure(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Value::Object(Some(w)) = ctx.get_field(this, 0) {
         return Ok(w);
     }
@@ -4287,7 +4309,8 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             // Return a ThreadFactory that delegates to the builder.
             // The factory is a 1-field object: field 0 = the builder reference.
             let this = obj_arg(args, 0)?;
-            let factory = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1)?;
+            let factory =
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1)?;
             ctx.set_field(factory, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -4382,7 +4405,10 @@ const INCUBATOR_SUBTASK_FAILED: i32 = 3;
 /// Wrap `value` in a synthetic `java.util.Optional` (1 field; null == empty).
 /// `Optional`-returning methods must never hand back a bare null — callers
 /// immediately dereference the result with `isPresent()`/`orElse(..)`.
-fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
+fn sts_optional_of(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin the payload across the Optional allocation (native stale-local family).
     let value_pin = pinned_object_value(ctx, value);
     let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
@@ -5341,7 +5367,11 @@ fn j25_config_copy_with(
     )?;
     let this = ctx.read_native_pin(this_pin, this);
     let value = read_pinned_object_value(ctx, value_pin, value);
-    for s in [J25_CONFIG_NAME, J25_CONFIG_THREAD_FACTORY, J25_CONFIG_TIMEOUT] {
+    for s in [
+        J25_CONFIG_NAME,
+        J25_CONFIG_THREAD_FACTORY,
+        J25_CONFIG_TIMEOUT,
+    ] {
         let v = if ctx.object_num_fields(this) > s {
             ctx.get_field(this, s)
         } else {
@@ -5363,10 +5393,7 @@ fn j25_config_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     j25_config_copy_with(ctx, this, J25_CONFIG_NAME, name)
 }
 
-fn j25_config_with_thread_factory(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn j25_config_with_thread_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let tf = args.get(1).copied().unwrap_or(Value::Object(None));
     j25_config_copy_with(ctx, this, J25_CONFIG_THREAD_FACTORY, tf)
@@ -6327,8 +6354,8 @@ pub(crate) struct TgChild {
     hash: i32,
 }
 
-pub(crate) fn tg_children()
--> &'static parking_lot::Mutex<std::collections::HashMap<i32, Vec<TgChild>>> {
+pub(crate) fn tg_children(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<i32, Vec<TgChild>>> {
     static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<i32, Vec<TgChild>>>> =
         SqOnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
@@ -6733,30 +6760,28 @@ pub(crate) const NEW15_COMMON_POOL_PARALLELISM: i32 = 1;
 /// The synthetic `Continuation` slot map, as `(slot, field the native believes
 /// is there)`. Every entry disagrees with the real class; that is the census
 /// row, and it stays visible on purpose.
-pub static NEW15_CONT_SLOT_MAP: read_alias::SlotMap =
-    read_alias::SlotMap {
-        class: "jdk/internal/vm/Continuation",
-        slots: &[
-            (NEW15_CONT_SCOPE, "scope"),
-            (NEW15_CONT_TARGET, "target"),
-            (NEW15_CONT_STATE, "state"),
-            (NEW15_CONT_PIN, "pin"),
-            (NEW15_CONT_PREEMPT, "preempted"),
-        ],
-        origin: "native-builtins/src/phases_late/concurrent.rs NEW15_CONT_*",
-    };
+pub static NEW15_CONT_SLOT_MAP: read_alias::SlotMap = read_alias::SlotMap {
+    class: "jdk/internal/vm/Continuation",
+    slots: &[
+        (NEW15_CONT_SCOPE, "scope"),
+        (NEW15_CONT_TARGET, "target"),
+        (NEW15_CONT_STATE, "state"),
+        (NEW15_CONT_PIN, "pin"),
+        (NEW15_CONT_PREEMPT, "preempted"),
+    ],
+    origin: "native-builtins/src/phases_late/concurrent.rs NEW15_CONT_*",
+};
 
 /// The synthetic `ForkJoinPool` common-pool proxy map. Slot 0 is `termination`
 /// and slot 1 is `saturate` on the real class.
-pub static NEW15_FJP_SLOT_MAP: read_alias::SlotMap =
-    read_alias::SlotMap {
-        class: "java/util/concurrent/ForkJoinPool",
-        slots: &[
-            (NEW15_FJP_PARALLELISM, "parallelism"),
-            (NEW15_FJP_ACTIVE, "active"),
-        ],
-        origin: "native-builtins/src/phases_late/concurrent.rs NEW15_FJP_*",
-    };
+pub static NEW15_FJP_SLOT_MAP: read_alias::SlotMap = read_alias::SlotMap {
+    class: "java/util/concurrent/ForkJoinPool",
+    slots: &[
+        (NEW15_FJP_PARALLELISM, "parallelism"),
+        (NEW15_FJP_ACTIVE, "active"),
+    ],
+    origin: "native-builtins/src/phases_late/concurrent.rs NEW15_FJP_*",
+};
 
 /// Where this receiver's `Continuation` fields actually live.
 ///
@@ -6836,12 +6861,12 @@ pub(crate) fn cont_slots(ctx: &dyn NativeContext, this: ObjectRef) -> ContSlots 
     // the discriminator because it is a real-JDK-only name — no synthetic
     // Continuation shape in this tree declares it.
     if layout_alias::enabled() {
-        let rows: &[(usize, &str)] =
-            if ctx.resolve_field_index_by_class_id(cid, "parent").is_some() {
-                NEW15_CONT_SLOT_MAP.slots
-            } else {
-                &[]
-            };
+        let rows: &[(usize, &str)] = if ctx.resolve_field_index_by_class_id(cid, "parent").is_some()
+        {
+            NEW15_CONT_SLOT_MAP.slots
+        } else {
+            &[]
+        };
         for (slot, expected) in rows {
             read_alias::observe_read(
                 ctx,
@@ -7969,19 +7994,53 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
     // registerNatives() — JDK 25 calls this from <clinit> of VirtualThread.
     // Keep it as a no-op so the static initializer doesn't hit
     // UnsatisfiedLinkError and force a downstream class-init failure.
-    r.register_with_kind(vt, "registerNatives", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(
+        vt,
+        "registerNatives",
+        "()V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // JVMTI notification natives — called from the VirtualThread state
     // machine. They are pure JVMTI hooks; cratonvm doesn't have a JVMTI
     // agent attached to the virtual-thread mount/unmount lifecycle, so
     // no-ops are spec-correct.
-    r.register_with_kind(vt, "notifyJvmtiStart", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
-    r.register_with_kind(vt, "notifyJvmtiEnd", "()V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
-    r.register_with_kind(vt, "notifyJvmtiMount", "(Z)V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
-    r.register_with_kind(vt, "notifyJvmtiUnmount", "(Z)V", |_ctx, _args| Ok(None), cratonvm_native_api::NativeKind::Bridge);
-    r.register_with_kind(vt, "notifyJvmtiDisableSuspend", "(Z)V", |_ctx, _args| {
-        Ok(None)
-    }, cratonvm_native_api::NativeKind::Bridge);
+    r.register_with_kind(
+        vt,
+        "notifyJvmtiStart",
+        "()V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vt,
+        "notifyJvmtiEnd",
+        "()V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vt,
+        "notifyJvmtiMount",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vt,
+        "notifyJvmtiUnmount",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        vt,
+        "notifyJvmtiDisableSuspend",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // postPinnedEvent(String) — JFR pinned-event reporter. Funnel into the
     // existing cratonvm JFR pinned-thread emitter so pin reports surface
@@ -8722,7 +8781,9 @@ fn common_factory_from_image(ctx: &mut dyn NativeContext) -> Option<cratonvm_typ
 /// `getFactory()` registration to ensure
 /// `getFactory().getClass().getName()` round-trips to the system
 /// property's dot-form.
-pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+pub(crate) fn alloc_common_factory(
+    ctx: &mut dyn NativeContext,
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let target = resolve_common_factory_internal_name(ctx);
     match ctx.ensure_class_initialized(&target) {
         Ok(cid) => {
@@ -8796,9 +8857,12 @@ pub(crate) fn populate_common_factory(
 
 #[cfg(test)]
 pub(crate) mod new15_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn new15_continuation_is_registered() {
@@ -9034,16 +9098,16 @@ pub(crate) mod new15_tests {
             fields
                 .iter()
                 .enumerate()
-                .map(|(slot_index, (name, descriptor))| {
-                    cratonvm_native_api::FieldMetadata {
+                .map(
+                    |(slot_index, (name, descriptor))| cratonvm_native_api::FieldMetadata {
                         name: (*name).to_string(),
                         descriptor: (*descriptor).to_string(),
                         access_flags: 0,
                         slot_index,
                         declaring_class_id: cid,
                         is_static: false,
-                    }
-                })
+                    },
+                )
                 .collect(),
         );
         ctx.alloc_object(cid, fields.len())
@@ -9179,7 +9243,11 @@ pub(crate) mod new15_tests {
     #[test]
     fn fjp_parallelism_resolves_to_the_real_int_field_not_termination() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let pool = instance_of(&mut ctx, "java/util/concurrent/ForkJoinPool", REAL_FJP_FIELDS);
+        let pool = instance_of(
+            &mut ctx,
+            "java/util/concurrent/ForkJoinPool",
+            REAL_FJP_FIELDS,
+        );
         // What real `ForkJoinPool(4)` bytecode leaves behind: parallelism at
         // its own index, `termination` a null latch.
         ctx.set_field(pool, 15, Value::Int(4));

@@ -521,9 +521,12 @@ fn native_find_driver_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// The proper classpath-walking ServiceLoader natives are reachable
     /// after `register_jdbc_driver_natives` runs. Catches a regression

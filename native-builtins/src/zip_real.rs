@@ -332,7 +332,9 @@ fn read_direct_dictionary(
     let mut dict = vec![0u8; len];
     if len > 0 && !ctx.copy_from_native_memory(buf_addr, &mut dict) {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("setDictionaryBuffer: invalid dictionary buffer address {buf_addr:#x}"),
+            message: format!(
+                "setDictionaryBuffer: invalid dictionary buffer address {buf_addr:#x}"
+            ),
         }
         .into());
     }
@@ -562,7 +564,12 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
     if let Some(a) = output_arr {
         if step.output_consumed > 0 {
-            write_byte_array(ctx, a, out_off, &output_buf[..step.output_consumed as usize]);
+            write_byte_array(
+                ctx,
+                a,
+                out_off,
+                &output_buf[..step.output_consumed as usize],
+            );
         }
     }
 
@@ -614,7 +621,12 @@ fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let step = infl_do_decompress(addr, &input_data, &mut output_buf);
     if let Some(a) = output_arr {
         if step.output_consumed > 0 {
-            write_byte_array(ctx, a, out_off, &output_buf[..step.output_consumed as usize]);
+            write_byte_array(
+                ctx,
+                a,
+                out_off,
+                &output_buf[..step.output_consumed as usize],
+            );
         }
     }
     finish_inflate(ctx, this, step)
@@ -1266,7 +1278,13 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     let il = "java/util/zip/Inflater";
     r.register_with_kind(il, "initIDs", "()V", infl_init_ids, NativeKind::Bridge);
     r.register_with_kind(il, "init", "(Z)J", infl_init, NativeKind::Bridge);
-    r.register_with_kind(il, "setDictionary", "(J[BII)V", infl_set_dictionary, NativeKind::Bridge);
+    r.register_with_kind(
+        il,
+        "setDictionary",
+        "(J[BII)V",
+        infl_set_dictionary,
+        NativeKind::Bridge,
+    );
     r.register_with_kind(
         il,
         "setDictionaryBuffer",
@@ -1309,7 +1327,13 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // Deflater
     let dl = "java/util/zip/Deflater";
     r.register_with_kind(dl, "init", "(IIZ)J", defl_init, NativeKind::Bridge);
-    r.register_with_kind(dl, "setDictionary", "(J[BII)V", defl_set_dictionary, NativeKind::Bridge);
+    r.register_with_kind(
+        dl,
+        "setDictionary",
+        "(J[BII)V",
+        defl_set_dictionary,
+        NativeKind::Bridge,
+    );
     r.register_with_kind(
         dl,
         "setDictionaryBuffer",
@@ -1365,7 +1389,13 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // real-JDK mode so archive writers never compile a second, incompatible
     // CRC-state transition around the native boundary.
     r.register(crc, "updateBytes", "(I[BII)I", crc32_update_bytes_0);
-    r.register_with_kind(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0, NativeKind::Bridge);
+    r.register_with_kind(
+        crc,
+        "updateBytes0",
+        "(I[BII)I",
+        crc32_update_bytes_0,
+        NativeKind::Bridge,
+    );
     r.register_with_kind(
         crc,
         "updateByteBuffer0",
@@ -1381,8 +1411,20 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // synthetic 1-field Long layout; those descriptors are disjoint from the
     // static ones below, so both sets coexist and each mode uses its own.
     let ad = "java/util/zip/Adler32";
-    r.register_with_kind(ad, "update", "(II)I", adler32_update_int, NativeKind::Bridge);
-    r.register_with_kind(ad, "updateBytes", "(I[BII)I", adler32_update_bytes, NativeKind::Bridge);
+    r.register_with_kind(
+        ad,
+        "update",
+        "(II)I",
+        adler32_update_int,
+        NativeKind::Bridge,
+    );
+    r.register_with_kind(
+        ad,
+        "updateBytes",
+        "(I[BII)I",
+        adler32_update_bytes,
+        NativeKind::Bridge,
+    );
     r.register_with_kind(
         ad,
         "updateByteBuffer",
@@ -2214,7 +2256,10 @@ mod tests {
         };
 
         let (consumed_first, produced_first, need_dict) = inflate(&mut ctx, 0);
-        assert_eq!(produced_first, 0, "no output is possible before the dictionary");
+        assert_eq!(
+            produced_first, 0,
+            "no output is possible before the dictionary"
+        );
         assert!(
             need_dict,
             "inflate must report needDict for an FDICT stream"
@@ -2375,8 +2420,14 @@ mod tests {
         };
 
         let (consumed_first, produced_first, need_dict) = inflate(&mut ctx, 0);
-        assert_eq!(produced_first, 0, "no output is possible before the dictionary");
-        assert!(need_dict, "inflate must report needDict for an FDICT stream");
+        assert_eq!(
+            produced_first, 0,
+            "no output is possible before the dictionary"
+        );
+        assert!(
+            need_dict,
+            "inflate must report needDict for an FDICT stream"
+        );
 
         infl_set_dictionary_buffer(
             &mut ctx,

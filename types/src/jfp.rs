@@ -185,7 +185,10 @@ mod tests {
             assert_eq!(double_compare(a, f64::INFINITY), 1);
             assert_eq!(double_compare(f64::NEG_INFINITY, a), -1);
         }
-        assert_eq!(signed.total_cmp(&f64::NEG_INFINITY), std::cmp::Ordering::Less);
+        assert_eq!(
+            signed.total_cmp(&f64::NEG_INFINITY),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
@@ -238,7 +241,10 @@ mod tests {
 
         // total_cmp: orders a negatively-signed NaN BELOW -infinity.
         assert_eq!(double_compare(neg_nan, f64::NEG_INFINITY), 1);
-        assert_eq!(neg_nan.total_cmp(&f64::NEG_INFINITY), std::cmp::Ordering::Less);
+        assert_eq!(
+            neg_nan.total_cmp(&f64::NEG_INFINITY),
+            std::cmp::Ordering::Less
+        );
 
         // partial_cmp: `None` for any NaN, so the usual `unwrap_or(Equal)`
         // makes NaN equal to everything — not merely the wrong order, but a

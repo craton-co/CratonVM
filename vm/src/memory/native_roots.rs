@@ -66,7 +66,6 @@
 use crate::types::ObjectRef;
 use std::collections::HashMap;
 
-
 // ---------------------------------------------------------------------------
 // CRATONVM_DBG_ROOTPROF=1 -- per-root-source timing.
 //
@@ -84,9 +83,7 @@ pub(crate) mod rootprof {
     static ON: OnceLock<bool> = OnceLock::new();
 
     pub fn on() -> bool {
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTPROF").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTPROF").is_some())
     }
 
     /// Print `parts` as one line when `total_ms` clears the noise floor.
@@ -303,10 +300,7 @@ fn scan_loaders_and_jmx(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>
     cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(roots);
 }
 fn remap_loaders_and_jmx(shared: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
-    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(
-        shared.vm_identity,
-        map,
-    );
+    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(shared.vm_identity, map);
     #[cfg(feature = "management")]
     cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(map);
 }
@@ -381,16 +375,16 @@ fn remap_security_manager(shared: &crate::vm::SharedVm, map: &cratonvm_types::Po
 // heap's addresses to another heap's collector and rewriting one VM's entries
 // through another VM's relocation map. See `runtime::serialization::oscache`.
 fn scan_osc_cache(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    shared.classes.osc_cache.scan_roots(shared.vm_identity, roots);
+    shared
+        .classes
+        .osc_cache
+        .scan_roots(shared.vm_identity, roots);
 }
 fn remap_osc_cache(shared: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     shared.classes.osc_cache.remap_roots(map);
 }
 fn scan_annotations(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(
-        shared.vm_identity,
-        roots,
-    );
+    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(shared.vm_identity, roots);
 }
 fn remap_annotations(shared: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(shared.vm_identity, map);
@@ -606,9 +600,7 @@ pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) 
 /// every source eliminated by bisection.
 pub fn root_attribution_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_SOURCE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_SOURCE").is_some())
 }
 
 /// Last cycle's (source name, root address) pairs. Diagnostic only; written

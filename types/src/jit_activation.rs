@@ -120,7 +120,9 @@ fn fallback() -> &'static Mutex<FxHashMap<u32, usize>> {
 /// binary can be measured with and without this change.
 fn global_mutex_mode() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| crate::flags::runtime_var_os("CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX").is_some())
+    *G.get_or_init(|| {
+        crate::flags::runtime_var_os("CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX").is_some()
+    })
 }
 
 /// Handle to this thread's table. The `Drop` impl is what returns the table to
@@ -299,7 +301,10 @@ pub fn enter(class_id: u32) -> Option<Activation> {
             if held == class_id {
                 slot.count
                     .store(slot.count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                return Some(Activation { class_id, slot: index });
+                return Some(Activation {
+                    class_id,
+                    slot: index,
+                });
             }
             if held == NO_OWNER_CLASS && free.is_none() {
                 free = Some((index, slot));
@@ -331,9 +336,14 @@ pub fn enter(class_id: u32) -> Option<Activation> {
     // SAFETY: just allocated, leaked from here on.
     let fresh_ref = unsafe { &*fresh };
     fresh_ref.slots[0].count.store(1, Ordering::Relaxed);
-    fresh_ref.slots[0].class_id.store(class_id, Ordering::Release);
+    fresh_ref.slots[0]
+        .class_id
+        .store(class_id, Ordering::Release);
     chunk.next.store(fresh, Ordering::Release);
-    Some(Activation { class_id, slot: index })
+    Some(Activation {
+        class_id,
+        slot: index,
+    })
 }
 
 /// Drop one activation previously returned by [`enter`].
@@ -464,7 +474,11 @@ mod tests {
         let inner = enter(7).expect("a real class id is tracked");
         assert_eq!(active_class_ids(), vec![7]);
         exit(inner);
-        assert_eq!(active_class_ids(), vec![7], "the outer frame still holds it");
+        assert_eq!(
+            active_class_ids(),
+            vec![7],
+            "the outer frame still holds it"
+        );
         exit(outer);
         assert!(active_class_ids().is_empty());
         assert_eq!(enter(NO_OWNER_CLASS), None);

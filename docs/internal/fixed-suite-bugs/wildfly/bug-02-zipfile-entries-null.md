@@ -63,7 +63,7 @@ This is self-contained in the jar/zip natives and leaves the JarFile fast path
 untouched (no per-call `identityHashCode` for JarFile).
 
 ## Verification
-- `ZipProbe`: `getName`→path, `size`→19, `getEntry`→`META-INF/MANIFEST.MF`,
+- `ZipProbe`: `getName`→path, `size`→19, `getEntry`→`../../../../apps/META-INF/MANIFEST.MF`,
   `entries`→ok. `JarEntriesRepro`: both `JarFile.entries()` and
   `ZipFile.entries()` ok — **no JarFile regression**.
 - WildFly cratonvm-client (remote container): the ShrinkWrap

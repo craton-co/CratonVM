@@ -19,7 +19,7 @@ use cratonvm_types::ArrayElementType;
 use cratonvm_types::ObjectRef;
 use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Calendar math helpers
@@ -647,59 +647,33 @@ fn native_string_init_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `<init>(Ljava/lang/StringBuilder;)V` — `new String(StringBuilder)`.
 ///
-/// Reads the builder's chars (CratonVM's synthetic SB layout: field 0 = char[]
-/// buffer, field 1 = count — same accessor `StringBuilder.toString()` uses) and
-/// initialises `this` from them. This bypasses the real JDK
-/// `String(AbstractStringBuilder, Void)` ctor, which assumes `getValue()` returns
-/// the compact-string `byte[]` and `Arrays.copyOfRange`s it — a char[]->byte[]
-/// type mismatch against CratonVM's char[]-backed builder (Tomcat DF05).
+/// Reads the builder's characters — through `sb_read_chars`, which understands
+/// WHICHEVER of the two layouts the receiver holds — and initialises `this` from
+/// them. This bypasses the real JDK `String(AbstractStringBuilder, Void)` ctor,
+/// which `Arrays.copyOfRange`s `getValue()`; that was a `char[]` -> `byte[]` type
+/// mismatch against a synthetic builder (Tomcat DF05).
+///
+/// The hand-rolled copy that used to stand in the body read slot 0 as a `char[]`
+/// and answered an EMPTY vector for a compact `byte[]` payload — which is a
+/// FABRICATION, not a refusal: the caller cannot tell an empty builder from one
+/// whose content this constructor declined to look at. MEASURED, `--jdk-only`
+/// with the builder registrations skipped so real bytecode owned the object: a
+/// builder holding "abcdefgh" reported `length() == 8` and
+/// `toString().length() == 0`, `rc = 0`, no exception — the "every append
+/// silently discarded" behaviour `H22` recorded against
+/// `register_string_builder_natives`, produced here, one class away from
+/// anything that registrar names.
+///
+/// The dispatch that lands a `(AbstractStringBuilder,Void)V` call on this
+/// `(StringBuilder)V` body is a separate defect and is NOT fixed here — see
+/// `WORKER-3-NOTE-6`. This makes the answer right whichever overload arrives.
 fn native_string_init_from_string_builder(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let sb = obj_arg(args, 1)?; // null builder -> NPE, matching the JDK ctor
-    let (buf, count) = crate::lang_string::sb_state(ctx, sb);
-    let units: Vec<u16> = match buf {
-        Some(b) => {
-            let n = count.max(0) as usize;
-            let mut chars = Vec::with_capacity(n);
-            for i in 0..n {
-                let ch = match ctx.get_array_element(b, i) {
-                    Value::Int(v) => v as u16,
-                    _ => 0,
-                };
-                chars.push(ch);
-            }
-            chars
-        }
-        // NOT `Vec::new()`. `sb_state` yields `None` for a builder whose
-        // `value` is the real compact `byte[]` — which is what real
-        // `AbstractStringBuilder` bytecode produces — and an empty vector for
-        // that receiver is a FABRICATION, not a refusal: the caller cannot
-        // tell an empty builder from one whose content this constructor
-        // declined to look at. `sb_read_chars` and `native_sb_to_string`, the
-        // two sibling copies of this read, were both given the layout-aware
-        // fallback; this one was missed, and it is the copy on the live path.
-        //
-        // MEASURED, `--jdk-only` with the builder registrations skipped so
-        // real bytecode owns the object: a builder holding "abcdefgh" reports
-        // `length() == 8` and `toString().length() == 0`, `rc = 0`, no
-        // exception. That is the "every append silently discarded" behaviour
-        // `H22` recorded against `register_string_builder_natives`, produced
-        // here, one class away from anything that registrar names.
-        //
-        // The dispatch that lands a `(AbstractStringBuilder,Void)V` call on
-        // this `(StringBuilder)V` body is a separate defect and is NOT fixed
-        // here — see `WORKER-3-NOTE-6`. This makes the answer right whichever
-        // overload arrives.
-        None => {
-            let mut units = crate::lang_string::sb_value_units(ctx, sb).unwrap_or_default();
-            let n = count.max(0) as usize;
-            units.truncate(n.min(units.len()));
-            units
-        }
-    };
+    let units: Vec<u16> = crate::lang_string::sb_read_chars(ctx, sb);
     // Write the UTF-16 units STRAIGHT into `this`.
     //
     // This used to be `String::from_utf16_lossy(&chars).into_bytes()` fed to
@@ -1328,7 +1302,10 @@ fn real_hashtable_enumerator_pinned(
     // synthetic-JDK shape, and the caller has a landing for it. Discard the
     // failure rather than surfacing it at the application's `keys()` call site,
     // which is the mistake the fabricated carrier made in the other direction.
-    if ctx.ensure_class_initialized(HASHTABLE_ENUMERATOR_CLASS).is_err() {
+    if ctx
+        .ensure_class_initialized(HASHTABLE_ENUMERATOR_CLASS)
+        .is_err()
+    {
         return Ok((None, ctx.read_native_pin(pin, this)));
     }
     if ctx.is_class_synthetic_stub(HASHTABLE_ENUMERATOR_CLASS)
@@ -2319,10 +2296,13 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn call_native(
         registry: &NativeMethodRegistry,
@@ -3233,7 +3213,8 @@ mod tests {
     fn test_sbis_read_sequential() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("AB");
 
         call_native(
@@ -3283,7 +3264,8 @@ mod tests {
     fn test_sbis_available_and_reset() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("XYZ");
 
         call_native(
@@ -3354,7 +3336,8 @@ mod tests {
     fn test_sbis_bulk_read() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let stream =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("Hello");
         let buf = ctx.new_array(ArrayElementType::Byte, 5);
 
@@ -3400,7 +3383,8 @@ mod tests {
         data: &str,
     ) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
         // We use a StringBufferInputStream as the underlying stream.
-        let sbis = try_alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let sbis =
+            try_alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string(data);
         call_native(
             reg,
@@ -3430,7 +3414,8 @@ mod tests {
     fn test_lnis_get_set_line_number() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
 
         call_native(
@@ -3505,7 +3490,8 @@ mod tests {
     fn test_lnis_set_line_number_roundtrip() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
         call_native(
             &reg,
@@ -3542,7 +3528,8 @@ mod tests {
         // Manually set line number and saved line number fields, then call reset.
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
+        let lnis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4).unwrap();
         let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0).unwrap();
         call_native(
             &reg,

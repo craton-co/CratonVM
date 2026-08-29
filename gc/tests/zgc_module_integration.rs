@@ -95,7 +95,9 @@ fn small_geometry() -> page::ZPageConfig {
 }
 
 fn small_allocator() -> Arc<page::ZPageAllocator> {
-    Arc::new(page::ZPageAllocator::new(small_geometry()).expect("scaled test geometry must validate"))
+    Arc::new(
+        page::ZPageAllocator::new(small_geometry()).expect("scaled test geometry must validate"),
+    )
 }
 
 /// Translate `page.rs`'s [`page::ZPageSizeClass`] into `forwarding.rs`'s three
@@ -576,11 +578,7 @@ fn barrier_default_address_mask_covers_the_address_space_vaddr_declares() {
 
 /// Allocate `count` objects of `bytes` each, retire the shared allocation
 /// pages, and hand back the addresses.
-fn fill_small_pages(
-    allocator: &page::ZPageAllocator,
-    count: usize,
-    bytes: usize,
-) -> Vec<usize> {
+fn fill_small_pages(allocator: &page::ZPageAllocator, count: usize, bytes: usize) -> Vec<usize> {
     let mut addrs = Vec::with_capacity(count);
     for _ in 0..count {
         addrs.push(
@@ -725,7 +723,9 @@ fn a_relocation_set_built_from_real_pages_round_trips_through_the_forwarding_reg
     );
 
     for ((page_id, from), to) in expected.iter() {
-        let table = registry.get(*page_id).expect("table vanished from registry");
+        let table = registry
+            .get(*page_id)
+            .expect("table vanished from registry");
         assert_eq!(
             table.find_payload(*from),
             Some(*to),
@@ -794,11 +794,19 @@ fn forwarding_from_offset_field_exactly_covers_page_rs_largest_relocatable_page(
 
     // And prove it at the encoder rather than only in arithmetic.
     assert!(
-        forwarding::ZgcForwardingEntry::pack(highest_object_offset, forwarding::ZForwardingPayload::from_encoded(0x1000)).is_some(),
+        forwarding::ZgcForwardingEntry::pack(
+            highest_object_offset,
+            forwarding::ZForwardingPayload::from_encoded(0x1000)
+        )
+        .is_some(),
         "the last object slot of a medium page must be encodable"
     );
     assert!(
-        forwarding::ZgcForwardingEntry::pack(largest_relocatable, forwarding::ZForwardingPayload::from_encoded(0x1000)).is_none(),
+        forwarding::ZgcForwardingEntry::pack(
+            largest_relocatable,
+            forwarding::ZForwardingPayload::from_encoded(0x1000)
+        )
+        .is_none(),
         "an offset one page past the end must be refused, not wrapped"
     );
 }
@@ -891,7 +899,11 @@ fn forwarding_to_field_covers_vaddrs_whole_offset_space() {
         vaddr::Z_MAX_HEAP_SIZE,
     );
     assert!(
-        forwarding::ZgcForwardingEntry::pack(0, forwarding::ZForwardingPayload::from_encoded(vaddr::Z_MAX_HEAP_SIZE - 8)).is_some(),
+        forwarding::ZgcForwardingEntry::pack(
+            0,
+            forwarding::ZForwardingPayload::from_encoded(vaddr::Z_MAX_HEAP_SIZE - 8)
+        )
+        .is_some(),
         "the top 8-aligned offset of vaddr's heap must be a legal destination"
     );
 }
@@ -1032,7 +1044,11 @@ fn a_minor_cycle_scope_admits_no_old_address_and_no_unallocated_byte() {
 
     let old = heap.allocate_old(64, 8).expect("old allocation");
     let young: Vec<u64> = (0..40)
-        .map(|_| heap.allocate_young(64, 8).expect("young allocation").address as u64)
+        .map(|_| {
+            heap.allocate_young(64, 8)
+                .expect("young allocation")
+                .address as u64
+        })
         .collect();
 
     assert_eq!(
@@ -1050,8 +1066,8 @@ fn a_minor_cycle_scope_admits_no_old_address_and_no_unallocated_byte() {
         "the fixture needs a partially-filled page for the 'above top' probe"
     );
 
-    let marker = ScopedAddressMarker::new(young.clone(), 64)
-        .rejecting(vec![old.address as u64, past_top]);
+    let marker =
+        ScopedAddressMarker::new(young.clone(), 64).rejecting(vec![old.address as u64, past_top]);
     let report = heap.collect_young(&young, &generation::ZEmptyRememberedSet, &marker);
 
     assert_eq!(marker.calls.load(Ordering::Relaxed), 1);
@@ -1067,7 +1083,10 @@ fn a_minor_cycle_scope_admits_no_old_address_and_no_unallocated_byte() {
         report.scope_rejected
     );
     assert!(report.scope_admitted >= young.len() as u64);
-    assert_eq!(report.pages_promoted, 0, "promotion age is 64; nothing may promote");
+    assert_eq!(
+        report.pages_promoted, 0,
+        "promotion age is 64; nothing may promote"
+    );
 }
 
 /// PINS: that young and old page sets stay disjoint across allocation and
@@ -1087,7 +1106,11 @@ fn young_and_old_page_sets_stay_disjoint_across_a_minor_cycle() {
     heap.allocate_old(128, 8).expect("old allocation");
 
     let live: Vec<u64> = (0..10)
-        .map(|_| heap.allocate_young(64, 8).expect("young allocation").address as u64)
+        .map(|_| {
+            heap.allocate_young(64, 8)
+                .expect("young allocation")
+                .address as u64
+        })
         .collect();
     // A second batch that nothing will keep alive, so its pages are freed and
     // their ids become reusable.
@@ -1099,12 +1122,7 @@ fn young_and_old_page_sets_stay_disjoint_across_a_minor_cycle() {
         let marker = ScopedAddressMarker::new(live.clone(), 64);
         heap.collect_young(&live, &generation::ZEmptyRememberedSet, &marker);
 
-        let young_ids: HashSet<u64> = heap
-            .young()
-            .snapshot()
-            .iter()
-            .map(|p| p.id())
-            .collect();
+        let young_ids: HashSet<u64> = heap.young().snapshot().iter().map(|p| p.id()).collect();
         let old_ids: HashSet<u64> = heap.old().snapshot().iter().map(|p| p.id()).collect();
         let both: Vec<u64> = young_ids.intersection(&old_ids).copied().collect();
         assert!(
@@ -1168,7 +1186,11 @@ fn a_young_page_is_promoted_on_the_cycle_its_age_reaches_the_policy_age() {
 
     // One page's worth of survivors, kept alive by the root set every cycle.
     let live: Vec<u64> = (0..8)
-        .map(|_| heap.allocate_young(64, 8).expect("young allocation").address as u64)
+        .map(|_| {
+            heap.allocate_young(64, 8)
+                .expect("young allocation")
+                .address as u64
+        })
         .collect();
     let page_id = allocator
         .page_for(live[0] as usize)
@@ -1348,7 +1370,10 @@ fn an_old_to_young_store_becomes_a_minor_cycle_root_at_the_derived_slot() {
 
     let old_page = allocator.page_for(old.address).expect("old page resolves");
     let ctx = HeapGenerationContext { heap: &heap };
-    assert!(ctx.is_old(old.address as u64), "the old object must read as old");
+    assert!(
+        ctx.is_old(old.address as u64),
+        "the old object must read as old"
+    );
     assert!(
         ctx.is_young(young.address as u64),
         "the young object must read as young"
@@ -1362,8 +1387,7 @@ fn an_old_to_young_store_becomes_a_minor_cycle_root_at_the_derived_slot() {
 
     // The store: field 3 of the old object now points at the young object.
     let field_index = 3usize;
-    let field_offset =
-        cratonvm_types::HEADER_SIZE + field_index * cratonvm_types::REF_FIELD_SIZE;
+    let field_offset = cratonvm_types::HEADER_SIZE + field_index * cratonvm_types::REF_FIELD_SIZE;
     let field_addr = old.address as u64 + field_offset as u64;
 
     let store_barrier = remembered::ZStoreBarrier::new(Arc::clone(&table));
@@ -1425,8 +1449,8 @@ fn an_old_to_young_store_becomes_a_minor_cycle_root_at_the_derived_slot() {
 
     // Roots are EMPTY: the only way the young object can survive is through the
     // remembered set. That is the whole point of the test.
-    let marker = ScopedAddressMarker::new(Vec::new(), 64)
-        .rejecting(vec![old.address as u64, field_addr]);
+    let marker =
+        ScopedAddressMarker::new(Vec::new(), 64).rejecting(vec![old.address as u64, field_addr]);
     let report = heap.collect_young(&[], &view, &marker);
 
     assert!(
@@ -1785,7 +1809,8 @@ fn every_zgc_module_agrees_with_cratonvm_types_on_the_shared_layout_constants() 
          disagree on the object grid"
     );
     assert_eq!(
-        vaddr_align, forwarding_align,
+        vaddr_align,
+        forwarding_align,
         "zgc::vaddr (Z_OBJECT_ALIGNMENT) and zgc::forwarding (ZFWD_ALIGN_SHIFT) \
          disagree on the object grid; forwarding drops the low \
          {} bits of every address it stores",
@@ -1811,7 +1836,8 @@ fn every_zgc_module_agrees_with_cratonvm_types_on_the_shared_layout_constants() 
         forwarding::ZFWD_MAX_FROM_OFFSET,
     );
     assert_eq!(
-        page::ZPAGE_DEFAULT_GRANULE, page::ZPAGE_DEFAULT_SMALL,
+        page::ZPAGE_DEFAULT_GRANULE,
+        page::ZPAGE_DEFAULT_SMALL,
         "zgc::page's granule and small page have drifted apart; \
          forwarding's from-offset budget was derived assuming they match \
          OpenJDK's 2 MiB"
@@ -1875,35 +1901,54 @@ fn every_zgc_module_agrees_with_cratonvm_types_on_the_shared_layout_constants() 
 /// bad. This test is the tripwire.
 #[test]
 fn barrier_reexports_are_bit_identical_to_vaddrs_definitions() {
-    assert_eq!(barrier::Z_MARKED0, vaddr::Z_MARKED0, "barrier vs vaddr: Z_MARKED0");
-    assert_eq!(barrier::Z_MARKED1, vaddr::Z_MARKED1, "barrier vs vaddr: Z_MARKED1");
-    assert_eq!(barrier::Z_REMAPPED, vaddr::Z_REMAPPED, "barrier vs vaddr: Z_REMAPPED");
     assert_eq!(
-        barrier::Z_FINALIZABLE, vaddr::Z_FINALIZABLE,
+        barrier::Z_MARKED0,
+        vaddr::Z_MARKED0,
+        "barrier vs vaddr: Z_MARKED0"
+    );
+    assert_eq!(
+        barrier::Z_MARKED1,
+        vaddr::Z_MARKED1,
+        "barrier vs vaddr: Z_MARKED1"
+    );
+    assert_eq!(
+        barrier::Z_REMAPPED,
+        vaddr::Z_REMAPPED,
+        "barrier vs vaddr: Z_REMAPPED"
+    );
+    assert_eq!(
+        barrier::Z_FINALIZABLE,
+        vaddr::Z_FINALIZABLE,
         "barrier vs vaddr: Z_FINALIZABLE"
     );
     assert_eq!(
-        barrier::Z_METADATA_MASK, vaddr::Z_METADATA_MASK,
+        barrier::Z_METADATA_MASK,
+        vaddr::Z_METADATA_MASK,
         "barrier vs vaddr: Z_METADATA_MASK"
     );
     assert_eq!(
-        barrier::Z_METADATA_SHIFT, vaddr::Z_METADATA_SHIFT,
+        barrier::Z_METADATA_SHIFT,
+        vaddr::Z_METADATA_SHIFT,
         "barrier vs vaddr: Z_METADATA_SHIFT"
     );
     assert_eq!(
-        barrier::Z_METADATA_BITS, vaddr::Z_METADATA_BITS,
+        barrier::Z_METADATA_BITS,
+        vaddr::Z_METADATA_BITS,
         "barrier vs vaddr: Z_METADATA_BITS"
     );
     assert_eq!(
-        barrier::Z_OFFSET_BITS, vaddr::Z_OFFSET_BITS,
+        barrier::Z_OFFSET_BITS,
+        vaddr::Z_OFFSET_BITS,
         "barrier vs vaddr: Z_OFFSET_BITS"
     );
     assert_eq!(
-        barrier::Z_OFFSET_MASK, vaddr::Z_OFFSET_MASK,
+        barrier::Z_OFFSET_MASK,
+        vaddr::Z_OFFSET_MASK,
         "barrier vs vaddr: Z_OFFSET_MASK"
     );
     assert_eq!(
-        barrier::Z_COLORED_TAG, vaddr::Z_COLORED_TAG,
+        barrier::Z_COLORED_TAG,
+        vaddr::Z_COLORED_TAG,
         "barrier vs vaddr: Z_COLORED_TAG"
     );
     assert_eq!(barrier::Z_NULL, vaddr::Z_NULL, "barrier vs vaddr: Z_NULL");
@@ -1924,7 +1969,8 @@ fn barrier_reexports_are_bit_identical_to_vaddrs_definitions() {
                 barrier::ZFastPath::Good(_)
             );
             assert_eq!(
-                by_vaddr, by_barrier,
+                by_vaddr,
+                by_barrier,
                 "vaddr::ZGoodMask::is_good and barrier::classify disagree about \
                  {word:#x} in phase {:?}",
                 mask.phase()

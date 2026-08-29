@@ -73,8 +73,8 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::jboss_module_xml::{parse_module_xml, ModuleXml, ServicesDisposition};
+use crate::try_alloc_concurrent_synthetic;
 
 // ===========================================================================
 // Class names (kept centralized so anchor strings are easy to spot in greps)
@@ -750,7 +750,9 @@ pub(crate) fn clear_boot_loader_for_test() {
 /// Called both from [`build_default_boot_holder_instance`] and from
 /// the lazy-rebuild path in [`native_loader_load_module`] when the
 /// caller didn't pass a real receiver.
-pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub fn build_local_module_loader(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     {
         let slot = boot_loader_slot().lock();
         if let Some((key, cached)) = *slot {
@@ -794,7 +796,9 @@ pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRe
 /// Allocate the `DefaultBootModuleLoaderHolder.INSTANCE` value.  The
 /// caller (a post-clinit fixup in `vm_util.rs`) writes the result to
 /// the holder's static field.
-pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub fn build_default_boot_holder_instance(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     Ok(build_local_module_loader(ctx)?)
 }
 
@@ -954,7 +958,10 @@ pub fn alloc_single_message_exception(
     Ok(exc)
 }
 
-fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+fn throw_module_not_found(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     let exc = alloc_single_message_exception(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT, name);
     Ok(MethodCallFailed::ExceptionThrown(exc?))
 }
@@ -2837,7 +2844,10 @@ pub(crate) fn native_module_classloader_get_resource(
 /// This helper parses out `protocol` / `host` / `file` from the spec and writes
 /// them via `set_field_by_name`, then keeps the legacy slot 0 / slot 5
 /// writes for any synthetic-mode consumers that still index by slot.
-pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn build_synthetic_url(
+    ctx: &mut dyn NativeContext,
+    spec: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
     let (protocol, file_part) = if let Some(rest) = spec.strip_prefix("jar:") {
         ("jar", rest.to_string())
@@ -3734,10 +3744,13 @@ fn native_loader_load_module_by_identifier(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use parking_lot::Mutex as PMutex;
 
     /// Serial test guard — the `-mp` test override and module cache are

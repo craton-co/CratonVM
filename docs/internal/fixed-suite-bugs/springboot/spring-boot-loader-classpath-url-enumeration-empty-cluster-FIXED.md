@@ -72,7 +72,7 @@ separate, narrower under-enumeration bug.
    - `t19_h10_class_manifest_attr` (`lang_class.rs`) gained a
      `spring_boot_exploded_manifest_attr` path: classes loaded from a
      `BOOT-INF/classes` or `WEB-INF/classes` directory now inherit manifest
-     attributes from the enclosing archive root's `META-INF/MANIFEST.MF`,
+     attributes from the enclosing archive root's `../../../../apps/META-INF/MANIFEST.MF`,
      matching how a real exploded Spring Boot launch resolves package
      metadata. (Adapted during the `origin/dev` merge below to plug into
      `dev`'s own concurrently-added per-package manifest infrastructure —

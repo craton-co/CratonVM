@@ -96,7 +96,10 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
             "wave2_a",
             "the Wave 2 Task A fixture `ReflectProbe` (ReflectProbe.class, compiled from \
              ReflectProbe.java)",
-            &[probe.join("ReflectProbe.class"), probe.join("ReflectProbe.java")],
+            &[
+                probe.join("ReflectProbe.class"),
+                probe.join("ReflectProbe.java"),
+            ],
         );
         return None;
     }

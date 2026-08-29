@@ -74,8 +74,8 @@
 //! End-to-end the probe must print `OK` on stdout and exit 0 with the
 //! shim registered.
 
-use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -87,7 +87,7 @@ use rustc_hash::FxHashMap;
 
 use crate::crypto_impl::{Aes, AesGcm, AesKey};
 use crate::phases_early::CIPHER_IV;
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Cipher state — kept in a process-wide side-table keyed on the
@@ -386,7 +386,11 @@ fn make_bytes_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 /// `IvParameterSpec.getIV`, `GCMParameterSpec.getIV`. The clone is not
 /// defensive politeness in these classes; it is the contract callers build key
 /// hygiene on, and the JDK's own providers scrub the array they get back.
-fn clone_byte_field(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> Option<ObjectRef> {
+fn clone_byte_field(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    slot: usize,
+) -> Option<ObjectRef> {
     let Value::Object(Some(arr)) = ctx.get_field(this, slot) else {
         return None;
     };
@@ -522,13 +526,14 @@ fn rsa_key_components(
     // Synthetic keys — resolve via the crypto_impl key_id.
     // The map is keyed `(vm_identity, identity_hash)`: an identity hash is
     // unique only within one heap, and the map is a process-global static.
-    let id = crate::crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
-        .or_else(|| match ctx.get_field(key, 3) {
-            Value::Long(i) => Some(i as u64),
-            Value::Int(i) => Some(i as u64),
-            _ => None,
-        })
-        .filter(|&i| i != 0)?;
+    let id =
+        crate::crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
+            .or_else(|| match ctx.get_field(key, 3) {
+                Value::Long(i) => Some(i as u64),
+                Value::Int(i) => Some(i as u64),
+                _ => None,
+            })
+            .filter(|&i| i != 0)?;
     if want_private {
         crate::crypto_impl::rsa_key_get_priv(id)
     } else {
@@ -1127,12 +1132,12 @@ fn check_transformation_supported(
             // `Cipher.getInstance("AES/CBC/CRATONVM-NO-SUCH-PADDING")` gives
             // `NoSuchAlgorithmException: Cannot find any provider supporting
             // AES/CBC/CRATONVM-NO-SUCH-PADDING`, NOT a padding exception.
-            GetInstanceForm::Anonymous => Err(
-                crate::jca::provider_chain::throw_no_such_algorithm_public(
+            GetInstanceForm::Anonymous => {
+                Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
                     ctx,
                     &format!("Cannot find any provider supporting {algo}"),
-                ),
-            ),
+                ))
+            }
             // Both provider-named overloads DO, because they interrogate one
             // named provider's single service: measured
             // `NoSuchPaddingException: Padding not supported:
@@ -1145,18 +1150,18 @@ fn check_transformation_supported(
             )),
         },
         TransformVerdict::NoSuchAlgorithm => match form {
-            GetInstanceForm::Anonymous => Err(
-                crate::jca::provider_chain::throw_no_such_algorithm_public(
+            GetInstanceForm::Anonymous => {
+                Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
                     ctx,
                     &format!("Cannot find any provider supporting {algo}"),
-                ),
-            ),
-            GetInstanceForm::WithProvider => Err(
-                crate::jca::provider_chain::throw_no_such_algorithm_public(
+                ))
+            }
+            GetInstanceForm::WithProvider => {
+                Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
                     ctx,
                     &format!("No such algorithm: {algo}"),
-                ),
-            ),
+                ))
+            }
         },
     }
 }
@@ -1312,11 +1317,9 @@ fn real_spi_ecb_route(
         // `classify_transformation` admits `NoPadding` only and this arm can
         // hardcode it. The key algorithm is `"RC4"` because that is what a
         // caller writes into `SecretKeySpec`; `ARCFOURCipher` does not read it.
-        CipherFamily::Arcfour => Some((
-            "com/sun/crypto/provider/ARCFOURCipher",
-            "NoPadding",
-            "RC4",
-        )),
+        CipherFamily::Arcfour => {
+            Some(("com/sun/crypto/provider/ARCFOURCipher", "NoPadding", "RC4"))
+        }
         _ => None,
     }
 }
@@ -1584,12 +1587,9 @@ fn classify_transformation(transformation: &str) -> TransformVerdict {
                 // RFC 5649, a DIFFERENT scheme: its own ICV and an explicit
                 // length, not RFC 3394 with a padding bolted on. NoPadding is
                 // its only spelling — the padding is intrinsic to the mode.
-                "KWP" => aes_padding_verdict(
-                    p,
-                    &named_padding,
-                    &["NOPADDING"],
-                    CipherFamily::AesKeyWrap,
-                ),
+                "KWP" => {
+                    aes_padding_verdict(p, &named_padding, &["NOPADDING"], CipherFamily::AesKeyWrap)
+                }
                 // ECB is in-crate; CBC/CFB/OFB drive the real SunJCE SPI. Both
                 // paths implement exactly PKCS#7 (spelled PKCS5Padding by JCA)
                 // and no padding — nothing else, which is why `PKCS7Padding`
@@ -1841,9 +1841,7 @@ fn key_length_reason(algo: &str, key_len: usize) -> Option<String> {
     match cipher_family(&tokenize_transformation(algo).ok()?.0)? {
         CipherFamily::Aes | CipherFamily::AesKeyWrap => (!matches!(key_len, 16 | 24 | 32))
             .then(|| format!("Invalid AES key length: {key_len} bytes")),
-        CipherFamily::Blowfish => {
-            (key_len > 56).then(|| "Key too long (> 448 bits)".to_string())
-        }
+        CipherFamily::Blowfish => (key_len > 56).then(|| "Key too long (> 448 bits)".to_string()),
         CipherFamily::Arcfour => (!(5..=128).contains(&key_len))
             .then(|| "Key length must be between 40 and 1024 bit".to_string()),
         _ => None,
@@ -1858,11 +1856,7 @@ fn key_length_reason(algo: &str, key_len: usize) -> Option<String> {
 /// `init` this VM cannot service): `getParameters()` is DECLARED to return null
 /// when the cipher has none, so a null is a legitimate answer and never a
 /// reason to fail the caller's `init`.
-fn cipher_iv_parameters(
-    ctx: &mut dyn NativeContext,
-    algo: &str,
-    iv: &[u8],
-) -> MethodCallResult {
+fn cipher_iv_parameters(ctx: &mut dyn NativeContext, algo: &str, iv: &[u8]) -> MethodCallResult {
     if iv.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
@@ -1962,7 +1956,10 @@ fn cipher_iv_parameters(
 /// allocated anything, so taking `&str` removes the hazard rather than pinning
 /// around it. `obj` still has to be pinned across `create_string` below, for
 /// the same reason.
-fn cipher_alloc(ctx: &mut dyn NativeContext, algo_str: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn cipher_alloc(
+    ctx: &mut dyn NativeContext,
+    algo_str: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
     let pin = ctx.pin_native_root(obj);
     // Compute key outside the closure — `obj_key` borrows `ctx` and the
@@ -2087,7 +2084,10 @@ const SPI_INIT_PLAIN: &str = "(ILjava/security/Key;Ljava/security/SecureRandom;)
 /// spelled-out transformation never takes a registry lookup.
 fn canonical_transformation(provider: Option<&str>, algo: &str) -> Option<String> {
     crate::jca::provider_chain::canonical_if_unrecognised(provider, "Cipher", algo, &|name| {
-        !matches!(classify_transformation(name), TransformVerdict::NoSuchAlgorithm)
+        !matches!(
+            classify_transformation(name),
+            TransformVerdict::NoSuchAlgorithm
+        )
     })
 }
 
@@ -2105,10 +2105,17 @@ fn cipher_get_instance_with_provider(
         // Asked about EVERY name the transformation may be registered under,
         // not just the bare algorithm: a provider may own only the fuller form
         // (`GOST3412-2015/CFB8`). See `cipher_transform_candidates`.
-        if cipher_transform_candidates(algo_str).into_iter().any(|(service, _, _)| {
-            crate::jca::provider_chain::third_party_service_class(Some(provider), "Cipher", &service)
+        if cipher_transform_candidates(algo_str)
+            .into_iter()
+            .any(|(service, _, _)| {
+                crate::jca::provider_chain::third_party_service_class(
+                    Some(provider),
+                    "Cipher",
+                    &service,
+                )
                 .is_some()
-        }) {
+            })
+        {
             let mut obj = cipher_alloc(ctx, algo_str)?;
             // An `Err` here is the named provider refusing its own service's
             // mode or padding, which is exactly what HotSpot surfaces from
@@ -3305,7 +3312,9 @@ fn aes_key_wrap_do_final(
                 aes_key_wrap(kek, &pkcs5_pad8(data))
             }
         }
-        (AesWrapFlavour::KwPkcs5, false) => aes_key_unwrap(kek, data).and_then(|p| pkcs5_unpad8(&p)),
+        (AesWrapFlavour::KwPkcs5, false) => {
+            aes_key_unwrap(kek, data).and_then(|p| pkcs5_unpad8(&p))
+        }
         (AesWrapFlavour::Kwp, true) => aes_key_wrap_with_padding(kek, data),
         (AesWrapFlavour::Kwp, false) => aes_key_unwrap_with_padding(kek, data),
     };
@@ -3421,8 +3430,13 @@ fn chacha20_do_final(
             let split = data.len() - 16;
             let mut tag = [0u8; 16];
             tag.copy_from_slice(&data[split..]);
-            match crate::chacha20::chacha20_poly1305_decrypt(&key, &nonce, aad, &data[..split], &tag)
-            {
+            match crate::chacha20::chacha20_poly1305_decrypt(
+                &key,
+                &nonce,
+                aad,
+                &data[..split],
+                &tag,
+            ) {
                 Ok(pt) => pt,
                 // The one outcome every AEAD caller writes a `catch` for.
                 // `AEADBadTagException` is a checked `BadPaddingException`; an
@@ -3686,9 +3700,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             // returns `None` and falls through to the identical `(n, d)`
             // path — same body, same exception classes, just slower.
             rsa_key_id
-                .and_then(|id| {
-                    crate::crypto_impl::rsa_cipher_decrypt_by_id(id, &rsa_n, pad, &data)
-                })
+                .and_then(|id| crate::crypto_impl::rsa_cipher_decrypt_by_id(id, &rsa_n, pad, &data))
                 .unwrap_or_else(|| {
                     crate::crypto_impl::rsa_cipher_decrypt(&rsa_n, &rsa_exp, pad, &data)
                 })
@@ -3831,9 +3843,8 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let (spi_name, _spi_mode, spi_padded) = parse_transformation(&algo);
     if let Some(family) = cipher_family(&spi_name) {
         if let Some((spi_class, pad_str, key_algo)) = real_spi_ecb_route(family, spi_padded) {
-            let out = drive_real_ecb_cipher(
-                ctx, spi_class, pad_str, key_algo, mode, &key_bytes, &data,
-            )?;
+            let out =
+                drive_real_ecb_cipher(ctx, spi_class, pad_str, key_algo, mode, &key_bytes, &data)?;
             // Capture the result BEFORE the reset, exactly as the route above
             // does: the reset allocates, and a moving GC between the two would
             // relocate the ciphertext array out from under `out`.
@@ -3855,7 +3866,17 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     // dispatch then ran AES-256-ECB: nonce discarded, output deterministic per
     // (key, block), and for the AEAD form no tag at all. See `crate::chacha20`.
     if is_chacha20_family(&algo) {
-        return chacha20_do_final(ctx, key, &algo, mode, &key_bytes, &iv_bytes, &aad, &data, state_counter);
+        return chacha20_do_final(
+            ctx,
+            key,
+            &algo,
+            mode,
+            &key_bytes,
+            &iv_bytes,
+            &aad,
+            &data,
+            state_counter,
+        );
     }
 
     // The AES key wraps. `Cipher.wrap`/`unwrap` already reached RFC 3394; a
@@ -4643,10 +4664,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                     ) {
                         let mut obj = cipher_alloc(ctx, &algo_str)?;
                         if try_delegate_cipher_to_named_provider(
-                            ctx,
-                            &provider,
-                            &algo_str,
-                            &mut obj,
+                            ctx, &provider, &algo_str, &mut obj,
                         )? {
                             let obj = record_provider_and_reread(ctx, obj, &provider);
                             return Ok(Some(Value::Object(Some(obj))));
@@ -5088,8 +5106,14 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             // instead would hand the provider nothing at `doFinal` — the same
             // silent-loss shape the `updateAAD` note records.
             if cipher_is_delegated(ctx, this) {
-                let res =
-                    cipher_delegate_bytes(ctx, this, "engineUpdate", Some(tmp), 0, remaining as i32)?;
+                let res = cipher_delegate_bytes(
+                    ctx,
+                    this,
+                    "engineUpdate",
+                    Some(tmp),
+                    0,
+                    remaining as i32,
+                )?;
                 return cipher_put_result_into_buffer(ctx, args.get(2).cloned(), res);
             }
             let bytes = read_bytes(ctx, tmp);
@@ -5120,8 +5144,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             if let Some(Value::Object(Some(input))) = args.get(1).cloned() {
                 if let Some(Value::Int(n)) = ctx.invoke_virtual(input, "remaining", "()I", &[])? {
                     if n > 0 {
-                        let tmp =
-                            ctx.new_array(cratonvm_types::ArrayElementType::Byte, n as usize);
+                        let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n as usize);
                         ctx.invoke_virtual(
                             input,
                             "get",
@@ -5970,10 +5993,13 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn shim_registers_all_clinits() {
@@ -6122,11 +6148,26 @@ mod tests {
         }
         // The wrapped SIZES are SunJCE's too, and they are what a caller sizing
         // a buffer depends on.
-        assert_eq!(aes_key_wrap_with_padding(&kek, &[0u8; 1]).unwrap().len(), 16);
-        assert_eq!(aes_key_wrap_with_padding(&kek, &[0u8; 8]).unwrap().len(), 16);
-        assert_eq!(aes_key_wrap_with_padding(&kek, &[0u8; 9]).unwrap().len(), 24);
-        assert_eq!(aes_key_wrap_with_padding(&kek, &[0u8; 16]).unwrap().len(), 24);
-        assert_eq!(aes_key_wrap_with_padding(&kek, &[0u8; 17]).unwrap().len(), 32);
+        assert_eq!(
+            aes_key_wrap_with_padding(&kek, &[0u8; 1]).unwrap().len(),
+            16
+        );
+        assert_eq!(
+            aes_key_wrap_with_padding(&kek, &[0u8; 8]).unwrap().len(),
+            16
+        );
+        assert_eq!(
+            aes_key_wrap_with_padding(&kek, &[0u8; 9]).unwrap().len(),
+            24
+        );
+        assert_eq!(
+            aes_key_wrap_with_padding(&kek, &[0u8; 16]).unwrap().len(),
+            24
+        );
+        assert_eq!(
+            aes_key_wrap_with_padding(&kek, &[0u8; 17]).unwrap().len(),
+            32
+        );
         assert!(aes_key_wrap_with_padding(&kek, &[]).is_err());
     }
 
@@ -6265,13 +6306,22 @@ mod tests {
         // one the dispatch actually needs: RFC 3394, RFC 3394 over PKCS#5-
         // padded input, and RFC 5649 are three different computations.
         assert!(is_aes_key_wrap_transformation("AES/KWP/NoPadding"));
-        assert!(matches!(aes_wrap_flavour("AES/KWP/NoPadding"), Some(AesWrapFlavour::Kwp)));
+        assert!(matches!(
+            aes_wrap_flavour("AES/KWP/NoPadding"),
+            Some(AesWrapFlavour::Kwp)
+        ));
         assert!(matches!(
             aes_wrap_flavour("AES/KW/PKCS5Padding"),
             Some(AesWrapFlavour::KwPkcs5)
         ));
-        assert!(matches!(aes_wrap_flavour("AES/KW/NoPadding"), Some(AesWrapFlavour::Kw)));
-        assert!(matches!(aes_wrap_flavour("AESWrap"), Some(AesWrapFlavour::Kw)));
+        assert!(matches!(
+            aes_wrap_flavour("AES/KW/NoPadding"),
+            Some(AesWrapFlavour::Kw)
+        ));
+        assert!(matches!(
+            aes_wrap_flavour("AESWrap"),
+            Some(AesWrapFlavour::Kw)
+        ));
         assert!(aes_wrap_flavour("AES/GCM/NoPadding").is_none());
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_128"), Some(16));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_192"), Some(24));
@@ -6289,7 +6339,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn refuses_algorithm(t: &str) -> bool {
-        matches!(classify_transformation(t), TransformVerdict::NoSuchAlgorithm)
+        matches!(
+            classify_transformation(t),
+            TransformVerdict::NoSuchAlgorithm
+        )
     }
 
     fn refuses_padding(t: &str) -> bool {
@@ -6318,7 +6371,10 @@ mod tests {
         // …and they resolve to their OWN families, not to AES. This is the
         // assertion that would have caught the original defect: the name was
         // admitted then and would have passed the four lines above.
-        assert!(matches!(cipher_family("ChaCha20"), Some(CipherFamily::ChaCha20)));
+        assert!(matches!(
+            cipher_family("ChaCha20"),
+            Some(CipherFamily::ChaCha20)
+        ));
         assert!(matches!(
             cipher_family("ChaCha20-Poly1305"),
             Some(CipherFamily::ChaCha20Poly1305)
@@ -6345,10 +6401,13 @@ mod tests {
     #[test]
     fn the_other_names_that_were_silently_aes_are_refused_too() {
         for t in [
-            "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish",
-            "Serpent", "CAST5", "Salsa20", "Skipjack", "ECIES", "ElGamal", "NULL",
+            "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish", "Serpent", "CAST5", "Salsa20",
+            "Skipjack", "ECIES", "ElGamal", "NULL",
         ] {
-            assert!(refuses_algorithm(t), "{t} must be refused, not served as AES");
+            assert!(
+                refuses_algorithm(t),
+                "{t} must be refused, not served as AES"
+            );
         }
         assert!(refuses_algorithm("CRATONVM-NO-SUCH-CIPHER"));
     }
@@ -6374,7 +6433,12 @@ mod tests {
     /// three of those lines read `178c380c…`.
     #[test]
     fn blowfish_and_rc4_are_their_own_ciphers_and_not_aes() {
-        for t in ["Blowfish", "BLOWFISH", "Blowfish/ECB/PKCS5Padding", "Blowfish/ECB/NoPadding"] {
+        for t in [
+            "Blowfish",
+            "BLOWFISH",
+            "Blowfish/ECB/PKCS5Padding",
+            "Blowfish/ECB/NoPadding",
+        ] {
             assert!(transformation_is_serviceable(t), "{t} must resolve");
             let (name, _, _) = parse_transformation(t);
             assert!(
@@ -6382,7 +6446,13 @@ mod tests {
                 "{t} must resolve to the Blowfish family, not to AES"
             );
         }
-        for t in ["RC4", "ARCFOUR", "rc4", "RC4/ECB/NoPadding", "ARCFOUR/ECB/NoPadding"] {
+        for t in [
+            "RC4",
+            "ARCFOUR",
+            "rc4",
+            "RC4/ECB/NoPadding",
+            "ARCFOUR/ECB/NoPadding",
+        ] {
             assert!(transformation_is_serviceable(t), "{t} must resolve");
             let (name, _, _) = parse_transformation(t);
             assert!(
@@ -6396,11 +6466,19 @@ mod tests {
         // pairing is written down is `real_spi_ecb_route`.
         assert_eq!(
             real_spi_ecb_route(CipherFamily::Blowfish, true),
-            Some(("com/sun/crypto/provider/BlowfishCipher", "PKCS5Padding", "Blowfish"))
+            Some((
+                "com/sun/crypto/provider/BlowfishCipher",
+                "PKCS5Padding",
+                "Blowfish"
+            ))
         );
         assert_eq!(
             real_spi_ecb_route(CipherFamily::Blowfish, false),
-            Some(("com/sun/crypto/provider/BlowfishCipher", "NoPadding", "Blowfish"))
+            Some((
+                "com/sun/crypto/provider/BlowfishCipher",
+                "NoPadding",
+                "Blowfish"
+            ))
         );
         // A stream cipher's padding does not depend on the transformation,
         // because `classify_transformation` admits only `NoPadding` for it.
@@ -6471,7 +6549,10 @@ mod tests {
             "RC4/ECB/PKCS5Padding",
             "ARCFOUR/ECB/PKCS5Padding",
         ] {
-            assert!(refuses_algorithm(t), "{t} must be refused, as HotSpot refuses it");
+            assert!(
+                refuses_algorithm(t),
+                "{t} must be refused, as HotSpot refuses it"
+            );
         }
         // `Blowfish/ECB/PKCS7Padding` is refused by HotSpot as well, and as a
         // PADDING failure here — the algorithm and mode do resolve.
@@ -6689,9 +6770,18 @@ mod tests {
     /// 256-bit key and encrypted with AES-256.
     #[test]
     fn size_pinned_names_pin_the_key_length() {
-        assert_eq!(transformation_pinned_key_len("AES_128/GCM/NoPadding"), Some(16));
-        assert_eq!(transformation_pinned_key_len("AES_192/CBC/NoPadding"), Some(24));
-        assert_eq!(transformation_pinned_key_len("AES_256/ECB/NoPadding"), Some(32));
+        assert_eq!(
+            transformation_pinned_key_len("AES_128/GCM/NoPadding"),
+            Some(16)
+        );
+        assert_eq!(
+            transformation_pinned_key_len("AES_192/CBC/NoPadding"),
+            Some(24)
+        );
+        assert_eq!(
+            transformation_pinned_key_len("AES_256/ECB/NoPadding"),
+            Some(32)
+        );
         assert_eq!(transformation_pinned_key_len("AES/GCM/NoPadding"), None);
         // HotSpot's measured wording, both flavours.
         assert_eq!(
@@ -6786,7 +6876,7 @@ mod tests {
         let key = key_with_handle(&mut ctx, 0);
         let err = cipher_init_record(&mut ctx, cipher_obj, 1, key, Vec::new())
             .expect_err("init must reject a key with no usable RSA components");
-                match err {
+        match err {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
@@ -6833,7 +6923,10 @@ mod tests {
             (s.mode, s.rsa_n.len(), s.rsa_exp.len())
         });
         assert_eq!(mode, 1);
-        assert!(n_len > 0 && e_len > 0, "the real key components are recorded");
+        assert!(
+            n_len > 0 && e_len > 0,
+            "the real key components are recorded"
+        );
     }
 
     // MUST STILL WORK — the guard is RSA-scoped; a symmetric init has no RSA

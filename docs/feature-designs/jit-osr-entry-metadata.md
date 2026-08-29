@@ -157,7 +157,7 @@ than assumed (Azure Linux, release binary, 2026-08-03):
 | Workload | OSR entries | Contract violations |
 |---|---|---|
 | `ConfigurationPropertiesTests` (114 tests, all pass) | **0** | 0 |
-| `probes/OsrDeadLocalProbe` | **125** | **0** |
+| `apps/probes/OsrDeadLocalProbe` | **125** | **0** |
 
 The first row is the reason the second exists. A Spring test class drives no OSR
 at all, so "zero violations" there is vacuous — it says nothing about a check

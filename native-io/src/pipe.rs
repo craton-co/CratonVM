@@ -313,12 +313,17 @@ mod platform {
     ) -> Option<std::io::Result<bool>> {
         let mut pfd = libc::pollfd {
             fd: raw as libc::c_int,
-            events: if want_write { libc::POLLOUT } else { libc::POLLIN },
+            events: if want_write {
+                libc::POLLOUT
+            } else {
+                libc::POLLIN
+            },
             revents: 0,
         };
         // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
         // matches the one-element buffer.
-        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, timeout_ms) };
+        let rc =
+            unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, timeout_ms) };
         if rc < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted || error.raw_os_error() == Some(4) {
@@ -1571,9 +1576,12 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn wp37_pipe_create_close_kernel_level() {

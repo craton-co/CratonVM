@@ -521,10 +521,7 @@ pub fn install_sequence_is_legal(steps: &[usize]) -> Result<(), InstallProtocolE
         }
         if let Some(prev) = highest {
             if step < prev {
-                return Err(InstallProtocolError::OutOfOrder {
-                    step,
-                    after: prev,
-                });
+                return Err(InstallProtocolError::OutOfOrder { step, after: prev });
             }
         }
         seen[step] = true;
@@ -950,9 +947,7 @@ impl CodeCacheLifecycle {
     /// Publish the configured code-cache capacity (a gauge). `0` = uncapped,
     /// which reports occupancy as `0.0` rather than dividing by zero.
     pub fn record_capacity_bytes(&self, bytes: u64) {
-        self.counters
-            .capacity_bytes
-            .store(bytes, Ordering::Relaxed);
+        self.counters.capacity_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Publish the arena's free-space shape (a gauge). Feeds
@@ -1091,8 +1086,7 @@ impl CodeCacheLifecycle {
                 .fetch_add(reclaimed_bytes, Ordering::Relaxed);
             c.reclaimed_code_bytes
                 .fetch_add(reclaimed_code_bytes, Ordering::Relaxed);
-            c.deferred_bodies
-                .store(deferred_bodies, Ordering::Relaxed);
+            c.deferred_bodies.store(deferred_bodies, Ordering::Relaxed);
             c.deferred_bytes.store(deferred_bytes, Ordering::Relaxed);
             c.max_deferral_sweeps
                 .fetch_max(oldest_deferral_sweeps as u64, Ordering::Relaxed);
@@ -1341,10 +1335,7 @@ impl CodeCacheLifecycleReport {
             }),
             deferred_fraction: ratio(raw.deferred_bytes, live_bytes),
             reclaim_completion: ratio(raw.reclaimed_bytes, raw.retired_bytes),
-            sweep_success_rate: ratio(
-                raw.sweeps.saturating_sub(raw.sweeps_deferred),
-                raw.sweeps,
-            ),
+            sweep_success_rate: ratio(raw.sweeps.saturating_sub(raw.sweeps_deferred), raw.sweeps),
             recompilation_ratio: ratio(raw.recompilations, raw.installs),
             versions_per_method: ratio(raw.installs, raw.methods_compiled),
             allocation_failure_rate: ratio(
@@ -1412,11 +1403,7 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
             f,
             "[JIT] code-cache retirement: retired={} bodies / {} bytes  sweeps={} \
              (deferred {}) reclaim_completion={:.4}",
-            r.retirements,
-            r.retired_bytes,
-            r.sweeps,
-            r.sweeps_deferred,
-            self.reclaim_completion,
+            r.retirements, r.retired_bytes, r.sweeps, r.sweeps_deferred, self.reclaim_completion,
         )?;
         if r.deferred_bodies == 0 {
             writeln!(
@@ -1429,10 +1416,7 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
                 "[JIT] code-cache retirement: RETAINED {} bodies / {} bytes ({:.4} of live) — \
                  quiescence unproven, oldest deferred {} sweeps. Retention is the fail-safe: \
                  a leak is a bug, freeing live code is a crash.",
-                r.deferred_bodies,
-                r.deferred_bytes,
-                self.deferred_fraction,
-                r.max_deferral_sweeps,
+                r.deferred_bodies, r.deferred_bytes, self.deferred_fraction, r.max_deferral_sweeps,
             )?;
         }
         let reasons = self.retire_reason_breakdown();
@@ -1720,7 +1704,10 @@ mod tests {
         // Sweep repeatedly: every one must RETAIN.
         for expected_age in 1..=3u32 {
             let out = lc.sweep();
-            assert!(!out.quiescent, "a thread is in JIT — sweep must not reclaim");
+            assert!(
+                !out.quiescent,
+                "a thread is in JIT — sweep must not reclaim"
+            );
             assert_eq!(out.reclaimed_bodies, 0);
             assert_eq!(out.deferred_bodies, 1);
             assert_eq!(out.deferred_bytes, 4096);
@@ -1991,7 +1978,11 @@ mod tests {
         let out = lc.sweep();
         assert!(out.quiescent);
         assert_eq!(out.reclaimed_bodies, total);
-        assert_eq!(drops.load(Ordering::Relaxed), total, "a retirement was lost");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            total,
+            "a retirement was lost"
+        );
         assert_eq!(freed_while_in_jit.load(Ordering::Relaxed), 0);
 
         // --- phase 2: install / retire / sweep all racing, no one in JIT ---
@@ -2029,7 +2020,10 @@ mod tests {
         // Drain whatever the racing sweeps left behind.
         while lc.queued_bodies() != 0 {
             let out = lc.sweep();
-            assert!(out.quiescent, "no thread is in JIT, so a sweep must proceed");
+            assert!(
+                out.quiescent,
+                "no thread is in JIT, so a sweep must proceed"
+            );
         }
 
         assert_eq!(
@@ -2164,7 +2158,10 @@ mod tests {
         // Flushing the I-cache AFTER the RW->RX flip races the fetch unit on a
         // non-coherent core.
         let mut late_flush = ordered.clone();
-        late_flush.swap(install_step::FLUSH_ICACHE, install_step::TRANSITION_RW_TO_RX);
+        late_flush.swap(
+            install_step::FLUSH_ICACHE,
+            install_step::TRANSITION_RW_TO_RX,
+        );
         assert_eq!(
             install_sequence_is_legal(&late_flush),
             Err(InstallProtocolError::OutOfOrder {

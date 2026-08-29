@@ -1758,7 +1758,7 @@ impl CompactValue {
                 "CompactValue::update_object_ptr_unchecked: pointer {:#x} is not a plausible heap object pointer",
                 new_ptr
             );
-                // A SUB_OBJECT slot is only decodable as a reference if its payload
+            // A SUB_OBJECT slot is only decodable as a reference if its payload
             // has crossed a reference-construction boundary in this process
             // (`crate::value::object_ref_payload_is_known`). Encoding one here IS
             // such a boundary: without this record, `to_value` / `decode_value`
@@ -3774,7 +3774,10 @@ mod tests {
             object_degradation_count() - before_total,
             DegradationSource::COUNT as u64,
         );
-        assert_eq!(after.iter().copied().sum::<u64>(), object_degradation_count());
+        assert_eq!(
+            after.iter().copied().sum::<u64>(),
+            object_degradation_count()
+        );
     }
 
     /// `note_object_degradation()` is the interpreter alias, so this crate's own

@@ -489,8 +489,7 @@ fn native_uri_get_scheme_specific_part(
 /// `lang_invoke.rs` shipped completely inert.
 fn has_synthetic_url_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(this);
-    !ctx
-        .declared_fields(class_id)
+    !ctx.declared_fields(class_id)
         .iter()
         .any(|f| !f.is_static && (f.name == "scheme" || f.name == "protocol"))
 }
@@ -1939,7 +1938,9 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             let frag = url_str.find('#');
             let query = url_str.find('?').filter(|q| frag.is_none_or(|f| *q < f));
             let scheme_end = url_str.find(':').filter(|c| {
-                url_str[..*c].chars().all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
+                url_str[..*c]
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
                     && url_str[..*c].starts_with(|ch: char| ch.is_ascii_alphabetic())
             });
             let auth_start = url_str.find("//").map(|s| s + 2);
@@ -1955,9 +1956,7 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 "query"
             } else if scheme_end.is_some_and(|c| pos < c) {
                 "scheme name"
-            } else if auth_start.is_some_and(|s| pos >= s)
-                && auth_stop.is_some_and(|e| pos < e)
-            {
+            } else if auth_start.is_some_and(|s| pos >= s) && auth_stop.is_some_and(|e| pos < e) {
                 "authority"
             } else {
                 "path"

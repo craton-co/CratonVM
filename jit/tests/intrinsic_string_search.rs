@@ -36,9 +36,7 @@
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
 use cratonvm_jit_api::JitRuntimeHelpers;
-use cratonvm_types::{
-    ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
-};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -96,7 +94,9 @@ fn helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,
@@ -653,11 +653,7 @@ fn string_index_of_const_char_differential() {
         "x\u{10437}yz",
     ];
     let needles: [u16; 6] = [
-        'a' as u16,
-        'z' as u16,
-        'o' as u16,
-        0x00e9,
-        0x4e2d,
+        'a' as u16, 'z' as u16, 'o' as u16, 0x00e9, 0x4e2d,
         0xFFFF, // a valid non-character, and a BMP one: scanned, not rejected
     ];
     for &ch in &needles {
@@ -682,7 +678,11 @@ fn string_index_of_const_char_counts_utf16_units_not_code_points() {
     let f = compile_index_of_const_char('z' as u16);
     let (s, _ss) = string_of("x\u{10437}yz");
     // x=0, surrogate pair=1,2, y=3, z=4. A code-point index would say 3.
-    assert_eq!(f(s.ptr()) as i32, 4, "must be a UTF-16 index, not a code-point one");
+    assert_eq!(
+        f(s.ptr()) as i32,
+        4,
+        "must be a UTF-16 index, not a code-point one"
+    );
 }
 
 #[test]

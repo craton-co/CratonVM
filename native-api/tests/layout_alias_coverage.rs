@@ -311,7 +311,10 @@ fn the_layout_asserting_allocation_surface_is_exactly_two_methods() {
             continue;
         }
         // Only allocation doors: the method must hand back an object.
-        let sig_end = registry[fn_at..].find('{').unwrap_or(registry.len() - fn_at) + fn_at;
+        let sig_end = registry[fn_at..]
+            .find('{')
+            .unwrap_or(registry.len() - fn_at)
+            + fn_at;
         let sig_end = registry[fn_at..sig_end]
             .find(';')
             .map_or(sig_end, |s| fn_at + s);
@@ -713,8 +716,8 @@ fn no_allocation_door_opens_before_the_census() {
 fn the_unresolved_class_sentinel_is_observed_before_it_is_substituted() {
     let src = read("vm/src/vm/vm_exec.rs");
     let stripped = strip_comments(&src);
-    let body = fn_body(&stripped, "alloc_object")
-        .expect("vm_exec.rs no longer defines `fn alloc_object`");
+    let body =
+        fn_body(&stripped, "alloc_object").expect("vm_exec.rs no longer defines `fn alloc_object`");
     let observe_at = body.find("layout_alias::UNRESOLVED_CLASS").expect(
         "`NativeContextImpl::alloc_object` no longer observes the `ClassId::new(0)` \
          sentinel under `layout_alias::UNRESOLVED_CLASS`.\n\
@@ -817,7 +820,10 @@ fn the_fabrication_funnel_uses_the_shared_classify() {
 fn the_appended_slot_allocators_do_not_regress_to_a_literal_width() {
     let stripped = strip_comments(&read("native-io/src/lib.rs"));
     for (func, derivation) in [
-        ("alloc_mapped_byte_buffer", "appended_slots::base_for_class("),
+        (
+            "alloc_mapped_byte_buffer",
+            "appended_slots::base_for_class(",
+        ),
         ("native_fc_open", "synthetic_file_channel::alloc_slots("),
     ] {
         let body = fn_body(&stripped, func).unwrap_or_else(|| {
@@ -1130,7 +1136,10 @@ fn census() {
         "  every production site above now reaches \
          cratonvm_native_api::layout_alias::observe via NativeContextImpl::alloc_object"
     );
-    assert!(prod > 0, "no direct allocation sites found at all — the scanner broke, not the tree");
+    assert!(
+        prod > 0,
+        "no direct allocation sites found at all — the scanner broke, not the tree"
+    );
 }
 
 /// Byte spans of `#[cfg(test)]` items, so the census can separate the sites that

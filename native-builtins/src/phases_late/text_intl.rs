@@ -2479,7 +2479,10 @@ pub(crate) const BI_CHARACTER: i32 = 2;
 
 pub(crate) const BI_LINE: i32 = 3;
 
-pub(crate) fn bi_alloc_kind(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn bi_alloc_kind(
+    ctx: &mut dyn NativeContext,
+    kind: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/text/BreakIterator", 3)?;
     ctx.set_field(obj, 0, Value::Object(None));
     ctx.set_field(obj, 1, Value::Int(0));
@@ -2693,9 +2696,12 @@ pub(crate) fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
 
 #[cfg(test)]
 pub(crate) mod break_iterator_line_boundary_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     const HELP_TEXT: &str =
         "specified, --user is used, and the env variable KC_CLI_PASSWORD is not defined";
@@ -2755,9 +2761,12 @@ pub(crate) mod break_iterator_line_boundary_tests {
 
 #[cfg(test)]
 pub(crate) mod break_iterator_sentence_boundary_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn sentence_does_not_end_inside_dotted_identifier() {

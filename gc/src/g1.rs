@@ -31,8 +31,7 @@ use crate::gc::{GcResult, GcStats};
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, GC_FLAG_OLD_GEN, ARRAY_DATA_OFFSET, HEADER_SIZE,
-    SLOT_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
@@ -333,12 +332,12 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 fn verify_budget() -> usize {
     use std::sync::OnceLock;
     static BUDGET: OnceLock<usize> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_G1_VERIFY_BUDGET") {
+    *BUDGET.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_G1_VERIFY_BUDGET") {
             Ok(v) => v.trim().parse::<usize>().unwrap_or(4096),
             Err(_) => 4096,
-        }
-    })
+        },
+    )
 }
 
 fn parallel_evac_enabled() -> bool {
@@ -1050,27 +1049,32 @@ impl<'a> SharedEvac<'a> {
             // `alloc_object(ClassId, n)` with no layout registered, so their
             // objects are legacy-layout and this loop was accidentally correct
             // for every one of them.
-            for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
-                let ref_ptr = raw as *mut u8;
-                if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
-                    if self.cset.contains(&ridx) {
-                        if let Some((new_ptr, fresh)) =
-                            self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                        {
-                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
-                            if fresh {
-                                Self::record_fresh_child(
-                                    ref_ptr,
-                                    new_ptr,
-                                    defer_self_forwarded,
-                                    children,
-                                    deferred_self_forwarded,
-                                );
+            for_each_flat_object_reference_trusting_header(
+                obj_ptr,
+                header,
+                0,
+                |slot_ptr, raw, compact| {
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                        if self.cset.contains(&ridx) {
+                            if let Some((new_ptr, fresh)) =
+                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                            {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                if fresh {
+                                    Self::record_fresh_child(
+                                        ref_ptr,
+                                        new_ptr,
+                                        defer_self_forwarded,
+                                        children,
+                                        deferred_self_forwarded,
+                                    );
+                                }
                             }
                         }
                     }
-                }
-            });
+                },
+            );
         }
     }
 
@@ -1175,27 +1179,36 @@ impl<'a> SharedEvac<'a> {
                 // remembered-set source whose CSet-bound edges are never
                 // rewritten at all.
                 let header = &*(obj_ptr as *const ObjectHeader);
-                for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
-                    let ref_ptr = raw as *mut u8;
-                    if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
-                        if self.cset.contains(&ridx) {
-                            if let Some((new_ptr, fresh)) =
-                                self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
-                            {
-                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
-                                if fresh {
-                                    Self::record_fresh_child(
-                                        ref_ptr,
-                                        new_ptr,
-                                        true,
-                                        &mut newly,
-                                        deferred_self_forwarded,
+                for_each_flat_object_reference_trusting_header(
+                    obj_ptr,
+                    header,
+                    0,
+                    |slot_ptr, raw, compact| {
+                        let ref_ptr = raw as *mut u8;
+                        if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
+                            if self.cset.contains(&ridx) {
+                                if let Some((new_ptr, fresh)) =
+                                    self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
+                                {
+                                    write_flat_object_reference(
+                                        slot_ptr,
+                                        new_ptr as usize,
+                                        compact,
                                     );
+                                    if fresh {
+                                        Self::record_fresh_child(
+                                            ref_ptr,
+                                            new_ptr,
+                                            true,
+                                            &mut newly,
+                                            deferred_self_forwarded,
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    },
+                );
             }
 
             offset += obj_size;
@@ -1566,8 +1579,7 @@ impl G1Region {
         // Captured BEFORE the fields are cleared — the zero-fill below is
         // bounded by them (see the `dirty` computation at the end).
         let prev_cursor = self.cursor;
-        let was_humongous_continuation =
-            self.region_type == RegionType::HumongousContinuation;
+        let was_humongous_continuation = self.region_type == RegionType::HumongousContinuation;
         self.region_type = RegionType::Free;
         self.cursor = 0;
         self.live_bytes = 0;
@@ -1761,7 +1773,6 @@ const G1_MAX_NEW_PERCENT: usize = 60;
 /// threads, 2M stores, ordinary arrays): one slot left the mode scaling 4.9x
 /// from one thread to eight while the barrier-free modes went flat.
 const RSET_EDGE_MEMO_SLOTS: usize = 4;
-
 
 // ---------------------------------------------------------------------------
 // Collection type
@@ -2394,7 +2405,8 @@ impl G1Collector {
 
     /// This heap's compact-layout domain.
     pub fn layout_domain(&self) -> u32 {
-        self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
+        self.layout_domain
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Create a new G1 collector with the given configuration.
@@ -2468,9 +2480,7 @@ impl G1Collector {
         crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
 
         Self {
-            layout_domain: std::sync::atomic::AtomicU32::new(
-                cratonvm_types::FIRST_LAYOUT_DOMAIN,
-            ),
+            layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
             config: config.clone(),
             arena,
             regions: Mutex::new(regions),
@@ -2494,9 +2504,7 @@ impl G1Collector {
             young_region_count: AtomicUsize::new(0),
             // Starts at the ceiling — see the field doc: the cap must be a
             // no-op until a pause is measured to overrun the goal.
-            young_target_regions: AtomicUsize::new(
-                (num_regions * G1_MAX_NEW_PERCENT / 100).max(1),
-            ),
+            young_target_regions: AtomicUsize::new((num_regions * G1_MAX_NEW_PERCENT / 100).max(1)),
             needs_gc_since_recount: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             mark_start_snapshot: Mutex::new(Vec::new()),
@@ -2644,7 +2652,12 @@ impl G1Collector {
     /// See [`Self::young_target_regions`] for what this is for, why the target
     /// starts at its ceiling, and why an unproductive pause must widen rather
     /// than tighten it.
-    fn update_young_target(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
+    fn update_young_target(
+        &self,
+        collection_type: G1CollectionType,
+        pause_us: u64,
+        stats: &GcStats,
+    ) {
         if !gc_flags().g1_young_pause_target {
             return;
         }
@@ -2667,7 +2680,10 @@ impl G1Collector {
         if goal_us == 0 {
             return;
         }
-        let cur = self.young_target_regions.load(Ordering::Relaxed).clamp(min, max);
+        let cur = self
+            .young_target_regions
+            .load(Ordering::Relaxed)
+            .clamp(min, max);
         let next = if pause_us > goal_us {
             // Overran: take 20% off, never below the floor.
             (cur * 4 / 5).max(min)
@@ -3337,9 +3353,13 @@ impl G1Collector {
                 record(raw as usize);
             }
         } else {
-            for_each_flat_object_reference_capped(obj_ptr, header, 0, walkable_slots, |_, raw, _| {
-                record(raw)
-            });
+            for_each_flat_object_reference_capped(
+                obj_ptr,
+                header,
+                0,
+                walkable_slots,
+                |_, raw, _| record(raw),
+            );
         }
         true
     }
@@ -3430,7 +3450,8 @@ impl G1Collector {
         // previous pause could not evacuate, so it runs with a heap the
         // collector has already declined to reason about normally — exactly the
         // state in which a death certificate should not be issued.
-        let _census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        let _census =
+            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
@@ -3493,7 +3514,10 @@ impl G1Collector {
     /// `acc` key the `acc` entry is the meaningful one (the `next` key is a
     /// pass-1-freed address recycled as later-pass to-space — no frame local
     /// can name it).
-    fn compose_forward_maps(acc: &mut cratonvm_types::PointerMap, next: &cratonvm_types::PointerMap) {
+    fn compose_forward_maps(
+        acc: &mut cratonvm_types::PointerMap,
+        next: &cratonvm_types::PointerMap,
+    ) {
         for v in acc.values_mut() {
             if let Some(&nv) = next.get(v) {
                 *v = nv;
@@ -3842,8 +3866,12 @@ impl G1Collector {
                     .iter()
                     .any(|r| r.region_type == RegionType::HumongousStart),
         );
-        let census =
-            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
+        let census = self.update_references_in_regions(
+            &mut regions,
+            &cset_set,
+            &pointer_map,
+            narrow.as_ref(),
+        );
         phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
         phases.fixup_regions = census.walked_regions;
         phases.fixup_bytes = census.walked_bytes;
@@ -3955,12 +3983,7 @@ impl G1Collector {
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection_with_phases(
-            G1CollectionType::YoungOnly,
-            pause_us,
-            &stats,
-            phases,
-        );
+        self.record_collection_with_phases(G1CollectionType::YoungOnly, pause_us, &stats, phases);
         crate::gc_metrics::record_g1_cycle(
             crate::gc_metrics::g1_cycle_kind::YOUNG,
             cset.len() as u32,
@@ -4700,7 +4723,11 @@ impl G1Collector {
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
-        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(main_forwards.len(), Default::default());
+        let mut pointer_map: cratonvm_types::PointerMap =
+            cratonvm_types::PointerMap::with_capacity_and_hasher(
+                main_forwards.len(),
+                Default::default(),
+            );
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
         }
@@ -5700,7 +5727,8 @@ impl G1Collector {
         let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
             return (HeaderVerdict::BadKindTag, Some(idx));
         };
-        if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
+        if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }
+            .is_none()
         {
             return (HeaderVerdict::BadElementTag, Some(idx));
         }
@@ -5802,7 +5830,8 @@ impl G1Collector {
             // is implied by the loop). A desync here is itself the answer, so
             // report where it happened rather than guessing past it.
             let ptr = obj_ptr as *const u8;
-            let kind_ok = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }.is_some();
+            let kind_ok =
+                unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }.is_some();
             let elem_ok =
                 unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }
                     .is_some();
@@ -5932,43 +5961,48 @@ impl G1Collector {
                 }
             }
         } else {
-            for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
-                if !self.evacuation_candidate_is_an_object(
-                    regions,
-                    "worklist-scan[object]",
-                    obj_ptr,
-                    raw,
-                    raw,
-                ) {
-                    return;
-                }
-                let ref_ptr = raw as *mut u8;
-                if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
-                    if cset.contains(&region_idx) {
-                        // Round-5 fix (CRIT, O(N²)): only push the
-                        // forwarded target onto the worklist when this
-                        // call site actually evacuated it. Step 9: the
-                        // freshness comes from the evacuation outcome
-                        // (`fresh`), not a separate `contains_key`
-                        // pre-check (a TOCTOU under parallel evacuation).
-                        if let Some((new_ptr, fresh)) = self.evacuate_object(
-                            regions,
-                            ref_ptr,
-                            pointer_map,
-                            objects_copied,
-                            bytes_copied,
-                            cset,
-                        ) {
-                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
-                            if fresh {
-                                work_list.push(new_ptr);
-                            }
-                        }
-                    } else if let Some(&new_addr) = pointer_map.get(&raw) {
-                        write_flat_object_reference(slot_ptr, new_addr, compact);
+            for_each_flat_object_reference_trusting_header(
+                obj_ptr,
+                header,
+                0,
+                |slot_ptr, raw, compact| {
+                    if !self.evacuation_candidate_is_an_object(
+                        regions,
+                        "worklist-scan[object]",
+                        obj_ptr,
+                        raw,
+                        raw,
+                    ) {
+                        return;
                     }
-                }
-            });
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
+                        if cset.contains(&region_idx) {
+                            // Round-5 fix (CRIT, O(N²)): only push the
+                            // forwarded target onto the worklist when this
+                            // call site actually evacuated it. Step 9: the
+                            // freshness comes from the evacuation outcome
+                            // (`fresh`), not a separate `contains_key`
+                            // pre-check (a TOCTOU under parallel evacuation).
+                            if let Some((new_ptr, fresh)) = self.evacuate_object(
+                                regions,
+                                ref_ptr,
+                                pointer_map,
+                                objects_copied,
+                                bytes_copied,
+                                cset,
+                            ) {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                if fresh {
+                                    work_list.push(new_ptr);
+                                }
+                            }
+                        } else if let Some(&new_addr) = pointer_map.get(&raw) {
+                            write_flat_object_reference(slot_ptr, new_addr, compact);
+                        }
+                    }
+                },
+            );
         }
     }
 
@@ -6155,34 +6189,43 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot_ptr, raw, compact| {
-                    if !self.evacuation_candidate_is_an_object(
-                        regions,
-                        "rset-source-scan[object]",
-                        obj_ptr,
-                        raw,
-                        raw,
-                    ) {
-                        return;
-                    }
-                    let ref_ptr = raw as *mut u8;
-                    if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
-                        if cset.contains(&ridx) {
-                            // Step 9: `fresh` ignored (see the Array branch).
-                            if let Some((new_ptr, _fresh)) = self.evacuate_object(
-                                regions,
-                                ref_ptr,
-                                pointer_map,
-                                objects_copied,
-                                bytes_copied,
-                                cset,
-                            ) {
-                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
-                                work_list.push(new_ptr);
+                for_each_flat_object_reference_trusting_header(
+                    obj_ptr,
+                    header,
+                    0,
+                    |slot_ptr, raw, compact| {
+                        if !self.evacuation_candidate_is_an_object(
+                            regions,
+                            "rset-source-scan[object]",
+                            obj_ptr,
+                            raw,
+                            raw,
+                        ) {
+                            return;
+                        }
+                        let ref_ptr = raw as *mut u8;
+                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
+                            if cset.contains(&ridx) {
+                                // Step 9: `fresh` ignored (see the Array branch).
+                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                                    regions,
+                                    ref_ptr,
+                                    pointer_map,
+                                    objects_copied,
+                                    bytes_copied,
+                                    cset,
+                                ) {
+                                    write_flat_object_reference(
+                                        slot_ptr,
+                                        new_ptr as usize,
+                                        compact,
+                                    );
+                                    work_list.push(new_ptr);
+                                }
                             }
                         }
-                    }
-                });
+                    },
+                );
             }
 
             offset += obj_size;
@@ -6343,8 +6386,7 @@ impl G1Collector {
         // then took that destination's rset mutex and hashed the same source
         // 100k times. Cleared per region, so it costs one small `HashSet` and
         // bounds the pushes by the region COUNT rather than the slot count.
-        let mut seen_targets: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut seen_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let jit_skips = self.jit_tlab_skip_spans();
         let dbg_walk = gc_flags().g1_dbg_reach;
         let mut walk_aborted = false;
@@ -6606,11 +6648,7 @@ impl G1Collector {
     /// incapable of returning anything else is not evidence, and the whole
     /// reason this exists is that the unit suite could not tell a correct
     /// Phase-4 narrowing from one that walked nothing.
-    fn rset_completeness_counts(
-        &self,
-        regions: &[G1Region],
-        site: &str,
-    ) -> (usize, usize) {
+    fn rset_completeness_counts(&self, regions: &[G1Region], site: &str) -> (usize, usize) {
         let mut examined = 0usize;
         let mut missing = 0usize;
         for h in 0..regions.len() {
@@ -6669,15 +6707,19 @@ impl G1Collector {
                     if header.element_type() == ArrayElementType::Reference {
                         let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
                         for k in 0..header.array_length() as usize {
-                            let raw: u64 =
-                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
+                            let raw: u64 = unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
                             if raw != 0 {
                                 check(raw as usize);
                             }
                         }
                     }
                 } else {
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| check(raw));
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| check(raw),
+                    );
                 }
                 offset += size;
             }
@@ -6714,7 +6756,11 @@ impl G1Collector {
         // only meaningful against the number of objects that statement covers.
         // Set `CRATONVM_G1_VERIFY_BUDGET=0` to opt out entirely.
         let unbounded = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
-        let budget = if unbounded { usize::MAX } else { verify_budget() };
+        let budget = if unbounded {
+            usize::MAX
+        } else {
+            verify_budget()
+        };
         if budget == 0 {
             return;
         }
@@ -6817,12 +6863,17 @@ impl G1Collector {
                     }
                 } else {
                     let mut found = 0u64;
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
-                        if is_dangling(raw) {
-                            found += 1;
-                            self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
-                        }
-                    });
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| {
+                            if is_dangling(raw) {
+                                found += 1;
+                                self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
+                            }
+                        },
+                    );
                     dangling_found += found;
                 }
 
@@ -6851,11 +6902,7 @@ impl G1Collector {
             // does not begin mid-heap for no reason.
             self.cset_verify_cursor.store(0, Ordering::Relaxed);
         }
-        crate::gc_metrics::record_g1_cset_verify(
-            objects_walked as u64,
-            dangling_found,
-            truncated,
-        );
+        crate::gc_metrics::record_g1_cset_verify(objects_walked as u64, dangling_found, truncated);
     }
 
     /// SECURITY FIX (V7b): report a detected dangling-into-CSet slot.
@@ -6919,7 +6966,11 @@ impl G1Collector {
         // SAME destination address = a TLAB allocation race (one copy clobbers
         // the other's header → `java/lang/Object`). Reverse-map the forwards.
         {
-            let mut by_dest: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(pointer_map.len(), Default::default());
+            let mut by_dest: cratonvm_types::PointerMap =
+                cratonvm_types::PointerMap::with_capacity_and_hasher(
+                    pointer_map.len(),
+                    Default::default(),
+                );
             let mut overlaps = 0usize;
             for (&k, &v) in pointer_map.iter() {
                 if k == v {
@@ -7036,9 +7087,14 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
-                        check(obj_ptr as usize, "field", raw);
-                    });
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| {
+                            check(obj_ptr as usize, "field", raw);
+                        },
+                    );
                 }
                 offset += obj_size;
             }
@@ -7134,9 +7190,14 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
-                        report(obj_ptr as usize, Some(ridx), "field", raw);
-                    });
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| {
+                            report(obj_ptr as usize, Some(ridx), "field", raw);
+                        },
+                    );
                 }
                 off += sz;
             }
@@ -7323,9 +7384,14 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference_trusting_header(addr as *mut u8, header, 0, |_, raw, _| {
-                    check_push(raw, addr, "field", 0, &mut stack, &mut seen, &mut bad);
-                });
+                for_each_flat_object_reference_trusting_header(
+                    addr as *mut u8,
+                    header,
+                    0,
+                    |_, raw, _| {
+                        check_push(raw, addr, "field", 0, &mut stack, &mut seen, &mut bad);
+                    },
+                );
             }
         }
         if bad > 0 {
@@ -7382,9 +7448,7 @@ impl G1Collector {
                             h,
                             0,
                             |_, raw, _| {
-                                if self.lookup_region_for_addr(raw).is_some()
-                                    && rseen.insert(raw)
-                                {
+                                if self.lookup_region_for_addr(raw).is_some() && rseen.insert(raw) {
                                     rstack.push(raw);
                                 }
                             },
@@ -8730,21 +8794,19 @@ impl G1Collector {
                 .map(|r| (r.region_type == RegionType::Free, r.recycled_in_generation))
                 .collect();
             for region in regions.iter() {
-                region
-                    .rset
-                    .retain_sources_in_generation(|src, generation| {
-                        match source_state.get(src) {
-                            // Free: holds nothing, so it holds no live edge.
-                            // Recycled since the edge was recorded: the holder
-                            // was zero-filled by `reset`. Either way the entry
-                            // is dead. `RSET_GENERATION_PINNED` entries (no
-                            // generation available at record time) survive the
-                            // second test by construction.
-                            Some(&(is_free, recycled_in)) => !is_free && generation >= recycled_in,
-                            // Out of range — can never be walked.
-                            None => false,
-                        }
-                    });
+                region.rset.retain_sources_in_generation(|src, generation| {
+                    match source_state.get(src) {
+                        // Free: holds nothing, so it holds no live edge.
+                        // Recycled since the edge was recorded: the holder
+                        // was zero-filled by `reset`. Either way the entry
+                        // is dead. `RSET_GENERATION_PINNED` entries (no
+                        // generation available at record time) survive the
+                        // second test by construction.
+                        Some(&(is_free, recycled_in)) => !is_free && generation >= recycled_in,
+                        // Out of range — can never be walked.
+                        None => false,
+                    }
+                });
             }
         }
 
@@ -8763,8 +8825,7 @@ impl G1Collector {
         // `rset_bytes_per_live_byte` is the measurement that says whether the
         // remembered set needs a real bound (audit §9 item 5), and a gauge that
         // silently under-reports by a third would answer that question wrong.
-        const RSET_ENTRY_BYTES: usize =
-            std::mem::size_of::<usize>() + std::mem::size_of::<u64>();
+        const RSET_ENTRY_BYTES: usize = std::mem::size_of::<usize>() + std::mem::size_of::<u64>();
         let rset_sources_total: usize = regions.iter().map(|r| r.rset.source_count()).sum();
         crate::gc_metrics::record_remembered_set_bytes(
             (rset_sources_total * RSET_ENTRY_BYTES) as u64,
@@ -9022,10 +9083,14 @@ impl G1Collector {
         };
 
         if !census.complete {
-            return declined("a phase-4 region walk aborted, so the census under-counts live edges");
+            return declined(
+                "a phase-4 region walk aborted, so the census under-counts live edges",
+            );
         }
         if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
-            return declined("a concurrent mark cycle is in flight (SATB snapshot liveness applies)");
+            return declined(
+                "a concurrent mark cycle is in flight (SATB snapshot liveness applies)",
+            );
         }
         if !self.mark_worklist.lock().is_empty() {
             return declined("the gray set is non-empty");
@@ -9212,9 +9277,14 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
-                        offend(raw, "a surviving object");
-                    });
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| {
+                            offend(raw, "a surviving object");
+                        },
+                    );
                 }
                 offset += obj_size;
             }
@@ -11491,9 +11561,9 @@ impl GarbageCollector for G1Collector {
             h => h,
         }) {
             Ok(hash) => hash,
-            Err(()) => crate::collector::displaced_identity_hash(
-                header.mark_word.load(Ordering::Relaxed),
-            ),
+            Err(()) => {
+                crate::collector::displaced_identity_hash(header.mark_word.load(Ordering::Relaxed))
+            }
         }
     }
 
@@ -11788,8 +11858,8 @@ impl GarbageCollector for G1Collector {
         // translates to the owning continuation region. Either way the read is
         // bounds-confined to the object's own backing memory.
         let mut raw = [0u8; 8]; // largest element is 8 bytes (long/double/ref)
-        // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
-        // total so the humongous span / payload bound is exact.
+                                // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
+                                // total so the humongous span / payload bound is exact.
         let total_size =
             ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
         // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)` is
@@ -11899,8 +11969,7 @@ impl GarbageCollector for G1Collector {
         // (`BarrierProbe primstore`), with ZGC flat.
         let total_size =
             ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
-        let needs_satb_read =
-            is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed();
+        let needs_satb_read = is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed();
         // SAFETY: `index < len` so the slot is inside the array payload.
         let flat_store = || {
             let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
@@ -12734,7 +12803,11 @@ fn describe_skip_coverage(
     let nearest = spans
         .iter()
         .map(|&(s, e)| {
-            let d = if addr < s { s - addr } else { addr.saturating_sub(e) };
+            let d = if addr < s {
+                s - addr
+            } else {
+                addr.saturating_sub(e)
+            };
             (d, s, e)
         })
         .min_by_key(|(d, _, _)| *d);
@@ -12813,7 +12886,11 @@ impl WalkTrail {
     /// the arithmetic that produced the landing offset can be checked by eye.
     fn render(&self) -> String {
         let mut out = String::new();
-        let start = if self.len == WALK_TRAIL_LEN { self.next } else { 0 };
+        let start = if self.len == WALK_TRAIL_LEN {
+            self.next
+        } else {
+            0
+        };
         for i in 0..self.len {
             let (off, cid, kind, size) = self.entries[(start + i) % WALK_TRAIL_LEN];
             if i > 0 {
@@ -13346,7 +13423,11 @@ pub mod live_region_memo {
             false
         });
         if stats::on() {
-            let counter = if answered { &stats::HITS } else { &stats::MISSES };
+            let counter = if answered {
+                &stats::HITS
+            } else {
+                &stats::MISSES
+            };
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         answered
@@ -13357,13 +13438,7 @@ pub mod live_region_memo {
     /// `epoch` must be the value read BEFORE the `regions` lock was taken — see
     /// the module doc's incarnation argument.
     #[inline]
-    pub(super) fn fill(
-        instance_id: u64,
-        epoch: u64,
-        region_idx: usize,
-        base: usize,
-        limit: usize,
-    ) {
+    pub(super) fn fill(instance_id: u64, epoch: u64, region_idx: usize, base: usize, limit: usize) {
         if !enabled() {
             return;
         }
@@ -13372,11 +13447,13 @@ pub mod live_region_memo {
             let slot = entries
                 .iter()
                 .position(|e| e.region_idx == region_idx && e.instance_id == instance_id)
-                .unwrap_or_else(|| VICTIM.with(|v| {
-                    let s = v.get();
-                    v.set((s + 1) % WAYS);
-                    s
-                }));
+                .unwrap_or_else(|| {
+                    VICTIM.with(|v| {
+                        let s = v.get();
+                        v.set((s + 1) % WAYS);
+                        s
+                    })
+                });
             entries[slot] = Entry {
                 instance_id,
                 epoch,
@@ -14128,7 +14205,8 @@ mod tests {
     fn a_humongous_span_named_by_a_root_survives_the_pause() {
         let gc = make_collector();
         let live = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
-        gc.set_array_element(live, 99_999, Value::Long(0x5EED)).unwrap();
+        gc.set_array_element(live, 99_999, Value::Long(0x5EED))
+            .unwrap();
         let _churn = gc.alloc_object(ClassId::new(1), 1);
 
         let mut roots: Vec<ObjectRef> = vec![live];
@@ -14155,7 +14233,8 @@ mod tests {
     fn a_humongous_span_held_only_by_an_evacuated_young_object_survives() {
         let gc = make_collector();
         let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
-        gc.set_array_element(h, 99_999, Value::Long(0xFEED)).unwrap();
+        gc.set_array_element(h, 99_999, Value::Long(0xFEED))
+            .unwrap();
 
         let holder = gc.alloc_object(ClassId::new(1), 1);
         let holder_before = holder.as_ptr();
@@ -14273,10 +14352,7 @@ mod tests {
             2,
             "a span referenced from another span must not be freed under it"
         );
-        assert_eq!(
-            gc.get_array_element(target, 0).unwrap(),
-            Value::Long(0xB0B)
-        );
+        assert_eq!(gc.get_array_element(target, 0).unwrap(), Value::Long(0xB0B));
     }
 
     /// A humongous object with an unrun finalizer must survive the pause.
@@ -14427,8 +14503,8 @@ mod tests {
         ] {
             let n = ((boundary_elems as isize) + delta).max(1) as usize;
             let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
-            let total = ARRAY_DATA_OFFSET
-                + crate::heap::array_data_size(n, ArrayElementType::Int).unwrap();
+            let total =
+                ARRAY_DATA_OFFSET + crate::heap::array_data_size(n, ArrayElementType::Int).unwrap();
             let really_humongous = gc.is_humongous(arr);
             assert!(
                 !really_humongous || gc.may_be_humongous(total),
@@ -15271,7 +15347,10 @@ mod tests {
             dr::label(dr::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE),
             dr::label(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION)
         );
-        assert_ne!(dr::label(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION), "unknown");
+        assert_ne!(
+            dr::label(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION),
+            "unknown"
+        );
         assert!(
             !dr::is_moving(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION),
             "the pause moves nothing, so it is not a moving young collection"
@@ -16528,15 +16607,19 @@ mod tests {
                     if header.element_type() == ArrayElementType::Reference {
                         let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
                         for k in 0..header.array_length() as usize {
-                            let raw: u64 =
-                                unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
+                            let raw: u64 = unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
                             if raw != 0 {
                                 check(raw as usize);
                             }
                         }
                     }
                 } else {
-                    for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| check(raw));
+                    for_each_flat_object_reference_trusting_header(
+                        obj_ptr,
+                        header,
+                        0,
+                        |_, raw, _| check(raw),
+                    );
                 }
                 offset += size;
             }
@@ -16737,7 +16820,10 @@ mod tests {
             .phase4_regions_to_walk(&regions, Some(&pre), &sources, false)
             .expect("narrowing is on and no census is wanted");
 
-        assert!(narrow.contains(&3), "a remembered-set source must be walked");
+        assert!(
+            narrow.contains(&3),
+            "a remembered-set source must be walked"
+        );
         assert!(
             narrow.contains(&5),
             "a region this pause wrote into must be walked — it holds new \
@@ -16804,21 +16890,21 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_SCRUB_FREE", Some("1"))],
             || {
-        let mut region = G1Region::new(64 * 1024);
-        let len = region.data.len();
-        region.region_type = RegionType::Eden;
-        region.data[..4096].fill(0xAA);
-        region.cursor = 4096;
+                let mut region = G1Region::new(64 * 1024);
+                let len = region.data.len();
+                region.region_type = RegionType::Eden;
+                region.data[..4096].fill(0xAA);
+                region.cursor = 4096;
 
-        region.reset(7);
+                region.reset(7);
 
-        assert_eq!(region.region_type, RegionType::Free);
-        assert_eq!(region.cursor, 0);
-        assert!(
-            region.data.iter().all(|&b| b == 0),
-            "under CRATONVM_G1_SCRUB_FREE a Free region must be entirely zero"
-        );
-        assert_eq!(len, region.data.len(), "reset must not resize the region");
+                assert_eq!(region.region_type, RegionType::Free);
+                assert_eq!(region.cursor, 0);
+                assert!(
+                    region.data.iter().all(|&b| b == 0),
+                    "under CRATONVM_G1_SCRUB_FREE a Free region must be entirely zero"
+                );
+                assert_eq!(len, region.data.len(), "reset must not resize the region");
             },
         );
     }
@@ -16967,7 +17053,10 @@ mod tests {
         let landed = gc
             .lookup_region_for_addr(ptr as usize)
             .expect("the allocation must live in some region");
-        assert_ne!(landed, 1, "the hint named a CSet region and must be ignored");
+        assert_ne!(
+            landed, 1,
+            "the hint named a CSet region and must be ignored"
+        );
         assert_eq!(
             regions[1].cursor, 0,
             "nothing may be bump-allocated into a CSet region"
@@ -17058,13 +17147,7 @@ mod tests {
             let regions = gc.regions.lock();
             let header = unsafe { &*(arr_ptr as *const ObjectHeader) };
             gc.collect_outgoing_cross_region_edges(
-                &regions,
-                holder,
-                arr_ptr,
-                header,
-                &mut out,
-                &mut seen,
-                None,
+                &regions, holder, arr_ptr, header, &mut out, &mut seen, None,
             );
         }
 
@@ -17183,38 +17266,38 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
             || {
-            let gc = make_collector(); // 8 regions, goal 200 ms
-            let (min, max) = gc.young_region_bounds();
-            assert_eq!(
-                gc.young_target_regions(),
-                max,
-                "the cap must be a no-op until a pause is measured to overrun"
-            );
+                let gc = make_collector(); // 8 regions, goal 200 ms
+                let (min, max) = gc.young_region_bounds();
+                assert_eq!(
+                    gc.young_target_regions(),
+                    max,
+                    "the cap must be a no-op until a pause is measured to overrun"
+                );
 
-            let productive = GcStats {
-                objects_copied: 1,
-                bytes_copied: 64,
-                bytes_freed: 4096,
-            };
-            // 500 ms against a 200 ms goal.
-            gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-            let shrunk = gc.young_target_regions();
-            assert!(
-                shrunk < max && shrunk >= min,
-                "an overrun must tighten the young generation (got {shrunk}, was {max})"
-            );
-
-            // Drive it to the floor, then confirm it never goes under.
-            for _ in 0..64 {
+                let productive = GcStats {
+                    objects_copied: 1,
+                    bytes_copied: 64,
+                    bytes_freed: 4096,
+                };
+                // 500 ms against a 200 ms goal.
                 gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-            }
-            assert_eq!(gc.young_target_regions(), min, "the floor must hold");
+                let shrunk = gc.young_target_regions();
+                assert!(
+                    shrunk < max && shrunk >= min,
+                    "an overrun must tighten the young generation (got {shrunk}, was {max})"
+                );
 
-            // Comfortably-under pauses give the slack back, up to the ceiling.
-            for _ in 0..256 {
-                gc.update_young_target(G1CollectionType::YoungOnly, 1_000, &productive);
-            }
-            assert_eq!(gc.young_target_regions(), max, "the ceiling must hold");
+                // Drive it to the floor, then confirm it never goes under.
+                for _ in 0..64 {
+                    gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
+                }
+                assert_eq!(gc.young_target_regions(), min, "the floor must hold");
+
+                // Comfortably-under pauses give the slack back, up to the ceiling.
+                for _ in 0..256 {
+                    gc.update_young_target(G1CollectionType::YoungOnly, 1_000, &productive);
+                }
+                assert_eq!(gc.young_target_regions(), max, "the ceiling must hold");
             },
         );
     }
@@ -17232,32 +17315,32 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
             || {
-            let gc = make_collector();
-            let (_min, max) = gc.young_region_bounds();
-            let productive = GcStats {
-                objects_copied: 1,
-                bytes_copied: 64,
-                bytes_freed: 4096,
-            };
-            for _ in 0..64 {
-                gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
-            }
-            assert!(gc.young_target_regions() < max);
+                let gc = make_collector();
+                let (_min, max) = gc.young_region_bounds();
+                let productive = GcStats {
+                    objects_copied: 1,
+                    bytes_copied: 64,
+                    bytes_freed: 4096,
+                };
+                for _ in 0..64 {
+                    gc.update_young_target(G1CollectionType::YoungOnly, 500_000, &productive);
+                }
+                assert!(gc.young_target_regions() < max);
 
-            gc.update_young_target(
-                G1CollectionType::YoungOnly,
-                500_000,
-                &GcStats {
-                    objects_copied: 0,
-                    bytes_copied: 0,
-                    bytes_freed: 0,
-                },
-            );
-            assert_eq!(
-                gc.young_target_regions(),
-                max,
-                "a pause that reclaimed nothing must not be allowed to tighten the trigger"
-            );
+                gc.update_young_target(
+                    G1CollectionType::YoungOnly,
+                    500_000,
+                    &GcStats {
+                        objects_copied: 0,
+                        bytes_copied: 0,
+                        bytes_freed: 0,
+                    },
+                );
+                assert_eq!(
+                    gc.young_target_regions(),
+                    max,
+                    "a pause that reclaimed nothing must not be allowed to tighten the trigger"
+                );
             },
         );
     }
@@ -17274,21 +17357,21 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
             || {
-            let gc = make_collector(); // goal 200 ms; a unit-test pause is far under
-            let (min, max) = gc.young_region_bounds();
-            // Start pinned at the floor so the only observable direction is UP.
-            gc.young_target_regions.store(min, Ordering::Relaxed);
+                let gc = make_collector(); // goal 200 ms; a unit-test pause is far under
+                let (min, max) = gc.young_region_bounds();
+                // Start pinned at the floor so the only observable direction is UP.
+                gc.young_target_regions.store(min, Ordering::Relaxed);
 
-            // A productive pause: one rooted object is copied out of Eden.
-            let a = gc.alloc_object(ClassId::new(1), 1);
-            let mut roots = vec![a];
-            let result = gc.young_collection(&mut roots, &NoopMonitors);
-            assert!(
-                result.stats.objects_copied > 0,
-                "the pause must be productive or the anti-storm rule applies instead"
-            );
+                // A productive pause: one rooted object is copied out of Eden.
+                let a = gc.alloc_object(ClassId::new(1), 1);
+                let mut roots = vec![a];
+                let result = gc.young_collection(&mut roots, &NoopMonitors);
+                assert!(
+                    result.stats.objects_copied > 0,
+                    "the pause must be productive or the anti-storm rule applies instead"
+                );
 
-            assert!(
+                assert!(
                 gc.young_target_regions() > min && gc.young_target_regions() <= max,
                 "a pause comfortably under the goal must hand slack back —              `record_collection` is where the adapter is wired in"
             );
@@ -17307,26 +17390,26 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
             || {
-            let gc = make_collector(); // 8 regions; free trigger at < 25%
-            {
-                let mut regions = gc.regions.lock();
-                // Three Eden regions: five of eight Free, far above the 25% floor.
-                for r in regions.iter_mut().take(3) {
-                    r.region_type = RegionType::Eden;
+                let gc = make_collector(); // 8 regions; free trigger at < 25%
+                {
+                    let mut regions = gc.regions.lock();
+                    // Three Eden regions: five of eight Free, far above the 25% floor.
+                    for r in regions.iter_mut().take(3) {
+                        r.region_type = RegionType::Eden;
+                    }
+                    gc.publish_region_census(&regions);
                 }
-                gc.publish_region_census(&regions);
-            }
-            assert_eq!(gc.young_region_count(), 3);
-            assert!(
-                !<G1Collector as GarbageCollector>::needs_gc(&gc),
-                "the Free pool is comfortable and the target is at its ceiling"
-            );
+                assert_eq!(gc.young_region_count(), 3);
+                assert!(
+                    !<G1Collector as GarbageCollector>::needs_gc(&gc),
+                    "the Free pool is comfortable and the target is at its ceiling"
+                );
 
-            gc.young_target_regions.store(3, Ordering::Relaxed);
-            assert!(
-                <G1Collector as GarbageCollector>::needs_gc(&gc),
-                "reaching the adaptive young size must request a collection"
-            );
+                gc.young_target_regions.store(3, Ordering::Relaxed);
+                assert!(
+                    <G1Collector as GarbageCollector>::needs_gc(&gc),
+                    "reaching the adaptive young size must request a collection"
+                );
             },
         );
     }
@@ -17351,45 +17434,45 @@ mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_G1_YOUNG_PAUSE_TARGET", Some("1"))],
             || {
-            let gc = make_collector(); // 8 regions
-            let (_min, max) = gc.young_region_bounds();
-            {
-                let mut regions = gc.regions.lock();
-                // Every region young — as far past any plausible target as the heap
-                // allows — while the target is untouched at its ceiling.
-                for r in regions.iter_mut() {
-                    r.region_type = RegionType::Eden;
+                let gc = make_collector(); // 8 regions
+                let (_min, max) = gc.young_region_bounds();
+                {
+                    let mut regions = gc.regions.lock();
+                    // Every region young — as far past any plausible target as the heap
+                    // allows — while the target is untouched at its ceiling.
+                    for r in regions.iter_mut() {
+                        r.region_type = RegionType::Eden;
+                    }
+                    gc.publish_region_census(&regions);
                 }
-                gc.publish_region_census(&regions);
-            }
-            assert!(gc.young_region_count() >= max);
-            assert_eq!(gc.young_target_regions(), max, "no pause has overrun yet");
-            // The free-pool arm is what must answer here (zero Free regions), so
-            // check the young arm in isolation by giving the pool room back.
-            gc.free_region_count.store(8, Ordering::Relaxed);
-            gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
-            assert!(
+                assert!(gc.young_region_count() >= max);
+                assert_eq!(gc.young_target_regions(), max, "no pause has overrun yet");
+                // The free-pool arm is what must answer here (zero Free regions), so
+                // check the young arm in isolation by giving the pool room back.
+                gc.free_region_count.store(8, Ordering::Relaxed);
+                gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
+                assert!(
                 !<G1Collector as GarbageCollector>::needs_gc(&gc),
                 "an untightened target must not be a trigger — the cap acts only on              a MEASURED overrun"
             );
 
-            // One measured overrun, and the same heap state now does trigger.
-            gc.update_young_target(
-                G1CollectionType::YoungOnly,
-                500_000, // 500 ms against a 200 ms goal
-                &GcStats {
-                    objects_copied: 1,
-                    bytes_copied: 64,
-                    bytes_freed: 4096,
-                },
-            );
-            assert!(gc.young_target_regions() < max);
-            gc.free_region_count.store(8, Ordering::Relaxed);
-            gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
-            assert!(
-                <G1Collector as GarbageCollector>::needs_gc(&gc),
-                "once a pause has overrun the goal, the tightened target must bind"
-            );
+                // One measured overrun, and the same heap state now does trigger.
+                gc.update_young_target(
+                    G1CollectionType::YoungOnly,
+                    500_000, // 500 ms against a 200 ms goal
+                    &GcStats {
+                        objects_copied: 1,
+                        bytes_copied: 64,
+                        bytes_freed: 4096,
+                    },
+                );
+                assert!(gc.young_target_regions() < max);
+                gc.free_region_count.store(8, Ordering::Relaxed);
+                gc.needs_gc_since_recount.store(0, Ordering::Relaxed);
+                assert!(
+                    <G1Collector as GarbageCollector>::needs_gc(&gc),
+                    "once a pause has overrun the goal, the tightened target must bind"
+                );
             },
         );
     }
@@ -19300,7 +19383,8 @@ mod tests {
         for i in 0..32 {
             let o = gc.alloc_object(ClassId::new(1), 1);
             gc.set_field(o, 0, Value::Int(i as i32));
-            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+            gc.set_array_element(arr, i, Value::Object(Some(o)))
+                .unwrap();
         }
         let mut roots = vec![arr];
         gc.young_collection(&mut roots, &NoopMonitors);
@@ -19348,7 +19432,10 @@ mod tests {
         let after = crate::gc_metrics::gc_metrics_raw();
 
         let walked = after.cset_verify_objects - before.cset_verify_objects;
-        assert!(walked <= 4, "the budget is a ceiling on objects walked, got {walked}");
+        assert!(
+            walked <= 4,
+            "the budget is a ceiling on objects walked, got {walked}"
+        );
         assert_eq!(
             after.cset_verify_truncated - before.cset_verify_truncated,
             1,
@@ -19445,7 +19532,8 @@ mod tests {
             gc.set_field(h, 1, Value::Object(Some(children[i % shared])));
             gc.set_field(h, 2, Value::Int(-(i as i32)));
             gc.set_field(h, 3, Value::Object(Some(children[(i * 3 + 1) % shared])));
-            gc.set_array_element(arr, i, Value::Object(Some(h))).unwrap();
+            gc.set_array_element(arr, i, Value::Object(Some(h)))
+                .unwrap();
         }
 
         let mut roots = vec![arr];
@@ -19466,7 +19554,11 @@ mod tests {
                 Value::Object(Some(o)) => o,
                 other => panic!("holder {i} lost -> {other:?}"),
             };
-            assert_eq!(gc.get_field(h, 0).as_int(), Some(i as i32), "holder {i} int 0");
+            assert_eq!(
+                gc.get_field(h, 0).as_int(),
+                Some(i as i32),
+                "holder {i} int 0"
+            );
             assert_eq!(
                 gc.get_field(h, 2).as_int(),
                 Some(-(i as i32)),
@@ -19962,9 +20054,10 @@ mod tests {
         let mut acc: cratonvm_types::PointerMap = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
             .into_iter()
             .collect();
-        let next: cratonvm_types::PointerMap = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
-            .into_iter()
-            .collect();
+        let next: cratonvm_types::PointerMap =
+            [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
+                .into_iter()
+                .collect();
         G1Collector::compose_forward_maps(&mut acc, &next);
         assert_eq!(
             acc.get(&0xa0),
@@ -20112,7 +20205,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, r)| {
-                    let cursor = if i == region_idx { tams_offset } else { r.cursor };
+                    let cursor = if i == region_idx {
+                        tams_offset
+                    } else {
+                        r.cursor
+                    };
                     (r.reuse_epoch, cursor, r.region_type)
                 })
                 .collect()
@@ -20882,10 +20979,16 @@ mod tests {
         {
             let regions = gc.regions.lock();
             // Cap of 2: the third DISTINCT source coarsens.
-            regions[target].rset.add_reference_in_generation_within(3, 0, 2);
-            regions[target].rset.add_reference_in_generation_within(4, 0, 2);
+            regions[target]
+                .rset
+                .add_reference_in_generation_within(3, 0, 2);
+            regions[target]
+                .rset
+                .add_reference_in_generation_within(4, 0, 2);
             assert!(!regions[target].rset.is_coarsened(), "still under the cap");
-            regions[target].rset.add_reference_in_generation_within(5, 0, 2);
+            regions[target]
+                .rset
+                .add_reference_in_generation_within(5, 0, 2);
             assert!(
                 regions[target].rset.is_coarsened(),
                 "exceeding the cap must coarsen rather than grow"
@@ -21214,9 +21317,7 @@ mod tests {
                 .expect("room in a fresh region");
             ptr as usize
         };
-        gc.post_write_barrier_rset(holder, unsafe {
-            ObjectRef::from_raw(far_addr as *mut u8)
-        });
+        gc.post_write_barrier_rset(holder, unsafe { ObjectRef::from_raw(far_addr as *mut u8) });
         assert!(
             gc.regions.lock()[far_region].rset.sources().contains(&src),
             "the holder's region must be recorded as a source of the target's rset"
@@ -21360,7 +21461,9 @@ mod tests {
             rs[target].rset.add_reference(unstamped);
         });
         assert_eq!(
-            gc.regions.lock()[target].rset.recorded_generation(unstamped),
+            gc.regions.lock()[target]
+                .rset
+                .recorded_generation(unstamped),
             Some(crate::region::RSET_GENERATION_PINNED),
             "the generation-less entry point must record the never-prune stamp"
         );

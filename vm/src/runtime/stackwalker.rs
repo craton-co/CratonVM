@@ -470,10 +470,7 @@ fn drop_osr_continuations(
             // The frame this entry was pushed FROM. An OSR continuation was
             // pushed from the very frame it continues, so that frame is still
             // there and names the same method.
-            let Some(frame) = (*depth as usize)
-                .checked_sub(1)
-                .and_then(|i| frames.get(i))
-            else {
+            let Some(frame) = (*depth as usize).checked_sub(1).and_then(|i| frames.get(i)) else {
                 return true;
             };
             if !label_names_frame(label, frame) {

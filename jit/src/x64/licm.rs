@@ -10,7 +10,6 @@
 use super::*;
 use crate::scev::{BoundSource, BoundTerm, PreheaderGuard};
 
-
 /// A loop-invariant `aload X; iload Y; aaload` sequence that can be hoisted
 /// out of a loop body. The hoisted value (a row pointer from an Object[][] array)
 /// is computed once before the loop and cached in a spill slot.
@@ -278,8 +277,8 @@ pub fn precise_jit_maps_enabled() -> bool {
         // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
         // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
         // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
-        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS")
-            .is_none();
+        let enabled =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none();
         if !enabled && moving_young_enabled() {
             eprintln!(
                 "[cratonvm] WARN: CRATONVM_NO_PRECISE_JIT_MAPS is set but a moving young \
@@ -1127,7 +1126,10 @@ pub fn inline_cm_tls_disp() -> usize {
         });
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
             if disp != 0 {
-                eprintln!("[INLINE-FR] compile-id mirror ENABLED at fs:[{:#x}]", disp as u32);
+                eprintln!(
+                    "[INLINE-FR] compile-id mirror ENABLED at fs:[{:#x}]",
+                    disp as u32
+                );
             } else {
                 eprintln!("[INLINE-FR] compile-id mirror probe FAILED — identity not published");
             }
@@ -1727,9 +1729,7 @@ pub(super) fn sp_tailcall_enabled() -> bool {
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SELF_TAILCALL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SELF_TAILCALL").is_some())
 }
 
 /// Diagnostic (`CRATONVM_SHADOW_OVERFLOW_DIAG`) — on a shadow-stack overflow
@@ -1878,8 +1878,8 @@ pub(super) fn safepoint_reg_spill_all() -> bool {
 pub(super) fn call_spill_elision_mode() -> u8 {
     use std::sync::OnceLock;
     static G: OnceLock<u8> = OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALL_SPILL_ELISION") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CALL_SPILL_ELISION") {
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "0" | "false" | "off" | "no" => 0,
                 "1" => 1,
@@ -1887,8 +1887,8 @@ pub(super) fn call_spill_elision_mode() -> u8 {
                 _ => 3,
             },
             Err(_) => 3,
-        }
-    })
+        },
+    )
 }
 
 /// Narrow the SB-CRASH-04 blind GPR spill at a GC-capable safepoint to the
@@ -1969,15 +1969,15 @@ pub(super) fn narrow_safepoint_spill_enabled() -> bool {
 pub(super) fn spill_args_published_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_ARGS_PUBLISHED") {
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_ARGS_PUBLISHED") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
-        },
-    )
+        }
+    })
 }
 
 /// SB-CRASH-04 default-path gap — opt-OUT for folding `precise_maps` into the
@@ -2247,7 +2247,13 @@ thread_local! {
 /// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
 /// cannot leak its ranges into the next unrelated method on this worker thread.
 pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
-    PROTECTED_RANGES_REQUEST.with(|c| c.set(if ranges.is_empty() { None } else { Some(ranges) }));
+    PROTECTED_RANGES_REQUEST.with(|c| {
+        c.set(if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        })
+    });
 }
 
 thread_local! {
@@ -3603,8 +3609,7 @@ pub(super) fn branch_targets_at(
             if pc + 4 >= code_len {
                 return false;
             }
-            let off =
-                i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]])
+            let off = i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]])
                     // Cast: signed branch displacement to isize
                     as isize;
             push_t(off, out)
@@ -5837,7 +5842,11 @@ mod loop_xform_tests {
                     "{:?} k = {k}",
                     x.kind
                 );
-                assert!(emits_safepoint_poll_at(&x.code, x.back_edge_pc(), x.code_len));
+                assert!(emits_safepoint_poll_at(
+                    &x.code,
+                    x.back_edge_pc(),
+                    x.code_len
+                ));
 
                 // Time-to-safepoint: the polled cycle is one body long for
                 // peel (unchanged), k + 1 bodies for unroll (bounded).
@@ -6076,7 +6085,11 @@ mod loop_xform_tests {
         for k in 1..=3usize {
             let peel = plan_loop_peel(&code, len, 11, 25, k, &[]).expect("peel");
             let ploops = detect_loops(&peel.code, peel.code_len);
-            assert_eq!(ploops, vec![(peel.steady_state_base(), peel.back_edge_pc())], "k={k}");
+            assert_eq!(
+                ploops,
+                vec![(peel.steady_state_base(), peel.back_edge_pc())],
+                "k={k}"
+            );
             assert_eq!(peel.steady_state_base(), 11 + k * 14, "k={k}");
             assert!(
                 find_bypassable_loop_headers(&peel.code, peel.code_len, &ploops, &[]).is_empty(),
@@ -6088,8 +6101,9 @@ mod loop_xform_tests {
         // edge still lands on the loop. Stated so nobody assumes otherwise.
         let unroll = plan_loop_unroll(&code, len, 11, 25, 1, &[]).expect("unroll");
         let uloops = detect_loops(&unroll.code, unroll.code_len);
-        assert!(find_bypassable_loop_headers(&unroll.code, unroll.code_len, &uloops, &[])
-            .contains(&11));
+        assert!(
+            find_bypassable_loop_headers(&unroll.code, unroll.code_len, &uloops, &[]).contains(&11)
+        );
     }
 
     #[test]
@@ -6551,10 +6565,10 @@ mod loop_xform_tests {
                 ] {
                     let Ok(x) = planned else { continue };
                     // One entry per original instruction start, payload = its bci.
-                    let table: Vec<(usize, usize)> =
-                        (0..len).filter(|&pc| x.bci_at(pc).is_some() || pc < len)
-                            .map(|pc| (pc, pc))
-                            .collect();
+                    let table: Vec<(usize, usize)> = (0..len)
+                        .filter(|&pc| x.bci_at(pc).is_some() || pc < len)
+                        .map(|pc| (pc, pc))
+                        .collect();
                     let rep = x.replicate_pc_keyed(&table);
 
                     // Sorted, as every consumer assumes.
@@ -6605,8 +6619,7 @@ mod loop_xform_tests {
                     let Ok(x) = planned else { continue };
                     // Synthetic: native offset = output pc * 4, so a wrong
                     // image is visible as a wrong number rather than a crash.
-                    let out: Vec<i32> =
-                        (0..x.code.len()).map(|pc| (pc as i32) * 4).collect();
+                    let out: Vec<i32> = (0..x.code.len()).map(|pc| (pc as i32) * 4).collect();
                     let rebuilt = x.rebuild_pc_to_native(&out, len);
                     assert_eq!(rebuilt.len(), len + 1, "{name} k={k}: length");
                     for bci in 0..=len {
@@ -6965,11 +6978,18 @@ mod loop_xform_tests {
                 };
                 pc += bytecode_len_at(&bytes, pc);
             }
-            assert_eq!(pc, bytes.len(), "{guard:?}: the guard does not walk exactly");
+            assert_eq!(
+                pc,
+                bytes.len(),
+                "{guard:?}: the guard does not walk exactly"
+            );
             assert_eq!(depth, 0, "{guard:?}: the guard is not stack-balanced");
             assert_eq!(branches, 1, "{guard:?}: one fallback edge, no more");
             // No backward branch, so no poll is owed and none is dropped.
-            assert!(all_backward_edges_are_polled(&bytes[..bytes.len() - 3], pc - 3));
+            assert!(all_backward_edges_are_polled(
+                &bytes[..bytes.len() - 3],
+                pc - 3
+            ));
         }
     }
 
@@ -7156,7 +7176,11 @@ mod loop_xform_tests {
                 let mut pc = header + bytecode_len_at(&code, header);
                 while pc < back_edge + 3 {
                     let entry = x.osr_entry_pc(pc).expect("bci is in range");
-                    assert_eq!(entry, v.fallback_base + (pc - header), "{kind:?} k={k} bci={pc}");
+                    assert_eq!(
+                        entry,
+                        v.fallback_base + (pc - header),
+                        "{kind:?} k={k} bci={pc}"
+                    );
                     assert_eq!(x.bci_at(entry), Some(pc));
                     assert!(entry >= x.steady_state_base() && entry <= x.back_edge_pc());
                     assert!(
@@ -7215,8 +7239,16 @@ mod loop_xform_tests {
                     vec![x.fast_back_edge_pc(), x.back_edge_pc()],
                     "{kind:?} k={k}"
                 );
-                assert!(emits_safepoint_poll_at(&x.code, x.fast_back_edge_pc(), x.code_len));
-                assert!(emits_safepoint_poll_at(&x.code, x.back_edge_pc(), x.code_len));
+                assert!(emits_safepoint_poll_at(
+                    &x.code,
+                    x.fast_back_edge_pc(),
+                    x.code_len
+                ));
+                assert!(emits_safepoint_poll_at(
+                    &x.code,
+                    x.back_edge_pc(),
+                    x.code_len
+                ));
                 assert_eq!(x.back_edge_pc(), v.fallback_base + body_len);
                 assert!(x.poll_free_bytes <= LOOP_XFORM_MAX_POLL_FREE_BYTES);
                 // Below the guard's minimum the fallback runs, and it polls

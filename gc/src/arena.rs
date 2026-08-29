@@ -507,7 +507,6 @@ fn sort_by_offset(v: &mut Vec<(usize, usize)>) {
     }
 }
 
-
 /// One contiguous stretch of the arena measured against a target request: the
 /// window of free spans — and the live "walls" standing between them — that
 /// would serve `request` at the least cost in bytes that would have to be
@@ -1053,17 +1052,15 @@ impl Arena {
         }
         // Arm 2 — the alignment window. Empty for every `align <= 8` caller.
         if worst > size {
-            let candidate = self
-                .free_large
-                .range(size..worst)
-                .find_map(|(&sz, list)| {
-                    list.iter().position(|block| {
+            let candidate = self.free_large.range(size..worst).find_map(|(&sz, list)| {
+                list.iter()
+                    .position(|block| {
                         let block_addr = base + block.offset;
                         let padding = ((block_addr + align - 1) & !(align - 1)) - block_addr;
                         padding.checked_add(size).is_some_and(|need| need <= sz)
                     })
                     .map(|idx| (sz, idx))
-                });
+            });
             if let Some((sz, idx)) = candidate {
                 let block = self.free_large[&sz][idx];
                 let block_addr = base + block.offset;
@@ -1163,7 +1160,11 @@ impl Arena {
             // allocation that can be served any other way leaves the
             // large-object floor alone, and one that cannot takes it rather
             // than raising `OutOfMemoryError`.
-            if end <= self.high_cursor.saturating_sub(self.remaining_high_reserve()) {
+            if end
+                <= self
+                    .high_cursor
+                    .saturating_sub(self.remaining_high_reserve())
+            {
                 // SAFETY: `aligned` is within `[0, self.data.len())` because
                 // `end <= self.data.len()` was just checked.
                 let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
@@ -1428,7 +1429,8 @@ impl Arena {
             return 0;
         }
         let before = self.free_high.len();
-        let mut v: Vec<(usize, usize)> = self.free_high.iter().map(|b| (b.offset, b.size)).collect();
+        let mut v: Vec<(usize, usize)> =
+            self.free_high.iter().map(|b| (b.offset, b.size)).collect();
         sort_by_offset(&mut v);
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(before);
         for (off, sz) in v {
@@ -1509,10 +1511,7 @@ impl Arena {
         // whole thing would mean a region that over-claimed early never gave
         // any of it back.
         let region = self.data.len() - self.high_cursor;
-        let give = region
-            .saturating_sub(self.high_reserve)
-            .min(block.size)
-            & !7;
+        let give = region.saturating_sub(self.high_reserve).min(block.size) & !7;
         if give == 0 {
             return 0;
         }
@@ -2414,7 +2413,11 @@ mod prefer_bump_tests {
         while let Some(p) = a.alloc(512, 8) {
             blocks.push(p as usize - base);
         }
-        assert!(blocks.len() > 8, "the fixture must fill the arena: {}", blocks.len());
+        assert!(
+            blocks.len() > 8,
+            "the fixture must fill the arena: {}",
+            blocks.len()
+        );
         assert!(
             a.alloc(512, 8).is_none(),
             "the arena is full, so this must refuse"
@@ -2481,7 +2484,11 @@ mod prefer_bump_tests {
                 a.add_free_block(off, N * SZ);
             }
             a.coalesce_free_list();
-            (a.free_blocks_sorted(), a.free_list_bytes(), a.largest_free_block())
+            (
+                a.free_blocks_sorted(),
+                a.free_list_bytes(),
+                a.largest_free_block(),
+            )
         };
 
         let (blocks_each, bytes_each, largest_each) = shape(true);
@@ -2591,7 +2598,7 @@ mod tests {
     /// are still live, and one that merely coalesced would not move the cursor
     /// at all. The RED it pins is the real one — `alloc` fails before the
     /// retraction and succeeds after, with nothing else changed.
-     /// The defect this whole region exists for, reduced to eleven lines.
+    /// The defect this whole region exists for, reduced to eleven lines.
     ///
     /// One small survivor inside each of four chunk-sized runs caps every hole
     /// at one chunk, so a request larger than a chunk cannot be served however
@@ -2894,7 +2901,7 @@ mod tests {
         assert_eq!(arena.used(), 1024 + 2048, "low cursor moved, high did not");
     }
 
-   #[test]
+    #[test]
     fn a_wholly_free_tail_is_handed_back_to_the_bump_cursor() {
         let mut arena = Arena::new(4096);
         // Layout: [live 512][dust 256][live 512][free tail 2816]

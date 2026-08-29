@@ -463,13 +463,13 @@ pub(crate) fn emit_hashed_vtable_stub(
     emit_load_frame(buf, RAX, arg_offsets[0]);
     buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
     miss_patches.push(emit_jcc(buf, 0x84)); // JZ slow
-    // Array-receiver guard. The hashed ways below compare only the 4-byte
-    // `ObjectHeader.class_id`, which a reference array fills with its COMPONENT
-    // class id — so a `Foo[]` receiver matches a way published for a `Foo`
-    // receiver and is called into `Foo`'s method body. `ObjectHeader.kind`
-    // (offset 4) separates them; anything not a plain object takes the
-    // resolving helper, which dispatches arrays on `java/lang/Object`.
-    //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
+                                            // Array-receiver guard. The hashed ways below compare only the 4-byte
+                                            // `ObjectHeader.class_id`, which a reference array fills with its COMPONENT
+                                            // class id — so a `Foo[]` receiver matches a way published for a `Foo`
+                                            // receiver and is called into `Foo`'s method body. `ObjectHeader.kind`
+                                            // (offset 4) separates them; anything not a plain object takes the
+                                            // resolving helper, which dispatches arrays on `java/lang/Object`.
+                                            //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
     buf.emit(&[
         0x80,
         0x78,
@@ -564,16 +564,7 @@ mod tests {
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
         crate::x64::set_moving_young_override(Some(false));
         let mut buf = ExecutableBuffer::new(4096).expect("buffer");
-        emit_hashed_vtable_stub(
-            &mut buf,
-            0x7fff_0000_0000_2000,
-            24,
-            &[32, 40],
-            0,
-            0,
-            0,
-            32,
-        );
+        emit_hashed_vtable_stub(&mut buf, 0x7fff_0000_0000_2000, 24, &[32, 40], 0, 0, 0, 32);
         let bytes = buf.as_slice();
         let guard = [
             0x80u8,
@@ -629,9 +620,9 @@ mod tests {
         // `LEA reg, [RBP + disp32]` is `0x8D` + ModRM(mod=10, rm=101); the
         // loads around it are `0x8B`, so the opcode alone separates them.
         let lea_disp = |want: i32, bytes: &[u8]| {
-            bytes.windows(6).any(|w| {
-                w[0] == 0x8D && (w[1] & 0xC7) == 0x85 && w[2..6] == (-want).to_le_bytes()
-            })
+            bytes
+                .windows(6)
+                .any(|w| w[0] == 0x8D && (w[1] & 0xC7) == 0x85 && w[2..6] == (-want).to_le_bytes())
         };
         assert!(
             lea_disp(stage_base, bytes),
@@ -720,9 +711,7 @@ mod tests {
         assert!(bytes
             .windows(8)
             .any(|window| window == u64::from(0xAABB_CCDDu32).to_le_bytes()));
-        assert!(bytes
-            .windows(8)
-            .any(|window| window == 17u64.to_le_bytes()));
+        assert!(bytes.windows(8).any(|window| window == 17u64.to_le_bytes()));
         assert!(bytes.ends_with(&[0xFF, 0xD0]));
     }
 

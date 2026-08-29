@@ -70,10 +70,7 @@ const PROXY_CLASS: u32 = 0x8000_0007;
 const PAYLOAD_CLASS: u32 = 0xD00D;
 
 fn backends() -> Vec<(&'static str, GcBackend)> {
-    let mut v = vec![
-        ("gen_heap", GcBackend::Generational),
-        ("g1", GcBackend::G1),
-    ];
+    let mut v = vec![("gen_heap", GcBackend::Generational), ("g1", GcBackend::G1)];
     #[cfg(feature = "zgc")]
     v.push(("zgc", GcBackend::Zgc));
     v
@@ -144,7 +141,10 @@ fn a_reference_capture_is_a_plain_pointer_at_the_wide_payload() {
         let payload = heap.alloc_object(ClassId::new(PAYLOAD_CLASS), 1);
         // Capture 1, not 0, so a thunk that ignored the index would read the
         // `Int` cell and fail here rather than pass by luck.
-        let obj = proxy_with(&heap, &[Value::Int(0x1234_5678), Value::Object(Some(payload))]);
+        let obj = proxy_with(
+            &heap,
+            &[Value::Int(0x1234_5678), Value::Object(Some(payload))],
+        );
 
         let via_heap = match heap.get_field(obj, 1) {
             Value::Object(Some(r)) => r.as_ptr() as u64,
@@ -163,7 +163,8 @@ fn a_reference_capture_is_a_plain_pointer_at_the_wide_payload() {
              (`narrow_oops_block_inline_fields`).",
         );
         assert_eq!(
-            via_thunk, payload.as_ptr() as u64,
+            via_thunk,
+            payload.as_ptr() as u64,
             "{name}: ...and the pointer must be the object that was stored, so \
              that an agreement between two equally-wrong readings cannot pass.",
         );

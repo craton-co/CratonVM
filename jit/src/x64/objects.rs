@@ -23,9 +23,6 @@ impl Compiler {
     // Moved to `x64/simd.rs`. Admission lives in `x64/simd_analysis.rs`; the
     // raw VEX encodings live in `x64/emit.rs`.
 
-
-
-
     pub(super) fn inline_card_mark_available(&self) -> bool {
         // Keep every old-receiver write on the helper-owned barrier path.
         //
@@ -85,9 +82,6 @@ impl Compiler {
         }
     }
 
-
-
-
     /// Emit an inline "decode the String character at `idx`" sequence for
     /// the STRING_SEARCH `compareTo` / `indexOf` intrinsics.
     ///
@@ -102,7 +96,13 @@ impl Compiler {
     /// the SIB base and may be any register (R12/RSP as a base is legal
     /// with the disp8 ModRM used here). No CALL; no memory beyond the array
     /// payload is touched.
-    pub(super) fn emit_string_decode_char(&mut self, dst: u8, val_reg: u8, idx_reg: u8, coder_reg: u8) {
+    pub(super) fn emit_string_decode_char(
+        &mut self,
+        dst: u8,
+        val_reg: u8,
+        idx_reg: u8,
+        coder_reg: u8,
+    ) {
         // TEST coder_reg, coder_reg ; JNZ utf16
         let mut rex = 0x48u8;
         if coder_reg >= 8 {
@@ -163,7 +163,6 @@ impl Compiler {
         self.patch_rel32_to_here(done);
     }
 
-
     /// Load a String receiver's `value` field (the backing `byte[]`/`char[]`
     /// ref) from `base` into `dst`, correctly handling BOTH object layouts
     /// that can coexist for `java/lang/String` at runtime:
@@ -206,16 +205,16 @@ impl Compiler {
             cratonvm_types::GC_FLAG_COMPACT,
         );
         let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
-        // The compact slot is narrow only when a `CompactLayout` was actually
-        // registered for this String class — `StringFieldLayout::new`'s
-        // fallback points `value_compact_offset` at the LEGACY cell payload,
-        // which stays 8 bytes wide. Matching the offset makes this
-        // self-checking rather than trusting the caller and the layout to
-        // agree.
+                                                      // The compact slot is narrow only when a `CompactLayout` was actually
+                                                      // registered for this String class — `StringFieldLayout::new`'s
+                                                      // fallback points `value_compact_offset` at the LEGACY cell payload,
+                                                      // which stays 8 bytes wide. Matching the offset makes this
+                                                      // self-checking rather than trusting the caller and the layout to
+                                                      // agree.
         let narrow = narrow_oops_enabled()
-            && self
-                .string_layout
-                .is_some_and(|l| l.value_compact_offset == compact_offset && l.value_compact_is_narrow);
+            && self.string_layout.is_some_and(|l| {
+                l.value_compact_offset == compact_offset && l.value_compact_is_narrow
+            });
         if narrow {
             self.emit_load_narrow_ref_field(dst, base, compact_offset);
         } else {
@@ -304,9 +303,6 @@ impl Compiler {
         self.emit_movsxd_r64_mem_disp32(dst, base, legacy_offset);
         self.patch_rel32_to_here(done);
     }
-
-
-
 
     /// Emit a compiled `getstatic` as a direct load, with no helper `CALL`.
     ///
@@ -422,7 +418,10 @@ impl Compiler {
     /// Handing the read table to a store caller would silently unblock exactly
     /// the fast path G1-2 exists to block. Two tables rather than one is what
     /// makes that mistake something you have to type out rather than inherit.
-    pub(super) fn emit_guarded_getfield_receiver_check(&mut self, bounds_addr: usize) -> Vec<usize> {
+    pub(super) fn emit_guarded_getfield_receiver_check(
+        &mut self,
+        bounds_addr: usize,
+    ) -> Vec<usize> {
         let mut slow: Vec<usize> = Vec::new();
         // 1. null → slow (helper throws the NPE).
         self.emit_test_r64_r64(RAX);
@@ -998,11 +997,7 @@ impl Compiler {
         // branch silently dropped it. Two dwords per `new` is the same price
         // that comment already judged negligible.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
-            0,
-        );
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
 
         // AFTER the mark-word zeroing, which would otherwise erase it.
         if compact_flag_pending {
@@ -1079,9 +1074,6 @@ impl Compiler {
     // -----------------------------------------------------------------------
     //
     // Moved to `x64/arrays.rs`.
-
-
-
 
     /// Emit an `ldc <Class>` site: call `helpers.ldc_class_cp` and push the
     /// returned mirror as an oop. Returns `false` when this pc is not a

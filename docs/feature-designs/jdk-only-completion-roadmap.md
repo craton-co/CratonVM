@@ -6,15 +6,15 @@
 > Read that before starting any lane below.
 >
 > * **PHASE 3 IS CLOSED.** All four items, 35 probe rows, 0 differing lines in
->   BOTH modes (`probes/Phase3Sweep.java`) — including P3-A, which this page
+>   BOTH modes (`apps/probes/Phase3Sweep.java`) — including P3-A, which this page
 >   still calls "the one live red in the suite": `aastore` covariance now holds
 >   on the compiled tier, checked after 400 000 warming stores.
 > * **PHASE 1 IS FIVE-NINTHS CLOSED, AND THE MECHANISM HAS INVERTED.**
 >   A/B/D/G/I clear; not one `NoClassDefFoundError` in 80 rows
->   (`probes/Phase1Sweep.java`). What is left is the opposite shape: strict mode
+>   (`apps/probes/Phase1Sweep.java`). What is left is the opposite shape: strict mode
 >   has **12** differing lines and COMPATIBLE mode has **18**, every extra one a
 >   place where declining to fabricate got the real JDK and the default did not.
->   `probes/AtomicUpdaterSweep.java` is 87/87 clean under `--jdk-only` and DIES
+>   `apps/probes/AtomicUpdaterSweep.java` is 87/87 clean under `--jdk-only` and DIES
 >   in compatible mode.
 > * **§5's "`--jdk-only-report` is a complete census and nothing was using it"
 >   is no longer true.** `difftest/src/census.rs` and `difftest/src/ledger.rs`
@@ -124,7 +124,7 @@ and both are wrong in that same direction:
   describes is not on the critical path here.
 * **Neither H2 root alone composes a working classpath.**
   `apps/h2database/h2/target/classes` holds exactly **one** file
-  (`META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
+  (`../../apps/META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
   and its `target/test-classes` is empty; `cratonvm/apps/h2database/h2` is fully
   built but has **no `ext/` directory**, while the *unbuilt* root carries all 13
   dependency jars. The runner has to union the two, and must resolve on a
@@ -473,7 +473,7 @@ now; P4-B is not a run and needs its own build first** — see its correction.
   should print — so it said so and attached the decisive check. That check is
   what resolved the question, against me. Treat an inability to confirm as a
   signal about the claim, not as a lane failing to find something.
-* **`probes/` is never run by `run.sh` at any `SUITE=` value.** A record whose
+* **`apps/probes/` is never run by `run.sh` at any `SUITE=` value.** A record whose
   only evidence is a probe cannot be discharged by a suite run, however green.
 * **`TIMEOUT=420` on this host** — `RMapGcStress` needs ~4m55s and times out at
   the 120s default, which then manufactures two `HARNESS ERROR` rows that read

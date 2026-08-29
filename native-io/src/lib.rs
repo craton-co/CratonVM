@@ -63,7 +63,9 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{layout_alias, read_alias, NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{
+    layout_alias, read_alias, NativeContext, NativeKind, NativeMethodRegistry,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
 // The heap's own object-kind discriminant. `bb_resolve_heap_array` uses it to
@@ -956,13 +958,11 @@ fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCa
     //     range rather than reported on its own, so there is no special case
     //     here even though there looks like there should be.
     fn out_of_bounds(off: i32, len: i32, arr_len: usize) -> MethodCallFailed {
-        MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::IndexOutOfBoundsException {
-                message: Some(format!(
-                    "Range [{off}, {off} + {len}) out of bounds for length {arr_len}"
-                )),
-            },
-        ))
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Range [{off}, {off} + {len}) out of bounds for length {arr_len}"
+            )),
+        }))
     }
     if off < 0 || len < 0 {
         return Err(out_of_bounds(off, len, arr_len));
@@ -1011,7 +1011,9 @@ fn writer_string_region(text: &str, off: i32, len: i32) -> Result<String, Method
     if begin < 0 || begin > end || end > total {
         return Err(writer_region_out_of_bounds(off, begin, end, total));
     }
-    Ok(String::from_utf16_lossy(&units[begin as usize..end as usize]))
+    Ok(String::from_utf16_lossy(
+        &units[begin as usize..end as usize],
+    ))
 }
 
 /// The same region, under `java.io.BufferedWriter`'s deliberately weaker
@@ -1720,10 +1722,7 @@ fn fos_is_closed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 ///
 /// `close()` and `flush()` do NOT call this: a double close is `void` on both
 /// streams, and so is `flush()` on a closed `FileOutputStream`.
-fn fis_refuse_if_closed(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<(), MethodCallFailed> {
+fn fis_refuse_if_closed(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
     if fis_is_closed(ctx, this) {
         return Err(io_stream_closed());
     }
@@ -1732,10 +1731,7 @@ fn fis_refuse_if_closed(
 
 /// [`fis_refuse_if_closed`] for a `FileOutputStream` receiver. Separate because
 /// the two `*_fd_object` accessors differ, not because the rule does.
-fn fos_refuse_if_closed(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<(), MethodCallFailed> {
+fn fos_refuse_if_closed(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
     if fos_is_closed(ctx, this) {
         return Err(io_stream_closed());
     }
@@ -2593,10 +2589,9 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let off = match args.get(2) {
@@ -2619,11 +2614,13 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_len = ctx.array_length(arr) as i32;
     if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::ioobe(cratonvm_types::error::out_of_bounds_message::check_from_index_size(
-                i64::from(off),
-                i64::from(len),
-                i64::from(arr_len),
-            )),
+            RuntimeError::ioobe(
+                cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                    i64::from(off),
+                    i64::from(len),
+                    i64::from(arr_len),
+                ),
+            ),
         )));
     }
     // Zero-length transfers answer before the closed check — see
@@ -2660,10 +2657,9 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let len = ctx.array_length(arr);
@@ -2721,8 +2717,22 @@ fn native_fos_write_bytes_ignore_append(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null buffer is an NPE, the same as at the `write([BII)V` door next to
+    // it. The two were repaired apart: `write` got the check and `writeBytes`,
+    // which is where the REAL `FileOutputStream.write(byte[],int,int)`
+    // bytecode arrives, kept the silent no-op. MEASURED with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/File`, which makes `write` yield
+    // and routes the call here: `fos.write(null, 0, 1)` went from NPE back to
+    // no-throw. Latent while the `write` override stands, and a lie about a
+    // write the moment it does not.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         _ => return Ok(None),
     };
     let off_i = match args.get(2) {
@@ -3707,7 +3717,9 @@ fn utf_data_format_exception(
         );
         let exc = ctx.read_native_pin(exc_pin, exc);
         ctx.unpin_native_roots(exc_pin);
-        return Some(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Some(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     None
 }
@@ -3724,10 +3736,9 @@ fn native_bais_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let data = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let len = ctx.array_length(data) as i32;
@@ -3747,10 +3758,9 @@ fn native_bais_init_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let data = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let offset = match args.get(2) {
@@ -3906,10 +3916,9 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     if let Some(result) = maybe_socket_input_stream_read(
@@ -6684,7 +6693,14 @@ fn native_scanner_find_in_line(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             // The caller's own pattern, so `groupCount()` and `group(1)` survive
             // into the `MatchResult` — a quoted literal of the matched text
             // would return the same string with the groups dropped.
-            scan_record_match(ctx, this, &input, pattern_str, pos + m.start(), pos + m.end());
+            scan_record_match(
+                ctx,
+                this,
+                &input,
+                pattern_str,
+                pos + m.start(),
+                pos + m.end(),
+            );
             scan_set_pos(ctx, this, pos.checked_add(m.end()).unwrap_or(usize::MAX))?;
             let s = ctx.create_string(matched);
             return Ok(Some(Value::Object(Some(s))));
@@ -12470,7 +12486,11 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Long(v) => v,
         _ => 0,
     };
-    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(
+        ctx,
+        this,
+        Value::Long(fc_pos + n as i64),
+    );
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -12510,7 +12530,11 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Long(v) => v,
         _ => 0,
     };
-    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(
+        ctx,
+        this,
+        Value::Long(fc_pos + n as i64),
+    );
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -12535,7 +12559,11 @@ fn native_fc_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_pos));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(
+        ctx,
+        this,
+        Value::Long(new_pos),
+    );
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -13814,11 +13842,13 @@ fn dis_read_one(
 /// existing loop already issues several `read` calls without holding anything
 /// across them, so a `DataInputStream` shared between threads was never atomic
 /// here; this does not add a race class.
-fn dis_fast_window(ctx: &mut dyn NativeContext, inner: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
+fn dis_fast_window(
+    ctx: &mut dyn NativeContext,
+    inner: ObjectRef,
+) -> Option<(ObjectRef, usize, usize)> {
     let class_id = ctx.class_id_of_object(inner);
     let class_name = ctx.class_name_of_id(class_id)?;
-    if class_name != "java/io/BufferedInputStream" && class_name != "java/io/ByteArrayInputStream"
-    {
+    if class_name != "java/io/BufferedInputStream" && class_name != "java/io/ByteArrayInputStream" {
         return None;
     }
     let pos = ctx.get_field_by_name(inner, "pos").as_int().unwrap_or(-1);
@@ -14407,10 +14437,9 @@ fn native_dis_read_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let len = ctx.array_length(buf) as i32;
@@ -14425,10 +14454,9 @@ fn native_dis_read_fully_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let off = match args.get(2) {
@@ -14601,7 +14629,10 @@ fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // pins one object per call; `unpin_native_roots(this_pin)` below releases
     // both, since pins are released from a handle onward.
     let inner_pin = ctx.pin_native_root(inner);
-    let scratch = ctx.new_array(ArrayElementType::Byte, SKIP_CHUNK.min(n - fast_skipped) as usize);
+    let scratch = ctx.new_array(
+        ArrayElementType::Byte,
+        SKIP_CHUNK.min(n - fast_skipped) as usize,
+    );
     let scratch_pin = ctx.pin_native_root(scratch);
     let mut scratch = scratch;
     let mut total_skipped = fast_skipped;
@@ -14753,10 +14784,9 @@ fn dos_write_one(
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let this_pin = ctx.pin_native_root(this);
@@ -14968,10 +14998,9 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let bytes = encode_modified_utf8(&s);
@@ -17994,10 +18023,12 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // silently rounded up to one byte, so the caller got a "buffered" stream
     // that flushes on every single byte.
     if size <= 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Buffer size <= 0".into(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Buffer size <= 0".into(),
+            }
+            .into(),
+        );
     }
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
@@ -18114,10 +18145,9 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let src = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let off_i = match args.get(2) {
@@ -18802,7 +18832,14 @@ macro_rules! tb_abstract_view_fns {
                 let v = tb_read_elem(ctx, view, rel_start + i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            buf_write_metadata(
+                ctx,
+                new_buf,
+                window.pos,
+                window.lim,
+                window.cap,
+                window.mark,
+            );
             // Read-only is CONTAGIOUS — see [`BufferDerivation`]. All three of
             // `$slice_fn`/`$slice2_fn`/`$dup_fn` wrote nothing to `isReadOnly`,
             // so every one of the six typed families handed a WRITABLE view
@@ -18853,7 +18890,14 @@ macro_rules! tb_abstract_view_fns {
                 let v = tb_read_elem(ctx, view, rel_start + i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            buf_write_metadata(
+                ctx,
+                new_buf,
+                window.pos,
+                window.lim,
+                window.cap,
+                window.mark,
+            );
             buf_write_read_only(ctx, new_buf, BufferDerivation::Inherit, src_ro);
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -18891,7 +18935,14 @@ macro_rules! tb_abstract_view_fns {
                 let v = tb_read_elem(ctx, view, i)?;
                 tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, window.pos, window.lim, window.cap, window.mark);
+            buf_write_metadata(
+                ctx,
+                new_buf,
+                window.pos,
+                window.lim,
+                window.cap,
+                window.mark,
+            );
             buf_write_read_only(ctx, new_buf, BufferDerivation::Inherit, src_ro);
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -21021,7 +21072,10 @@ fn mmap_sync_back_from_java(
     if id == 0 {
         return Ok(());
     }
-    let writable = matches!(ctx.get_field(mbb, mbb_base + MBB_PRIVATE_WRITABLE), Value::Int(1));
+    let writable = matches!(
+        ctx.get_field(mbb, mbb_base + MBB_PRIVATE_WRITABLE),
+        Value::Int(1)
+    );
     if !writable {
         return Ok(());
     }
@@ -21085,7 +21139,11 @@ fn native_fc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     if fc_pos > new_size {
-        cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_size));
+        cratonvm_native_api::synthetic_file_channel::set_position_value(
+            ctx,
+            this,
+            Value::Long(new_size),
+        );
     }
     Ok(Some(Value::Object(Some(this))))
 }
@@ -22416,7 +22474,6 @@ fn dc_socket_rows_without(
 // classes. The `OP_*` bits stay because they are NIO-spec constants, not a
 // layout. W7-66-live-over-allocations.md.
 
-
 /// SelectionKey operation bits
 const OP_READ: i32 = 1;
 const OP_WRITE: i32 = 4;
@@ -22782,9 +22839,7 @@ fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // a premise about the registrations, not a property of the class, so it is
     // checked rather than assumed. The predicate is `t16_afc_uses_real_handle`'s:
     // our channels are >= 3 slots with an Int handle id in slot 0.
-    if !afc_is_ours(ctx, this)
-        || !matches!(afc_get(ctx, this, AFC_FIELD_FD), Value::Int(_))
-    {
+    if !afc_is_ours(ctx, this) || !matches!(afc_get(ctx, this, AFC_FIELD_FD), Value::Int(_)) {
         return Err(RuntimeError::IOException {
             message: "AsynchronousFileChannel.lock: receiver was not opened by this VM's \
                       asynchronous file channel implementation"
@@ -23689,7 +23744,9 @@ fn try_wrap_pending_future(
     let built = ctx.new_object_initialized(
         "sun/nio/ch/PendingFuture",
         "(Ljava/nio/channels/AsynchronousChannel;)V",
-        &[Value::Object(Some(ctx.read_native_pin(channel_pin, channel)))],
+        &[Value::Object(Some(
+            ctx.read_native_pin(channel_pin, channel),
+        ))],
     );
     let answer = (|| {
         let pf = match built {
@@ -24049,10 +24106,16 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
     // `pollEvents`/`reset`/`watchable` FROM -- all `final`, all with `Code`.
     // A registration on the concrete class wins at step 1; these are the belt
     // to that pair of braces, and cost nothing when the concrete row answers.
-    for target in WS_IMPLS.iter().chain(["sun/nio/fs/AbstractWatchService"].iter()) {
+    for target in WS_IMPLS
+        .iter()
+        .chain(["sun/nio/fs/AbstractWatchService"].iter())
+    {
         crate::concrete_receiver::mirror_class_registrations(r, __rows_before, ws, target);
     }
-    for target in WK_IMPLS.iter().chain(["sun/nio/fs/AbstractWatchKey"].iter()) {
+    for target in WK_IMPLS
+        .iter()
+        .chain(["sun/nio/fs/AbstractWatchKey"].iter())
+    {
         crate::concrete_receiver::mirror_class_registrations(
             r,
             __rows_before,
@@ -24259,7 +24322,10 @@ fn closed_watch_service_exception(ctx: &mut dyn NativeContext) -> MethodCallFail
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-fn ws_require_open(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+fn ws_require_open(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*this);
     let w5_out = ws_require_open_body(ctx, *this);
     *this = ctx.read_native_pin(w5_pin, *this);
@@ -24482,7 +24548,12 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             if same_path {
                 wk_set(ctx, existing, WK_FIELD_EVENTS, Value::Int(event_mask));
                 wk_set(ctx, existing, WK_FIELD_VALID, Value::Int(1));
-                wk_set(ctx, existing, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
+                wk_set(
+                    ctx,
+                    existing,
+                    WK_FIELD_WATCHABLE,
+                    Value::Object(Some(path_obj)),
+                );
                 return Ok(Some(Value::Object(Some(existing))));
             }
         }
@@ -24515,7 +24586,12 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     wk_set(ctx, wk, WK_FIELD_VALID, Value::Int(1));
     wk_set(ctx, wk, WK_FIELD_PENDING, Value::Object(None));
     let path_obj_now = ctx.read_native_pin(path_obj_pin, path_obj);
-    wk_set(ctx, wk, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj_now)));
+    wk_set(
+        ctx,
+        wk,
+        WK_FIELD_WATCHABLE,
+        Value::Object(Some(path_obj_now)),
+    );
 
     // Attach to the service's Java-side registration array.
     let watcher = ctx.read_native_pin(watcher_pin, watcher);
@@ -24634,7 +24710,12 @@ fn ws_signalled_key(
         }
         let wk_now = ctx.read_native_pin(wk_pin, wk);
         let pending_now = ctx.read_native_pin(pending_pin, pending);
-        wk_set(ctx, wk_now, WK_FIELD_PENDING, Value::Object(Some(pending_now)));
+        wk_set(
+            ctx,
+            wk_now,
+            WK_FIELD_PENDING,
+            Value::Object(Some(pending_now)),
+        );
         signalled = Some(wk_now);
         break;
     }
@@ -25179,10 +25260,20 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
         dc_get_option,
     );
-    r.register(dc, "supportedOptions", "()Ljava/util/Set;", dc_supported_options);
+    r.register(
+        dc,
+        "supportedOptions",
+        "()Ljava/util/Set;",
+        dc_supported_options,
+    );
 
     // socket() → DatagramSocket
-    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", native_dc_socket);
+    r.register(
+        dc,
+        "socket",
+        "()Ljava/net/DatagramSocket;",
+        native_dc_socket,
+    );
 
     // DatagramSocket-surface adaptor methods.
     //
@@ -25212,7 +25303,12 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // `dc_receiver_channel` is what makes one body serve both receivers.
     let dsa = "sun/nio/ch/DatagramSocketAdaptor";
 
-    r.register(dc, "setSendBufferSize", "(I)V", native_dc_set_send_buffer_size);
+    r.register(
+        dc,
+        "setSendBufferSize",
+        "(I)V",
+        native_dc_set_send_buffer_size,
+    );
     r.register(
         dsa,
         "setSendBufferSize",
@@ -25312,10 +25408,7 @@ fn dc_receiver_channel(ctx: &dyn NativeContext, receiver: ObjectRef) -> ObjectRe
     }
 }
 
-fn native_dc_set_send_buffer_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_dc_set_send_buffer_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
     let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     if let Some(fd) = dc_fd(ctx, this) {
@@ -25324,10 +25417,7 @@ fn native_dc_set_send_buffer_size(
     Ok(None)
 }
 
-fn native_dc_set_recv_buffer_size(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_dc_set_recv_buffer_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
     let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     if let Some(fd) = dc_fd(ctx, this) {
@@ -25529,11 +25619,11 @@ fn dc_option_name(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
 /// the Java-visible record is kept — which is still the value `getOption` will
 /// return, so the round-trip the caller can observe stays consistent.
 fn dc_interface_ipv4(ctx: &mut dyn NativeContext, ni: ObjectRef) -> Option<std::net::Ipv4Addr> {
-    let addresses = match ctx.invoke_virtual(ni, "getInetAddresses", "()Ljava/util/Enumeration;", &[])
-    {
-        Ok(Some(Value::Object(Some(e)))) => e,
-        _ => return None,
-    };
+    let addresses =
+        match ctx.invoke_virtual(ni, "getInetAddresses", "()Ljava/util/Enumeration;", &[]) {
+            Ok(Some(Value::Object(Some(e)))) => e,
+            _ => return None,
+        };
     // Bounded: an interface with a pathological address list must not spin.
     for _ in 0..64 {
         match ctx.invoke_virtual(addresses, "hasMoreElements", "()Z", &[]) {
@@ -26029,7 +26119,9 @@ fn inet_addr_literal(ctx: &dyn NativeContext, inet_addr: ObjectRef) -> Option<St
         _ => return None,
     };
     match ctx.get_field_by_name(inet_holder, "address") {
-        Value::Int(address) => Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string()),
+        Value::Int(address) => {
+            Some(std::net::Ipv4Addr::from((address as u32).to_be_bytes()).to_string())
+        }
         _ => None,
     }
 }
@@ -26100,9 +26192,11 @@ fn native_dc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(Value::Object(Some(this))));
     }
     if let Some(fd) = dc_fd(ctx, this) {
-        ctx.fd_table().udp_disconnect(fd).map_err(|e| RuntimeError::IOException {
-            message: format!("DatagramChannel.disconnect: {e}"),
-        })?;
+        ctx.fd_table()
+            .udp_disconnect(fd)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("DatagramChannel.disconnect: {e}"),
+            })?;
     }
     dc_clear_connected(ctx, this);
     Ok(Some(Value::Object(Some(this))))
@@ -26500,18 +26594,20 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // changes: an unreachable registrar never installed them. `nio_selector.rs`
 // declares the same four constants (`pub const OP_READ: i32 = 1`, ...).
 
-
 // ===========================================================================
 // Comprehensive I/O tests
 // ===========================================================================
 
 #[cfg(test)]
 mod io_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
     use cratonvm_native_api::fd_table::FileDescriptorTable;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::Write;
 
     // -----------------------------------------------------------------------
@@ -28980,9 +29076,12 @@ mod io_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_mutf8_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // ---- Encoder (writeUTF payload) ----
 
@@ -29127,9 +29226,12 @@ mod t2_mutf8_tests {
 
 #[cfg(test)]
 mod ra2_utf8_decoder_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::decode_utf8_into_chars;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn to_string(chars: &[u16]) -> String {
         String::from_utf16(chars).unwrap()
@@ -29253,10 +29355,13 @@ mod ra2_utf8_decoder_tests {
 // ===========================================================================
 #[cfg(test)]
 mod ra3_reader_read_charbuffer_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Drive `native_reader_read_charbuffer` through a scripted mock and
     /// assert that `CharBuffer.put(char[], int, int)` is invoked with the
@@ -29406,10 +29511,13 @@ mod ra3_reader_read_charbuffer_tests {
 // ===========================================================================
 #[cfg(test)]
 mod bais_layout_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_bais(ctx: &mut MockNativeContext, bytes: &[u8]) -> (ObjectRef, ObjectRef) {
         let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
@@ -29896,10 +30004,13 @@ mod bais_layout_tests {
 // ===========================================================================
 #[cfg(test)]
 mod buffer_bounds_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_bb(ctx: &mut MockNativeContext, cap: usize) -> ObjectRef {
         // alloc_byte_buffer leaves pos=0, lim=cap, cap=cap.
@@ -30192,7 +30303,10 @@ mod buffer_bounds_tests {
     /// `asWritableBuffer` to try.
     #[test]
     fn as_read_only_buffer_is_unconditional_and_therefore_one_way() {
-        assert!(buffer_view_read_only(BufferDerivation::ForceReadOnly, false));
+        assert!(buffer_view_read_only(
+            BufferDerivation::ForceReadOnly,
+            false
+        ));
         assert!(buffer_view_read_only(BufferDerivation::ForceReadOnly, true));
         // The mutant: `$ro_fn` implemented as a plain `$dup_fn` alias, which is
         // exactly what `servlet.rs`'s typed-view `$ro` still is. It agrees with
@@ -30605,7 +30719,10 @@ mod buffer_bounds_tests {
     fn write_alone_neither_creates_nor_truncates() {
         let m = file_channel_open_mode(&["WRITE"]).unwrap();
         assert!(m.write);
-        assert!(!m.create, "no CREATE ⇒ NoSuchFileException on a missing file");
+        assert!(
+            !m.create,
+            "no CREATE ⇒ NoSuchFileException on a missing file"
+        );
         assert!(!m.truncate, "no TRUNCATE_EXISTING ⇒ the contents survive");
         assert!(!m.append);
     }
@@ -30619,9 +30736,11 @@ mod buffer_bounds_tests {
 
     #[test]
     fn create_new_counts_as_create() {
-        assert!(file_channel_open_mode(&["WRITE", "CREATE_NEW"])
-            .unwrap()
-            .create);
+        assert!(
+            file_channel_open_mode(&["WRITE", "CREATE_NEW"])
+                .unwrap()
+                .create
+        );
     }
 
     /// MEASURED, and the messages are compared EXACTLY:
@@ -30940,7 +31059,8 @@ mod buffer_bounds_tests {
         // --- the RED: a real-JDK-shaped receiver with a segment and no `hb`.
         let mut native = vec![31u8, 32, 33, 34];
         let addr = native.as_mut_ptr() as i64;
-        let segment = ctx.alloc_object_with_class(0, "jdk/internal/foreign/NativeMemorySegmentImpl");
+        let segment =
+            ctx.alloc_object_with_class(0, "jdk/internal/foreign/NativeMemorySegmentImpl");
         let bb = ctx.alloc_object(8);
         ctx.set_field(bb, 0, Value::Int(-1)); // Buffer.mark
         ctx.set_field(bb, 1, Value::Int(0)); // Buffer.position
@@ -31260,10 +31380,13 @@ mod files_bulk_transfer_tests {
     //! `write_byte_array_from` / `read_byte_array_into` impls, so these
     //! tests verify the call-site wiring (offsets, length, byte fidelity)
     //! rather than the memcpy override itself.
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Build a synthetic `Path`-like object whose slot-0 field is a string
     /// holding `path_str` — exactly what `read_path_str` falls back to.
@@ -31383,10 +31506,13 @@ mod files_bulk_transfer_tests {
 // ===========================================================================
 #[cfg(test)]
 mod abs_path_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Build a synthetic `java.io.File` whose slot-0 path string is `path`.
     fn make_file(ctx: &mut MockNativeContext, path: &str) -> ObjectRef {

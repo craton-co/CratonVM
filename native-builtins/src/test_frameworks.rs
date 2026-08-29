@@ -2167,7 +2167,9 @@ fn bytebuddy_object_is_exact_class(
     obj: ObjectRef,
     class_name: &str,
 ) -> bool {
-    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+        == Some(class_name)
 }
 
 fn native_bytebuddy_method_type_token_hash_code(
@@ -3214,8 +3216,11 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
     // Allocate a PropertiesWrapper with enough fields for the JDK
     // layout (`properties` is the only declared field).  Use the
     // standard synthetic allocator so the class is initialised first.
-    let wrapper =
-        try_alloc_concurrent_synthetic(ctx, "org/apache/maven/surefire/booter/PropertiesWrapper", 2)?;
+    let wrapper = try_alloc_concurrent_synthetic(
+        ctx,
+        "org/apache/maven/surefire/booter/PropertiesWrapper",
+        2,
+    )?;
     // Allocate a tiny placeholder map for the `properties` field so any
     // bytecode that touches the field (not via our overrides) sees a
     // non-null Map. Use a HashMap (well-known to our natives) rather
@@ -3343,24 +3348,23 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let instantiate_factory =
-        |ctx: &mut dyn NativeContext,
-         class_name: &str|
-         -> Result<Option<ObjectRef>, MethodCallFailed> {
-            let init_ok = ctx.ensure_class_initialized(class_name).is_ok();
-            let obj = if init_ok {
-                match ctx.new_object(class_name) {
-                    Ok(Some(Value::Object(Some(o)))) => o,
-                    _ => try_alloc_concurrent_synthetic(ctx, class_name, 0)?,
-                }
-            } else {
-                try_alloc_concurrent_synthetic(ctx, class_name, 0)?
-            };
-            // Use real object allocation + constructor init so surefire's internal
-            // processor/channel fields are materialized with the expected layout.
-            let _ = ctx.invoke_special(class_name, "<init>", "()V", &[Value::Object(Some(obj))]);
-            Ok(Some(obj))
+    let instantiate_factory = |ctx: &mut dyn NativeContext,
+                               class_name: &str|
+     -> Result<Option<ObjectRef>, MethodCallFailed> {
+        let init_ok = ctx.ensure_class_initialized(class_name).is_ok();
+        let obj = if init_ok {
+            match ctx.new_object(class_name) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => try_alloc_concurrent_synthetic(ctx, class_name, 0)?,
+            }
+        } else {
+            try_alloc_concurrent_synthetic(ctx, class_name, 0)?
         };
+        // Use real object allocation + constructor init so surefire's internal
+        // processor/channel fields are materialized with the expected layout.
+        let _ = ctx.invoke_special(class_name, "<init>", "()V", &[Value::Object(Some(obj))]);
+        Ok(Some(obj))
+    };
 
     let conn_val = args.first().copied().unwrap_or(Value::Object(None));
     let conn_text = match conn_val {
@@ -3847,7 +3851,10 @@ fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Meth
     Ok(javac_array_list_from_values(ctx, &[])?)
 }
 
-fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+fn javac_array_list_from_values(
+    ctx: &mut dyn NativeContext,
+    values: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
     let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let pin_base = ctx.pin_native_root(list);
     let value_pins: Vec<Option<(usize, ObjectRef)>> = values
@@ -4383,8 +4390,16 @@ fn assertj_array_values_equal(left: Value, right: Value) -> bool {
         // Arrays.equals(float[], float[]) and Arrays.equals(double[], double[])
         // use the canonical NaN bit pattern, rather than IEEE `==`.
         (Value::Float(left), Value::Float(right)) => {
-            let left = if left.is_nan() { 0x7fc0_0000 } else { left.to_bits() };
-            let right = if right.is_nan() { 0x7fc0_0000 } else { right.to_bits() };
+            let left = if left.is_nan() {
+                0x7fc0_0000
+            } else {
+                left.to_bits()
+            };
+            let right = if right.is_nan() {
+                0x7fc0_0000
+            } else {
+                right.to_bits()
+            };
             left == right
         }
         (Value::Double(left), Value::Double(right)) => {
@@ -4516,7 +4531,12 @@ fn assertj_objects_equal(
         // `assertThat(springNullBean).isEqualTo(null)` passes on HotSpot
         // (`NullBean.equals` is `this == obj || obj == null`).
         (Some(left), None) => {
-            let r = ctx.invoke_virtual(left, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            let r = ctx.invoke_virtual(
+                left,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(None)],
+            )?;
             return Ok(matches!(r, Some(Value::Int(v)) if v != 0));
         }
         (Some(left), Some(right)) if left == right => return Ok(true),
@@ -4560,8 +4580,9 @@ fn assertj_objects_equal(
         let value_slot = ctx
             .resolve_field_index("java/lang/Long", "value")
             .unwrap_or(0);
-        return Ok(assertj_long_value(ctx, left, value_slot)
-            == assertj_long_value(ctx, right, value_slot));
+        return Ok(
+            assertj_long_value(ctx, left, value_slot) == assertj_long_value(ctx, right, value_slot)
+        );
     }
 
     // A virtual call may allocate or re-enter Java, so retain both operands
@@ -4586,9 +4607,13 @@ fn assertj_array_list_long_layout(
     iterable: ObjectRef,
     needle: ObjectRef,
 ) -> Option<(ObjectRef, usize, usize, i64)> {
-    if ctx.class_name_arc_of_id(ctx.class_id_of_object(iterable)).as_deref()
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(iterable))
+        .as_deref()
         != Some("java/util/ArrayList")
-        || ctx.class_name_arc_of_id(ctx.class_id_of_object(needle)).as_deref()
+        || ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(needle))
+            .as_deref()
             != Some("java/lang/Long")
     {
         return None;
@@ -4638,29 +4663,27 @@ fn assertj_iterable_contains_generic(
     let needle_pin = needle.map(|needle| ctx.pin_native_root(needle));
     let result: Result<bool, MethodCallFailed> = (|| {
         let iterable = ctx.read_native_pin(iterable_pin, iterable);
-        let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
-            Some(Value::Object(Some(iterator))) => iterator,
-            _ => return Ok(false),
-        };
+        let iterator =
+            match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
+                Some(Value::Object(Some(iterator))) => iterator,
+                _ => return Ok(false),
+            };
         let iterator_pin = ctx.pin_native_root(iterator);
-        let result = (|| {
-            loop {
-                let iterator = ctx.read_native_pin(iterator_pin, iterator);
-                let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
-                if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
-                    return Ok(false);
-                }
-                let iterator = ctx.read_native_pin(iterator_pin, iterator);
-                let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
-                    Some(Value::Object(element)) => element,
-                    _ => None,
-                };
-                let needle = needle.map(|needle| {
-                    ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle)
-                });
-                if assertj_objects_equal(ctx, element, needle)? {
-                    return Ok(true);
-                }
+        let result = (|| loop {
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+            if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
+                return Ok(false);
+            }
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                Some(Value::Object(element)) => element,
+                _ => None,
+            };
+            let needle = needle
+                .map(|needle| ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle));
+            if assertj_objects_equal(ctx, element, needle)? {
+                return Ok(true);
             }
         })();
         ctx.unpin_native_roots(iterator_pin);
@@ -4722,11 +4745,15 @@ fn native_assertj_lightweight_comparable_assert(
         let static_object = |ctx: &mut dyn NativeContext, owner: &str, field: &str| {
             ctx.ensure_class_initialized(owner)
                 .ok()
-                .and_then(|class_id| ctx.static_field_index_by_name(class_id, field)
-                    .map(|index| ctx.get_static_field(class_id, index)))
+                .and_then(|class_id| {
+                    ctx.static_field_index_by_name(class_id, field)
+                        .map(|index| ctx.get_static_field(class_id, index))
+                })
                 .unwrap_or(Value::Object(None))
         };
-        let alloc_blank = |ctx: &mut dyn NativeContext, class_name: &str| -> Result<ObjectRef, MethodCallFailed> {
+        let alloc_blank = |ctx: &mut dyn NativeContext,
+                           class_name: &str|
+         -> Result<ObjectRef, MethodCallFailed> {
             let class_id = ctx.ensure_class_initialized(class_name)?;
             Ok(ctx.alloc_object(class_id, ctx.class_num_total_fields(class_id)))
         };
@@ -4735,7 +4762,11 @@ fn native_assertj_lightweight_comparable_assert(
             .map(|pin| Value::Object(Some(ctx.read_native_pin(pin, value.unwrap()))))
             .unwrap_or(Value::Object(None));
         ctx.set_field_by_name(assertion_live, "actual", actual);
-        ctx.set_field_by_name(assertion_live, "myself", Value::Object(Some(assertion_live)));
+        ctx.set_field_by_name(
+            assertion_live,
+            "myself",
+            Value::Object(Some(assertion_live)),
+        );
         let objects = static_object(ctx, "org/assertj/core/internal/Objects", "INSTANCE");
         ctx.set_field_by_name(assertion_live, "objects", objects);
         let conditions = static_object(ctx, "org/assertj/core/internal/Conditions", "INSTANCE");
@@ -4773,8 +4804,11 @@ fn native_assertj_lightweight_comparable_assert(
         // move objects -- and hold no cached ObjectRef across an allocation.
         let info = alloc_blank(ctx, "org/assertj/core/api/WritableAssertionInfo")?;
         let info_pin = ctx.pin_native_root(info);
-        let mut representation =
-            static_object(ctx, "org/assertj/core/api/AbstractAssert", "customRepresentation");
+        let mut representation = static_object(
+            ctx,
+            "org/assertj/core/api/AbstractAssert",
+            "customRepresentation",
+        );
         if matches!(representation, Value::Object(None)) {
             let provider = static_object(
                 ctx,
@@ -4851,7 +4885,11 @@ fn native_assertj_lightweight_comparable_assert(
         ctx.set_field_by_name(comparables, "failures", failures);
         ctx.unpin_native_roots(comparables_pin);
         let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-        ctx.set_field_by_name(assertion_live, "comparables", Value::Object(Some(comparables)));
+        ctx.set_field_by_name(
+            assertion_live,
+            "comparables",
+            Value::Object(Some(comparables)),
+        );
         Ok(Some(Value::Object(Some(assertion_live))))
     })();
     if let Some(value_pin) = value_pin {
@@ -4871,7 +4909,11 @@ pub(crate) fn native_assertj_string_assert_that(
             *value,
             "org/assertj/core/api/StringAssert",
         ),
-        _ => native_assertj_lightweight_comparable_assert(ctx, None, "org/assertj/core/api/StringAssert"),
+        _ => native_assertj_lightweight_comparable_assert(
+            ctx,
+            None,
+            "org/assertj/core/api/StringAssert",
+        ),
     }
 }
 
@@ -4910,7 +4952,13 @@ pub(crate) fn native_assertj_comparable_is_greater_than(
     };
     let expected = match args.get(1) {
         Some(Value::Object(Some(expected))) => *expected,
-        _ => return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(None)),
+        _ => {
+            return assertj_comparable_assert_greater_than_fallback(
+                ctx,
+                assertion,
+                Value::Object(None),
+            )
+        }
     };
     let assertion_pin = ctx.pin_native_root(assertion);
     let expected_pin = ctx.pin_native_root(expected);
@@ -4918,7 +4966,13 @@ pub(crate) fn native_assertj_comparable_is_greater_than(
         let assertion = ctx.read_native_pin(assertion_pin, assertion);
         let actual = match ctx.get_field_by_name(assertion, "actual") {
             Value::Object(Some(actual)) => actual,
-            _ => return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected))),
+            _ => {
+                return assertj_comparable_assert_greater_than_fallback(
+                    ctx,
+                    assertion,
+                    Value::Object(Some(expected)),
+                )
+            }
         };
         let actual_pin = ctx.pin_native_root(actual);
         let result = (|| -> MethodCallResult {
@@ -4941,7 +4995,11 @@ pub(crate) fn native_assertj_comparable_is_greater_than(
                 _ => false,
             };
             if !default_strategy {
-                return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected)));
+                return assertj_comparable_assert_greater_than_fallback(
+                    ctx,
+                    assertion,
+                    Value::Object(Some(expected)),
+                );
             }
             let actual = ctx.read_native_pin(actual_pin, actual);
             let expected_live = ctx.read_native_pin(expected_pin, expected);
@@ -4952,26 +5010,41 @@ pub(crate) fn native_assertj_comparable_is_greater_than(
                     && ctx.class_id_of_object(expected_live) == class_id
             }) {
                 // String.compareTo uses lexicographic UTF-16 code-unit order.
-                ctx.read_string(actual).unwrap_or_default().encode_utf16().cmp(
-                    ctx.read_string(expected_live)
-                        .unwrap_or_default()
-                        .encode_utf16(),
-                ).is_gt()
+                ctx.read_string(actual)
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .cmp(
+                        ctx.read_string(expected_live)
+                            .unwrap_or_default()
+                            .encode_utf16(),
+                    )
+                    .is_gt()
             } else if uuid_class.is_some_and(|class_id| {
                 ctx.class_id_of_object(actual) == class_id
                     && ctx.class_id_of_object(expected_live) == class_id
             }) {
                 (uuid_get_msb(ctx, actual), uuid_get_lsb(ctx, actual))
-                    > (uuid_get_msb(ctx, expected_live), uuid_get_lsb(ctx, expected_live))
+                    > (
+                        uuid_get_msb(ctx, expected_live),
+                        uuid_get_lsb(ctx, expected_live),
+                    )
             } else {
-                return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected_live)));
+                return assertj_comparable_assert_greater_than_fallback(
+                    ctx,
+                    assertion,
+                    Value::Object(Some(expected_live)),
+                );
             };
             if relation_is_greater {
                 let assertion = ctx.read_native_pin(assertion_pin, assertion);
                 return Ok(Some(ctx.get_field_by_name(assertion, "myself")));
             }
             let assertion = ctx.read_native_pin(assertion_pin, assertion);
-            assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected_live)))
+            assertj_comparable_assert_greater_than_fallback(
+                ctx,
+                assertion,
+                Value::Object(Some(expected_live)),
+            )
         })();
         ctx.unpin_native_roots(actual_pin);
         result
@@ -5018,15 +5091,16 @@ pub(crate) fn native_assertj_standard_comparison_iterable_contains(
             assertj_array_list_long_layout(ctx, iterable, needle)
         {
             let long_class = ctx.class_id_of_object(needle);
-            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)? {
+            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)?
+            {
                 Some(index) => return Ok(Some(Value::Int(i32::from(index != usize::MAX)))),
                 None => {}
             }
         }
     }
-    Ok(Some(Value::Int(i32::from(assertj_iterable_contains_generic(
-        ctx, iterable, needle,
-    )?))))
+    Ok(Some(Value::Int(i32::from(
+        assertj_iterable_contains_generic(ctx, iterable, needle)?,
+    ))))
 }
 
 pub(crate) fn native_assertj_standard_comparison_iterables_remove_first(
@@ -5046,17 +5120,26 @@ pub(crate) fn native_assertj_standard_comparison_iterables_remove_first(
             assertj_array_list_long_layout(ctx, iterable, needle)
         {
             let long_class = ctx.class_id_of_object(needle);
-            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)? {
+            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)?
+            {
                 Some(index) if index != usize::MAX => {
                     for offset in index + 1..size {
-                        ctx.set_array_element(elements, offset - 1, ctx.get_array_element(elements, offset));
+                        ctx.set_array_element(
+                            elements,
+                            offset - 1,
+                            ctx.get_array_element(elements, offset),
+                        );
                     }
                     if size > 0 {
                         ctx.set_array_element(elements, size - 1, Value::Object(None));
                     }
                     ctx.set_field_by_name(iterable, "size", Value::Int((size - 1) as i32));
                     if let Value::Int(mod_count) = ctx.get_field_by_name(iterable, "modCount") {
-                        ctx.set_field_by_name(iterable, "modCount", Value::Int(mod_count.wrapping_add(1)));
+                        ctx.set_field_by_name(
+                            iterable,
+                            "modCount",
+                            Value::Int(mod_count.wrapping_add(1)),
+                        );
                     }
                     return Ok(None);
                 }
@@ -5070,31 +5153,29 @@ pub(crate) fn native_assertj_standard_comparison_iterables_remove_first(
     let needle_pin = needle.map(|needle| ctx.pin_native_root(needle));
     let result: Result<(), MethodCallFailed> = (|| {
         let iterable = ctx.read_native_pin(iterable_pin, iterable);
-        let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
-            Some(Value::Object(Some(iterator))) => iterator,
-            _ => return Ok(()),
-        };
+        let iterator =
+            match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
+                Some(Value::Object(Some(iterator))) => iterator,
+                _ => return Ok(()),
+            };
         let iterator_pin = ctx.pin_native_root(iterator);
-        let result = (|| {
-            loop {
+        let result = (|| loop {
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+            if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
+                return Ok(());
+            }
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                Some(Value::Object(element)) => element,
+                _ => None,
+            };
+            let needle = needle
+                .map(|needle| ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle));
+            if assertj_objects_equal(ctx, element, needle)? {
                 let iterator = ctx.read_native_pin(iterator_pin, iterator);
-                let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
-                if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
-                    return Ok(());
-                }
-                let iterator = ctx.read_native_pin(iterator_pin, iterator);
-                let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
-                    Some(Value::Object(element)) => element,
-                    _ => None,
-                };
-                let needle = needle.map(|needle| {
-                    ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle)
-                });
-                if assertj_objects_equal(ctx, element, needle)? {
-                    let iterator = ctx.read_native_pin(iterator_pin, iterator);
-                    ctx.invoke_virtual(iterator, "remove", "()V", &[])?;
-                    return Ok(());
-                }
+                ctx.invoke_virtual(iterator, "remove", "()V", &[])?;
+                return Ok(());
             }
         })();
         ctx.unpin_native_roots(iterator_pin);

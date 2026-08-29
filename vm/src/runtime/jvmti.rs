@@ -4382,10 +4382,16 @@ mod tests {
         assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 999);
 
         env.set_local_float(1, 0, 2, 1.5).unwrap();
-        assert_eq!(env.get_local_float(1, 0, 2).unwrap().to_bits(), 1.5f32.to_bits());
+        assert_eq!(
+            env.get_local_float(1, 0, 2).unwrap().to_bits(),
+            1.5f32.to_bits()
+        );
 
         env.set_local_double(1, 0, 3, 2.5).unwrap();
-        assert_eq!(env.get_local_double(1, 0, 3).unwrap().to_bits(), 2.5f64.to_bits());
+        assert_eq!(
+            env.get_local_double(1, 0, 3).unwrap().to_bits(),
+            2.5f64.to_bits()
+        );
 
         env.set_local_object(1, 0, 4, None).unwrap();
         assert_eq!(env.get_local_object(1, 0, 4).unwrap(), None);
@@ -5621,7 +5627,11 @@ mod tests {
     fn manager_owned_by(vm: usize) -> Arc<JvmtiEventManager> {
         install_manager_for_vm(vm, Arc::new(JvmtiEventManager::new_for_vm(vm)));
         let m = manager_for_vm(vm).expect("just installed");
-        assert_eq!(m.vm_identity(), vm, "the row must hold the VM's own manager");
+        assert_eq!(
+            m.vm_identity(),
+            vm,
+            "the row must hold the VM's own manager"
+        );
         m
     }
 
@@ -5674,8 +5684,12 @@ mod tests {
         let tid: ThreadId = 21;
         let mid: MethodId = 0x1234;
         for m in [&mgr_a, &mgr_b] {
-            m.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldAccess, Some(tid))
-                .unwrap();
+            m.set_event_notification_mode(
+                EventMode::Enable,
+                JvmtiEventKind::FieldAccess,
+                Some(tid),
+            )
+            .unwrap();
         }
 
         let hits_a = Arc::new(AtomicU32::new(0));
@@ -5768,8 +5782,12 @@ mod tests {
 
         let tid: ThreadId = 22;
         for m in [&mgr_a, &mgr_b] {
-            m.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
-                .unwrap();
+            m.set_event_notification_mode(
+                EventMode::Enable,
+                JvmtiEventKind::MethodEntry,
+                Some(tid),
+            )
+            .unwrap();
         }
 
         let seen_a = Arc::new(AtomicU32::new(0));

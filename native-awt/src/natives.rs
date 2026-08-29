@@ -702,15 +702,23 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
     // native disposer thread. CratonVM resolves fields by name and has no JNI
     // ID cache, so there is nothing to initialize — same rationale as the
     // `initIDs` block further down this file.
-    registry.register_with_kind("sun/java2d/Disposer", "initIDs", "()V", |_ctx, _args| {
-        void_ok()
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "sun/java2d/Disposer",
+        "initIDs",
+        "()V",
+        |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
+    );
     // Toolkit.<clinit> calls this JNI bootstrap before ImageIO and Spring's
     // HTTP image converter can initialize desktop classes. CratonVM keeps the
     // relevant IDs in Rust-side registries, so the HotSpot native is a no-op.
-    registry.register_with_kind("java/awt/Toolkit", "initIDs", "()V", |_ctx, _args| {
-        void_ok()
-    }, NativeKind::Bridge);
+    registry.register_with_kind(
+        "java/awt/Toolkit",
+        "initIDs",
+        "()V",
+        |_ctx, _args| void_ok(),
+        NativeKind::Bridge,
+    );
     // java.awt.Toolkit.getDefaultToolkit — return a real HeadlessToolkit.
     // The previous implementation returned `new java/awt/Toolkit`, but
     // `java.awt.Toolkit` is abstract; instances of it have no concrete
@@ -1514,18 +1522,23 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
             }
             Ok(color_obj)
         });
-        registry.register(class, "setBackground", "(Ljava/awt/Color;)V", |ctx, args| {
-            if let Some(this) = get_obj(args, 0) {
-                let argb = get_obj(args, 1)
-                    .map(|c| match ctx.get_field_by_name(c, "value") {
-                        Value::Int(v) => v as u32,
-                        _ => 0xFF_FFFFFF,
-                    })
-                    .unwrap_or(0xFF_FFFFFF);
-                with_gfx(ctx, this, |gs| gs.set_background(argb));
-            }
-            void_ok()
-        });
+        registry.register(
+            class,
+            "setBackground",
+            "(Ljava/awt/Color;)V",
+            |ctx, args| {
+                if let Some(this) = get_obj(args, 0) {
+                    let argb = get_obj(args, 1)
+                        .map(|c| match ctx.get_field_by_name(c, "value") {
+                            Value::Int(v) => v as u32,
+                            _ => 0xFF_FFFFFF,
+                        })
+                        .unwrap_or(0xFF_FFFFFF);
+                    with_gfx(ctx, this, |gs| gs.set_background(argb));
+                }
+                void_ok()
+            },
+        );
         registry.register(class, "getBackground", "()Ljava/awt/Color;", |ctx, args| {
             let argb = match get_obj(args, 0) {
                 Some(this) => with_gfx(ctx, this, |gs| gs.background()),
@@ -2157,7 +2170,13 @@ fn packed_masks(image_type: i32) -> Option<[i32; 4]> {
 /// image and stamp them onto the `BufferedImage`'s own fields.
 ///
 /// Every object here is built by REAL JDK bytecode; nothing is fabricated.
-fn attach_real_raster(ctx: &mut dyn NativeContext, this: ObjectRef, w: i32, h: i32, image_type: i32) {
+fn attach_real_raster(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    w: i32,
+    h: i32,
+    image_type: i32,
+) {
     let Some(masks) = packed_masks(image_type) else {
         return;
     };
@@ -2372,7 +2391,6 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             int_ok(0)
         },
     );
-
 
     registry.register(
         "java/awt/image/BufferedImage",

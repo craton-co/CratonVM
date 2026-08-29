@@ -57,13 +57,7 @@ fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
 // allocation); reading through it here yields the current address even after
 // the internal string/array allocations of earlier calls in the caller's
 // sequence.
-fn put_arr(
-    ctx: &mut dyn NativeContext,
-    map_pin: usize,
-    map: ObjectRef,
-    key: &str,
-    items: &[&str],
-) {
+fn put_arr(ctx: &mut dyn NativeContext, map_pin: usize, map: ObjectRef, key: &str, items: &[&str]) {
     let k = ctx.create_string(key);
     let k_pin = ctx.pin_native_root(k);
     let arr = make_string_array(ctx, items);
@@ -224,7 +218,13 @@ fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "DayAbbreviations",
         &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
-    put_arr(ctx, map_pin, map, "DayNarrows", &["S", "M", "T", "W", "T", "F", "S"]);
+    put_arr(
+        ctx,
+        map_pin,
+        map,
+        "DayNarrows",
+        &["S", "M", "T", "W", "T", "F", "S"],
+    );
     put_arr(
         ctx,
         map_pin,
@@ -266,7 +266,13 @@ fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
-    put_arr(ctx, map_pin, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
+    put_arr(
+        ctx,
+        map_pin,
+        map,
+        "QuarterAbbreviations",
+        &["Q1", "Q2", "Q3", "Q4"],
+    );
     put_arr(ctx, map_pin, map, "QuarterNarrows", &["1", "2", "3", "4"]);
     put_arr(
         ctx,
@@ -282,7 +288,13 @@ fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "standalone.QuarterAbbreviations",
         &["Q1", "Q2", "Q3", "Q4"],
     );
-    put_arr(ctx, map_pin, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(
+        ctx,
+        map_pin,
+        map,
+        "standalone.QuarterNarrows",
+        &["1", "2", "3", "4"],
+    );
     // 9-slot DateTimePatterns: 4 time patterns (FULL/LONG/MEDIUM/SHORT),
     // 4 date patterns, 1 date-time combiner — the standard JDK layout
     // SimpleDateFormat consumes via DateFormatSymbols.
@@ -320,7 +332,13 @@ fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
             "{1} {0}",
         ],
     );
-    put_str(ctx, map_pin, map, "DateTimePatternChars", "GyMdkHmsSEDFwWahKzZYuXL");
+    put_str(
+        ctx,
+        map_pin,
+        map,
+        "DateTimePatternChars",
+        "GyMdkHmsSEDFwWahKzZYuXL",
+    );
     put_arr(
         ctx,
         map_pin,
@@ -493,11 +511,20 @@ type CldrTable = std::sync::Arc<std::collections::BTreeMap<String, CldrValue>>;
 /// `cldr_table_for`: the hit check, whose innermost body is a bare `return`,
 /// and the store. The `ctx.find_resource` probing that builds the table runs
 /// between them, after the read guard has been dropped.
-fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>> {
+fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<
+    std::collections::HashMap<String, Option<CldrTable>>,
+> {
     static INSTANCE: std::sync::OnceLock<
-        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>>,
+        cratonvm_types::lock_order::OrderedMutex<
+            std::collections::HashMap<String, Option<CldrTable>>,
+        >,
     > = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    INSTANCE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The two packages that hold a `LocaleData` base name's CLDR classes: the
@@ -849,13 +876,11 @@ pub(crate) fn cldr_collation_rule(
     found
 }
 
-fn collation_rule_cache(
-) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<String>>>
-{
+fn collation_rule_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<
+    std::collections::HashMap<String, Option<String>>,
+> {
     static INSTANCE: std::sync::OnceLock<
-        cratonvm_types::lock_order::OrderedMutex<
-            std::collections::HashMap<String, Option<String>>,
-        >,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<String>>>,
     > = std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| {
         cratonvm_types::lock_order::OrderedMutex::new(
@@ -875,7 +900,9 @@ fn cldr_collation_rule_uncached(
     // `Rule` for that locale or does not exist.
     let mut candidates = Vec::new();
     if !country.is_empty() {
-        candidates.push(format!("sun/text/resources/ext/CollationData_{lang}_{country}"));
+        candidates.push(format!(
+            "sun/text/resources/ext/CollationData_{lang}_{country}"
+        ));
     }
     candidates.push(format!("sun/text/resources/ext/CollationData_{lang}"));
     for cand in candidates {
@@ -898,11 +925,7 @@ fn cldr_collation_rule_uncached(
 
 /// The FormatData table for a locale. One name for the base string so the six
 /// call sites cannot drift apart on it.
-fn cldr_format_data(
-    ctx: &mut dyn NativeContext,
-    lang: &str,
-    country: &str,
-) -> Option<CldrTable> {
+fn cldr_format_data(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> Option<CldrTable> {
     load_cldr_table(ctx, "sun.text.resources.cldr.FormatData", lang, country)
 }
 
@@ -1475,7 +1498,9 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// scan is the established, well-tested path and answers the same thing.
 /// Because our native IS the `getBundle` frame (no Java frame is pushed for
 /// it), the innermost captured Java frame is the caller.
-fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn caller_bundle_class_loader(
+    ctx: &mut dyn NativeContext,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let frames = ctx.capture_stack_trace(0);
     let Some(frame) = frames.last() else {
         return Ok(None);
@@ -1484,13 +1509,12 @@ fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<Obje
         return Ok(None);
     };
     let mirror = ctx.get_class_mirror(cid);
-    let loader = match crate::lang_class::native_class_get_class_loader(
-        ctx,
-        &[Value::Object(Some(mirror))],
-    ) {
-        Ok(Some(Value::Object(Some(loader)))) => loader,
-        _ => return Ok(None),
-    };
+    let loader =
+        match crate::lang_class::native_class_get_class_loader(ctx, &[Value::Object(Some(mirror))])
+        {
+            Ok(Some(Value::Object(Some(loader)))) => loader,
+            _ => return Ok(None),
+        };
     // Anything other than the application-loader singleton. NOT
     // `is_user_defined_loader`: that predicate excludes a bare
     // `java.net.URLClassLoader` BY CLASS NAME for its other call sites, yet
@@ -2507,7 +2531,11 @@ fn locale_calendar_name(
 ) -> Option<String> {
     let (lang, country) = arg_locale(ctx, locale_arg);
     if let Some(names) = cldr_calendar_name_array(ctx, &lang, &country, field, style) {
-        let index = if field == CAL_DAY_OF_WEEK { value - 1 } else { value };
+        let index = if field == CAL_DAY_OF_WEEK {
+            value - 1
+        } else {
+            value
+        };
         if index >= 0 {
             if let Some(name) = names.get(index as usize) {
                 if !name.is_empty() {
@@ -2998,8 +3026,12 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 &[Value::Int(pattern_sep as i32)],
             );
             let this_now = ctx.read_native_pin(this_pin, this);
-            let _ =
-                ctx.invoke_virtual(this_now, "setPercent", "(C)V", &[Value::Int(percent_ch as i32)]);
+            let _ = ctx.invoke_virtual(
+                this_now,
+                "setPercent",
+                "(C)V",
+                &[Value::Int(percent_ch as i32)],
+            );
             let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
                 this_now,
@@ -3008,7 +3040,8 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 &[Value::Int(zero_digit as i32)],
             );
             let this_now = ctx.read_native_pin(this_pin, this);
-            let _ = ctx.invoke_virtual(this_now, "setDigit", "(C)V", &[Value::Int(digit_ch as i32)]);
+            let _ =
+                ctx.invoke_virtual(this_now, "setDigit", "(C)V", &[Value::Int(digit_ch as i32)]);
             let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
                 this_now,
@@ -3537,15 +3570,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // surrogate is a normalization boundary, and it is itself
             // normalized under every form (unassigned, combining class 0), so
             // the answer is "every representable run is normalized".
-            let normalized = normalizer_runs(&input).into_iter().all(|run| {
-                match form_ordinal {
+            let normalized = normalizer_runs(&input)
+                .into_iter()
+                .all(|run| match form_ordinal {
                     0 => is_nfd_quick(run.chars()) == IsNormalized::Yes,
                     1 => is_nfc_quick(run.chars()) == IsNormalized::Yes,
                     2 => is_nfkd_quick(run.chars()) == IsNormalized::Yes,
                     3 => is_nfkc_quick(run.chars()) == IsNormalized::Yes,
                     _ => true,
-                }
-            });
+                });
             Ok(Some(Value::Int(if normalized { 1 } else { 0 })))
         },
     );

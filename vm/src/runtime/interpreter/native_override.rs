@@ -1234,7 +1234,11 @@ pub(super) fn is_bc_sect_field_class(class_name: &str) -> bool {
     )
 }
 
-pub(super) fn is_bc_sect_field_native_override(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+pub(super) fn is_bc_sect_field_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
     if !is_bc_sect_field_class(class_name) {
         return false;
     }
@@ -1987,7 +1991,10 @@ pub(crate) fn is_file_system_provider_link_native_override(
             "createSymbolicLink",
             "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V"
         ) | ("createLink", "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V")
-            | ("readSymbolicLink", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;")
+            | (
+                "readSymbolicLink",
+                "(Ljava/nio/file/Path;)Ljava/nio/file/Path;"
+            )
     )
 }
 
@@ -5205,9 +5212,19 @@ pub(crate) fn is_string_builder_layout_native_override(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // `java/lang/StringBuffer` is NOT here, and its absence is load-bearing.
+    // Its 62 natives were retired from the real-JDK registrar (see the block
+    // at `register_string_builder_natives`'s call site in
+    // `native-builtins/src/lib.rs`) so that its own `synchronized` bodies run
+    // and supply the monitor and the `toStringCache` invalidation a shared
+    // native cannot. Leaving the class here would let this gate resolve
+    // `StringBuffer.append` by walking to the INHERITED
+    // `AbstractStringBuilder.append` native and running it directly, skipping
+    // the `StringBuffer` body entirely — a retirement that is silently undone
+    // by the gate that outlived it.
     if !matches!(
         class_name,
-        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+        "java/lang/StringBuilder" | "java/lang/AbstractStringBuilder"
     ) {
         return false;
     }
@@ -5797,10 +5814,11 @@ fn admit_forced_native(
     method_name: &str,
     method_descriptor: &str,
 ) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
-    let Some(id) = shared
-        .natives
-        .native_methods
-        .resolve_id(class_name, method_name, method_descriptor)
+    let Some(id) =
+        shared
+            .natives
+            .native_methods
+            .resolve_id(class_name, method_name, method_descriptor)
     else {
         return Ok(None);
     };
@@ -6416,17 +6434,18 @@ pub(super) fn intercept_force_registered_native_cached(
     }
     if shape & INTERCEPT_SHAPE_CLASS_REFLECTION != 0
         && matches!(
-        args.first(),
-        Some(Value::Object(Some(receiver))) if {
-            let receiver_cid = shared.mem.heap.class_id_of(*receiver);
-            shared
-                .classes.class_manager
-                .read()
-                .get_class(receiver_cid)
-                .map(|class| &*class.name == "java/lang/Class")
-                .unwrap_or(false)
-        }
-    ) {
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.mem.heap.class_id_of(*receiver);
+                shared
+                    .classes.class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
         let callback = shared.natives.native_methods.find(
             "java/lang/Class",
             method_name,
@@ -7034,7 +7053,9 @@ pub(super) fn synthetic_stub_yields_with_cm(
         None => (false, "class not loaded"),
         Some(cid) => match cm.get_class(cid) {
             None => (false, "class id not in the store"),
-            Some(cls) if cls.origin.is_compatibility_stub() => (false, "loaded class is itself a synthetic stub"),
+            Some(cls) if cls.origin.is_compatibility_stub() => {
+                (false, "loaded class is itself a synthetic stub")
+            }
             Some(_) => match crate::classloading::find_method_recursive(
                 cid,
                 method_name,
@@ -7067,8 +7088,6 @@ pub(crate) fn dbg_stub_yield() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STUB_YIELD").is_some())
 }
-
-
 
 /// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
 /// dispatch paths** as of 2026-08-04.
@@ -7128,7 +7147,8 @@ static STUB_DOOR_TALLY: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn stub_door_note(file: &'static str, line: u32, class_name: &str, verdict: bool) {
-    let m = STUB_DOOR_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let m =
+        STUB_DOOR_TALLY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
     if let Ok(mut g) = m.lock() {
         *g.entry((file, line, class_name.to_string(), verdict))
             .or_insert(0) += 1;
@@ -7680,11 +7700,7 @@ mod forced_native_string_tests {
     #[test]
     fn the_string_guard_can_fail() {
         assert!(
-            force_native_over_real_jdk_bytecode(
-                "java/lang/StringUTF16",
-                "getChars",
-                "([BII[CI)V"
-            ),
+            force_native_over_real_jdk_bytecode("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
             "`force_native_over_real_jdk_bytecode` no longer forces the one entry that proves \
              it still forces anything, so `no_string_shape_is_forced_native_by_name_on_any_\
              dispatch_path` above is vacuous"
@@ -8391,11 +8407,10 @@ mod enforcement_dial_door_tests {
         // the helper, so the scan must account for it, but it is not
         // outstanding work. Filing both under one heading makes the list read
         // as twice the remaining problem.
-        const FORCE_SITES_EXEMPT: &[(&str, bool, &str)] = &[
-            (
-                "jit_bridge.rs",
-                true,
-                "NOT APPLICABLE, verified by reading the bind path rather than \
+        const FORCE_SITES_EXEMPT: &[(&str, bool, &str)] = &[(
+            "jit_bridge.rs",
+            true,
+            "NOT APPLICABLE, verified by reading the bind path rather than \
                  inferred from the grep that first listed it. Under `--jdk-only`, \
                  `jit::direct_native_helper` refuses to bind any native whose \
                  registry kind is not `Intrinsic` (§1.4's reviewed exception) and \
@@ -8408,8 +8423,7 @@ mod enforcement_dial_door_tests {
                  the safe direction. Wiring it is a tier-up optimisation, not a \
                  correctness fix — and `registered_native_will_run`, the natural \
                  place, also feeds interpreter dispatch, so it is not a free edit.",
-            ),
-        ];
+        )];
 
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -8491,7 +8505,10 @@ mod enforcement_dial_door_tests {
         // ZERO, and held there. Every force site under vm/src now either consults
         // the dial or is a reasoned `permanent: true` non-hole. A new unwired
         // site is a red test on its own — nobody has to notice a count creep up.
-        let holes = FORCE_SITES_EXEMPT.iter().filter(|(_, perm, _)| !*perm).count();
+        let holes = FORCE_SITES_EXEMPT
+            .iter()
+            .filter(|(_, perm, _)| !*perm)
+            .count();
         assert_eq!(
             holes, 0,
             "{holes} force site(s) are UNWIRED holes. A `permanent: true` row is a \
@@ -8561,11 +8578,7 @@ mod string_builder_layout_override_tests {
     /// chunk 4 look like a hang. `SbMethodMatrixProbe` is the Java witness.
     #[test]
     fn forces_every_compact_layout_operation_native() {
-        for class in [
-            "java/lang/StringBuilder",
-            "java/lang/StringBuffer",
-            "java/lang/AbstractStringBuilder",
-        ] {
+        for class in ["java/lang/StringBuilder", "java/lang/AbstractStringBuilder"] {
             for (name, desc) in [
                 ("setLength", "(I)V"),
                 ("deleteCharAt", "(I)Ljava/lang/StringBuilder;"),
@@ -8606,11 +8619,7 @@ mod string_builder_layout_override_tests {
     /// silently ignored — see the long note on `length()` in the predicate.
     #[test]
     fn leaves_the_two_mockito_stubbed_operations_evictable() {
-        for class in [
-            "java/lang/StringBuilder",
-            "java/lang/StringBuffer",
-            "java/lang/AbstractStringBuilder",
-        ] {
+        for class in ["java/lang/StringBuilder", "java/lang/AbstractStringBuilder"] {
             assert!(!is_string_builder_layout_native_override(
                 class, "length", "()I"
             ));
@@ -8619,6 +8628,41 @@ mod string_builder_layout_override_tests {
                 "substring",
                 "(I)Ljava/lang/String;"
             ));
+        }
+    }
+
+    /// `java/lang/StringBuffer` is claimed by NOTHING here, and that is the
+    /// paired half of retiring its 62 registrations: its own `synchronized`
+    /// bodies must run, or the buffer loses both its monitor and its
+    /// `toStringCache` invalidation. Asserted operation by operation rather
+    /// than once, so a future widening of the list cannot quietly re-take the
+    /// class.
+    #[test]
+    fn never_claims_string_buffer_whose_own_bodies_carry_the_monitor() {
+        for (name, desc) in [
+            ("append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("append", "(C)Ljava/lang/StringBuffer;"),
+            ("insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("delete", "(II)Ljava/lang/StringBuffer;"),
+            ("deleteCharAt", "(I)Ljava/lang/StringBuffer;"),
+            ("replace", "(IILjava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("reverse", "()Ljava/lang/StringBuffer;"),
+            ("setLength", "(I)V"),
+            ("setCharAt", "(IC)V"),
+            ("toString", "()Ljava/lang/String;"),
+            ("charAt", "(I)C"),
+            ("length", "()I"),
+            ("capacity", "()I"),
+            ("ensureCapacity", "(I)V"),
+            ("trimToSize", "()V"),
+            ("getChars", "(II[CI)V"),
+            ("substring", "(II)Ljava/lang/String;"),
+            ("<init>", "(Ljava/lang/String;)V"),
+        ] {
+            assert!(
+                !is_string_builder_layout_native_override("java/lang/StringBuffer", name, desc),
+                "StringBuffer.{name}{desc} must run its OWN synchronized body"
+            );
         }
     }
 
@@ -8819,10 +8863,7 @@ mod redefine_immunity_tests {
                 "../interpreter.rs",
                 include_str!("../interpreter.rs").replace("\r\n", "\n"),
             ),
-            (
-                "invoke.rs",
-                include_str!("invoke.rs").replace("\r\n", "\n"),
-            ),
+            ("invoke.rs", include_str!("invoke.rs").replace("\r\n", "\n")),
             (
                 "dispatch_virtual.rs",
                 include_str!("dispatch_virtual.rs").replace("\r\n", "\n"),
@@ -8956,7 +8997,10 @@ mod intercept_shape_tests {
     fn intercept_shape_agrees_with_the_arms_it_gates() {
         let classloader = [
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;"),
-            ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;"),
+            (
+                "getResources",
+                "(Ljava/lang/String;)Ljava/util/Enumeration;",
+            ),
             (
                 "getResourceAsStream",
                 "(Ljava/lang/String;)Ljava/io/InputStream;",
@@ -9018,8 +9062,11 @@ mod intercept_shape_tests {
             ("InvokeAttributionProbe", "callee", "(I)I"),
             ("java/lang/String", "length", "()I"),
             ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
-            ("org/apache/tomcat/util/bcel/classfile/ConstantPool", "getConstant",
-             "(ILjava/lang/Class;)Lorg/apache/tomcat/util/bcel/classfile/Constant;"),
+            (
+                "org/apache/tomcat/util/bcel/classfile/ConstantPool",
+                "getConstant",
+                "(ILjava/lang/Class;)Lorg/apache/tomcat/util/bcel/classfile/Constant;",
+            ),
             // Right names, WRONG owner: the reflection arm is keyed on the
             // method pair alone, so this one legitimately sets a bit and the
             // receiver check below it is what declines. Recorded so a future

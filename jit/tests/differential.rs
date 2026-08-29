@@ -42,7 +42,9 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,
@@ -396,7 +398,6 @@ fn differential_double_chain_matches_host() {
     );
 }
 
-
 // --- BUG-JOIN-MIRROR-20260726 ---------------------------------------------
 //
 // The x64 single-pass backend elides a `MOV reg,[rbp-off]` reload when the
@@ -429,7 +430,9 @@ fn differential_double_chain_matches_host() {
 /// 9: areturn                 b0
 /// ```
 fn ternary_pick() -> Vec<u8> {
-    vec![0x2a, 0xc7, 0x00, 0x07, 0x2b, 0xa7, 0x00, 0x04, 0x2a, 0xb0, 0, 0]
+    vec![
+        0x2a, 0xc7, 0x00, 0x07, 0x2b, 0xa7, 0x00, 0x04, 0x2a, 0xb0, 0, 0,
+    ]
 }
 
 #[test]

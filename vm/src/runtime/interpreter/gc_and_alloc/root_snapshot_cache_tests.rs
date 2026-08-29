@@ -97,9 +97,8 @@ fn root_snapshot_includes_off_frame_thread_roots() {
     update_root_snapshot(&shared, &mut thread);
 
     let snapshot = thread.root_snapshot.lock();
-    let published = |o: cratonvm_types::ObjectRef| {
-        snapshot.iter().any(|root| root.as_ptr() == o.as_ptr())
-    };
+    let published =
+        |o: cratonvm_types::ObjectRef| snapshot.iter().any(|root| root.as_ptr() == o.as_ptr());
     assert!(
         published(printed),
         "a peer's print-buffer object must be published to cross-thread collectors"

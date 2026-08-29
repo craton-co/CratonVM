@@ -57,8 +57,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
+use crate::try_alloc_concurrent_synthetic;
 
 const ALGO_RSA: i32 = 6;
 const ALGO_EC: i32 = 7;
@@ -502,12 +502,12 @@ fn replay_kpg_initialize(
         )?;
         return Ok(());
     }
-    let bits = get_kpg_keysize(ctx, this)
-        .filter(|n| *n > 0)
-        .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+    let bits = get_kpg_keysize(ctx, this).filter(|n| *n > 0).or_else(|| {
+        match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
             Value::Int(n) if n > 0 => Some(n),
             _ => None,
-        });
+        }
+    });
     if let Some(bits) = bits {
         ctx.invoke_virtual(
             spi,
@@ -542,7 +542,12 @@ fn drive_real_dh_keypair(
     this: ObjectRef,
     base: usize,
 ) -> MethodCallResult {
-    drive_spi_keypair(ctx, this, "com/sun/crypto/provider/DHKeyPairGenerator", base)
+    drive_spi_keypair(
+        ctx,
+        this,
+        "com/sun/crypto/provider/DHKeyPairGenerator",
+        base,
+    )
 }
 
 /// Build `spi_class`, replay this receiver's `initialize`, and generate.
@@ -1077,14 +1082,14 @@ fn drive_real_rsa_pss_keyfactory(
     let result = (|| {
         let kf =
             match ctx.new_object_initialized("sun/security/rsa/RSAKeyFactory$PSS", "()V", &[])? {
-            Some(Value::Object(Some(o))) => o,
-            _ => {
-                return Err(RuntimeError::NotImplemented {
-                    feature: "sun.security.rsa.RSAKeyFactory$PSS".into(),
+                Some(Value::Object(Some(o))) => o,
+                _ => {
+                    return Err(RuntimeError::NotImplemented {
+                        feature: "sun.security.rsa.RSAKeyFactory$PSS".into(),
+                    }
+                    .into())
                 }
-                .into())
-            }
-        };
+            };
         let spec = ctx.read_native_pin(pin, spec);
         let desc = format!("(Ljava/security/spec/KeySpec;){ret_desc}");
         ctx.invoke_virtual(kf, engine, &desc, &[Value::Object(Some(spec))])
@@ -2022,7 +2027,11 @@ fn alloc_private_key(
     Ok(obj)
 }
 
-fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_keypair(
+    ctx: &mut dyn NativeContext,
+    pubk: ObjectRef,
+    privk: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
     let kp = try_alloc_concurrent_synthetic(ctx, "java/security/KeyPair", 2)?;
     ctx.set_field(kp, 0, Value::Object(Some(pubk)));
     ctx.set_field(kp, 1, Value::Object(Some(privk)));
@@ -2132,11 +2141,7 @@ fn pqc_umbrella(name: &str) -> Option<(&'static str, &'static str)> {
 /// HotSpot defaults to. The spec's name is only honoured when it belongs to the
 /// requested family, so `initialize(new NamedParameterSpec("ML-KEM-512"))` on an
 /// `ML-DSA` generator does not silently switch algorithms.
-fn resolve_pqc_umbrella(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    base: usize,
-) -> Option<i32> {
+fn resolve_pqc_umbrella(ctx: &mut dyn NativeContext, this: ObjectRef, base: usize) -> Option<i32> {
     let requested = get_kpg_name(ctx, this)?;
     let (prefix, default_name) = pqc_umbrella(&requested)?;
     let from_spec = match ctx.get_field(this, base + KPG_OFF_SPEC) {
@@ -2323,7 +2328,10 @@ fn kpg_can_generate(alg: &str) -> bool {
     let idx = algo_idx(alg);
     // The real-keygen branches: RSA (and RSASSA-PSS, which shares RSA key
     // material), EC/ECDSA, DSA, and Ed25519/Ed448/EdDSA via the real SunEC SPI.
-    if matches!(idx, ALGO_RSA | ALGO_EC | ALGO_DSA | ALGO_ED25519 | ALGO_ED448) {
+    if matches!(
+        idx,
+        ALGO_RSA | ALGO_EC | ALGO_DSA | ALGO_ED25519 | ALGO_ED448
+    ) {
         return true;
     }
     // The XDH family and finite-field DH, each through the real provider SPI
@@ -3026,12 +3034,9 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             .flatten()
     });
     if let Some(provider) = kf_provider.as_deref() {
-        if let Some(kf) = crate::jca::provider_chain::build_real_key_factory(
-            ctx,
-            provider,
-            &requested_alg,
-            &alg,
-        )? {
+        if let Some(kf) =
+            crate::jca::provider_chain::build_real_key_factory(ctx, provider, &requested_alg, &alg)?
+        {
             return Ok(Some(Value::Object(Some(kf))));
         }
     }
@@ -3050,7 +3055,8 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ));
     }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let kf = try_alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS)?;
+    let kf =
+        try_alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS)?;
     set_kf_algo(ctx, kf, idx);
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
     // `getAlgorithm()` echoes what the caller typed — see `kf_get_algorithm`.
@@ -3090,9 +3096,9 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
         get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
-        Value::Int(i) => i,
-        _ => -1,
-    });
+            Value::Int(i) => i,
+            _ => -1,
+        });
     // EdDSA / XDH: reconstruct concrete SunEC Ed25519/Ed448/X25519/X448 keys
     // from the standard EdECPublicKeySpec/XECPublicKeySpec/X509EncodedKeySpec.
     // Keycloak builds an EdECPublicKeySpec while importing OKP JWKs; Spring
@@ -3271,8 +3277,7 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     key_id,
                     true,
                     RsaKeyType::Rsa,
-                )
-                {
+                ) {
                     return Ok(Some(Value::Object(Some(key))));
                 }
             }
@@ -3286,7 +3291,11 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .map(|b| n_bytes.len() as i32 * 8 - i32::from(b.leading_zeros() as u8))
                 .unwrap_or(0);
             return Ok(Some(Value::Object(Some(alloc_public_key(
-                ctx, ALGO_RSA, modulus_bits, &pk_der, key_id,
+                ctx,
+                ALGO_RSA,
+                modulus_bits,
+                &pk_der,
+                key_id,
             )?))));
         }
     }
@@ -3376,9 +3385,9 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo =
         get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
-        Value::Int(i) => i,
-        _ => -1,
-    });
+            Value::Int(i) => i,
+            _ => -1,
+        });
     // EdDSA / XDH: mirrors `kf_generate_public`'s route (curve-specific or
     // generic "EdDSA"/"XDH", curve sniffed from the spec's own OID when
     // generic). This is the private-key half of the PemPrivateKeyParser fix
@@ -4084,7 +4093,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
         kf_generate_private,
     );
     r.register(kf, "getAlgorithm", "()Ljava/lang/String;", kf_get_algorithm);
-    r.register(kf, "getProvider", "()Ljava/security/Provider;", kf_get_provider);
+    r.register(
+        kf,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        kf_get_provider,
+    );
     r.register(
         kf,
         "translateKey",
@@ -4215,9 +4229,12 @@ pub fn register(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// `kpg_can_generate` decides whether `getInstance` refuses, so it has to
     /// agree with `kpg_generate_key_pair`'s dispatch. Both columns here were
@@ -4227,12 +4244,29 @@ mod tests {
     #[test]
     fn kpg_can_generate_matches_the_generate_dispatch() {
         for alg in [
-            "RSA", "RSASSA-PSS", "EC", "DSA", "Ed25519", "Ed448", "EdDSA",
-            "ML-DSA-44", "ML-DSA-65", "ML-DSA-87", "ML-KEM-512", "ML-KEM-768",
-            "ML-KEM-1024", "ML-DSA", "ML-KEM",
+            "RSA",
+            "RSASSA-PSS",
+            "EC",
+            "DSA",
+            "Ed25519",
+            "Ed448",
+            "EdDSA",
+            "ML-DSA-44",
+            "ML-DSA-65",
+            "ML-DSA-87",
+            "ML-KEM-512",
+            "ML-KEM-768",
+            "ML-KEM-1024",
+            "ML-DSA",
+            "ML-KEM",
             // Served since 2026-08-14, each through the provider SPI HotSpot
             // registers for it (`xdh_kpg_spi_class` / `DHKeyPairGenerator`).
-            "X25519", "X448", "XDH", "x25519", "DH", "DiffieHellman",
+            "X25519",
+            "X448",
+            "XDH",
+            "x25519",
+            "DH",
+            "DiffieHellman",
         ] {
             assert!(super::kpg_can_generate(alg), "{alg} must be serviceable");
         }
@@ -4510,8 +4544,12 @@ mod tests {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let der = pkcs8_stub(oid);
             let arr = alloc_byte_array(&mut ctx, &der);
-            let spec =
-                try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
+            let spec = try_alloc_concurrent_synthetic(
+                &mut ctx,
+                "java/security/spec/PKCS8EncodedKeySpec",
+                1,
+            )
+            .unwrap();
             ctx.set_field(spec, 0, Value::Object(Some(arr)));
             let generic = if expected == ALGO_X25519 || expected == ALGO_X448 {
                 ALGO_XDH_GENERIC
@@ -4528,7 +4566,8 @@ mod tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let arr = alloc_byte_array(&mut ctx, &[]);
         let spec =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1)
+                .unwrap();
         ctx.set_field(spec, 0, Value::Object(Some(arr)));
         assert_eq!(
             resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true),

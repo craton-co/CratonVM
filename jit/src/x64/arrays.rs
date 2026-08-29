@@ -41,7 +41,7 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x08); // SIB: scale=0(00=*1), index=RCX(001), base=RAX(000)
         self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // disp8 // Cast: x86-64 immediate encoding
-                                               // Sign-extend EAX to RAX
+                                                     // Sign-extend EAX to RAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
     }
@@ -158,7 +158,7 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
         self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
-                                               // Sign-extend EAX to RAX
+                                                     // Sign-extend EAX to RAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
     }
@@ -172,7 +172,7 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
         self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
-                                               // MOVZX already zero-extends to EAX, upper 32 bits of RAX auto-zeroed
+                                                     // MOVZX already zero-extends to EAX, upper 32 bits of RAX auto-zeroed
     }
 
     /// Inline short/char element store (compact: 2 bytes/element). RAX=array, RCX=index, RDX=value.
@@ -250,10 +250,8 @@ impl Compiler {
             return;
         }
         if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
-            let box_ptr = self.build_and_record_deopt_point(
-                bci,
-                crate::deopt::DeoptReason::PendingException,
-            );
+            let box_ptr =
+                self.build_and_record_deopt_point(bci, crate::deopt::DeoptReason::PendingException);
             self.exc_frame_box_ptr_by_bci.insert(bci, box_ptr);
         }
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX

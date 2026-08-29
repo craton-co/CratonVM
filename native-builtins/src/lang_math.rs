@@ -9,12 +9,12 @@ use cratonvm_types::Value;
 
 use crate::lang_string::{
     format_double, format_float, native_string_chars, native_string_code_point_at,
-    native_string_code_points,
-    native_string_code_point_count, native_string_format, native_string_format_locale,
-    native_string_formatted, native_string_indent, native_string_is_blank, native_string_lines,
-    native_string_offset_by_code_points, native_string_region_matches,
-    native_string_region_matches_ic, native_string_repeat, native_string_transform,
-    native_string_value_of_int, native_string_value_of_long, native_string_value_of_object,
+    native_string_code_point_count, native_string_code_points, native_string_format,
+    native_string_format_locale, native_string_formatted, native_string_indent,
+    native_string_is_blank, native_string_lines, native_string_offset_by_code_points,
+    native_string_region_matches, native_string_region_matches_ic, native_string_repeat,
+    native_string_transform, native_string_value_of_int, native_string_value_of_long,
+    native_string_value_of_object,
 };
 
 pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: &str) {
@@ -1795,10 +1795,12 @@ const NEGATIVE_ZERO_FLOAT_BITS: u32 = 0x8000_0000;
 // be four private helpers here, which is how `Comparator.naturalOrder()` in
 // `native-collections` kept running `f64::total_cmp` after these were repaired.
 use cratonvm_types::jfp::{
+    double_compare as java_compare_double, float_compare as java_compare_float,
+};
+use cratonvm_types::jfp::{
     double_to_long_bits as double_to_long_bits_canonical,
     float_to_int_bits as float_to_int_bits_canonical,
 };
-use cratonvm_types::jfp::{double_compare as java_compare_double, float_compare as java_compare_float};
 
 // --- trig and math functions ---
 #[inline(always)]
@@ -3090,11 +3092,17 @@ type ScopedIntegerCache = std::collections::HashMap<usize, Vec<Option<cratonvm_t
 /// `resolve_integer_cache_high` holds that guard across this acquisition. If
 /// `INTEGER_CACHE_HIGH` is ever given a level it must be a HIGHER one, never an
 /// equal — see its own comment for why it has none today.
-static INTEGER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache>> =
-    std::sync::OnceLock::new();
+static INTEGER_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache>,
+> = std::sync::OnceLock::new();
 
 fn integer_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache> {
-    INTEGER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    INTEGER_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// `IntegerCache.low` — `-128`, and NOT configurable. `jdk25src/java.base/
@@ -3228,22 +3236,34 @@ fn integer_cache_bound(ctx: &mut dyn NativeContext) -> i32 {
     high
 }
 
-static BOOLEAN_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>>> =
-    std::sync::OnceLock::new();
+static BOOLEAN_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>>,
+> = std::sync::OnceLock::new();
 
 fn boolean_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>> {
-    BOOLEAN_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    BOOLEAN_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// `LongCache` for `Long.valueOf(long)` — JLS §5.1.7 mandates the canonical
 /// cached instance for values in [-128, 127] so `Long.valueOf(x) ==
 /// Long.valueOf(x)` holds. Shared across threads but VM-scoped and GC-scanned
 /// for the same reasons documented above for `INTEGER_CACHE`.
-static LONG_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
-    std::sync::OnceLock::new();
+static LONG_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>,
+> = std::sync::OnceLock::new();
 
 fn long_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
-    LONG_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    LONG_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3279,29 +3299,47 @@ fn long_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedVal
 
 /// `CharacterCache` for `Character.valueOf(char)`. 128 slots indexed by the
 /// code unit itself — there is no offset because the low bound is zero.
-static CHARACTER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>>> =
-    std::sync::OnceLock::new();
+static CHARACTER_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>>,
+> = std::sync::OnceLock::new();
 
 fn character_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>> {
-    CHARACTER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    CHARACTER_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// `ByteCache` for `Byte.valueOf(byte)`. 256 slots indexed by `b + 128`, and
 /// unlike every other cache in this file it covers the type's ENTIRE domain.
-static BYTE_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
-    std::sync::OnceLock::new();
+static BYTE_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>,
+> = std::sync::OnceLock::new();
 
 fn byte_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
-    BYTE_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    BYTE_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// `ShortCache` for `Short.valueOf(short)`. 256 slots indexed by `s + 128`,
 /// covering -128..=127 out of a 65,536-value domain.
-static SHORT_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
-    std::sync::OnceLock::new();
+static SHORT_CACHE: std::sync::OnceLock<
+    cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>,
+> = std::sync::OnceLock::new();
 
 fn short_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
-    SHORT_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    SHORT_CACHE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The canonical-instance dance, once, for the caches added above.
@@ -3461,7 +3499,9 @@ pub fn canonical_wrapper_if_cached(
     v: Value,
 ) -> Option<cratonvm_types::ObjectRef> {
     fn read<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
-        cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
+        cache: &'static cratonvm_types::lock_order::OrderedPlMutex<
+            std::collections::HashMap<usize, C>,
+        >,
         vm_identity: usize,
         idx: usize,
     ) -> Option<cratonvm_types::ObjectRef> {
@@ -3534,7 +3574,8 @@ pub(crate) fn native_integer_value_of(
         // is an extra allocation.
         if let Some(cached) = {
             let c = integer_cache().lock();
-            c.get(&scope).and_then(|entries| entries.get(idx).copied().flatten())
+            c.get(&scope)
+                .and_then(|entries| entries.get(idx).copied().flatten())
         } {
             return Ok(Some(Value::Object(Some(cached))));
         }
@@ -5383,7 +5424,9 @@ pub(crate) fn native_character_to_lower_case_int(
     if !(0..=0x10FFFF).contains(&cp) {
         return Ok(Some(Value::Int(cp)));
     }
-    Ok(Some(Value::Int(character_case_map(cp as u32, false) as i32)))
+    Ok(Some(
+        Value::Int(character_case_map(cp as u32, false) as i32),
+    ))
 }
 
 /// `Character.toUpperCase(int)` — code-point variant, mirror of
@@ -6630,9 +6673,15 @@ fn java_trim(s: &str) -> &str {
 /// sign, the two literal words, and the optional `FloatTypeSuffix`.
 enum JavaFloatHead<'a> {
     /// One of the two words. `nan` is true for `NaN`, else `Infinity`.
-    Word { nan: bool, neg: bool },
+    Word {
+        nan: bool,
+        neg: bool,
+    },
     /// A numeric body with its sign, suffix already removed.
-    Body { body: &'a str, neg: bool },
+    Body {
+        body: &'a str,
+        neg: bool,
+    },
     Malformed,
 }
 
@@ -6832,7 +6881,11 @@ fn round_binary(m: u128, sticky: bool, exp2: i64, prec: u32, emax: i64) -> u64 {
     let (mut s, round_up) = if shift > 0 {
         let sh = shift as u32;
         let trunc = if sh >= 128 { 0 } else { m >> sh };
-        let low = if sh >= 128 { m } else { m & ((1u128 << sh) - 1) };
+        let low = if sh >= 128 {
+            m
+        } else {
+            m & ((1u128 << sh) - 1)
+        };
         let half = 1u128 << (sh - 1);
         let up = match low.cmp(&half) {
             std::cmp::Ordering::Greater => true,
@@ -6924,9 +6977,7 @@ fn read_string_arg_npe(
         // points — `Double`/`Float` x `parseX`/`valueOf` — which is measured,
         // not assumed: this helper serves all four and they all say `"in"`.
         _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
-            message: Some(
-                "Cannot invoke \"String.length()\" because \"in\" is null".to_string(),
-            ),
+            message: Some("Cannot invoke \"String.length()\" because \"in\" is null".to_string()),
         }
         .into()),
     }
@@ -6940,7 +6991,11 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f32::NAN),
         JavaFloatHead::Word { nan: false, neg } => {
-            return Ok(if neg { f32::NEG_INFINITY } else { f32::INFINITY })
+            return Ok(if neg {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            })
         }
         JavaFloatHead::Body { body, neg } => (body, neg),
     };
@@ -6948,7 +7003,8 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
         && body.as_bytes()[0] == b'0'
         && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
     let v = if is_hex {
-        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        let (digits, frac_n, pexp) =
+            java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
         f32::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 24, 127) as u32)
     } else {
         if !java_decimal_grammar_ok(body) {
@@ -6984,7 +7040,11 @@ fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeErr
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f64::NAN),
         JavaFloatHead::Word { nan: false, neg } => {
-            return Ok(if neg { f64::NEG_INFINITY } else { f64::INFINITY })
+            return Ok(if neg {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            })
         }
         JavaFloatHead::Body { body, neg } => (body, neg),
     };
@@ -6992,7 +7052,8 @@ fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeErr
         && body.as_bytes()[0] == b'0'
         && (body.as_bytes()[1] == b'x' || body.as_bytes()[1] == b'X');
     let v = if is_hex {
-        let (digits, frac_n, pexp) = java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
+        let (digits, frac_n, pexp) =
+            java_hex_grammar(&body[2..]).ok_or_else(|| java_nfe_float(s))?;
         f64::from_bits(java_hex_float_bits(&digits, frac_n, pexp, 53, 1023))
     } else {
         if !java_decimal_grammar_ok(body) {
@@ -7563,7 +7624,11 @@ mod tests {
             return 0;
         }
         if a.is_nan() || b.is_nan() {
-            return if a.is_nan() && b.is_nan() { 0 } else { u64::MAX };
+            return if a.is_nan() && b.is_nan() {
+                0
+            } else {
+                u64::MAX
+            };
         }
         if a.is_infinite() || b.is_infinite() {
             return u64::MAX;
@@ -7627,8 +7692,18 @@ mod tests {
 
         // And the rule itself, across the whole range the fast path used to own.
         let bases = [
-            0.5_f64, 0.9, 1.5, 2.0, 3.7, 7.25, -0.5, -1.5, -3.7, 0.49340830293407123,
-            1.0000001, 0.9999999,
+            0.5_f64,
+            0.9,
+            1.5,
+            2.0,
+            3.7,
+            7.25,
+            -0.5,
+            -1.5,
+            -3.7,
+            0.49340830293407123,
+            1.0000001,
+            0.9999999,
         ];
         for &x in &bases {
             for e in -63..=63_i32 {
@@ -7684,7 +7759,11 @@ mod tests {
             assert!(v.is_nan(), "Math.pow({x}, {y}) = {v}, expected NaN");
             // HotSpot hands back the canonical positive NaN here, and so must we
             // — `Double.doubleToRawLongBits` on the result is observable.
-            assert_eq!(v.to_bits(), 0x7ff8_0000_0000_0000, "Math.pow({x}, {y}) NaN payload");
+            assert_eq!(
+                v.to_bits(),
+                0x7ff8_0000_0000_0000,
+                "Math.pow({x}, {y}) NaN payload"
+            );
         }
 
         // The neighbours that must NOT be swept up: a zero exponent wins over a
@@ -8136,15 +8215,30 @@ mod tests {
         // Warm: the answer is the SAME OBJECT the native itself returns, not
         // a private twin that merely behaves the same.
         let i7 = box_int(&mut ctx, 7);
-        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(7)), Some(i7));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Int(7)),
+            Some(i7)
+        );
         let ca = box_char(&mut ctx, 97);
-        assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(97)), Some(ca));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "C", Value::Int(97)),
+            Some(ca)
+        );
         let j5 = ref_of(native_long_value_of(&mut ctx, &[Value::Long(5)]).unwrap());
-        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(5)), Some(j5));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "J", Value::Long(5)),
+            Some(j5)
+        );
         let b3 = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(3)]).unwrap());
-        assert_eq!(canonical_wrapper_if_cached(vm, "B", Value::Int(3)), Some(b3));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "B", Value::Int(3)),
+            Some(b3)
+        );
         let s9 = ref_of(native_short_value_of(&mut ctx, &[Value::Int(9)]).unwrap());
-        assert_eq!(canonical_wrapper_if_cached(vm, "S", Value::Int(9)), Some(s9));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "S", Value::Int(9)),
+            Some(s9)
+        );
 
         // The probe itself must not have installed anything: another VM
         // identity still misses for the same values.
@@ -8164,7 +8258,10 @@ mod tests {
         // Populate `Long.valueOf(0)` so the wrong answer is AVAILABLE to be
         // returned. Without this the test passes for the wrong reason.
         let zero = ref_of(native_long_value_of(&mut ctx, &[Value::Long(0)]).unwrap());
-        assert_eq!(canonical_wrapper_if_cached(vm, "J", Value::Long(0)), Some(zero));
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "J", Value::Long(0)),
+            Some(zero)
+        );
 
         // `("J", Value::Int(5))` must MISS. A descriptor-only match indexes
         // slot 5 + 128 of LONG_CACHE — or worse, defaults the payload to 0 and
@@ -8191,8 +8288,14 @@ mod tests {
         assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(1)), None);
         assert_eq!(canonical_wrapper_if_cached(vm, "Z", Value::Int(0)), None);
         // `F`/`D`: HotSpot caches neither. MEASURED `neg.floatValueOf` = false.
-        assert_eq!(canonical_wrapper_if_cached(vm, "F", Value::Float(0.0)), None);
-        assert_eq!(canonical_wrapper_if_cached(vm, "D", Value::Double(0.0)), None);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "F", Value::Float(0.0)),
+            None
+        );
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "D", Value::Double(0.0)),
+            None
+        );
         // Out of bound, per type. MEASURED `fieldoob.*` = false throughout.
         assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Int(-129)), None);
         assert_eq!(canonical_wrapper_if_cached(vm, "C", Value::Int(128)), None);
@@ -8204,7 +8307,10 @@ mod tests {
             canonical_wrapper_if_cached(vm, "Ljava/lang/Integer;", Value::Int(7)),
             None
         );
-        assert_eq!(canonical_wrapper_if_cached(vm, "I", Value::Object(None)), None);
+        assert_eq!(
+            canonical_wrapper_if_cached(vm, "I", Value::Object(None)),
+            None
+        );
     }
 
     /// The configurable bound and the read-only probe must agree: a value
@@ -8868,7 +8974,11 @@ mod tests {
     #[test]
     fn math_get_exponent_of_a_subnormal_is_min_exponent_minus_one() {
         let mut ctx = mock_ctx();
-        for v in [f64::MIN_POSITIVE / 2.0, f64::from_bits(1), -f64::from_bits(1)] {
+        for v in [
+            f64::MIN_POSITIVE / 2.0,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+        ] {
             let r = native_math_get_exponent_double(&mut ctx, &[Value::Double(v)]);
             assert_eq!(r.unwrap(), Some(Value::Int(-1023)), "getExponent({v:e})");
         }
@@ -8895,7 +9005,10 @@ mod tests {
         }
         let r = native_math_pow(
             &mut ctx,
-            &[Value::Double(-1.0), Value::Double(f64::from_bits(NAN_NEG_PAYLOAD))],
+            &[
+                Value::Double(-1.0),
+                Value::Double(f64::from_bits(NAN_NEG_PAYLOAD)),
+            ],
         );
         assert_eq!(d(&r), NAN_NEG_PAYLOAD, "pow(-1.0, NaN) keeps the operand");
         // A unit base with an ordinary exponent is untouched.
@@ -8968,7 +9081,10 @@ mod tests {
             NAN_NEG_PAYLOAD
         );
         assert_eq!(
-            d(&native_math_next_down_double(&mut ctx, &[Value::Double(nan)])),
+            d(&native_math_next_down_double(
+                &mut ctx,
+                &[Value::Double(nan)]
+            )),
             NAN_NEG_PAYLOAD
         );
         // Whichever side is the NaN, that NaN is what comes back.

@@ -12,7 +12,6 @@
 /// W7-49-slot-index-recensus.md §8.
 pub mod appended_slots;
 pub mod capability;
-pub mod poly_call_site;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
 /// distinction, and the refusal a by-name lookup is allowed to return.
@@ -45,6 +44,7 @@ pub mod native_ring;
 /// Receiver classes no supported JDK image declares — the measured table that
 /// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
 pub mod no_image_receiver;
+pub mod poly_call_site;
 /// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
 /// `trouble` flag (read back by `checkError()`) and a `Handler`'s
 /// `ErrorManager`. Sibling of `delegated_close`: that module decides which
@@ -55,7 +55,6 @@ pub mod print_error_state;
 // time. Sibling of `no_image_receiver`: both are class/triple-scoped kind
 // decisions made centrally because they are MEASUREMENTS against a JDK image
 // that no registration site can know.
-pub mod retired_shadow;
 pub mod plain_server_socket;
 /// The READ-side half of the slot-index census: a native reading slot `k` of a
 /// real JDK object it did not allocate, where slot `k` on the loaded class
@@ -68,6 +67,7 @@ pub mod plain_server_socket;
 /// because the two are two halves of one species.
 pub mod read_alias;
 pub mod registry;
+pub mod retired_shadow;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
 /// The synthetic `java.nio.channels.FileChannel` private slot map. Lives here,
@@ -101,11 +101,6 @@ pub use delegated_close::{
     absorb_exception, absorb_io_exception, absorb_thrown, vm_only_best_effort,
 };
 pub use intrinsic::InterpIntrinsic;
-pub use print_error_state::{
-    absorb_io_exception_recording, absorb_write_exception_recording, classify_write_failure,
-    clear_trouble, is_trouble, record_host_io_failure, record_write_failure, report_handler_error,
-    set_trouble, take_absorbed, DelegatedWrite,
-};
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///
 /// `NativeMethodRegistry::find` hashes all three of class/method/descriptor on
@@ -113,14 +108,19 @@ pub use print_error_state::{
 /// plus an array index; `NativeMethodKey` removes the hash from the sites that
 /// still have to resolve by name. See `native_id` for the full rationale.
 pub use native_id::{NativeCallSite, NativeMethodId, NativeMethodKey};
+pub use print_error_state::{
+    absorb_io_exception_recording, absorb_write_exception_recording, classify_write_failure,
+    clear_trouble, is_trouble, record_host_io_failure, record_write_failure, report_handler_error,
+    set_trouble, take_absorbed, DelegatedWrite,
+};
 pub use registry::{
     dispatch_baos_event, install_baos_event_hook, AnnotationData, AnnotationElementValue,
-    BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata, MethodMetadata,
-    LambdaSerializability,
-    NativeCallback, NativeCensusEntry, NativeClassAccess, NativeContext, NativeExceptionAccess,
-    NativeGpuAccess, NativeHandle, NativeHandleScope, NativeHeapAccess, NativeInvokeAccess,
-    NativeKind, NativeMethodRegistry, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker,
-    StackTraceEntry, ThreadJmxSnapshot, TypeArgAnnotations,
+    BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata,
+    LambdaSerializability, MethodMetadata, NativeCallback, NativeCensusEntry, NativeClassAccess,
+    NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHandle, NativeHandleScope,
+    NativeHeapAccess, NativeInvokeAccess, NativeKind, NativeMethodRegistry, NativeSystemAccess,
+    NativeThreadAccess, NativeThreadBlocker, StackTraceEntry, ThreadJmxSnapshot,
+    TypeArgAnnotations,
 };
 
 // ===========================================================================
