@@ -243,6 +243,16 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         builtin_new_stream,
     );
     registry.register(KLASS, "closeStream", "(J)V", builtin_close_stream);
+    // Stream-scoped dispatch. `gpu_dispatch_method_on_stream` has always been
+    // there and `submit_method_dispatch` has always called it -- but only ever
+    // with a stream resolved from the executor, so a caller holding a
+    // `GpuStream` could not submit onto it.
+    registry.register(
+        KLASS,
+        "streamSubmitMethod",
+        "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)J",
+        builtin_stream_submit_method,
+    );
 
     registry.register(KLASS, "futureStatus", "(J)I", builtin_future_status);
     registry.register(KLASS, "futureIsDone", "(J)Z", builtin_future_is_done);
@@ -277,6 +287,14 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/String;",
         builtin_future_get_error_message,
     );
+    // `GpuFuture.cancel(boolean)` calls this. It was never registered, so
+    // every cancel attempt on a real CratonVM died with
+    // `UnsatisfiedLinkError: Native.futureCancel` instead of returning the
+    // documented "could not cancel" answer -- and it died from inside
+    // `cancel()`, which the Java side documents as returning `false` rather
+    // than throwing. Registered now; see `builtin_future_cancel` for why the
+    // answer is always "rejected".
+    registry.register(KLASS, "futureCancel", "(JZ)I", builtin_future_cancel);
 
     registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
@@ -315,6 +333,15 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "arrayToHost",
         "(J)Ljava/lang/Object;",
         builtin_array_to_host,
+    );
+    // Read back into the caller's array instead of a fresh one. See
+    // `builtin_array_to_host_into`: the buffer-reusing GpuArray.toHost(dest)
+    // overloads bounded the caller's garbage but not the allocation here.
+    registry.register(
+        KLASS,
+        "arrayToHostInto",
+        "(JLjava/lang/Object;)Z",
+        builtin_array_to_host_into,
     );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
 
@@ -553,6 +580,23 @@ fn rebuild_java_array(
     bytes: &[u8],
 ) -> cratonvm_types::ObjectRef {
     let obj = ctx.new_array(element_type, element_count);
+    fill_java_array(ctx, obj, element_type, element_count, bytes);
+    obj
+}
+
+/// Decodes `bytes` into an existing Java primitive array.
+///
+/// Split out of [`rebuild_java_array`] so `arrayToHostInto` can reuse the
+/// decoding without the allocation: the two differ only in where the elements
+/// land.
+#[cfg(feature = "gpu-offload")]
+fn fill_java_array(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    element_type: ArrayElementType,
+    element_count: usize,
+    bytes: &[u8],
+) {
     match element_type {
         ArrayElementType::Int => {
             for i in 0..element_count {
@@ -600,7 +644,6 @@ fn rebuild_java_array(
             // lands here, leave the array zero-initialized.
         }
     }
-    obj
 }
 
 /// Read every element of a Java primitive array into a flat byte buffer.
@@ -1115,6 +1158,30 @@ fn builtin_submit_method_handle(
     Ok(Some(Value::Long(handle as i64)))
 }
 
+/// `Native.streamSubmitMethod(long streamHandle, String className,
+/// String methodName, String descriptor, Object[] args) -> long`
+///
+/// The same dispatch as `submitMethodHandle`, onto a caller-named stream
+/// instead of the submitting executor's default one, and answering the bare
+/// submission handle.
+///
+/// Kernels submitted to one stream run in submission order, so a caller can
+/// queue a chain and wait once on the last handle. That guarantee is what the
+/// whole fire-and-forget path on the Java side rests on, and until this existed
+/// there was no way to name the stream it applied to: `GpuStream` was a handle
+/// and a `close()` with nothing that accepted it.
+///
+/// A `streamHandle` of 0 means "no particular stream", matching what
+/// `gpu_dispatch_method_on_stream` already does with `None`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_stream_submit_method(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = submit_method_dispatch_on(ctx, args, StreamSource::Explicit)?;
+    Ok(Some(Value::Long(handle as i64)))
+}
+
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit_method(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
@@ -1136,11 +1203,37 @@ fn builtin_submit_method(
 /// the work to the VM. Answers the submission handle; a synthetic
 /// failure handle carries the reason for the Java side to read back.
 #[cfg(feature = "gpu-offload")]
+/// Where the stream for a dispatch comes from.
+///
+/// The two `submitMethod` shapes differ only in this. `Native.submitMethod`
+/// and `Native.submitMethodHandle` take an executor handle and run on that
+/// executor's default stream; `Native.streamSubmitMethod` takes the stream
+/// directly, which is what lets a caller order several kernels against each
+/// other and wait once.
+#[cfg(feature = "gpu-offload")]
+#[derive(Clone, Copy)]
+enum StreamSource {
+    /// Argument 0 is an executor handle; use (or create) its default stream.
+    ExecutorDefault,
+    /// Argument 0 is the stream handle itself.
+    Explicit,
+}
+
+#[cfg(feature = "gpu-offload")]
 fn submit_method_dispatch(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> Result<u64, cratonvm_types::error::MethodCallFailed> {
-    let exec = arg_long(args, 0) as u64;
+    submit_method_dispatch_on(ctx, args, StreamSource::ExecutorDefault)
+}
+
+#[cfg(feature = "gpu-offload")]
+fn submit_method_dispatch_on(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+    stream_source: StreamSource,
+) -> Result<u64, cratonvm_types::error::MethodCallFailed> {
+    let handle0 = arg_long(args, 0) as u64;
     let timed = dispatch_timing::enabled();
     let mut mark = std::time::Instant::now();
     if timed {
@@ -1196,7 +1289,14 @@ fn submit_method_dispatch(
 
     // Dispatch via the NativeContext escape hatch. The VM's impl
     // calls into `runtime::offload::dispatch_method_from_native_on_stream`.
-    let stream = resolve_or_create_default_stream(ctx, exec);
+    let stream = match stream_source {
+        StreamSource::ExecutorDefault => resolve_or_create_default_stream(ctx, handle0),
+        // A stream handle of 0 is "no particular stream": gpu_dispatch_method_on_stream
+        // reads None as "a fresh private one-shot stream for this dispatch", which is
+        // what the un-streamed entry points get anyway.
+        StreamSource::Explicit if handle0 == 0 => None,
+        StreamSource::Explicit => Some(handle0),
+    };
     let submission_handle = match ctx.gpu_dispatch_method_on_stream(
         &class_name,
         &method_name,
@@ -1326,6 +1426,43 @@ fn builtin_close_stream(
 // Futures — these are the only Native.* surface that round-trips entirely
 // through `long` handles, so they work end-to-end in stub mode.
 // ---------------------------------------------------------------------------
+
+/// `Native.futureStatus(long futureHandle) -> int`
+///
+/// Status codes (mirrors the Java side enum-ordinal layout in the spec):
+///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
+#[cfg(feature = "gpu-offload")]
+/// `Native.futureCancel(long handle, boolean mayInterruptIfRunning) -> int`
+///
+/// Returns `1` if the cancellation request was accepted and `0` if it was
+/// rejected. This implementation always answers `0`.
+///
+/// That is not a stub: there is no device-side cancellation primitive anywhere
+/// in this workspace. `NativeContext` exposes dispatch, status, synchronize,
+/// take-result and release for a GPU submission, and nothing that revokes one.
+/// CUDA itself offers no way to abort a launched kernel short of tearing down
+/// the context, which would take every other submission on the device with it.
+///
+/// Answering `0` is the honest report of that, and it is exactly the contract
+/// the Java side documents: `GpuFuture.cancel` returns `false` when the work
+/// "could not be cancelled for some other GPU-specific reason (e.g. ... no
+/// cancellation primitive is implemented for this future kind)".
+///
+/// What matters is that the method is *registered*. Before this, `cancel()`
+/// raised `UnsatisfiedLinkError: Native.futureCancel` -- a hard failure out of
+/// a method whose whole documented behaviour is to answer `false` when it
+/// cannot do the job.
+///
+/// When a cancellation primitive does land, this is the single place to change:
+/// accept the request, mark the submission failed so `futureStatus` reports
+/// `2`, and return `1`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_future_cancel(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
 
 /// `Native.futureStatus(long futureHandle) -> int`
 ///
@@ -1719,6 +1856,54 @@ fn builtin_array_allocate_double(
 ///
 /// Looks up the handle in our state and rebuilds a fresh Java primitive
 /// array of the same shape from the stored bytes.
+#[cfg(feature = "gpu-offload")]
+/// `Native.arrayToHostInto(long arrayHandle, Object dest) -> boolean`
+///
+/// Reads the array back into `dest` rather than into a freshly allocated one,
+/// and answers whether it did.
+///
+/// `arrayToHost` allocates a Java array per call. `GpuArray.toHost(dest)` then
+/// copies out of that array and drops it, so the buffer-reusing overloads on
+/// the Java side only ever bounded the *caller's* garbage — the full-size
+/// allocation still happened here, on every read-back, in the hot loop those
+/// overloads exist for.
+///
+/// Answers `false` rather than throwing when it cannot help: an unknown handle,
+/// a `dest` that is not an array, or one shorter than the stored element count.
+/// The Java side treats `false` as "fall back to `arrayToHost`", so a mismatch
+/// degrades to the previous behaviour instead of failing the read.
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_to_host_into(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let dest = match arg_object(args, 1) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+
+    // Same as arrayToHost: settle any deferred device-to-host writeback before
+    // reading the resident store.
+    if let Some(fresh_bytes) = ctx.gpu_array_download_if_dirty(handle) {
+        array_replace_bytes(handle, fresh_bytes);
+    }
+    let snapshot = state::with(|s| {
+        s.arrays
+            .get(&handle)
+            .map(|entry| (entry.element_type, entry.element_count, entry.bytes.clone()))
+    });
+    let (etype, count, bytes) = match snapshot {
+        Some(t) => t,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    if ctx.array_length(dest) < count {
+        return Ok(Some(Value::Int(0)));
+    }
+    fill_java_array(ctx, dest, etype, count, &bytes);
+    Ok(Some(Value::Int(1)))
+}
+
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,

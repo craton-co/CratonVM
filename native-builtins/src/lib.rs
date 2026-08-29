@@ -16182,28 +16182,28 @@ pub fn register_essential_natives_with_shims(
         u2,
         "getFloat",
         "(Ljava/lang/Object;J)F",
-        native_unsafe_get_float,
+        native_unsafe_get_float_mb,
         NativeKind::Bridge,
     );
     registry.register_with_kind(
         u2,
         "putFloat",
         "(Ljava/lang/Object;JF)V",
-        native_unsafe_put_float,
+        native_unsafe_put_float_mb,
         NativeKind::Bridge,
     );
     registry.register_with_kind(
         u2,
         "getDouble",
         "(Ljava/lang/Object;J)D",
-        native_unsafe_get_double,
+        native_unsafe_get_double_mb,
         NativeKind::Bridge,
     );
     registry.register_with_kind(
         u2,
         "putDouble",
         "(Ljava/lang/Object;JD)V",
-        native_unsafe_put_double,
+        native_unsafe_put_double_mb,
         NativeKind::Bridge,
     );
     registry.register_with_kind(
@@ -25804,7 +25804,7 @@ fn system_ephemeral_port_range() -> (i32, i32) {
 /// MEASURED 2026-08-28 in BOTH modes (`probes/ArraysHashSetShadowSweep.java`),
 /// against HotSpot 25.0.3+9. Every one of these natives opened with
 ///
-/// ```rust
+/// ```text
 /// let src = match args.first() {
 ///     Some(Value::Object(Some(a))) => *a,
 ///     _ => return Ok(Some(Value::Object(None))),   // <- a null array answers null
