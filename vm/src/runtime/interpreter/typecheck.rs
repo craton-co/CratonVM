@@ -969,9 +969,23 @@ pub(crate) fn aastore_element_assignable(
         return true;
     }
 
-    // Element is a plain object. The component must be a reference type "L...;"
-    // (an array component would not accept a non-array element — but fail open
-    // rather than throw, to avoid regressions from imprecise component info).
+    // Element is a plain object and the component is an ARRAY type. This is the
+    // one narrowing in this function that needs no type information to be
+    // sound: the only instances of an array type are arrays (JLS §10.7), and
+    // the branch above already established that the heap does not call this
+    // value an array. So the store is illegal whatever the component resolves
+    // to, and there is no imprecision for a fail-open to hedge against.
+    //
+    // It used to return `true` here with the other unresolvable cases, which
+    // let a `String[][]` be handed an `Integer` (MEASURED 2026-08-28,
+    // `probes/DodArrayStoreSweep`, both modes: HotSpot throws
+    // `ArrayStoreException`, this VM produced the array).
+    if component.starts_with('[') {
+        return false;
+    }
+
+    // Any other non-`L...;` component IS imprecision — fail open rather than
+    // throw, as everywhere else in this function.
     if !(component.starts_with('L') && component.ends_with(';')) {
         return true;
     }
