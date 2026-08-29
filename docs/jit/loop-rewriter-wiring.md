@@ -298,7 +298,7 @@ which any of this runs. The first workload put through it —
 `bench/StringRegexOnly.java` — threw `NullPointerException` at `sb.append(i)`,
 deterministically, from n = 20,000 up.
 
-The bisect (`probes/LoopVersionOsrProbe.java` is the reproducer, and its comment
+The bisect (`apps/probes/LoopVersionOsrProbe.java` is the reproducer, and its comment
 is the argument) needed three things at once:
 
 * a **versioned** artifact — the same loop with an unprovable trip count gets an
@@ -328,8 +328,8 @@ This is the case for the flag existing. Every unit test passed throughout.
 
 * Both compile doors, on real Java: the invocation-count door and the OSR door,
   each producing a versioned artifact whose answers match HotSpot's exactly
-  (`probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
-  `probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java`,
+  (`apps/probes/LoopXformProbe.java`, `apps/probes/LoopVersionOsrProbe.java`,
+  `apps/probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java`,
   `bench/HashMapOnly.java`) — in all three configurations: default,
   `bytecode-loop-xform`, and `bytecode-loop-xform,deopt-real=0`.
 * An application suite, armed and under the DEFAULT `deopt_real`:

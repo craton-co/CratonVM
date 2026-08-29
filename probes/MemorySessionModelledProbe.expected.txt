@@ -1,7 +1,0 @@
-scope.class = jdk.internal.foreign.ConfinedSession
-beforeClose.isAlive = true
-close = ok
-afterClose.isAlive = false
-arenaScope.beforeClose.isAlive = false
-arenaScope.close = java.lang.IllegalStateException:Already closed
-arenaScope.afterClose.isAlive = false

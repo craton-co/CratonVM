@@ -2,11 +2,12 @@
 
 This document describes how to cut a new release of CratonVM.
 
-> **Current readiness note (2026-07-02):** the repository is not ready for a
-> public release tag or broad crates.io publish wave until the release-readiness
-> blockers recorded in `docs/known-issues/full-scoped-review-2026-07-02.md`
-> are resolved. Do not infer release readiness from local source-tree package
-> checks alone; verify the exact release commit with the gates below.
+> **Current readiness note:** the repository is not ready for a public release
+> tag or broad crates.io publish wave until the release-readiness blockers from
+> the most recent full-scoped review are resolved — `cargo fmt --all -- --check`
+> alone still fails workspace-wide. Do not infer release readiness from local
+> source-tree package checks alone; verify the exact release commit with the
+> gates below.
 
 ## 1. Versioning
 
