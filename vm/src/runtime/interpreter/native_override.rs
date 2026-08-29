@@ -5212,9 +5212,19 @@ pub(crate) fn is_string_builder_layout_native_override(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    // `java/lang/StringBuffer` is NOT here, and its absence is load-bearing.
+    // Its 62 natives were retired from the real-JDK registrar (see the block
+    // at `register_string_builder_natives`'s call site in
+    // `native-builtins/src/lib.rs`) so that its own `synchronized` bodies run
+    // and supply the monitor and the `toStringCache` invalidation a shared
+    // native cannot. Leaving the class here would let this gate resolve
+    // `StringBuffer.append` by walking to the INHERITED
+    // `AbstractStringBuilder.append` native and running it directly, skipping
+    // the `StringBuffer` body entirely — a retirement that is silently undone
+    // by the gate that outlived it.
     if !matches!(
         class_name,
-        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+        "java/lang/StringBuilder" | "java/lang/AbstractStringBuilder"
     ) {
         return false;
     }
@@ -8568,11 +8578,7 @@ mod string_builder_layout_override_tests {
     /// chunk 4 look like a hang. `SbMethodMatrixProbe` is the Java witness.
     #[test]
     fn forces_every_compact_layout_operation_native() {
-        for class in [
-            "java/lang/StringBuilder",
-            "java/lang/StringBuffer",
-            "java/lang/AbstractStringBuilder",
-        ] {
+        for class in ["java/lang/StringBuilder", "java/lang/AbstractStringBuilder"] {
             for (name, desc) in [
                 ("setLength", "(I)V"),
                 ("deleteCharAt", "(I)Ljava/lang/StringBuilder;"),
@@ -8613,11 +8619,7 @@ mod string_builder_layout_override_tests {
     /// silently ignored — see the long note on `length()` in the predicate.
     #[test]
     fn leaves_the_two_mockito_stubbed_operations_evictable() {
-        for class in [
-            "java/lang/StringBuilder",
-            "java/lang/StringBuffer",
-            "java/lang/AbstractStringBuilder",
-        ] {
+        for class in ["java/lang/StringBuilder", "java/lang/AbstractStringBuilder"] {
             assert!(!is_string_builder_layout_native_override(
                 class, "length", "()I"
             ));
@@ -8626,6 +8628,41 @@ mod string_builder_layout_override_tests {
                 "substring",
                 "(I)Ljava/lang/String;"
             ));
+        }
+    }
+
+    /// `java/lang/StringBuffer` is claimed by NOTHING here, and that is the
+    /// paired half of retiring its 62 registrations: its own `synchronized`
+    /// bodies must run, or the buffer loses both its monitor and its
+    /// `toStringCache` invalidation. Asserted operation by operation rather
+    /// than once, so a future widening of the list cannot quietly re-take the
+    /// class.
+    #[test]
+    fn never_claims_string_buffer_whose_own_bodies_carry_the_monitor() {
+        for (name, desc) in [
+            ("append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("append", "(C)Ljava/lang/StringBuffer;"),
+            ("insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("delete", "(II)Ljava/lang/StringBuffer;"),
+            ("deleteCharAt", "(I)Ljava/lang/StringBuffer;"),
+            ("replace", "(IILjava/lang/String;)Ljava/lang/StringBuffer;"),
+            ("reverse", "()Ljava/lang/StringBuffer;"),
+            ("setLength", "(I)V"),
+            ("setCharAt", "(IC)V"),
+            ("toString", "()Ljava/lang/String;"),
+            ("charAt", "(I)C"),
+            ("length", "()I"),
+            ("capacity", "()I"),
+            ("ensureCapacity", "(I)V"),
+            ("trimToSize", "()V"),
+            ("getChars", "(II[CI)V"),
+            ("substring", "(II)Ljava/lang/String;"),
+            ("<init>", "(Ljava/lang/String;)V"),
+        ] {
+            assert!(
+                !is_string_builder_layout_native_override("java/lang/StringBuffer", name, desc),
+                "StringBuffer.{name}{desc} must run its OWN synchronized body"
+            );
         }
     }
 
