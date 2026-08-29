@@ -42,6 +42,33 @@ wave-3. See
 > table below is the third measurement, on the merged binary with the CAS bind
 > in, and every row's spread is under 3%.
 
+**`AtomicReference.compareAndSet`'s synthetic stub — was the worst row in the
+table below at 37x, now de-registered (2026-08-29).** The refutation this page
+recorded in "What was tried and refuted" was correct AT THE TIME (stub 257 ns,
+real bytecode 289 ns) but stopped being true the moment the CAS bind above
+landed: real-JDK `AtomicReference.compareAndSet` is one line delegating to
+`VarHandle.compareAndSet`, and that line is now thin-direct-bound instead of
+funnel-served. Six interleaved runs, kill switch as the only difference,
+`--dump-native-registry` confirmed no native registered for the tuple either
+way (so this genuinely reaches real bytecode, not a second stub — see the
+note in "What was tried and refuted" about the first attempt gating the wrong
+registrar):
+
+| | stub kept | stub dropped |
+|---|---:|---:|
+| `AtomicReference.compareAndSet` | 519.5-543.8 (**531.7**) | 331.4-344.0 (**332.0**) |
+| `VarHandle.compareAndSet` reference (control, composite) | 256.5-261.1 | 257.7-272.6 |
+| `AtomicInteger.increment` (control) | 5.8-6.0 | 5.5-6.0 |
+
+A **1.6x** win, with both controls unmoved across arms — this is the change,
+not the box. Measured on a moderately busy box (load 10-16, not the idle box
+the rest of this page insists on), so the table above still needs a clean
+idle-box re-measurement pass with this row included; the ratio (not the
+absolute ns) is what this measurement can actually support. The stub
+(`native_atomic_ref_cas` in `native-builtins/src/util_concurrent_ext.rs`) and
+its registration are removed, not just gated off — see the comment left in
+its place for the arithmetic and the evidence.
+
 ## Severity
 **HIGH and broad**, for the same reason the `VarHandle` page was: these are the
 primitives under `CompletableFuture`, `AbstractQueuedSynchronizer`,
@@ -177,6 +204,14 @@ The "710 ns shadow" was an artefact of the busier first run. On a quiet box
 231.0 — a 1.15x wrapper, which is about what a wrapper should cost. **The stub
 is not the problem; the CAS underneath it is**, and that is where the 35x lives.
 
+> **This conclusion was correct when written and stopped being true on
+> 2026-08-28.** The arithmetic above is "a `VarHandle` CAS at ~233 ns plus a
+> frame" — once the CAS bind took that 233 ns down to ~53.6, the same
+> arithmetic points the other way, and it now measures out that way too. See
+> "Closed since this page was filed": the stub is removed. Keep this section
+> as the record of why the FIRST measurement was wrong (the gate on the wrong
+> registrar) and the SECOND was right for its binary, not as today's answer.
+
 ## Where to look first
 
 1. **`VarHandle.get` on a reference field, 77.0 ns against 2.4 — and against
@@ -191,21 +226,16 @@ is not the problem; the CAS underneath it is**, and that is where the 35x lives.
    argument that a reference travelling INWARD needs no root, and a CAS proved
    a `Z`-returning bind carries no reference out either. A read is the one that
    genuinely returns one, so this is the hard case rather than an oversight.
-2. **`AtomicReference.compareAndSet`, and this page's earlier refutation of it
-   is now WORTH RE-OPENING.** The refutation stands as recorded: de-registering
-   the synthetic stub measured SLOWER (289 vs 257 ns) because the JDK's
-   `VALUE.compareAndSet(...)` cost a 233 ns `VarHandle` CAS plus a frame. That
-   VarHandle CAS is now 53.6 ns, so the same arithmetic predicts the opposite
-   result — the delegating path should now be roughly 60-70 ns against the
-   stub's ~265. Predicted, NOT measured: the earlier attempt is exactly why this
-   needs the A/B and the registry dump rather than the arithmetic, and it needs
-   the gate on the registrar `--dump-native-registry` NAMES
-   (`util_concurrent_ext.rs`), not the one grep finds first.
-3. **A NATIVE profile of the composition probe with everything compiled.** The
+2. **A NATIVE profile of the composition probe with everything compiled.** The
    last one was taken when composition was 92.35% interpreted, so it measured
    the interpreter and nothing else. The CAS bind moved composition 1.10x,
    almost exactly the 9.6% its 10.47 CAS per chain predicted — which is
    reassuring about the accounting and leaves ~90% of the chain unattributed.
+   The `AtomicReference` stub removal closed above should move it again by
+   roughly however much `AtomicLong.incrementAndGet` (1.00 per chain, still
+   funnel-served — a different class, not touched by either fix this page has
+   landed) does NOT explain of the remaining ~90%; still nobody's profiled the
+   current shape end to end.
 
 ## What is already excluded, with the evidence
 
@@ -214,9 +244,6 @@ Do not re-derive these.
 * **Compile refusals.** `hot_but_stuck_in_interpreter=0` on both probes.
   Restoring either of the two fixed refusals with its kill switch costs 2.19x
   and 2.88x, so the instrument works and reads zero.
-* **The `AtomicReference` CAS shadow.** Measured and refuted above — and see
-  "Where to look first" item 2, which re-opens it on new arithmetic rather than
-  on a new opinion.
 * **The `VarHandle` CAS funnel entry.** Bound 2026-08-28; the funnel arm still
   serves the interpreter and the declined sites, and the two share one
   implementation.
@@ -229,6 +256,15 @@ Do not re-derive these.
   threads on `HibfixVarHandleScale`, and exactly 1.00x at one thread.
 * **The CAS funnel.** `try_varhandle_instance_field_cas` serves the instance
   case: 3 839 190 served, 0 declined on the composition workload. Worth 0.5%.
+* **The funnel's own descriptor re-parse.** `varhandle_cas_operand_kinds` was
+  re-walking the call site's descriptor string on every declined/unbound CAS
+  (`CharSearcher::next_match` at 3.84% of a native profile taken before the
+  bind existed to take the hot sites away from this route). Memoized per call
+  site (2026-08-29, same one-slot thread-local idiom as
+  `native-builtins::lang_invoke::VH_PLAN_MEMO`); re-profiled after, the same
+  function drops to 0.50%. Worth little on THIS page's own probes now that the
+  bind serves the hot sites, but free and correct, so it stays for whatever
+  declined sites keep reaching the funnel.
 * **Java-frame profiling.** A Java-frame sampler attributes the whole of a
   native call to the Java frame that made it. It produced "34% in
   `tryPushStack`" and sent three days into `VarHandle` primitives that were not
