@@ -119,7 +119,9 @@ segments; `ofBuffer`; `heapBase()`; and every layout's `byteSize`,
 
 ## 4. The residual, sized rather than guessed
 
-27 rows in compatible mode, 47 under `--jdk-only`, and they are one defect:
+**25 rows in compatible mode, 45 under `--jdk-only`, down from 27/47: the
+`Arena` family is CLOSED (2026-08-29) and the rest is one defect.** All of what
+is left is `class`, `superclass` and `isInterface` -- 13, 10 and 2 rows.
 
 ```text
                        compatible                                    --jdk-only
@@ -154,15 +156,71 @@ objects, on both VMs. So this breaks a `getSuperclass()` walk, a
 `getClass().getName()` log line, and any code that switches on the concrete
 implementation class — not the ordinary uses.
 
-**Not fixed here, and the reason has been checked rather than assumed.** Naming
-the real classes is not a rename: `NativeMemorySegmentImpl` and
-`HeapMemorySegmentImpl$OfByte` have their own field layouts, and every accessor
-in `panama.rs` addresses this VM's six-slot carrier by raw slot index. Adopting
-them means moving the whole segment model onto the JDK's, which is the same
-answer the DoD screen gave and the same shape as
-`fabricating-an-abstract-class-trades-an-npe-for-an-abstractmethoderror`. The
-layout families (`ValueLayouts$OfIntImpl` and friends) are the smaller half and
-may be tractable on their own; nothing here has measured that.
+### 4.1 The reason given here for stopping was wrong. WITHDRAWN 2026-08-29
+
+This section said naming the real classes "means moving the whole segment model
+onto the JDK's", because every accessor addresses a raw slot index. That is a
+statement about the accessors, and it was not checked against the file it is
+about.
+
+**`p67_memory_session`, two hundred lines above the arena in the same file,
+already mints the REAL `jdk/internal/foreign/MemorySessionImpl` and resolves its
+fields BY NAME** (`p67_session_slots`), with a synthetic fallback for the carrier
+that has no real class behind it. The primitive this section says does not exist
+is the one the neighbouring family runs on. `--dump-native-registry` was saying
+it too, and I had the dump open: `ArenaImpl`, `NativeMemorySegmentImpl` and
+`ValueLayouts$OfIntImpl` each carry registered natives with **zero invocations**
+-- a destination already wired, with nothing minting anything that reaches it.
+
+**`Arena` is done.** `Arena.ofConfined().getClass()` answers
+`jdk.internal.foreign.ArenaImpl` in all three arms.
+
+### 4.2 The recipe, and what each step costs when it is skipped
+
+Three things move together. Both attempts where they did not are recorded
+because the failures are the useful part:
+
+| Step | What it is | What skipping it cost |
+|---|---|---|
+| The **class** | mint the real impl, not the interface | -- |
+| The **slots** | resolve by NAME from the receiver's class, one shared resolver, synthetic fallback | `panama.rs` kept a hard-coded index 1 for the session; its own comment already warned that "open-coding the index here is what let the two files drift out of step" |
+| The **whole family's registrations** | every INSTANCE method, on the impl class too | moved `close`/`scope`/`allocate`, left the ten `allocateFrom` shapes: dispatch fell through to JDK default bytecode and `RJdkForeign`'s downcall **SIGSEGV**'d in `heap_read_bytes`, both modes |
+
+And spell the class names as **literals** at the registration site.
+`for arena_cls in [arena, P67_ARENA_IMPL]` reddened `registrar_drift` with
+`STALE BASELINE -- 1 recorded drift pair no longer drift`: that scanner reads the
+call TEXT, so a variable and a const read to it as no registration at all, while
+the registration was live the whole time.
+
+### 4.3 A latent defect the move surfaced
+
+`pe_arena_allocate_impl` discriminated the two rival arena layouts **by width**
+(`object_num_fields > 3`), under a comment saying the reads are "gated on the
+width that makes them meaningful". A width is not an identity. The new carrier
+is four slots wide, so it took the `--synthetic-jdk` branch, read this model's
+`open` flag as that model's `closed` flag, and every `arena.allocate` threw
+`Arena is closed` -- **0 of 199 rows, both modes**. Two producers were minting
+ONE class with two different layouts; now that they mint different classes, the
+test asks the class. See `two-producers-of-one-carrier-class-is-a-failure-family`.
+
+### 4.4 What the remaining four families cost, measured
+
+Instance-field counts from `javap -p` on the JDK 25.0.4+7 image, superclass
+fields included -- these are the layouts a by-name resolver has to land on:
+
+```text
+  jdk.internal.foreign.ArenaImpl                     2   DONE 2026-08-29
+  jdk.internal.foreign.NativeMemorySegmentImpl       4   (min + length, readOnly, scope)
+  jdk.internal.foreign.HeapMemorySegmentImpl$OfByte  5   (offset, base + the same three)
+  jdk.internal.foreign.layout.SequenceLayoutImpl     5   (elemCount, elementLayout + byteSize, byteAlignment, name)
+  jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   (+ carrier, order, handle)
+  jdk.internal.foreign.layout.StructLayoutImpl       6   (kind, elements, minByteAlignment + the same three)
+```
+
+None of them is large. The segment family is the one that also clears
+`compatibility_classes > 0`, since it is the only one with a fabricated
+stand-in; it is also the widest, at 118 registered natives to move rather than
+the arena's 14.
 
 ## 5. Reproduce
 
