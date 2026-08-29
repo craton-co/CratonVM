@@ -1845,7 +1845,59 @@ So the feature's own engagement number was never going to be non-zero on this
 family, for a reason unrelated to the one §"Follow-up 2026-08-28" gave. It stays
 default-OFF.
 
-### 7. `frame_cov=(… incomplete=N …)` did not need a new instrument
+### 7. The oop-map backstop exists now, and it is the CLASS FILE's verifier
+
+§"Follow-up 2026-08-27 (second)" withdrew the map-completeness oracle as a
+backstop and closed with: *"a backstop that can tell a dead slot from a live one
+without the map does not exist yet."*
+
+**Asking the JIT's own model would have been circular** — the oop map IS its
+output, so "the map does not name this slot" and "the model says it is not live
+here" are the same sentence. `classloading::type_maps` is a different oracle
+with a different provenance: what `bytecode_verifier` retains from the JVMS
+§4.10.1 StackMapTable walk, i.e. **javac's claim** about the type of every local
+at every instruction start. It answers both of the oracle's declared false
+positives at once — a primitive local is not an oop there, and an out-of-scope
+local is `Top`.
+
+Every never-mapped word in a java local is now classified against it. Measured,
+`CRATONVM_DBG_VERIFY_OOP_MAPS=1`, on the 2026-08-29 tip:
+
+| class | `verifier_oop` | `verifier_not_oop` | `verifier_unknown` | name index |
+|---|---:|---:|---:|---|
+| `TestMVStoreTool` | **0** | 40 | 198 | 762 names, 0 collisions |
+| `TestMultiThread` (PASSES) | **262** | **847 347** | 1 284 994 | 1 215 names, 0 collisions |
+
+Read the second row against what this page recorded on 2026-08-27:
+**1 108 464 never-mapped words on that class, 670 474 of them in frames
+asserting shadow coverage, on a run that PASSES.** The verifier refutes
+**847 347** of them outright and leaves **262** corroborated. That is the
+difference between a counter and a lead: 262 sites, each with a method and a
+bci, is a list somebody can work; a million is a number nobody can act on, which
+is exactly why that section withdrew it.
+
+`TestMVStoreTool`'s **zero** is the strong result the oracle's own doc says to
+look for.
+
+Three things this does NOT claim:
+
+* **`verifier_unknown` is large and that is honest, not a rounding error.** It
+  is every refusal to answer — an INLINED frame (a spliced callee's locals share
+  the region and the bci belongs to the callee's bytecode, so the outer map read
+  at that pc is a different method's types), a slot outside the java locals
+  (operand spill is indexed by runtime depth, which the frame does not carry),
+  a pc with no row, a name the index cannot resolve. Counting them separately is
+  the point: a backstop whose "no gap" silently includes "could not look" is the
+  vacuous green this page has spent a week avoiding.
+* **262 corroborated hits on a PASSING class is a lead, not a verdict.** They
+  may be live references the conservative band scan is still catching, or
+  genuine gaps that happen not to bite. What changed is that there are 262 of
+  them to look at rather than a million.
+* The index is name-keyed and cannot tell two loaders' versions of one class
+  apart. `0 collisions` on both runs is why the numbers above are trustworthy;
+  a non-zero there discounts the run.
+
+### 8. `frame_cov=(… incomplete=N …)` did not need a new instrument
 
 §"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the
 first time anywhere that a map refuses on its OWN claim rather than being
@@ -1904,6 +1956,9 @@ it.
   index cannot resolve — counted rather than folded in, because a backstop
   whose "no gap" silently includes "could not look" is the vacuous green this
   page has been avoiding all along. Behind `CRATONVM_DBG_VERIFY_OOP_MAPS`.
+  **Measured**: `verifier_oop=0` on `TestMVStoreTool`, and on `TestMultiThread`
+  — where this page recorded 1 108 464 never-mapped words — the verifier
+  refutes **847 347** and leaves **262**. See §"Follow-up 2026-08-29" §7.
 * **`CRATONVM_ZGC_TARGETED_COMPACTION` engages zero times**, and §"Follow-up
   2026-08-29" §6 says why in a way §"Follow-up 2026-08-28" could not: the
   target is recorded on the allocation failure, and on this family the
