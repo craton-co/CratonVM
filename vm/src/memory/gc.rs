@@ -225,6 +225,38 @@ pub fn unload_dead_class_metadata(
     // purging valid rows there would just churn a fresh `$ProxyN` per
     // collection for classes that are still perfectly alive.
     cratonvm_native_builtins::forget_unloaded_proxy_classes(shared.vm_identity, &raw_ids);
+    // ...and the level below it: the annotation-proxy cache holds INSTANCES of
+    // those generated `$ProxyN` classes, keyed by holder class id, and is
+    // itself a GC root — so the collector keeps each cached proxy alive while
+    // nothing keeps its class alive. A proxy whose class was just unloaded is
+    // handed straight back out of that cache by the next
+    // `getDeclaredAnnotations()`, and resolving its class throws
+    // `NoClassDefFoundError: jdk/proxyN/$ProxyM`. Spring's `AnnotationsScanner`
+    // catches that and returns NO annotations, so every `@AutoConfiguration` /
+    // `@Conditional` / `@Bean` on the holder silently disappears — see
+    // `lang_class::forget_unloaded_annotation_proxies` for the suite failure
+    // this reproduced as. Same placement rationale as the call above: only on
+    // the path that actually unloaded classes.
+    let dead_set: FxHashSet<u32> = raw_ids.iter().copied().collect();
+    let annotation_proxies_dropped =
+        cratonvm_native_builtins::lang_class::forget_unloaded_annotation_proxies(
+            shared.vm_identity,
+            &dead_set,
+            &|obj| {
+                shared
+                    .mem
+                    .heap
+                    .is_object_address(obj.as_ptr() as usize)
+                    .map(|valid| shared.mem.heap.class_id_of(valid).as_u32())
+            },
+        );
+    if annotation_proxies_dropped != 0
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some()
+    {
+        eprintln!(
+            "[DBG_MIRRORPIN] dropped {annotation_proxies_dropped} annotation-proxy cache              row(s) whose class or holder was unloaded"
+        );
+    }
     shared
         .debug
         .diagnostic_counters

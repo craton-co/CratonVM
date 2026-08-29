@@ -151,6 +151,129 @@ impl Locals {
     }
 }
 
+/// A `cond ? then : else` diamond the emitter can turn into two
+/// unconditional computations plus a `selp`.
+///
+/// Built by [`Emitter::plan_if_conversion`], which documents the shape and
+/// why only this one is recognised.
+#[derive(Debug)]
+struct IfConversion {
+    /// First instruction of the fall-through (predicate FALSE) arm.
+    then_start: usize,
+    /// PC of that arm's terminating `goto <join>`.
+    then_goto_pc: usize,
+    /// First instruction of the branch-taken (predicate TRUE) arm, which
+    /// is also where the fall-through arm's block ends.
+    else_start: usize,
+    /// Where the two arms reconverge.
+    join: usize,
+}
+
+/// Whether a speculated arm's emitted PTX may run unconditionally, and
+/// what it costs to do so.
+///
+/// See [`Emitter::try_emit_if_converted`] for why this reads the PTX and
+/// not the bytecode. `None` means "not speculatable at any price";
+/// `Some(cost)` is a weighted instruction count the caller compares
+/// against its budget.
+///
+/// # Why a weighted count and not a plain one
+///
+/// Both arms run on every lane, so converting trades a branch the warp
+/// might never have diverged on for arithmetic it certainly executes.
+/// Whether that is a win depends on what the arithmetic COSTS, not on how
+/// many lines it takes: the ray tracer's
+/// `disc > 0f ? (float) Math.sqrt(disc) : 1e9f` is one instruction per
+/// arm, and one of them is `sqrt.rn.f32`, which `ptxas` expands into a
+/// `MUFU.RSQ` and a Newton-Raphson chain. Speculating it on a warp whose
+/// lanes all miss the sphere -- which is most of a frame's background --
+/// buys a removed `BSSY`/`BSYNC` pair and pays for a square root nobody
+/// wanted. Measured on this kernel, the plain-count version of this
+/// screen made the compute half 56% SLOWER.
+fn speculation_cost(text: &str) -> Option<u32> {
+    /// What one instruction counts as. `1` for ordinary ALU work; the
+    /// multi-instruction expansions are what a plain count gets wrong.
+    fn weight(t: &str) -> u32 {
+        const EXPENSIVE: [&str; 7] = [
+            "sqrt.", "div.rn", "div.rz", "div.rm", "div.rp", "rcp.", "ex2.",
+        ];
+        if EXPENSIVE.iter().any(|m| t.contains(m)) {
+            16
+        } else {
+            1
+        }
+    }
+    let mut cost = 0u32;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.ends_with(':')
+            || t.starts_with('@')
+            || t.contains("bra ")
+            || t.contains("ld.global")
+            || t.contains("st.global")
+            || t.contains("ld.shared")
+            || t.contains("st.shared")
+            || t.contains("atom.")
+            || t.contains("red.")
+            || t.contains("bar.")
+            || t.contains("call")
+            || t.contains("ret;")
+        {
+            return None;
+        }
+        cost = cost.saturating_add(weight(t));
+    }
+    Some(cost)
+}
+
+/// The budget `CRATONVM_GPU_IF_CONVERT=1` selects: the least-bad setting
+/// the sweep found, which is a tie with the feature off rather than a win.
+/// Everything cheaper and everything dearer measured worse.
+const DEFAULT_IF_CONVERSION_BUDGET: u32 = 8;
+
+/// The if-conversion budget this process runs with: the largest weighted
+/// arm-pair cost [`speculation_cost`] may report and still convert. `0`
+/// converts nothing.
+///
+/// **Off by default, and that is a measured decision rather than caution.**
+/// The transform does what it was built to do -- on the ray tracer it takes
+/// PTX branches from 51 to 21 and SASS branch machinery from 17.4% of the
+/// kernel to 15.4% -- and it makes that kernel SLOWER, by 56% of its compute
+/// half, in 8 of 8 interleaved rounds against a transfer-floor control. A
+/// branch a warp does not diverge on is nearly free; `selp` makes every lane
+/// compute both arms. Sweeping the budget found no value that wins: 8 is a
+/// tie with off and every other setting is worse. See
+/// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
+///
+/// It is kept, and kept reachable, because that is one kernel. A shape with
+/// cheap arms and heavy divergence is exactly what it is for, and the flags
+/// are how someone measures whether theirs is one.
+///
+/// `CRATONVM_GPU_IF_CONVERT=1` turns it on at [`DEFAULT_IF_CONVERSION_BUDGET`];
+/// `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` turns it on at `n`.
+fn if_conversion_budget_from_flags() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Some(n) = cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT_MAX_OPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            return n;
+        }
+        let on = cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if on {
+            DEFAULT_IF_CONVERSION_BUDGET
+        } else {
+            0
+        }
+    })
+}
+
 /// All state the emitter needs while walking a method.
 pub(crate) struct Emitter<'a> {
     pub bytes: &'a [u8],
@@ -195,6 +318,11 @@ pub(crate) struct Emitter<'a> {
     /// Set to `true` the first time we emit a bounds check; controls
     /// whether the failure block needs to be emitted at the end.
     pub used_bounds_label: bool,
+    /// Weighted-instruction budget for the branch-to-`selp` if-conversion;
+    /// `0` converts nothing. Taken from the flags by [`Emitter::new`], and
+    /// overridable per call so a test can exercise the transform without
+    /// depending on the process-wide default -- which is `0`.
+    pub if_convert_budget: u32,
     /// Set to `true` when a `goto` to the loop header is encountered;
     /// caller should stop emitting at that point.
     pub hit_back_branch: bool,
@@ -257,6 +385,7 @@ impl<'a> Emitter<'a> {
             tid_reg_inner: None,
             bounds_fail_label: "L_bounds_fail".into(),
             used_bounds_label: false,
+            if_convert_budget: if_conversion_budget_from_flags(),
             hit_back_branch: false,
             ret_value_reg: None,
             writes_param_mask: 0,
@@ -702,8 +831,15 @@ impl<'a> Emitter<'a> {
             },
         );
 
+        // Blocks the if-converter consumed as the arms of a diamond.
+        // They are emitted inline, unconditionally, ahead of the join --
+        // so the outer walk must not emit them a second time.
+        let mut if_converted = BTreeSet::<usize>::new();
         for (index, &block_start) in starts.iter().enumerate() {
             let block_end = starts.get(index + 1).copied().unwrap_or(end);
+            if if_converted.contains(&block_start) {
+                continue;
+            }
             let Some(entry) = entries.get(&block_start).cloned() else {
                 // Valid class files can retain unreachable bytecode.  It has
                 // no incoming edge in the admitted subgraph, so emitting it
@@ -737,24 +873,50 @@ impl<'a> Emitter<'a> {
                         let target = self.branch_target(pc, op)?;
                         Self::check_back_edge(pc, target, &emitted, &entries)?;
                         let predicate = self.emit_branch_predicate(op)?;
-                        let state = BlockState {
-                            stack: self.stack.clone(),
-                            locals: self.locals.clone(),
-                        };
-                        self.copy_state_to_edge(
-                            &state,
-                            target,
-                            Some((&predicate.name, false)),
-                            &mut entries,
-                        )?;
-                        self.copy_state_to_edge(
-                            &state,
-                            next,
-                            Some((&predicate.name, true)),
-                            &mut entries,
-                        )?;
-                        writeln!(self.body, "    @{} bra L_body_{target};", predicate.name)
-                            .unwrap();
+                        // A `cond ? a : b` whose two arms are short and
+                        // pure becomes two unconditional computations and
+                        // one `selp`, with no branch and therefore no warp
+                        // reconvergence at all. See `plan_if_conversion`.
+                        let mut converted = false;
+                        if self.if_convert_budget > 0 {
+                            if let Some(plan) = self
+                                .plan_if_conversion(pc, next, target, &starts, index, start, end)
+                            {
+                                if self.try_emit_if_converted(
+                                    &plan,
+                                    &predicate,
+                                    loop_info,
+                                    &mut entries,
+                                    end,
+                                )? {
+                                    emitted.insert(plan.then_start);
+                                    emitted.insert(plan.else_start);
+                                    if_converted.insert(plan.then_start);
+                                    if_converted.insert(plan.else_start);
+                                    converted = true;
+                                }
+                            }
+                        }
+                        if !converted {
+                            let state = BlockState {
+                                stack: self.stack.clone(),
+                                locals: self.locals.clone(),
+                            };
+                            self.copy_state_to_edge(
+                                &state,
+                                target,
+                                Some((&predicate.name, false)),
+                                &mut entries,
+                            )?;
+                            self.copy_state_to_edge(
+                                &state,
+                                next,
+                                Some((&predicate.name, true)),
+                                &mut entries,
+                            )?;
+                            writeln!(self.body, "    @{} bra L_body_{target};", predicate.name)
+                                .unwrap();
+                        }
                         terminated = true;
                     }
                     0xA7 | 0xC8 => {
@@ -803,6 +965,388 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Recognise the one control-flow shape worth if-converting, and
+    /// nothing else.
+    ///
+    /// # What this is for
+    ///
+    /// The GPU kernels in this tree are written branchlessly on purpose
+    /// -- ternaries and short-circuit `&&`s rather than `if` statements
+    /// -- and the lowerer turned them straight back into branches. On the
+    /// ray tracer that came to 67 `BRA` plus 32 `BSSY`/`BSYNC`/`BMOV`
+    /// triples, 18% of the kernel's SASS, spent reconverging warps around
+    /// arms that are three instructions of float arithmetic. A `selp` has
+    /// no reconvergence: every lane computes both sides and keeps one.
+    ///
+    /// # The shape
+    ///
+    /// Exactly what `javac` emits for `c ? a : b`:
+    ///
+    /// ```text
+    ///     <cond>; if<cmp> ELSE     <- this block's terminator
+    ///     <then expr>
+    ///     goto JOIN
+    ///   ELSE:
+    ///     <else expr>
+    ///   JOIN:                      <- fallen into, never branched to
+    /// ```
+    ///
+    /// so: the fall-through block runs from `next` to exactly where the
+    /// branch target begins, and ends in a `goto`; the target's block runs
+    /// to that `goto`'s destination and falls through to it. Both are
+    /// single basic blocks, which is what makes them speculatable at all.
+    /// An arm containing its own branch is refused and lowered the old
+    /// way, so a NESTED ternary converts its inner diamond and keeps the
+    /// outer branch. That is a deliberate boundary rather than an
+    /// oversight: every conversion is independently sound, and the
+    /// innermost arms are the shortest ones.
+    ///
+    /// This judges the SHAPE only. Whether the arms may actually run
+    /// unconditionally is decided by `try_emit_if_converted`, from the PTX
+    /// they emit rather than from the bytecode they came from.
+    fn plan_if_conversion(
+        &self,
+        branch_pc: usize,
+        next: usize,
+        target: usize,
+        starts: &[usize],
+        index: usize,
+        region_start: usize,
+        end: usize,
+    ) -> Option<IfConversion> {
+        // The branch must end this block and the fall-through must be the
+        // next one. `cfg_block_starts` inserts both, so their absence
+        // means some other edge already claimed the range.
+        if starts.get(index + 1).copied() != Some(next) {
+            return None;
+        }
+        let then_end = starts.get(index + 2).copied()?;
+        // The taken arm must begin exactly where the fall-through arm's
+        // block ends: a forward branch over the whole then-expression and
+        // nothing more.
+        if target != then_end {
+            return None;
+        }
+        let else_end = starts.get(index + 3).copied().unwrap_or(end);
+        let goto_pc = self.last_instruction_pc(next, then_end)?;
+        let goto_op = *self.bytes.get(goto_pc)?;
+        if goto_op != 0xA7 && goto_op != 0xC8 {
+            return None;
+        }
+        let join = self.branch_target(goto_pc, goto_op).ok()?;
+        if join != else_end || join <= target || join > end {
+            return None;
+        }
+        // Neither arm may carry control flow of its own; the taken arm
+        // must have no terminator at all, because it falls into the join.
+        if self.has_control_flow(next, goto_pc) || self.has_control_flow(target, join) {
+            return None;
+        }
+        // Neither arm may have a predecessor other than this branch.
+        //
+        // This is not a refinement, it is the thing that makes the
+        // conversion legal at all. A short-circuit `a && b ? x : y`
+        // compiles to TWO conditional branches to the SAME else-label,
+        // and the second one's diamond passes every test above -- so
+        // consuming the else-block would leave the FIRST branch's
+        // `bra L_body_<else>` pointing at a label nothing emits. That is
+        // PTX `ptxas` rejects, which the VM turns into a blacklisted
+        // method and a silent CPU fallback: the kernel would still
+        // produce the right answer, just never on the device, and a
+        // correctness check would read BIT_IDENTICAL either way.
+        if self.has_other_predecessor(region_start, end, branch_pc, next)
+            || self.has_other_predecessor(region_start, end, branch_pc, target)
+        {
+            return None;
+        }
+        Some(IfConversion {
+            then_start: next,
+            then_goto_pc: goto_pc,
+            else_start: target,
+            join,
+        })
+    }
+
+    /// PC of the last instruction starting in `[from, to)`, or `None` if
+    /// the range does not decode into whole instructions.
+    fn last_instruction_pc(&self, from: usize, to: usize) -> Option<usize> {
+        let mut pc = from;
+        let mut last = None;
+        while pc < to {
+            let size = instr_size(self.bytes, pc).ok()?;
+            if size == 0 || pc + size > to {
+                return None;
+            }
+            last = Some(pc);
+            pc += size;
+        }
+        last
+    }
+
+    /// Whether any control transfer in `[from, to)` other than the one at
+    /// `this_branch` targets `block`.
+    ///
+    /// Conservative by construction: an undecodable instruction or a
+    /// switch (whose table this does not read) answers "yes", which
+    /// refuses the conversion rather than risking a dangling label.
+    fn has_other_predecessor(
+        &self,
+        from: usize,
+        to: usize,
+        this_branch: usize,
+        block: usize,
+    ) -> bool {
+        let mut pc = from;
+        while pc < to {
+            let Ok(size) = instr_size(self.bytes, pc) else {
+                return true;
+            };
+            if size == 0 || pc + size > to {
+                return true;
+            }
+            let op = self.bytes[pc];
+            match op {
+                0xAA | 0xAB => return true,
+                0x99..=0xA4 | 0xA7 | 0xC6..=0xC8 if pc != this_branch => {
+                    match self.branch_target(pc, op) {
+                        Ok(t) if t == block => return true,
+                        Err(_) => return true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            pc += size;
+        }
+        false
+    }
+
+    /// Whether `[from, to)` contains any branch, switch or return.
+    fn has_control_flow(&self, from: usize, to: usize) -> bool {
+        let mut pc = from;
+        while pc < to {
+            let Ok(size) = instr_size(self.bytes, pc) else {
+                return true;
+            };
+            if size == 0 || pc + size > to {
+                return true;
+            }
+            match self.bytes[pc] {
+                0x99..=0xA8 | 0xAA | 0xAB | 0xAC..=0xB1 | 0xC6..=0xC8 => return true,
+                _ => {}
+            }
+            pc += size;
+        }
+        false
+    }
+
+    /// Emit both arms unconditionally and merge them with `selp`.
+    ///
+    /// Returns `Ok(false)` when the arms turn out not to be speculatable,
+    /// having left the emitter exactly as it found it -- the caller then
+    /// lowers the branch the ordinary way.
+    ///
+    /// # Why the screen is on the PTX and not on the bytecode
+    ///
+    /// Running both arms is sound only when neither can fault, store, or
+    /// deopt. That is a property of what the arm LOWERS TO, and the
+    /// opcode-to-lowering map is a 2000-line match with array bounds
+    /// checks, divide-by-zero guards and an intrinsic table in it. An
+    /// allow-list of opcodes would be a second copy of that knowledge,
+    /// free to drift from the first; the text the arm actually emitted IS
+    /// the knowledge. So: emit into a scratch buffer, and refuse anything
+    /// holding a label, a branch, a predicated instruction, or a memory
+    /// access. A bounds check lowers to `@%p bra L_bounds_fail`, so the
+    /// branch screen already catches it; the memory screen is there for a
+    /// future lowering that somehow does not branch.
+    fn try_emit_if_converted(
+        &mut self,
+        plan: &IfConversion,
+        predicate: &Reg,
+        loop_info: &CountedLoop,
+        entries: &mut BTreeMap<usize, BlockState>,
+        end: usize,
+    ) -> Result<bool, LoweringError> {
+        let saved = BlockState {
+            stack: self.stack.clone(),
+            locals: self.locals.clone(),
+        };
+        // Emitter state a rejected speculation must not leave behind.
+        // `emit_op` sets these as a side effect of lowering an opcode, and
+        // a rejected arm's opcodes did not happen: a stray `writes` bit
+        // would cost a pointless D2H writeback of a read-only array, and a
+        // stray `reads` bit would silently disable the chunked overlap for
+        // an array nothing reads.
+        let saved_writes = self.writes_param_mask;
+        let saved_reads = self.reads_param_mask;
+        let saved_bounds_label = self.used_bounds_label;
+
+        let real_body = std::mem::take(&mut self.body);
+        let then_ok = self.walk_straight(plan.then_start, plan.then_goto_pc, loop_info);
+        let then_text = std::mem::take(&mut self.body);
+        let then_state = BlockState {
+            stack: self.stack.clone(),
+            locals: self.locals.clone(),
+        };
+
+        self.stack = saved.stack.clone();
+        self.locals = saved.locals.clone();
+        let else_ok = if then_ok.is_ok() {
+            self.walk_straight(plan.else_start, plan.join, loop_info)
+        } else {
+            Ok(())
+        };
+        let else_text = std::mem::take(&mut self.body);
+        let else_state = BlockState {
+            stack: self.stack.clone(),
+            locals: self.locals.clone(),
+        };
+
+        self.body = real_body;
+        let budget = self.if_convert_budget;
+        let cost = speculation_cost(&then_text)
+            .zip(speculation_cost(&else_text))
+            .map(|(a, b)| a.saturating_add(b));
+        let usable = then_ok.is_ok()
+            && else_ok.is_ok()
+            && cost.is_some_and(|c| c <= budget)
+            && then_state.stack.0.len() == else_state.stack.0.len();
+        if !usable {
+            self.stack = saved.stack;
+            self.locals = saved.locals;
+            self.writes_param_mask = saved_writes;
+            self.reads_param_mask = saved_reads;
+            self.used_bounds_label = saved_bounds_label;
+            return Ok(false);
+        }
+
+        // Build the merge before committing any text, so a slot pair no
+        // `selp` can express still leaves the emitter untouched.
+        let Some((merged, selps)) = self.plan_merge(&then_state, &else_state, predicate) else {
+            self.stack = saved.stack;
+            self.locals = saved.locals;
+            self.writes_param_mask = saved_writes;
+            self.reads_param_mask = saved_reads;
+            self.used_bounds_label = saved_bounds_label;
+            return Ok(false);
+        };
+
+        self.body.push_str(&then_text);
+        self.body.push_str(&else_text);
+        for line in selps {
+            self.body.push_str(&line);
+        }
+        self.stack = merged.stack;
+        self.locals = merged.locals;
+        if plan.join < end {
+            let state = BlockState {
+                stack: self.stack.clone(),
+                locals: self.locals.clone(),
+            };
+            self.copy_state_to_edge(&state, plan.join, None, entries)?;
+        }
+        Ok(true)
+    }
+
+    /// Emit `[from, to)` as straight-line code. The caller has already
+    /// established that the range holds no control flow.
+    fn walk_straight(
+        &mut self,
+        from: usize,
+        to: usize,
+        loop_info: &CountedLoop,
+    ) -> Result<(), LoweringError> {
+        let mut pc = from;
+        while pc < to {
+            let op = self.bytes[pc];
+            let size = instr_size(self.bytes, pc)?;
+            if size == 0 || pc + size > to {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "instruction at pc={pc} runs past the speculated arm"
+                )));
+            }
+            self.emit_op(op, pc, Some(loop_info))?;
+            pc += size;
+        }
+        Ok(())
+    }
+
+    /// The `selp` merge of two arms' end states, or `None` when some slot
+    /// pair cannot be expressed as one.
+    ///
+    /// `predicate` is TRUE on the branch-TAKEN path, which is the `else`
+    /// arm -- so the operand order is `selp d, else, then, p`. Reversing
+    /// it yields a kernel that computes both right values and keeps the
+    /// wrong one, which no shape test would catch.
+    fn plan_merge(
+        &mut self,
+        then_state: &BlockState,
+        else_state: &BlockState,
+        predicate: &Reg,
+    ) -> Option<(BlockState, Vec<String>)> {
+        let mut lines = Vec::new();
+        let mut stack = Vec::with_capacity(then_state.stack.0.len());
+        for (t, e) in then_state.stack.0.iter().zip(&else_state.stack.0) {
+            stack.push(self.merge_slot(t, e, predicate, &mut lines)?);
+        }
+        let local_count = then_state.locals.0.len().max(else_state.locals.0.len());
+        let mut locals = Vec::with_capacity(local_count);
+        for i in 0..local_count {
+            let t = then_state.locals.0.get(i).and_then(Option::as_ref);
+            let e = else_state.locals.0.get(i).and_then(Option::as_ref);
+            locals.push(match (t, e) {
+                (Some(t), Some(e)) => Some(self.merge_slot(t, e, predicate, &mut lines)?),
+                // Bound on one arm only: dead after the join for any
+                // verifier-valid method, exactly as `copy_matching_state`
+                // already assumes for the branching form.
+                _ => None,
+            });
+        }
+        Some((
+            BlockState {
+                stack: OpStack(stack),
+                locals: Locals(locals),
+            },
+            lines,
+        ))
+    }
+
+    /// One slot of [`Emitter::plan_merge`].
+    fn merge_slot(
+        &mut self,
+        t: &Reg,
+        e: &Reg,
+        predicate: &Reg,
+        lines: &mut Vec<String>,
+    ) -> Option<Reg> {
+        if t.name == e.name {
+            return Some(t.clone());
+        }
+        if t.kind != e.kind || t.wide != e.wide {
+            return None;
+        }
+        // A `U64` slot is an array reference, and the array lowering
+        // identifies an array BY its parameter-pointer register -- a
+        // merged one would be an array nothing can resolve, the same
+        // reason `canonicalise_state` refuses to phi them. A predicate
+        // and the raw-16-bit conversion temporary never legitimately
+        // live across a join.
+        let suffix = match t.kind {
+            RegKind::U32 => "u32",
+            RegKind::S32 => "s32",
+            RegKind::S64 => "s64",
+            RegKind::F32 => "f32",
+            RegKind::F64 => "f64",
+            RegKind::U64 | RegKind::Pred | RegKind::B16 => return None,
+        };
+        let dst = self.regs.fresh_reg_with_wide(t.kind, t.wide);
+        lines.push(format!(
+            "    selp.{suffix} {}, {}, {}, {};\n",
+            dst.name, e.name, t.name, predicate.name
+        ));
+        Some(dst)
     }
 
     fn cfg_block_starts(
@@ -3811,9 +4355,35 @@ pub(crate) fn locate_bound(
         if let Some(src) = pre_loop_bound_source(bytes, loop_info.header_pc, slot, sig)? {
             return Ok(src);
         }
+        // `for (int i = 0; i < n; i++)` with `n` an `int` PARAMETER: the
+        // bound is the parameter itself, never stored to. The guard it
+        // needs is the same `tid >= bound` as every other shape. What it
+        // is not is a free acceptance: the launch grid is otherwise sized
+        // from the largest array argument, and a scalar bound can exceed
+        // every one of them, so admitting this shape without telling the
+        // host would under-provision threads and silently drop the tail of
+        // the loop. The acceptance is therefore paired with
+        // `WorkBound::ParamScalar`, which makes the dispatch site size the
+        // grid from this parameter's runtime value; see that variant.
+        //
+        // Only an UNMODIFIED parameter qualifies. A slot the method stores
+        // to is not the parameter's incoming value at the header, and
+        // proving which store reaches the header is dataflow this
+        // recognizer deliberately does not do.
+        if let Some(idx) = int_param_index_for_local(sig, slot) {
+            if !local_is_ever_stored(bytes, slot)? {
+                return Ok(BoundSource::ParamScalar(idx));
+            }
+            return Err(LoweringError::UnsupportedNode(format!(
+                "loop bound is `int` parameter {idx} (local {slot}), but the \
+                 method stores to that local, so it is not provably the \
+                 parameter's incoming value at the loop header"
+            )));
+        }
         return Err(LoweringError::UnsupportedNode(format!(
-            "loop bound is local {slot}, but its definition is not an \
-             arraylength of a method parameter — bound is unknown"
+            "loop bound is local {slot}, but its definition is neither an \
+             arraylength of a method parameter nor an unmodified `int` \
+             parameter - bound is unknown"
         )));
     }
     // Literal bound — bipush / sipush / iconst_*
@@ -3898,6 +4468,84 @@ fn pre_loop_bound_source(
     Ok(None)
 }
 
+/// Parameter index of the `int` parameter occupying local `slot`, or
+/// `None` when that slot is not a declared parameter or is not an `int`.
+///
+/// Only `ParamKind::I32` qualifies. A `long` bound would need a 64-bit
+/// guard and a grid sized from a value a launch cannot represent; a
+/// floating bound is not a trip count at all.
+fn int_param_index_for_local(sig: &KernelSignature, slot: u16) -> Option<u32> {
+    let mut s = 0u16;
+    for (i, k) in sig.param_kinds.iter().enumerate() {
+        if s == slot {
+            return match k {
+                ParamKind::I32 => u32::try_from(i).ok(),
+                _ => None,
+            };
+        }
+        s += match k {
+            ParamKind::I64 | ParamKind::F64 => 2,
+            ParamKind::Void => 0,
+            _ => 1,
+        };
+    }
+    None
+}
+
+/// Whether any instruction in the method writes local `slot`.
+///
+/// Deliberately whole-method and opcode-level rather than
+/// reaching-definitions: the question is "is this local still the
+/// incoming parameter value", and one store anywhere is enough to make
+/// the answer "not provably". `iinc` counts as a store.
+fn local_is_ever_stored(bytes: &[u8], slot: u16) -> Result<bool, LoweringError> {
+    let mut pc = 0usize;
+    while pc < bytes.len() {
+        let op = bytes[pc];
+        let size = instr_size(bytes, pc)?;
+        if pc + size > bytes.len() {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "instruction at pc={pc} runs past the end of the bytecode                  ({} bytes) - truncated Code attribute",
+                bytes.len()
+            )));
+        }
+        // `(base slot, how many slots it covers)`. A `lstore`/`dstore`
+        // writes TWO slots, and a later method body is free to reuse a
+        // dead parameter's slot as the upper half of one - so counting
+        // only the named slot would report "never stored" for a slot
+        // that is in fact overwritten.
+        let stored: Option<(u16, u16)> = match op {
+            // istore / fstore / astore
+            0x36 | 0x38 | 0x3A => bytes.get(pc + 1).map(|b| (*b as u16, 1)),
+            // lstore / dstore
+            0x37 | 0x39 => bytes.get(pc + 1).map(|b| (*b as u16, 2)),
+            // istore_<n>, fstore_<n>, astore_<n>
+            0x3B..=0x3E | 0x43..=0x46 | 0x4B..=0x4E => Some((((op - 0x3B) % 4) as u16, 1)),
+            // lstore_<n>, dstore_<n>
+            0x3F..=0x42 | 0x47..=0x4A => Some((((op - 0x3B) % 4) as u16, 2)),
+            // iinc
+            0x84 => bytes.get(pc + 1).map(|b| (*b as u16, 1)),
+            // wide istore/fstore/astore and wide iinc: one slot
+            0xC4 if matches!(bytes.get(pc + 1), Some(0x36) | Some(0x38) | Some(0x3A) | Some(0x84)) =>
+            {
+                Some((u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]), 1))
+            }
+            // wide lstore/dstore: two
+            0xC4 if matches!(bytes.get(pc + 1), Some(0x37) | Some(0x39)) => {
+                Some((u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]), 2))
+            }
+            _ => None,
+        };
+        if let Some((base, width)) = stored {
+            if slot >= base && slot - base < width {
+                return Ok(true);
+            }
+        }
+        pc += size;
+    }
+    Ok(false)
+}
+
 fn param_len_for_local(sig: &KernelSignature, slot: u16) -> Result<BoundSource, LoweringError> {
     let mut s = 0u16;
     for (i, k) in sig.param_kinds.iter().enumerate() {
@@ -3927,4 +4575,8 @@ pub(crate) enum BoundSource {
     ParamLen(usize),
     /// A literal compile-time constant.
     Literal(i32),
+    /// `pN` - an unmodified `int` parameter used directly as the bound.
+    /// See [`crate::emitter::WorkBound::ParamScalar`] for the obligation
+    /// this one puts on the host that the other two do not.
+    ParamScalar(u32),
 }
