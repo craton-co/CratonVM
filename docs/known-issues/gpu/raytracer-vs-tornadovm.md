@@ -842,31 +842,33 @@ comparison here is therefore paired, arm-alternating, and reported as a
 ratio or a per-round win count, and the absolute milliseconds are labelled
 with whether their pass was quiet.
 
-That is not a caveat, it is one of the findings. §13.6's decomposition was
-run twice — once against a loaded box and once against a quiet one — and
-the loaded pass manufactured a conclusion that the quiet pass does not
-support. Both are written down there, because the shape of the mistake is
-more useful than the number.
+That is not a caveat, it is one of the findings. §13.6's decomposition took
+four passes, and the first three each produced a confident wrong answer
+with a mechanism ready to explain it. They are all written down there,
+because the failure mode is not "noisy numbers" — it is plausible
+structure, and a loaded box produces that as readily as a real effect.
 
 ## 13.1 A fourth resolution, 11520×6480 — the margin keeps shrinking
 
 74,649,600 pixels, 2.25x the 8K point and 27x the largest size §7 ever
-reached. `bench-gpu/run-raytracer-interleaved.sh`, 4 rounds, arm order
-alternated, `XMX=10g` (the frame is an `int[]` of 298 MB and all three
-arms allocate one):
+reached. `bench-gpu/run-raytracer-interleaved.sh`, 6 rounds, arm order
+alternated, `XMX=10g` (the frame is an `int[]` of 298 MB and all three arms
+allocate one), on a host gated quiet:
 
 | round | CratonVM `--gpu` | TornadoVM PTX | ratio |
 |---|---:|---:|---:|
-| 1 | 51.85 | 82.54 | 1.59x |
-| 2 | 35.34 | 62.89 | 1.78x |
-| 3 | 35.33 | 71.96 | 2.04x |
-| 4 | 35.30 | 74.88 | 2.12x |
-| **mean** | **39.45** | **73.07** | **1.85x** |
+| 1 | 35.08 | 60.83 | 1.73x |
+| 2 | 29.15 | 56.50 | 1.94x |
+| 3 | 33.43 | 60.58 | 1.81x |
+| 4 | 34.69 | 61.45 | 1.77x |
+| 5 | 29.20 | 60.91 | 2.09x |
+| 6 | 35.30 | 63.97 | 1.81x |
+| **mean** | **32.81** | **60.71** | **1.85x** |
 
-CratonVM won 4/4. Round 1 is both arms' cold-GPU round — an idle RTX 2060
-on this box sits at `P8` and 300 MHz against a 2100 MHz maximum — and
-CratonVM's three warm rounds are 35.30/35.33/35.34, which is as stable as
-anything in this document.
+CratonVM won 6/6. An earlier pass of the same six rounds against a loaded
+box put both arms 30% higher (43.64 vs 84.55) and returned the same ratio to
+within 5% — which is what pairing is for, and is the only thing about the
+loaded pass worth keeping.
 
 So the curve now reads **2.5x → 2.2x → 2.0x → 1.85x** across 2.76M, 8.29M,
 33.2M and 74.6M pixels. §7 extrapolated a ~33% floor (1.5x) from the
@@ -1052,6 +1054,11 @@ each:
 |---|---:|---:|---:|
 | dev tip, before this work | 1.8135 ms | 1.2489 ms | **1.452x** |
 | with the pool and the elision | 1.8494 ms | 1.2727 ms | **1.453x** |
+| the same, on a quiet host | 1.6892 ms | 1.1558 ms | **1.462x** |
+
+The third row is the one to read: five rounds spanning 1.441x to 1.493x,
+a 3.6% spread, against a first pair taken while the box was busy. The
+overlap is where it was.
 
 That is the arithmetic, not a surprise: a frame is 8 chunk launches, so the
 whole per-launch saving here is ~16 driver calls against a 1.25 ms frame —
@@ -1074,43 +1081,83 @@ mis-stated: this is a per-LAUNCH saving, so it is worth what the launch
 rate makes it worth, and the ray tracer's launch rate is two orders of
 magnitude below the workload where it matters.
 
-## 13.6 The fixed-cost / per-pixel model breaks down past 8K
+## 13.6 The fit still holds past 8K — and a loaded box said three times that it did not
 
 §12 asked whether "the same ~0.104 ms fixed / ~0.564 ns per-pixel fit still
-holds, or whether something changes past 8.3M pixels". Something changes.
+holds, or whether something changes past 8.3M pixels". Nothing changes. Four
+sizes spanning a 27x range, `bench-gpu/run-transfer-decomposition.sh` running
+`GpuTransferFloor` (same launch shape, same bytes out, no arithmetic) and
+`RayTracerKernel` alternately within each size, minimum per arm across
+rounds, on a host gated quiet by `bench-gpu/wait-for-quiet.sh`:
 
-`bench-gpu/run-transfer-decomposition.sh` runs `GpuTransferFloor` (same
-launch shape, same bytes out, no arithmetic) and `RayTracerKernel`
-alternately within each size and takes the minimum per arm across rounds —
-a minimum rather than a mean because contention on this box only ever makes
-a run slower, and an earlier mean-based pass put a loaded tracer reading
-*below* its own floor and fitted a negative fixed cost out of it.
-
-| pixels | floor | tracer | floor ns/px | tracer ns/px | compute ns/px |
+| pixels | floor | tracer | floor ns/px | tracer ns/px | **compute ns/px** |
 |---:|---:|---:|---:|---:|---:|
-| 2,764,800 | 1.0441 ms | 1.3004 ms | 0.378 | 0.470 | 0.093 |
-| 8,294,400 | 3.5689 ms | 3.8226 ms | 0.430 | 0.461 | 0.031 |
-| 33,177,600 | 14.4517 ms | 15.6162 ms | 0.436 | 0.471 | 0.035 |
-| 74,649,600 | 35.5373 ms | 39.7437 ms | 0.476 | 0.532 | 0.056 |
+| 2,764,800 | 1.0015 ms | 1.0828 ms | 0.362 | 0.392 | **0.029** |
+| 8,294,400 | 2.9939 ms | 3.1862 ms | 0.361 | 0.384 | **0.023** |
+| 33,177,600 | 12.5718 ms | 13.1611 ms | 0.379 | 0.397 | **0.018** |
+| 74,649,600 | 31.4237 ms | 33.3750 ms | 0.421 | 0.447 | **0.026** |
 
-Two findings, and the first invalidates the model rather than refining it.
+**The compute half — the quantity this decomposition exists to isolate — is
+flat at 0.018 to 0.029 ns/px over a 27x range in n.** After §8c collapsed
+the double-precision square roots, this kernel is a transfer with some
+arithmetic attached, and nothing about that changes at 4K, at 8K, or an
+octave past 8K. §12's shrinking vs-TornadoVM margin is therefore a transfer
+story, and the thing to profile next is the writeback path, not the kernel.
 
-**The transfer floor's per-pixel cost is not constant — it rises with n.**
-0.378 to 0.476 ns/px from 2.76M to 74.6M pixels, and that is the direction
-a fixed cost cannot produce: a genuine fixed term makes the per-pixel
-figure LARGER at small n, not smaller. Subtracting §7's own 0.104 ms fixed
-term makes the trend steeper still, 0.340 to 0.475 ns/px, a 40%
-degradation. A two-parameter `fixed + per_pixel * n` least-squares fit over
-these four points returns a NEGATIVE intercept, which is the fit's way of
-saying the model is wrong rather than the data being noisy.
+The transfer floor's own per-pixel figure is quoted with less confidence
+than the compute column. A second quiet pass over the same four sizes read
+0.354 / 0.356 / 0.345 / 0.355 ns/px — flat where the table above rises 16% —
+so the floor is not resolved here to better than about 18% at the large
+sizes, and any trend inside that band is not a finding. (It is also why the
+least-squares fit over these four points returns a small NEGATIVE intercept:
+a slope that wanders by 16% across the range makes a two-parameter fit
+report the wander rather than a fixed cost. The per-size numbers are the
+measurement; the fit is not.)
 
-**The compute half is small and is not what moves.** 0.03-0.09 ns/px
-against a 0.38-0.48 ns/px floor: after §8c collapsed the double-precision
-square roots, this kernel is overwhelmingly a transfer rather than a
-computation. So §13.1's shrinking vs-TornadoVM margin is a transfer story,
-and the thing to profile next is the writeback path at large n — the
-page-locked staging slab, the host memcpy into the Java heap, and whatever
-WDDM does with a 298 MB pinned buffer — not the kernel.
+### The three answers this produced before it produced the right one
+
+That table took four passes, and the first three each produced a confident
+wrong finding. They are worth writing down, because the failure mode is not
+"noisy numbers" — it is *plausible structure*:
+
+1. **Mean over rounds, loaded box.** One loaded tracer round put a tracer
+   reading BELOW its own floor, and the fit returned a negative fixed cost
+   with a straight face.
+2. **Minimum over rounds, loaded box.** No more impossibilities, and a clean
+   monotone story instead: the floor's per-pixel cost "rises 40% with n",
+   0.340 to 0.475 ns/px. It is the kind of finding that gets written up —
+   PCIe queueing, device-memory pressure, a page-locked slab past some
+   threshold. It is not there.
+3. **Minimum over rounds, quiet until the last size.** The floor came out
+   flat and the tracer tracked it to 33.2M, then added 13.7 ms at 74.6M — a
+   sharp, localised cliff at exactly one size, which is the most convincing
+   shape of all. The chunk A/B settles it: quiet, `chunks=8` at that size is
+   30.89 ms, and the 40.24 ms the loaded pass recorded is almost exactly its
+   own `chunks=1` number. The loaded pass had measured the un-overlapped
+   path.
+
+Each of those had a mechanism ready for it. None of them was the mechanism.
+`wait-for-quiet.sh` exists because of the third one.
+
+### And the overlap is alive at every size
+
+The cliff hypothesis was worth testing on its own terms, since serial
+dispatch is `kernel + transfer` where overlapped is `max(kernel, transfer)`
+— and a floor whose kernel is ~0 cannot tell the two apart, which is exactly
+why it would stay linear while the tracer did not. Same-binary A/B on
+`CRATONVM_GPU_CHUNKS`, quiet, paired rounds:
+
+| pixels | `chunks=1` | `chunks=8` | overlap |
+|---:|---:|---:|---:|
+| 2,764,800 | 1.6892 ms | 1.1558 ms | **1.462x** |
+| 8,294,400 | 4.6381 ms | 3.7354 ms | **1.242x** |
+| 33,177,600 | 17.3413 ms | 13.6579 ms | **1.270x** |
+| 74,649,600 | 42.4034 ms | 30.8858 ms | **1.373x** |
+
+It never stops working. The 1.462x at 1920×1440 also reproduces §8d's 1.51x
+at the same size to within the 3.6% spread of its own five rounds — which,
+for a number first measured eight days and several hundred commits earlier,
+is the closest thing this record has to a control.
 
 ## 13.7 Where the CPU path's remaining 5.3x goes: mostly the vectorizer
 
