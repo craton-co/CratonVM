@@ -322,6 +322,28 @@ yourself does.
   path. It wants a lane that can run Groovy, Netty and Spring against it —
   the same three the return-type half was A/B'd on.
 
+## 7b. A fix this lane wrote and then dropped, and why that was right
+
+While verifying, this lane independently diagnosed and fixed the
+`cratonvm/internal/ArrayListViewItr` refusal that killed its caller under
+`--jdk-only` — the last mode defect in the corpus. L6 landed the same fix first
+(`844c581fa`, `SnapshotItrRoute::ViewCollection`), so this lane's duplicate was
+dropped on merge in favour of theirs.
+
+**Theirs is better, and specifically it avoids a hazard this lane's version
+had.** `real_snapshot_iterator` uses the array it is handed DIRECTLY when the
+length already matches the count. This lane passed the view's own backing array,
+and the route's `remove()` shifts that same array — so the cursor would skip the
+element after every removal. L6's version copies first, and its record says so
+in as many words. A 21-row probe did not expose it; reading the callee did.
+
+**The lesson is about how the duplicate was missed, not about the fix.** This
+lane DID check `dev` for duplicate work immediately before merging — by grepping
+for `SnapshotItrRoute::ArrayListView`, its own name for the route. L6 called it
+`ViewCollection`. **Grepping your own identifier only ever finds your own work;
+check the SITE.** The right query was the mint site, `alloc_arraylist_iterator`,
+which would have hit on the first try.
+
 ## 8. Verification
 
 ```text
