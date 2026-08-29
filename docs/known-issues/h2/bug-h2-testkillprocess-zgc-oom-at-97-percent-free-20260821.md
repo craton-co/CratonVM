@@ -2,6 +2,37 @@
 
 ## Status
 
+> ### 2026-08-29 — read this first
+>
+> **The page's own class has passed since 2026-08-24/26. What was still failing
+> on 2026-08-28 — `TestMVStoreTool` and `TestCachedQueryResults` — was failing
+> on FOUR defects, and §"Follow-up 2026-08-29" fixes all four.** In the order
+> that matters:
+>
+> 1. **The slide was discarding every byte it emptied** whenever the cursor
+>    could not follow it down, and no later sweep could rediscover them (the
+>    sweep walks the object-start registry, which the slide has just rebuilt).
+>    885 793 objects relocated per run and the largest free block was 8 184
+>    bytes.
+> 2. **The large-object end had no compactor at all** — 99–198 free blocks
+>    where one would do.
+> 3. **The TLAB refill floor** was one notch above what the free list could
+>    serve, so every refill bumped and the 128 MiB large-object reserve was
+>    spent on churn.
+> 4. **The region tripwire** meant to catch small objects leaking into that end
+>    was armed on three exits that could not fire it.
+>
+> Each has a same-binary kill switch (`CRATONVM_ZGC_PUBLISH_VACATED`,
+> `CRATONVM_ZGC_HIGH_COMPACTION`, `CRATONVM_ZGC_TLAB_STARVED_RECYCLE`) and its
+> own engagement counter on the `[GC] zgc-high-compaction:` line, because the
+> feature this work supersedes shipped reading zero for a week and the only
+> reason anyone found out is that it carried a counter.
+>
+> **Everything below this box is the record of how the diagnosis got here**,
+> including three attributions this page had to withdraw. Read
+> §"What this page no longer tracks, and where it went" for where each 2026-08-28
+> row ended up.
+
 **FIXED for this class 2026-08-24. Two classes remain, on a DIFFERENT
 obligation.** `TestKillProcessWhileWriting` passes in the default configuration
 — `rc=0`, zero `OutOfMemoryError`, zero `arena allocation failed` — on three
