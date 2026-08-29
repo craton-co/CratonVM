@@ -3089,33 +3089,33 @@ pub(crate) fn native_class_for_name(
         // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
         //
         // MEASURED on JDK 25, and asserted by two vectors that were already in
-        // the tree before this branch existed:
+        // the tree before this arm existed:
         //
         //   Class.forName("[Lp.X;")   ->  CNFE msg="p.X"   cause=null
         //   Class.forName("[[Lp.X;")  ->  CNFE msg="p.X"   cause=null
         //
         // `regression-suite/src/RExceptions.java:382` and
         // `RJdkFailure.java:168` both check exactly this, and both turned red
-        // when this branch was added with `&dotted_name` -- the descriptor --
-        // as the message. HotSpot resolves the descriptor down to the element
+        // when this arm was added with `&dotted_name` -- the descriptor -- as
+        // the message. HotSpot resolves the descriptor down to the element
         // class and reports the resolution that actually failed, which is the
         // name a caller can act on: `[Lp.X;` is not a name anything can be
         // asked for again.
-        let element = {
-            let mut e = dotted_name.trim_start_matches('[');
-            if e.starts_with('L') && e.ends_with(';') {
-                e = &e[1..e.len() - 1];
-            }
-            // A descriptor whose element is not a reference type (`[I`, or a
-            // malformed spelling) has no element NAME to report; keep what the
-            // caller passed rather than inventing one.
-            if e.is_empty() { dotted_name.clone() } else { e.to_string() }
-        };
+        //
+        // Through `for_name_cnfe_name`, which is exactly this rule and is what
+        // the two loader arms further down already call. Two lanes fixed this
+        // on the same day and the other one re-derived the extraction inline;
+        // a third copy of a rule that already has a named home is how the
+        // multi-dimension case (`[[Lp.X;`) ends up handled in two places and
+        // then in one. The helper delegates to
+        // `cratonvm_classloading::array_descriptor_element_class`, which strips
+        // every dimension and returns `None` -- so the caller's own name
+        // survives -- for `[I` and for malformed spellings.
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &element,
+            &for_name_cnfe_name(&dotted_name),
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }

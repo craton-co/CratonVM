@@ -3616,6 +3616,37 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
                 } else {
                     None
                 };
+
+            // A modular jar reached through `-cp` is an UNNAMED-module citizen:
+            // a real JVM ignores its `module-info` outright, and `getModule()`
+            // answers the loader's unnamed module. This VM's registry scans the
+            // application class path for `module-info.class` and registers what
+            // it finds (so readability checks pass for e.g. `org.jboss.logging`),
+            // which made this accessor report `ch.qos.logback.classic` for a
+            // class-path class.
+            //
+            // MEASURED 2026-08-28, `probes/L7ModuleProbe`, both modes:
+            //
+            //   ch.qos.logback.classic.spi.LogbackServiceProvider
+            //     HotSpot   isNamed=false  name=null
+            //     CratonVM  isNamed=true   name=ch.qos.logback.classic
+            //
+            // It is not a labelling nicety. `ServiceLoader`'s classpath lookup
+            // iterator does `if (clazz.getModule().isNamed()) continue;` — a
+            // SILENT skip, no error and no report row — so every classpath SPI
+            // provider disappeared. Under `--jdk-only`, where the ServiceLoader
+            // synthetic stubs are refused and the real bytecode runs, that made
+            // SLF4J bind `NOPLoggerFactory` and every Spring Boot application
+            // die in `LogbackLoggingSystem.beforeInitialize`.
+            //
+            // Same rule, same predicate, as `populate_boot_layer_modules` and
+            // `ModuleRegistry::providers_for_service`; this is its fourth door.
+            // A `--module-path` module is re-registered `automatic = false` by
+            // `vm_init` immediately after `ClassManager::new`, so it is NOT
+            // class-path-only and is unaffected — which is what
+            // `regression-suite/src/RJdkModule.java` pins.
+            let module_name = module_name.filter(|n| !ctx.module_is_class_path_only(n));
+
             if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {
                 return Ok(Some(Value::Object(Some(cached))));
             }
