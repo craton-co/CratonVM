@@ -544,3 +544,158 @@ when there is no element name to report (`[I`, or a malformed spelling).
 Recorded here rather than as its own page because it is one line and nothing is
 left open — but recorded, because a red vector on `dev` blocks every lane, and
 the next worker to meet it should not have to re-derive that it is not theirs.
+
+---
+
+## 9. The residuals, measured — 2026-08-29
+
+§4 named four residual categories whose adjudication rested on a missing
+measurement. This section is those measurements. Two categories close; two
+stay open with a number instead of a hypothesis.
+
+### 9.1 The multi-image census — §4.6 CLOSES, and it reverses three rows
+
+§4.6 listed nine registrations for methods JDK 25 does not declare, and said
+the prerequisite for retiring them was the multi-image sweep. That sweep is
+run: `probes/UnsafeImageCensus.java` asks a running image whether it declares
+each of CratonVM's **212 distinct `Unsafe` registration triples**, and whether
+each is `native` or bytecode. Pure reflection — `getDeclaredMethod` is a lookup
+and opens nothing — so one `--release 17` build runs on every image with no
+flags.
+
+Images: `/data/jdkimages/jdk{17,21,25}-linux`, i.e. **17.0.20.1+1**,
+**21.0.12+8**, **25.0.4+7**.
+
+```text
+                 absent   native   bytecode
+  JDK 17            7       70       133
+  JDK 21            7       68       135
+  JDK 25           10       68       132
+```
+
+Every row that is absent somewhere, or that disagrees across images:
+
+| class | method | 17 | 21 | 25 |
+| --- | --- | --- | --- | --- |
+| `jdk.internal.misc.Unsafe` | `defineAnonymousClass` | ABSENT | ABSENT | ABSENT |
+| `jdk.internal.misc.Unsafe` | `getReferencePlain` | ABSENT | ABSENT | ABSENT |
+| `jdk.internal.misc.Unsafe` | `putReferencePlain` | ABSENT | ABSENT | ABSENT |
+| `jdk.internal.misc.Unsafe` | `monitorEnter` | ABSENT | ABSENT | ABSENT |
+| `jdk.internal.misc.Unsafe` | `monitorExit` | ABSENT | ABSENT | ABSENT |
+| `jdk.internal.misc.Unsafe` | `park(Object,long)` | ABSENT | ABSENT | ABSENT |
+| `sun.misc.Unsafe` | `defineClass` | ABSENT | ABSENT | ABSENT |
+| **`jdk.internal.misc.Unsafe`** | **`weakCompareAndSetObject`** | **bytecode** | **bytecode** | ABSENT |
+| **`sun.misc.Unsafe`** | **`ensureClassInitialized`** | **bytecode** | **bytecode** | ABSENT |
+| **`sun.misc.Unsafe`** | **`shouldBeInitialized`** | **bytecode** | **bytecode** | ABSENT |
+| `jdk.internal.misc.Unsafe` | `loadFence` | native | bytecode | bytecode |
+| `jdk.internal.misc.Unsafe` | `storeFence` | native | bytecode | bytecode |
+
+**Three of my nine candidates are alive on 17 and 21.** Retiring
+`weakCompareAndSetObject`, `sun` `ensureClassInitialized` and `sun`
+`shouldBeInitialized` on JDK 25's evidence would have removed the only
+implementation those two images have. That is exactly the failure
+[`WORKER-3-NOTE-2`](WORKER-3-NOTE-2-the-multi-image-method-sweep-says-192-not-342-20260821.md)
+recorded, reproduced here on the family it warned about.
+
+The other seven are absent from all three supported images. **They are still
+not retired in this commit**, and the reason is narrower than before: the
+synthetic-JDK mode is a fourth image this census does not cover, and
+`classloading/src/class_manager.rs` fabricates these two classes for it. What
+it fabricates is only `<clinit>`, so on the evidence a retirement looks safe —
+but "looks safe from reading" is not the standard this campaign uses, and the
+synthetic-JDK arm was not run. The seven are handed over as a measured,
+adjudicated list rather than a guess.
+
+**A by-product worth its own line.** `native-builtins/src/deprecated_verify.rs`
+tags `sun/misc/Unsafe.defineClass` as `ImageStatus::Declared`, whose own doc
+says *"At least one supported image declares the triple … and MUST stay"*. The
+census says ABSENT on 17, 21 and 25. The tag is wrong, and nothing could catch
+it: the test asserts the REGISTRATION is present for a `Declared` row and never
+checks the claim against an image, so the `Declared` half is unfalsifiable
+while the `AbsentFromAllSupportedImages` half is enforced. By that file's own
+rule the row should be retagged and its registration removed. Left for whoever
+owns T8, with the measurement attached.
+
+### 9.2 `arrayIndexScale` on a non-array — §4.3 CLOSES, and the value changed
+
+§4.3 declined to change the catch-all `1` because the blast radius across
+JCTools-shaped consumers was unmeasured. It is measured now, over the whole
+117-vector corpus in both modes:
+
+```text
+  arrayIndexScale ASKED       161 (compatible) / 175 (strict), in ALL 117 vectors
+  ... with a NON-ARRAY class    0                  0
+```
+
+The path is thoroughly exercised and the non-array arm is never reached. Blast
+radius zero, so the specified answer is free: **a non-array now scales 0**,
+which is what the `sun.misc` javadoc says and what makes a caller's
+`if (scale == 0) throw` guard fire instead of handing it a plausible basis for
+address arithmetic over a class with no elements.
+
+The row still differs from the oracle — HotSpot's refusal is the broken one
+recorded on 2026-08-26 — but it now differs by being *correct* rather than by
+being a different kind of wrong.
+
+### 9.3 The null-base fallback — §4.5 stays OPEN, with a number
+
+The fix §4.5 specified needs to know what reaches the fallback. Instrumented at
+all 21 null-base fallback sites and run over the same corpus:
+
+```text
+  null-base fallback REACHED        5 warn-lines, 1 vector (RChmKeySetView)
+  ... offset UNCLASSIFIED           0             0 vectors
+```
+
+(The warn is rate-limited to the first occurrence and then powers of two, so
+five lines is at least sixteen calls in that one process. A zero, by contrast,
+is exact: the first occurrence always warns.)
+
+So the fallback is genuinely exercised, and every offset that reached it was
+an arena handle, a synthetic offset or a registered static field. The refusal —
+an `IllegalArgumentException`, matching what `setMemory`/`copyMemory` already
+do at address 0 — would cost nothing on this corpus.
+
+**It is still not taken, and the measurement is what sharpens the reason.**
+The corpus does not contain the three definition-of-done workloads, and this
+family's sibling fallback is documented as existing precisely for WildFly and
+Spring Boot — which are not in it either (§4.1, and `objectFieldOffset1` minted
+**0** synthetic offsets across the same 117 vectors, in both modes: its rescue
+path is rare, not routine, and the corpus cannot see it). A zero measured on a
+corpus that excludes the workloads a path was written for is weak evidence
+about that path.
+
+**What would close it:** run the same instrument under L7's three
+definition-of-done workloads. The instrument is left in the tree for that
+purpose — `note_unsafe_side_store_offset` in `unsafe_natives_ext.rs`, one
+relaxed `fetch_add` on a branch every classified access returns before
+reaching. If `UNCLASSIFIED-NULL-BASE` is silent there too, the refusal is
+licensed and is a four-line change.
+
+### 9.4 Method note: my own instrument lied to me twice
+
+Both worth carrying, because neither is about the VM.
+
+**The instrument was mute, and only the positive control said so.** The
+`arrayIndexScale` counter went into the `_` arm of the match — and an early
+`if (bytes.first() != Some(&b'['))  { return 1; }` stands in front of it, so
+the arm only ever sees a name that starts with `[` and has an unrecognised
+second byte, which nothing produces. The first corpus run reported a clean zero
+from a counter that could not fire. The control — the sweep, which asks
+`arrayIndexScale(String.class)` three times — is what caught it.
+`a-cheap-check-in-front-of-an-informative-one-hides-its-zero`, in the
+instrument this time rather than in the code under test.
+
+**The denominator's message contained the numerator's name.** The denominator
+warn read *"…DENOMINATOR for UNCLASSIFIED-NULL-BASE"*, and the grep that
+counted hits matched that string, so every denominator line was also counted as
+a hit — reporting 5 unclassified and 175 non-array where the true counts are 0
+and 0. The tell was that the two columns were *exactly equal* in both modes.
+An instrument that names the thing it is a denominator for cannot be read by
+grep.
+
+And a third, from the run before those: a bare `javac src/*.java` over the
+corpus gives 58 errors, because the vectors depend on a named module the suite
+assembles first. Every counter read zero because no vector ran. **A zero from a
+run that did not happen is not a zero** — the count now reuses `run.sh`'s own
+build and prints how many vectors it actually executed.

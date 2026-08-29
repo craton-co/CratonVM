@@ -517,9 +517,22 @@ mod tests {
         assert_eq!(array_index_scale_for_name("[Ljava/lang/Object;"), 8);
         assert_eq!(array_index_scale_for_name("[Ljava/lang/String;"), 8);
         assert_eq!(array_index_scale_for_name("[[I"), 8);
-        // Non-array or unknown → defensive default of 1.
-        assert_eq!(array_index_scale_for_name("java/lang/Object"), 1);
-        assert_eq!(array_index_scale_for_name(""), 1);
+        // Non-array or unknown → 0, which is what
+        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
+        // callers guard on with `if (scale == 0) throw`.
+        //
+        // This assertion said 1 until 2026-08-29 and called it a "defensive
+        // default". It was not defensive: 1 is a plausible element width, so a
+        // caller computing `base + i * scale` over a class that has no
+        // elements got a plausible address instead of a refusal -- the
+        // dangerous direction in this family. The value was left alone by an
+        // earlier session because its blast radius was unmeasured; measured
+        // over the whole 117-vector corpus in both modes,
+        // `array_index_scale_for_name` is asked 161/175 times in every vector
+        // and NOT ONCE with a non-array, so taking the specified answer costs
+        // nothing. See the L1 record, section 9.2.
+        assert_eq!(array_index_scale_for_name("java/lang/Object"), 0);
+        assert_eq!(array_index_scale_for_name(""), 0);
 
         // End-to-end: synthesise a Class mirror with `name` at slot 1 and
         // invoke the native. The native should read the name and derive
@@ -555,9 +568,21 @@ mod tests {
         assert_eq!(int_scale, Some(Value::Int(4)));
 
         // byte[] → 1.
+        //
+        // Field 0 was the never-registered placeholder `0` here, which is the
+        // class-id-0 name shadow the comment above this block warns about: the
+        // name in slot 1 is never read, the derivation returns its non-array
+        // answer, and that answer USED TO BE 1 -- the same value `[B` derives.
+        // So this case asserted the catch-all and would have passed for a
+        // mirror naming anything at all. It only surfaced when the non-array
+        // answer became 0 (the javadoc's), which is what a default that
+        // collides with a real value costs: it hides the case it stands in for.
+        // Registered properly, as the `[Ljava/lang/Object;` and `[I` cases
+        // above already were.
+        let byte_cid = ctx.ensure_class_initialized("[B").unwrap();
         let byte_name = ctx.create_string("[B");
         let byte_mirror = ctx.alloc_object(ClassId::new(0), 2);
-        ctx.set_field(byte_mirror, 0, Value::Int(0));
+        ctx.set_field(byte_mirror, 0, Value::Int(byte_cid.as_u32() as i32));
         ctx.set_field(byte_mirror, 1, Value::Object(Some(byte_name)));
         let byte_scale = native_unsafe_array_index_scale(
             &mut ctx,
