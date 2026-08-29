@@ -502,3 +502,45 @@ The `--add-exports` is needed on **both** VMs and at `javac` time; the
 `jdk.internal.misc.Unsafe` instance is read from `sun.misc.Unsafe`'s
 `theInternalUnsafe` field, which `jdk.unsupported` opens to the unnamed module,
 so no `--add-opens` is required.
+
+---
+
+## 8. Two vectors this lane cleared that were not its own
+
+The landing merge of `origin/dev` at `d17feaad2` turned **`RExceptions`** and
+**`RJdkFailure`** red — in the core arm as well as the strict one, so 72/72
+became 71/72.
+
+**Checked against pristine `origin/dev` before blaming the merge.** A detached
+worktree at `d17feaad2`, built from scratch, fails both on its own:
+
+```text
+pristine origin/dev d17feaad2   ONLY="RExceptions RJdkFailure"
+  RExceptions  FAIL     RJdkFailure  FAIL     0 passed, 2 failed
+```
+
+Both are one defect, and it is in a change that landed hours earlier:
+
+```text
+Class.forName("[Lcom.cratonvm.absent.NoSuchClass20260812;")
+  HotSpot 25    ClassNotFoundException msg="com.cratonvm.absent.NoSuchClass20260812"
+  dev d17feaad2 ClassNotFoundException msg="[Lcom.cratonvm.absent.NoSuchClass20260812;"
+```
+
+`c6ccccbc8` (lane L5) added an array-descriptor branch to
+`native_class_for_name` so that `Class.forName("[I")` resolves without
+consulting a loader — correct, and it fixed three of its own rows. Its refusal
+path passes `&dotted_name`, the **descriptor**, as the exception message.
+HotSpot resolves the descriptor down to the element and reports the resolution
+that actually failed, which is the only name a caller can act on: `[Lp.X;` is
+not something anything can be asked for again.
+
+Both vectors were already in the tree asserting exactly this, each with the
+measured JDK 25 behaviour written into its own comment
+(`RExceptions.java:371-383`, `RJdkFailure.java:168`). Cleared by naming the
+element: strip the leading `[`s, unwrap `L…;`, and fall back to the descriptor
+when there is no element name to report (`[I`, or a malformed spelling).
+
+Recorded here rather than as its own page because it is one line and nothing is
+left open — but recorded, because a red vector on `dev` blocks every lane, and
+the next worker to meet it should not have to re-derive that it is not theirs.
