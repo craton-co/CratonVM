@@ -417,15 +417,29 @@ recorded gap: this campaign's whole premise is that the two modes converge.
 Closing it needs the iterator itself to change, which is the same change
 `W7-1 family 1` made for `TreeMap`'s views and is a lane of its own.
 
-### 6.2 `PriorityQueue.iterator().remove()` does not write through — 1 row
+### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
 
-`native_pq_iterator` deliberately returns an `ArrayList$Itr` over an
-ArrayList-shaped WRAPPER holding a heap-order snapshot, and its own comment
-records why the alternative is worse (a real `PriorityQueue$Itr`'s slot 0 is
-`cursor:int`, and the snapshot array stored there is coerced away). Rerouting
-`remove` means teaching `values_view_source`/`propagate_list_removal` — the path
-every map view shares — about a non-map source. Measured: `size()` 3 where
-HotSpot answers 2.
+Was 1 row: `size()` answered 3 after an `iterator().remove()` where HotSpot
+answers 2.
+
+The snapshot the iterator walks is now marked with its queue, using the same
+trailing-capacity-slot marker every `values()` view uses, so
+`native_al_itr_remove`'s existing write-through fires. What made this tractable
+after the first reading called it "the path every map view shares" is that the
+wrapper NEVER ESCAPES: it is minted inside `native_pq_iterator`, handed to the
+`ArrayList$Itr`, and never returned. So the blast radius is not the marker's 21
+consumers but the two this iterator actually reaches —
+
+* `resync_values_view`, on the `next()` path via `al_state_for_read`, which
+  would have rebuilt the snapshot as EMPTY because `collect_entries_any` knows
+  six MAP families and a queue is none of them. It now declines for a queue
+  source, exactly as `resync_ts_view` declines for a non-`TreeMap` one;
+* `propagate_list_removal`, which now routes a queue source through the
+  queue's own `remove(Object)` native — the one that owns the sift-down the
+  heap invariant needs.
+
+Both guards are keyed on a `PriorityQueue` source specifically, so no source
+that exists today changes behaviour.
 
 ### 6.3 `reversed()` is a snapshot, not a live view — 1 row
 
@@ -436,12 +450,65 @@ after a later `put`, answers `{e=5, c=3, a=1, b=2, d=4}`). The JDK's are
 `ReverseOrder*View` classes; this needs the `TmViewSpec` treatment extended to
 the `LinkedHashMap` family, which is the same lane as §6.1.
 
-### 6.4 `Currency.getDisplayName(Locale.ENGLISH)` answers the CODE — 1 row
+### 6.4 `Currency.getDisplayName(Locale.ENGLISH)` answers the CODE — FIXED 2026-08-29
 
-`USD` where HotSpot answers `US Dollar`. Not a collections defect: the currency
-display name comes from the CLDR bundle through `LocaleServiceProvider`, and
-`getDisplayName` is not registered at all — this is real bytecode failing to
-find its resource. Filed against the locale-data surface, not L3's.
+Was `USD` where HotSpot answers `US Dollar`. `LocaleDateTzShadowSweep` is now
+0-diff in both modes.
+
+The first reading — "the CLDR bundle is not reachable" — was wrong, and the
+probe that found the defect is the one that showed it: **the data was already
+there.** `ResourceBundle.getString("usd")` returns `US Dollar` on this VM
+today. CLDR keys `CurrencyNames` with the UPPERCASE code for the SYMBOL and the
+lowercase code for the NAME, a convention `cldr_currency_symbol`'s own doc
+comment had recorded, and nothing read the second half of it.
+
+What was missing was the plumbing: `Currency.getDisplayName` ran real bytecode,
+which reaches the name through `LocaleServiceProviderPool` +
+`CurrencyNameProvider` — an SPI this VM does not serve. The pool answered null
+and the JDK's documented last resort (the code itself) took over. `Locale
+.getDisplayCountry` works on this VM for the opposite reason: it is a registered
+bridge, and it fires.
+
+Fixed with the twin of the symbol helper — `cldr_currency_display_name`, same
+table, lowercase key — and a `getDisplayName(Locale)` bridge beside
+`getSymbol(Locale)`. The no-arg form delegates to it in real bytecode, so one
+override fixes both call forms.
+
+**This ADDS a shadow while the campaign is retiring them, and that is debt, not
+a win.** The right end state is the provider pool serving
+`CurrencyNameProvider`, after which `Currency` needs no bridge at all; both
+halves should be deleted together. It is the same trade `getSymbol(Locale)` and
+the whole `Locale.getDisplay*` family already made in that file, and it buys a
+right answer where real bytecode gives a wrong one.
+
+Two things fell out of it. The curated fallback table in `phases_early.rs` (the
+compatible-mode `getDisplayName()`) said **`British Pound Sterling`** where
+HotSpot says `British Pound`, and had no entry for CNY/CHF/CAD/AUD at all; it
+now goes through the shared helper so the two copies cannot drift, and the eight
+fallback names are HotSpot's own, measured rather than guessed. And:
+
+### 6.4b `ResourceBundle.getBundle` fabricates a bundle HotSpot refuses — 2 rows, OPEN
+
+```text
+ResourceBundle.getBundle("sun.util.resources.CurrencyNames", Locale.ENGLISH)
+  HotSpot   MissingResourceException: Can't find bundle for base name ...
+  CratonVM  a java.util.ResourceBundle, whose getString("USD") answers "$"
+
+ResourceBundle.getBundle("sun.util.resources.LocaleNames", Locale.ENGLISH)
+  same shape
+```
+
+A fabricated SUCCESS, which is the more serious direction: an application
+probing for a bundle it does not expect to exist is told it does. The
+campaign's own fabrication screen does not catch it, because
+`java.util.ResourceBundle` is a REAL class — what is fabricated is the
+resource, not the type.
+
+Not fixed here, and the reason is worth stating rather than leaving as silence:
+the VM's own locale shims consume these synthetic bundles, so making
+`getBundle` refuse them is a change to the locale/resource surface with its own
+blast radius, not a `java.util` collections fix. Probe:
+`apps/probes/CurrencyNameProbe.java`, rows 17-21.
 
 ### 6.5 The method-reference dispatch door — FIXED 2026-08-29
 
