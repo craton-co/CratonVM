@@ -6849,7 +6849,25 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => alloc_ref_array(ctx, size),
     };
     let elems = read_value_slice(ctx, &elem_handles, &elems);
+    // `ArrayList.toArray(T[])` copies through `Arrays.copyOf` /
+    // `System.arraycopy`, so a narrowing element is an `ArrayStoreException` in
+    // arraycopy's wording. The source is named `java.lang.Object[]` because
+    // that is what `ArrayList.elementData` is, whatever the list's element type
+    // -- and it is what HotSpot prints (MEASURED, `probes/DodArrayStoreSweep`).
     for (i, val) in elems.iter().enumerate() {
+        if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+            ctx,
+            target,
+            *val,
+            cratonvm_native_api::array_store::StoreRoute::Arraycopy {
+                source_component: "java/lang/Object",
+            },
+        ) {
+            if pin_base != usize::MAX {
+                ctx.unpin_native_roots(pin_base);
+            }
+            return Err(e);
+        }
         ctx.set_array_element(target, i, *val);
     }
     let target_len = ctx.array_length(target);
@@ -18683,7 +18701,25 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => alloc_ref_array(ctx, len),
     });
     let keys = collect_view_snapshot_ordered(ctx, backing)?;
+    // `AbstractSet`/`AbstractCollection.toArray(T[])` stores through
+    // `aastore` in its own loop, so a narrowing element is an
+    // `ArrayStoreException` naming the VALUE -- `java.lang.Integer`, not
+    // arraycopy's sentence, which is `ArrayList`'s (MEASURED on 25.0.4+7,
+    // `probes/DodArrayStoreSweep`). Unchecked before, in BOTH modes: these
+    // registrations are `Bridge`, so `--jdk-only` does not refuse them and
+    // strict was wrong here too.
+    //
+    // The ZERO-arg `toArray()` next door needs no check and does not get one:
+    // it returns an `Object[]`, which accepts every reference.
     for (i, k) in keys.iter().enumerate().take(len) {
+        if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+            ctx,
+            arr,
+            *k,
+            cratonvm_native_api::array_store::StoreRoute::Aastore,
+        ) {
+            return Err(e);
+        }
         ctx.set_array_element(arr, i, *k);
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -42569,8 +42605,34 @@ fn native_ll_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let target = if reuse {
         template_ref
     } else {
-        rooted_across(ctx, &mut [&mut this, &mut template_ref], |ctx| {
-            alloc_ref_array(ctx, size)
+        // The result must have the TEMPLATE's runtime type, not `Object[]`.
+        // `Collection.toArray(T[])` is specified that way and every sibling
+        // implementation here already does it -- an array's heap header stores
+        // its component class id, so `class_id_of_object(template)` IS the
+        // component id `new_ref_array` wants.
+        //
+        // This allocated a bare `Object[]`, which is a wrong ANSWER on its own
+        // (a caller assigning to `String[]` gets a `ClassCastException` at the
+        // `checkcast`) and which also silently disabled the store check added
+        // beside it: every reference is storable in an `Object[]`, so the
+        // narrowing element the check exists to reject was legal in the array
+        // actually being filled. MEASURED: `LinkedList<Object>` holding an
+        // Integer, `toArray(new String[0])` -> HotSpot `ArrayStoreException:
+        // java.lang.Integer`, this VM a populated `Object[]`.
+        //
+        // A NULL template still gets `Object[]`, which is correct: there is no
+        // requested type to honour.
+        // Resolved BEFORE `rooted_across` borrows the roots: a `ClassId` is a
+        // plain value and a moving collection cannot invalidate it, whereas
+        // reading `template_ref` inside the closure would borrow a root the
+        // call already holds mutably.
+        let want_comp = match template {
+            Value::Object(Some(_)) => Some(ctx.class_id_of_object(template_ref)),
+            _ => None,
+        };
+        rooted_across(ctx, &mut [&mut this, &mut template_ref], |ctx| match want_comp {
+            Some(comp) => ctx.new_ref_array(comp, size),
+            None => alloc_ref_array(ctx, size),
         })
     };
     let mut cur_opt = match ll_get(ctx, this, "head") {
@@ -42583,6 +42645,17 @@ fn native_ll_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             break;
         }
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        // Same `aastore` route as the set views: `LinkedList` inherits
+        // `AbstractCollection.toArray(T[])`, whose `ArrayStoreException` names
+        // the value rather than the arrays.
+        if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+            ctx,
+            target,
+            elem,
+            cratonvm_native_api::array_store::StoreRoute::Aastore,
+        ) {
+            return Err(e);
+        }
         ctx.set_array_element(target, i, elem);
         i += 1;
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {

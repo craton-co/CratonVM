@@ -3078,19 +3078,6 @@ impl SharedVm {
             // native via `register_collections_natives`; this branch
             // covers the real-JDK path which never calls that bulk
             // registration.
-            /// The `ArrayStoreException` `System.arraycopy` raises, named after
-            /// the offending element's class exactly as HotSpot names it.
-            fn array_store_failure(
-                ctx: &dyn cratonvm_native_api::NativeContext,
-                value: cratonvm_types::ObjectRef,
-            ) -> cratonvm_types::error::MethodCallFailed {
-                let cname = ctx
-                    .class_name_of_id(ctx.class_id_of_object(value))
-                    .unwrap_or_default()
-                    .replace('/', ".");
-                cratonvm_types::error::RuntimeError::ArrayStoreException { message: cname }.into()
-            }
-
             fn real_jdk_to_array_typed(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
                 args: &[cratonvm_types::Value],
@@ -3224,19 +3211,20 @@ impl SharedVm {
                                 ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
-                            // The JDK copies with `System.arraycopy`, which
-                            // performs the aastore store check — so
-                            // `List<String>.toArray(new Integer[4])` is an
-                            // `ArrayStoreException`, not an `Integer[]` full of
-                            // `String`s. Same rule as the opcode by
-                            // construction: `aastore_element_assignable` IS the
-                            // interpreter's predicate, and it fails OPEN
-                            // (`None`) wherever it cannot answer, so this can
-                            // only ever ADD a refusal HotSpot also makes.
-                            if let cratonvm_types::Value::Object(Some(vo)) = v {
-                                if ctx.aastore_element_assignable(cur_target, vo) == Some(false) {
-                                    return Err(array_store_failure(ctx, vo));
-                                }
+// `AbstractCollection.toArray(T[])` stores through
+                            // `aastore`, so a narrowing element is an
+                            // `ArrayStoreException` naming the VALUE's class --
+                            // not arraycopy's sentence, which is the other
+                            // route's. MEASURED: a `HashSet<Object>` holding an
+                            // Integer, `toArray(new String[0])` ->
+                            // `ArrayStoreException: java.lang.Integer`.
+                            if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+                                ctx,
+                                cur_target,
+                                v,
+                                cratonvm_native_api::array_store::StoreRoute::Aastore,
+                            ) {
+                                return Err(e);
                             }
                             ctx.set_array_element(cur_target, i, v);
                         }
@@ -3276,15 +3264,23 @@ impl SharedVm {
                     let copy = size.min(d_len);
                     for i in 0..copy {
                         let v = ctx.get_array_element(d, i);
-                        // See the iterator path above: `System.arraycopy`'s
-                        // store check.
-                        if let cratonvm_types::Value::Object(Some(vo)) = v {
-                            if ctx.aastore_element_assignable(target, vo) == Some(false) {
-                                if let Some((h, _)) = d_pin {
-                                    ctx.unpin_native_roots(h);
-                                }
-                                return Err(array_store_failure(ctx, vo));
-                            }
+// `ArrayList.toArray(T[])` is a NARROWING copy through
+                        // `Arrays.copyOf` / `System.arraycopy`, so arraycopy's
+                        // wording, with the source named `java.lang.Object[]`
+                        // because `elementData` is one whatever the list's
+                        // element type. This native wrote every element
+                        // unchecked, so compatible mode produced a `String[]`
+                        // holding an `Integer`.
+                        if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+                            ctx,
+                            target,
+                            v,
+                            cratonvm_native_api::array_store::StoreRoute::Arraycopy {
+                                source_component: "java/lang/Object",
+                            },
+                        ) {
+                            ctx.unpin_native_roots(h);
+                            return Err(e);
                         }
                         ctx.set_array_element(target, i, v);
                     }
