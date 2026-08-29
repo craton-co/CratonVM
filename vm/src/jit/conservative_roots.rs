@@ -3113,19 +3113,85 @@ fn report_unpublished_band_words(
             // words are that method's java-locals, one object in three
             // consecutive slots.
             let sp_id = frame_active_sp_id(rbp, cm);
-            let in_map = sp_id.map(|id| {
-                cm.oop_maps
-                    .iter()
-                    .filter(|m| m.bytecode_pc == id)
-                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
-            });
+            // THREE answers, not two. `sp_id.map(..)` gave `Some(false)` both
+            // when a map was found and did not name the slot AND when NO MAP
+            // EXISTS for the stored id -- and those point at opposite repairs.
+            //
+            // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+            // (2026-08-29): six of seven reported words came from one frame
+            // whose stored id was `1729768472`. That is not a bytecode pc; it
+            // is `0x671a2c18`, the low 32 bits of `0x200671a2c18` -- the heap
+            // pointer this same scan reports two slots away in the same frame.
+            // The frame's sp-id slot holds half an object pointer, so no map
+            // can match it, and `live_hi=None` on the same line says the same
+            // thing. Printed as `Some(false)` that read as "the dataflow calls
+            // this slot dead", which sends a reader at the band verifier
+            // instead of at the frame whose id is garbage.
+            //
+            // `no-map-for-id` is also the honest label for what the SCAN does
+            // here: `frame_active_map_slots` returns `None`, so the dead-slot
+            // relaxation deliberately does not fire and the word is reported.
+            // The report now says which of the two it is.
+            let in_map: &'static str = match sp_id {
+                None => "no-sp-id",
+                Some(id) => {
+                    let mut any_map = false;
+                    let mut names_slot = false;
+                    for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == id) {
+                        any_map = true;
+                        if m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off) {
+                            names_slot = true;
+                        }
+                    }
+                    if !any_map {
+                        "no-map-for-id"
+                    } else if names_slot {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
+            };
+            // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
+            // this dump exists at all.
+            //
+            // A safepoint id that is not a bytecode pc has two opposite causes:
+            // something STORED an oop into the reserved sp-id slot (a codegen
+            // defect at that offset), or `rbp` is wrong for this frame so the
+            // read lands on a NEIGHBOURING slot that legitimately holds one (a
+            // frame-resolution defect, the family of the 2026-08-26
+            // innermost-mirror repair). Printing the whole reserved-locals tail
+            // beside `sp_id_off` separates them in one line: a pointer sitting
+            // exactly at `sp_id_off` is the first; the whole tail reading like
+            // some neighbouring frame's is the second.
+            if in_map == "no-map-for-id" {
+                let lo = cm.frame_layout.java_locals_hi.max(8);
+                let hi = cm.frame_layout.locals_hi;
+                let mut tail = String::new();
+                let mut o = lo;
+                while o <= hi && o - lo < 128 {
+                    let a = rbp.wrapping_sub(o as usize);
+                    if a >= rbp - frame_size && a + 8 <= rbp && a & 7 == 0 {
+                        // SAFETY: the same bounded, aligned in-band read the
+                        // walk above makes, on this thread's own frame.
+                        let v = unsafe { (a as *const usize).read() };
+                        tail.push_str(&format!(" [{o}]=0x{v:x}"));
+                    }
+                    o += 8;
+                }
+                eprintln!(
+                    "[moving-young-band]   no-map-for-id sp_id_off={} tail({}..{}):{}",
+                    cm.sp_id_slot_off, cm.frame_layout.java_locals_hi, hi, tail,
+                );
+            }
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} in_map={in_map:?} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
                 published.len(),
+                cm.sp_id_slot_off,
                 cm.frame_layout,
             );
         }
@@ -3909,6 +3975,18 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if current_thread_jit_depth() == 0 {
         return;
     }
+    // WHICH obligation the peer's own proof fails on, when it fails.
+    //
+    // `proven=false` is the shortfall that refuses the whole cycle, and a
+    // count of them cannot be acted on: the proof has SIX ways to say no
+    // (`JIT_RELOCATION_UNSUPPORTED`, `NO_PRECISE_MAP`, `MISSING_EXACT_RBP`,
+    // `FOREIGN_INNERMOST_RBP`, `ACTIVE_FRAME_MAP`, `PARENT_FRAME_MAP`) and they
+    // want completely different repairs. The per-reason counters are already
+    // maintained process-wide, so a before/after snapshot around this one call
+    // names the term without any new bookkeeping. Only taken when the debug
+    // flag is on — it is two array reads either side of a proof that already
+    // walks the stack.
+    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -3916,8 +3994,25 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if proven && depth > 0 {
         cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
     }
-    if xt_coverage_dbg() {
-        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    if let Some(before) = before {
+        let added = cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask() & !before;
+        let mut why = String::new();
+        for i in 0..cratonvm_gc::gc_quiescence::incomplete_reason::COUNT {
+            if added & (1usize << i) != 0 {
+                if !why.is_empty() {
+                    why.push(',');
+                }
+                why.push_str(cratonvm_gc::gc_quiescence::incomplete_reason::label(i));
+            }
+        }
+        if why.is_empty() {
+            // Distinguishable from a reason literally labelled "none": this
+            // says the proof added no obligation to the mask at all, which for
+            // a `proven=false` deposit means the reason was ALREADY recorded
+            // this cycle (by this thread's earlier proof, or by a peer).
+            why.push_str("<no-new-reason>");
+        }
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth} why={why}");
     }
 }
 
