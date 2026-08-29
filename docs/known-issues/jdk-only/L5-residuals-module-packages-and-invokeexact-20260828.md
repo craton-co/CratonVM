@@ -377,3 +377,11 @@ still report a mutable set, and that is a separate defect one layer down.
 ```bash
 cratonvm --java-home "$JDK" --jdk-only -cp probes/out L5ModuleInvokeSweep
 ```
+
+**The probe IS in your checkout, and that is worth a sentence.**
+`3b2901531` ("major doc consistency update before the release") untracked all
+862 sources under `probes/`, so most lane records now cite probe paths that no
+longer travel with the repository. `probes/` itself is not gitignored — only
+`apps/` is — so this probe, and the eight test fixtures the same cleanup took
+out, are tracked there normally. If you are reading a record whose probe you
+cannot find, that is why, and `probes/` is where to put it back.
