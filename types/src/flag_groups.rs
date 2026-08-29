@@ -893,6 +893,13 @@ pub const INVENTORY: &[E] = &[
     // three are DEFAULT-ON and read `=0` to disable, so they carry `on_key`
     // and the "0" off-word rather than an `off_key`.
     E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
+    // Declared 2026-08-29 with the branch-to-`selp` if-conversion in
+    // `jit-cuda/src/lowering/emit.rs`. DEFAULT-ON, so it carries the "0"
+    // off-word rather than an `off_key`: it is an A/B lever for a codegen
+    // change with no observable semantics, and the only way to price such
+    // a change on this host is to run one binary both ways in the same
+    // minutes.
+    E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
     // A/B lever, never a supported configuration: restore the pre-fix
     // substitution of "slot 0, tagged int" for a field site the VM-side
