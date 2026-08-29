@@ -1455,6 +1455,27 @@ to stop exactly this is **129 695 184 bytes unclaimed**, i.e. it was never
 claimed because the low end had already bumped through it. That is item 4
 below, and items 2 and 3 are what let it get there.
 
+> ### Before reading any arm of this section: `relocation_on_proven_jit=0` VOIDS a run
+>
+> Every repair in items 2 and 3 happens inside `relocate_stw`, and that function
+> declines outright while a compiled frame is live whose oops the cycle could
+> not prove rewritable. On a contended host that refusal fires on *every* cycle.
+> Measured here, one run of `TestMVStoreTool` at `--Xmx 1g` on this Azure box at
+> load 32:
+>
+> ```text
+> compaction_cycles=0 objects_relocated=0
+> relocation_skipped_jit=6 relocation_on_proven_jit=0
+> ```
+>
+> That run OOM'd with `oom=4` and says **nothing** about either repair, because
+> neither ran. The same class on the same binary at load 8–19 reports
+> `relocation_on_proven_jit=4…15`.
+>
+> So: read `relocation_on_proven_jit` before reading `rc`. A run with a zero
+> there is a measurement of the host, and this page has a long history of
+> readings that turned out to be exactly that.
+
 ### 2. The slide was LOSING what it emptied — the largest of the four
 
 This is the one that explains why compaction never produced a big hole, and it
