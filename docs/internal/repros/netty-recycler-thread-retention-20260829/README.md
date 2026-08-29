@@ -54,6 +54,21 @@ it retains on **both** VMs — correct behaviour, since a pinned Recycler is
 supposed to hold its owner. Keep that column: it is the probe's positive
 control, and without it a table of all-green cells would say nothing.
 
+## `FrameRetainProbe` — is it the frame that HELD the reference?
+
+The netty test nulls `thread` and loops IN THE SAME METHOD;
+`RecyclerRetainProbe` looped in a callee. Three arms isolate that: loop inline
+in the frame that held it, loop in a callee, and a looping frame that never had
+it. All collect, under `BG_COMPILE=0`. So a compiled frame holding a nulled
+local does not by itself retain.
+
+## `RecyclerInlineProbe` — the cell neither of the other two covered
+
+The netty body AND the inline loop, six owner/guard combinations, two rounds,
+`BG_COMPILE=0`. All twelve collect. **The failure cannot be reproduced outside
+JUnit**, which is what points the next investigation at JUnit's invocation
+machinery rather than at netty or at the test's own frame.
+
 ## The lever the page actually turns
 
 None of these. It is `CRATONVM_BG_COMPILE=0` against the six tests in

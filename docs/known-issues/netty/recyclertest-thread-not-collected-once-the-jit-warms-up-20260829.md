@@ -98,11 +98,46 @@ which is correct: a pinned Recycler is supposed to hold its owner.
 "a spliced callee's locals are named by no oop map" defect fixed on
 2026-08-28.
 
+## It does not reproduce outside JUnit, and that is the sharpest thing known
+
+Two more shapes were tried, and both collect. Together they say the retaining
+reference is **not in the test's own frame**.
+
+`FrameRetainProbe`. The netty test nulls `thread` and then runs the
+`System.gc()` loop IN THE SAME METHOD; the earlier `RecyclerRetainProbe` ran it
+in a callee. That is the difference between "a compiled frame pins a dead
+local" and something else, and nobody had tested it. Three arms — loop inline
+in the frame that held the reference, loop in a callee, and a looping frame
+that never held the reference at all — **all collect**, on both VMs, under
+`CRATONVM_BG_COMPILE=0`. A compiled frame holding a nulled local does not, on
+its own, retain.
+
+`RecyclerInlineProbe` is then the one cell neither probe covered: the netty
+body (Recycler allocated on the thread, its object kept) **and** the loop
+inline, all six owner/guard combinations, `BG_COMPILE=0`, two rounds. **All
+twelve cells collect**, in 65-75 ms.
+
+So the standalone shape cannot be made to fail. What is left that the suite has
+and the probe does not is JUnit itself: reflective invocation, the parameterized
+machinery that holds the `Object[]` arguments and the test instance, and — for
+this method — the `@Timeout` executor that runs each invocation on its own
+thread. The retainer is somewhere in that, and the probes above are what
+narrowed it to there rather than to netty or to the test's own frame.
+
+A successor should start from that, not from the Recycler. The instrument to
+build is "which root reaches this object", asked at the `System.gc()`
+safepoint; the nearest existing thing is the
+`CRATONVM_DBG=remap-residue` frame walk from the 2026-08-28 splice fix, which
+answers a different question (words still pointing into from-space) and would
+need turning around.
+
 ## What it is, and how far the narrowing got
 
-A reference the bytecode has already nulled is still reachable from a
-JIT-compiled frame on the collecting thread's stack. `--nojit` removes it;
-more compilation makes it worse; nothing else moves it.
+A reference the bytecode has already nulled is still reachable from
+somewhere on the collecting thread's stack once enough is compiled. `--nojit`
+removes it; more compilation makes it worse; nothing else moves it. Note the
+section above: it is NOT simply the frame that held the local, so "conservative
+scan pins a dead slot" is too small an explanation.
 
 The precision levers do **not** move it, which is the part that still needs
 explaining:
