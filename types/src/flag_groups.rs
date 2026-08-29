@@ -901,6 +901,11 @@ pub const INVENTORY: &[E] = &[
     // pair, so one binary can sweep the curve -- picking that number by
     // rebuilding once per point is not possible on a host that moves 2x
     // between two runs.
+    // Declared 2026-08-29 with the per-call-site dispatch memo in
+    // `vm/src/runtime/offload.rs`. DEFAULT-ON with a "0" off-word: the memo
+    // has no observable semantics, so the only honest way to price it is one
+    // binary run both ways in the same minutes.
+    E { group: Group::JIT, token: "gpu-dispatch-memo", on_key: Some("CRATONVM_GPU_DISPATCH_MEMO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "gpu-if-convert-max-ops", on_key: Some("CRATONVM_GPU_IF_CONVERT_MAX_OPS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },

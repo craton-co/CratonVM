@@ -198,6 +198,35 @@ pub struct OffloadCache {
     chunk_stage_i64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i64>>>>,
     chunk_stage_f32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f32>>>>,
     chunk_stage_f64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>>>,
+    /// Per-call-site memo for everything `dispatch_method_from_native_on_stream`
+    /// used to re-derive from the three name strings on EVERY dispatch.
+    ///
+    /// GPULlama3's forward pass makes 453 dispatches per token across 12
+    /// distinct kernels, and each one arrived as
+    /// `("org/.../CratonKernels", "matmulSplit", "([I[FI[F)V")` and paid, in
+    /// order: a `load_class_concurrent` attempt, a class-manager read lock, a
+    /// name hash lookup, a LINEAR scan of the class's method table comparing
+    /// two strings per entry, and a `lookup_or_compile`. All of that is a
+    /// function of the three names alone, and the three names are fixed per
+    /// call site.
+    ///
+    /// Keyed on the name triple rather than on a class id because the names
+    /// are what the caller supplies. That makes the memo stale if a class is
+    /// ever redefined under the same name -- which is exactly the staleness
+    /// `kernels` already has, since it is keyed on `(class_id, method_index)`
+    /// and a redefinition would reuse neither.
+    dispatch_memo: RwLock<FxHashMap<u64, ResolvedDispatch>>,
+    /// Class id of `craton/gpu/GpuArray`, resolved once.
+    ///
+    /// `try_gpu_array_shape` used to answer "is this argument a GpuArray" by
+    /// taking the class-manager read lock, cloning the class's name into a
+    /// fresh `String`, and comparing it -- per ARGUMENT, per dispatch. At
+    /// ~5 arguments across 453 dispatches that is 2,265 lock acquisitions and
+    /// 2,265 allocations per token to answer a question that is one integer
+    /// compare. `None` means "not looked up yet"; `Some(None)` means the
+    /// class is not loaded in this process, which is the ordinary case for a
+    /// program that never touches `craton.gpu`.
+    gpu_array_class_id: RwLock<Option<Option<crate::classloading::ClassId>>>,
     /// Compute capability of `ctx`'s device, as `(major, minor)`.
     ///
     /// This is the `sm_XX` every kernel on this cache is lowered for.
@@ -208,6 +237,83 @@ pub struct OffloadCache {
     /// when the probe fails or reports something older, because the
     /// lowering emits Volta-era PTX unconditionally.
     sm: (u32, u32),
+}
+
+/// Everything a dispatch needs to know about its target method, resolved
+/// once per call site instead of once per call.
+///
+/// See [`OffloadCache::dispatch_memo`] for what this replaces and why the
+/// key is the name triple.
+#[cfg(feature = "gpu-offload")]
+#[derive(Clone)]
+struct ResolvedDispatch {
+    /// The three names this entry was resolved from, kept so a hash
+    /// collision on the memo key is caught rather than dispatched.
+    class_name: String,
+    method_name: String,
+    descriptor: String,
+    class_id: crate::classloading::ClassId,
+    method_index: u16,
+    is_static: bool,
+    this_field_names: Vec<String>,
+    writes_param_mask: u64,
+    return_kind: ParamKind,
+    work_bound: jit_cuda::emitter::WorkBound,
+}
+
+#[cfg(feature = "gpu-offload")]
+impl ResolvedDispatch {
+    /// The shape the dispatch site destructures. A struct rather than a
+    /// bare tuple in the map because a seven-field tuple with two `u16`-ish
+    /// members is exactly the kind of thing that gets silently reordered.
+    fn into_tuple(
+        self,
+    ) -> (
+        crate::classloading::ClassId,
+        u16,
+        bool,
+        Vec<String>,
+        u64,
+        ParamKind,
+        jit_cuda::emitter::WorkBound,
+    ) {
+        (
+            self.class_id,
+            self.method_index,
+            self.is_static,
+            self.this_field_names,
+            self.writes_param_mask,
+            self.return_kind,
+            self.work_bound,
+        )
+    }
+}
+
+/// Hash of a call site's name triple, the memo's key.
+#[cfg(feature = "gpu-offload")]
+fn dispatch_memo_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    class_name.hash(&mut h);
+    method_name.hash(&mut h);
+    descriptor.hash(&mut h);
+    h.finish()
+}
+
+/// `CRATONVM_GPU_DISPATCH_MEMO=0` restores the per-call re-derivation.
+///
+/// Default ON. It exists as an A/B lever rather than a supported
+/// configuration: the memo has no observable semantics, so the only honest
+/// way to price it is to run one binary both ways in the same minutes on a
+/// host that will not hold a clock still between two builds.
+#[cfg(feature = "gpu-offload")]
+fn dispatch_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_DISPATCH_MEMO")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
 }
 
 impl OffloadCache {
@@ -272,8 +378,86 @@ impl OffloadCache {
             chunk_stage_i64: RwLock::new(None),
             chunk_stage_f32: RwLock::new(None),
             chunk_stage_f64: RwLock::new(None),
+            dispatch_memo: RwLock::new(FxHashMap::default()),
+            gpu_array_class_id: RwLock::new(None),
             sm,
         }
+    }
+
+    /// The memoised resolution for one call site, if it has been resolved
+    /// before and the memo is enabled.
+    #[cfg(feature = "gpu-offload")]
+    fn dispatch_memo_get(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<ResolvedDispatch> {
+        if !dispatch_memo_enabled() {
+            return None;
+        }
+        // Keyed by a hash of the triple, not by the triple itself: a
+        // `HashMap<(String, String, String), _>` cannot be probed with
+        // `(&str, &str, &str)` -- `Borrow` has no tuple impl -- so every
+        // LOOKUP would allocate the three strings it is trying to avoid
+        // resolving. The names are kept in the value and compared on hit,
+        // so a hash collision resolves the slow way rather than dispatching
+        // the wrong method.
+        let key = dispatch_memo_key(class_name, method_name, descriptor);
+        let held = self.dispatch_memo.read();
+        match held.get(&key) {
+            Some(resolved)
+                if resolved.class_name == class_name
+                    && resolved.method_name == method_name
+                    && resolved.descriptor == descriptor =>
+            {
+                cratonvm_types::gpu_dispatch_memo_census::note_resolve_hit();
+                Some(resolved.clone())
+            }
+            _ => {
+                cratonvm_types::gpu_dispatch_memo_census::note_resolve_miss();
+                None
+            }
+        }
+    }
+
+    /// Remember one call site's resolution.
+    #[cfg(feature = "gpu-offload")]
+    fn dispatch_memo_put(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        resolved: &ResolvedDispatch,
+    ) {
+        if !dispatch_memo_enabled() {
+            return;
+        }
+        let key = dispatch_memo_key(class_name, method_name, descriptor);
+        self.dispatch_memo.write().insert(key, resolved.clone());
+    }
+
+    /// Class id of `craton/gpu/GpuArray` in this process, resolved once.
+    ///
+    /// `Some(None)` is a real answer -- the class is not loaded -- and is
+    /// cached like any other, because a program that never touches
+    /// `craton.gpu` would otherwise re-ask on every argument of every
+    /// dispatch.
+    #[cfg(feature = "gpu-offload")]
+    fn gpu_array_class_id(
+        &self,
+        shared: &crate::vm::SharedVm,
+    ) -> Option<crate::classloading::ClassId> {
+        if let Some(cached) = *self.gpu_array_class_id.read() {
+            return cached;
+        }
+        let resolved = shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id("craton/gpu/GpuArray");
+        *self.gpu_array_class_id.write() = Some(resolved);
+        resolved
     }
 
     /// Whether the cache has a usable device context. Surfaces
@@ -3207,7 +3391,9 @@ pub fn dispatch_method_from_native_on_stream(
         u64,
         ParamKind,
         jit_cuda::emitter::WorkBound,
-    ) = {
+    ) = if let Some(hit) = cache.dispatch_memo_get(class_name, method_name, descriptor) {
+        hit.into_tuple()
+    } else {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
         // no reason to have referenced it from Java code, so it may
@@ -3317,15 +3503,20 @@ pub fn dispatch_method_from_native_on_stream(
                     };
                     names.push(nm.to_string());
                 }
-                (
+                let resolved = ResolvedDispatch {
+                    class_name: class_name.to_string(),
+                    method_name: method_name.to_string(),
+                    descriptor: descriptor.to_string(),
                     class_id,
-                    mi,
-                    is_static_local,
-                    names,
-                    compiled.signature.writes_param_mask,
-                    compiled.signature.return_kind,
-                    compiled.signature.work_bound,
-                )
+                    method_index: mi,
+                    is_static: is_static_local,
+                    this_field_names: names,
+                    writes_param_mask: compiled.signature.writes_param_mask,
+                    return_kind: compiled.signature.return_kind,
+                    work_bound: compiled.signature.work_bound,
+                };
+                cache.dispatch_memo_put(class_name, method_name, descriptor, &resolved);
+                resolved.into_tuple()
             }
             LookupOutcome::Skip => {
                 return record_failed_submission(
@@ -3667,7 +3858,7 @@ pub fn dispatch_method_from_native_on_stream(
                 // the DeviceBuffer in the resident state so this
                 // path skips the H→D copy when the bytes haven't
                 // changed since the previous kernel.
-                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, *obj_ref) {
+                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, &cache, *obj_ref) {
                     match marshal_resident_array_arg(ctx, etype, len, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
@@ -5780,13 +5971,18 @@ impl MarshalWriteback {
 #[cfg(feature = "gpu-offload")]
 fn try_gpu_array_shape(
     shared: &crate::vm::SharedVm,
+    cache: &OffloadCache,
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<(cratonvm_types::ArrayElementType, usize, u64)> {
+    cratonvm_types::gpu_dispatch_memo_census::note_array_probe();
+    // One integer compare against a class id resolved once for the process.
+    // This used to take the class-manager read lock and clone the class's
+    // name into a fresh `String` to compare it -- per ARGUMENT, per
+    // dispatch. GPULlama3 marshals ~5 arguments across 453 dispatches a
+    // token, so that was 2,265 lock acquisitions and 2,265 allocations per
+    // token to answer a question that is one `==`.
     let cid = shared.mem.heap.class_id_of(obj_ref);
-    let cm = shared.classes.class_manager.read();
-    let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
-    drop(cm);
-    if cls_name != "craton/gpu/GpuArray" {
+    if cache.gpu_array_class_id(shared) != Some(cid) {
         return None;
     }
     // field 0 holds the long `handle`.

@@ -1249,6 +1249,10 @@ use backend_stub as backend;
 
 pub mod critical;
 pub mod event;
+/// CUDA graph capture and replay. Cuda-mode only; the stub backend has
+/// nothing to capture.
+#[cfg(feature = "cuda")]
+pub mod graph;
 pub mod launch;
 pub mod stream;
 

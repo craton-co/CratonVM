@@ -352,6 +352,13 @@ impl Stream {
     /// caller's `Stream` to `backend_cuda::DeviceModuleInner::
     /// launch_raw_on_stream` for true per-stream kernel submission
     /// (AUDIT 2026-05-24 C32 stream-port fix).
+    /// The device this stream belongs to, for the `bind_to_thread` prelude
+    /// every raw-handle use in this crate shares.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaDevice> {
+        &self.inner.device
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn cuda_stream_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaStream> {
         &self.inner.stream

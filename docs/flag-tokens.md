@@ -569,12 +569,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-248 tokens.
+249 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
+| `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
 | `gpu-if-convert` | `CRATONVM_GPU_IF_CONVERT` |
 | `gpu-if-convert-max-ops` | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
