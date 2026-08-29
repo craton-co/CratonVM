@@ -22094,10 +22094,25 @@ fn native_arrays_fill_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if let Value::Object(Some(v)) = val {
         let comp = ctx.class_id_of_object(arr);
         let actual = ctx.class_id_of_object(v);
-        if actual != comp
-            && !ctx.is_subclass(actual, comp)
-            && ctx.class_name_of_id(comp).as_deref() != Some("java/lang/Object")
-        {
+        let exact_admits = actual == comp
+            || ctx.is_subclass(actual, comp)
+            || ctx.class_name_of_id(comp).as_deref() == Some("java/lang/Object");
+        // The exact check above compares `arr`'s own reported class id against
+        // `v`'s, which is wrong whenever the component itself has no ordinary
+        // class id to compare against -- e.g. a `char[][]`'s component is the
+        // primitive array class `char[]`, which `class_id_of_object` cannot
+        // resolve the same way for the array (`arr`) and the value (`v`).
+        // Fall back to the shared, hardened JVMS aastore covariance predicate --
+        // already used by `java.lang.reflect.Array.set` for the identical
+        // "may this be stored into a reference array" question (see
+        // `reflect_array_element_assignable` in native-builtins/src/lib.rs) --
+        // before refusing. MEASURED: `Arrays.fill((Object[]) new char[3][],
+        // new char[]{'a'})` incorrectly threw `ArrayStoreException:
+        // java.lang.Object` under CratonVM while HotSpot filled it fine
+        // (`sun.nio.cs.HKSCS$Encoder.initc2b`'s `Arrays.fill(c2b,
+        // C2B_UNMAPPABLE)` hit exactly this, breaking every real
+        // `Big5-HKSCS`/`MS950_HKSCS`/etc. charset's static init).
+        if !exact_admits && !ctx.aastore_element_assignable(arr, v).unwrap_or(false) {
             return Err(RuntimeError::ArrayStoreException {
                 message: ctx.class_name_of_id(actual).unwrap_or_default(),
             }
