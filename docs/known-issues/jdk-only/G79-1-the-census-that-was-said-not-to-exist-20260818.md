@@ -8,7 +8,7 @@ Probe `regression-suite/probes/AwtCategoryCensus.java`; registry dump via
 reflection.
 
 This is step one of the P0 **"Wholesale `Bridge` over-tagging"** row in
-[`jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md), which
+[`jdk-only-runtime-services.md`](runtime-services-blocker-inventory.md), which
 requires a census before any retag ([`jdk-only-native-review.md`](../../jdk-only-native-review.md) §7).
 
 ---

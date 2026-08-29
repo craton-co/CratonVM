@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Stage 1 of 4 — **internal diagnostic**. `--jdk-only` may fail on programs that run fine under `--real-jdk`; that is the intended signal, not a bug in your program. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) |
-| **Companions** | [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) · [`jdk-only-native-review.md`](jdk-only-native-review.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) |
+| **Companions** | [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md) · [`jdk-only-native-review.md`](jdk-only-native-review.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) |
 
 ## What the flag means
 
@@ -126,7 +126,7 @@ The `kind` tag is stable and greppable (`JdkOnlyViolation::kind()`).
 | Kind | It means | Your next step |
 |---|---|---|
 | `compatibility-class-requested` | The VM was about to fabricate a class with no real bytes. | If it is a **JDK** class: a runtime service is incomplete — file it. If it is an **application or dependency** class: your classpath is genuinely missing a jar. Fix the classpath; the compatible mode was hiding a real error. |
-| `synthetic-native-registered` | A `SyntheticStub` registration was refused at VM init. | Nothing you can do at the command line. The named registration site is the work item. Many of these are permanent bridges carrying the wrong tag — see [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md). |
+| `synthetic-native-registered` | A `SyntheticStub` registration was refused at VM init. | Nothing you can do at the command line. The named registration site is the work item. Many of these are permanent bridges carrying the wrong tag — see [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md). |
 | `synthetic-native-invocation` | A `SyntheticStub` was reached at dispatch time. | A dispatch path bypassed the registration gate. Always worth filing: it names a hole in the resolver, not just in one native. |
 | `missing-native` | An `ACC_NATIVE` method has no registered bridge. | The most actionable kind. Attach `--dump-missing-natives-grouped` — the module grouping tells you which JDK module is under-served. |
 | `native-shadows-bytecode` | A registered native was about to win over concrete real bytecode. | Under stage-1 policy this is recorded, not enforced. It is the leading indicator for a wrong-result bug. |
@@ -239,7 +239,7 @@ An issue is actionable when it carries all five of:
 
 Do not file: a `synthetic-native-registered` violation on its own. Those are
 already enumerated by the census and tracked in
-[`jdk-only-runtime-services.md`](jdk-only-runtime-services.md). File the
+[`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md). File the
 *program* that fails because of one.
 
 ---
@@ -255,7 +255,7 @@ contract.
 | **1 — Internal diagnostic** *(current)* | `--jdk-only` may fail. The census and the errors are the product, not successful execution. | Flag exists; violations are structured; no synthetic-stub *invocation* goes unrecorded. Failures are expected. |
 | **2 — Experimental** | The core Java corpus and selected frameworks pass. The fallback is documented and works. | Linux + JDK 21 strict job **blocking**. Zero `CompatibilityStub` classes on the core corpus. Startup/memory budgets published (see [`benchmarks/jdk-only.md`](benchmarking/jdk-only.md)). |
 | **3 — Preview** | JDK 21 and 25, Linux and Windows, broad runtime-service coverage. | Differential and regression gates blocking in strict mode. No new unapproved HotSpot divergence. Windows filesystem/process/networking vectors stable. |
-| **4 — Stable** | A declared JDK/platform matrix, published performance budgets, a support policy. | No known P0/P1 compatibility substitution remains open in [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md). Zero final `SyntheticStub` registrations. Zero synthetic-stub invocations across interpreter, JIT, JNI, reflection and method-handle paths. |
+| **4 — Stable** | A declared JDK/platform matrix, published performance budgets, a support policy. | No known P0/P1 compatibility substitution remains open in [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md). Zero final `SyntheticStub` registrations. Zero synthetic-stub invocations across interpreter, JIT, JNI, reflection and method-handle paths. |
 
 Between stages, three things stay constant: `--real-jdk` remains the default,
 the `synthetic-jdk` build configuration keeps its blocking compile/test job so

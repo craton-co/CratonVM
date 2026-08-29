@@ -7486,19 +7486,40 @@ fn fjt_get_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// Latent when W6-9 measured it (no caller in the tree), but the reason it is
 /// latent is that nothing calls it, not that calling it works.
 ///
-/// The entry is REMOVED, not reset in place. "Never seen" is exactly the state
-/// this restores — every reader already treats a missing key and a fresh entry
-/// identically — and it is the only one that keeps `fjp_queued_task_count()`
-/// honest: that count is over `!done` entries, so a reset-in-place entry would
-/// report a task sitting in nobody's queue as forked-and-pending. The `1<<24`
-/// bit the real method preserves has no reader in this model. Dropping the key
-/// drops a GC root, which is safe here and nowhere else in this family: the
-/// caller is executing a method ON the task, so the task is live on its stack.
+/// The entry is RESET, not removed — and the RAW RESULT is deliberately kept.
+///
+/// Removing it was the obvious reading and it is wrong on one row. The real
+/// `reinitialize()` clears `aux` and all of `status` except `1<<24`; it does
+/// NOT touch `RecursiveTask.result`, which is an ordinary field of the
+/// subclass. So HotSpot answers the PREVIOUS result from `getRawResult()`
+/// after a `reinitialize()`, and this model — which keeps the raw result in
+/// the side table rather than in a field — answered null once the key was
+/// gone. MEASURED against HotSpot 25.0.4+7, both modes
+/// (`probes/ForkJoinShadowSweep.java`):
+///
+/// ```text
+///   t.invoke(); t.reinitialize(); t.getRawResult()
+///     HotSpot  10        CratonVM  null
+/// ```
+///
+/// That is not a curiosity: `getRawResult()` is how a caller reads a completed
+/// task's value without re-raising its exception, and a reinitialised task
+/// answering null is indistinguishable from one that completed with null.
+///
+/// The cost of resetting in place rather than removing is that
+/// `fjp_queued_task_count()` — an estimate by its own javadoc — now counts a
+/// reinitialised task as pending until it runs again. A task that has been
+/// reset genuinely IS not done, so that is a defensible reading of the count
+/// either way; a wrong `getRawResult()` is not.
 fn fjt_reinitialize(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    crate::phases_early::fjp_state()
-        .lock()
-        .remove(&crate::phases_early::fjp_key(this));
+    let mut state = crate::phases_early::fjp_state().lock();
+    if let Some(entry) = state.get_mut(&crate::phases_early::fjp_key(this)) {
+        entry.done = false;
+        entry.cancelled = false;
+        entry.thrown = Value::Object(None);
+        // `entry.result` is NOT cleared — see above.
+    }
     Ok(None)
 }
 
@@ -8426,6 +8447,17 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         "commonPool",
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
+            // THE SINGLETON. `commonPool()` is specified to answer the same
+            // object every time, and this body minted a fresh one per call --
+            // its own TODO said so. See `fjp_common_pool_get`. The cache is
+            // consulted before the allocation and published after the whole
+            // carrier is populated, so a concurrent caller either sees nothing
+            // and builds its own (losing the store, which is harmless: both
+            // carriers are equivalent and only one stays published) or sees a
+            // fully-initialised one.
+            if let Some(cached) = crate::phases_early::fjp_common_pool_get() {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             let obj = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ForkJoinPool",
@@ -8475,6 +8507,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             // before delegating to KeycloakMain.main, so we must populate
             // the field with an instance of that class.
             populate_common_factory(ctx, obj)?;
+            crate::phases_early::fjp_common_pool_set(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
