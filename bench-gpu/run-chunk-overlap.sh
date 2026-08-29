@@ -21,6 +21,9 @@ W="${2:-1920}"
 H="${3:-1440}"
 ROUNDS="${4:-5}"
 ITERS="${ITERS:-30}"
+# Past 8K the frame stops fitting a default heap: 11520x6480 is an `int[]`
+# of 298 MB.
+XMX="${XMX:-6g}"
 JDK="${JDK:-C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot}"
 GPU_JAR="${GPU_JAR:?set GPU_JAR to the craton-gpu annotations jar}"
 CP="$HERE_W;$GPU_JAR"
@@ -28,7 +31,7 @@ CP="$HERE_W;$GPU_JAR"
 "$JDK/bin/javac" -cp "$GPU_JAR" -d "$HERE" "$HERE/RayTracerKernel.java" || exit 1
 
 run() {
-  CRATONVM_GPU_CHUNKS="$1" "$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx 6g \
+  CRATONVM_GPU_CHUNKS="$1" "$CV" --java-home "$JDK" --gpu --gpu-min-work 1 --Xmx "$XMX" \
     -cp "$CP" RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null \
     | sed -n 's/.*[[:space:]]best_ms=\([^[:space:]]*\).*/\1/p'
 }

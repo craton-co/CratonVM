@@ -116,9 +116,10 @@ Not a regression: the dispatch cost itself. 453 submissions per token at
 ~31 µs of host time each is 14 ms, 35% of an idle token and more than 100%
 of a contended one. Two driver round trips per submission were pure
 bookkeeping and are gone as of this record's own commit — see
-`gpu/raytracer-vs-tornadovm-RESOLVED-20260829.md` §9, "the per-launch event
-bookkeeping", for the event-pool and same-stream-wait-elision work and its
-measured effect on this workload.
+`gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md` §13.5 for the event-pool
+and same-stream-wait-elision work, its engagement census, and why the ray
+tracer -- 8 launches a frame against this workload's 453 a token -- was
+never going to show it.
 
 ## 5. Repro
 

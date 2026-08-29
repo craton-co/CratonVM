@@ -836,12 +836,17 @@ the residual's own hypothesis was wrong; those are the interesting ones,
 because a residual that is quietly dropped leaves the wrong belief behind.
 
 Every number below was measured on the same box on the same afternoon, and
-that box was NOT quiet — up to seven `rustc` processes belonging to other
-sessions ran through parts of it. Every comparison here is therefore
-paired, arm-alternating, and reported as a ratio or a per-round win count;
-the absolute milliseconds are ~20-25% above the ones §12 published in the
-morning, uniformly across all four resolutions and both engines, which is
-what a loaded box looks like.
+that box is shared: up to twenty-four `rustc` and `cargo` processes
+belonging to other sessions came and went through the pass. Every
+comparison here is therefore paired, arm-alternating, and reported as a
+ratio or a per-round win count, and the absolute milliseconds are labelled
+with whether their pass was quiet.
+
+That is not a caveat, it is one of the findings. §13.6's decomposition was
+run twice — once against a loaded box and once against a quiet one — and
+the loaded pass manufactured a conclusion that the quiet pass does not
+support. Both are written down there, because the shape of the mistake is
+more useful than the number.
 
 ## 13.1 A fourth resolution, 11520×6480 — the margin keeps shrinking
 
@@ -921,18 +926,28 @@ side-effect-free ones into `selp`. That was implemented (see
 `gpu/lowering-branches.md`), it engages, it is bit-exact, and it costs
 time.
 
-**It engages.** `bench-gpu/count-kernel-branches.sh` dumps the kernel's
-PTX with `CRATONVM_GPU_DUMP_PTX`, assembles it with the real `ptxas`, and
-counts both levels:
+**It engages, and the census says exactly which half of it does what.**
+`bench-gpu/count-kernel-branches.sh` dumps the kernel's PTX with
+`CRATONVM_GPU_DUMP_PTX`, assembles it with the real `ptxas`, and counts
+both levels. Three budgets, one binary:
 
-| | PTX instr | `selp` | `bra` | SASS instr | `BRA` | `BSSY`/`BSYNC`/`BMOV` | branch machinery |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `CRATONVM_GPU_IF_CONVERT=0` | 649 | 81 | 51 | 936 | 67 | 96 | **17.4%** |
-| `CRATONVM_GPU_IF_CONVERT=1` | 603 | 96 | 21 | 904 | 58 | 81 | **15.4%** |
+| budget | PTX instr | `selp` | `bra` | SASS instr | `BRA` | `BSSY`/`BSYNC`/`BMOV` | branch machinery |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 (default) | 649 | 81 | 51 | 936 | 67 | 96 | **17.4%** |
+| 8 | 615 | 92 | 29 | 920 | 66 | 93 | **17.3%** |
+| unbounded | 603 | 96 | 21 | 904 | 58 | 81 | **15.4%** |
 
-The 67 `BRA` and 96 reconvergence instructions reproduce §9's count
-exactly. PTX branches fall by 59%; SASS branch machinery falls by 15%,
-because `ptxas` was already if-converting some of them itself.
+The 67 `BRA` and 96 reconvergence instructions at budget 0 reproduce §9's
+count exactly.
+
+Read the middle row against the bottom one and the whole answer is there.
+**Budget 8 removes 22 PTX branches and 1 SASS branch.** The diamonds cheap
+enough to be worth converting are ones `ptxas` was already converting by
+itself, so doing it in the lowerer changes the PTX and not the machine
+code — which is why budget 8 measures as a tie rather than a small win.
+The 9 SASS branches that only fall at an unbounded budget are precisely
+the ones `ptxas` declined to convert, and it declined for the same reason
+the timing punishes converting them: they guard a square root.
 
 **It is bit-exact.** Both arms, 1920×1440, against the HotSpot reference:
 `differing=0`, `checksum_delta=0`.
@@ -982,7 +997,9 @@ frame, minimum of 5 rounds per setting, against the same transfer floor:
 Floor 1.0135 ms. **The best budget is a tie with the feature switched off,**
 and everything else is worse; the non-monotonicity between 2 and 8 is the
 noise floor talking, since the whole compute half is 0.13 ms of a 1.14 ms
-frame.
+frame. And the census above says why a tie is the ceiling: at budget 8 the
+lowerer is converting diamonds `ptxas` already converts, so it is rewriting
+PTX that assembles to the same SASS.
 
 **So the transform ships OPT-IN.** `CRATONVM_GPU_IF_CONVERT=1` turns it on
 at budget 8, `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` at `n`, and unset does

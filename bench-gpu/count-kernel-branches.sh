@@ -25,11 +25,14 @@ CP="$HERE_W;$GPU_JAR"
 
 "$JDK/bin/javac" -cp "$GPU_JAR" -d "$HERE" "$HERE/RayTracerKernel.java" || exit 1
 
+# `$2` is the weighted arm-pair budget: 0 is the shipped default (the
+# transform off), 8 is what `CRATONVM_GPU_IF_CONVERT=1` selects, and a large
+# number converts every diamond the shape and purity tests admit.
 report() {
-  local label="$1" flag="$2"
+  local label="$1" budget="$2"
   local dir; dir="$(mktemp -d)"
   local dir_w; dir_w="$(cd "$dir" && pwd -W)"
-  CRATONVM_GPU_IF_CONVERT="$flag" CRATONVM_GPU_DUMP_PTX="$dir_w" \
+  CRATONVM_GPU_IF_CONVERT_MAX_OPS="$budget" CRATONVM_GPU_DUMP_PTX="$dir_w" \
     "$CV" --java-home "$JDK" --gpu --gpu-min-work 1 -cp "$CP" \
     RayTracerKernel "$W" "$H" 2 >/dev/null 2>&1
   local ptx; ptx="$(ls "$dir"/*render*.ptx "$dir"/*.ptx 2>/dev/null | head -1)"
@@ -64,5 +67,6 @@ report() {
 }
 
 echo "RayTracerKernel.render at ${W}x${H}"
-report "if-convert=0" 0
-report "if-convert=1" 1
+report "budget=0 (default)" 0
+report "budget=8" 8
+report "budget=unbounded" 10000

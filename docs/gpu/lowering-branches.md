@@ -90,6 +90,15 @@ pair of `mov`s. `sqrt`/`div`/`rcp`/`ex2` count 16 and everything else 1.
 Sweeping the budget at 1920x1440 found no setting that wins — 8 ties with
 the feature off, and 2, 4, 16, 32 and unbounded are all worse.
 
+An instruction census says why a tie is the ceiling rather than an
+accident. At budget 8 the transform removes 22 PTX branches and **one**
+SASS branch: the diamonds cheap enough to be worth converting are ones
+`ptxas` already converts on its own, so the lowerer is rewriting PTX that
+assembles to the same machine code. The nine SASS branches that only fall
+at an unbounded budget are exactly the ones `ptxas` declined — and it
+declined for the same reason the clock punishes taking them: they guard a
+square root.
+
 So: `CRATONVM_GPU_IF_CONVERT=1` turns it on at the default budget,
 `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` turns it on at `n`, and unset does
 nothing. It is kept and kept reachable because that is one kernel — a shape
