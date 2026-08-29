@@ -14331,7 +14331,17 @@ unsafe fn try_varhandle_instance_field_cas(
     // own kind, for the reason the read path checks its return type: the
     // registered descriptor is the erased `([Ljava/lang/Object;)Z`, so the
     // site's is the only statement of what the caller actually passed.
-    let (expected_desc, new_desc) = varhandle_cas_operand_kinds(info.descriptor)?;
+    //
+    // MEASURED (native profile, `HibfixVarHandleProbe`'s reference CAS,
+    // `perf record --call-graph dwarf`): re-deriving this from the descriptor
+    // STRING on every call -- walking `(Ljava/lang/Object;Ljava/lang/Object;)Z`
+    // byte by byte via `str::find` -- was `CharSearcher::next_match` at 3.84%
+    // of total samples, on a call site that is 100% deterministic: `info` is
+    // built once per compiled call site and its `descriptor` is `'static`, so
+    // the same pointer answers the same way for the life of the compiled
+    // method. One-slot thread-local memo, same idiom as
+    // `native-builtins::lang_invoke::VH_PLAN_MEMO`.
+    let (expected_desc, new_desc) = vh_cas_kinds_memoized(info.descriptor)?;
     if expected_desc != plan.value_desc || new_desc != plan.value_desc {
         return None;
     }
@@ -14349,6 +14359,35 @@ unsafe fn try_varhandle_instance_field_cas(
         new_val,
     );
     Some(i64::from(swapped))
+}
+
+thread_local! {
+    /// One-slot memo of [`varhandle_cas_operand_kinds`], keyed by the call
+    /// site's descriptor pointer.
+    ///
+    /// `JitInvokeInfo::descriptor` is `'static` constant-pool text built once
+    /// per compiled call site, so the pointer is a stable identity for a hot
+    /// loop that calls the same `compareAndSet` site repeatedly -- exactly the
+    /// `HibfixComposeProbe2`/`HibfixVarHandleProbe` access pattern this exists
+    /// for. A miss (a different call site, or the first call) just falls back
+    /// to the uncached parse below and replaces the slot; it is never wrong,
+    /// only sometimes not yet warm. `0` is not a valid descriptor pointer (it
+    /// comes from `&'static str` bytes living in the binary's data section),
+    /// so it doubles as the "unset" sentinel.
+    static VH_CAS_KINDS_MEMO: Cell<(usize, Option<(u8, u8)>)> = Cell::new((0, None));
+}
+
+/// [`varhandle_cas_operand_kinds`], memoized per call site. See
+/// [`VH_CAS_KINDS_MEMO`] for why the descriptor pointer is a safe cache key.
+fn vh_cas_kinds_memoized(descriptor: &'static str) -> Option<(u8, u8)> {
+    let key = descriptor.as_ptr() as usize;
+    let cached = VH_CAS_KINDS_MEMO.with(Cell::get);
+    if cached.0 == key {
+        return cached.1;
+    }
+    let kinds = varhandle_cas_operand_kinds(descriptor);
+    VH_CAS_KINDS_MEMO.with(|c| c.set((key, kinds)));
+    kinds
 }
 
 /// The last two parameter kinds of a `compareAndSet` call site, collapsed the
