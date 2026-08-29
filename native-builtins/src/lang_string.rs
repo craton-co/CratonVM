@@ -1511,6 +1511,582 @@ pub(crate) fn sb_value_units(
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// The two layouts, and the WRITER half of `sb_value_units`
+// ---------------------------------------------------------------------------
+
+/// Which representation a builder's `value` slot holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SbLayout {
+    /// CratonVM's own synthetic class: `value: char[] @0`, `count: int @1`.
+    /// One array element per character; there is no `coder`.
+    Synthetic,
+    /// The real JDK's compact layout: `value: byte[]`, `coder: byte`,
+    /// `count: int` — every slot resolved BY NAME, because a slot COUNT cannot
+    /// separate the nine images (see [`sb_field_slot`]).
+    Compact { coder_slot: usize },
+}
+
+/// Everything a native needs to know about a builder's payload, resolved in ONE
+/// pass.
+///
+/// The first version of this migration asked the receiver the same questions in
+/// every helper: `sb_append_units` alone reached `sb_layout` four times — once
+/// directly, once through `sb_count_units`, once through `sb_capacity_units`,
+/// once more for the coder — and each of those re-read `value`, re-asked its
+/// element type, and for a compact receiver resolved `coder` by NAME under the
+/// class-manager read lock.
+///
+/// MEASURED, ABBA-interleaved over six rounds against the pre-migration control:
+/// **2.0x on `append(String)`, 2.6x on `append(int)`, 3.1x on `charAt`, 3.5x on
+/// an inflating build.** That is the cost of asking the same question five
+/// times on the hottest path in the VM, and this struct is the answer: one pass,
+/// handed down.
+#[derive(Clone, Copy)]
+pub(crate) struct SbView {
+    pub(crate) layout: SbLayout,
+    pub(crate) buf: Option<cratonvm_types::ObjectRef>,
+    /// Array length in ELEMENTS — bytes for the compact layout, characters for
+    /// the synthetic one.
+    pub(crate) raw_len: usize,
+    pub(crate) utf16: bool,
+    /// Characters, clamped to what the payload can actually hold.
+    pub(crate) count: usize,
+    /// Characters — `value.length >> coder`, which is `capacity()`.
+    pub(crate) capacity: usize,
+}
+
+/// The builder's `count` field, wherever this image puts it. Split out of
+/// [`sb_state`] so [`sb_view`] can read it without also re-deriving the payload.
+fn sb_raw_count(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32 {
+    let at = |slot: usize| match ctx.get_field(this, slot) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    match sb_field_slot(ctx, this, "count") {
+        Some(slot) => at(slot),
+        // No class model (the mock) — the historical heuristic, unchanged.
+        None if ctx.object_num_fields(this) >= 3 => at(2),
+        None => at(1),
+    }
+}
+
+/// Resolve the receiver's payload once.
+///
+/// `WORKER-3-NOTE-3` §3 named the residual precisely: CratonVM keeps two
+/// incompatible representations of one class, the natives wrote the first and
+/// real `AbstractStringBuilder` bytecode writes the second, and **any run in
+/// which some calls take one path and some the other holds a torn object**.
+/// [`sb_value_units`] taught the READER both; every writer then still converted
+/// whatever it found into a `char[]`, which is what PRODUCED the tear rather
+/// than tolerating it.
+///
+/// The payload that is already there decides. A builder real bytecode
+/// constructed is written back compact; one allocated under the synthetic
+/// 2-slot class is written back as a `char[]`. Only a builder with no payload at
+/// all asks the class, and there the presence of a field named `coder` is the
+/// whole test: the synthetic class declares two fields and neither is called
+/// that (`classloading/src/class_manager.rs`, `instance_fields(2)`).
+pub(crate) fn sb_view(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> SbView {
+    use cratonvm_types::ArrayElementType;
+    let (buf, raw_len, elem) = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if ctx.object_is_array(a) => (
+            Some(a),
+            ctx.array_length(a),
+            Some(ctx.heap_element_type_of(a)),
+        ),
+        _ => (None, 0, None),
+    };
+    // `coder` is read at slot 1 FIRST, and only resolved by name when that read
+    // cannot be a coder.
+    //
+    // `AbstractStringBuilder` declares `value` then `coder` before anything
+    // else on every compact-strings image — MEASURED with `javap -p --system`
+    // on 17.0.20.1+1, 21.0.12+8 and 25.0.4+7, where the variation is entirely
+    // in what comes AFTER (`maybeLatin1` arrives at 2 in 21 and 25, which is
+    // why `count` still has to be resolved by name; see `sb_field_slot`).
+    //
+    // The guess is self-checking rather than trusted: a `coder` is 0 or 1 and
+    // nothing else, so any other value — or a non-int, which is what slot 1
+    // holds under the synthetic 2-slot layout — falls through to the name
+    // lookup. That matters because the lookup is a class-manager READ LOCK on
+    // the hottest path in the VM: paying it per operation, on top of the one
+    // `count` already costs, is the whole of `charAt`'s remaining 1.25x
+    // against the pre-migration control.
+    let compact_payload = matches!(
+        elem,
+        Some(ArrayElementType::Byte) | Some(ArrayElementType::Boolean)
+    );
+    let (layout, utf16) = if compact_payload {
+        match ctx.get_field(this, 1) {
+            Value::Int(c @ (0 | 1)) => (SbLayout::Compact { coder_slot: 1 }, c == 1),
+            _ => {
+                let coder_slot = sb_field_slot(ctx, this, "coder").unwrap_or(1);
+                let utf16 = matches!(ctx.get_field(this, coder_slot), Value::Int(1));
+                (SbLayout::Compact { coder_slot }, utf16)
+            }
+        }
+    } else if matches!(elem, Some(ArrayElementType::Char)) {
+        (SbLayout::Synthetic, false)
+    } else {
+        // No payload to ask, so the CLASS decides — the constructor case.
+        match sb_field_slot(ctx, this, "coder") {
+            Some(coder_slot) => (
+                SbLayout::Compact { coder_slot },
+                matches!(ctx.get_field(this, coder_slot), Value::Int(1)),
+            ),
+            None => (SbLayout::Synthetic, false),
+        }
+    };
+    let capacity = if utf16 { raw_len / 2 } else { raw_len };
+    let count = (sb_raw_count(ctx, this).max(0) as usize).min(capacity);
+    SbView {
+        layout,
+        buf,
+        raw_len,
+        utf16,
+        count,
+        capacity,
+    }
+}
+
+/// Which representation the receiver holds. Prefer [`sb_view`] where more than
+/// one of its answers is wanted; this exists for the few callers that want only
+/// this one.
+pub(crate) fn sb_layout(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> SbLayout {
+    sb_view(ctx, this).layout
+}
+
+/// Capacity in CHARACTERS — `value.length >> coder`, which is exactly what
+/// `AbstractStringBuilder.capacity()` answers, and is observable and specified.
+pub(crate) fn sb_capacity_units(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> usize {
+    sb_view(ctx, this).capacity
+}
+
+/// The builder's length, clamped to what its payload can actually hold.
+pub(crate) fn sb_count_units(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> usize {
+    sb_view(ctx, this).count
+}
+
+/// `AbstractStringBuilder.ensureCapacityInternal` + `newCapacity`, reproduced
+/// rather than approximated: `capacity()` is observable, so the growth rule is
+/// part of the contract and `probes/StringBuilderShadowSweep.java` asserts it at
+/// six points.
+fn sb_grow_units(old: usize, needed: usize) -> usize {
+    if needed <= old {
+        old
+    } else {
+        std::cmp::max(old.saturating_mul(2).saturating_add(2), needed)
+    }
+}
+
+thread_local! {
+    /// Scratch for the compact payload's BYTES, so the bulk read/write pair can
+    /// be used without an allocation per call.
+    static SB_BYTE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The characters in `[from, to)` of a resolved view.
+///
+/// One bulk call per read: `read_char_array_into` for the synthetic payload,
+/// `read_byte_array_into` for the compact one, decoded in Rust afterwards. The
+/// per-element `get_array_element` loop this replaced was half of `charAt`'s
+/// 3.1x.
+pub(crate) fn sb_units_range_view(
+    ctx: &dyn NativeContext,
+    v: &SbView,
+    from: usize,
+    to: usize,
+) -> Vec<u16> {
+    let mut out = Vec::new();
+    let Some(arr) = v.buf else {
+        return out;
+    };
+    if to <= from {
+        return out;
+    }
+    match v.layout {
+        SbLayout::Synthetic => {
+            let to = to.min(v.raw_len);
+            if to <= from {
+                return out;
+            }
+            out.resize(to - from, 0);
+            let written = ctx.read_char_array_into(arr, from, &mut out[..]);
+            out.truncate(written);
+        }
+        SbLayout::Compact { .. } if v.utf16 => {
+            let to = to.min(v.raw_len / 2);
+            if to <= from {
+                return out;
+            }
+            let n = to - from;
+            SB_BYTE_SCRATCH.with(|cell| {
+                let mut bytes = cell.borrow_mut();
+                bytes.clear();
+                bytes.resize(n * 2, 0);
+                let read = ctx.read_byte_array_into(arr, from * 2, &mut bytes[..]);
+                // Little-endian, the same order `sb_put_units_at` writes and
+                // `vm_object::create_java_string` uses for Strings.
+                out.reserve(read / 2);
+                for pair in bytes[..read - (read % 2)].chunks_exact(2) {
+                    out.push(u16::from(pair[0]) | (u16::from(pair[1]) << 8));
+                }
+            });
+        }
+        SbLayout::Compact { .. } => {
+            let to = to.min(v.raw_len);
+            if to <= from {
+                return out;
+            }
+            let n = to - from;
+            SB_BYTE_SCRATCH.with(|cell| {
+                let mut bytes = cell.borrow_mut();
+                bytes.clear();
+                bytes.resize(n, 0);
+                let read = ctx.read_byte_array_into(arr, from, &mut bytes[..]);
+                out.reserve(read);
+                out.extend(bytes[..read].iter().map(|&b| u16::from(b)));
+            });
+        }
+    }
+    out
+}
+
+/// The characters in `[from, to)`, whatever layout the builder holds.
+pub(crate) fn sb_units_range(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    from: usize,
+    to: usize,
+) -> Vec<u16> {
+    sb_units_range_view(ctx, &sb_view(ctx, this), from, to)
+}
+
+/// One character of a resolved view, without decoding the whole payload.
+pub(crate) fn sb_unit_at_view(ctx: &dyn NativeContext, v: &SbView, index: usize) -> Option<u16> {
+    let arr = v.buf?;
+    match v.layout {
+        SbLayout::Synthetic => {
+            if index >= v.raw_len {
+                return None;
+            }
+            match ctx.get_array_element(arr, index) {
+                Value::Int(x) => Some(x as u16),
+                _ => None,
+            }
+        }
+        SbLayout::Compact { .. } if v.utf16 => {
+            if index * 2 + 1 >= v.raw_len {
+                return None;
+            }
+            let lo = match ctx.get_array_element(arr, index * 2) {
+                Value::Int(x) => u16::from(x as u8),
+                _ => 0,
+            };
+            let hi = match ctx.get_array_element(arr, index * 2 + 1) {
+                Value::Int(x) => u16::from(x as u8),
+                _ => 0,
+            };
+            Some((hi << 8) | lo)
+        }
+        SbLayout::Compact { .. } => {
+            if index >= v.raw_len {
+                return None;
+            }
+            match ctx.get_array_element(arr, index) {
+                Value::Int(x) => Some((x & 0xff) as u16),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// One character, without decoding the whole payload.
+pub(crate) fn sb_unit_at(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    index: usize,
+) -> Option<u16> {
+    sb_unit_at_view(ctx, &sb_view(ctx, this), index)
+}
+
+/// Write `units` into a payload starting at CHARACTER `at`.
+///
+/// ONE bulk call, always: `write_char_array_from` for the synthetic payload and
+/// `write_byte_array_from` for the compact one, the latter encoded into the
+/// thread-local scratch first. The per-element store loop this replaced turned
+/// `append("abcdefgh")` into eight VM dispatches, and sixteen once the builder
+/// had inflated.
+///
+/// UTF16 is little-endian — the same order [`sb_value_units`] reads and
+/// `vm_object::create_java_string` writes, so `StringUTF16.isBigEndian()` stays
+/// false for builders exactly as it is for Strings.
+fn sb_put_units_at(
+    ctx: &mut dyn NativeContext,
+    buf: cratonvm_types::ObjectRef,
+    at: usize,
+    units: &[u16],
+    layout: SbLayout,
+    utf16: bool,
+) {
+    if units.is_empty() {
+        return;
+    }
+    if let SbLayout::Synthetic = layout {
+        if !ctx.write_char_array_from(buf, at, units) {
+            for (i, &u) in units.iter().enumerate() {
+                ctx.set_array_element(buf, at + i, Value::Int(i32::from(u)));
+            }
+        }
+        return;
+    }
+    // The encode and the store both happen INSIDE the borrow. Cloning the
+    // scratch out of its cell first — which is what this did — allocates a
+    // fresh `Vec` on every append and gives the scratch nothing to do.
+    SB_BYTE_SCRATCH.with(|cell| {
+        let mut bytes = cell.borrow_mut();
+        bytes.clear();
+        let off = if utf16 {
+            bytes.reserve(units.len() * 2);
+            for &u in units {
+                bytes.push((u & 0xFF) as u8);
+                bytes.push((u >> 8) as u8);
+            }
+            at * 2
+        } else {
+            bytes.extend(units.iter().map(|&u| (u & 0xFF) as u8));
+            at
+        };
+        if !ctx.write_byte_array_from(buf, off, &bytes) {
+            // A heap that declines the bulk path (the unit-test mocks do).
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(buf, off + i, Value::Int(i32::from(b)));
+            }
+        }
+    });
+}
+
+/// Store `units` as the builder's ENTIRE content, in the receiver's OWN layout.
+///
+/// `exact_capacity` is `None` for an ordinary write — the payload array is
+/// reused when the units fit and otherwise grown by [`sb_grow_units`] — and
+/// `Some(c)` for the two callers that own the capacity themselves,
+/// `ensureCapacity` and `trimToSize`, which always reallocate.
+///
+/// Returns the post-GC `this`: this can allocate, so every caller MUST use the
+/// returned reference for anything afterwards.
+///
+/// This is the writer half `WORKER-3-NOTE-3` N1 named. Before it, every write
+/// path installed a fresh `char[]` over whatever it found, so a builder that
+/// real `AbstractStringBuilder` bytecode had constructed was CONVERTED to the
+/// synthetic layout by its first native mutation — and every later
+/// real-bytecode read of `value`/`coder` then read a `char[]` as though it were
+/// a compact `byte[]`. MEASURED against jdk-25.0.4+7:
+/// `new StringBuilder("a\u{20ac}b").chars().toArray()` answered
+/// `[97, 172, 98]` where HotSpot answers `[97, 8364, 98]` — 0x20AC truncated to
+/// its low byte, which is exactly a LATIN1 read of a UTF-16 unit.
+/// `codePoints()`, `compareTo` and `writeObject` are the same read and were the
+/// same wrong.
+pub(crate) fn sb_store_units(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    units: &[u16],
+    exact_capacity: Option<usize>,
+) -> cratonvm_types::ObjectRef {
+    use cratonvm_types::ArrayElementType;
+    let v = sb_view(&*ctx, this);
+    // The JDK INFLATES and never deflates: once a builder has held a non-LATIN1
+    // character its `coder` stays UTF16 for the life of the value array.
+    // Deflating on the way back down would DOUBLE the reported capacity, which
+    // `probes/StringBuilderShadowSweep.java` asserts it does not
+    // (`delete back to all-latin1 keeps capacity`).
+    let compact = matches!(v.layout, SbLayout::Compact { .. });
+    let utf16 = compact && (v.utf16 || units.iter().any(|&u| u > 0xFF));
+    let target = match exact_capacity {
+        Some(c) => c.max(units.len()),
+        None => sb_grow_units(v.capacity, units.len()),
+    };
+    let need_elems = if compact {
+        target << usize::from(utf16)
+    } else {
+        target
+    };
+    let reuse = if exact_capacity.is_some() || utf16 != v.utf16 {
+        None
+    } else {
+        v.buf.filter(|_| {
+            v.raw_len
+                >= if compact {
+                    units.len() << usize::from(utf16)
+                } else {
+                    units.len()
+                }
+        })
+    };
+    let (this, buf) = match reuse {
+        Some(a) => (this, a),
+        None => {
+            let elem = if compact {
+                ArrayElementType::Byte
+            } else {
+                ArrayElementType::Char
+            };
+            let mut scope = NativeHandleScope::new(ctx);
+            let handle = scope.root(this);
+            let fresh = scope.new_array(elem, need_elems);
+            let this = scope.get(&handle);
+            scope.set_field(this, 0, Value::Object(Some(fresh)));
+            (this, fresh)
+        }
+    };
+    sb_put_units_at(ctx, buf, 0, units, v.layout, utf16);
+    if let SbLayout::Compact { coder_slot } = v.layout {
+        ctx.set_field(this, coder_slot, Value::Int(i32::from(utf16)));
+    }
+    sb_set_count(ctx, this, units.len() as i32);
+    this
+}
+
+/// Replace the whole payload, growing by the JDK's rule when it does not fit.
+pub(crate) fn sb_write_units(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    units: &[u16],
+) -> cratonvm_types::ObjectRef {
+    sb_store_units(ctx, this, units, None)
+}
+
+/// Append `units` in the receiver's own layout.
+///
+/// The in-place arm is the hot one: one resolved view, one bulk store, one count
+/// write, no allocation and no whole-payload read. The slow arm — a grow, or a
+/// LATIN1 payload asked for a character it cannot hold — reads the content once
+/// and hands it to [`sb_store_units`], which is amortised O(1) because the
+/// growth rule doubles.
+pub(crate) fn sb_append_units(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    units: &[u16],
+) -> cratonvm_types::ObjectRef {
+    if units.is_empty() {
+        return this;
+    }
+    let v = sb_view(&*ctx, this);
+    if v.count + units.len() <= v.capacity {
+        let representable = match v.layout {
+            SbLayout::Synthetic => true,
+            SbLayout::Compact { .. } => v.utf16 || units.iter().all(|&u| u <= 0xFF),
+        };
+        if let (true, Some(buf)) = (representable, v.buf) {
+            sb_put_units_at(ctx, buf, v.count, units, v.layout, v.utf16);
+            sb_set_count(ctx, this, (v.count + units.len()) as i32);
+            return this;
+        }
+    }
+    let mut all = sb_units_range_view(&*ctx, &v, 0, v.count);
+    all.extend_from_slice(units);
+    sb_store_units(ctx, this, &all, None)
+}
+
+/// Grow the payload so it can hold at least `min_capacity` characters, keeping
+/// the content and the coder. `ensureCapacity`'s whole body.
+fn sb_reserve_units(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    min_capacity: usize,
+) -> cratonvm_types::ObjectRef {
+    let v = sb_view(&*ctx, this);
+    if min_capacity <= v.capacity {
+        return this;
+    }
+    let units = sb_units_range_view(&*ctx, &v, 0, v.count);
+    let target = sb_grow_units(v.capacity, min_capacity);
+    sb_store_units(ctx, this, &units, Some(target))
+}
+
+/// Overwrite ONE character in place. `false` when the payload cannot hold it —
+/// a LATIN1 compact array asked for a non-LATIN1 character — and the caller must
+/// take the whole-payload path so the array inflates.
+fn sb_put_unit(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    index: usize,
+    unit: u16,
+) -> bool {
+    let v = sb_view(&*ctx, this);
+    if matches!(v.layout, SbLayout::Compact { .. }) && !v.utf16 && unit > 0xFF {
+        return false;
+    }
+    let Some(buf) = v.buf else {
+        return false;
+    };
+    sb_put_units_at(ctx, buf, index, &[unit], v.layout, v.utf16);
+    true
+}
+
+/// The catchable `OutOfMemoryError` HotSpot raises for an over-large value
+/// array. The panicking allocator would abort the whole VM instead of unwinding
+/// to the `catch` the caller wrote.
+fn sb_oom() -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::OutOfMemoryError {
+        message: "Requested array size exceeds VM limit".to_string(),
+    }
+    .into()
+}
+
+/// Read `len` characters of a Java `char[]` starting at `from`, bulk where the
+/// heap offers it and element by element where it does not.
+fn sb_read_char_array(
+    ctx: &dyn NativeContext,
+    arr: cratonvm_types::ObjectRef,
+    from: usize,
+    len: usize,
+) -> Vec<u16> {
+    let mut out = vec![0u16; len];
+    let read = ctx.read_char_array_into(arr, from, &mut out[..]);
+    if read < len {
+        for (i, slot) in out.iter_mut().enumerate().skip(read) {
+            *slot = match ctx.get_array_element(arr, from + i) {
+                Value::Int(c) => c as u16,
+                _ => 0,
+            };
+        }
+    }
+    out
+}
+
+/// Install a fresh, empty payload of `capacity` characters in the receiver's OWN
+/// layout, and return the post-GC `this`. `None` is the catchable
+/// `OutOfMemoryError` HotSpot raises for an over-large value array.
+///
+/// A constructor is the one place where the payload cannot decide the layout, so
+/// the CLASS decides: an object allocated under the real
+/// `java.lang.StringBuilder` declares `value: byte[]`, and writing a `char[]`
+/// into it — which is what these constructors did — is the tear itself, minted
+/// at birth.
+fn sb_alloc_payload(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    capacity: usize,
+) -> Option<cratonvm_types::ObjectRef> {
+    use cratonvm_types::ArrayElementType;
+    let layout = sb_view(&*ctx, this).layout;
+    let elem = match layout {
+        SbLayout::Compact { .. } => ArrayElementType::Byte,
+        SbLayout::Synthetic => ArrayElementType::Char,
+    };
+    let mut scope = NativeHandleScope::new(ctx);
+    let handle = scope.root(this);
+    let buf = scope.try_new_array(elem, capacity)?;
+    let this = scope.get(&handle);
+    scope.set_field(this, 0, Value::Object(Some(buf)));
+    if let SbLayout::Compact { coder_slot } = layout {
+        scope.set_field(this, coder_slot, Value::Int(0));
+    }
+    Some(this)
+}
+
 pub(crate) fn sb_state(
     ctx: &dyn NativeContext,
     this: cratonvm_types::ObjectRef,
@@ -1621,10 +2197,40 @@ fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, co
         // write on the JDK 17 layout and a `count` write on the 2-slot
         // synthetic one, and the unconditional `set_field(this, 2, count)`
         // wrote an int over `maybeLatin1` on every JDK 21+ image.
-        if let Some(coder) = sb_field_slot(ctx, this, "coder") {
-            ctx.set_field(this, coder, Value::Int(0));
-        }
+        // `coder` is NOT written here any more. It used to be forced to
+        // LATIN1 on every count update, on the premise stated just above —
+        // "the payload these natives maintain is a `char[]`". Since the layout
+        // migration that premise is false: `sb_store_units` writes the
+        // receiver's OWN payload and owns the `coder` that describes it, and a
+        // blind zero here would tell every real-bytecode reader that a UTF16
+        // payload was LATIN1 — the same wrong answer by a shorter route. The
+        // count is all this helper knows, and all it now writes.
         ctx.set_field(this, slot, Value::Int(count));
+        // …and `StringBuffer.toStringCache`, when the receiver has one.
+        //
+        // Every mutating native funnels through here, which makes this the
+        // chokepoint the cache needs. `StringBuffer` caches its last
+        // `toString()` and every one of its own bodies nulls the field before
+        // delegating — but SIX of them do not, because they do not need to:
+        // `insert(int,int)`, `(int,long)`, `(int,float)`, `(int,double)`,
+        // `(int,boolean)` and `(int,CharSequence)` are
+        // `invokespecial AbstractStringBuilder.insert(...)`, and the JDK's own
+        // `AbstractStringBuilder.insert` then re-dispatches VIRTUALLY to
+        // `this.insert(offset, String.valueOf(i))`, landing back in the
+        // synchronized `StringBuffer` override that does null it. A native
+        // registered on the abstract base renders the value itself and never
+        // re-enters, so that hook never fires. MEASURED: with the 62
+        // `StringBuffer` shadows retired, `sb.toString(); sb.insert(0, 7);
+        // sb.toString()` answered the STALE "abc" for exactly those six and
+        // the right "7abc" for the other thirty.
+        //
+        // The guard is `count_slot + 1 < num_fields` — "this receiver has state
+        // after `count`", which is true of `StringBuffer` on every image and
+        // false of `StringBuilder` on every image — so the hot builder path
+        // pays one integer comparison and never a second name resolution.
+        if slot + 1 < ctx.object_num_fields(this) {
+            ctx.set_field_by_name(this, "toStringCache", Value::Object(None));
+        }
         return;
     }
     // No class model (the mock) — the historical heuristic, unchanged.
@@ -1640,120 +2246,39 @@ fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, co
     }
 }
 
-/// Helper: ensure the StringBuilder has capacity for `additional` more chars.
-/// Returns the char[] buffer (possibly newly allocated and copied).
-/// Returns `(updated_this, buf)`.  The first element is the post-GC ObjectRef
-/// for `this`; callers MUST use it for all subsequent writes to the StringBuilder
-/// because `ctx.new_array` can trigger a moving GC that relocates `this`.
+/// Ensure the builder can hold `additional` more characters, in its OWN layout.
+///
+/// This used to hand back a `char[]` for the caller to write into, which is why
+/// every write path converted the payload: there is no `char[]` to hand back for
+/// a builder real `AbstractStringBuilder` bytecode constructed, so the old body
+/// ALLOCATED one and installed it over the compact `byte[]`. Callers now go
+/// through [`sb_append_units`] / [`sb_store_units`], which write the receiver's
+/// own representation, and this is the capacity half alone.
+///
+/// Returns the post-GC `this`: growing allocates, and `ctx.new_array` can move
+/// the receiver.
 pub(crate) fn sb_ensure_capacity(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     additional: usize,
-) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
-    use cratonvm_types::ArrayElementType;
-
-    let (buf, raw_count) = sb_state(ctx, this);
-    let old_cap = buf.map_or(0, |b| ctx.array_length(b));
-    // Clamp to the CHAR[] capacity only when there is one. For a receiver whose
-    // payload is a compact `byte[]` there is no char[] to clamp against and
-    // `old_cap` is 0, so the old clamp reported every such builder as empty and
-    // the grow below had nothing to preserve.
-    let count = if buf.is_some() {
-        (raw_count.max(0) as usize).min(old_cap)
-    } else {
-        raw_count.max(0) as usize
-    };
-
-    if buf.is_some() && count + additional <= old_cap {
-        return (this, buf.unwrap());
-    }
-
-    // Grow: max(old_cap * 2 + 2, count + additional)
-    let new_cap = std::cmp::max(
-        old_cap.saturating_mul(2).saturating_add(2),
-        count + additional,
-    );
-
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_handle = scope.root(this);
-    let new_buf = scope.new_array(ArrayElementType::Char, new_cap);
-    let this = scope.get(&this_handle);
-
-    // Re-read old_buf via the GC-updated `this` (GC also updates object fields).
-    // audit-round5 fix #6 (HIGH): use the `bulk_array_copy` intrinsic
-    // (single `copy_nonoverlapping` in the VM override) instead of a
-    // per-element `get_array_element` / `set_array_element` loop. This
-    // collapses 2N virtual trait dispatches into one bulk call on the
-    // StringBuilder grow path.
-    if let Value::Object(Some(old_buf)) = scope.get_field(this, 0) {
-        if scope.object_is_array(old_buf)
-            && scope.heap_element_type_of(old_buf) == cratonvm_types::ArrayElementType::Char
-        {
-            let _ = scope.bulk_array_copy(old_buf, 0, new_buf, 0, count);
-        } else {
-            // A receiver whose `value` is the real compact `byte[]` — a builder
-            // real `AbstractStringBuilder` bytecode constructed (Mockito's
-            // inline mock maker and Byte Buddy retransformation both produce
-            // them), or one built while the `--jdk-only` enforcement dial was
-            // armed on `java/lang/AbstractStringBuilder`.
-            //
-            // The `char[]` guard above is a copy CONDITION, so this arm used to
-            // fall straight through to the `set_field` below and install an
-            // empty `char[]` over the payload: every character already in the
-            // builder was DISCARDED, silently, with no exception and `rc=0`.
-            // Widen it instead — `sb_value_units` reads either layout — so the
-            // conversion this function was already performing stops losing the
-            // content it converts.
-            let existing = sb_value_units(&*scope, this).unwrap_or_default();
-            let keep = existing.len().min(count).min(new_cap);
-            if !scope.write_char_array_from(new_buf, 0, &existing[..keep]) {
-                for (i, &ch) in existing[..keep].iter().enumerate() {
-                    scope.set_array_element(new_buf, i, Value::Int(ch as i32));
-                }
-            }
-        }
-    }
-
-    scope.set_field(this, 0, Value::Object(Some(new_buf)));
-    (this, new_buf)
+) -> cratonvm_types::ObjectRef {
+    let count = sb_count_units(&*ctx, this);
+    sb_reserve_units(ctx, this, count.saturating_add(additional))
 }
 
-/// Helper: append a slice of u16 chars to a StringBuilder.
+/// Helper: append a slice of UTF-16 units to a builder.
+///
 /// Returns the CURRENT (pin-refreshed) `this`: the grow path allocates, and
 /// callers that return `this` to Java (every `append` overload — chained
-/// `.append(...)` dispatches on that return value) must hand back the
-/// post-move address, not their raw pre-call copy (cceres5, live-captured at
+/// `.append(...)` dispatches on that return value) must hand back the post-move
+/// address, not their raw pre-call copy (cceres5, live-captured at
 /// `JndiName.getAbsoluteName`'s chained appends).
 pub(crate) fn sb_append_chars(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     chars: &[u16],
 ) -> cratonvm_types::ObjectRef {
-    // Most appends do not grow. Reuse this first state read instead of
-    // entering `sb_ensure_capacity` and then reading the buffer/count again.
-    let (current_buf, current_count) = sb_state(ctx, this);
-    let current_cap = current_buf.map_or(0, |buf| ctx.array_length(buf));
-    let current_count = (current_count.max(0) as usize).min(current_cap);
-    let (this, buf, count) = if let Some(buf) =
-        current_buf.filter(|_| current_count.saturating_add(chars.len()) <= current_cap)
-    {
-        (this, buf, current_count)
-    } else {
-        let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
-        let (_, count) = sb_state(ctx, this);
-        (this, buf, count.max(0) as usize)
-    };
-
-    // Char arrays are compact u16 payloads in the VM. The bulk override is a
-    // single checked copy; retain the element loop only for mock contexts or
-    // unusual heaps that decline the fast path.
-    if !ctx.write_char_array_from(buf, count, chars) {
-        for (i, &ch) in chars.iter().enumerate() {
-            ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
-        }
-    }
-    sb_set_count(ctx, this, (count + chars.len()) as i32);
-    this
+    sb_append_units(ctx, this, chars)
 }
 
 /// Helper: append a Rust string to a StringBuilder. Returns the CURRENT
@@ -1767,21 +2292,38 @@ pub(crate) fn sb_append_str(
     sb_append_chars(ctx, this, &chars)
 }
 
+/// The `NullPointerException` a real `AbstractStringBuilder` body raises when it
+/// dereferences a null argument, with HotSpot's helpful-NPE wording.
+///
+/// Ten arms of this registrar used to answer a plausible NON-answer instead — an
+/// empty builder, an unchanged builder, `-1` — which is the fabricated-success
+/// shape `W2-7-fabricated-success-where-the-spec-mandates-failure.md`
+/// inventories: a caller that guards a loop with the exception never leaves it,
+/// and nothing anywhere throws. Every one of them is a `native-won` triple of
+/// the L2 lane and was MEASURED against jdk-25.0.4+7 by
+/// `probes/StringBuilderShadowSweep.java`.
+fn sb_npe(message: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(message.to_string()),
+    }
+    .into()
+}
+
 pub(crate) fn native_sb_init_default(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_h = scope.root(this);
-    let buf = scope.new_array(ArrayElementType::Char, 16);
-    let this = scope.get(&this_h);
-    scope.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(&mut *scope, this, 0);
+    // `AbstractStringBuilder()` is `value = new byte[16]` on a real image and
+    // `char[16]` on the synthetic one; `sb_alloc_payload` picks by the CLASS,
+    // which is the only thing that can decide it for a fresh object.
+    let Some(this) = sb_alloc_payload(ctx, this, 16) else {
+        return Err(sb_oom());
+    };
+    sb_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -1789,7 +2331,6 @@ pub(crate) fn native_sb_init_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1800,70 +2341,77 @@ pub(crate) fn native_sb_init_string(
     // disagreed with the String it was constructed from
     // (`s.contentEquals(new StringBuilder(s))` answered false). MEASURED,
     // `scratchpad/g26/G26Builder.java` rows c1/c2/c3/c5/c7/e1/e4.
+    //
+    // `AbstractStringBuilder(String)` is `this(str.length() + 16); append(str);`
+    // so a null argument fails in `str.length()` — a NullPointerException, not
+    // a usable builder of length 0. MEASURED: `new StringBuilder((String) null)`
+    // throws on jdk-25.0.4+7 and answered `0` here.
     let chars: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(s))) => read_string_chars(&*ctx, *s),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => Vec::new(),
     };
-    let cap = chars.len() + 16;
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_h = scope.root(this);
-    let buf = scope.new_array(ArrayElementType::Char, cap);
-    let this = scope.get(&this_h);
-    for (i, &ch) in chars.iter().enumerate() {
-        scope.set_array_element(buf, i, Value::Int(ch as i32));
-    }
-    scope.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(&mut *scope, this, chars.len() as i32);
+    // Capacity first, content second — exactly the JDK's two steps, so an
+    // inflating write keeps the `len + 16` capacity the constructor established
+    // instead of recomputing one.
+    let Some(this) = sb_alloc_payload(ctx, this, chars.len() + 16) else {
+        return Err(sb_oom());
+    };
+    sb_write_units(ctx, this, &chars);
     Ok(None)
 }
 
 /// `StringBuilder(CharSequence)` / `StringBuffer(CharSequence)`.
 ///
-/// Without this native the real JDK `StringBuilder(CharSequence)` ctor runs
-/// bytecode that delegates to `AbstractStringBuilder.<init>(CharSequence)`,
-/// which populates the *real* JDK field layout (`value`/`coder`/`count`).
-/// CratonVM's StringBuilder uses a synthetic layout (char[] at slot 0, count
-/// at slot 1), so the real ctor leaves the object inconsistent: subsequent
-/// synthetic `append`/`toString` natives misread the slots, prepending
-/// `seq.length()` NUL chars (picocli's `Help.Ansi.Text` copy-ctor —
-/// `new StringBuilder(other.plain)` — was the visible symptom: blank
-/// `--help` output). Intercept it so the synthetic layout stays consistent,
-/// mirroring `native_sb_init_string` but coercing any CharSequence to text.
+/// Without this native the real JDK ctor delegates to
+/// `AbstractStringBuilder.<init>(CharSequence)`, which populates the real field
+/// layout in a way the SYNTHETIC arm cannot read — picocli's
+/// `Help.Ansi.Text` copy-ctor (`new StringBuilder(other.plain)`) came out blank.
+/// Intercept it so the receiver stays consistent in either layout, mirroring
+/// `native_sb_init_string` but coercing any CharSequence to text.
 pub(crate) fn native_sb_init_charsequence(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // Real JDK `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a
-    // null sequence throws NPE; coerce any non-null CharSequence to its text.
-    // `this` crosses TWO allocating calls here —
-    // `invoke_to_string` (arbitrary Java `toString()`, can allocate/GC at
-    // will) and `new_array`; the handle slot remains current across both.
+    // `charsequence_chars` runs arbitrary Java `charAt`, which can allocate and
+    // move `this`, so it is rooted across that call and the answer is taken from
+    // the handle afterwards.
     let mut scope = NativeHandleScope::new(ctx);
     let this_h = scope.root(this);
-    // `charsequence_chars`, not `invoke_to_string`: `AbstractStringBuilder`'s
-    // own `(CharSequence)` constructor is `this(seq.length() + 16);
-    // append(seq);`, so the characters it stores are the ones `append` reads —
-    // by `charAt` for anything but the fast-path shapes, never `toString()`.
-    // The units form also carries an unpaired surrogate, which the `str` this
-    // replaces could not: MEASURED rows c6/c8/c9 of
-    // `scratchpad/g26/G26Builder.java`.
+    // `charsequence_chars`, not `invoke_to_string`: `AbstractStringBuilder`'s own
+    // `(CharSequence)` constructor is `this(seq.length() + 16); append(seq);`, so
+    // the characters it stores are the ones `append` reads — by `charAt` for
+    // anything but the fast-path shapes, never `toString()`. The units form also
+    // carries an unpaired surrogate, which the `str` this replaces could not:
+    // MEASURED rows c6/c8/c9 of `scratchpad/g26/G26Builder.java`.
+    //
+    // The doc comment on this function has always said the rest: real
+    // `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a null
+    // sequence throws NPE. The code did not — this arm answered an empty
+    // builder. MEASURED.
     let chars: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(o))) => charsequence_chars(&mut *scope, *o, None)?,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"java.lang.CharSequence.length()\" because \"seq\" is null",
+            ))
+        }
         _ => Vec::new(),
     };
-    let cap = chars.len() + 16;
-    let buf = scope.new_array(ArrayElementType::Char, cap);
     let this = scope.get(&this_h);
-    for (i, &ch) in chars.iter().enumerate() {
-        scope.set_array_element(buf, i, Value::Int(ch as i32));
-    }
-    scope.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(&mut *scope, this, chars.len() as i32);
+    drop(scope);
+    let Some(this) = sb_alloc_payload(ctx, this, chars.len() + 16) else {
+        return Err(sb_oom());
+    };
+    sb_write_units(ctx, this, &chars);
     Ok(None)
 }
 
@@ -1871,7 +2419,6 @@ pub(crate) fn native_sb_init_capacity(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1885,10 +2432,10 @@ pub(crate) fn native_sb_init_capacity(
     // HotSpot throws.
     //
     // This is deliberately a DIFFERENT exception class from `setLength(-1)`'s
-    // `StringIndexOutOfBoundsException`, and `RJdkBridge1`'s `sbidx` rows
-    // assert both, one right after the other, precisely because the two
-    // negative-length paths in this class do not agree. MEASURED on
-    // jdk-25.0.3.9: `new StringBuilder(-1)` -> `NegativeArraySizeException: -1`,
+    // `StringIndexOutOfBoundsException`, and `RJdkBridge1`'s `sbidx` rows assert
+    // both, one right after the other, precisely because the two negative-length
+    // paths in this class do not agree. MEASURED on jdk-25.0.3.9:
+    // `new StringBuilder(-1)` -> `NegativeArraySizeException: -1`,
     // `new StringBuffer(-7)` -> `NegativeArraySizeException: -7`.
     let cap = match args.get(1) {
         Some(Value::Int(v)) => {
@@ -1902,23 +2449,10 @@ pub(crate) fn native_sb_init_capacity(
         }
         _ => 16,
     };
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_h = scope.root(this);
-    // HotSpot throws a catchable OutOfMemoryError for an over-large value array
-    // (e.g. `new StringBuilder(Integer.MAX_VALUE)`); mirror that instead of the
-    // panicking allocator, which would abort the whole VM.
-    let buf = match scope.try_new_array(ArrayElementType::Char, cap) {
-        Some(b) => b,
-        None => {
-            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
-                message: "Requested array size exceeds VM limit".to_string(),
-            }
-            .into());
-        }
+    let Some(this) = sb_alloc_payload(ctx, this, cap) else {
+        return Err(sb_oom());
     };
-    let this = scope.get(&this_h);
-    scope.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(&mut *scope, this, 0);
+    sb_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -2149,8 +2683,19 @@ pub(crate) fn native_sb_append_char_array_off_len(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `append(char[] str, int offset, int len)` opens with
+    // `checkRange(offset, offset + len, str.length)`, so the array is
+    // dereferenced BEFORE the window is judged: a null `str` is a
+    // NullPointerException whatever the offsets are, including the
+    // `(-1, -1)` pair that would otherwise be a range failure. This arm
+    // returned the builder unchanged. MEASURED.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot read the array length because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let off_i32 = match args.get(2) {
@@ -2179,11 +2724,14 @@ pub(crate) fn native_sb_append_char_array_off_len(
     // audit-round5 fix #6 (HIGH): both sides are Java `char[]` — go
     // through `bulk_array_copy` (single `copy_nonoverlapping` in the VM
     // override) instead of materialising a per-element Rust `Vec<u16>`.
-    let (this, buf) = sb_ensure_capacity(ctx, this, copy_len);
-    let (_, count) = sb_state(ctx, this);
-    let count = count as usize;
-    let _ = ctx.bulk_array_copy(arr, start, buf, count, copy_len);
-    sb_set_count(ctx, this, (count + copy_len) as i32);
+    // The source is a Java `char[]`; the destination is whichever layout the
+    // receiver holds. The `bulk_array_copy` straight into the builder's buffer
+    // that used to stand here cannot: for a compact receiver there is no
+    // `char[]` to copy into, and the `sb_ensure_capacity` that produced one
+    // CONVERTED the payload. Read the window once, then append through the
+    // layout-aware writer.
+    let src = sb_read_char_array(ctx, arr, start, copy_len);
+    let this = sb_append_units(ctx, this, &src);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2196,18 +2744,22 @@ pub(crate) fn native_sb_append_char_array(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // `append(char[] str)` is `int len = str.length;` — a null array throws,
+    // and this is the overload of the three null-append shapes that does NOT
+    // append the text "null" (`append(String)` and `append(CharSequence)` do).
+    // MEASURED: the three really do differ.
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot read the array length because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let n = ctx.array_length(arr);
-    // audit-round5 fix #6 (HIGH): bulk-copy directly into the SB buffer
-    // (see `native_sb_append_char_array_off_len` for rationale).
-    let (this, buf) = sb_ensure_capacity(ctx, this, n);
-    let (_, count) = sb_state(ctx, this);
-    let count = count as usize;
-    let _ = ctx.bulk_array_copy(arr, 0, buf, count, n);
-    sb_set_count(ctx, this, (count + n) as i32);
+    let src = sb_read_char_array(ctx, arr, 0, n);
+    let this = sb_append_units(ctx, this, &src);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2965,49 +3517,24 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (buf, count) = sb_state(ctx, this);
-    let count = count.max(0) as usize;
-    // Read chars and build Rust string
-    let chars: Vec<u16> = match buf {
-        Some(buf) => {
-            let count = count.min(ctx.array_length(buf));
-            let mut chars = Vec::with_capacity(count);
-            for i in 0..count {
-                let ch = match ctx.get_array_element(buf, i) {
-                    Value::Int(v) => v as u16,
-                    _ => 0,
-                };
-                chars.push(ch);
-            }
-            chars
-        }
-        // NOT `""`. A receiver whose `value` is the real compact `byte[]` has a
-        // payload this function can read perfectly well — it is the same
-        // decode `decode_string_chars` has always done for `String` — and
-        // answering "" for it is a FABRICATION, not a refusal: the caller
-        // cannot tell an empty builder from one whose content this native
-        // declined to look at. That answer is the visible half of the "every
-        // append silently discarded, `toString()` empty, `rc=0`" behaviour
-        // `H22` measured on this registrar.
-        //
-        // A receiver with no readable payload at all still yields "", which is
-        // what a freshly-allocated builder legitimately holds.
-        None => {
-            let mut units = sb_value_units(ctx, this).unwrap_or_default();
-            units.truncate(count.min(units.len()));
-            units
-        }
-    };
-    // `StringBuilder.toString()` must return a *fresh* String distinct from
-    // any equal literal — the JVM spec only pools literals and `intern()`.
-    // Routing it through the interned pool made `==` wrongly report identity
-    // (e.g. `sb.toString() == "literal"`), breaking identity-based symbol
-    // comparisons such as xerces' `NamespaceSupport`.
+    // `sb_read_chars` reads whichever layout the receiver holds. The version of
+    // this that recognised only a `char[]` answered "" for a compact receiver —
+    // a FABRICATION, not a refusal: the caller cannot tell an empty builder from
+    // one whose content the native declined to look at, and that is the visible
+    // half of the "every append silently discarded, `toString()` empty, `rc=0`"
+    // behaviour `H22` measured on this registrar.
+    let chars = sb_read_chars(&*ctx, this);
+    // `StringBuilder.toString()` must return a *fresh* String distinct from any
+    // equal literal — the JVM spec only pools literals and `intern()`. Routing
+    // it through the interned pool made `==` wrongly report identity (e.g.
+    // `sb.toString() == "literal"`), breaking identity-based symbol comparisons
+    // such as xerces' `NamespaceSupport`.
+    //
     // `_gc_safe` (inside `sb_string_from_units`): the units are already
-    // Rust-owned; `this`/`buf` are not dereferenced again below, so a moving
-    // young GC here is safe. Without this, a StringBuilder.toString()-heavy hot
-    // loop (e.g. Response.toAbsolute()) hard-aborts the whole process on
-    // young-gen exhaustion instead of collecting and continuing -- see
+    // Rust-owned and `this` is not dereferenced again below, so a moving young
+    // GC here is safe. Without it a `toString()`-heavy hot loop (e.g.
+    // `Response.toAbsolute()`) hard-aborts the process on young-gen exhaustion
+    // instead of collecting and continuing — see
     // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
     let result = sb_string_from_units(ctx, &chars)?;
     Ok(Some(Value::Object(Some(result))))
@@ -3067,7 +3594,8 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
 
-    let (buf, count) = sb_state(ctx, this);
+    let view = sb_view(&*ctx, this);
+    let count = view.count as i32;
     // (1) Source-range check FIRST, with `SIOOBE_FORMATTER`. This precedes the
     // null-`dst` dereference, which is why a bad source window beats a null
     // destination rather than the other way round.
@@ -3106,18 +3634,15 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
         )
         .into());
     }
-    let buf = match buf {
-        Some(b) => b,
-        // No backing buffer means a length-0 builder; the source check above
-        // already guarantees `n == 0`, so there is nothing to copy.
-        None => return Ok(None),
-    };
+    // Decoded through the receiver's own layout: reading the payload array
+    // element by element is a LATIN1 read of a UTF-16 unit whenever the two
+    // disagree, which is the truncation `chars()` measured.
+    let src = sb_units_range_view(&*ctx, &view, src_begin as usize, src_begin as usize + n);
     // `set_array_element` is infallible (returns no Result), so every store is
     // guarded by the explicit destination-range check above rather than relying
     // on a downstream bounds error.
-    for i in 0..n {
-        let ch = ctx.get_array_element(buf, src_begin as usize + i);
-        ctx.set_array_element(dst, dst_begin as usize + i, ch);
+    for (i, &u) in src.iter().enumerate() {
+        ctx.set_array_element(dst, dst_begin as usize + i, Value::Int(i32::from(u)));
     }
     Ok(None)
 }
@@ -3131,69 +3656,72 @@ pub(crate) fn native_sb_length(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(count)))
 }
 
-/// `AbstractStringBuilder.getCoder()B` — synthetic-layout accessor.
+/// `AbstractStringBuilder.getCoder()B`.
 ///
-/// The real JDK `getCoder()` returns the `coder` byte field of the compact-string
-/// `AbstractStringBuilder` (`byte[] value`, `byte coder`, `int count`). CratonVM
-/// instead backs StringBuilder/StringBuffer with a synthetic layout (slot 0 =
-/// `char[] buffer`, slot 1 = `int count`) that has no `coder` field. Real-JDK
-/// bytecode such as `String.nonSyncContentEquals` (reached from
-/// `String.contentEquals(CharSequence)`) calls `sb.getCoder()` / `sb.getValue()`
-/// directly; with no native override it would read our `int count` as the coder
-/// byte and the `char[]` buffer as a compact `byte[]`, forcing a bogus UTF16
-/// branch and a `StringIndexOutOfBoundsException` in `StringUTF16.contentEquals`
-/// (BUG-TC0622, same family as BUG-M `lastIndexOf`).
-///
-/// We derive the coder exactly the way `vm_object::create_java_string` does:
-/// LATIN1 (0) iff every code unit fits in a byte, otherwise UTF16 (1). Matching
-/// that choice keeps the comparison correct: the receiver String's coder and our
-/// builder's coder agree whenever the contents do.
+/// For a compact receiver this is the `coder` FIELD, not a value derived from
+/// the content, and the difference is load-bearing: the JDK inflates and never
+/// deflates, so a builder that has held a non-LATIN1 character keeps
+/// `coder == UTF16` even while its current content is all LATIN1. Deriving the
+/// answer from the content would then contradict `getValue()`'s array, and
+/// `String.nonSyncContentEquals` — the one caller that matters — compares the
+/// two only when `coder() == sb.getCoder()`, so a disagreement is a wrong
+/// answer, not a slow one.
 pub(crate) fn native_sb_get_coder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let chars = sb_read_chars(ctx, this);
-    let coder = if chars.iter().all(|&u| u <= 0xFF) {
-        0
-    } else {
-        1
-    };
-    Ok(Some(Value::Int(coder)))
+    let v = sb_view(&*ctx, this);
+    match v.layout {
+        SbLayout::Compact { .. } => Ok(Some(Value::Int(i32::from(v.utf16)))),
+        // The synthetic `char[]` payload is not compacted at all, so the coder
+        // is whatever `native_sb_get_value`'s synthesised array will use — and
+        // the two must agree by construction.
+        SbLayout::Synthetic => {
+            let chars = sb_read_chars(&*ctx, this);
+            Ok(Some(Value::Int(i32::from(chars.iter().any(|&u| u > 0xFF)))))
+        }
+    }
 }
 
-/// `AbstractStringBuilder.getValue()[B` — synthetic-layout accessor.
+/// `AbstractStringBuilder.getValue()[B`.
 ///
-/// Companion to [`native_sb_get_coder`]: returns a freshly allocated compact
-/// `byte[]` view of the synthetic `char[]` buffer, in the SAME layout CratonVM's
-/// own Strings use (`vm_object::create_java_string`): LATIN1 packs one byte per
-/// char, UTF16 packs two little-endian bytes per char (low byte first). The
-/// `coder` implied by this array must match [`native_sb_get_coder`] for the real
-/// `nonSyncContentEquals` path to compute correctly.
+/// Companion to [`native_sb_get_coder`]: the compact `byte[]` the real JDK's
+/// `String.nonSyncContentEquals` reads, paired with the coder that describes it.
+///
+/// For a compact receiver that array IS the payload and is handed back
+/// directly — the JDK's own accessor returns the field, callers bound their read
+/// by `length()`, and copying it would be pure waste on a path
+/// `String.contentEquals` takes. For a synthetic receiver there is no such array
+/// and one is built, in the SAME layout CratonVM's own Strings use
+/// (`vm_object::create_java_string`): LATIN1 one byte per char, UTF16 two
+/// little-endian bytes per char, low byte first.
 pub(crate) fn native_sb_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let v = sb_view(&*ctx, this);
+    if let SbLayout::Compact { .. } = v.layout {
+        if let Some(arr) = v.buf {
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    }
     // Snapshot the chars into a Rust-local Vec BEFORE allocating, so the moving
-    // GC that `new_array` may trigger cannot leave us with a stale `this`/buffer.
-    let chars = sb_read_chars(ctx, this);
+    // GC that `new_array` may trigger cannot leave us with a stale `this`.
+    let chars = sb_units_range_view(&*ctx, &v, 0, v.count);
     let latin1 = chars.iter().all(|&u| u <= 0xFF);
     let byte_len = if latin1 { chars.len() } else { chars.len() * 2 };
     let arr = ctx.new_array(ArrayElementType::Byte, byte_len);
-    if latin1 {
-        for (i, &u) in chars.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int((u & 0xFF) as i32));
-        }
-    } else {
-        // Little-endian UTF16: low byte at even index, high byte at odd index —
-        // consistent with create_java_string and StringUTF16.isBigEndian()==false.
-        for (i, &u) in chars.iter().enumerate() {
-            ctx.set_array_element(arr, i * 2, Value::Int((u & 0xFF) as i32));
-            ctx.set_array_element(arr, i * 2 + 1, Value::Int(((u >> 8) & 0xFF) as i32));
-        }
-    }
+    sb_put_units_at(
+        ctx,
+        arr,
+        0,
+        &chars,
+        SbLayout::Compact { coder_slot: 1 },
+        !latin1,
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -3206,39 +3734,26 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (buf, count) = sb_state(ctx, this);
+    let v = sb_view(&*ctx, this);
+    let count = v.count as i32;
     if index < 0 || index >= count {
-        // Message as well as class: `AbstractStringBuilder.charAt` delegates
-        // to `String.checkIndex` → `Preconditions.checkIndex(index, count,
-        // SIOOBE_FORMATTER)`.
+        // Message as well as class: `AbstractStringBuilder.charAt` delegates to
+        // `String.checkIndex` → `Preconditions.checkIndex(index, count,
+        // SIOOBE_FORMATTER)`. Its wording is TRANSCRIBED from HotSpot and
+        // asserted by the probe rows n21/n22/n23 (`Index 5 out of bounds for
+        // length 2`), which match today and must keep matching.
         return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
-    // `buf.unwrap()` here ABORTED THE VM. A builder whose slot 0 is not a
-    // `char[]` reaches this with `count > 0` and `buf == None`, and a Rust
-    // panic is not a Java throwable: it terminates the process instead of
-    // unwinding to the `catch` the caller wrote.
-    //
-    // MEASURED reproducer before the fix (`scratchpad/g26/G26Builder.java`
-    // row i6): `new StringBuilder("xy").insert(1, (CharSequence) s)` had no
-    // native, so real `AbstractStringBuilder` bytecode ran against this VM's
-    // synthetic `char[]`/`count` layout and left the receiver inconsistent;
-    // the next `charAt` panicked at this line —
-    // `thread 'main-vm' panicked ... called Option::unwrap() on a None value`,
-    // exit without a stack trace. The registration gap is closed below
-    // (`insert(int, CharSequence)` and its 4-arg sibling), so nothing in the
-    // suite reaches this arm any more; it stays because the guard must not
-    // depend on that.
-    //
-    // `sioobe_index` is the same refusal the bounds arm above raises, so a
-    // caller sees one class for "this index is not readable" either way. Its
-    // message is TRANSCRIBED from HotSpot and asserted by the probe rows
-    // n21/n22/n23 (`Index 5 out of bounds for length 2`), which match today
-    // and must keep matching.
-    let Some(buf) = buf else {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
-    };
-    let ch = ctx.get_array_element(buf, index as usize);
-    Ok(Some(ch))
+    // `buf.unwrap()` here once ABORTED THE VM: a builder whose slot 0 was not a
+    // `char[]` reached this with `count > 0` and no buffer, and a Rust panic is
+    // not a Java throwable — it terminates the process instead of unwinding to
+    // the `catch` the caller wrote. `sb_unit_at` reads either layout and yields
+    // `None` only when there is no readable payload at all, where the same
+    // refusal the bounds arm raises is the honest answer.
+    match sb_unit_at_view(&*ctx, &v, index as usize) {
+        Some(u) => Ok(Some(Value::Int(i32::from(u)))),
+        None => Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into()),
+    }
 }
 
 /// `AbstractStringBuilder.codePointAt(int index)`.
@@ -3443,11 +3958,10 @@ pub(crate) fn native_sb_append_code_point(
 }
 
 /// `AbstractStringBuilder.reverse()` (JDK 25
-/// `AbstractStringBuilder.java:1696-1733`, delegating to
-/// `StringUTF16.reverse`).
+/// `AbstractStringBuilder.java:1696-1733`, delegating to `StringUTF16.reverse`).
 ///
-/// The javadoc is explicit that this is NOT a plain code-unit reversal, which
-/// is what this used to be:
+/// The javadoc is explicit that this is NOT a plain code-unit reversal, which is
+/// what this used to be:
 ///
 /// > Causes this character sequence to be replaced by the reverse of the
 /// > sequence. **If there are any surrogate pairs included in the sequence,
@@ -3455,14 +3969,14 @@ pub(crate) fn native_sb_append_code_point(
 /// > the order of the high-low surrogates is never reversed.**
 ///
 /// > Note that the reverse operation may result in producing surrogate pairs
-/// > that were unpaired low-surrogates and high-surrogates before the
-/// > operation. For example, reversing `"\uDC00\uD800"` produces
-/// > `"𐀀"` which is a valid surrogate pair.
+/// > that were unpaired low-surrogates and high-surrogates before the operation.
+/// > For example, reversing `"\uDC00\uD800"` produces `"𐀀"` which is a valid
+/// > surrogate pair.
 ///
-/// The JDK does it in two passes and so does this: reverse every code unit,
-/// then walk the result and swap back any `(low, high)` neighbour — that
-/// neighbour is exactly a pair the first pass inverted. The second pass runs
-/// only when the first saw a surrogate, and it advances TWO units after a swap
+/// The JDK does it in two passes and so does this: reverse every code unit, then
+/// walk the result and swap back any `(low, high)` neighbour — that neighbour is
+/// exactly a pair the first pass inverted. The second pass runs only when the
+/// first saw a surrogate, and it advances TWO units after a swap
 /// (`putChar(val, i++, c1)`), so `"\uDC00\uD800"` in the *input* is left as the
 /// valid pair the javadoc promises rather than being swapped a second time.
 pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3470,38 +3984,28 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (buf, count) = sb_state(ctx, this);
-    if let Some(buf) = buf {
-        let count = count.max(0) as usize;
-        let mut units: Vec<u16> = Vec::with_capacity(count);
-        let count = count.min(ctx.array_length(buf));
-        for i in 0..count {
-            units.push(match ctx.get_array_element(buf, i) {
-                Value::Int(c) => c as u16,
-                _ => 0,
-            });
-        }
-        let had_surrogate = units.iter().any(|&u| (0xD800..=0xDFFF).contains(&u));
-        units.reverse();
-        if had_surrogate {
-            let mut i = 0usize;
-            while i + 1 < units.len() {
-                // A LOW surrogate followed by a HIGH one is a pair the
-                // reversal inverted; put it back.
-                if (0xDC00..=0xDFFF).contains(&units[i])
-                    && (0xD800..=0xDBFF).contains(&units[i + 1])
-                {
-                    units.swap(i, i + 1);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+    let v = sb_view(&*ctx, this);
+    let mut units = sb_units_range_view(&*ctx, &v, 0, v.count);
+    let had_surrogate = units.iter().any(|&u| (0xD800..=0xDFFF).contains(&u));
+    units.reverse();
+    if had_surrogate {
+        let mut i = 0usize;
+        while i + 1 < units.len() {
+            // A LOW surrogate followed by a HIGH one is a pair the reversal
+            // inverted; put it back.
+            if (0xDC00..=0xDFFF).contains(&units[i]) && (0xD800..=0xDBFF).contains(&units[i + 1]) {
+                units.swap(i, i + 1);
+                i += 2;
+            } else {
+                i += 1;
             }
         }
-        for (i, &u) in units.iter().enumerate() {
-            ctx.set_array_element(buf, i, Value::Int(i32::from(u)));
-        }
     }
+    // The write is in place — same length, so `sb_store_units` reuses the
+    // payload array — and through the layout-aware writer, because reversing a
+    // compact `byte[]` by writing a `char[]` over it is the conversion this
+    // migration removed.
+    let this = sb_write_units(ctx, this, &units);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -3509,72 +4013,27 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // StringBuilder mutation methods
 // ---------------------------------------------------------------------------
 
-/// Helper: read the current content of a StringBuilder as a Vec<u16>.
+/// Helper: read the current content of a builder as a `Vec<u16>`.
+///
+/// Reads whichever layout the receiver holds. Returning an empty vector for a
+/// compact `byte[]` payload — which this did before `sb_value_units` landed —
+/// was NOT a refusal: it was a wrong answer with a plausible shape, and it is
+/// the visible half of the "every append silently discarded, `toString()`
+/// empty, `rc=0`" behaviour `H22` measured on this registrar.
 pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> Vec<u16> {
-    let (buf, count) = sb_state(ctx, this);
-    let count = count.max(0) as usize;
-    let mut chars = Vec::with_capacity(count);
-    if let Some(buf) = buf {
-        let count = count.min(ctx.array_length(buf));
-        for i in 0..count {
-            let val = ctx.get_array_element(buf, i);
-            chars.push(match val {
-                Value::Int(c) => c as u16,
-                _ => 0,
-            });
-        }
-        return chars;
-    }
-    // `sb_state` yields `None` for a builder whose `value` is the real compact
-    // `byte[]`, and returning an empty vector here was NOT a refusal — it was a
-    // wrong answer with a plausible shape.
-    //
-    // The caller that matters is `native_string_init_abstract_string_builder`,
-    // i.e. `String(AbstractStringBuilder, Void)`. MEASURED, `javap -p -c
-    // --system <jdk-25> java.lang.StringBuilder`, that IS `toString()`:
-    //
-    // ```text
-    //    1: invokevirtual  Method length:()I
-    //    4: ifne  10
-    //    7: ldc   String ""            // the empty-builder fast path
-    //   16: invokespecial Method java/lang/String."<init>":(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V
-    // ```
-    //
-    // so any builder that real `AbstractStringBuilder` bytecode constructed —
-    // which the doc comment on that constructor already names ("Byte Buddy can
-    // execute that real bytecode while retransformation is in progress") —
-    // stringified to "". No exception, `rc=0`, and `length()` answering the
-    // right number the whole time.
-    //
-    // MEASURED reproduction with the `--jdk-only` enforcement dial armed on
-    // `java/lang/StringBuilder,java/lang/AbstractStringBuilder`:
-    // `value = byte[16]`, `coder = 0`, `count = 2`, `sb.length() == 2`, and
-    // `sb.toString().length() == 0` with a `byte[0]` behind it. That is the
-    // "every append silently discarded, `toString()` empty, `rc=0`" behaviour
-    // `H22` measured on `register_string_builder_natives`, and this is where it
-    // was produced.
-    //
-    // `sb_value_units` reads either layout, so the answer is now the builder's
-    // actual content in both.
-    let mut units = sb_value_units(ctx, this).unwrap_or_default();
-    units.truncate(count.min(units.len()));
-    units
+    let v = sb_view(ctx, this);
+    sb_units_range_view(ctx, &v, 0, v.count)
 }
 
-/// Helper: write a Vec<u16> back into a StringBuilder, replacing all content.
+/// Helper: write a slice of UTF-16 units into a builder, replacing all content.
+///
+/// Returns the post-GC `this`.
 pub(crate) fn sb_write_chars(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     chars: &[u16],
 ) -> cratonvm_types::ObjectRef {
-    let current_count = sb_state(ctx, this).1 as usize;
-    let additional = chars.len().saturating_sub(current_count);
-    let (this, buf) = sb_ensure_capacity(ctx, this, additional);
-    for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(buf, i, Value::Int(ch as i32));
-    }
-    sb_set_count(ctx, this, chars.len() as i32);
-    this
+    sb_write_units(ctx, this, chars)
 }
 
 /// `insert(int, String)` — insert a string at `offset`.
@@ -3750,10 +4209,51 @@ pub(crate) fn native_sb_insert_charsequence_range(
         return Err(failure);
     }
     let offset = offset as usize;
-    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
-    result.extend_from_slice(&chars[..offset]);
-    result.extend_from_slice(&insert_chars);
-    result.extend_from_slice(&chars[offset..]);
+    // 5. The splice — and the ORDER matters when the source is the receiver.
+    //
+    // `AbstractStringBuilder.insert(int, CharSequence, int, int)` is
+    //
+    //     ensureCapacityInternal(count + len);
+    //     shift(dstOffset, len);      // value[dstOffset..count) moves right
+    //     count += len;
+    //     putCharsAt(dstOffset, s, start, end);   // reads s.charAt(...) NOW
+    //
+    // so every character is read from the array AFTER the shift and after the
+    // characters written before it. That is unobservable for any other
+    // sequence, and fully observable when `s == this`: MEASURED on
+    // jdk-25.0.4+7, `new StringBuilder("abc").insert(1, b)` is `aaaabc`, not
+    // the `aabcbc` a snapshot-first implementation produces, and
+    // `new StringBuilder("abcdef").insert(2, b, 1, 3)` is `abbbcdef`, not
+    // `abbccdef`.
+    //
+    // It is a sequential dependency, not an artefact of leftover capacity: the
+    // reads are all at indices below the pre-insert length, so the region the
+    // shift left stale is written before it could ever be read. Four probe
+    // rows pin all four shapes.
+    let self_source = cs_handle
+        .as_ref()
+        .is_some_and(|handle| scope.get(handle) == this_now);
+    let result = if self_source {
+        let len = insert_chars.len();
+        let n = chars.len();
+        let mut buf: Vec<u16> = Vec::with_capacity(n + len);
+        // The array as `shift` leaves it: the head, then whatever the shift did
+        // not overwrite, then the tail moved right by `len`.
+        buf.extend_from_slice(&chars[..offset]);
+        buf.extend_from_slice(&chars[offset..(offset + len).min(n)]);
+        buf.resize(offset + len, 0);
+        buf.extend_from_slice(&chars[offset..]);
+        for i in 0..len {
+            buf[offset + i] = buf[start as usize + i];
+        }
+        buf
+    } else {
+        let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+        result.extend_from_slice(&chars[..offset]);
+        result.extend_from_slice(&insert_chars);
+        result.extend_from_slice(&chars[offset..]);
+        result
+    };
     let this_now = sb_write_chars(&mut *scope, this_now, &result);
     Ok(Some(Value::Object(Some(this_now))))
 }
@@ -4090,8 +4590,15 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // Deferred, not read here: `insert(int index, char[] str, int offset,
+    // int len)` is `checkOffset(index, count); checkRangeSIOOBE(offset,
+    // offset + len, str.length);`, so a bad DESTINATION offset beats a null
+    // array. `insert(-1, (char[]) null, 0, 1)` is a
+    // StringIndexOutOfBoundsException and `insert(1, (char[]) null, 0, 1)` is a
+    // NullPointerException; both were a silent no-op. MEASURED, both orders.
     let arr = match args.get(2) {
-        Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(Some(a))) => Some(*a),
+        Some(Value::Object(None)) => None,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let src_off = match args.get(3) {
@@ -4109,6 +4616,11 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         return Err(failure);
     }
     let offset = offset as usize;
+    let Some(arr) = arr else {
+        return Err(sb_npe(
+            "Cannot read the array length because \"str\" is null",
+        ));
+    };
 
     let arr_len = ctx.array_length(arr) as i32;
     // `offset + len` is computed in i64 because a wrapped i32 sum would read as
@@ -4159,9 +4671,28 @@ pub(crate) fn native_sb_insert_char_array(
         Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    // `checkOffset(offset, count)` is the FIRST line of the real body and
+    // `int len = str.length;` the second, so the destination check precedes the
+    // dereference: `insert(9, (char[]) null)` on a 3-character builder is a
+    // StringIndexOutOfBoundsException, `insert(1, (char[]) null)` a
+    // NullPointerException. Reading the array up front — as this did — made
+    // both a silent no-op, so the source read now happens after the check.
+    // MEASURED, both orders.
     let arr = match args.get(2) {
-        Some(Value::Object(Some(a))) => *a,
+        Some(Value::Object(Some(a))) => Some(*a),
+        Some(Value::Object(None)) => None,
         _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+
+    let chars = sb_read_chars(ctx, this);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+    let Some(arr) = arr else {
+        return Err(sb_npe(
+            "Cannot read the array length because \"str\" is null",
+        ));
     };
     let arr_len = ctx.array_length(arr);
     let mut insert_chars = Vec::with_capacity(arr_len);
@@ -4171,12 +4702,6 @@ pub(crate) fn native_sb_insert_char_array(
             _ => 0,
         });
     }
-
-    let chars = sb_read_chars(ctx, this);
-    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
-        return Err(failure);
-    }
-    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -4295,11 +4820,6 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// `setCharAt(int, char)` — set the char at `index`.
-///
-/// `checkIndex(index, count)`. Dropping the store for an out-of-range index —
-/// what the `if index < count` guard did — is a WRITE that silently did not
-/// happen, the worst reading of the fabricated-success species.
 pub(crate) fn native_sb_set_char_at(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4316,17 +4836,24 @@ pub(crate) fn native_sb_set_char_at(
         Some(Value::Int(c)) => *c as u16,
         _ => return Ok(None),
     };
-    let (buf, count) = sb_state(ctx, this);
+    let v = sb_view(&*ctx, this);
+    let count = v.count as i32;
     if index < 0 || index >= count {
         return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
     }
-    if let Some(buf) = buf {
-        ctx.set_array_element(buf, index as usize, Value::Int(ch as i32));
+    // In place where the payload can hold the character; otherwise a LATIN1
+    // compact array has been asked for a non-LATIN1 one and has to inflate,
+    // which is a whole-payload rewrite — exactly `AbstractStringBuilder`'s own
+    // `inflate()`.
+    if !sb_put_unit(ctx, this, index as usize, ch) {
+        let mut units = sb_units_range_view(&*ctx, &v, 0, count as usize);
+        units[index as usize] = ch;
+        sb_write_units(ctx, this, &units);
     }
     Ok(None)
 }
 
-/// `setLength(int)` — truncate, or extend with NUL chars.
+/// `setLength(int)` — truncate, or extend with NUL characters.
 ///
 /// A negative length is the one thing `AbstractStringBuilder.setLength` rejects,
 /// and it does so before touching the buffer; clamping it to 0 (what this did)
@@ -4358,26 +4885,19 @@ pub(crate) fn native_sb_set_length(
         );
     }
     let new_len = new_len as usize;
-    let (buf, count) = sb_state(ctx, this);
-    let count = count as usize;
-    if new_len > count {
-        // Extend with null chars
-        let (this, buf) = sb_ensure_capacity(ctx, this, new_len - count);
-        for i in count..new_len {
-            ctx.set_array_element(buf, i, Value::Int(0));
-        }
+    let v = sb_view(&*ctx, this);
+    let count = v.count;
+    if new_len <= count {
+        // The JDK only moves `count`; the characters past it are unreachable and
+        // are overwritten by whatever is appended next.
         sb_set_count(ctx, this, new_len as i32);
-    } else {
-        if new_len < count {
-            // Just zero the excess (optional for correctness), but must update count
-            if let Some(buf) = buf {
-                for i in new_len..count {
-                    ctx.set_array_element(buf, i, Value::Int(0));
-                }
-            }
-        }
-        sb_set_count(ctx, this, new_len as i32);
+        return Ok(None);
     }
+    // Extending pads with U+0000, and does so through the layout-aware writer so
+    // the padding lands in the receiver's own representation.
+    let mut units = sb_units_range_view(&*ctx, &v, 0, count);
+    units.resize(new_len, 0);
+    sb_write_units(ctx, this, &units);
     Ok(None)
 }
 
@@ -4435,8 +4955,18 @@ pub(crate) fn native_sb_index_of(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // `read_string_chars`, not `read_string`: the needle may itself hold an
     // unpaired surrogate.
+    //
+    // A null needle is a NullPointerException, not `-1`: `indexOf` reaches
+    // `String.indexOf(byte[], byte, int, String, int)`, whose first act is
+    // `tgt.length()`. `-1` is the answer for "not present", and a caller
+    // cannot tell it from "you passed null". MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -4452,8 +4982,16 @@ pub(crate) fn native_sb_index_of_from(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // The null needle beats the `fromIndex`, which is only clamped and never
+    // rejected: `indexOf(null, -1)` and `indexOf(null, 99)` are both NPE.
+    // MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -4498,8 +5036,15 @@ pub(crate) fn native_sb_last_index_of(
     };
     // `read_string_chars`: an unpaired surrogate in the needle cannot survive
     // `read_string().encode_utf16()`, which routes through a Rust `str`.
+    //
+    // A null needle throws, exactly as in `indexOf`. MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let chars = sb_read_chars(ctx, this);
@@ -4521,8 +5066,15 @@ pub(crate) fn native_sb_last_index_of_from(
     };
     // `read_string_chars`: an unpaired surrogate in the needle cannot survive
     // `read_string().encode_utf16()`, which routes through a Rust `str`.
+    //
+    // A null needle throws, exactly as in `indexOf`. MEASURED.
     let target: Vec<u16> = match args.get(1) {
         Some(Value::Object(Some(obj))) => read_string_chars(ctx, *obj),
+        Some(Value::Object(None)) => {
+            return Err(sb_npe(
+                "Cannot invoke \"String.length()\" because \"str\" is null",
+            ))
+        }
         _ => return Ok(Some(Value::Int(-1))),
     };
     let from = match args.get(2) {
@@ -4617,18 +5169,20 @@ pub(crate) fn native_sb_substring_range(
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// capacity() — return backing array length
+/// `capacity()` — `value.length >> coder`, the JDK's own expression.
 pub(crate) fn native_sb_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (buf, _) = sb_state(ctx, this);
-    let cap = buf.map_or(0, |b| ctx.array_length(b));
-    Ok(Some(Value::Int(cap as i32)))
+    Ok(Some(Value::Int(sb_capacity_units(&*ctx, this) as i32)))
 }
 
-/// ensureCapacity(int) — grow if needed
+/// `ensureCapacity(int)` — grow if needed, by the JDK's `newCapacity` rule.
+///
+/// A request at or below the current capacity is a no-op, INCLUDING a negative
+/// one: `AbstractStringBuilder.ensureCapacity` tests `minimumCapacity > 0` first
+/// and returns.
 pub(crate) fn native_sb_ensure_cap(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4641,69 +5195,40 @@ pub(crate) fn native_sb_ensure_cap(
         Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
         _ => return Ok(None),
     };
-    let (buf, count) = sb_state(ctx, this);
-    let old_cap = buf.map_or(0, |b| ctx.array_length(b));
-    if min_cap > old_cap {
-        let needed = min_cap.saturating_sub(count as usize);
-        let _ = sb_ensure_capacity(ctx, this, needed);
-    }
+    sb_reserve_units(ctx, this, min_cap);
     Ok(None)
 }
 
-/// `trimToSize()` — shrink the backing `char[]` to exactly `count`.
+/// `trimToSize()` — shrink the payload to exactly `count << coder` bytes.
 ///
 /// This was `native_noop_with_this` on the assumption that capacity is not
-/// observable. It IS observable on this VM: `native_sb_capacity` (registered
-/// on the same class, three lines above `trimToSize`) answers
-/// `array_length(value)`, so after a no-op trim `capacity()` still reported
-/// the pre-trim buffer size — a directly visible divergence from
-/// `AbstractStringBuilder.trimToSize`, which reallocates `value` to exactly
-/// `count`. The buffer is also the only thing holding the surplus memory
+/// observable. It IS observable: `native_sb_capacity` answers
+/// `value.length >> coder`, so after a no-op trim `capacity()` still reported
+/// the pre-trim size — a directly visible divergence from
+/// `AbstractStringBuilder.trimToSize`, which reallocates `value` to exactly the
+/// live length. The payload is also the only thing holding the surplus memory
 /// alive, so the no-op defeated the method's entire purpose.
 ///
-/// Mirrors `sb_ensure_capacity`'s discipline for the reverse direction:
-/// allocating the replacement array can move `this`, so root it in a
-/// `NativeHandleScope`, re-read the receiver, and bulk-copy the live prefix
-/// out of the OLD buffer read back through the (post-GC) receiver.
-///
-/// A receiver on the real JDK 9+ 3-slot layout (`value: byte[]`) is left
-/// untouched: `sb_state` only recognises a `char[]` payload and yields `None`,
-/// and the compact byte[] representation is not managed by these natives.
+/// The `coder` is preserved, not recomputed: the JDK's `Arrays.copyOf(value,
+/// count << coder)` cannot deflate, so a trimmed UTF16 builder stays UTF16 and
+/// `capacity()` stays `count`.
 pub(crate) fn native_sb_trim_to_size(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ArrayElementType;
-
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let (buf, count) = sb_state(ctx, this);
-    let Some(buf) = buf else {
-        return Ok(None);
-    };
-    let old_cap = ctx.array_length(buf);
-    let count = (count.max(0) as usize).min(old_cap);
-    if count == old_cap {
+    let v = sb_view(&*ctx, this);
+    let count = v.count;
+    if count == v.capacity {
         // Already exact — `trimToSize` is defined to be a no-op in that case,
         // and skipping the copy keeps the common path allocation-free.
         return Ok(None);
     }
-
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_handle = scope.root(this);
-    let new_buf = scope.new_array(ArrayElementType::Char, count);
-    let this = scope.get(&this_handle);
-
-    if let Value::Object(Some(old_buf)) = scope.get_field(this, 0) {
-        if scope.object_is_array(old_buf)
-            && scope.heap_element_type_of(old_buf) == ArrayElementType::Char
-        {
-            let _ = scope.bulk_array_copy(old_buf, 0, new_buf, 0, count);
-        }
-    }
-    scope.set_field(this, 0, Value::Object(Some(new_buf)));
+    let units = sb_units_range_view(&*ctx, &v, 0, count);
+    sb_store_units(ctx, this, &units, Some(count));
     Ok(None)
 }
 

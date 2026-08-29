@@ -70,7 +70,8 @@ The other 138 lines agreed, across all five map kinds:
 The bridge-kind retirement surface is 2,057 rows; ~1,600 are now covered by a
 differential probe. What remains is a long tail — **519 rows across 144
 classes**, of which 149 rows are in families of three rows or fewer — plus the
-176-row StringBuilder cluster that stays out while `WORKER-3-NOTE-3` has it open
+176-row StringBuilder cluster that stayed out while `WORKER-3-NOTE-3` had it open
+(**closed 2026-08-28 by lane L2**)
 with a diagnosed mechanism.
 
 The tail is not obviously worth one probe per class. The better next move is the
