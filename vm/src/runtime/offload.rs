@@ -2530,11 +2530,15 @@ pub fn dispatch_gemm(
         }
     };
 
-    if let Err(e) = module.launch_on_stream(ctx, kind.entry_name(), &launch, args, &stream) {
+    // Which tile the launch config chose has to be the same decision the
+    // entry point makes, or the grid is sized for one shape and the kernel
+    // indexes for the other. Both ask `use_large_tile`.
+    let entry = kind.entry_name(kernels::use_large_tile(m, n));
+    if let Err(e) = module.launch_on_stream(ctx, entry, &launch, args, &stream) {
         return record_failed_submission(
             Some(stream),
             kind_of_device_error(&e),
-            format!("gemm: launch_on_stream({}): {e}", kind.entry_name()),
+            format!("gemm: launch_on_stream({entry}): {e}"),
         );
     }
 
