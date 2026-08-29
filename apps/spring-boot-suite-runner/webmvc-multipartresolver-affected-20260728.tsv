@@ -1,3 +1,0 @@
-module	class
-module/spring-boot-webmvc	org.springframework.boot.webmvc.autoconfigure.actuate.web.WebMvcEndpointManagementContextConfigurationTests
-module/spring-boot-webmvc	org.springframework.boot.webmvc.autoconfigure.DispatcherServletAutoConfigurationTests

@@ -7177,6 +7177,20 @@ impl NativeMethodRegistry {
                     | ("quietlyJoin", "(JLjava/util/concurrent/TimeUnit;)Z")
                     | ("quietlyJoinUninterruptibly", "(JLjava/util/concurrent/TimeUnit;)Z")
                     | ("quietlyJoinPoolInvokeAllTask", "(J)V")
+                    // The two STATIC accessors that answer "which pool am I
+                    // in". Registered by `phases_early.rs`, backed by
+                    // `FJP_POOL_STACK`; unregistered they run real bytecode
+                    // that asks `Thread.currentThread() instanceof
+                    // ForkJoinWorkerThread`, which is false on this VM even
+                    // inside `pool.invoke` because the pool runs its tasks
+                    // INLINE. Adding a registration without adding it to THIS
+                    // list is silent: the filter below drops any Bridge on
+                    // these three classes that the list does not name, so the
+                    // native is registered and then thrown away. Measured that
+                    // way first. Must stay in step with
+                    // `is_forkjoin_native_override`.
+                    | ("inForkJoinPool", "()Z")
+                    | ("getPool", "()Ljava/util/concurrent/ForkJoinPool;")
             );
         if real_forkjoinpool_enabled()
             && matches!(
