@@ -16747,6 +16747,7 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// Read straight off the submission — whichever code path failed
     /// stamped the category at that moment, so nothing here has to infer
     /// it from the message.
+    #[allow(clippy::too_many_arguments)]
     fn gpu_dispatch_gemm(
         &mut self,
         half: bool,
@@ -16756,18 +16757,23 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
         m: i32,
         n: i32,
         k: i32,
+        trans_a: bool,
+        trans_b: bool,
+        stream_handle: Option<u64>,
     ) -> Option<u64> {
         #[cfg(feature = "gpu-offload")]
         {
             use crate::runtime::kernels::GemmKind;
             let kind = if half { GemmKind::F16 } else { GemmKind::F32 };
             Some(crate::runtime::offload::dispatch_gemm(
-                self.shared, kind, a_handle, b_handle, c_handle, m, n, k,
+                self.shared, kind, a_handle, b_handle, c_handle, m, n, k, trans_a,
+                trans_b, stream_handle,
             ))
         }
         #[cfg(not(feature = "gpu-offload"))]
         {
             let _ = (half, a_handle, b_handle, c_handle, m, n, k);
+            let _ = (trans_a, trans_b, stream_handle);
             None
         }
     }

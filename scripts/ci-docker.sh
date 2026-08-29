@@ -32,13 +32,19 @@ set -u
 set -o pipefail
 
 # Git Bash on Windows rewrites any argument that looks like an absolute
-# POSIX path (`/workspace`, `/usr/local/cargo/registry`, ...) into a Windows
-# path before handing it to docker.exe, which is not an MSYS program and
-# does not want that rewrite -- `-w /workspace` becomes `-w 'C:/Program
-# Files/Git/workspace'` and the run fails with "the working directory ... is
-# invalid". This opts every path argument in this script out of that
-# rewrite; it is a no-op on Linux/macOS, where MSYS_NO_PATHCONV is unread.
+# POSIX path into a Windows path before handing it to docker.exe, which is
+# not an MSYS program. That is *wanted* for a genuine host path (the build
+# context, the bind-mount source) but wrong for a path meant to be read
+# inside the container (`-w /workspace` must NOT become `-w 'C:/Program
+# Files/Git/workspace'`, which is the "working directory ... is invalid"
+# failure this used to hit). MSYS_NO_PATHCONV=1 turns the rewrite off
+# entirely, so host paths need converting by hand instead, via `winpath()`
+# below (cygpath ships with Git Bash). Both are no-ops on Linux/macOS,
+# where MSYS_NO_PATHCONV is unread and `command -v cygpath` fails.
 export MSYS_NO_PATHCONV=1
+winpath() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
@@ -96,7 +102,7 @@ mkdir -p "$OUT_DIR"
 
 if [ "$DO_BUILD" -eq 1 ]; then
   echo "[ci-docker] building image ($IMAGE) ..." >&2
-  docker build -t "$IMAGE" -f "$HERE/docker/Dockerfile" "$HERE/docker" || exit 1
+  docker build -t "$IMAGE" -f "$(winpath "$HERE/docker/Dockerfile")" "$(winpath "$HERE/docker")" || exit 1
 fi
 
 docker volume create "$CARGO_CACHE_VOLUME" >/dev/null
@@ -106,7 +112,7 @@ run_in_container() {
   shift 2
   docker volume create "$target_volume" >/dev/null
   docker run --rm \
-    -v "$REPO_ROOT":/workspace \
+    -v "$(winpath "$REPO_ROOT")":/workspace \
     -v "$CARGO_CACHE_VOLUME":/usr/local/cargo/registry \
     -v "$target_volume":/workspace/target \
     -w /workspace \
@@ -137,26 +143,76 @@ shard3() {
 # build-and-test's own fmt step uses), the deprecated-feature-alias cfg
 # grep, the workspace build, clippy, the doc build, and three of the
 # repo's own gate scripts that don't need a JDK-image matrix.
+#
+# Each step runs even if an earlier one failed (no `&&` chain), and its
+# PASS/FAIL is written to target/ci-docker/shard-4-steps.tsv — that is what
+# lets the top-level summary name exactly which of these 8 checks are red
+# instead of just reporting shard 4's overall exit code. A step whose own
+# prerequisite is missing (e.g. clippy after a build that failed to produce
+# what it needs) still reports FAIL for itself rather than being skipped, so
+# a red build doesn't quietly hide which of the later steps would also fail.
 shard4() {
   run_in_container shard4 cratonvm-ci-target-4 '
-    set -e
-    echo "== cargo fmt --check ==" &&
-    (cargo fmt --all -- --check || true) &&
-    echo "== deprecated feature-alias cfg grep ==" &&
-    (git grep -n -I -E "cfg\([^)]*\"(experimental-jmx|experimental-tls)\"" -- "*.rs" && exit 1 || echo "OK: no cfg gates on deprecated aliases.") &&
-    echo "== cargo build --workspace ==" &&
-    cargo build --workspace &&
-    echo "== cargo clippy --all-targets -D warnings ==" &&
-    cargo clippy --all-targets -- -D warnings &&
-    echo "== cargo doc --workspace --no-deps ==" &&
-    cargo doc --workspace --no-deps &&
-    echo "== scripts/check-no-diag-prints.sh ==" &&
-    bash scripts/check-no-diag-prints.sh &&
-    echo "== scripts/merge-parse-check.sh ==" &&
-    bash scripts/merge-parse-check.sh &&
-    echo "== scripts/gc-flake-gate.sh ==" &&
-    bash scripts/gc-flake-gate.sh
+    RESULTS=/workspace/target/ci-docker/shard-4-steps.tsv
+    mkdir -p "$(dirname "$RESULTS")"
+    : > "$RESULTS"
+    step() {
+      local name="$1"; shift
+      echo "== $name =="
+      if "$@"; then
+        echo "-- PASS: $name --"
+        printf "%s\tPASS\n" "$name" >> "$RESULTS"
+      else
+        echo "-- FAIL: $name --"
+        printf "%s\tFAIL\n" "$name" >> "$RESULTS"
+      fi
+    }
+    cfg_alias_check() {
+      ! git grep -n -I -E "cfg\([^)]*\"(experimental-jmx|experimental-tls)\"" -- "*.rs"
+    }
+    step "cargo fmt --check"            cargo fmt --all -- --check
+    step "deprecated feature-alias cfg" cfg_alias_check
+    step "cargo build --workspace"      cargo build --workspace
+    step "cargo clippy -D warnings"     cargo clippy --all-targets -- -D warnings
+    step "cargo doc --workspace"        cargo doc --workspace --no-deps
+    step "check-no-diag-prints.sh"      bash scripts/check-no-diag-prints.sh
+    step "merge-parse-check.sh"         bash scripts/merge-parse-check.sh
+    step "gc-flake-gate.sh"             bash scripts/gc-flake-gate.sh
+    ! grep -q FAIL "$RESULTS"
   '
+}
+
+# For a FAILing shard, pull a short, specific excerpt out of its log instead
+# of leaving the reader to go open target/ci-docker/shard-N.log themselves.
+diagnose_shard() {
+  local n="$1" log="$OUT_DIR/shard-$n.log"
+  if [ "$n" = "4" ]; then
+    local results="$OUT_DIR/shard-4-steps.tsv"
+    if [ -f "$results" ]; then
+      awk -F'\t' '$2=="FAIL"{print "    FAILED STEP: " $1}' "$results"
+      if ! grep -q . "$results" 2>/dev/null; then
+        echo "    (no step recorded any result -- container likely never started; see the log)"
+      fi
+    else
+      echo "    (no per-step results file -- the container itself failed to start; see the log)"
+    fi
+    return
+  fi
+  # Shards 1-3: a cargo compile error, or named test failures, whichever the
+  # log actually contains -- printed in the order cargo would report them.
+  local compile_errors test_failures
+  compile_errors="$(grep -E '^error(\[E[0-9]+\])?:' "$log" 2>/dev/null | sort -u | head -10)"
+  test_failures="$(grep -E '^(test .* FAILED|failures:)$' "$log" 2>/dev/null | grep -v '^failures:$' | sort -u | head -20)"
+  if [ -n "$compile_errors" ]; then
+    echo "    COMPILE ERRORS:"
+    echo "$compile_errors" | sed 's/^/      /'
+  elif [ -n "$test_failures" ]; then
+    echo "    FAILED TESTS:"
+    echo "$test_failures" | sed 's/^/      /'
+  else
+    echo "    (no recognized error/test-failure pattern -- last 5 log lines:)"
+    tail -5 "$log" | sed 's/^/      /'
+  fi
 }
 
 run_shard() {
@@ -176,7 +232,7 @@ if [ -n "$SHARD_FILTER" ]; then
   SHARDS_TO_RUN=("$SHARD_FILTER")
 fi
 
-rm -f "$OUT_DIR"/shard-*.rc
+rm -f "$OUT_DIR"/shard-*.rc "$OUT_DIR/shard-4-steps.tsv"
 
 if [ "$PARALLEL" -eq 1 ] && [ "${#SHARDS_TO_RUN[@]}" -gt 1 ]; then
   pids=()
@@ -201,7 +257,8 @@ for n in "${SHARDS_TO_RUN[@]}"; do
   if [ "$rc" = "0" ]; then
     echo "shard $n: PASS"
   else
-    echo "shard $n: FAIL (exit $rc) -- see $OUT_DIR/shard-$n.log"
+    echo "shard $n: FAIL (exit $rc) -- full log: $OUT_DIR/shard-$n.log"
+    diagnose_shard "$n"
     FAILED=1
   fi
 done
