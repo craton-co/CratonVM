@@ -6330,14 +6330,24 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// hibernate, with the sharded run's apparent +18% traced to contention rather
 /// than to compile cost.
 ///
-/// What keeps it off is a CORRECTNESS regression the soak found:
-/// `docs/known-issues/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-20260828.md`.
-/// A 3-byte out-of-bounds read through a spliced accessor raises
-/// `InternalError` ("precise deoptimization unavailable … reason
-/// UnreachedCode") instead of `IndexOutOfBoundsException` — deterministically,
-/// 5 reps per arm. Flip this once that is fixed, and note that the designated
-/// differential gate cannot see this flag at all (it splices zero times in
-/// `ir_vs_singlepass`, which has no VM to supply callee bodies).
+/// What kept it off was a CORRECTNESS regression the soak found — a 3-byte
+/// out-of-bounds read through a spliced accessor raising `InternalError`
+/// instead of `IndexOutOfBoundsException`. **That is FIXED** (2026-08-28,
+/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`):
+/// `lower_inner_with_scopes` was passing `Lowerer::new` an empty
+/// `spliced_ranges`, so every deopt inside a relocated body recorded a bci
+/// the method does not have. `DuplicatedByteBufTest` is `ok=416 failed=0`
+/// with the flag on, 3 reps, matching the flag-off arm.
+///
+/// It is still OFF, and flipping it is a separate decision this comment must
+/// not pre-empt: the soak's own record stages the flip
+/// (`performance/ir-inline-gauntlet-soak-20260828.md`, landed as "do not flip
+/// it yet"), and the blocker being gone is a precondition, not the decision.
+/// Whoever takes it should re-run the 200-class serial netty pass and the
+/// hibernate slice on the fixed binary rather than inheriting the soak's
+/// numbers, and should note that the designated differential gate cannot see
+/// this flag at all (it splices zero times in `ir_vs_singlepass`, which has
+/// no VM to supply callee bodies).
 pub fn ir_inline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),

@@ -4867,7 +4867,7 @@ fn reloc_emit_enabled() -> bool {
                 // no-op here — but this arm was the ONLY one resolving from a
                 // raw bci, and a raw bci inside a spliced body is the exact
                 // shape that produced
-                // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror`.
+                // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
