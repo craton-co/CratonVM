@@ -115,6 +115,33 @@ No HANGs exist in the current default-collector Hibernate ORM full-suite
 baseline (`FAIL=4→1, HANG=0, ABORTED=6` matching the known-benign self-skip
 count).
 
+### Two more from the 4548-class H2 run, both measured 2026-08-29
+
+`UniqueConstraintBatchingTest.testBatching` is the SAME missing locale sysprop
+as the two `testFormat` rows above, wearing a counter's clothes. Its assertion
+is `assertEquals(1, triggerable.triggerMessages().size())` on a log watcher
+built with `watchForLogMessages("Unique index")` — and **H2 localizes its own
+`DbException` text from `Locale.getDefault()`**, so on this host the line reads
+`Нарушение уникального индекса или первичного ключа: ...` and the watcher
+matches nothing. The constraint violation itself happens correctly; the
+`PersistenceException` catch block is what runs. Both VMs fail without
+`-Duser.language=en -Duser.country=US` and pass with it. Fixed by the same two
+`required-sysprops.tsv` rows.
+
+`PackagedEntityManagerTest.testExcludeHbmPar` never ran against H2 at all. The
+class boots an EMF from a JAR it builds out of
+`hibernate-core/target/bundles/excludehbmpar/`, whose `persistence.xml` was
+filtered for **PostgreSQL** at fixture-build time
+(`jdbc:postgresql://localhost/hibernate_orm_test_$worker`). A persistence unit
+carries its own connection settings, so the suite's H2 `hibernate.properties`
+does not reach it. The `relation "caipirinha_seq" does not exist` wording said
+so before any A/B — that is Postgres's sentence, not H2's. With no Postgres
+reachable both VMs fail identically with
+`PSQLException: Connection to localhost:5432 refused`.
+
+Detail for both:
+`internal/fixed-suite-bugs/hibernate/h2-complete-suite-misc-residuals-three-of-four-closed-20260829.md`.
+
 ## Hibernate Reactive
 
 Full detail was in the now-retired
