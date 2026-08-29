@@ -2049,15 +2049,47 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         }
     });
+    // `MethodType.parameterArray()` returns a COPY. The JDK's whole body is
+    // `return ptypes.clone();`, and the clone is the contract: `MethodType` is
+    // specified immutable AND interned, so handing back the live `ptypes` lets
+    // any caller rewrite a type that other callers already hold.
+    //
+    // MEASURED before this, against jdk-25.0.3.9-hotspot:
+    //
+    //   MethodType mt = methodType(int.class, String.class, long.class);
+    //   mt.parameterArray()[0] = int.class;
+    //   mt                        HotSpot (String,long)int   CratonVM (int,long)int
+    //   mt.parameterType(0)               java.lang.String              int
+    //
+    // One write, and the type is a different type for good. It took six other
+    // rows down with it in `probes/L8InvokeLookupSweep.java` -- `toString`,
+    // `descriptorString`, `changeReturnType`, `appendParameterTypes`, `wrap`
+    // and `unwrap` all read the corrupted array afterwards and were NOT six
+    // more defects, which is why the probe asks `isCopy` BEFORE it asks any of
+    // them.
     r.register(mt, "parameterArray", "()[Ljava/lang/Class;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let params = ctx.get_field(this, 1);
-        if let Value::Object(Some(_)) = params {
-            Ok(Some(params))
-        } else {
+        let Value::Object(Some(params)) = ctx.get_field(this, 1) else {
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(empty))))
+            return Ok(Some(Value::Object(Some(empty))));
+        };
+        let n = ctx.array_length(params);
+        // GC-safety: `new_array` can collect and relocate `params`, so pin it
+        // across the allocation and read it back before the copy.
+        let params_pin = ctx.pin_native_root(params);
+        let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+        let out_pin = ctx.pin_native_root(out);
+        let params = ctx.read_native_pin(params_pin, params);
+        let out = ctx.read_native_pin(out_pin, out);
+        if !ctx.bulk_array_copy(params, 0, out, 0, n) {
+            for i in 0..n {
+                let v = ctx.get_array_element(params, i);
+                ctx.set_array_element(out, i, v);
+            }
         }
+        let out = ctx.read_native_pin(out_pin, out);
+        ctx.unpin_native_roots(params_pin);
+        Ok(Some(Value::Object(Some(out))))
     });
     // `Class.getSimpleName()`'s spelling of a binary class name.
     //
