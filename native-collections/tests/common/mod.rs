@@ -50,6 +50,23 @@ pub struct MockCtx {
     class_names: HashMap<u32, String>,
     name_to_id: HashMap<String, u32>,
     class_interfaces: UnsafeCell<HashMap<u32, Vec<ClassId>>>,
+    /// class_id -> `class_num_total_fields`, for the tests that need a class
+    /// to have DECLARED FIELDS. Absent means zero, which is the trait default
+    /// and what every class in this mock used to report.
+    ///
+    /// Zero-for-everything is not a neutral default: `al_itr_alt_base` decides
+    /// whether a `VALUES_ITR_CARRIERS` iterator is one this crate minted by
+    /// `object_num_fields(itr) == class_num_total_fields(cid) + 3`, behind an
+    /// early-out for anything <= 4 fields wide. A carrier that reports zero
+    /// declared fields is minted three wide, trips that early-out, and is
+    /// treated as a FOREIGN receiver to be delegated to real bytecode -- of
+    /// which a mock has none. So the whole carrier path was unreachable here,
+    /// silently, and that is the exact shape of the defect the carrier machinery
+    /// exists to prevent (`native_pq_iterator`'s dormant `PriorityQueue$Itr`
+    /// registration, which reported every queue EMPTY once something started
+    /// minting the real class). Declare the real count with
+    /// [`MockCtx::declare_class_fields`] to exercise it.
+    class_total_fields: UnsafeCell<HashMap<u32, usize>>,
     lambda_functional_interfaces: UnsafeCell<HashMap<u32, String>>,
     lambda_proxy_hosts: UnsafeCell<HashMap<u32, String>>,
     next_class_id: u32,
@@ -124,6 +141,7 @@ impl MockCtx {
             class_names,
             name_to_id,
             class_interfaces: UnsafeCell::new(HashMap::new()),
+            class_total_fields: UnsafeCell::new(HashMap::new()),
             lambda_functional_interfaces: UnsafeCell::new(HashMap::new()),
             lambda_proxy_hosts: UnsafeCell::new(HashMap::new()),
             next_class_id: 1,
@@ -174,6 +192,23 @@ impl MockCtx {
 
     pub fn set_relocate_pins_on_alloc(&mut self, enabled: bool) {
         self.relocate_pins_on_alloc = enabled;
+    }
+
+    /// Give `name` a `class_num_total_fields` of `n`, ensuring the class exists.
+    ///
+    /// Use the count the REAL class has, and say where it comes from at the call
+    /// site — the number is the whole point. Production code that distinguishes
+    /// "an object this crate minted" from "an object the JDK minted" does it by
+    /// comparing an object's width against its class's declared width, so a mock
+    /// that reports zero for every class collapses that distinction and takes
+    /// the wrong branch without saying so.
+    pub fn declare_class_fields(&mut self, name: &str, n: usize) -> ClassId {
+        let cid = self.ensure_class_initialized(name).expect("mock class");
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.class_total_fields.get()).insert(cid.as_u32(), n);
+        }
+        cid
     }
 
     pub fn set_class_interfaces(&self, class_id: ClassId, interfaces: Vec<ClassId>) {
@@ -431,6 +466,16 @@ impl cratonvm_native_api::NativeClassAccess for MockCtx {
     fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
         Vec::new()
     }
+    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.class_total_fields.get())
+                .get(&class_id.as_u32())
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
     fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
         // SAFETY: single-threaded test code.
         unsafe {

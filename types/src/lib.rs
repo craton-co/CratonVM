@@ -589,6 +589,93 @@ pub mod scalar_deopt_census {
     }
 }
 
+/// Per-launch driver-call bookkeeping the GPU bridge saved, and did not.
+///
+/// Two savings landed together on 2026-08-29 and neither is visible from a
+/// wall clock on this host: a `CUevent` free list, so a kernel submission
+/// stops paying `cuEventCreate` now and `cuEventDestroy` later for each of
+/// the two events it mints, and a same-stream wait elision, so a launch
+/// stops issuing `cuStreamWaitEvent` for an ordering its own stream
+/// already guarantees. GPULlama3 makes 453 submissions per token, so the
+/// two are worth roughly 1,800 driver calls a token -- but a change that
+/// never fires looks exactly like one that fires and does not help, and
+/// this box's clock moves enough between two runs to hide either.
+///
+/// So: count. `recycled` against `created` says whether the pool is
+/// serving anything; `elided` against `issued` says how much of the
+/// ordering traffic was a stream waiting on itself.
+///
+/// The counters live here rather than in `cuda-bridge` for the same reason
+/// [`cell_census`] does: they are written in one crate and printed in
+/// another, and this is the crate both of them already depend on.
+pub mod gpu_event_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CREATED: AtomicU64 = AtomicU64::new(0);
+    static RECYCLED: AtomicU64 = AtomicU64::new(0);
+    static WAITS_ISSUED: AtomicU64 = AtomicU64::new(0);
+    static WAITS_ELIDED: AtomicU64 = AtomicU64::new(0);
+
+    /// One `cuEventCreate` the pool could not serve.
+    #[inline]
+    pub fn note_created() {
+        CREATED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One event handed out from the free list instead of created.
+    #[inline]
+    pub fn note_recycled() {
+        RECYCLED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `cuStreamWaitEvent` actually issued.
+    #[inline]
+    pub fn note_wait_issued() {
+        WAITS_ISSUED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One wait skipped because the event was recorded on the same stream.
+    #[inline]
+    pub fn note_wait_elided() {
+        WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(created, recycled, waits issued, waits elided)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            CREATED.load(Ordering::Relaxed),
+            RECYCLED.load(Ordering::Relaxed),
+            WAITS_ISSUED.load(Ordering::Relaxed),
+            WAITS_ELIDED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when this process launched any kernel.
+    ///
+    /// Silent for a run with no GPU work at all -- there is nothing to
+    /// report and every CPU-only test would otherwise grow a line -- but
+    /// NOT silent for a run whose pool served nothing. `recycled=0` beside
+    /// a large `created` is the finding, and a census you have to know to
+    /// ask for is how a soak gets run without one.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (created, recycled, issued, elided) = totals();
+        if created + recycled + issued + elided == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu events: created={created} recycled={recycled} \
+                 (pool served {:.1}%); stream waits issued={issued} \
+                 elided={elided} ({:.1}% elided)",
+                100.0 * recycled as f64 / (created + recycled).max(1) as f64,
+                100.0 * elided as f64 / (issued + elided).max(1) as f64,
+            );
+        });
+    }
+}
+
 pub mod cell_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
