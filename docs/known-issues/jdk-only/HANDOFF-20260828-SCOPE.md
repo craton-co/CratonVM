@@ -25,7 +25,7 @@ been removed again.
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
-| **L8 the long tail** | **TAKEN 2026-08-29** — 217 unprobed rows across 56 classes, re-derived on this tree (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
+| **L8 the long tail** | **IN PROGRESS 2026-08-29** — 217 unprobed rows across 56 classes (§2.1); 2 of 7 batches closed, 16 defects, 5233 probe rows 0-diff | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
 **Six of the seven lanes are DONE** — L1, L3, L4, L5, L6 and L7. L2
 (`StringBuilder` / `StringBuffer` / `AbstractStringBuilder`) is the only one
@@ -171,15 +171,29 @@ bridge rows whose real method has Code and owns its slot   2063  across 195 clas
 **So the tail is 217 rows, not 780** — six lanes closed 1753 between them. The
 unprobed remainder groups into seven batches, and they are what L8 is working:
 
-| batch | rows | classes |
-| --- | ---: | --- |
-| Throwable and the exception hierarchy | ~70 | `Throwable` 16 + ~25 classes at 2-4 each, all sharing one registration set |
-| `java/math/BigInteger` | 24 | the largest single class left |
-| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 26 | |
-| `java/security/MessageDigest` + `AccessController` | 20 | |
-| `jdk/internal` — `VM`, `SharedSecrets`, `Signal`, `AbstractClassLoaderValue` | ~19 | |
-| `java/net/URI` + `URL` | 14 | and `uri-resolve-folded-…-20260826.md` §4 defers a fix pending exactly this probe |
-| `java/lang/ref` | ~12 | GC-adjacent |
+| batch | rows | classes | state |
+| --- | ---: | --- | --- |
+| `java/net/URI` + `URL` | 14 | and `uri-resolve-folded-…-20260826.md` §4 deferred a fix pending exactly this probe | **DONE 2026-08-29** — `UriRecompositionSweep`, 1258 rows 0-diff both modes, **7 defects**; the deferred row was 26. `l8-tail-uri-seven-defects-and-a-deferral-that-was-26-rows-20260829.md` |
+| Throwable and the exception hierarchy | 117 | `Throwable` 16 + 41 classes at 2-5 each, all sharing one registration set | **DONE 2026-08-29** — `ThrowableFamilySweep`, 3975 rows 0-diff both modes, **9 defects**. `l8-tail-throwable-nine-defects-and-the-one-the-registry-had-to-name-20260829.md` |
+| `java/math/BigInteger` | 24 | the largest single class left | open |
+| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 26 | | open |
+| `java/security/MessageDigest` + `AccessController` | 20 | | open |
+| `jdk/internal` — `VM`, `SharedSecrets`, `Signal`, `AbstractClassLoaderValue` | ~19 | | open |
+| `java/lang/ref` | ~12 | GC-adjacent | open |
+
+The Throwable row was estimated at ~70 and measured at **117** once the family
+was counted from the registry rather than from the class list — every
+`Exception`/`Error` subclass in `THROWABLE_FAMILY_CLASSES`, not just the ones
+whose names looked central.
+
+**A note for every lane, not only this one:** `RSslEndpointIdentification`, the
+vector `origin/dev` landed on 2026-08-29, is **flaky on a loaded host and fails
+on the HOTSPOT ORACLE side** — `HARNESS ERROR [G4] ... the HotSpot oracle run
+FAILED (rc=1)`, `application data must actually flow once the handshake
+succeeded; got: []`, with CratonVM passing all four of its own checks in the
+same run. Three consecutive `--jdk-only` runs of one binary gave green, red,
+green. It will redden ARM 1 and ARM 3 for anyone landing this week; it is not
+your merge.
 
 **Re-run the tail's existing probes before writing a new one.** Restored to
 `apps/probes/` and taken on the current binary, they are: `LangMiscSweep`,

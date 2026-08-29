@@ -11194,17 +11194,35 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;)V",
         native_exception_init_msg,
     );
+    // These two OWN their slots -- `--dump-native-registry` says
+    // `owns_slot: true` here and `false` for the same descriptors in
+    // `lang_misc`'s measured per-class table, so this registrar is the one
+    // that decides and the table's rows are inert. They therefore have to
+    // carry the class-specific behaviour themselves.
+    //
+    // `ExceptionInInitializerError()` is `super(); initCause(null)` and
+    // `(String)` is `super(s, null)`: both leave `cause` at a REAL null rather
+    // than at the `cause == this` sentinel, so a later `initCause` on such an
+    // instance is an `IllegalStateException`. The generic bodies below write
+    // the sentinel and made it a silent success. MEASURED by
+    // `apps/probes/ThrowableFamilySweep.java`; see
+    // `lang_misc::native_exc_init_noargs_null_cause` for the disassembly.
+    //
+    // The `(Throwable)` descriptor has no duplicate here, which is why the
+    // table's fix for it took effect and these two did not -- one fix landing
+    // for one descriptor and not its neighbour is the signature of a method
+    // with more than one registrar.
     registry.register(
         "java/lang/ExceptionInInitializerError",
         "<init>",
         "()V",
-        native_exception_init_empty,
+        crate::lang_misc::native_exc_init_noargs_null_cause,
     );
     registry.register(
         "java/lang/ExceptionInInitializerError",
         "<init>",
         "(Ljava/lang/String;)V",
-        native_exception_init_msg,
+        crate::lang_misc::native_exc_init_message_null_cause,
     );
     // Surefire abnormal-shutdown path (`ForkedBooter.exit1`) schedules a
     // "last ditch" terminator thread via private method
