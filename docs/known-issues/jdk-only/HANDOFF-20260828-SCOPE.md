@@ -25,6 +25,7 @@ been removed again.
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
+| **L8 the long tail** | **TAKEN 2026-08-29** — 217 unprobed rows across 56 classes, re-derived on this tree (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
 **Six of the seven lanes are DONE** — L1, L3, L4, L5, L6 and L7. L2
 (`StringBuilder` / `StringBuffer` / `AbstractStringBuilder`) is the only one
@@ -146,8 +147,39 @@ Divided by FAMILY, sized on the static surface. Percentages are of 2244.
 | **L6** | `ConcurrentHashMap` 48, `Thread` 37, `ForkJoinTask` 36, `ForkJoinPool` 26 | 147 | 7% |
 | **L7** | Phase 4 — the three definition-of-done workloads | n/a | — |
 
-The remaining ~780 rows are a long tail: **71 of the 183 classes have ≤3 rows
-each**. Nobody owns the tail yet; finish your lane before taking any of it.
+The remaining rows are a long tail, and the sizing above is the one taken
+BEFORE the seven lanes ran. Re-derived 2026-08-29 on the tree every lane landed
+into, from a live `--dump-native-registry`:
+
+```text
+bridge rows whose real method has Code and owns its slot   2063  across 195 classes
+  claimed by a finished lane                               1753  across 133
+  TAIL, unowned                                             310  across  62
+    already reached by the tail's existing probes            93
+    UNPROBED                                                217  across  56
+```
+
+**So the tail is 217 rows, not 780** — six lanes closed 1753 between them. The
+unprobed remainder groups into seven batches, and they are what L8 is working:
+
+| batch | rows | classes |
+| --- | ---: | --- |
+| Throwable and the exception hierarchy | ~70 | `Throwable` 16 + ~25 classes at 2-4 each, all sharing one registration set |
+| `java/math/BigInteger` | 24 | the largest single class left |
+| `java/lang/System` + `Runtime` + `Object` + `System$Logger` | 26 | |
+| `java/security/MessageDigest` + `AccessController` | 20 | |
+| `jdk/internal` — `VM`, `SharedSecrets`, `Signal`, `AbstractClassLoaderValue` | ~19 | |
+| `java/net/URI` + `URL` | 14 | and `uri-resolve-folded-…-20260826.md` §4 defers a fix pending exactly this probe |
+| `java/lang/ref` | ~12 | GC-adjacent |
+
+**Re-run the tail's existing probes before writing a new one.** Restored to
+`apps/probes/` and taken on the current binary, they are: `LangMiscSweep`,
+`TailFamilySweep`, `CharacterSweep`, `IoSystemSweep`, `InetFamilySweep`,
+`Phase3Sweep` all **0-diff in both modes**; `UriLocaleSweep` and
+`MathSurfaceSweep` red, and both reds are already-recorded known issues (the
+`Locale` display-name data gap, the `URI` empty-authority recomposition, and
+1-ULP `Math.pow`/`sin`/`log10`). Confirming coverage is the point — that is
+seven probes' worth of tail surface nobody has to re-derive.
 
 ---
 
