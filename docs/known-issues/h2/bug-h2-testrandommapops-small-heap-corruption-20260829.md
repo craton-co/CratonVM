@@ -114,6 +114,67 @@ what the section below was waiting for. `CRATONVM_ZGC_RELOCATE=0` is the first
 arm to run: it restores non-moving behaviour byte for byte, so a failure that
 survives it is not a relocation defect at all.
 
+## 2026-08-29 (later): the first arm this page names has been RUN — it IS a relocation defect
+
+`CRATONVM_ZGC_RELOCATE=0` was this page's own prescribed first arm, on the rule
+that *"a failure that survives it is not a relocation defect at all"*. It does
+not survive it.
+
+Azure Linux, `--Xmx 256m`, 900 s cap, interleaved base/norelo, one binary
+(`dev@a94842f04`), load recorded on every run as this page requires:
+
+| arm | rep | rc | secs | load0 | `oom` | `arena` | signature |
+|---|---|---:|---:|---:|---:|---:|---|
+| base | 1 | 1 | **122** | 23.1 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 1 | 124 (cap) | 900 | 17.1 | 0 | 10 | — none — |
+| base | 2 | 1 | **786** | 21.3 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 2 | 124 (cap) | 900 | 19.9 | 0 | 9 | — none — |
+| base | 3 | 1 | **64** | 12.0 | 0 | 0 | `NullPointerException` |
+
+**base 3/3 fail; `ZGC_RELOCATE=0` clean to the cap every time.** The cap is
+7-14x the base median, so a clean arm here carries information by this page's
+own standard.
+
+The `arena` column is the confirmation that the switch ENGAGED rather than
+silently doing nothing: with relocation off the arena fragments and reports
+9-10 allocation failures, which is exactly what relocation exists to prevent.
+A clean arm with `arena=0` would have meant the flag was inert.
+
+So the defect is in relocation, and the remaining question is *which* relocation
+obligation is unmet. `relocate_stw`'s own doc names the shortlist and says the
+audit is unfinished:
+
+> The returned `PointerMap` is **non-empty** ... Every consumer of a raw heap
+> address outside this heap — JIT frame maps, monitor tables, external root
+> providers, native side tables — must be remapped through it ... **Auditing
+> those arms is the reason this stays behind a default-off flag**
+
+It is no longer behind a default-off flag. `CRATONVM_ZGC_RELOCATE` and
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` both default ON.
+
+### What was checked and came back CLEAN
+
+The native side-table arm of that shortlist was audited by diffing every
+`gc_scan_*` root provider against its remap counterpart across
+`native-builtins`, `native-io`, `native-collections`, `native-api`,
+`native-awt` and the crypto/security crates. **32 scans, 32 updates, all
+paired and all wired post-GC.** Four looked unpaired at first
+(`gc_scan_selector_roots`, `gc_scan_channel_roots`,
+`gc_scan_ssc_socket_cache_roots`, `gc_scan_ss_back_ref_roots`) — they use the
+other naming convention, `*_update_after_gc`, and are called. That is a
+negative result, and it removes the cheapest hypothesis rather than
+supporting it.
+
+### Next, in order
+
+1. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — splits "relocation" into
+   "relocation while a compiled frame is live" and the rest. Running.
+2. `CRATONVM_DBG_REMAP_RESIDUE=1` on a failing base run. That instrument scans
+   a live JIT frame for words that are still KEYS in the pointer map — i.e.
+   from-addresses nothing rewrote — and prints
+   `[remap-frame] ... stale_words=N [off=.. stale=0x..->0x..]`. A non-zero
+   `stale_words` names the unremapped slot outright. Running.
+
 ## Why "repro and dump" WAS the wrong instrument
 
 One failure in three, twenty minutes a run, and a different symptom each time
