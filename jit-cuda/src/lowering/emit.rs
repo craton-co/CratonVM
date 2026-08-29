@@ -229,41 +229,48 @@ fn speculation_cost(text: &str) -> Option<u32> {
     Some(cost)
 }
 
-/// The most a pair of speculated arms may cost, in the units
-/// [`speculation_cost`] counts.
-///
-/// `CRATONVM_GPU_IF_CONVERT_MAX_OPS` overrides it, so one binary can sweep
-/// the whole curve in one sitting -- which is the only way to pick this
-/// number on a host that does not hold a clock still between two builds.
-///
-/// The default is measured, not chosen: see
-/// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
-fn if_conversion_budget() -> u32 {
-    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT_MAX_OPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(DEFAULT_IF_CONVERSION_BUDGET)
-    })
-}
-
-/// See [`if_conversion_budget`].
+/// The budget `CRATONVM_GPU_IF_CONVERT=1` selects: the least-bad setting
+/// the sweep found, which is a tie with the feature off rather than a win.
+/// Everything cheaper and everything dearer measured worse.
 const DEFAULT_IF_CONVERSION_BUDGET: u32 = 8;
 
-/// `CRATONVM_GPU_IF_CONVERT=0` restores the pre-2026-08-29 lowering, in
-/// which every `cond ? a : b` stayed a branch.
+/// The if-conversion budget this process runs with: the largest weighted
+/// arm-pair cost [`speculation_cost`] may report and still convert. `0`
+/// converts nothing.
 ///
-/// Default ON. It exists as an A/B lever rather than a supported
-/// configuration: the conversion is a codegen change with no observable
-/// semantics, so the only way to price it is to run the same binary both
-/// ways on the same host in the same minutes.
-fn if_conversion_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT")
+/// **Off by default, and that is a measured decision rather than caution.**
+/// The transform does what it was built to do -- on the ray tracer it takes
+/// PTX branches from 51 to 21 and SASS branch machinery from 17.4% of the
+/// kernel to 15.4% -- and it makes that kernel SLOWER, by 56% of its compute
+/// half, in 8 of 8 interleaved rounds against a transfer-floor control. A
+/// branch a warp does not diverge on is nearly free; `selp` makes every lane
+/// compute both arms. Sweeping the budget found no value that wins: 8 is a
+/// tie with off and every other setting is worse. See
+/// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
+///
+/// It is kept, and kept reachable, because that is one kernel. A shape with
+/// cheap arms and heavy divergence is exactly what it is for, and the flags
+/// are how someone measures whether theirs is one.
+///
+/// `CRATONVM_GPU_IF_CONVERT=1` turns it on at [`DEFAULT_IF_CONVERSION_BUDGET`];
+/// `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` turns it on at `n`.
+fn if_conversion_budget_from_flags() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Some(n) = cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT_MAX_OPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            return n;
+        }
+        let on = cratonvm_types::flags::runtime_var("CRATONVM_GPU_IF_CONVERT")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
+            .unwrap_or(false);
+        if on {
+            DEFAULT_IF_CONVERSION_BUDGET
+        } else {
+            0
+        }
     })
 }
 
@@ -311,6 +318,11 @@ pub(crate) struct Emitter<'a> {
     /// Set to `true` the first time we emit a bounds check; controls
     /// whether the failure block needs to be emitted at the end.
     pub used_bounds_label: bool,
+    /// Weighted-instruction budget for the branch-to-`selp` if-conversion;
+    /// `0` converts nothing. Taken from the flags by [`Emitter::new`], and
+    /// overridable per call so a test can exercise the transform without
+    /// depending on the process-wide default -- which is `0`.
+    pub if_convert_budget: u32,
     /// Set to `true` when a `goto` to the loop header is encountered;
     /// caller should stop emitting at that point.
     pub hit_back_branch: bool,
@@ -373,6 +385,7 @@ impl<'a> Emitter<'a> {
             tid_reg_inner: None,
             bounds_fail_label: "L_bounds_fail".into(),
             used_bounds_label: false,
+            if_convert_budget: if_conversion_budget_from_flags(),
             hit_back_branch: false,
             ret_value_reg: None,
             writes_param_mask: 0,
@@ -865,7 +878,7 @@ impl<'a> Emitter<'a> {
                         // one `selp`, with no branch and therefore no warp
                         // reconvergence at all. See `plan_if_conversion`.
                         let mut converted = false;
-                        if if_conversion_enabled() {
+                        if self.if_convert_budget > 0 {
                             if let Some(plan) = self
                                 .plan_if_conversion(pc, next, target, &starts, index, start, end)
                             {
@@ -1192,7 +1205,7 @@ impl<'a> Emitter<'a> {
         };
 
         self.body = real_body;
-        let budget = if_conversion_budget();
+        let budget = self.if_convert_budget;
         let cost = speculation_cost(&then_text)
             .zip(speculation_cost(&else_text))
             .map(|(a, b)| a.saturating_add(b));

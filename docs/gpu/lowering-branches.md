@@ -69,10 +69,36 @@ bit-exactness check are what stand behind it.
 `bra` to a label it never emits. It is a whole-body invariant rather than a
 check inside the transform, because the point is to catch the next one.
 
-`CRATONVM_GPU_IF_CONVERT=0` restores the branching form, as an A/B lever
-rather than a supported configuration: the conversion has no observable
-semantics, so the only honest way to price it is one binary run both ways in
-the same minutes. `EligibleTernary.java` is the fixture — `select` converts,
-`nested` converts its inner diamond only, `shortCircuit` and `withStore` are
-refused — and `ptxas_round_trip_if_converted_ternaries` assembles all four
-with the real NVIDIA assembler.
+## It is off by default, and that is the measurement talking
+
+The transform does what it was built to do. On the ray tracer, PTX branches
+fall from 51 to 21 and SASS branch machinery from 17.4% of the kernel to
+15.4%, and the frame stays bit-identical to HotSpot. It also makes that
+kernel **slower**: 0.128 ms to 0.199 ms on the compute half, 56% worse, in 8
+of 8 interleaved rounds against a transfer-floor control that held within 3%.
+
+The mechanism is the trade the fourth condition names. A branch a warp does
+not diverge on costs almost nothing — all 32 lanes skip the untaken arm
+together — while `selp` makes every lane compute both. Four of that kernel's
+ternaries are `disc > 0f ? (float) Math.sqrt(disc) : 1e9f`, one per sphere,
+and most of a frame is background where a whole warp misses every sphere.
+Converted, those warps compute four square roots they had been skipping.
+
+That is also why the budget is weighted rather than counted: the arms in
+question are ONE instruction each, so a length cap cannot tell them from a
+pair of `mov`s. `sqrt`/`div`/`rcp`/`ex2` count 16 and everything else 1.
+Sweeping the budget at 1920x1440 found no setting that wins — 8 ties with
+the feature off, and 2, 4, 16, 32 and unbounded are all worse.
+
+So: `CRATONVM_GPU_IF_CONVERT=1` turns it on at the default budget,
+`CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` turns it on at `n`, and unset does
+nothing. It is kept and kept reachable because that is one kernel — a shape
+with cheap arms and heavy divergence is exactly what it is for, and these
+flags are how someone measures whether theirs is one.
+
+`EligibleTernary.java` is the fixture — `select` converts, `nested` converts
+its inner diamond only, `shortCircuit` and `withStore` are refused — and
+`ptxas_round_trip_if_converted_ternaries` assembles all four with the real
+NVIDIA assembler. The tests pass the budget explicitly rather than reading
+the flag, because a test that silently exercises a non-default path is not
+testing what it says it is.

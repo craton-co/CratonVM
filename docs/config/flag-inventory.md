@@ -1141,7 +1141,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GPU_CRITICAL_LEASE_MS` | GC | `CRATONVM_GC=gpu-critical-lease-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_CRITICAL_WAIT_MS` | GC | `CRATONVM_GC=gpu-critical-wait-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_DUMP_PTX` | DBG | `CRATONVM_DBG=gpu-dump-ptx` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_GPU_IF_CONVERT` | JIT | `CRATONVM_JIT=gpu-if-convert` | default-on | on | behaviour | snapshot | jit-cuda |
+| `CRATONVM_GPU_IF_CONVERT` | JIT | `CRATONVM_JIT=gpu-if-convert` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` | JIT | `CRATONVM_JIT=gpu-if-convert-max-ops` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_NO_ZEROCOPY` | GC | `CRATONVM_GC=gpu-zerocopy` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_GPU_TIME_DISPATCH` | DBG | `CRATONVM_DBG=gpu-time-dispatch` | opt-in | off | diag | snapshot | native-builtins |

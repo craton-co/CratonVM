@@ -728,6 +728,8 @@ this bullet was wrong".
   the WRONG WAY — §13.4.** It does remove the branches, and it costs 56%
   of the compute half, because "short" was the wrong screen: the arms are
   one instruction each and one of those instructions is a square root.
+  Re-screened by weighted cost and swept, the best budget ties with the
+  feature off. It ships opt-in.
 * **§12's shrinking-margin curve at 4K/8K is not yet explained down to a
   mechanism the way §8/§8c were** — **DECOMPOSED in §13.6, and the
   fixed-cost model this bullet expected it to confirm turns out not to
@@ -959,11 +961,37 @@ those warps compute four square roots they had been skipping, and
 `sqrt.rn.f32` is a `MUFU.RSQ` plus a Newton-Raphson chain rather than one
 instruction.
 
-So the screen was counting the wrong thing. It capped an arm's LENGTH,
-and the arms in question are one instruction each. It now costs an arm
-instead, weighting `sqrt`/`div`/`rcp`/`ex2` at 16, with the budget
+So the screen was counting the wrong thing. It capped an arm's LENGTH, and
+the arms in question are one instruction each — a length cap cannot tell
+`sqrt.rn.f32` from `mov.f32`. It now costs an arm instead, weighting
+`sqrt`/`div`/`rcp`/`ex2` at 16 and everything else at 1, with the budget
 tunable through `CRATONVM_GPU_IF_CONVERT_MAX_OPS` so the curve can be swept
-in one binary rather than one build per point.
+in one binary rather than one build per point. Same host, same 1920×1440
+frame, minimum of 5 rounds per setting, against the same transfer floor:
+
+| budget | tracer | compute | vs off |
+|---:|---:|---:|---:|
+| 0 (off) | 1.1440 ms | 0.1305 ms | — |
+| 2 | 1.1608 ms | 0.1473 ms | +13% |
+| 4 | 1.1549 ms | 0.1414 ms | +8% |
+| **8** | **1.1436 ms** | **0.1301 ms** | **−0.3%** |
+| 16 | 1.1675 ms | 0.1540 ms | +18% |
+| 32 | 1.2298 ms | 0.2163 ms | +66% |
+| unbounded | 1.2244 ms | 0.2109 ms | +62% |
+
+Floor 1.0135 ms. **The best budget is a tie with the feature switched off,**
+and everything else is worse; the non-monotonicity between 2 and 8 is the
+noise floor talking, since the whole compute half is 0.13 ms of a 1.14 ms
+frame.
+
+**So the transform ships OPT-IN.** `CRATONVM_GPU_IF_CONVERT=1` turns it on
+at budget 8, `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` at `n`, and unset does
+nothing. It is kept, and kept reachable, rather than deleted: this is one
+kernel, and a kernel with cheap arms and heavy divergence is exactly the
+shape it was built for. The flags are how the next person measures whether
+theirs is one — which is the whole point of the exercise, since this
+residual sat in the record for eight days as an unpriced "would remove most
+of that".
 
 ## 13.5 The per-launch event bookkeeping is real, and it is not this kernel's problem
 

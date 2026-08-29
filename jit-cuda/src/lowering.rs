@@ -65,7 +65,7 @@ pub fn lower_method(
     sm_major: u32,
     sm_minor: u32,
 ) -> Result<PtxModule, LoweringError> {
-    lower_method_with_pool_impl(class_name, method, None, sig, sm_major, sm_minor)
+    lower_method_with_pool_impl(class_name, method, None, sig, sm_major, sm_minor, None)
 }
 
 /// [`lower_method`], but resolving `ldc`/`ldc_w`/`ldc2_w` against `cp`
@@ -82,13 +82,17 @@ pub fn lower_method_with_pool(
     sm_major: u32,
     sm_minor: u32,
 ) -> Result<PtxModule, LoweringError> {
-    lower_method_with_pool_impl(class_name, method, Some(cp), sig, sm_major, sm_minor)
+    lower_method_with_pool_impl(class_name, method, Some(cp), sig, sm_major, sm_minor, None)
 }
 
 /// Shared implementation behind [`lower_method`] and
 /// [`lower_method_with_pool`]. `cp` is `None` for the CP-free entry
 /// point, which keeps its pre-AUDIT-C31 behaviour: an `ldc`/`ldc_w`/
 /// `ldc2_w` in the body fails to lower rather than being resolved.
+/// `if_convert_budget` overrides the process-wide flag-derived budget for
+/// this one call. `None` means "use the flags", which is what production
+/// passes; a test that wants to exercise the branch-to-`selp` transform
+/// passes `Some(n)` rather than depending on a default that is `0`.
 fn lower_method_with_pool_impl(
     class_name: &str,
     method: &ClassFileMethod,
@@ -96,6 +100,7 @@ fn lower_method_with_pool_impl(
     sig: &KernelSignature,
     sm_major: u32,
     sm_minor: u32,
+    if_convert_budget: Option<u32>,
 ) -> Result<PtxModule, LoweringError> {
     let kernel_name = mangle(class_name, &method.name, &method.descriptor);
     let params = build_param_list(sig);
@@ -113,6 +118,9 @@ fn lower_method_with_pool_impl(
     let shape = detect_loop(bytes, cp)?;
 
     let mut emitter = Emitter::new(bytes, sig, cp);
+    if let Some(budget) = if_convert_budget {
+        emitter.if_convert_budget = budget;
+    }
     emitter.bind_param_locals()?;
 
     // The launch grid is sized from this; `Unknown` means "largest
@@ -997,6 +1005,47 @@ mod tests {
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
+    /// [`lower_fixture`], but with the branch-to-`selp` if-conversion
+    /// forced on at `budget`.
+    ///
+    /// The transform is OFF by default -- it is a measured loss on the one
+    /// kernel it was built for (see
+    /// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass) --
+    /// so a test that asserts on it has to ask for it. Asking here rather
+    /// than setting an environment variable also keeps the tests
+    /// order-independent: the flag is latched in a `OnceLock`, so a process
+    /// that reads it once cannot be told twice.
+    fn lower_fixture_if_converted(
+        class: &str,
+        method_name: &str,
+        descriptor: &str,
+        budget: u32,
+    ) -> PtxModule {
+        let method = load_method(class, method_name, descriptor);
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
+        };
+        lower_method_with_pool_impl(class, &method, None, &sig, 7, 5, Some(budget))
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
+    /// [`lower_fixture_if_converted`] through the pool-aware entry point.
+    fn lower_fixture_with_pool_if_converted(
+        class: &str,
+        method_name: &str,
+        descriptor: &str,
+        budget: u32,
+    ) -> PtxModule {
+        let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
+        let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
+        };
+        lower_method_with_pool_impl(class, &method, Some(&cp), &sig, 7, 5, Some(budget))
+            .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
     /// [`lower_fixture_with_pool`], but additionally threading an
     /// [`crate::annotations::AdmissionHint`] through
     /// `analyzer::analyze_with_annotations_and_pool` — needed for
@@ -1317,26 +1366,28 @@ mod tests {
     )]
     fn ptxas_round_trip_if_converted_ternaries() {
         ptxas_round_trip(
-            &lower_fixture("EligibleTernary", "select", "([F[F[F)V").render(),
+            &lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200).render(),
             "ternary_select",
         );
         ptxas_round_trip(
-            &lower_fixture_with_pool("EligibleTernary", "nested", "([F[F)V").render(),
+            &lower_fixture_with_pool_if_converted("EligibleTernary", "nested", "([F[F)V", 200)
+                .render(),
             "ternary_nested",
         );
         ptxas_round_trip(
-            &lower_fixture("EligibleTernary", "withStore", "([F[F)V").render(),
+            &lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render(),
             "ternary_with_store",
         );
         ptxas_round_trip(
-            &lower_fixture_with_pool("EligibleTernary", "shortCircuit", "([F[F[F)V").render(),
+            &lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200)
+                .render(),
             "ternary_short_circuit",
         );
         // The one that matters most: the real kernel this whole record is
         // about, which is where the short-circuit shape came from.
         ptxas_round_trip(
-            &lower_fixture("EligibleTernary", "select", "([F[F[F)V").render(),
-            "ternary_select_again",
+            &lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 0).render(),
+            "ternary_select_default_off",
         );
     }
 
@@ -1851,7 +1902,8 @@ mod tests {
     /// the arms are short and pure enough to run unconditionally.
     #[test]
     fn a_ternary_lowers_to_selp_with_no_branch() {
-        let text = lower_fixture("EligibleTernary", "select", "([F[F[F)V").render();
+        let text = lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200)
+            .render();
         assert!(
             text.contains("selp.f32"),
             "expected the ternary to become a select:
@@ -1879,8 +1931,10 @@ mod tests {
         // converted form has no body branch, the guard's own early-out
         // aside, and the pre-conversion form is what every other fixture
         // in this file with a branch still produces.
-        let converted = lower_fixture("EligibleTernary", "select", "([F[F[F)V").render();
-        let branching = lower_fixture("EligibleTernary", "withStore", "([F[F)V").render();
+        let converted =
+            lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200).render();
+        let branching =
+            lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render();
         assert!(!converted.contains("bra L_body_"));
         assert!(
             branching.contains("bra L_body_"),
@@ -1900,7 +1954,8 @@ mod tests {
     /// blacklist the method and run it on the CPU, with the right answer.
     #[test]
     fn a_short_circuit_condition_is_not_if_converted() {
-        let m = lower_fixture_with_pool("EligibleTernary", "shortCircuit", "([F[F[F)V");
+        let m =
+            lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200);
         let text = m.render();
         assert!(
             text.contains("bra L_body_"),
@@ -1931,7 +1986,8 @@ mod tests {
     /// bounds check's own `bra`, which is the belt to that braces.
     #[test]
     fn a_diamond_whose_arms_store_is_not_if_converted() {
-        let text = lower_fixture("EligibleTernary", "withStore", "([F[F)V").render();
+        let text =
+            lower_fixture_if_converted("EligibleTernary", "withStore", "([F[F)V", 200).render();
         assert!(
             text.contains("bra L_body_"),
             "a speculated store must be refused:
@@ -1954,7 +2010,9 @@ mod tests {
     /// worth converting because they are the shortest.
     #[test]
     fn a_nested_ternary_converts_the_inner_diamond_only() {
-        let text = lower_fixture_with_pool("EligibleTernary", "nested", "([F[F)V").render();
+        let text =
+            lower_fixture_with_pool_if_converted("EligibleTernary", "nested", "([F[F)V", 200)
+                .render();
         assert!(
             text.contains("selp.f32"),
             "expected the inner ternary to convert:

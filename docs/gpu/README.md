@@ -332,19 +332,26 @@ Beyond the original narrow shape, the analyzer now admits:
   rectangular nest bounded by two scalars is still rejected — its trip
   count is `rows * cols`, a product, and `WorkBound` names one parameter.
   `EligibleScalarBound.java` is the fixture.
-- **A ternary lowered without a branch.** `cond ? a : b` becomes two
-  unconditional computations and one `selp` when both arms are single
-  basic blocks whose emitted PTX holds no label, branch, predicated
-  instruction or memory access — which is what makes running both of them
-  sound. The screen reads the emitted PTX rather than an opcode list, so
-  it cannot drift from the lowering it is judging; an array access is
-  caught by its own bounds check's branch. A nested ternary converts its
-  inner diamond and keeps the outer branch, and a short-circuit `&&` (two
-  conditional branches to one else-label) keeps both. Kernels in this tree
-  are written branchlessly on purpose and the lowerer used to turn them
-  back into branches, at 18% of the ray tracer's SASS in `BRA` plus
-  `BSSY`/`BSYNC`/`BMOV` reconvergence triples. `CRATONVM_GPU_IF_CONVERT=0`
-  restores the branching form; `EligibleTernary.java` is the fixture.
+- **A ternary lowered without a branch — OPT-IN, and measured a loss on
+  the one kernel it was built for.** Under `CRATONVM_GPU_IF_CONVERT=1`,
+  `cond ? a : b` becomes two unconditional computations and one `selp`
+  when both arms are single basic blocks whose emitted PTX holds no label,
+  branch, predicated instruction or memory access — which is what makes
+  running both of them sound. The screen reads the emitted PTX rather than
+  an opcode list, so it cannot drift from the lowering it is judging; an
+  array access is caught by its own bounds check's branch. A nested
+  ternary converts its inner diamond and keeps the outer branch, and a
+  short-circuit `&&` (two conditional branches to one else-label) keeps
+  both. It does what it was built to do: on the ray tracer it takes PTX
+  branches from 51 to 21 and SASS branch machinery from 17.4% of the
+  kernel to 15.4%. It also makes that kernel 56% slower on its compute
+  half, because a branch a warp does not diverge on is nearly free while
+  `selp` makes every lane compute both arms — and four of that kernel's
+  ternaries have a square root in one arm.
+  `CRATONVM_GPU_IF_CONVERT_MAX_OPS=<n>` sets the weighted arm-pair budget
+  (`sqrt`/`div`/`rcp`/`ex2` count 16, everything else 1) so the curve can
+  be swept in one binary; no setting won on that kernel.
+  `EligibleTernary.java` is the fixture.
 - **`Math.exp`** → `ex2.approx.f32` of `x * log2(e)`, and only when
   `CRATONVM_GPU_APPROX_MATH=1` is set. It is the one entry in the
   table that is not bit-exact with the JDK (about 2 ULP against
