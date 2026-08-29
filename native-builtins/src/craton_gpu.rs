@@ -1464,6 +1464,7 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
+#[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
@@ -1899,6 +1900,7 @@ fn builtin_array_to_host_into(
     Ok(Some(Value::Int(1)))
 }
 
+#[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],

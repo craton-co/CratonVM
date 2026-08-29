@@ -519,11 +519,15 @@ three arms — the documented load flake of `HANDOFF-20260812.md`, checked rathe
 than assumed.
 
 
-## 10. The second merge brought a red of its own, in a file this lane does not own
+## 10. Two reds this lane did not cause, cleared because they blocked everyone
 
-`origin/dev` moved again between the first merge and the push, and the eleven
-new commits took `RExceptions` (core) and `RJdkFailure` (strict and all) red.
-Both report the same thing:
+`origin/dev` moved twice more between the first merge and the push — nine and
+eleven commits — and each time brought something of its own.
+
+### 10.1 `Class.forName` on an array descriptor named the descriptor
+
+The eleven-commit merge took `RExceptions` (core) and `RJdkFailure` (strict and
+all) red. Both report the same thing:
 
 ```text
 java.lang.AssertionError: an array CNFE must name the element, not the
@@ -556,6 +560,40 @@ that failed states the contract in its own message. Verified as dev's before
 touching, by the rule the scope brief gives: the arm arrives in
 `git diff <first-merge>..HEAD -- native-builtins/src/lang_class.rs`, and this
 branch's own diff does not list that file.
+
+### 10.2 `dev`'s tip did not COMPILE
+
+The next merge would not build at all:
+
+```text
+error: could not compile `cratonvm-native-builtins` (lib) due to 16 previous errors
+```
+
+All sixteen inside two `native-builtins/src/craton_gpu.rs` handlers,
+`builtin_future_status` and `builtin_array_to_host`, which had lost their
+`#[cfg(feature = "gpu-offload")]`. Every other handler in that module has it, so
+on a default build those two were compiled while the imports they need
+(`Value`, `state`, `arg_long`, `rebuild_java_array`, `array_replace_bytes`) were
+gated out from under them.
+
+**Proven to be `dev`'s, not the merge's**, on a pristine detached worktree at
+`origin/dev` (`8f9ae7a9c`) with its own target directory and nothing of this
+branch in it:
+
+```bash
+git worktree add /data/cvm-devcheck-l7 --detach origin/dev
+cargo check -p cratonvm-native-builtins --lib     # the identical 16 errors
+```
+
+Fixed by restoring the attribute on both — which is the contract the module's
+own header states (*"On a default build it compiles down to an empty
+`register()` that does nothing"*), and no `not(feature)` shim is needed because
+both are named only from `register()` and from
+`#[cfg(all(test, feature = "gpu-offload"))] mod tests`, both gated.
+
+Worth stating plainly because a broken tip is worse than a red gate and much
+easier to misattribute: **any lane that merged `dev` in this window and saw
+`native-builtins` fail to compile was looking at this, not at its own work.**
 
 
 ## Reproduce
