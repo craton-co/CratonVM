@@ -47,7 +47,7 @@ and only afterward reads `moduleClassLoader`.
    allocated via `alloc_concurrent_synthetic` (bypassing the real
    constructor), real bytecode's internal `ResourceLoader` state is never
    populated, so these methods silently returned empty results instead of
-   the module's own `META-INF/services/*` entries. Added all four to both
+   the module's own `../../../../apps/META-INF/services/*` entries. Added all four to both
    force-gates alongside `findClass`.
 
 ## Correction (2026-07-06, second pass): the "remaining gap" was a test-harness bug, not a VM bug
@@ -131,5 +131,5 @@ then iterating the result exactly as WildFly's extension-loading code does.
 With `CRATONVM_JBOSS_MP_ROOT` set to the module tree: `count=1`,
 `Found extension: org.jboss.as.jmx.JMXExtension` — matches HotSpot exactly,
 both before and after the `load_provider_class` reordering fix. Plain
-classpath `ServiceLoader` usage (non-JBoss, `META-INF/services`-based)
+classpath `ServiceLoader` usage (non-JBoss, `../../../../apps/META-INF/services`-based)
 re-verified unaffected by the reordering: `count=1` matching HotSpot.

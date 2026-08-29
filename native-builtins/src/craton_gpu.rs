@@ -352,7 +352,7 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
 
-    registry.register(KLASS, "gemm", "(JJJIIIZ)J", builtin_gemm);
+    registry.register(KLASS, "gemm", "(JJJIIIZZZJ)J", builtin_gemm);
     registry.register(KLASS, "futureErrorKind", "(J)I", builtin_future_error_kind);
     registry.register(KLASS, "futureAwait", "(JJ)I", builtin_future_await);
     registry.register(KLASS, "releaseFuture", "(J)V", builtin_release_future);
@@ -1608,7 +1608,8 @@ fn builtin_future_is_done(
     Ok(Some(Value::Int(if done { 1 } else { 0 })))
 }
 
-/// `Native.gemm(long a, long b, long c, int m, int n, int k, boolean half) -> long`
+/// `Native.gemm(long a, long b, long c, int m, int n, int k, boolean half,
+///              boolean transA, boolean transB, long stream) -> long`
 ///
 /// Built-in matrix multiply: `C[MxN] = A[MxK] * B[KxN]`, row-major.
 ///
@@ -1637,9 +1638,16 @@ fn builtin_gemm(
     let n = arg_int(args, 4);
     let k = arg_int(args, 5);
     let half = arg_int(args, 6) != 0;
+    let trans_a = arg_int(args, 7) != 0;
+    let trans_b = arg_int(args, 8) != 0;
+    // 0 is "no stream named"; the Java side never mints handle 0.
+    let stream = match arg_long(args, 9) as u64 {
+        0 => None,
+        h => Some(h),
+    };
 
     let handle = ctx
-        .gpu_dispatch_gemm(half, a, b, c, m, n, k)
+        .gpu_dispatch_gemm(half, a, b, c, m, n, k, trans_a, trans_b, stream)
         .unwrap_or(0);
     Ok(Some(Value::Long(handle as i64)))
 }

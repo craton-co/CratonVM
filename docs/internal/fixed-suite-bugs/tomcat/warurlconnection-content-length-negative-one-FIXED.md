@@ -61,7 +61,7 @@ run: PASSES on HotSpot.
 ## Root cause
 
 The test URL is `jar:war:file:<war-path>*/WEB-INF/lib/test.jar!/META-INF/resources/index.html`
-— a jar entry (`META-INF/resources/index.html`) inside a jar
+— a jar entry (`../../../../apps/META-INF/resources/index.html`) inside a jar
 (`WEB-INF/lib/test.jar`) that is itself packaged inside a WAR, accessed via
 Tomcat's `war:` pseudo-protocol (which uses `*/` as its own separator,
 converted to `jar:...!/...` form by `UriUtil.warToJar`).

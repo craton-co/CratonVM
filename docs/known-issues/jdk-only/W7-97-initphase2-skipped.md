@@ -19,7 +19,7 @@
 ## 1. The symptom, and why it hid
 
 Under `--jdk-only`, `ServiceLoader` returned **zero** module-declared providers
-for the whole process, while classpath `META-INF/services` providers kept
+for the whole process, while classpath `../../../apps/META-INF/services` providers kept
 working. A `ServiceLoader` probe therefore reads green; only a provider declared
 by a `provides` clause in the JDK image is lost.
 
@@ -34,7 +34,7 @@ were compared, not just counts:
 | `java.nio.file.spi.FileSystemProvider` | 2 | **0** | 2 |
 | `java.util.spi.ToolProvider` | 9 | **0** | 9 |
 | `javax.tools.JavaCompiler` | 1 | **0** | 1 |
-| classpath `META-INF/services` control | 1 | 1 | 1 |
+| classpath `../../../apps/META-INF/services` control | 1 | 1 | 1 |
 | `ToolProvider.getSystemJavaCompiler() != null` | true | **false** | true |
 
 Controlled: three consecutive `ServiceLoader.load` calls with no `ModuleLayer`

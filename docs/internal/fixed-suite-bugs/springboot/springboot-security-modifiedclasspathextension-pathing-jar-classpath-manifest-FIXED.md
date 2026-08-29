@@ -38,7 +38,7 @@ its one target method through the isolated loader.
 
 `module/spring-boot-security`'s Gradle test classpath is long enough that
 `apps/spring-boot-suite-runner`'s runner writes a **"pathing JAR"** — a jar
-containing no class files, only a `META-INF/MANIFEST.MF` `Class-Path:`
+containing no class files, only a `../../../../apps/META-INF/MANIFEST.MF` `Class-Path:`
 attribute listing the real dependency jars/dirs — and launches
 `cratonvm.exe --jar <pathing-jar>` instead of a long `-cp` argument (see
 `apps/spring-boot-suite-runner/run-spring-boot-suite.ps1`'s "Classpath

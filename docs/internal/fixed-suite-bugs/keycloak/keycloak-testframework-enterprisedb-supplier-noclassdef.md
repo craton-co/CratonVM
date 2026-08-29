@@ -50,7 +50,7 @@ provider classpath by default without requiring a hand-maintained jar list:
 - Still adds all usable Keycloak module output directories, including
   `test-framework/test-containers/target/classes`.
 - Prunes stale `target/classes` / `target/test-classes` entries that contain
-  `META-INF/services` descriptors but no compiled `.class` files; those
+  `../../../../apps/META-INF/services` descriptors but no compiled `.class` files; those
   resource-only stale service descriptors can otherwise break every test via
   `ServiceLoader`.
 

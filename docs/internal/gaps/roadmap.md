@@ -1258,11 +1258,11 @@ This section is the **complete, exhaustive list** of work remaining to make Crat
 ### C3. Resource loading
 - C3.1 `getResource` / `getResourceAsStream` walking classpath/module path.
 - C3.2 `Class.getResource` relative resolution.
-- C3.3 Multi-release JAR support (`META-INF/versions/N/`).
+- C3.3 Multi-release JAR support (`../../../apps/META-INF/versions/N/`).
 
 ### C4. JAR/ZIP infrastructure
 - C4.1 Real ZIP64 reader (already partial via miniz_oxide).
-- C4.2 Signed JAR verification (`META-INF/MANIFEST.MF`, `*.SF`, `*.RSA/*.DSA/*.EC`).
+- C4.2 Signed JAR verification (`../../../apps/META-INF/MANIFEST.MF`, `*.SF`, `*.RSA/*.DSA/*.EC`).
 - C4.3 Sealed packages enforcement.
 - C4.4 Spring Boot fat-JAR `BOOT-INF/lib/*.jar` nested loading.
 - C4.5 WAR/EAR support (Tomcat compatibility).
@@ -2947,7 +2947,7 @@ Cross-cutting summary at the end.
 ### (1) Vulnerabilities
 - **Zip-bomb vector**: every read path preallocates `Vec::with_capacity(entry.size() as usize)` (`class_path.rs:477, 551, 562, 594, 990, 1635, 1718`). `size` is attacker-controlled — a JAR declaring `size = u64::MAX` triggers a multi-gigabyte allocation **before** any read. **No** `max_uncompressed_size` cap, no streaming limit, no ratio check.
 - **Zip-slip mitigation incomplete** — when *extracting fat-JAR entries* (`extract_fat_jar_entries`, `:541-574`), entry names go into `entries_cache` verbatim. No validation against `..`, absolute paths, NUL bytes. Same for `load_jmod` (`:1715-1724`) and `extract_jar_signer_blocks` (`:973-997`). In-memory only, so no on-disk write, but resource-namespace poisoning is possible.
-- **Multi-release shadow attack** (`class_path.rs:343-355`) — walks `META-INF/versions/{N}/...` from 25 down to 9 **regardless of the running JVM's release** and **regardless of whether the manifest declares `Multi-Release: true` for the specific class**. A JAR's `versions/25/java/lang/String.class` shadows the base entry.
+- **Multi-release shadow attack** (`class_path.rs:343-355`) — walks `../../../apps/META-INF/versions/{N}/...` from 25 down to 9 **regardless of the running JVM's release** and **regardless of whether the manifest declares `Multi-Release: true` for the specific class**. A JAR's `versions/25/java/lang/String.class` shadows the base entry.
 - **No JAR signature verification** — `extract_jar_signer_blocks` reads `.RSA`/`.DSA`/`.EC` blocks as opaque bytes and attaches them to `CodeSource`. No manifest-digest verification, no `.SF` parsing, no PKCS#7, no cert-chain validation. Signed JARs are trusted on filename alone.
 - **Symlink-traversal check is fail-open** — on `canonicalize` failure the check is silently skipped and the read proceeds (`class_path.rs:725-738`).
 - NUL-byte / backslash check inconsistent across `find_class_source_path` / `find_class_code_source_info` (`:834, 912`) vs the resource paths.
@@ -2962,7 +2962,7 @@ Cross-cutting summary at the end.
 - Manifest re-read per JAR after the fat-JAR probe (`class_path.rs:435` + `448-450`).
 - `probe_fat_jar_structure` iterates only `0..archive.len().min(100)` (`:489-499`) — false-negatives on JARs where interesting entries are at index > 100.
 - `find_in_archive` takes the archive `Mutex` per class load (`:1629-1643`) — no parallel class loading from a single JAR.
-- `find_in_multi_release_archive` does up to **17 `by_name` probes per class lookup** (`:347-352`); cache versioned-name set or test `META-INF/versions/` existence first.
+- `find_in_multi_release_archive` does up to **17 `by_name` probes per class lookup** (`:347-352`); cache versioned-name set or test `../../../apps/META-INF/versions/` existence first.
 - `find_class_code_source_info` re-canonicalizes the JAR path and re-scans signature blocks on every call (`:936-941, :973-997`).
 - `cds_class_cache` (`class_manager.rs:502`) is a byte cache, not a parsed-class cache; parsed `Class` is the expensive object.
 
