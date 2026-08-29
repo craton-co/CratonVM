@@ -2216,15 +2216,52 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Object(None)))
             },
         );
+        // AN UNCONDITIONAL REFUSAL, over a measurement this class already
+        // has. `getTotalSpace()`/`getUsableSpace()`/`getUnallocatedSpace()`
+        // are registered thirty lines up and answer correctly; the
+        // string-keyed door -- which is how `FileStore` is specified to expose
+        // the same three, and the only way to reach an attribute generically --
+        // threw `UnsupportedOperationException` for every name including those.
+        //
+        //   fs.getTotalSpace()             a real byte count
+        //   fs.getAttribute("totalSpace")  UnsupportedOperationException
+        //
+        // MEASURED with `apps/probes/L4BridgeSweep.java`, where it also ENDED
+        // THE RUN: the row was a value row, the throw was uncaught, and the
+        // last 14 rows of a different family never executed. The typed
+        // accessors are the control that identifies the door rather than the
+        // measurement.
+        //
+        // A null name is an NPE (`Objects.requireNonNull` in the JDK), not a
+        // refusal -- reporting UOE there tells a caller the attribute is
+        // unsupported when what happened is that they passed nothing.
         r.register(
             fs_store,
             "getAttribute",
             "(Ljava/lang/String;)Ljava/lang/Object;",
-            |_ctx, _args| {
-                Err(RuntimeError::UnsupportedOperationException {
-                    message: "no such attribute".into(),
-                }
-                .into())
+            |ctx, args| {
+                let name_obj = match args.get(1) {
+                    Some(Value::Object(Some(s))) => *s,
+                    _ => {
+                        return Err(RuntimeError::NullPointerException { message: None }.into());
+                    }
+                };
+                let spec = ctx.read_string(name_obj).unwrap_or_default();
+                // `"basic:totalSpace"` and `"totalSpace"` name the same thing;
+                // the view prefix is optional and `basic` is the default.
+                let attr = match spec.split_once(':') {
+                    Some(("basic", rest)) => rest,
+                    Some(_) => return Err(unsupported_file_store_attribute(&spec)),
+                    None => spec.as_str(),
+                };
+                let which = match attr {
+                    "totalSpace" => 0,
+                    "unallocatedSpace" => 1,
+                    "usableSpace" => 2,
+                    _ => return Err(unsupported_file_store_attribute(&spec)),
+                };
+                let space = file_store_space(ctx, args, which);
+                Ok(Some(box_long(ctx, space)))
             },
         );
         r.register(fs_store, "toString", "()Ljava/lang/String;", |ctx, args| {
@@ -18573,13 +18610,13 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/Object;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                match basic_file_attributes_file_key(ctx, this) {
-                    Some(key) => {
-                        let s = ctx.create_string(&key);
-                        Ok(Some(Value::Object(Some(s))))
-                    }
-                    None => Ok(Some(Value::Object(None))),
-                }
+                // The real key OBJECT -- see
+                // `basic_file_attributes_file_key_object` for why a string that
+                // prints identically is not good enough.
+                Ok(Some(
+                    basic_file_attributes_file_key_object(ctx, this)
+                        .unwrap_or(Value::Object(None)),
+                ))
             },
         );
     }
@@ -19502,7 +19539,8 @@ pub(crate) fn file_identity_key_for_path(path: &str) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path).ok()?;
         Some(format!(
-            "(dev={},ino={})",
+            // Hex, for the reason given on `basic_file_attributes_file_key`.
+            "(dev={:x},ino={})",
             meta.dev() as i64,
             meta.ino() as i64
         ))
@@ -19532,6 +19570,80 @@ pub(crate) fn file_identity_key_for_path(path: &str) -> Option<String> {
 /// free (the JDK's own key classes are package-private in `sun.nio.fs`, so no
 /// caller can name the concrete type). `None` -> `null`, which stays the
 /// documented answer when the identity is unavailable.
+/// The `fileKey()` VALUE: a real `sun.nio.fs.UnixFileKey` (or
+/// `WindowsFileKey`), not a string that prints like one.
+///
+/// The string producer below was right about the CONTENT and wrong about the
+/// TYPE, and the two doors into this attribute disagreed because of it:
+///
+/// ```text
+///   readAttributes(f, BasicFileAttributes.class).fileKey()
+///       HotSpot  sun.nio.fs.UnixFileKey      this VM  sun.nio.fs.UnixFileKey
+///   readAttributes(f, PosixFileAttributes.class).fileKey()
+///       HotSpot  sun.nio.fs.UnixFileKey      this VM  java.lang.String
+/// ```
+///
+/// One door reaches the real JDK bytecode and mints a real key; the other
+/// reaches this native. `Objects.equals` between them is false whatever the
+/// two print, so a program that uses `fileKey` to decide whether two paths
+/// name the same file -- which is the method's only purpose, and what
+/// `FileTreeWalker.wouldLoop` uses to break symlink cycles -- got `false` for
+/// one file. MEASURED with `apps/probes/L4BridgeSweep.java`.
+///
+/// The key classes are package-private with package-private constructors, so
+/// this mints them the same way [`p57_closed_channel`] mints its exception:
+/// `new_object` plus the real `<init>`. Falling back to the string keeps the
+/// previous behaviour when the class is absent (a synthetic image), which is
+/// no worse than before and never null.
+fn basic_file_attributes_file_key_object(
+    ctx: &mut dyn NativeContext,
+    attrs: ObjectRef,
+) -> Option<Value> {
+    let field = |ctx: &dyn NativeContext, name: &str| match ctx.get_field_by_name(attrs, name) {
+        Value::Long(v) => Some(v),
+        Value::Int(v) => Some(i64::from(v)),
+        _ => None,
+    };
+    let (cls, desc, ctor_args) = if basic_file_attributes_is_windows(ctx, attrs) {
+        let volume = field(ctx, "volSerialNumber")?;
+        let high = field(ctx, "fileIndexHigh")?;
+        let low = field(ctx, "fileIndexLow")?;
+        if volume == 0 && high == 0 && low == 0 {
+            return None;
+        }
+        let index = ((high as u64) << 32) | (low as u64 & 0xffff_ffff);
+        (
+            "sun/nio/fs/WindowsFileKey",
+            "(IJ)V",
+            vec![Value::Int(volume as i32), Value::Long(index as i64)],
+        )
+    } else {
+        let dev = field(ctx, "st_dev")?;
+        let ino = field(ctx, "st_ino")?;
+        if dev == 0 && ino == 0 {
+            return None;
+        }
+        (
+            "sun/nio/fs/UnixFileKey",
+            "(JJ)V",
+            vec![Value::Long(dev), Value::Long(ino)],
+        )
+    };
+    if let Ok(Some(Value::Object(Some(key)))) = ctx.new_object(cls) {
+        let mut call = Vec::with_capacity(ctor_args.len() + 1);
+        call.push(Value::Object(Some(key)));
+        call.extend(ctor_args);
+        if ctx.invoke(cls, "<init>", desc, &call).is_ok() {
+            return Some(Value::Object(Some(key)));
+        }
+    }
+    // The class is not there. Keep the string: it still compares equal to
+    // itself across two reads of one file, which is most of the contract.
+    let s = basic_file_attributes_file_key(ctx, attrs)?;
+    let s = ctx.create_string(&s);
+    Some(Value::Object(Some(s)))
+}
+
 pub(crate) fn basic_file_attributes_file_key(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
@@ -19558,10 +19670,22 @@ pub(crate) fn basic_file_attributes_file_key(
     };
     let dev = field("st_dev")?;
     let ino = field("st_ino")?;
+    // HEX, because `sun.nio.fs.UnixFileKey.toString` is
+    // `"(dev=" + Long.toHexString(st_dev) + ",ino=" + st_ino + ")"`. This
+    // producer used decimal while the attribute-map producer 900 lines down
+    // used `{:x}`, so ONE file had two different identities depending on which
+    // door was asked:
+    //
+    //   readAttributes(f, BasicFileAttributes.class).fileKey()  (dev=10301,...)
+    //   readAttributes(f, PosixFileAttributes.class).fileKey()  (dev=66305,...)
+    //
+    // 0x10301 == 66305. Same device, two spellings, and `equals` between them
+    // is false -- which is the whole purpose of a file key. MEASURED with
+    // `apps/probes/L4BridgeSweep.java`.
     if dev == 0 && ino == 0 {
         return None;
     }
-    Some(format!("(dev={dev},ino={ino})"))
+    Some(format!("(dev={:x},ino={ino})", dev as u64))
 }
 
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
@@ -20916,6 +21040,17 @@ mod named_attribute_tests {
             assert!(unix.contains(&name), "unix view is missing `{name}`");
         }
     }
+}
+
+/// `FileStore.getAttribute`'s refusal, with the name the caller asked for.
+///
+/// The JDK's message is the attribute string itself; a constant "no such
+/// attribute" cannot tell a caller which of several names in a loop failed.
+fn unsupported_file_store_attribute(spec: &str) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!("'{spec}' not recognized"),
+    }
+    .into()
 }
 
 fn box_long(ctx: &mut dyn NativeContext, v: i64) -> Value {
@@ -23157,7 +23292,41 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             let set = ctx.read_native_pin(set_pin, set);
             ctx.unpin_native_roots(set_pin);
             ctx.set_field(fa, 0, Value::Object(Some(name)));
-            ctx.set_field(fa, 1, Value::Object(Some(set)));
+            // A COPY, not the caller's set. The JDK's `asFileAttribute` closes
+            // over `Set.copyOf(perms)`, so the attribute's value is fixed at
+            // the moment it is built. Storing the caller's own set means a
+            // later `perms.add(...)` retroactively changes the mode an already
+            // constructed attribute will request -- and, because
+            // `Files.createFile(p, attr)` reads the value at creation time, the
+            // change lands on a file created afterwards with no visible cause.
+            //
+            // MEASURED with `apps/probes/L4BridgeSweep.java`
+            // (`fa.value() == perms` -- HotSpot false, this VM true).
+            //
+            // If the copy cannot be made, keep the original: an aliased value
+            // is worse than a fresh one but far better than a null attribute.
+            let stored = match ctx.new_object("java/util/LinkedHashSet") {
+                Ok(Some(Value::Object(Some(copy)))) => {
+                    let copy_pin = ctx.pin_native_root(copy);
+                    let ok = ctx
+                        .invoke(
+                            "java/util/LinkedHashSet",
+                            "<init>",
+                            "(Ljava/util/Collection;)V",
+                            &[Value::Object(Some(copy)), Value::Object(Some(set))],
+                        )
+                        .is_ok();
+                    let copy = ctx.read_native_pin(copy_pin, copy);
+                    ctx.unpin_native_roots(copy_pin);
+                    if ok {
+                        copy
+                    } else {
+                        set
+                    }
+                }
+                _ => set,
+            };
+            ctx.set_field(fa, 1, Value::Object(Some(stored)));
             Ok(Some(Value::Object(Some(fa))))
         },
     );
