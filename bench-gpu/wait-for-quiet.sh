@@ -17,12 +17,19 @@
 # and TIMEOUT the point at which it gives up and says so on stderr rather
 # than blocking a script forever.
 set -u
-MAX_BUILDS="${MAX_BUILDS:-0}"
+MAX_BUILDS="${MAX_BUILDS:-2}"
 SETTLE="${SETTLE:-3}"
 INTERVAL="${INTERVAL:-20}"
 TIMEOUT="${TIMEOUT:-1800}"
 
-busy() { ps -W 2>/dev/null | grep -cE 'rustc|cargo|link\.exe' || echo 0; }
+# Count the processes that actually burn a core: `rustc` and the linker,
+# by distinct WINDOWS pid. `ps -W` lists an MSYS and a Windows view of the
+# same process, and a `cargo` driver waiting on its children is not load --
+# counting either of those makes any threshold below "several" unreachable
+# on a machine that always has one build somewhere.
+busy() {
+  ps -W 2>/dev/null     | grep -E 'rustc\.exe|link\.exe|cl\.exe'     | awk '{ print $4 }' | sort -u | grep -c . || echo 0
+}
 
 waited=0
 quiet=0
