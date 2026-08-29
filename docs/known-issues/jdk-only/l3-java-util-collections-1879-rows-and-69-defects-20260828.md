@@ -13,7 +13,8 @@
 its measurement here.** Twelve differential probes, 1879 rows, against HotSpot
 25.0.4+7, run in BOTH modes on every one of five builds. Six of the twelve are
 0-diff in both modes; the other six carry only the eight residual rows of §6 and
-the thirteen of the companion dispatch-door record.
+the thirteen of the companion dispatch-door record (those thirteen are
+CLOSED as of 2026-08-29 — see §6.5).
 
 Lane brief: `HANDOFF-20260828-L3-util-collections.md` (retired). Method:
 `HANDOFF-20260828-SCOPE.md` §3.
@@ -60,7 +61,7 @@ Every one of the 56 classes is now covered by a probe.
 | `PqOptionalShadowSweep` | 125 | 2 (§6.1, §6.2) | 2 |
 | `LinkedSequencedShadowSweep` | 102 | 1 (§6.3) | 1 |
 | `LocaleDateTzShadowSweep` | 123 | 1 (§6.4) | 1 |
-| `MethodRefDoorProbe` | 25 | 13 (§6.5) | 13 |
+| `MethodRefDoorProbe` | 25 | **0** | **0** |
 
 ## 3. The defects, by shape
 
@@ -396,7 +397,7 @@ directly is not the same as calling the method.**
 
 ## 6. The residuals, each with its measurement
 
-### 6.1 The snapshot-iterator families are not fail-fast — 5 rows
+### 6.1 The snapshot-iterator families are not fail-fast — 5 rows, OPEN
 
 ```text
 TreeSet      for (x : s) s.add(..)      HotSpot CME   CratonVM no-throw
@@ -406,25 +407,83 @@ PriorityQueue for (x : q) q.add(..)     HotSpot CME   CratonVM no-throw
 TreeMap.keySet()  (--jdk-only ONLY)     HotSpot CME   CratonVM no-throw
 ```
 
-STRUCTURAL, not an omission. These four families hand out a SNAPSHOT iterator,
-and under `--jdk-only` that iterator is the real `java.util.Arrays$ArrayItr` —
-whose `next()` is real bytecode. A comodification check has nowhere to run.
-Implementing it only in compatible mode, where the fabricated iterator's `next()`
-IS a native, would make the two modes disagree, which is a worse state than a
-recorded gap: this campaign's whole premise is that the two modes converge.
+**The 2026-08-29 re-diagnosis, which is the useful part of this section.** The
+first reading said the check "has nowhere to run" because the iterator is the
+real `Arrays$ArrayItr` and its `next()` is real bytecode. That is true of three
+of the five and it is not the cause. `apps/probes/FailFastShapeProbe` printed
+the iterator CLASS each family hands out, and the answer lines up exactly with
+the fail-fast column:
 
-Closing it needs the iterator itself to change, which is the same change
-`W7-1 family 1` made for `TreeMap`'s views and is a lane of its own.
+| family | HotSpot's iterator | CratonVM's | fail-fast? |
+| --- | --- | --- | --- |
+| `TreeSet` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
+| `ArrayDeque` | `ArrayDeque$DeqIterator` | `Arrays$ArrayItr` | no |
+| `PriorityQueue` | `PriorityQueue$Itr` | `ArrayList$Itr` | no |
+| `TreeMap.keySet()` | `TreeMap$KeyIterator` | `Arrays$ArrayItr` | no |
+| `TreeMap.values()` | `TreeMap$ValueIterator` | **`TreeMap$ValueIterator`** | **yes** |
+| `TreeMap.entrySet()` | `TreeMap$EntryIterator` | **`TreeMap$EntryIterator`** | **yes** |
+| `HashMap.values()` | `HashMap$ValueIterator` | **`HashMap$ValueIterator`** | **yes** |
+| `ArrayList` | `ArrayList$Itr` | **`ArrayList$Itr`** | **yes** |
 
-### 6.2 `PriorityQueue.iterator().remove()` does not write through — 1 row
+Every family that hands out its REAL iterator class is fail-fast, and every
+family that does not is not. That is one defect wearing two faces, and it means
+these five rows are not a missing check — they are **four iterator-class
+identity differences the twelve probes never asked about**, which the fail-fast
+rows are the behavioural shadow of.
 
-`native_pq_iterator` deliberately returns an `ArrayList$Itr` over an
-ArrayList-shaped WRAPPER holding a heap-order snapshot, and its own comment
-records why the alternative is worse (a real `PriorityQueue$Itr`'s slot 0 is
-`cursor:int`, and the snapshot array stored there is coerced away). Rerouting
-`remove` means teaching `values_view_source`/`propagate_list_removal` — the path
-every map view shares — about a non-map source. Measured: `size()` 3 where
-HotSpot answers 2.
+`native_ts_iterator`'s own comment has known the class since the L7 wave: *"No
+JDK declares `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
+behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class — and
+then hand back the snapshot through a real iterator anyway."* The refusal is
+right; the fallback is what costs the class and the check.
+
+**The fix this points at, for whoever takes it.** The mechanism already exists
+and already serves the four working rows: `VALUES_ITR_CARRIERS` maps a view
+carrier to its real iterator class, and `alloc_arraylist_iterator_as` mints that
+class with the three snapshot fields past its declared ones, refusing rather
+than fabricating when the class is not real. Pointing `TreeSet` at
+`java/util/TreeMap$KeyIterator` through that same helper gets the right class
+for two of the four rows at once — `TreeMap.keySet()` is TreeSet-carried on this
+VM, so it is one producer, not two, which is the
+`two-producers-of-one-carrier-class-is-a-failure-family` trap this would
+otherwise walk into.
+
+That gets identity. Fail-fast additionally needs a GENERATION the third door can
+read: `al_view_generation` answers `None` for a source with no `modCount`, which
+is every one of these four. Either the natives maintain the real `modCount`
+field their family declares, or each family gets a generation of its own. The
+`modCount` route is the one that also makes real JDK bytecode agree, which is
+the campaign's direction.
+
+Not attempted here. `native_ts_iterator` is among the most pin-dense functions
+in the crate — its own comments record two Family-1 stale-`ObjectRef` defects
+paid for in `RTreeRangeGc` — and replacing a working, GC-audited snapshot path
+is a change that wants its own build-and-arm cycle rather than a corner of
+someone else's. It is the same lane as §6.3.
+
+### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
+
+Was 1 row: `size()` answered 3 after an `iterator().remove()` where HotSpot
+answers 2.
+
+The snapshot the iterator walks is now marked with its queue, using the same
+trailing-capacity-slot marker every `values()` view uses, so
+`native_al_itr_remove`'s existing write-through fires. What made this tractable
+after the first reading called it "the path every map view shares" is that the
+wrapper NEVER ESCAPES: it is minted inside `native_pq_iterator`, handed to the
+`ArrayList$Itr`, and never returned. So the blast radius is not the marker's 21
+consumers but the two this iterator actually reaches —
+
+* `resync_values_view`, on the `next()` path via `al_state_for_read`, which
+  would have rebuilt the snapshot as EMPTY because `collect_entries_any` knows
+  six MAP families and a queue is none of them. It now declines for a queue
+  source, exactly as `resync_ts_view` declines for a non-`TreeMap` one;
+* `propagate_list_removal`, which now routes a queue source through the
+  queue's own `remove(Object)` native — the one that owns the sift-down the
+  heap invariant needs.
+
+Both guards are keyed on a `PriorityQueue` source specifically, so no source
+that exists today changes behaviour.
 
 ### 6.3 `reversed()` is a snapshot, not a live view — 1 row
 
@@ -435,16 +494,100 @@ after a later `put`, answers `{e=5, c=3, a=1, b=2, d=4}`). The JDK's are
 `ReverseOrder*View` classes; this needs the `TmViewSpec` treatment extended to
 the `LinkedHashMap` family, which is the same lane as §6.1.
 
-### 6.4 `Currency.getDisplayName(Locale.ENGLISH)` answers the CODE — 1 row
+### 6.4 `Currency.getDisplayName(Locale.ENGLISH)` answers the CODE — FIXED 2026-08-29
 
-`USD` where HotSpot answers `US Dollar`. Not a collections defect: the currency
-display name comes from the CLDR bundle through `LocaleServiceProvider`, and
-`getDisplayName` is not registered at all — this is real bytecode failing to
-find its resource. Filed against the locale-data surface, not L3's.
+Was `USD` where HotSpot answers `US Dollar`. `LocaleDateTzShadowSweep` is now
+0-diff in both modes.
 
-### 6.5 The method-reference dispatch door — its own record
+The first reading — "the CLDR bundle is not reachable" — was wrong, and the
+probe that found the defect is the one that showed it: **the data was already
+there.** `ResourceBundle.getString("usd")` returns `US Dollar` on this VM
+today. CLDR keys `CurrencyNames` with the UPPERCASE code for the SYMBOL and the
+lowercase code for the NAME, a convention `cldr_currency_symbol`'s own doc
+comment had recorded, and nothing read the second half of it.
 
-See the companion page. 13 of `MethodRefDoorProbe`'s 25 rows.
+What was missing was the plumbing: `Currency.getDisplayName` ran real bytecode,
+which reaches the name through `LocaleServiceProviderPool` +
+`CurrencyNameProvider` — an SPI this VM does not serve. The pool answered null
+and the JDK's documented last resort (the code itself) took over. `Locale
+.getDisplayCountry` works on this VM for the opposite reason: it is a registered
+bridge, and it fires.
+
+Fixed with the twin of the symbol helper — `cldr_currency_display_name`, same
+table, lowercase key — and a `getDisplayName(Locale)` bridge beside
+`getSymbol(Locale)`. The no-arg form delegates to it in real bytecode, so one
+override fixes both call forms.
+
+**This ADDS a shadow while the campaign is retiring them, and that is debt, not
+a win.** The right end state is the provider pool serving
+`CurrencyNameProvider`, after which `Currency` needs no bridge at all; both
+halves should be deleted together. It is the same trade `getSymbol(Locale)` and
+the whole `Locale.getDisplay*` family already made in that file, and it buys a
+right answer where real bytecode gives a wrong one.
+
+Two things fell out of it. The curated fallback table in `phases_early.rs` (the
+compatible-mode `getDisplayName()`) said **`British Pound Sterling`** where
+HotSpot says `British Pound`, and had no entry for CNY/CHF/CAD/AUD at all; it
+now goes through the shared helper so the two copies cannot drift, and the eight
+fallback names are HotSpot's own, measured rather than guessed. And:
+
+### 6.4b `ResourceBundle.getBundle` fabricates a bundle HotSpot refuses — 2 rows, OPEN
+
+```text
+ResourceBundle.getBundle("sun.util.resources.CurrencyNames", Locale.ENGLISH)
+  HotSpot   MissingResourceException: Can't find bundle for base name ...
+  CratonVM  a java.util.ResourceBundle, whose getString("USD") answers "$"
+
+ResourceBundle.getBundle("sun.util.resources.LocaleNames", Locale.ENGLISH)
+  same shape
+```
+
+A fabricated SUCCESS, which is the more serious direction: an application
+probing for a bundle it does not expect to exist is told it does. The
+campaign's own fabrication screen does not catch it, because
+`java.util.ResourceBundle` is a REAL class — what is fabricated is the
+resource, not the type.
+
+Not fixed here, and the reason is worth stating rather than leaving as silence:
+the VM's own locale shims consume these synthetic bundles, so making
+`getBundle` refuse them is a change to the locale/resource surface with its own
+blast radius, not a `java.util` collections fix. Probe:
+`apps/probes/CurrencyNameProbe.java`, rows 17-21.
+
+### 6.5 The method-reference dispatch door — FIXED 2026-08-29
+
+Was 13 of `MethodRefDoorProbe`'s 25 rows; the probe is now 0-diff in both modes.
+The cause was not the missing gate the companion page first named but the class
+the gate is asked ABOUT: ordinary virtual dispatch probes the registry with the
+RECEIVER's class, and the lambda door probed with the class that DECLARES the
+method. `java/util/HashMap$KeyIterator` carries the native and does not declare
+`remove()`; `java/util/HashMap$HashIterator` declares it and carries nothing.
+Fixed in `vm/src/runtime/interpreter/lambda.rs`. Full account, including the 977
+registrations that share the shape and were deliberately NOT activated, in
+`a-bound-method-reference-is-a-different-dispatch-door-20260828.md`.
+
+### 6.6 `Properties.keySet().iterator()` answers the wrong iterator class — 1 row
+
+Found on 2026-08-29 while diagnosing §6.5, by a probe written to check an
+assumption rather than to find a defect:
+
+```text
+Properties.keySet().iterator().getClass().getName()
+  HotSpot   java.util.concurrent.ConcurrentHashMap$KeyIterator
+  CratonVM  java.util.HashMap$KeyIterator          (both modes)
+```
+
+Real: `Properties` stores its entries in a `ConcurrentHashMap` in JDK 25, so its
+key-set iterator is the CHM one. This VM keeps them in the side table and mints
+the `HashMap` carrier. Behaviourally the two agree on all 182 rows of
+`PropertiesShadowSweep` — this is a `getClass().getName()` difference, which is
+the shape `an-identity-only-probe-understates-a-behavioural-gap` warns can be
+either cosmetic or the visible edge of a real one. Recorded rather than fixed
+because changing the minted carrier is the
+`two-producers-of-one-carrier-class-is-a-failure-family` trap: the CHM key
+iterator name already has a producer (`MAP_KEY_ITR_CARRIERS`), and adding a
+second one to it is what made `elements()` never terminate. Probe:
+`apps/probes/ItrClassNameProbe.java`.
 
 ## 7. The final verification, on the tree every lane landed into
 
@@ -467,7 +610,7 @@ twelve probes recompiled from source and re-run, both modes, one run:
 | `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 1 / 1 |
 | `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 1 |
 | `UtilTailShadowSweep` | 146 / 146 / 146 | 0 / 0 |
-| `MethodRefDoorProbe` | 25 / 25 / 25 | 13 / 13 |
+| `MethodRefDoorProbe` | 25 / 25 / 25 | 0 / 0 |
 
 Row counts equal and the trailing `DONE` present on all thirty-six runs, so no
 run is a truncated tail reading as clean. The eight differing rows are §6's
