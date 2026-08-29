@@ -3803,6 +3803,26 @@ impl SharedVm {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
         sys_props.insert("java.home".to_string(), java_home_val.clone());
+        // `java.version` and `java.runtime.version` describe the CLASS LIBRARY,
+        // not this VM -- `java.vm.name`/`java.vm.version` are where CratonVM
+        // names itself, and they are left alone. Seeding them as constants
+        // meant a run against a 25.0.4+7 image reported 25.0.1, which is what
+        // every version-sniffing library reads:
+        //
+        //   java.version                   HotSpot 25.0.4      was 25.0.1
+        //   Runtime.version().update()             4           was 1
+        //   Runtime.version().toString()   25.0.4+7-LTS        was 25.0.1+8
+        //
+        // `Runtime.version()` parses `java.runtime.version` (see
+        // `lang_system::runtime_version_parts`), so one wrong constant was five
+        // wrong rows. The image states both in its own `release` file; the
+        // hardcoded values stay as the fallback for a synthetic-JDK run, which
+        // has no image to ask. MEASURED by
+        // `apps/probes/SystemRuntimeObjectSweep.java`.
+        if let Some((version, runtime_version)) = jdk_image_release_versions(&java_home_val) {
+            sys_props.insert("java.version".to_string(), version);
+            sys_props.insert("java.runtime.version".to_string(), runtime_version);
+        }
 
         // java.class.path — match the HotSpot contract:
         //   * `-jar <FILE>` launch  ->  `java.class.path = <FILE>` (the
@@ -9058,6 +9078,30 @@ pub struct Vm {
     /// registry publishes its TLAB address to a cross-thread GC; moving the
     /// containing `Vm` must not invalidate that address.
     pub main_thread: Box<JvmThread>,
+}
+
+/// `(JAVA_VERSION, JAVA_RUNTIME_VERSION)` from a JDK image's `release` file, or
+/// `None` when there is no readable image there.
+///
+/// The file is a flat `KEY="value"` list written by the JDK build; both keys
+/// are present in every image this VM supports. `JAVA_RUNTIME_VERSION` falls
+/// back to `JAVA_VERSION` because a stripped image can omit it, and returning a
+/// version without a build is better than returning the wrong one.
+fn jdk_image_release_versions(java_home: &str) -> Option<(String, String)> {
+    let data = std::fs::read_to_string(std::path::Path::new(java_home).join("release")).ok()?;
+    let mut version = None;
+    let mut runtime = None;
+    for line in data.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("JAVA_VERSION=") {
+            version = Some(rest.trim_matches('"').to_string());
+        } else if let Some(rest) = line.strip_prefix("JAVA_RUNTIME_VERSION=") {
+            runtime = Some(rest.trim_matches('"').to_string());
+        }
+    }
+    let version = version?;
+    let runtime = runtime.unwrap_or_else(|| version.clone());
+    Some((version, runtime))
 }
 
 impl Vm {
