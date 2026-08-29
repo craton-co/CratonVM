@@ -97,7 +97,7 @@ byte-read-and-`defineClass` through the captured `testClassLoader` reference.
 Mockito's plugin loader (`PluginInitializer.loadImpl`/`loadImpls`,
 `mockito-core-5.23.0.jar`) resolves `mockito-extensions/org.mockito.plugins.MockResolver`
 (Mockito's OWN plugin-discovery convention, distinct from
-`META-INF/services/`) via `Thread.currentThread().getContextClassLoader()
+`../../../../apps/META-INF/services/`) via `Thread.currentThread().getContextClassLoader()
 .getResources(...)`, reads the declared implementation class name
 (`org.springframework.test.context.bean.override.mockito.SpringMockResolver`,
 declared inside `spring-test-7.0.7.jar`'s own
@@ -112,7 +112,7 @@ this test, is the `DynamicClassLoader`.
 - **CratonVM**: fails every time (3/3 runs on current `dev`, `d999dc76f`),
   with the exact stack trace above.
 - Verified via `javap` that `spring-test-7.0.7.jar` genuinely has NO
-  `META-INF/services/org.mockito.plugins.MockResolver` (only the Mockito-
+  `../../../../apps/META-INF/services/org.mockito.plugins.MockResolver` (only the Mockito-
   specific `mockito-extensions/` file) — ruling out a simple "wrong
   ServiceLoader convention" explanation.
 - Verified via `javap` that `DynamicClassLoader` does NOT override

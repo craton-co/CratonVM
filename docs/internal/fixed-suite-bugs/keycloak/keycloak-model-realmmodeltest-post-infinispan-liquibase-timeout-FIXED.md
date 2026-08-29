@@ -73,12 +73,12 @@ CratonVM controls:
 - `verify-fullname-deny-rxjavaonly-20260708-001`: HANG at 450 seconds, but it
   completed the publisher response for `node-1#6` and reached Liquibase
   parsing. It recorded 11 `ChangeLogParserFactory Matched file ...` lines,
-  with the last observed file `META-INF/jpa-changelog-1.3.0.xml`.
+  with the last observed file `../../../../apps/META-INF/jpa-changelog-1.3.0.xml`.
 - `verify-fullname-compiled-rxskip-20260708-001`: HANG at 450 seconds with
   the RxJava3 skip-list entry compiled into the unique binary. It reached
   Liquibase parsing and recorded 3 `ChangeLogParserFactory Matched file ...`
   lines, with the last observed file
-  `META-INF/jpa-changelog-1.0.0.Final-db2.xml`.
+  `../../../../apps/META-INF/jpa-changelog-1.0.0.Final-db2.xml`.
 - `verify-fullname-nojit-after11-20260708-001`: HANG at 900 seconds, but got
   further into Liquibase than the RxJava3-denied JIT run. It recorded about
   150 matched changelog files and reached the Keycloak 26.x changelog range.

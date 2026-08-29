@@ -387,10 +387,7 @@ fn dbb_allocate_collecting(
 fn is_reservation_failure(size: i64) -> bool {
     let b = bits();
     size > 0
-        && b.reserved
-            .load(Ordering::Acquire)
-            .saturating_add(size)
-            > b.max.load(Ordering::Relaxed)
+        && b.reserved.load(Ordering::Acquire).saturating_add(size) > b.max.load(Ordering::Relaxed)
 }
 
 fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
@@ -700,7 +697,10 @@ fn bits_reserve_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // reclaimable; further rounds would only add latency to the OOM.
         if after >= before {
             if dm_dbg_enabled() {
-                eprintln!("[dm] reserveMemory no progress, breaking at round={}", round);
+                eprintln!(
+                    "[dm] reserveMemory no progress, breaking at round={}",
+                    round
+                );
             }
             break;
         }
@@ -1642,12 +1642,8 @@ pub mod elem_fastpath {
                 0 => {
                     // A racing writer that wins stores a class id that was also
                     // served, so a lost race costs nothing.
-                    let _ = cell.compare_exchange(
-                        0,
-                        class_id,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+                    let _ =
+                        cell.compare_exchange(0, class_id, Ordering::Relaxed, Ordering::Relaxed);
                     return;
                 }
                 _ => {}
@@ -2122,11 +2118,21 @@ fn dbb_put_rel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
     let Some((addr, position)) = dbb_rel_addr(ctx, this, true) else {
         elem_census::bailed(elem_census::PUT_REL);
-        return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "put",
+            "(B)Ljava/nio/ByteBuffer;",
+            &args[1..],
+        );
     };
     if !ctx.copy_to_native_memory(addr, &[byte as u8]) {
         elem_census::bailed(elem_census::PUT_REL);
-        return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "put",
+            "(B)Ljava/nio/ByteBuffer;",
+            &args[1..],
+        );
     }
     elem_census::served(elem_census::PUT_REL, addr);
     dbb_commit_position(ctx, this, position + 1);
@@ -2370,10 +2376,13 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Serialize tests that mutate the global `Bits` accounting state.
     /// Without this, parallel `cargo test` runs see racey reserved-byte

@@ -576,9 +576,7 @@ fn scan_absolute_path(c: &[char], i: usize) -> Option<(usize, String)> {
         && matches!(c.get(i + 2), Some('\\') | Some('/'))
         && (i == 0 || !is_ident_char(c[i - 1]));
     let root_start = c[i] == '/'
-        && (i == 0
-            || c[i - 1].is_whitespace()
-            || matches!(c[i - 1], '(' | '[' | '"' | '\'' | '='));
+        && (i == 0 || c[i - 1].is_whitespace() || matches!(c[i - 1], '(' | '[' | '"' | '\'' | '='));
     if !drive_start && !root_start {
         return None;
     }

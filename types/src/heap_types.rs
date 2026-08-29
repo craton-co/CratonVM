@@ -222,7 +222,6 @@ pub const REF_FIELD_SIZE: usize = 8;
 /// Byte offset of the discriminant word within a 16-byte `Value` field cell.
 pub const FIELD_CELL_TAG_OFFSET: usize = 0;
 
-
 /// The discriminant word a 16-byte `Value` field cell carries when it holds a
 /// reference -- i.e. when the 8 bytes at [`FIELD_CELL_PAYLOAD64_OFFSET`] are an
 /// object pointer and not something else.
@@ -438,12 +437,12 @@ const ELEM_BITS: u64 = 0xF;
 // Word bits 54..55 (byte 6, bits 6..7) are RESERVED: inside MARK_QUARTET_MASK,
 // claimed by no field. They are preserved by every quartet rebuild.
 const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: word bits 56..59, byte 7 bits 0..3
-// FOUR bits for three defined flags. The spare one is not slack -- it is what
-// keeps `header_reserved_fields_plausible` able to fail. That screen rejects a
-// header carrying an undefined flag bit, and if the field were exactly three
-// bits wide the bit could not be represented, so the screen would always pass:
-// a guard that cannot fail, on the path that decides whether a candidate
-// address is a real object.
+                                                 // FOUR bits for three defined flags. The spare one is not slack -- it is what
+                                                 // keeps `header_reserved_fields_plausible` able to fail. That screen rejects a
+                                                 // header carrying an undefined flag bit, and if the field were exactly three
+                                                 // bits wide the bit could not be represented, so the screen would always pass:
+                                                 // a guard that cannot fail, on the path that decides whether a candidate
+                                                 // address is a real object.
 const FLAGS_BITS: u64 = 0xF;
 const AGE_SHIFT: u32 = MARK_QUARTET_SHIFT + 12; // 60: word bits 60..63, byte 7 bits 4..7
 const AGE_BITS: u64 = 0xF;
@@ -778,7 +777,6 @@ pub struct ObjectHeader {
     /// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §4.
     pub mark_word: AtomicU64,
 }
-
 
 /// GC flag: object resides in the old generation.
 pub const GC_FLAG_OLD_GEN: u8 = 0x01;
@@ -1971,8 +1969,14 @@ mod tests {
         let flag_field: u64 = FLAGS_BITS << FLAGS_SHIFT;
 
         for (name, mark) in [
-            ("NEUTRAL", ObjectHeader::make_neutral_hashed(quartet, 0x0123_4567)),
-            ("THIN_LOCKED", ObjectHeader::make_thin_locked(quartet, 0x0BAD_F00D, 9)),
+            (
+                "NEUTRAL",
+                ObjectHeader::make_neutral_hashed(quartet, 0x0123_4567),
+            ),
+            (
+                "THIN_LOCKED",
+                ObjectHeader::make_thin_locked(quartet, 0x0BAD_F00D, 9),
+            ),
             ("INFLATED", ObjectHeader::make_inflated(quartet, payload)),
             ("FORWARDED", ObjectHeader::make_forwarded(quartet, payload)),
         ] {
@@ -2002,14 +2006,22 @@ mod tests {
                 "{name}: the state tag moved"
             );
             assert_eq!(header.kind(), ObjectKind::Array, "{name}: kind");
-            assert_eq!(header.element_type(), ArrayElementType::Int, "{name}: element_type");
+            assert_eq!(
+                header.element_type(),
+                ArrayElementType::Int,
+                "{name}: element_type"
+            );
             assert_eq!(header.gc_age(), 9, "{name}: gc_age");
             assert_eq!(
                 header.gc_flags() & GC_FLAG_COMPACT,
                 GC_FLAG_COMPACT,
                 "{name}: the sticky flag was cleared"
             );
-            assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED, "{name}: claimed bit");
+            assert_eq!(
+                header.gc_flags() & GC_FLAG_MARKED,
+                GC_FLAG_MARKED,
+                "{name}: claimed bit"
+            );
             assert!(
                 !header.try_add_gc_flags(GC_FLAG_MARKED),
                 "{name}: the second claim must lose"
@@ -2168,7 +2180,10 @@ mod tests {
             }
 
             let claims = wins.load(Ordering::Relaxed);
-            assert_eq!(claims, 1, "the lock-state churn split one claim into {claims}");
+            assert_eq!(
+                claims, 1,
+                "the lock-state churn split one claim into {claims}"
+            );
             assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED);
             assert_eq!(header.kind(), ObjectKind::Array);
             assert_eq!(header.element_type(), ArrayElementType::Long);
@@ -2335,21 +2350,24 @@ mod tests {
         let mint = || panic!("must not mint for a non-neutral object");
 
         let header = make_header();
-        header
-            .mark_word
-            .store(ObjectHeader::make_thin_locked(MARK_NEUTRAL, 77, 0), Ordering::Relaxed);
+        header.mark_word.store(
+            ObjectHeader::make_thin_locked(MARK_NEUTRAL, 77, 0),
+            Ordering::Relaxed,
+        );
         assert!(header.mark_word_identity_hash(mint).is_err());
 
         let header = make_header();
-        header
-            .mark_word
-            .store(ObjectHeader::make_inflated(MARK_NEUTRAL, 0x1_0000), Ordering::Relaxed);
+        header.mark_word.store(
+            ObjectHeader::make_inflated(MARK_NEUTRAL, 0x1_0000),
+            Ordering::Relaxed,
+        );
         assert!(header.mark_word_identity_hash(mint).is_err());
 
         let header = make_header();
-        header
-            .mark_word
-            .store(ObjectHeader::make_forwarded(MARK_NEUTRAL, 0x2_0000), Ordering::Relaxed);
+        header.mark_word.store(
+            ObjectHeader::make_forwarded(MARK_NEUTRAL, 0x2_0000),
+            Ordering::Relaxed,
+        );
         assert!(header.mark_word_identity_hash(mint).is_err());
     }
 
@@ -2375,9 +2393,7 @@ mod tests {
                         // Every thread proposes a DIFFERENT value, so a lost
                         // update is visible rather than accidentally benign.
                         header
-                            .mark_word_identity_hash(|| {
-                                next.fetch_add(1, Ordering::Relaxed)
-                            })
+                            .mark_word_identity_hash(|| next.fetch_add(1, Ordering::Relaxed))
                             .unwrap()
                     })
                 })
@@ -2390,9 +2406,10 @@ mod tests {
                 seen.windows(2).all(|w| w[0] == w[1]),
                 "threads disagreed about one object's identity hash: {seen:?}"
             );
-            assert_eq!(ObjectHeader::neutral_hash(
-                header.mark_word.load(Ordering::Relaxed)
-            ), seen[0]);
+            assert_eq!(
+                ObjectHeader::neutral_hash(header.mark_word.load(Ordering::Relaxed)),
+                seen[0]
+            );
         }
     }
 
@@ -2599,7 +2616,7 @@ mod tests {
     fn header_has_no_reclaimable_padding() {
         let field_bytes = 4  // class_id
             + 4          // shape
-            + 8;         // mark_word (which also carries the quartet)
+            + 8; // mark_word (which also carries the quartet)
     }
 
     /// The two removable fields, and what each is actually worth once 8-byte
@@ -2900,15 +2917,10 @@ mod tests {
                 .store(source.mark_word.load(Ordering::Acquire), Ordering::Release);
 
             // Step 2: only now clobber the source.
-            source
-                .mark_word
-                .store(
-                    ObjectHeader::make_forwarded(
-                        source.mark_word.load(Ordering::Acquire),
-                        dest_addr,
-                    ),
-                    Ordering::Release,
-                );
+            source.mark_word.store(
+                ObjectHeader::make_forwarded(source.mark_word.load(Ordering::Acquire), dest_addr),
+                Ordering::Release,
+            );
 
             let src_mark = source.mark_word.load(Ordering::Acquire);
             assert!(ObjectHeader::is_forwarded_mark(src_mark));
@@ -2983,9 +2995,10 @@ mod tests {
 
         let dest: u64 = 0;
         let dest_addr = &dest as *const u64 as usize;
-        header
-            .mark_word
-            .store(ObjectHeader::make_forwarded(MARK_NEUTRAL, dest_addr), Ordering::Release);
+        header.mark_word.store(
+            ObjectHeader::make_forwarded(MARK_NEUTRAL, dest_addr),
+            Ordering::Release,
+        );
 
         assert!(
             header.is_forwarded(),
@@ -3017,7 +3030,10 @@ mod tests {
         let addr = &cell as *const u64 as usize;
         for (name, mark) in [
             ("NEUTRAL", MARK_NEUTRAL),
-            ("THIN_LOCKED", ObjectHeader::make_thin_locked(MARK_NEUTRAL, 7, 1)),
+            (
+                "THIN_LOCKED",
+                ObjectHeader::make_thin_locked(MARK_NEUTRAL, 7, 1),
+            ),
             ("INFLATED", ObjectHeader::make_inflated(MARK_NEUTRAL, addr)),
         ] {
             header.mark_word.store(mark, Ordering::Release);
@@ -3144,7 +3160,11 @@ mod tests {
     fn the_quartet_mask_is_disjoint_from_every_state_payload() {
         // The statically-known fields.
         assert_eq!(MARK_QUARTET_MASK & MARK_STATE_MASK, 0, "state tag");
-        assert_eq!(MARK_QUARTET_MASK & MARK_HASH_MASK, 0, "NEUTRAL identity hash");
+        assert_eq!(
+            MARK_QUARTET_MASK & MARK_HASH_MASK,
+            0,
+            "NEUTRAL identity hash"
+        );
         assert_eq!(
             MARK_QUARTET_MASK & THIN_LOCK_RECURSION_MASK,
             0,
@@ -3234,7 +3254,10 @@ mod tests {
                     ObjectHeader::make_thin_locked(prev, 0x0BAD_F00D, 7),
                 ),
                 ("make_inflated", ObjectHeader::make_inflated(prev, payload)),
-                ("make_forwarded", ObjectHeader::make_forwarded(prev, payload)),
+                (
+                    "make_forwarded",
+                    ObjectHeader::make_forwarded(prev, payload),
+                ),
                 (
                     "make_neutral_hashed",
                     ObjectHeader::make_neutral_hashed(prev, 0x0123_4567),
@@ -3341,7 +3364,11 @@ mod tests {
             );
             header.set_gc_age(age);
             let mark = header.mark_word.load(Ordering::Acquire);
-            assert_eq!(ObjectHeader::thin_lock_owner(mark), 0x0BAD_F00D, "age {age}");
+            assert_eq!(
+                ObjectHeader::thin_lock_owner(mark),
+                0x0BAD_F00D,
+                "age {age}"
+            );
             assert_eq!(ObjectHeader::thin_lock_recursion(mark), 200, "age {age}");
             assert_eq!(header.gc_age(), age, "age {age}");
 

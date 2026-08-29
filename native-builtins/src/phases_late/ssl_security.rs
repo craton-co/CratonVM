@@ -293,11 +293,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
     ] {
-    r.register(
-        mac,
-        "getInstance",
-        desc,
-        |ctx, args| {
+        r.register(mac, "getInstance", desc, |ctx, args| {
             // State lives off-object in mac_state_table, keyed by identity hash
             // (bug-26 L3).
             //
@@ -389,12 +385,9 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             // bc-java's `pkcs` suite) is the shape.
             if requested_provider.is_none() && !mac_algorithm_supported(&algo) {
                 if let Some(p) = crate::jca::provider_chain::find_service_provider("Mac", &algo) {
-                    if let Some(obj) = crate::jca::provider_chain::build_real_mac(
-                        ctx,
-                        &p,
-                        &requested_algo,
-                        &algo,
-                    )? {
+                    if let Some(obj) =
+                        crate::jca::provider_chain::build_real_mac(ctx, &p, &requested_algo, &algo)?
+                    {
                         return Ok(Some(Value::Object(Some(obj))));
                     }
                 }
@@ -424,208 +417,207 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 },
             );
             Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // getInstance(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;
-    //
-    // The SEVENTEENTH public method of `javax.crypto.Mac`, and the one that was
-    // registered nowhere. It went missing because
-    // `phases_late::every_public_mac_method_is_registered` — the census whose
-    // doc comment says "Every PUBLIC method of `javax.crypto.Mac` must be
-    // registered — not most of them" — had its population transcribed from THIS
-    // registrar rather than from the JDK, so it listed 16 of 17 and every one of
-    // the 16 passed. See
-    // `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`.
-    //
-    // Leaving it unregistered is not inert. The other two overloads allocate a
-    // 4-slot synthetic `javax/crypto/Mac` and seed `mac_state_table`; this one
-    // fell through to the REAL JDK body, which hands back a `Mac` with no
-    // `mac_state_table` row — while `init`, `update`, `doFinal`, `getAlgorithm`,
-    // `getMacLength` and `reset` on that object are ALL intercepted by natives
-    // that read that row. `getMacLength()` on it answers
-    // `IllegalStateException: MAC algorithm unavailable:` (empty name), and
-    // `doFinal()` answers on an empty key — a silently WRONG MAC, which is the
-    // worst outcome in this file's own accounting, since a MAC that verifies is
-    // itself the security decision.
-    //
-    // ## The contract, measured on HotSpot 25.0.3+9 (this host, 2026-08-13)
-    //
-    // ```text
-    // getInstance("HmacSHA256", SunJCE)      -> OK  prov=SunJCE len=32, getProvider() == the SAME instance
-    // getInstance("HmacSHA256", SUN)         -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider SUN
-    // getInstance("HmacSHA256", new Provider("MyAnon",…){})
-    //                                        -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider MyAnon
-    // getInstance("NoSuchMac",  SunJCE)      -> NoSuchAlgorithmException: no such algorithm: NoSuchMac for provider SunJCE
-    // getInstance("",           SunJCE)      -> NoSuchAlgorithmException: no such algorithm:  for provider SunJCE
-    // getInstance("HmacSHA256", (Provider)null) -> IllegalArgumentException: missing provider
-    // getInstance(null,         SunJCE)      -> NullPointerException: null algorithm name
-    // getInstance(null,         (Provider)null) -> NullPointerException: null algorithm name
-    // ```
-    //
-    // Three rows are the whole design, and none is guessable from the
-    // `(String, String)` overload:
-    //
-    // 1. **There is no `NoSuchProviderException` on this overload at all.** The
-    //    caller handed over a `Provider` INSTANCE, so there is nothing to look
-    //    up; a provider that was never passed to `Security.addProvider` is
-    //    perfectly acceptable as an argument (`MyAnon` above got as far as the
-    //    algorithm check). `check_named_provider_arg` is called anyway and is a
-    //    documented no-op for a non-`String` argument — it is here for the null
-    //    row, which it does handle, and so that the two overloads keep one
-    //    ordering rather than two.
-    // 2. **A null provider is `IllegalArgumentException("missing provider")`,
-    //    not NPE** — the same `IllegalArgumentException` the `(String, String)`
-    //    overload gives for `null` and for `""`.
-    // 3. **The null-algorithm check runs FIRST.** `getInstance(null, null)` is
-    //    NPE, not IAE — measured on both two-argument overloads. So the
-    //    algorithm argument is located before the provider is examined, which is
-    //    exactly the order below.
-    //
-    // Ownership then decides the rest: whether the *named* provider supplies the
-    // algorithm is the only question this overload can fail on, and HotSpot
-    // answers it identically for a registered provider that lacks the row (SUN)
-    // and an unregistered one that lacks it (MyAnon). `check_provider_ownership`
-    // reads the same service table for both and `ProviderArgWording::Shared`
-    // reproduces the message verbatim.
-    //
-    // **Known residual, stated so a green run is not read as more than it is:**
-    // on the SYNTHETIC path only — a name this engine computes itself —
-    // `getProvider()` answers the canonical `SunJCE` object
-    // (`jce_provider_object`), not the instance the caller passed. HotSpot
-    // returns the caller's own instance (`m.getProvider() == provider` measured
-    // `true`); this VM answers an equal NAME but a different object. Fixing
-    // that means giving `MacState` a provider field, and `MacState` is built
-    // with an explicit all-fields literal in `phases_late.rs` — a file this
-    // lane does not own — whose own comment says to list every field.
-    //
-    // A Mac built from the named provider's own SPI (`build_real_mac`, below)
-    // does not have this residual: it is constructed through
-    // `javax.crypto.Mac`'s real `(MacSpi, Provider, String)` constructor with
-    // that provider's object, so `getProvider().getName()` is `BC`.
-    r.register(
-        mac,
-        "getInstance",
-        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
-        |ctx, args| {
-            // NOT `mac_algorithm_arg`: that one takes the first argument
-            // `read_string` succeeds on, and on THIS overload the second
-            // argument is a `Provider`, whose `read_string` is not reliably
-            // `None`. With a null algorithm the plain scan would hand the
-            // PROVIDER back as the algorithm name and answer
-            // `NoSuchAlgorithmException` where HotSpot answers
-            // `NullPointerException: null algorithm name`. See
-            // `mac_algorithm_arg_string_typed`.
-            let Some((algo_idx, algo)) = mac_algorithm_arg_string_typed(ctx, args) else {
-                return Err(RuntimeError::NullPointerException {
-                    message: Some("null algorithm name".to_string()),
-                }
-                .into());
-            };
-            // Null provider => IllegalArgumentException("missing provider").
-            // A non-null, non-String argument is the Provider instance itself,
-            // which this call is a documented no-op for.
-            crate::jca::provider_chain::check_named_provider_arg(
-                ctx,
-                args,
-                algo_idx + 1,
-                crate::jca::provider_chain::ProviderArgWording::Shared,
-            )?;
-            // The one question this overload can fail on: does THAT provider
-            // supply this algorithm? `check_provider_ownership` reads the
-            // provider's name off the instance via `provider_name_of` when the
-            // argument is not a String, so an unregistered `Provider` object is
-            // reported by its own name — which is what HotSpot does.
-            crate::jca::provider_chain::check_provider_ownership(
-                ctx,
-                args,
-                algo_idx + 1,
-                "Mac",
-                &algo,
-                crate::jca::provider_chain::ProviderArgWording::Shared,
-            )?;
-            // Resolve against the NAMED provider's own alias rows, then build
-            // that provider's own `MacSpi` — the same two steps the
-            // `(String, String)` overload takes, for the same reasons, and this
-            // overload had NEITHER.
-            //
-            // Ownership was checked just above and then the name was put to
-            // THIS engine's `mac_algorithm_supported` gate, so every algorithm
-            // BouncyCastle owns and this engine does not compute was refused
-            // with `no such algorithm: <name> for provider BC` — a provider
-            // being told it does not implement what it had just been confirmed
-            // to own, one line earlier, by the same table.
-            //
-            // Measured against HotSpot 25 (`MacProvObj2`), before:
-            //
-            // ```text
-            // 1.3.14.3.2.26     byName   BC len=20 2376178e…
-            //                   byObject EX NoSuchAlgorithmException:
-            //                            no such algorithm: 1.3.14.3.2.26 for provider BC
-            // ```
-            //
-            // `PBEwithHmacSHA1` and `AESCMAC` are the same shape. HotSpot
-            // serves both forms identically, which is what makes the two
-            // overloads' disagreement the defect rather than a policy: a caller
-            // holding a `Provider` INSTANCE — which is what
-            // `Security.getProvider("BC")` hands back, and what BouncyCastle's
-            // own `JcaJceHelper`/`PKCS12` paths carry — got a refusal the same
-            // caller would not have got from the string.
-            let requested_provider =
-                crate::jca::provider_chain::provider_arg_name(ctx, args, algo_idx + 1);
-            let requested_algo = algo.clone();
-            let algo = crate::jca::provider_chain::canonical_if_unrecognised(
-                requested_provider.as_deref(),
-                "Mac",
-                &algo,
-                &mac_algorithm_supported,
-            )
-            .unwrap_or(algo);
-            if let Some(provider) = requested_provider.as_deref() {
-                if let Some(obj) = crate::jca::provider_chain::build_real_mac(
-                    ctx,
-                    provider,
-                    &requested_algo,
-                    &algo,
-                )? {
-                    return Ok(Some(Value::Object(Some(obj))));
-                }
-            }
-            // Backstop for the case ownership cannot see: a provider whose name
-            // this VM could not read (`provider_name_of` -> "<unknown>", which
-            // `check_provider_ownership` deliberately admits) asking for a name
-            // this engine does not compute. Refusing BEFORE allocating is the
-            // W4-3 rule — an unimplemented name must never reach a receiver,
-            // because `mac_compute_hmac` has no default arm and the object would
-            // be a Mac that answers for an algorithm nothing here implements.
-            if !mac_algorithm_supported(&algo) {
-                // Once a provider is in play HotSpot reports the failure against
-                // THAT provider, so the message must carry its name.
-                let provider = match args.get(algo_idx + 1) {
-                    Some(Value::Object(Some(p))) => {
-                        Some(crate::jca::provider_chain::provider_name_of(ctx, *p))
+        });
+        // getInstance(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;
+        //
+        // The SEVENTEENTH public method of `javax.crypto.Mac`, and the one that was
+        // registered nowhere. It went missing because
+        // `phases_late::every_public_mac_method_is_registered` — the census whose
+        // doc comment says "Every PUBLIC method of `javax.crypto.Mac` must be
+        // registered — not most of them" — had its population transcribed from THIS
+        // registrar rather than from the JDK, so it listed 16 of 17 and every one of
+        // the 16 passed. See
+        // `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`.
+        //
+        // Leaving it unregistered is not inert. The other two overloads allocate a
+        // 4-slot synthetic `javax/crypto/Mac` and seed `mac_state_table`; this one
+        // fell through to the REAL JDK body, which hands back a `Mac` with no
+        // `mac_state_table` row — while `init`, `update`, `doFinal`, `getAlgorithm`,
+        // `getMacLength` and `reset` on that object are ALL intercepted by natives
+        // that read that row. `getMacLength()` on it answers
+        // `IllegalStateException: MAC algorithm unavailable:` (empty name), and
+        // `doFinal()` answers on an empty key — a silently WRONG MAC, which is the
+        // worst outcome in this file's own accounting, since a MAC that verifies is
+        // itself the security decision.
+        //
+        // ## The contract, measured on HotSpot 25.0.3+9 (this host, 2026-08-13)
+        //
+        // ```text
+        // getInstance("HmacSHA256", SunJCE)      -> OK  prov=SunJCE len=32, getProvider() == the SAME instance
+        // getInstance("HmacSHA256", SUN)         -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider SUN
+        // getInstance("HmacSHA256", new Provider("MyAnon",…){})
+        //                                        -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider MyAnon
+        // getInstance("NoSuchMac",  SunJCE)      -> NoSuchAlgorithmException: no such algorithm: NoSuchMac for provider SunJCE
+        // getInstance("",           SunJCE)      -> NoSuchAlgorithmException: no such algorithm:  for provider SunJCE
+        // getInstance("HmacSHA256", (Provider)null) -> IllegalArgumentException: missing provider
+        // getInstance(null,         SunJCE)      -> NullPointerException: null algorithm name
+        // getInstance(null,         (Provider)null) -> NullPointerException: null algorithm name
+        // ```
+        //
+        // Three rows are the whole design, and none is guessable from the
+        // `(String, String)` overload:
+        //
+        // 1. **There is no `NoSuchProviderException` on this overload at all.** The
+        //    caller handed over a `Provider` INSTANCE, so there is nothing to look
+        //    up; a provider that was never passed to `Security.addProvider` is
+        //    perfectly acceptable as an argument (`MyAnon` above got as far as the
+        //    algorithm check). `check_named_provider_arg` is called anyway and is a
+        //    documented no-op for a non-`String` argument — it is here for the null
+        //    row, which it does handle, and so that the two overloads keep one
+        //    ordering rather than two.
+        // 2. **A null provider is `IllegalArgumentException("missing provider")`,
+        //    not NPE** — the same `IllegalArgumentException` the `(String, String)`
+        //    overload gives for `null` and for `""`.
+        // 3. **The null-algorithm check runs FIRST.** `getInstance(null, null)` is
+        //    NPE, not IAE — measured on both two-argument overloads. So the
+        //    algorithm argument is located before the provider is examined, which is
+        //    exactly the order below.
+        //
+        // Ownership then decides the rest: whether the *named* provider supplies the
+        // algorithm is the only question this overload can fail on, and HotSpot
+        // answers it identically for a registered provider that lacks the row (SUN)
+        // and an unregistered one that lacks it (MyAnon). `check_provider_ownership`
+        // reads the same service table for both and `ProviderArgWording::Shared`
+        // reproduces the message verbatim.
+        //
+        // **Known residual, stated so a green run is not read as more than it is:**
+        // on the SYNTHETIC path only — a name this engine computes itself —
+        // `getProvider()` answers the canonical `SunJCE` object
+        // (`jce_provider_object`), not the instance the caller passed. HotSpot
+        // returns the caller's own instance (`m.getProvider() == provider` measured
+        // `true`); this VM answers an equal NAME but a different object. Fixing
+        // that means giving `MacState` a provider field, and `MacState` is built
+        // with an explicit all-fields literal in `phases_late.rs` — a file this
+        // lane does not own — whose own comment says to list every field.
+        //
+        // A Mac built from the named provider's own SPI (`build_real_mac`, below)
+        // does not have this residual: it is constructed through
+        // `javax.crypto.Mac`'s real `(MacSpi, Provider, String)` constructor with
+        // that provider's object, so `getProvider().getName()` is `BC`.
+        r.register(
+            mac,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+            |ctx, args| {
+                // NOT `mac_algorithm_arg`: that one takes the first argument
+                // `read_string` succeeds on, and on THIS overload the second
+                // argument is a `Provider`, whose `read_string` is not reliably
+                // `None`. With a null algorithm the plain scan would hand the
+                // PROVIDER back as the algorithm name and answer
+                // `NoSuchAlgorithmException` where HotSpot answers
+                // `NullPointerException: null algorithm name`. See
+                // `mac_algorithm_arg_string_typed`.
+                let Some((algo_idx, algo)) = mac_algorithm_arg_string_typed(ctx, args) else {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("null algorithm name".to_string()),
                     }
-                    _ => None,
+                    .into());
                 };
-                return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
-            }
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
-            let id = ctx.identity_hash_code(obj);
-            // BUG nb-phases-late(4): bound the key-bearing side-table before
-            // inserting so it cannot retain key material for the VM lifetime.
-            let mut t = mac_state_table().lock().unwrap();
-            mac_state_evict_if_needed(&mut t, id);
-            t.insert(
-                id,
-                MacState {
-                    algo,
-                    key: Vec::new(),
-                    data: Vec::new(),
-                    initialized: false,
-                },
-            );
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+                // Null provider => IllegalArgumentException("missing provider").
+                // A non-null, non-String argument is the Provider instance itself,
+                // which this call is a documented no-op for.
+                crate::jca::provider_chain::check_named_provider_arg(
+                    ctx,
+                    args,
+                    algo_idx + 1,
+                    crate::jca::provider_chain::ProviderArgWording::Shared,
+                )?;
+                // The one question this overload can fail on: does THAT provider
+                // supply this algorithm? `check_provider_ownership` reads the
+                // provider's name off the instance via `provider_name_of` when the
+                // argument is not a String, so an unregistered `Provider` object is
+                // reported by its own name — which is what HotSpot does.
+                crate::jca::provider_chain::check_provider_ownership(
+                    ctx,
+                    args,
+                    algo_idx + 1,
+                    "Mac",
+                    &algo,
+                    crate::jca::provider_chain::ProviderArgWording::Shared,
+                )?;
+                // Resolve against the NAMED provider's own alias rows, then build
+                // that provider's own `MacSpi` — the same two steps the
+                // `(String, String)` overload takes, for the same reasons, and this
+                // overload had NEITHER.
+                //
+                // Ownership was checked just above and then the name was put to
+                // THIS engine's `mac_algorithm_supported` gate, so every algorithm
+                // BouncyCastle owns and this engine does not compute was refused
+                // with `no such algorithm: <name> for provider BC` — a provider
+                // being told it does not implement what it had just been confirmed
+                // to own, one line earlier, by the same table.
+                //
+                // Measured against HotSpot 25 (`MacProvObj2`), before:
+                //
+                // ```text
+                // 1.3.14.3.2.26     byName   BC len=20 2376178e…
+                //                   byObject EX NoSuchAlgorithmException:
+                //                            no such algorithm: 1.3.14.3.2.26 for provider BC
+                // ```
+                //
+                // `PBEwithHmacSHA1` and `AESCMAC` are the same shape. HotSpot
+                // serves both forms identically, which is what makes the two
+                // overloads' disagreement the defect rather than a policy: a caller
+                // holding a `Provider` INSTANCE — which is what
+                // `Security.getProvider("BC")` hands back, and what BouncyCastle's
+                // own `JcaJceHelper`/`PKCS12` paths carry — got a refusal the same
+                // caller would not have got from the string.
+                let requested_provider =
+                    crate::jca::provider_chain::provider_arg_name(ctx, args, algo_idx + 1);
+                let requested_algo = algo.clone();
+                let algo = crate::jca::provider_chain::canonical_if_unrecognised(
+                    requested_provider.as_deref(),
+                    "Mac",
+                    &algo,
+                    &mac_algorithm_supported,
+                )
+                .unwrap_or(algo);
+                if let Some(provider) = requested_provider.as_deref() {
+                    if let Some(obj) = crate::jca::provider_chain::build_real_mac(
+                        ctx,
+                        provider,
+                        &requested_algo,
+                        &algo,
+                    )? {
+                        return Ok(Some(Value::Object(Some(obj))));
+                    }
+                }
+                // Backstop for the case ownership cannot see: a provider whose name
+                // this VM could not read (`provider_name_of` -> "<unknown>", which
+                // `check_provider_ownership` deliberately admits) asking for a name
+                // this engine does not compute. Refusing BEFORE allocating is the
+                // W4-3 rule — an unimplemented name must never reach a receiver,
+                // because `mac_compute_hmac` has no default arm and the object would
+                // be a Mac that answers for an algorithm nothing here implements.
+                if !mac_algorithm_supported(&algo) {
+                    // Once a provider is in play HotSpot reports the failure against
+                    // THAT provider, so the message must carry its name.
+                    let provider = match args.get(algo_idx + 1) {
+                        Some(Value::Object(Some(p))) => {
+                            Some(crate::jca::provider_chain::provider_name_of(ctx, *p))
+                        }
+                        _ => None,
+                    };
+                    return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
+                }
+                let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
+                let id = ctx.identity_hash_code(obj);
+                // BUG nb-phases-late(4): bound the key-bearing side-table before
+                // inserting so it cannot retain key material for the VM lifetime.
+                let mut t = mac_state_table().lock().unwrap();
+                mac_state_evict_if_needed(&mut t, id);
+                t.insert(
+                    id,
+                    MacState {
+                        algo,
+                        key: Vec::new(),
+                        data: Vec::new(),
+                        initialized: false,
+                    },
+                );
+                Ok(Some(Value::Object(Some(obj))))
+            },
+        );
     }
 
     r.register(mac, "init", "(Ljava/security/Key;)V", |ctx, args| {
@@ -1096,16 +1088,21 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     // `NullPointerException: Cannot enter synchronized block because
     // "this.lock" is null`. Answer with the provider these HMACs actually
     // come from, which is what `Security.getProviders()` advertises them under.
-    r.register(mac, "getProvider", "()Ljava/security/Provider;", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
-        if let Value::Object(Some(p)) = ctx.get_field_by_name(_this, "provider") {
-            let pid = ctx.class_id_by_name("java/security/Provider");
-            if pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid)) {
-                return Ok(Some(Value::Object(Some(p))));
+    r.register(
+        mac,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            if let Value::Object(Some(p)) = ctx.get_field_by_name(_this, "provider") {
+                let pid = ctx.class_id_by_name("java/security/Provider");
+                if pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid)) {
+                    return Ok(Some(Value::Object(Some(p))));
+                }
             }
-        }
-        Ok(Some(Value::Object(Some(jce_provider_object(ctx)?))))
-    });
+            Ok(Some(Value::Object(Some(jce_provider_object(ctx)?))))
+        },
+    );
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2310,14 +2307,19 @@ pub(crate) fn p68_factory_max_protocol(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> Option<native_tls::Protocol> {
-    p68_factory_pinned_protocol_name(ctx, args).as_deref().and_then(new13_ctx_max_protocol)
+    p68_factory_pinned_protocol_name(ctx, args)
+        .as_deref()
+        .and_then(new13_ctx_max_protocol)
 }
 
 /// FIX (es-restclient-https): look up the custom trust anchors (if any)
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
+pub(crate) fn p68_factory_trust_roots(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
@@ -2353,7 +2355,10 @@ pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value
 /// field 0 (user-defined factory subclass — see `net_phase_e`'s
 /// `createSocket` comment) simply misses the table → `None` → unchanged
 /// default verification.
-pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<u64>, MethodCallFailed> {
+pub(crate) fn p68_factory_java_tm_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<u64>, MethodCallFailed> {
     let Some(Value::Object(Some(factory))) = args.first() else {
         return Ok(None);
     };
@@ -2363,7 +2368,9 @@ pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value
     let Value::Object(Some(sslctx)) = ctx.get_field(*factory, 0) else {
         return Ok(None);
     };
-    Ok(crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)?)
+    Ok(crate::t27_tls::ctx_trust_managers_key_if_attached(
+        ctx, sslctx,
+    )?)
 }
 
 /// FIX (h2-testnetutils-cipherfactory-createsocket-cast): staging table for
@@ -2457,8 +2464,7 @@ pub(crate) struct PendingConnectSocket {
 /// `drop_pending_connect_socket_if_any` removes. None touches `ctx`, so the
 /// guard is never held across a re-entry into the VM — which is the whole of
 /// what the level claims.
-fn pending_connect_sockets(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+fn pending_connect_sockets() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
     rustc_hash::FxHashMap<i32, PendingConnectSocket>,
 > {
     static T: std::sync::OnceLock<
@@ -2611,7 +2617,10 @@ pub(crate) fn new13_ssl_socket_connect(
 
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
-pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn new13_alloc_ssl_session(
+    ctx: &mut dyn NativeContext,
+    tls_id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     let session =
         try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS)?;
     // Two stream registries back an `SSLSocket` here: `s2_registry` (the
@@ -2757,7 +2766,14 @@ pub(crate) fn p68_create_socket_inet_address(
     let extra_roots = p68_factory_trust_roots(ctx, args)?;
     let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
     let max_protocol = p68_factory_max_protocol(ctx, args);
-    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, max_protocol)
+    new13_do_create_socket(
+        ctx,
+        &host,
+        port as u16,
+        &extra_roots,
+        java_tm_key,
+        max_protocol,
+    )
 }
 
 /// NEW-13: real, blocking TCP-connect + TLS client handshake shared by
@@ -2775,7 +2791,15 @@ pub(crate) fn new13_connect_and_handshake(
     java_tm_key: Option<u64>,
     max_protocol: Option<native_tls::Protocol>,
 ) -> Result<i32, MethodCallFailed> {
-    new13_connect_and_handshake_on(ctx, host, port, extra_root_ders, java_tm_key, max_protocol, None)
+    new13_connect_and_handshake_on(
+        ctx,
+        host,
+        port,
+        extra_root_ders,
+        java_tm_key,
+        max_protocol,
+        None,
+    )
 }
 
 /// Is the default client path backed by the raw `openssl::SslConnector`
@@ -3160,7 +3184,8 @@ pub(crate) fn new13_do_create_socket(
 ) -> MethodCallResult {
     let tls_id =
         new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key, max_protocol)?;
-    let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS)?;
+    let sock =
+        try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS)?;
     let sock = new13_finish_socket(ctx, sock, host, port, tls_id);
     if crate::nbflags().dbg_tls_sock {
         eprintln!(
@@ -3248,10 +3273,17 @@ pub(crate) fn kmf_keystore_id_by_identity(
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two sites: a one-statement
 /// `insert` at `init` time, and the `getKeyManagers` read, now bound in a block
 /// so its guard drops before the arm that walks the object through `ctx`.
-fn kmf_live_km_id_by_identity() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>> {
-    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn kmf_live_km_id_by_identity(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, i32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// FIX (tomcat-clientauth-engine-config): same pattern as
@@ -3439,8 +3471,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &format!("{proto_name} SSLContext not available"),
                 ));
             }
-            let obj =
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "javax/net/ssl/SSLContext",
+                NEW13_SSL_CTX_FIELDS,
+            )?;
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto_ref)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(0));
             ctx.set_field(obj, NEW13_CTX_KM, Value::Object(None));
@@ -3456,8 +3491,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // A "Default" context is pre-initialised: it uses the platform
             // trust store and an implementation-defined `SecureRandom`.
-            let obj =
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "javax/net/ssl/SSLContext",
+                NEW13_SSL_CTX_FIELDS,
+            )?;
             let proto = ctx.create_string("TLSv1.3");
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(1));
@@ -3684,7 +3722,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4273,7 +4312,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     /// `socket.getSession().getCipherSuite()`. A missing answer is normally
     /// better than a wrong one; here it was neither — it was a crash where the
     /// oracle has a defined, greppable answer.
-    fn new13_resolve_socket_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Value, MethodCallFailed> {
+    fn new13_resolve_socket_session(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+    ) -> Result<Value, MethodCallFailed> {
         let stored = ctx.get_field(this, NEW13_SOCK_SESSION);
         if matches!(stored, Value::Object(Some(_))) {
             return Ok(stored);
@@ -4314,7 +4356,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     /// Synchronous delivery is chosen over spawning a Java thread from a
     /// native because it needs no `Runnable` shim class and cannot leak a
     /// thread when a listener throws; the event contents are identical.
-    fn new13_fire_handshake_completed(ctx: &mut dyn NativeContext, socket: ObjectRef) -> Result<(), MethodCallFailed> {
+    fn new13_fire_handshake_completed(
+        ctx: &mut dyn NativeContext,
+        socket: ObjectRef,
+    ) -> Result<(), MethodCallFailed> {
         let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
         // Copy the handles out and release the lock BEFORE re-entering Java:
         // `handshakeCompleted` is arbitrary application code that can call
@@ -4377,13 +4422,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             );
         }
         ctx.unpin_native_roots(pin);
-    Ok(())
-}
+        Ok(())
+    }
 
     /// Release the global roots held for `socket`'s handshake listeners.
     /// Called from `close()` so a long-lived process that opens many TLS
     /// sockets does not accumulate permanently-reachable listener objects.
-    fn new13_drop_handshake_listeners(ctx: &mut dyn NativeContext, socket: ObjectRef) -> Result<(), MethodCallFailed> {
+    fn new13_drop_handshake_listeners(
+        ctx: &mut dyn NativeContext,
+        socket: ObjectRef,
+    ) -> Result<(), MethodCallFailed> {
         let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
         let handles = match handshake_listeners().lock().remove(&socket_key) {
             Some(entry) => entry,
@@ -4392,8 +4440,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         for (_, handle) in handles {
             ctx.remove_global_root(handle);
         }
-    Ok(())
-}
+        Ok(())
+    }
 
     // SSLSocket methods
     let ssl_sock = "javax/net/ssl/SSLSocket";
@@ -4501,18 +4549,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let removed = {
                 let mut table = handshake_listeners().lock();
                 match table.get_mut(&socket_key) {
-                    Some(entry) => {
-                        match entry.iter().position(|(key, _)| *key == listener_key) {
-                            Some(pos) => {
-                                let (_, handle) = entry.remove(pos);
-                                if entry.is_empty() {
-                                    table.remove(&socket_key);
-                                }
-                                Some(handle)
+                    Some(entry) => match entry.iter().position(|(key, _)| *key == listener_key) {
+                        Some(pos) => {
+                            let (_, handle) = entry.remove(pos);
+                            if entry.is_empty() {
+                                table.remove(&socket_key);
                             }
-                            None => None,
+                            Some(handle)
                         }
-                    }
+                        None => None,
+                    },
                     None => None,
                 }
             };
@@ -4644,7 +4690,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // by default under java.util.logging), and abandon the connection having
     // never read the request or written a response — surfaced to the client
     // as a silent hang (e.g. Reactor's `.block(Duration)` timing out).
-    fn ssl_sock_negotiated_alpn(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<String>, MethodCallFailed> {
+    fn ssl_sock_negotiated_alpn(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+    ) -> Result<Option<String>, MethodCallFailed> {
         let tls_id = new13_resolve_tls_id(ctx, this);
         if tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE {
             return Ok(None);
@@ -4819,7 +4868,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // enabled == supported here (matches the JDK default before any
     // `setEnabledCipherSuites` call — this synthetic socket has no
     // set-side storage, so `set*` below are accepted but not persisted).
-    fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    fn ssl_sock_supported_cipher_suites(
+        ctx: &mut dyn NativeContext,
+    ) -> Result<ObjectRef, MethodCallFailed> {
         // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
         // E42: the body moved to the module-level `jsse_supported_suite_name_array`
         // so the SSLEngine and SSLSocketFactory doors — which each carried
@@ -5447,8 +5498,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let address =
-                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1")?;
+            let address = crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1")?;
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -6036,8 +6086,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     // carries the raw DER bytes so `Certificate.getEncoded()`
                     // can return them without relying on
                     // legacy-synthetic-crypto.
-                    let cert0 =
-                        try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
+                    let cert0 = try_alloc_concurrent_synthetic(
+                        ctx,
+                        "java/security/cert/X509Certificate",
+                        4,
+                    )?;
                     // `cert` is live across `create_string`/`new_array` below,
                     // both of which allocate — pin and re-read, same discipline
                     // `build_rooted_ref_array` applies to the array itself.
@@ -6268,11 +6321,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // slot 0, so the un-overridden real `getProvider()` bytecode
             // returned a `String` where a `Provider` belongs — the same defect
             // that fix records for KMF, still live here.
-            let provider_name = crate::jca::provider_chain::find_service_provider(
-                "TrustManagerFactory",
-                &algo_str,
-            )
-            .unwrap_or_else(|| "SunJSSE".to_string());
+            let provider_name =
+                crate::jca::provider_chain::find_service_provider("TrustManagerFactory", &algo_str)
+                    .unwrap_or_else(|| "SunJSSE".to_string());
             let provider =
                 crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name)?;
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
@@ -6296,7 +6347,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // set; reading OUR slot off it returns whatever happens to live there
         // (a `Provider`, for a real receiver). See `jsse_factory_is_ours`.
         if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/TrustManagerFactory") {
-            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "getAlgorithm",
+                "()Ljava/lang/String;",
+                &[],
+            );
         }
         if ctx.object_num_fields(this) > 2 {
             Ok(Some(ctx.get_field(this, 2)))
@@ -6654,7 +6710,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(kmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !jsse_factory_is_ours(ctx, this, "javax/net/ssl/KeyManagerFactory") {
-            return ctx.invoke_virtual_bytecode_only(this, "getAlgorithm", "()Ljava/lang/String;", &[]);
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "getAlgorithm",
+                "()Ljava/lang/String;",
+                &[],
+            );
         }
         if ctx.object_num_fields(this) > 2 {
             Ok(Some(ctx.get_field(this, 2)))
@@ -7221,8 +7282,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 _ => "NOT_HANDSHAKING",
             };
             // Return an enum synthetic
-            let e =
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2)?;
+            let e = try_alloc_concurrent_synthetic(
+                ctx,
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                2,
+            )?;
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -7533,8 +7597,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     return Ok(Some(v));
                 }
             }
-            let e =
-                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2)?;
+            let e = try_alloc_concurrent_synthetic(
+                ctx,
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                2,
+            )?;
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -8048,7 +8115,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             if !certificate_factory_stub_serves(&type_name) {
                 return Err(cert_type_not_found(ctx, &type_name));
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1)?;
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1)?;
             // W7-29 residual, closed 2026-08-12. This used to be
             // `ctx.set_field(obj, 0, Value::Object(None))`, and W7-29's "what
             // was deliberately not done" section named the consequence: in
@@ -8221,7 +8289,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
 
             // Fallback: the input stream had no readable bytes at all.
-            let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3)?;
+            let cert =
+                try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3)?;
             let sub = ctx.create_string("CN=Unknown");
             let iss = ctx.create_string("CN=Unknown");
             ctx.set_field(cert, 0, Value::Object(Some(sub)));
@@ -8446,8 +8515,11 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let sub = ctx.get_field(this, 0);
             if matches!(sub, Value::Object(Some(_))) {
                 // Wrap string in a Principal-like synthetic
-                let princ =
-                    try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
+                let princ = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "javax/security/auth/x500/X500Principal",
+                    1,
+                )?;
                 ctx.set_field(princ, 0, sub);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -8462,8 +8534,11 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let iss = ctx.get_field(this, 1);
             if matches!(iss, Value::Object(Some(_))) {
-                let princ =
-                    try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
+                let princ = try_alloc_concurrent_synthetic(
+                    ctx,
+                    "javax/security/auth/x500/X500Principal",
+                    1,
+                )?;
                 ctx.set_field(princ, 0, iss);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -8785,10 +8860,13 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 pub(crate) mod new13_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn build_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
@@ -8886,7 +8964,10 @@ pub(crate) mod new13_tests {
 
         for (name, desc) in [
             ("getPeerPrincipal", "()Ljava/security/Principal;"),
-            ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+            (
+                "getLocalCertificates",
+                "()[Ljava/security/cert/Certificate;",
+            ),
             ("getLocalPrincipal", "()Ljava/security/Principal;"),
         ] {
             let mine = cb_addr(&p68_only, cls, name, desc)
@@ -9323,7 +9404,11 @@ pub(crate) mod new13_tests {
         let this = &[Value::Object(Some(sess))];
 
         let proto = r
-            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getProtocol",
+                "()Ljava/lang/String;",
+            )
             .expect("getProtocol registered");
         match proto(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => {
@@ -9333,7 +9418,11 @@ pub(crate) mod new13_tests {
         }
 
         let cipher = r
-            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getCipherSuite",
+                "()Ljava/lang/String;",
+            )
             .expect("getCipherSuite registered");
         match cipher(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => {
@@ -9349,7 +9438,11 @@ pub(crate) mod new13_tests {
             .expect("getId registered");
         match get_id(&mut ctx, this) {
             Ok(Some(Value::Object(Some(a)))) => {
-                assert_eq!(ctx.array_length(a), 0, "a session with no id must answer byte[0]");
+                assert_eq!(
+                    ctx.array_length(a),
+                    0,
+                    "a session with no id must answer byte[0]"
+                );
             }
             other => panic!("getId must return an array, got {other:?}"),
         }
@@ -9378,7 +9471,11 @@ pub(crate) mod new13_tests {
         let this = &[Value::Object(Some(sess))];
 
         let proto = r
-            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getProtocol",
+                "()Ljava/lang/String;",
+            )
             .unwrap();
         match proto(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => {
@@ -9387,11 +9484,18 @@ pub(crate) mod new13_tests {
             other => panic!("a real negotiated protocol must pass through, got {other:?}"),
         }
         let cipher = r
-            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .find(
+                "javax/net/ssl/SSLSession",
+                "getCipherSuite",
+                "()Ljava/lang/String;",
+            )
             .unwrap();
         match cipher(&mut ctx, this) {
             Ok(Some(Value::Object(Some(s)))) => {
-                assert_eq!(ctx.read_string(s).as_deref(), Some("TLS_AES_256_GCM_SHA384"))
+                assert_eq!(
+                    ctx.read_string(s).as_deref(),
+                    Some("TLS_AES_256_GCM_SHA384")
+                )
             }
             other => panic!("a real negotiated suite must pass through, got {other:?}"),
         }
@@ -9571,8 +9675,7 @@ pub(crate) mod new13_tests {
                  `Mac.getInstance` actually serves, so nothing would ever ask."
             );
         }
-        let implemented_upper: Vec<String> =
-            implemented.iter().map(|a| mac_normalise(a)).collect();
+        let implemented_upper: Vec<String> = implemented.iter().map(|a| mac_normalise(a)).collect();
         // NOT an agreement with HotSpot — a pin on this VM's own, WIDER,
         // normalisation. Measured on HotSpot 25.0.3+9 today:
         //
@@ -9657,7 +9760,10 @@ pub(crate) mod new13_tests {
     /// arm's bytes under the right name.
     #[test]
     fn mac_normalise_keeps_the_sha512_truncations_distinct() {
-        assert_ne!(mac_normalise("HmacSHA512/224"), mac_normalise("HmacSHA512/256"));
+        assert_ne!(
+            mac_normalise("HmacSHA512/224"),
+            mac_normalise("HmacSHA512/256")
+        );
         assert_ne!(mac_normalise("HmacSHA512/256"), mac_normalise("HmacSHA512"));
         assert_ne!(mac_normalise("HmacSHA3-256"), mac_normalise("HmacSHA256"));
         // …and the three must genuinely produce three different MACs.
@@ -9925,7 +10031,15 @@ pub(crate) mod new13_tests {
         // answered `CertificateException: <type> not found`; every one of them
         // was answered with a live X.509-parsing factory by the pre-built
         // `target/release/cratonvm.exe` in both default and `--jdk-only` mode.
-        for t in ["PKCS7", "PKCS12", "AES", "X.500", "PkiPath", "NO-SUCH-CERT-TYPE", ""] {
+        for t in [
+            "PKCS7",
+            "PKCS12",
+            "AES",
+            "X.500",
+            "PkiPath",
+            "NO-SUCH-CERT-TYPE",
+            "",
+        ] {
             assert!(
                 !certificate_factory_type_supported(t),
                 "{t} is not advertised by any provider, so getInstance must refuse it rather \

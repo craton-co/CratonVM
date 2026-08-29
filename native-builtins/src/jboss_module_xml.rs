@@ -480,9 +480,12 @@ pub fn native_parse_module_xml(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     const STANDALONE_MODULE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <module name="org.jboss.as.standalone" xmlns="urn:jboss:module:1.9">

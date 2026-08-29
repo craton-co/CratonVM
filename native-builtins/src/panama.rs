@@ -7,7 +7,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // `LAYOUT_PADDING`, `LAYOUT_SEQUENCE`, `LAYOUT_STRUCT` and `LAYOUT_UNION` are
 // NOT imported here any more (F16, 2026-08-13): the group-layout family moved
@@ -188,7 +188,9 @@ fn craton_segment_class_id(ctx: &mut dyn NativeContext) -> Option<cratonvm_types
     }
     let class_id = match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
         Some(id) => id,
-        None => ctx.try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0).ok()?,
+        None => ctx
+            .try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0)
+            .ok()?,
     };
     CACHED.store((vm << 32) | u64::from(class_id.as_u32()), Ordering::Relaxed);
     Some(class_id)
@@ -348,8 +350,7 @@ pub enum IllegalNativeAccess {
 
 /// 0 = Allow, 1 = Warn, 2 = Deny. Plain integer rather than a lock: this is
 /// read on every restricted call and written once, before any bytecode runs.
-static ILLEGAL_NATIVE_ACCESS: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(1);
+static ILLEGAL_NATIVE_ACCESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
 /// Set the `--illegal-native-access` mode. Called from the launcher before the
 /// VM starts.
@@ -374,8 +375,7 @@ pub fn illegal_native_access() -> IllegalNativeAccess {
 /// HotSpot prints its restricted-method warning ONCE per calling module, and
 /// the only module we can attribute to is the unnamed one, so this fires once
 /// per process.
-static RESTRICTED_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static RESTRICTED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The gate for a genuinely RESTRICTED method (`reinterpret`, `libraryLookup`,
 /// downcalls, upcalls) — the ones the JDK annotates `@Restricted`.
@@ -1078,13 +1078,18 @@ fn register_craton_segment_impl_surface(r: &mut NativeMethodRegistry) {
         // `unsafeGetBase()` — the heap carrier's backing array, or `null` for an
         // off-heap one. This is the JDK's `(base, offset)` pair convention: a
         // null base means `offset` is an absolute machine address.
-        r.register(owner, "unsafeGetBase", "()Ljava/lang/Object;", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(match heap_segment_view(ctx, this) {
-                Some(view) => Value::Object(Some(view.base)),
-                None => Value::Object(None),
-            }))
-        });
+        r.register(
+            owner,
+            "unsafeGetBase",
+            "()Ljava/lang/Object;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(match heap_segment_view(ctx, this) {
+                    Some(view) => Value::Object(Some(view.base)),
+                    None => Value::Object(None),
+                }))
+            },
+        );
         // `unsafeGetOffset()` — the other half of that pair, and NOT the same
         // number as `address()`. For a heap carrier the JDK returns the
         // `Unsafe`-style offset, which has `arrayBaseOffset` baked in
@@ -1730,17 +1735,25 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
     // confinement here. The owner slot belongs to `foreign_ffm`'s session model,
     // and a second copy of that index is exactly the drift this file's
     // scope-resolution comment warns about.
-    r.register(ms, "isAccessibleBy", "(Ljava/lang/Thread;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let thread = args.get(1).copied().unwrap_or(Value::Object(None));
-        match pe_segment_session(ctx, this) {
-            Some(session) => {
-                ctx.invoke_virtual(session, "isAccessibleBy", "(Ljava/lang/Thread;)Z", &[thread])
+    r.register(
+        ms,
+        "isAccessibleBy",
+        "(Ljava/lang/Thread;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let thread = args.get(1).copied().unwrap_or(Value::Object(None));
+            match pe_segment_session(ctx, this) {
+                Some(session) => ctx.invoke_virtual(
+                    session,
+                    "isAccessibleBy",
+                    "(Ljava/lang/Thread;)Z",
+                    &[thread],
+                ),
+                // No modelled session means unconfined, which every thread may reach.
+                None => Ok(Some(Value::Int(1))),
             }
-            // No modelled session means unconfined, which every thread may reach.
-            None => Ok(Some(Value::Int(1))),
-        }
-    });
+        },
+    );
 
     // isLoaded / load / unload / force — specified to throw for a segment that
     // did not come from `FileChannel.map`, which is every segment this VM mints.
@@ -2236,13 +2249,7 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
                                 Some(a) => {
                                     // SAFETY: bounds-checked above; `staged`
                                     // is exactly `bytes` long.
-                                    unsafe {
-                                        std::ptr::copy(
-                                            staged.as_ptr(),
-                                            a as *mut u8,
-                                            bytes,
-                                        )
-                                    };
+                                    unsafe { std::ptr::copy(staged.as_ptr(), a as *mut u8, bytes) };
                                     true
                                 }
                                 None => false,
@@ -2304,7 +2311,6 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
             Ok(None)
         },
     );
-
 
     // ---- the rest of the surface `java.lang.foreign` declares -------------
     //
@@ -2379,8 +2385,12 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
             let n = usize::try_from(common).unwrap_or(0).min(MAX_COPY_SIZE);
             // SAFETY: both pointers are segment bases and `n` is bounded by the
             // shorter of the two segment sizes.
-            let (a_bytes, b_bytes) =
-                unsafe { (std::slice::from_raw_parts(a, n), std::slice::from_raw_parts(b, n)) };
+            let (a_bytes, b_bytes) = unsafe {
+                (
+                    std::slice::from_raw_parts(a, n),
+                    std::slice::from_raw_parts(b, n),
+                )
+            };
             let index = a_bytes
                 .iter()
                 .zip(b_bytes.iter())
@@ -2419,7 +2429,9 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
             if base.is_null() {
                 return Ok(Some(Value::Object(None)));
             }
-            let avail = usize::try_from(size - offset).unwrap_or(0).min(MAX_COPY_SIZE);
+            let avail = usize::try_from(size - offset)
+                .unwrap_or(0)
+                .min(MAX_COPY_SIZE);
             // SAFETY: `offset` is within the segment and `avail` is the
             // remaining length from there.
             let bytes = unsafe { std::slice::from_raw_parts(base.add(offset as usize), avail) };
@@ -2502,7 +2514,6 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         },
     );
 
-
     // toArray(elementLayout) — copy the whole segment out into a Java array.
     //
     // Eight overloads, one per primitive layout, each with its own array return
@@ -2522,8 +2533,6 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
     ] {
         r.register(ms, "toArray", desc, pe_segment_to_array);
     }
-
-
 
     // allocateFrom(elementLayout, values...) — the seven array overloads.
     //
@@ -2761,7 +2770,10 @@ fn pe_segment_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0);
     if size % width != 0 {
         return Err(RuntimeError::IllegalStateException {
-            message: format!("Segment size is not a multiple of {}. Size: {}", width, size),
+            message: format!(
+                "Segment size is not a multiple of {}. Size: {}",
+                width, size
+            ),
         }
         .into());
     }
@@ -4158,12 +4170,7 @@ fn heap_element_bits(ctx: &dyn NativeContext, base: ObjectRef, index: usize) -> 
 }
 
 /// Store the raw bits of one array element back, in that array's own encoding.
-fn heap_store_element(
-    ctx: &dyn NativeContext,
-    view: &HeapSegmentView,
-    index: usize,
-    bits: u64,
-) {
+fn heap_store_element(ctx: &dyn NativeContext, view: &HeapSegmentView, index: usize, bits: u64) {
     use cratonvm_types::ArrayElementType as A;
     let value = match view.elem_type {
         A::Byte => Value::Int(i32::from(bits as u8 as i8)),
@@ -5127,17 +5134,23 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
     //
     // Real `unload0` returns void and reports nothing, so the `false` an
     // implementation without an unload path returns is intentionally ignored.
-    r.register_with_kind(rnl, "unload0", "(Ljava/lang/String;J)V", |ctx, args| {
-        let handle = match args.get(1) {
-            Some(Value::Long(n)) => *n,
-            Some(Value::Int(n)) => *n as i64,
-            _ => 0,
-        };
-        // Undo the +1 offset applied by load0 to recover the library index; a
-        // handle of 0 ("not loaded") decodes to -1 and is refused.
-        let _unloaded = ctx.unload_native_library(handle - 1);
-        Ok(None)
-    }, NativeKind::Bridge);
+    r.register_with_kind(
+        rnl,
+        "unload0",
+        "(Ljava/lang/String;J)V",
+        |ctx, args| {
+            let handle = match args.get(1) {
+                Some(Value::Long(n)) => *n,
+                Some(Value::Int(n)) => *n as i64,
+                _ => 0,
+            };
+            // Undo the +1 offset applied by load0 to recover the library index; a
+            // handle of 0 ("not loaded") decodes to -1 and is refused.
+            let _unloaded = ctx.unload_native_library(handle - 1);
+            Ok(None)
+        },
+        NativeKind::Bridge,
+    );
 
     // static native long findEntry0(long handle, String name)  (in NativeLibrary)
     r.register_with_kind(
@@ -5292,16 +5305,17 @@ pub(crate) fn alloc_downcall_handle(
     let descriptor = ctx.read_native_pin(desc_pin, descriptor);
 
     let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, capture_call_state)?;
-    let method_type = crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?
-        .ok_or_else(|| -> MethodCallFailed {
-            RuntimeError::IllegalStateException {
-                message: format!(
-                    "Unable to construct MethodType for DowncallHandle descriptor \
+    let method_type =
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?
+            .ok_or_else(|| -> MethodCallFailed {
+                RuntimeError::IllegalStateException {
+                    message: format!(
+                        "Unable to construct MethodType for DowncallHandle descriptor \
                      {method_descriptor}"
-                ),
-            }
-            .into()
-        })?;
+                    ),
+                }
+                .into()
+            })?;
 
     let handle = ctx.read_native_pin(handle_pin, handle);
     let descriptor = ctx.read_native_pin(desc_pin, descriptor);
@@ -5566,7 +5580,9 @@ fn downcall_carrier_descriptor(
     }
     method_descriptor.push(')');
     match plf::descriptor_return_layout(ctx, descriptor) {
-        Some(layout) => method_descriptor.push_str(downcall_layout_carrier_descriptor(ctx, layout)?),
+        Some(layout) => {
+            method_descriptor.push_str(downcall_layout_carrier_descriptor(ctx, layout)?)
+        }
         None => method_descriptor.push('V'),
     }
     Ok(method_descriptor)
@@ -5594,16 +5610,15 @@ pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, captures)?;
 
     let method_type =
-        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?.ok_or_else(
-            || -> MethodCallFailed {
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?
+            .ok_or_else(|| -> MethodCallFailed {
                 RuntimeError::IllegalStateException {
                     message: format!(
                 "Unable to construct MethodType for DowncallHandle descriptor {method_descriptor}"
             ),
                 }
                 .into()
-            },
-        )?;
+            })?;
     Ok(Some(Value::Object(Some(method_type))))
 }
 
@@ -5633,7 +5648,11 @@ fn downcall_layout_carrier_descriptor(
         LAYOUT_FLOAT => "F",
         LAYOUT_DOUBLE => "D",
         crate::panama_libffi::LAYOUT_UNKNOWN => {
-            return Err(unclassifiable_access_layout(ctx, layout, "downcall carrier"))
+            return Err(unclassifiable_access_layout(
+                ctx,
+                layout,
+                "downcall carrier",
+            ))
         }
         // ADDRESS and aggregate layouts use the FFM MemorySegment carrier.
         _ => "Ljava/lang/foreign/MemorySegment;",
@@ -5956,14 +5975,14 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                     crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, rl).max(0) as usize;
                 let align =
                     crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, rl).max(1) as usize;
-                let (alloc_id, ptr) = ctx
-                    .allocate_native_memory(total, align.max(8))
-                    .ok_or_else(|| -> MethodCallFailed {
+                let (alloc_id, ptr) = ctx.allocate_native_memory(total, align.max(8)).ok_or_else(
+                    || -> MethodCallFailed {
                         RuntimeError::OutOfMemoryError {
                             message: "Failed to allocate result MemorySegment".into(),
                         }
                         .into()
-                    })?;
+                    },
+                )?;
                 // THE COPY LENGTH IS CLAMPED TO `ret_slot`, DELIBERATELY.
                 //
                 // `ret_slot` is sized by `panama_libffi::alloc_return_slot`
@@ -6046,7 +6065,8 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/FunctionDescriptor;",
         |ctx, args| {
             let params = args.first().copied().unwrap_or(Value::Object(None));
-            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            let desc =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(desc, 0, Value::Object(None)); // void return
             ctx.set_field(desc, 1, params);
             Ok(Some(Value::Object(Some(desc))))
@@ -6059,7 +6079,8 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
         |ctx, args| {
             let params = args.first().copied().unwrap_or(Value::Object(None));
-            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            let desc =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(desc, 0, Value::Object(None));
             ctx.set_field(desc, 1, params);
             Ok(Some(Value::Object(Some(desc))))
@@ -6811,8 +6832,11 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout$PathElement;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let elem =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
+            let elem = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/foreign/MemoryLayout$PathElement",
+                2,
+            )?;
             ctx.set_field(elem, 0, name); // field name
             ctx.set_field(elem, 1, Value::Int(0)); // kind=group
             Ok(Some(Value::Object(Some(elem))))
@@ -6823,8 +6847,11 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         "sequenceElement",
         "()Ljava/lang/foreign/MemoryLayout$PathElement;",
         |ctx, _| {
-            let elem =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
+            let elem = try_alloc_concurrent_synthetic(
+                ctx,
+                "java/lang/foreign/MemoryLayout$PathElement",
+                2,
+            )?;
             ctx.set_field(elem, 0, Value::Object(None));
             ctx.set_field(elem, 1, Value::Int(1)); // kind=sequence
             Ok(Some(Value::Object(Some(elem))))
@@ -6901,7 +6928,6 @@ pub(crate) fn pe_segment_reinterpret(
 }
 
 fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
-
     // `getUtf8String(J)` and `reinterpret(J)` USED TO BE REGISTERED HERE, on
     // both class names, and both drifted: `register_p67_foreign_memory`
     // registers the same triples, and THAT pass is the one a shipping binary
@@ -6982,7 +7008,6 @@ fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
             Ok(None)
         },
     );
-
 
     // Arena.allocateUtf8String(String) → MemorySegment. JDK 22 renamed this to
     // `allocateFrom`, which shares the body — see the registration in
@@ -7130,7 +7155,10 @@ mod segment_splitter_tests {
                     "count {count} size {size} leaves a gap or an overlap"
                 );
                 assert_eq!(split * size, lobound, "count {count} size {size}");
-                assert!(split <= count - split, "the low half must never be the larger one");
+                assert!(
+                    split <= count - split,
+                    "the low half must never be the larger one"
+                );
                 // The element counts must tile too, and each half's count must
                 // match its byte span. Checking only the BYTE bounds is what let
                 // a bad high-half count through: the splitter kept claiming the
@@ -7164,9 +7192,7 @@ mod tests {
     use super::*;
     // The four compound layout tags are test-only in this file now — see the
     // note on the `ffi::` import at the top.
-    use cratonvm_native_api::ffi::{
-        LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_STRUCT, LAYOUT_UNION,
-    };
+    use cratonvm_native_api::ffi::{LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_STRUCT, LAYOUT_UNION};
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -7576,8 +7602,8 @@ mod tests {
     // Phase 85.1: Arena Lifecycle Tests
     // ===================================================================
 
-    use crate::try_alloc_concurrent_synthetic;
     use crate::test_utils::mock_ctx;
+    use crate::try_alloc_concurrent_synthetic;
 
     /// Helper: create an arena object of the given kind using the actual registration logic.
     fn make_arena(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
@@ -7988,8 +8014,7 @@ mod tests {
         assert_eq!(orig_size, 64);
 
         // Reinterpret with new size 128
-        let reinterpreted =
-            alloc_segment_carrier(&mut ctx, 6).unwrap();
+        let reinterpreted = alloc_segment_carrier(&mut ctx, 6).unwrap();
         ctx.set_field(reinterpreted, 0, Value::Long(orig_ptr));
         ctx.set_field(reinterpreted, 1, Value::Long(128));
         ctx.set_field(reinterpreted, 2, ctx.get_field(seg, 2));
@@ -8043,7 +8068,8 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8086,7 +8112,8 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8134,7 +8161,8 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8249,7 +8277,8 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8279,7 +8308,8 @@ mod tests {
         let mut ctx = mock_ctx();
 
         // Create a "MethodHandle" target object
-        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
+        let target =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
 
         let entry = ffi::UpcallEntry {
             target,
@@ -8315,7 +8345,9 @@ mod tests {
             let mut ctx = mock_ctx();
 
             // Create target, descriptor
-            let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
+            let target =
+                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)
+                    .unwrap();
 
             let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
             let param_layout = make_layout(&mut ctx, LAYOUT_INT);
@@ -8323,11 +8355,13 @@ mod tests {
             ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
             let descriptor =
-                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                    .unwrap();
             ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
             ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-            let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
+            let linker =
+                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
             let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
             // Register upcall handle
@@ -8367,7 +8401,8 @@ mod tests {
 
             // Create an UpcallStub handle object for pe_upcall_invoke
             // (uses the VM upcall slot 0, not the trampoline address)
-            let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2).unwrap();
+            let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2)
+                .unwrap();
             ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
 
             // Create args array
@@ -8389,7 +8424,8 @@ mod tests {
         // Invoking an upcall with an invalid slot should return an error
         let mut ctx = mock_ctx();
 
-        let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2).unwrap();
+        let stub =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2).unwrap();
         ctx.set_field(stub, 0, Value::Long(999)); // non-existent slot
 
         let result = pe_upcall_invoke(&mut ctx, &[Value::Object(Some(stub))]);
@@ -8445,7 +8481,8 @@ mod tests {
             ctx.set_array_element(params_arr, i, Value::Object(Some(p)));
         }
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8490,7 +8527,8 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_flt)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8557,7 +8595,8 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_var)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
@@ -8605,12 +8644,15 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p2)));
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)
+                .unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
-        let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
+        let target =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
+        let linker =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
         let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
         // Pre-arm the mock NativeContext to return Int(123) from invoke_virtual.
@@ -9390,9 +9432,7 @@ mod tests {
         size: i64,
         read_only: bool,
     ) -> ObjectRef {
-        let seg =
-            alloc_segment_carrier(ctx, SEG_HEAP_FIELDS)
-                .unwrap();
+        let seg = alloc_segment_carrier(ctx, SEG_HEAP_FIELDS).unwrap();
         ctx.set_field(seg, 0, Value::Long(0));
         ctx.set_field(seg, 1, Value::Long(size));
         ctx.set_field(seg, 2, Value::Object(None));
@@ -10063,8 +10103,7 @@ mod tests {
     #[test]
     fn a_zero_size_native_segment_is_also_an_index_out_of_bounds() {
         let mut ctx = mock_ctx();
-        let seg =
-            alloc_segment_carrier(&mut ctx, 6).unwrap();
+        let seg = alloc_segment_carrier(&mut ctx, 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(0x1000));
         ctx.set_field(seg, 1, Value::Long(0));
         ctx.set_field(seg, 5, Value::Long(0));
@@ -10392,8 +10431,14 @@ mod tests {
         // CONTROL: a real native segment is still stored, so the arm above is
         // not simply refusing every ADDRESS write.
         let target = arena_segment(&mut ctx, arena, 8);
-        pe_segment_set_impl(&mut ctx, dst, address_layout, 0, Value::Object(Some(target)))
-            .expect("a native segment is still a legal ADDRESS value");
+        pe_segment_set_impl(
+            &mut ctx,
+            dst,
+            address_layout,
+            0,
+            Value::Object(Some(target)),
+        )
+        .expect("a native segment is still a legal ADDRESS value");
         let stored = match pe_segment_get_impl(&mut ctx, dst, address_layout, 0).unwrap() {
             Some(Value::Object(Some(seg))) => crate::panama_libffi::segment_address(&ctx, seg),
             other => panic!("get(ADDRESS) answered {other:?}"),

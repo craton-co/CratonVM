@@ -32,8 +32,9 @@ static DEFINES: AtomicU64 = AtomicU64::new(0);
 const CENSUS_NAME_CAP: usize = 8192;
 
 #[allow(clippy::type_complexity)]
-static CENSUS: std::sync::OnceLock<parking_lot::Mutex<(std::collections::HashMap<String, u64>, u64)>> =
-    std::sync::OnceLock::new();
+static CENSUS: std::sync::OnceLock<
+    parking_lot::Mutex<(std::collections::HashMap<String, u64>, u64)>,
+> = std::sync::OnceLock::new();
 
 /// Record one class definition. Called from the single choke point every
 /// `define_class*` entry point funnels through.

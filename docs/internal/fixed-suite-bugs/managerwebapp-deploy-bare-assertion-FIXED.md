@@ -23,7 +23,7 @@
 > for that write-up). The synthetic `InetSocketAddress.<init>(String,int)`
 > native always left `addr=None`, so every request into any webapp
 > configured with `RemoteCIDRValve` (Tomcat manager's default
-> `META-INF/context.xml`) NPE'd on `request.getRemoteAddr()` — a bare 500
+> `../../../apps/META-INF/context.xml`) NPE'd on `request.getRemoteAddr()` — a bare 500
 > on literally every request, which is what this doc's original symptom was.
 >
 > ### Bug 2 — `BaseModelMBean`'s JMX `invoke()` never reflected into the

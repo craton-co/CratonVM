@@ -69,7 +69,8 @@ static PINNED_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// same array refcount correctly instead of a second `unpin` prematurely
 /// dropping a still-live pin.
 fn table() -> &'static Mutex<cratonvm_types::PointerMap> {
-    static TABLE: std::sync::OnceLock<Mutex<cratonvm_types::PointerMap>> = std::sync::OnceLock::new();
+    static TABLE: std::sync::OnceLock<Mutex<cratonvm_types::PointerMap>> =
+        std::sync::OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(cratonvm_types::PointerMap::default()))
 }
 

@@ -446,7 +446,6 @@ fn dgram_unblock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(arg_obj(args, 0))))
 }
 
-
 // ---------------------------------------------------------------------------
 // Public registration
 // ---------------------------------------------------------------------------

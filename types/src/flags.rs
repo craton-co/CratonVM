@@ -1445,10 +1445,7 @@ impl IoFlags {
             synthetic_net_sockets_forced: present(src, "CRATONVM_SYNTHETIC_NET_SOCKETS"),
             synthetic_filewriter_forced: exactly_one(src, "CRATONVM_SYNTHETIC_FILEWRITER"),
             synthetic_raf_forced: exactly_one(src, "CRATONVM_SYNTHETIC_RAF"),
-            synthetic_netty_tcnative_forced: exactly_one(
-                src,
-                "CRATONVM_SYNTHETIC_NETTY_TCNATIVE",
-            ),
+            synthetic_netty_tcnative_forced: exactly_one(src, "CRATONVM_SYNTHETIC_NETTY_TCNATIVE"),
             socket_capture_prefix: non_empty_string(src, "CRATONVM_SOCKET_CAPTURE"),
             select_max_block_ms: i32_positive(src, "CRATONVM_SELECT_MAX_BLOCK_MS"),
             no_selector_connect_probe: non_empty_non_zero_non_false(
@@ -1468,10 +1465,7 @@ impl IoFlags {
             dbg_sc_read: present(src, "CRATONVM_DBG_SC_READ"),
             dbg_sc_write: present(src, "CRATONVM_DBG_SC_WRITE"),
             dbg_eintr_inject: u64_positive(src, "CRATONVM_DBG_EINTR_INJECT"),
-            dbg_eintr_no_retry: non_empty_non_zero_non_false(
-                src,
-                "CRATONVM_DBG_EINTR_NO_RETRY",
-            ),
+            dbg_eintr_no_retry: non_empty_non_zero_non_false(src, "CRATONVM_DBG_EINTR_NO_RETRY"),
         }
     }
 }
@@ -2007,7 +2001,6 @@ pub struct NativeFlags {
 
     /// `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` — [`parse::exactly_one`].
     pub use_wildfly_synth_bytecode: bool,
-
 }
 
 impl NativeFlags {
@@ -2170,10 +2163,7 @@ impl NativeFlags {
                 src,
                 "CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING",
             ),
-            synthetic_mxbean_mapping: one_true_yes_exact(
-                src,
-                "CRATONVM_SYNTHETIC_MXBEAN_MAPPING",
-            ),
+            synthetic_mxbean_mapping: one_true_yes_exact(src, "CRATONVM_SYNTHETIC_MXBEAN_MAPPING"),
             synthetic_pqc: present(src, "CRATONVM_SYNTHETIC_PQC"),
             synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
@@ -2739,7 +2729,8 @@ pub fn with_process_overrides<R>(edits: &[(&str, Option<&str>)], f: impl FnOnce(
 ///
 /// Returns `default` when the variable is unset — the common case, silent.
 pub fn resolve_capped_usize(name: &str, what: &str, default: usize, max: usize) -> usize {
-    let (value, warning) = capped_var_verdict(runtime_var(name).ok().as_deref(), name, what, default, max);
+    let (value, warning) =
+        capped_var_verdict(runtime_var(name).ok().as_deref(), name, what, default, max);
     if let Some(w) = warning {
         eprintln!("{w}");
     }
@@ -2763,8 +2754,13 @@ fn capped_var_verdict(
     default: usize,
     max: usize,
 ) -> (usize, Option<String>) {
-    debug_assert!(default <= max, "a default above the ceiling can never be reached");
-    let Some(raw) = raw else { return (default, None) };
+    debug_assert!(
+        default <= max,
+        "a default above the ceiling can never be reached"
+    );
+    let Some(raw) = raw else {
+        return (default, None);
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return (default, None);
@@ -3787,8 +3783,16 @@ mod tests {
     fn an_in_range_value_is_honoured_exactly() {
         let _lock = process_override_lock();
         assert_eq!(cap_with(Some("9000")), 9000);
-        assert_eq!(cap_with(Some("  9000  ")), 9000, "surrounding space is trimmed");
-        assert_eq!(cap_with(Some("65536")), 65_536, "the ceiling itself is in range");
+        assert_eq!(
+            cap_with(Some("  9000  ")),
+            9000,
+            "surrounding space is trimmed"
+        );
+        assert_eq!(
+            cap_with(Some("65536")),
+            65_536,
+            "the ceiling itself is in range"
+        );
     }
 
     #[test]
@@ -3806,7 +3810,11 @@ mod tests {
     #[test]
     fn zero_and_nonsense_keep_the_default() {
         let _lock = process_override_lock();
-        assert_eq!(cap_with(Some("0")), 4096, "a cap of zero reports empty as complete");
+        assert_eq!(
+            cap_with(Some("0")),
+            4096,
+            "a cap of zero reports empty as complete"
+        );
         assert_eq!(cap_with(Some("banana")), 4096);
         assert_eq!(cap_with(Some("-1")), 4096, "usize::from_str rejects a sign");
         assert_eq!(cap_with(Some("")), 4096);
@@ -3826,8 +3834,11 @@ mod tests {
     fn the_warnings_read_as_one_sentence() {
         for raw in ["200000", "0", "banana"] {
             let (_, w) = capped_var_verdict(
-                Some(raw), "CRATONVM_NATIVE_SHADOW_SINK_CAP", "interpreter observation sink",
-                4096, 65_536,
+                Some(raw),
+                "CRATONVM_NATIVE_SHADOW_SINK_CAP",
+                "interpreter observation sink",
+                4096,
+                65_536,
             );
             let w = w.expect("this input must warn");
             assert!(
@@ -3848,7 +3859,14 @@ mod tests {
     /// its own happy path trains the reader to ignore it.
     #[test]
     fn an_honoured_value_is_silent() {
-        for raw in [None, Some("9000"), Some("65536"), Some("  9000  "), Some(""), Some("   ")] {
+        for raw in [
+            None,
+            Some("9000"),
+            Some("65536"),
+            Some("  9000  "),
+            Some(""),
+            Some("   "),
+        ] {
             let (_, w) = capped_var_verdict(raw, "X", "sink", 4096, 65_536);
             assert!(w.is_none(), "{raw:?} must not warn, got {w:?}");
         }

@@ -7,12 +7,12 @@
 
 use crate::attribute::*;
 use crate::buffer::ClassFileBuffer;
+use crate::byte_view::SharedBytes;
 use crate::class_access_flags::*;
 use crate::class_file::ClassFile;
 use crate::class_file_version::{preview_enabled, ClassFileVersion};
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
-use crate::byte_view::SharedBytes;
 use crate::field::ClassFileField;
 // Resource limits and the checked-arithmetic helpers that enforce them all
 // live in one place — see `reader/src/limits.rs` and
@@ -730,11 +730,7 @@ fn read_attributes(
         // range. No per-attribute `Vec<u8>` allocation, no memcpy of the
         // body. On java.base bootstrap this saves ~25 MB of malloc churn
         // (~5 k classes × ~10 attrs × ~50 B average).
-        attributes.push(LazyAttribute::new_raw_in(
-            name,
-            source.clone(),
-            start..end,
-        ));
+        attributes.push(LazyAttribute::new_raw_in(name, source.clone(), start..end));
     }
 
     Ok(attributes)

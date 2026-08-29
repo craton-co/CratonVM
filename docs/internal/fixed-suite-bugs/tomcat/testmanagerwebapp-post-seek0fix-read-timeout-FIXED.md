@@ -64,7 +64,7 @@
 >
 > `p59_jar_lookup_versioned_entry` asks `p59_jar_is_multi_release(path)` on
 > every entry lookup, and answering it re-read and re-parsed the whole
-> `META-INF/MANIFEST.MF` every time. `<Utf8Chunks as Iterator>::next` under that
+> `../../../../apps/META-INF/MANIFEST.MF` every time. `<Utf8Chunks as Iterator>::next` under that
 > function was the **second hottest symbol at 8.3%**. Memoized on
 > `JarContents::multi_release`, a `OnceLock<bool>` keyed on the same
 > (path, mtime) pair as the rest of the jar cache. Commit `3517a77fe`.

@@ -10,7 +10,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Date math utilities
@@ -929,10 +929,12 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
         let chars: Vec<u16> = text.encode_utf16().collect();
 
         if src_end > chars.len() {
-            return Err(
-                RuntimeError::sioobe_range(src_begin as i32, src_end as i32, chars.len() as i32)
-                    .into(),
-            );
+            return Err(RuntimeError::sioobe_range(
+                src_begin as i32,
+                src_end as i32,
+                chars.len() as i32,
+            )
+            .into());
         }
 
         for i in src_begin..src_end {
@@ -985,9 +987,7 @@ fn instantiation_exception(
         return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
     }
     RuntimeError::UnsupportedOperationException {
-        message: format!(
-            "InstantiationException could not be constructed (message={message:?})"
-        ),
+        message: format!("InstantiationException could not be constructed (message={message:?})"),
     }
     .into()
 }
@@ -1029,19 +1029,23 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
                 // no-class-id case and the not-a-mirror case had been collapsed
                 // into one message, and only the second of them was true.
                 None if crate::lang_class::mirror_is_primitive(ctx, this_class) => {
-                    let name = crate::lang_class::mirror_class_name(ctx, this_class)
-                        .unwrap_or_default();
+                    let name =
+                        crate::lang_class::mirror_class_name(ctx, this_class).unwrap_or_default();
                     return Err(instantiation_exception(ctx, Some(&name)));
                 }
-                None => return Err(RuntimeError::UnsupportedOperationException {
-                    message: "Class.newInstance: receiver is not a Class mirror".to_string(),
-                }.into()),
+                None => {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: "Class.newInstance: receiver is not a Class mirror".to_string(),
+                    }
+                    .into())
+                }
             };
             let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
             if class_name.is_empty() {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: "Class.newInstance: receiver mirror has no class name".to_string(),
-                }.into());
+                }
+                .into());
             }
 
             // Reject abstract classes / interfaces / array / primitive types
@@ -1097,8 +1101,12 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
             match result {
                 Some(Value::Object(Some(obj))) => Ok(Some(Value::Object(Some(obj)))),
                 _ => Err(RuntimeError::UnsupportedOperationException {
-                    message: format!("InstantiationException: failed to instantiate {}", class_name),
-                }.into()),
+                    message: format!(
+                        "InstantiationException: failed to instantiate {}",
+                        class_name
+                    ),
+                }
+                .into()),
             }
         },
     );
@@ -1793,10 +1801,13 @@ pub fn register_url_codec(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Helper: look up a native and call it through the registry.
     fn call_native(
@@ -2373,7 +2384,8 @@ mod tests {
     fn test_string_buffer_input_stream() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let sbis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("AB");
 
         // init
@@ -2457,7 +2469,8 @@ mod tests {
     fn test_string_buffer_input_stream_read_array() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
+        let sbis =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("Hello");
 
         call_native(

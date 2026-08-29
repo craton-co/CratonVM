@@ -446,7 +446,14 @@ fn kernel_tan(mut x: f64, mut y: f64, iy: i32) -> f64 {
 /// This is the routine that makes `sin(1e300)` mean anything at all: it works
 /// in 24-bit chunks against a 396-bit table of `2/pi`.
 #[allow(clippy::needless_range_loop)]
-fn kernel_rem_pio2(x: &[f64], y: &mut [f64], e0: i32, nx: usize, prec: usize, ipio2: &[i32]) -> i32 {
+fn kernel_rem_pio2(
+    x: &[f64],
+    y: &mut [f64],
+    e0: i32,
+    nx: usize,
+    prec: usize,
+    ipio2: &[i32],
+) -> i32 {
     let pio2 = [
         f64::from_bits(0x3FF9_21FB_4000_0000), // 0x1.921fb4p0
         f64::from_bits(0x3E74_442D_0000_0000), // 0x1.4442dp-24
@@ -1138,13 +1145,17 @@ pub fn atan2(y: f64, x: f64) -> f64 {
 
     if (iy | ly) == 0 {
         return match m {
-            0 | 1 => y,                                 // atan(+-0, +anything) = +-0
-            2 => std::f64::consts::PI + tiny,           // atan(+0, -anything) = pi
-            _ => -std::f64::consts::PI - tiny,          // atan(-0, -anything) = -pi
+            0 | 1 => y,                        // atan(+-0, +anything) = +-0
+            2 => std::f64::consts::PI + tiny,  // atan(+0, -anything) = pi
+            _ => -std::f64::consts::PI - tiny, // atan(-0, -anything) = -pi
         };
     }
     if (ix | lx) == 0 {
-        return if hy < 0 { -pi_o_2 - tiny } else { pi_o_2 + tiny };
+        return if hy < 0 {
+            -pi_o_2 - tiny
+        } else {
+            pi_o_2 + tiny
+        };
     }
     if ix == EXP_BITS_I {
         if iy == EXP_BITS_I {
@@ -1164,7 +1175,11 @@ pub fn atan2(y: f64, x: f64) -> f64 {
         }
     }
     if iy == EXP_BITS_I {
-        return if hy < 0 { -pi_o_2 - tiny } else { pi_o_2 + tiny };
+        return if hy < 0 {
+            -pi_o_2 - tiny
+        } else {
+            pi_o_2 + tiny
+        };
     }
 
     let k = (iy - ix) >> 20;
@@ -1176,10 +1191,10 @@ pub fn atan2(y: f64, x: f64) -> f64 {
         atan((y / x).abs()) // safe to do y/x
     };
     match m {
-        0 => z,                                    // atan(+, +)
-        1 => -z,                                   // atan(-, +)
-        2 => std::f64::consts::PI - (z - pi_lo),   // atan(+, -)
-        _ => (z - pi_lo) - std::f64::consts::PI,   // atan(-, -)
+        0 => z,                                  // atan(+, +)
+        1 => -z,                                 // atan(-, +)
+        2 => std::f64::consts::PI - (z - pi_lo), // atan(+, -)
+        _ => (z - pi_lo) - std::f64::consts::PI, // atan(-, -)
     }
 }
 
@@ -1328,7 +1343,11 @@ pub fn hypot(x: f64, y: f64) -> f64 {
 /// an even integer.
 // `-1.0 * z` is not `-z`: they differ in the sign of a produced NaN, and this
 // site is reached with `z` already special-cased. Kept as the source writes it.
-#[allow(clippy::excessive_precision, clippy::neg_multiply, clippy::assign_op_pattern)]
+#[allow(
+    clippy::excessive_precision,
+    clippy::neg_multiply,
+    clippy::assign_op_pattern
+)]
 pub fn pow(x: f64, y: f64) -> f64 {
     let mut z;
     let mut r;
@@ -2010,7 +2029,11 @@ pub fn tanh(x: f64) -> f64 {
     if ix >= EXP_BITS_I {
         // tanh(+-inf) = +-1, tanh(NaN) = NaN. Written as `1/x +- 1` so the
         // signed zero of `1/-inf` carries the sign.
-        return if jx >= 0 { 1.0 / x + 1.0 } else { 1.0 / x - 1.0 };
+        return if jx >= 0 {
+            1.0 / x + 1.0
+        } else {
+            1.0 / x - 1.0
+        };
     }
     let z;
     if ix < 0x4036_0000 {
@@ -2362,7 +2385,10 @@ mod tests {
             let got = log(x);
             if f64::from_bits(want).is_nan() {
                 // The spec fixes NaN-ness, not the NaN payload/sign.
-                assert!(got.is_nan(), "log({x:?}) [{xb:#018x}] should be NaN, got {got:?}");
+                assert!(
+                    got.is_nan(),
+                    "log({x:?}) [{xb:#018x}] should be NaN, got {got:?}"
+                );
                 continue;
             }
             assert_eq!(
@@ -3858,7 +3884,6 @@ mod tests {
         (0xDC8A3197370A4A1E, 0x39CAE98F55B8DEC1, 0x39618569778CF6C0),
     ];
 
-
     // -----------------------------------------------------------------------
     // The rest of the family. Same discipline as `log` above: bits, not a
     // tolerance. A tolerance here would pass on platform libm and prove
@@ -3895,7 +3920,10 @@ mod tests {
             checked += 1;
         }
         // A table that silently became empty is a test that cannot fail.
-        assert!(checked >= 40, "{name}: only {checked} vectors, table truncated?");
+        assert!(
+            checked >= 40,
+            "{name}: only {checked} vectors, table truncated?"
+        );
     }
 
     /// Two-argument form of [`check_un`].
@@ -3922,7 +3950,10 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked >= 40, "{name}: only {checked} vectors, table truncated?");
+        assert!(
+            checked >= 40,
+            "{name}: only {checked} vectors, table truncated?"
+        );
     }
 
     #[test]
@@ -4012,7 +4043,11 @@ mod tests {
 
     #[test]
     fn ieee_remainder_matches_hotspot_strictmath_bit_for_bit() {
-        check_bin("IEEEremainder", super::ieee_remainder, IEEEREMAINDER_VECTORS);
+        check_bin(
+            "IEEEremainder",
+            super::ieee_remainder,
+            IEEEREMAINDER_VECTORS,
+        );
     }
 
     /// `IEEEremainder` rounds the quotient to the NEAREST integer, **ties to
@@ -4034,7 +4069,10 @@ mod tests {
         assert_eq!(super::ieee_remainder(-1.5, 1.0), 0.5);
         // The overflow case: x/p is +inf, but the remainder is representable.
         let r = super::ieee_remainder(f64::MAX, f64::MIN_POSITIVE);
-        assert!(r.is_finite(), "remainder of MAX by MIN_NORMAL must be finite, got {r:?}");
+        assert!(
+            r.is_finite(),
+            "remainder of MAX by MIN_NORMAL must be finite, got {r:?}"
+        );
         // Spec special cases.
         assert!(super::ieee_remainder(1.0, 0.0).is_nan());
         assert!(super::ieee_remainder(f64::INFINITY, 1.0).is_nan());
@@ -4126,14 +4164,14 @@ mod tests {
             for mant in [
                 0u64,
                 1,
-                0x8_0000_0000_0000,      // low word 0x0000_0000
-                0xf_ffff_ffff_ffff,      // low word 0xffff_ffff  (-1)
-                0x0_0000_8000_0000,      // low word 0x8000_0000  (i32::MIN)
-                0x0_0000_7fff_ffff,      // low word 0x7fff_ffff  (i32::MAX)
-                0xf_ffff_8000_0000,      // i32::MIN low word, full high mantissa
-                0x7_ffff_7fff_ffff,      // i32::MAX low word, other high mantissa
-                0x0_0000_c000_0000,      // low word 0xc000_0000
-                0x0_0000_4000_0000,      // low word 0x4000_0000
+                0x8_0000_0000_0000, // low word 0x0000_0000
+                0xf_ffff_ffff_ffff, // low word 0xffff_ffff  (-1)
+                0x0_0000_8000_0000, // low word 0x8000_0000  (i32::MIN)
+                0x0_0000_7fff_ffff, // low word 0x7fff_ffff  (i32::MAX)
+                0xf_ffff_8000_0000, // i32::MIN low word, full high mantissa
+                0x7_ffff_7fff_ffff, // i32::MAX low word, other high mantissa
+                0x0_0000_c000_0000, // low word 0xc000_0000
+                0x0_0000_4000_0000, // low word 0x4000_0000
             ] {
                 let bits = (exp << 52) | mant;
                 v.push(f64::from_bits(bits));
@@ -4218,10 +4256,8 @@ mod tests {
         for (name, f) in binary {
             for &x in &strided {
                 for &y in &strided {
-                    let _ = std::hint::black_box(f(
-                        std::hint::black_box(x),
-                        std::hint::black_box(y),
-                    ));
+                    let _ =
+                        std::hint::black_box(f(std::hint::black_box(x), std::hint::black_box(y)));
                     let _ = name;
                 }
             }
@@ -4297,7 +4333,11 @@ mod tests {
     }
 
     fn canon(d: f64) -> u64 {
-        if d.is_nan() { NAN_SENTINEL } else { d.to_bits() }
+        if d.is_nan() {
+            NAN_SENTINEL
+        } else {
+            d.to_bits()
+        }
     }
 
     fn fnv(mut h: u64, v: u64) -> u64 {
@@ -4355,7 +4395,8 @@ mod tests {
         for &(name, f, want) in cases {
             let got = unary_digest(f);
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "{name}: digest {got:#018x} != HotSpot {want:#018x} over {} points — \
                  re-run apps/fdlibm_oracle with --dump {name} to localize",
                 corpus_size()
@@ -4374,7 +4415,11 @@ mod tests {
             ("atan2", super::atan2, 0x8327_323f_2533_8181),
             ("pow", super::pow, 0x5c4c_68f6_e383_2102),
             ("hypot", super::hypot, 0xe1fe_a734_7916_96e1),
-            ("IEEEremainder", super::ieee_remainder, 0x8aa1_c64f_79b8_b597),
+            (
+                "IEEEremainder",
+                super::ieee_remainder,
+                0x8aa1_c64f_79b8_b597,
+            ),
         ];
         for &(name, f, want) in cases {
             let got = binary_digest(f);

@@ -1258,10 +1258,13 @@ pub fn has_active_context() -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn primitive_types_translate() {
@@ -1369,15 +1372,42 @@ mod tests {
     #[test]
     fn real_jdk_value_layout_carriers_are_classified() {
         for (class_name, expected) in [
-            ("jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl", LAYOUT_BOOLEAN),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfByteImpl", LAYOUT_BYTE),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfCharImpl", LAYOUT_CHAR),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfShortImpl", LAYOUT_SHORT),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfIntImpl", LAYOUT_INT),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfLongImpl", LAYOUT_LONG),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl", LAYOUT_FLOAT),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl", LAYOUT_DOUBLE),
-            ("jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl", LAYOUT_ADDRESS),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+                LAYOUT_BOOLEAN,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+                LAYOUT_BYTE,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+                LAYOUT_CHAR,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+                LAYOUT_SHORT,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+                LAYOUT_INT,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+                LAYOUT_LONG,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+                LAYOUT_FLOAT,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+                LAYOUT_DOUBLE,
+            ),
+            (
+                "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+                LAYOUT_ADDRESS,
+            ),
             // and this VM's own spellings, which already worked
             ("java/lang/foreign/ValueLayout$OfInt", LAYOUT_INT),
             ("java/lang/foreign/ValueLayout$OfFloat", LAYOUT_FLOAT),
@@ -1398,14 +1428,23 @@ mod tests {
     fn group_and_sequence_carriers_are_classified() {
         for (class_name, expected) in [
             ("java/lang/foreign/StructLayout", LAYOUT_STRUCT),
-            ("jdk/internal/foreign/layout/StructLayoutImpl", LAYOUT_STRUCT),
+            (
+                "jdk/internal/foreign/layout/StructLayoutImpl",
+                LAYOUT_STRUCT,
+            ),
             ("java/lang/foreign/GroupLayout", LAYOUT_STRUCT),
             ("java/lang/foreign/UnionLayout", LAYOUT_UNION),
             ("jdk/internal/foreign/layout/UnionLayoutImpl", LAYOUT_UNION),
             ("java/lang/foreign/SequenceLayout", LAYOUT_SEQUENCE),
-            ("jdk/internal/foreign/layout/SequenceLayoutImpl", LAYOUT_SEQUENCE),
+            (
+                "jdk/internal/foreign/layout/SequenceLayoutImpl",
+                LAYOUT_SEQUENCE,
+            ),
             ("java/lang/foreign/PaddingLayout", LAYOUT_PADDING),
-            ("jdk/internal/foreign/layout/PaddingLayoutImpl", LAYOUT_PADDING),
+            (
+                "jdk/internal/foreign/layout/PaddingLayoutImpl",
+                LAYOUT_PADDING,
+            ),
         ] {
             assert_eq!(
                 layout_kind_of_class(class_name),

@@ -362,10 +362,7 @@ fn native_unsafe_invoke_cleaner(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // ((DirectBuffer) directBuffer).attachment() != null` -- a view keeps a
     // reference to what it was cut from in `attachment`, and only a root
     // direct buffer has it null.
-    if matches!(
-        ctx.get_field_by_name(buf, "att"),
-        Value::Object(Some(_))
-    ) {
+    if matches!(ctx.get_field_by_name(buf, "att"), Value::Object(Some(_))) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "invokeCleaner: duplicate or slice".into(),
         }
@@ -2280,10 +2277,13 @@ fn native_unsafe_get_and_add_int_from_unsafe(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ClassId;
 
     fn dummy_this() -> Value {
@@ -2431,7 +2431,10 @@ mod tests {
                 Value::Int(0xCD),
             ],
         );
-        assert!(err.is_err(), "a fill past the end of the block must be refused");
+        assert!(
+            err.is_err(),
+            "a fill past the end of the block must be refused"
+        );
         for i in 60..64i64 {
             assert_eq!(
                 crate::unsafe_arena_get_byte(addr + i),

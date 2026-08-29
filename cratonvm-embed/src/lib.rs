@@ -319,8 +319,8 @@ mod tests {
     /// what the host set is what `is_jdk_only` / `execution_policy` report.
     #[test]
     fn explicit_jdk_only_round_trips() {
-        let cfg = VmConfig::with_host_jdk_default()
-            .with_compatibility_mode(CompatibilityMode::JdkOnly);
+        let cfg =
+            VmConfig::with_host_jdk_default().with_compatibility_mode(CompatibilityMode::JdkOnly);
         assert_eq!(cfg.compatibility_mode, CompatibilityMode::JdkOnly);
         assert!(cfg.is_jdk_only());
         assert_eq!(cfg.compatibility_mode.as_str(), "jdk-only");

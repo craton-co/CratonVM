@@ -87,7 +87,7 @@ reconstruct from the interpreter frame, and the emitter publishes that state at
 loop *headers*; the guard sits in the prologue's straight-line code, where a
 local can still live in a register the trampoline does not seed. Answering the
 header with the guard produced a null receiver on a real workload — see
-`probes/LoopVersionOsrProbe.java`.
+`apps/probes/LoopVersionOsrProbe.java`.
 
 For peel and unroll the guard is a profitability filter only — both are legal at
 every trip count. See the loop peeling-and-versioning design.

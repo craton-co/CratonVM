@@ -25,7 +25,6 @@ impl Compiler {
     // block is emitted after the whole body, so the code that decides which bci
     // a stub resumes at is not at the guard it serves.
 
-
     /// deopt-osr Step 7: emit an OSR-exit map — a precise deopt snapshot tagged
     /// `DeoptReason::OsrExit` — at a loop-boundary `bci` (one of the PCs already
     /// vetted OSR-eligible, i.e. `osr_entry_native[pc] >= 0`, so it inherits the
@@ -67,7 +66,11 @@ impl Compiler {
     /// `emit_osr_exit_map_at_reason` calls) so `UnreachedCode` finally reaches
     /// `recommend_action` and gets `MakeNotCompilable` on first occurrence, as
     /// `fb4a333d` always intended.
-    pub(super) fn emit_osr_exit_map_at_reason(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
+    pub(super) fn emit_osr_exit_map_at_reason(
+        &mut self,
+        bci: usize,
+        reason: crate::deopt::DeoptReason,
+    ) {
         let box_ptr = self.build_and_record_deopt_point(bci, reason);
         self.osr_exit_box_ptr_by_bci.insert(bci, box_ptr);
         self.osr_exit_points.push(bci);
@@ -355,7 +358,9 @@ pub(super) fn publish_entry_metadata(
             if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES")
                 .is_some()
             {
-                (0..num_locals).filter(|&i| high_halves.contains(&i)).collect()
+                (0..num_locals)
+                    .filter(|&i| high_halves.contains(&i))
+                    .collect()
             } else {
                 pure_high_halves(&kinds, &high_halves)
             };
@@ -442,8 +447,8 @@ pub(super) fn publish_entry_metadata(
                 if (live_resident >> j) & 1 == 0 {
                     continue;
                 }
-                let shares = (dg.is_some() && dg == gpr_home(j))
-                    || (dx.is_some() && dx == xmm_home(j));
+                let shares =
+                    (dg.is_some() && dg == gpr_home(j)) || (dx.is_some() && dx == xmm_home(j));
                 if shares {
                     hazardous |= 1u64 << i;
                     break;
@@ -609,11 +614,7 @@ pub(super) fn publish_entry_metadata(
                     *slot = osr_dead_mask.get(image).copied().unwrap_or(0);
                 }
             }
-            crate::osr_coords::BciIndexed::from_translated(
-                rebuilt,
-                orig_code_len,
-                "osr_dead_mask",
-            )
+            crate::osr_coords::BciIndexed::from_translated(rebuilt, orig_code_len, "osr_dead_mask")
         }
         None => crate::osr_coords::OutPcIndexed::new(osr_dead_mask, "osr_dead_mask")
             .into_bci_by_identity(orig_code_len),
@@ -759,7 +760,12 @@ mod seed_collision_tests {
         let found = seed_collisions_at(0, 8, &gpr, &[]);
         assert_eq!(
             found,
-            vec![SeedCollision { file: "GPR", reg: "r12".into(), first: 5, second: 7 }],
+            vec![SeedCollision {
+                file: "GPR",
+                reg: "r12".into(),
+                first: 5,
+                second: 7
+            }],
             "the detector must NAME both locals, not just count"
         );
     }
@@ -799,7 +805,10 @@ mod seed_collision_tests {
         let gpr = vec![Some(13u8), Some(13u8), Some(13u8)];
         let found = seed_collisions_at(0, 3, &gpr, &[]);
         assert_eq!(
-            found.iter().map(|c| (c.first, c.second)).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|c| (c.first, c.second))
+                .collect::<Vec<_>>(),
             vec![(0, 1), (1, 2)]
         );
     }

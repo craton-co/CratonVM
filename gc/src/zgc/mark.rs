@@ -1934,7 +1934,10 @@ impl std::fmt::Debug for ZMarkShared {
         f.debug_struct("ZMarkShared")
             .field("n_workers", &self.n_workers)
             .field("stripes", &self.stripes.stripe_count())
-            .field("marking_active", &self.marking_active.load(Ordering::Relaxed))
+            .field(
+                "marking_active",
+                &self.marking_active.load(Ordering::Relaxed),
+            )
             .field("terminated", &self.terminator.is_terminated_hint())
             .finish()
     }
@@ -2150,7 +2153,10 @@ impl ZMarkHandle {
         }
         self.note_if_late();
         self.shared.ingress.push(slot, addr);
-        self.shared.stats.ingress_pushes.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .ingress_pushes
+            .fetch_add(1, Ordering::Relaxed);
         // Ingress lock released inside `push`; safe to take the terminator's.
         self.shared.terminator.note_work_published();
         true
@@ -2872,9 +2878,7 @@ impl ZMarkCoordinator {
         let mut handles = Vec::with_capacity(n);
         for id in 0..n {
             let worker_shared = Arc::clone(&shared);
-            let seed = ((id as u64).wrapping_add(1))
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ nonce;
+            let seed = ((id as u64).wrapping_add(1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nonce;
             let handle = std::thread::Builder::new()
                 .name(format!("zgc-mark-{id}"))
                 .spawn(move || {
@@ -3545,12 +3549,7 @@ mod tests {
     #[test]
     fn cycles_in_the_object_graph_terminate() {
         // A pure cycle, plus a self-loop, plus a back edge to the root.
-        let g = graph(&[
-            (1, &[2]),
-            (2, &[3]),
-            (3, &[1, 4]),
-            (4, &[4, 2]),
-        ]);
+        let g = graph(&[(1, &[2]), (2, &[3]), (3, &[1, 4]), (4, &[4, 2])]);
         let ctx = Arc::new(TestMarkContext::new(g));
         let pool = ZMarkCoordinator::new(ctx.clone(), 2);
 
@@ -3730,8 +3729,8 @@ mod tests {
 
         let hook_release = Arc::clone(&release);
         let hook_entered = Arc::clone(&entered_slow);
-        let ctx = Arc::new(TestMarkContext::new(g).with_visit_hook(Box::new(
-            move |addr: u64| {
+        let ctx = Arc::new(
+            TestMarkContext::new(g).with_visit_hook(Box::new(move |addr: u64| {
                 if addr != SLOW {
                     return;
                 }
@@ -3745,8 +3744,8 @@ mod tests {
                     spins += 1;
                     std::thread::yield_now();
                 }
-            },
-        )));
+            })),
+        );
 
         let pool = ZMarkCoordinator::new(ctx.clone(), 2);
         pool.begin_cycle();
@@ -4006,7 +4005,10 @@ mod tests {
         }
 
         let s = pool.stats().snapshot();
-        assert_eq!(s.domain_refusals, 1, "the refusal must be attributed to the DOMAIN");
+        assert_eq!(
+            s.domain_refusals, 1,
+            "the refusal must be attributed to the DOMAIN"
+        );
         assert_eq!(
             s.off_heap_children, 0,
             "and must NOT hide inside the wild-pointer counter"
@@ -4614,8 +4616,8 @@ mod tests {
         let hook_in_visit = Arc::clone(&in_visit);
         let hook_released = Arc::clone(&released);
         let hook_taken = Arc::clone(&gate_taken);
-        let ctx = Arc::new(TestMarkContext::new(g).with_visit_hook(Box::new(
-            move |_addr: u64| {
+        let ctx = Arc::new(
+            TestMarkContext::new(g).with_visit_hook(Box::new(move |_addr: u64| {
                 // Only the very first visit of the run gates; every later one
                 // passes straight through, so this costs one atomic per
                 // scanned object and cannot stall the drain.
@@ -4628,8 +4630,8 @@ mod tests {
                     spins += 1;
                     std::thread::yield_now();
                 }
-            },
-        )));
+            })),
+        );
 
         let pool = ZMarkCoordinator::new(ctx.clone(), 3);
 

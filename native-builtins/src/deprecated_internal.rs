@@ -15,7 +15,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 // ===========================================================================
 // Off-heap memory tracking (T8.4.2)
@@ -294,13 +294,13 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
     // `system_bootstrap` seeds `java.awt.headless=true`, so an ordinary run
     // still answers false, but `-Djava.awt.headless=false` is now honoured.
     r.register(beans, "isDesignTime", "()Z", native_beans_is_design_time);
+    r.register(beans, "setDesignTime", "(Z)V", native_beans_set_design_time);
     r.register(
         beans,
-        "setDesignTime",
-        "(Z)V",
-        native_beans_set_design_time,
+        "isGuiAvailable",
+        "()Z",
+        native_beans_is_gui_available,
     );
-    r.register(beans, "isGuiAvailable", "()Z", native_beans_is_gui_available);
     r.register(
         beans,
         "setGuiAvailable",
@@ -313,8 +313,7 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
 /// `java.beans.Beans` design-time flag. The real JDK scopes this per
 /// `ThreadGroupContext`; CratonVM has one such context in practice, so a
 /// process-global flag is observationally equivalent.
-static BEANS_DESIGN_TIME: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BEANS_DESIGN_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `java.beans.Beans` GUI-available override: `-1` un-set (fall back to the
 /// headless computation), `0` false, `1` true. Mirrors the real JDK's
@@ -348,7 +347,10 @@ fn native_beans_is_gui_available(ctx: &mut dyn NativeContext, _args: &[Value]) -
     Ok(Some(Value::Int(i32::from(available))))
 }
 
-fn native_beans_set_gui_available(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_beans_set_gui_available(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let on = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
     BEANS_GUI_AVAILABLE.store(i8::from(on), Ordering::Relaxed);
     Ok(None)
@@ -1614,10 +1616,13 @@ fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Helper: look up a native and call it through the registry.
     fn call_native(

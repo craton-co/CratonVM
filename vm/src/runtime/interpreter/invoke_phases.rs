@@ -202,8 +202,10 @@ pub fn dump() {
     // is only correct while `Owned` stays rare. Printed so that stays checked.
     let (owned, cached) = crate::runtime::frame::frame_kind_counts();
     let tot = owned + cached;
-    let pct = if tot == 0 { 0.0 } else { 100.0 * owned as f64 / tot as f64 };
-    eprintln!(
-        "[invoke-phases] frames: owned={owned} cached={cached} owned_share={pct:.3}%"
-    );
+    let pct = if tot == 0 {
+        0.0
+    } else {
+        100.0 * owned as f64 / tot as f64
+    };
+    eprintln!("[invoke-phases] frames: owned={owned} cached={cached} owned_share={pct:.3}%");
 }

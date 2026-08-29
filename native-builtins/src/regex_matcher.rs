@@ -299,10 +299,7 @@ impl JavaRegex {
 /// * A `$` followed by neither a digit nor `{` is emitted as a literal `$`
 ///   (Java throws `IllegalArgumentException`; we choose the lenient path —
 ///   malformed replacements are programming errors and rare).
-fn parse_java_replacement(
-    rep: &str,
-    group_count: usize,
-) -> Result<Vec<JavaReplToken>, usize> {
+fn parse_java_replacement(rep: &str, group_count: usize) -> Result<Vec<JavaReplToken>, usize> {
     let mut tokens: Vec<JavaReplToken> = Vec::new();
     let mut lit = String::new();
     let bytes = rep.as_bytes();
@@ -416,9 +413,12 @@ fn render_java_replacement<'a>(
 
 #[cfg(test)]
 mod java_replacement_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{compile_anchored_cached, compile_java_regex};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn ra(text: &str, pat: &str, rep: &str) -> String {
         compile_java_regex(pat, 0)
@@ -1947,7 +1947,6 @@ pub(crate) fn native_matcher_end_idx(
     matcher_group_boundary(ctx, this, idx, true)
 }
 
-
 /// `Matcher.appendReplacement`'s error for a `$N` naming a group the pattern
 /// does not have: `IndexOutOfBoundsException("No group N")`. The message text
 /// is HotSpot's, verbatim.
@@ -3154,13 +3153,16 @@ fn matcher_realjdk_group_in_bounds(
 
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{
         compile_java_regex, is_matcher_realjdk_native_callback,
         matcher_realjdk_build_offset_tables, matcher_realjdk_capture_layout_valid,
         matcher_realjdk_group_index_in_bounds, matcher_realjdk_group_slice,
         matcher_realjdk_native_callback,
+    };
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
 
     #[test]
@@ -3528,9 +3530,12 @@ pub(crate) fn native_matcher_group_idx_realjdk(
 // ===========================================================================
 #[cfg(test)]
 mod regex_lookbehind_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// The exact pattern Hazelcast's `AbstractXmlConfigHelper.schemaValidation`
     /// passes to `String.split` — a negative look-behind whose `\G\S+` body is

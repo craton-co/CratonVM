@@ -41,7 +41,7 @@ have now regressed, each with a **different failure signature than the original 
 `typeContributors.hasSize(1)`; got an **empty list**. This is the exact same
 symptom the HIB-CV-24 fix (14b) closed on 2026-06-30 — a `TestClassLoader`
 override of `findResources` hands back a `file:` URL (not `jar:...!/`) for the
-`META-INF/services/org.hibernate.boot.model.TypeContributor` descriptor, and
+`../../../../apps/META-INF/services/org.hibernate.boot.model.TypeContributor` descriptor, and
 `ClassLoaderService.loadJavaServices` must find exactly 1 provider from it.
 
 ### Root cause

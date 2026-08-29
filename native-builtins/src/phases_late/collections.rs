@@ -866,7 +866,8 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
         "emptyEnumeration",
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
-            let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+            let e =
+                try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
             Ok(Some(Value::Object(Some(e))))
         },
     );
@@ -1366,7 +1367,11 @@ pub(crate) fn native_p64_ll_get_last(
 // --- SequencedMap helpers ---
 
 // Helper: create Map$Entry from key + value
-pub(crate) fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p64_make_entry(
+    ctx: &mut dyn NativeContext,
+    key: Value,
+    value: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the entry alloc below — a moving young GC there would
     // relocate the key/value (native stale-local family).
     let key_pin = pinned_object_value(ctx, key);

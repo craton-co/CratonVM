@@ -327,13 +327,13 @@ scripts/baselines/jdk25-*.tsv text eol=lf
 OLD:
 
 ```
-| `jdk-only-bridge-ratchet.json` | [`scripts/jdk-only-bridge-ratchet.py`](../jdk-only-bridge-ratchet.py) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
+| `jdk-only-bridge-ratchet.json` | `scripts/internal/jdk-only-bridge-ratchet.py` (gitignored) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
 ```
 
 NEW:
 
 ```
-| `jdk-only-bridge-ratchet.json` | [`scripts/jdk-only-bridge-ratchet.py`](../jdk-only-bridge-ratchet.py) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
+| `jdk-only-bridge-ratchet.json` | `scripts/internal/jdk-only-bridge-ratchet.py` (gitignored) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
 | `jdk25-<binary.name>.tsv`, `jdk25-module-<name>.tsv` | the public/protected surface of one JDK 25 class or module, for any guard whose expected set would otherwise be transcribed from the registrar it audits | [`scripts/jdk-baseline/generate.py`](../jdk-baseline/generate.py) — `--update` writes, `--check` diffs, `--verify` runs its known-answer test |
 ```
 

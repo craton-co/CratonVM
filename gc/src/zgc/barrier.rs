@@ -1289,11 +1289,7 @@ pub fn load_barrier_fast(slot: &AtomicU64, good_mask: u64) -> ZFastPath {
 /// [`load_barrier_fast`] for a heap whose address payload is not
 /// [`Z_OFFSET_MASK`].
 #[inline(always)]
-pub fn load_barrier_fast_masked(
-    slot: &AtomicU64,
-    good_mask: u64,
-    address_mask: u64,
-) -> ZFastPath {
+pub fn load_barrier_fast_masked(slot: &AtomicU64, good_mask: u64, address_mask: u64) -> ZFastPath {
     classify_masked(slot.load(Ordering::Relaxed), good_mask, address_mask)
 }
 
@@ -1302,11 +1298,7 @@ pub fn load_barrier_fast_masked(
 /// Same load, same `#[inline(always)]` budget, one fewer branch: see
 /// [`classify_bad_masked`] for why the bad mask is the right comparand.
 #[inline(always)]
-pub fn load_barrier_fast_bad(
-    slot: &AtomicU64,
-    bad_mask: u64,
-    address_mask: u64,
-) -> ZFastPath {
+pub fn load_barrier_fast_bad(slot: &AtomicU64, bad_mask: u64, address_mask: u64) -> ZFastPath {
     classify_bad_masked(slot.load(Ordering::Relaxed), bad_mask, address_mask)
 }
 
@@ -1317,11 +1309,7 @@ pub fn load_barrier_fast_bad(
 /// thread wrote before its `volatile` store; if the barrier downgraded that
 /// load to `Relaxed` it would silently delete the edge the program asked for.
 #[inline(always)]
-pub fn load_barrier_fast_acquire(
-    slot: &AtomicU64,
-    good_mask: u64,
-    address_mask: u64,
-) -> ZFastPath {
+pub fn load_barrier_fast_acquire(slot: &AtomicU64, good_mask: u64, address_mask: u64) -> ZFastPath {
     classify_masked(slot.load(Ordering::Acquire), good_mask, address_mask)
 }
 
@@ -1855,7 +1843,9 @@ struct ZMarkBufferGuard {
 impl Drop for ZMarkBufferGuard {
     fn drop(&mut self) {
         if !self.buffer.lock().buckets.is_empty() {
-            Z_ORPHANED_MARK_BUFFERS.lock().push(Arc::clone(&self.buffer));
+            Z_ORPHANED_MARK_BUFFERS
+                .lock()
+                .push(Arc::clone(&self.buffer));
         }
     }
 }
@@ -1902,7 +1892,8 @@ pub struct ZMarkQueue {
 impl ZMarkQueue {
     /// Create an empty queue with a fresh process-unique id.
     pub fn new() -> Self {
-        let shards: [Mutex<Vec<u64>>; Z_MARK_SHARDS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
+        let shards: [Mutex<Vec<u64>>; Z_MARK_SHARDS] =
+            std::array::from_fn(|_| Mutex::new(Vec::new()));
         Self {
             // Relaxed: we need uniqueness, not ordering against other memory.
             id: NEXT_Z_MARK_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
@@ -2273,7 +2264,11 @@ mod tests {
         }
         // Null: both forms say Good, and the bad form needs no null test.
         assert_eq!(classify_bad(Z_NULL, bad_mask), ZFastPath::Good(0));
-        assert_eq!(Z_NULL & bad_mask, 0, "null must AND to zero — that IS the test");
+        assert_eq!(
+            Z_NULL & bad_mask,
+            0,
+            "null must AND to zero — that IS the test"
+        );
     }
 
     /// The regression `zgc::vaddr`'s tag bit introduced, and the reason the
@@ -2317,7 +2312,11 @@ mod tests {
             "offset 0 is not the null observation"
         );
         assert_eq!(ctx.stats().heal_cas_wins.load(Ordering::Relaxed), 1);
-        assert_eq!(ctx.marked_addrs(), vec![0], "the object at offset 0 is live");
+        assert_eq!(
+            ctx.marked_addrs(),
+            vec![0],
+            "the object at offset 0 is live"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2369,7 +2368,11 @@ mod tests {
         let stale = vaddr::color(0x3000, vaddr::ZColor::Remapped);
         let slot = AtomicU64::new(stale);
 
-        assert_eq!(z_load(&slot, &ctx), 0x3000, "the barrier returns the OFFSET");
+        assert_eq!(
+            z_load(&slot, &ctx),
+            0x3000,
+            "the barrier returns the OFFSET"
+        );
 
         let healed = slot.load(Ordering::Relaxed);
         assert_eq!(healed, vaddr::color(0x3000, vaddr::ZColor::Marked0));
@@ -2603,7 +2606,10 @@ mod tests {
         use crate::zgc::vaddr;
 
         // Offsets: anything the fast path can produce, by construction.
-        assert!(is_bare_offset(0, Z_OFFSET_MASK), "offset 0 is a real location");
+        assert!(
+            is_bare_offset(0, Z_OFFSET_MASK),
+            "offset 0 is a real location"
+        );
         assert!(is_bare_offset(0x3000, Z_OFFSET_MASK));
         assert!(
             is_bare_offset(Z_OFFSET_MASK, Z_OFFSET_MASK),
@@ -2689,7 +2695,10 @@ mod tests {
 
         assert_eq!(got, 0x3000);
         let after = slot.load(Ordering::Relaxed);
-        assert_ne!(after, bad, "the slot value must have CHANGED — this is the heal");
+        assert_ne!(
+            after, bad,
+            "the slot value must have CHANGED — this is the heal"
+        );
         assert_eq!(after, 0x3000 | Z_MARKED0);
         assert_eq!(
             classify(after, ctx.good_mask()),
@@ -2813,10 +2822,11 @@ mod tests {
         let original = 0x2000 | Z_MARKED0;
         let slot = AtomicU64::new(original);
 
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            z_load(&slot, &ctx)
-        }));
-        assert!(caught.is_err(), "the default on_forward_failure must diverge");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
+        assert!(
+            caught.is_err(),
+            "the default on_forward_failure must diverge"
+        );
 
         assert_eq!(
             slot.load(Ordering::Relaxed),
@@ -2872,9 +2882,7 @@ mod tests {
             stats: ZBarrierStats::new(),
         };
         let slot = AtomicU64::new(0x4400 | Z_MARKED0);
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            z_load(&slot, &ctx)
-        }));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
         let msg = *caught
             .expect_err("the override must diverge")
             .downcast::<String>()
@@ -2905,9 +2913,7 @@ mod tests {
         let original = 0x5000 | Z_MARKED0;
         let slot = AtomicU64::new(original);
 
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            z_load(&slot, &ctx)
-        }));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
         assert!(
             caught.is_err(),
             "an out-of-domain forward must not be survivable"
@@ -3013,15 +3019,18 @@ mod tests {
         assert_eq!(s.slow_path_entries, 1);
         assert_eq!(s.null_slow_paths, 1, "the reason counter");
         assert_eq!(s.heal_skipped, 1, "and the roll-up bucket");
-        assert_eq!(s.heal_cas_wins + s.heal_cas_losses, 0, "no CAS was attempted");
+        assert_eq!(
+            s.heal_cas_wins + s.heal_cas_losses,
+            0,
+            "no CAS was attempted"
+        );
         let (accounted, entries) = identity(ctx.stats());
         assert_eq!(accounted, entries, "exit 1 (null) must account for itself");
 
         // -- Exit 2: `forward` answered `None` ----------------------------
         let ctx = TestBarrierContext::relocating_with_failing_forward();
         let slot = AtomicU64::new(0x7000 | Z_MARKED0); // bad: good is REMAPPED
-        let caught =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
         assert!(caught.is_err(), "a `None` forward must not be survivable");
         let s = ctx.stats().snapshot();
         assert_eq!(s.slow_path_entries, 1);
@@ -3046,9 +3055,11 @@ mod tests {
         let ctx = TestBarrierContext::relocating();
         ctx.forward_to(0x8000, LINUX_SHAPED_HEAP_ADDRESS);
         let slot = AtomicU64::new(0x8000 | Z_MARKED0);
-        let caught =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
-        assert!(caught.is_err(), "an out-of-domain forward must not be survivable");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| z_load(&slot, &ctx)));
+        assert!(
+            caught.is_err(),
+            "an out-of-domain forward must not be survivable"
+        );
         let s = ctx.stats().snapshot();
         assert_eq!(s.slow_path_entries, 1);
         assert_eq!(s.forward_failures, 1);
@@ -3063,7 +3074,7 @@ mod tests {
         // -- Exit 4: the CAS, both outcomes, on ONE stats block -----------
         let ctx = TestBarrierContext::marking();
         let slot = AtomicU64::new(0x9000 | Z_REMAPPED); // bad: good is MARKED0
-        // (a) win — `observed` is what the slot actually holds.
+                                                        // (a) win — `observed` is what the slot actually holds.
         assert_eq!(z_load(&slot, &ctx), 0x9000);
         assert_eq!(slot.load(Ordering::Relaxed), 0x9000 | Z_MARKED0);
         // (b) loss — hand the slow path a comparand the slot does NOT hold.
@@ -3083,7 +3094,10 @@ mod tests {
             "both entrants attempted a CAS, so neither may land in the skip bucket"
         );
         let (accounted, entries) = identity(ctx.stats());
-        assert_eq!(accounted, entries, "exit 4 (the CAS) must account for itself");
+        assert_eq!(
+            accounted, entries,
+            "exit 4 (the CAS) must account for itself"
+        );
     }
 
     /// The counterpart claim, and the one the cross-module suite got wrong:

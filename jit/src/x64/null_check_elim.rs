@@ -9,7 +9,6 @@
 
 use super::*;
 
-
 /// If the bytecode instruction immediately preceding `pc` is an `aload`
 /// of some local, return the local index. Otherwise return `None`.
 ///

@@ -384,10 +384,10 @@ fn the_thread_virtual_slot_read_keeps_its_eetop_witness() {
     // shape). Recorded rather than quietly corrected, because "I picked a
     // bigger window" is not the lesson; "do not guess an extent when the
     // language gives you one" is.
-    let at = src
-        .find("let is_virtual_synthetic = {")
-        .expect("vm_exec no longer binds `is_virtual_synthetic` — if the virtual-thread \
-                 decision moved, this gate must move with it, not be deleted");
+    let at = src.find("let is_virtual_synthetic = {").expect(
+        "vm_exec no longer binds `is_virtual_synthetic` — if the virtual-thread \
+                 decision moved, this gate must move with it, not be deleted",
+    );
     let open = at + src[at..].find('{').expect("binding has no block");
     let mut depth = 0usize;
     let mut end = open;
@@ -455,7 +455,9 @@ fn every_guarded_row_publishes_its_slot_map() {
     for (name, declared_in, wired_in) in rows {
         let d = read(declared_in);
         assert!(
-            d.contains(&format!("static {name}: cratonvm_native_api::read_alias::SlotMap")),
+            d.contains(&format!(
+                "static {name}: cratonvm_native_api::read_alias::SlotMap"
+            )),
             "`{name}` is not declared as a SlotMap in {declared_in}"
         );
         // The call may qualify the path (`&crate::lang_class::NAME`), so match
@@ -593,15 +595,14 @@ fn ssc_p58_socket_stays_deleted_and_the_registrar_stays_gated() {
 
     let lib = read("native-builtins/src/lib.rs");
     assert!(
-        lib.contains(
-            "#[cfg(feature = \"synthetic-jdk\")]\npub fn register_synthetic_overrides("
-        ),
+        lib.contains("#[cfg(feature = \"synthetic-jdk\")]\npub fn register_synthetic_overrides("),
         "`register_synthetic_overrides` is no longer immediately preceded by \
          `#[cfg(feature = \"synthetic-jdk\")]`. That attribute is why phase 58 is \
          absent from every default-build census."
     );
     assert!(
-        fn_body(&lib, "register_synthetic_overrides").contains("register_phase58_natives(registry);"),
+        fn_body(&lib, "register_synthetic_overrides")
+            .contains("register_phase58_natives(registry);"),
         "phase 58 is no longer called from `register_synthetic_overrides`. It may \
          have moved somewhere the real-JDK boot path reaches, which is exactly \
          the escape this gate exists for."

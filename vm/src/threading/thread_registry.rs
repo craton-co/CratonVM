@@ -638,8 +638,7 @@ impl ThreadRegistry {
             // produced exactly ONE census line across 453 s and four
             // zero-span breaks, which is the fact this counter is here to
             // confirm or kill.
-            static CENSUS_SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static CENSUS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let seq = CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
                 "[g1][TLAB-CENSUS] #{seq} entries={total} dead={dead} \
@@ -2433,7 +2432,9 @@ impl ThreadRegistry {
                     }
                 };
                 if moved {
-                    self.synchronizer_owner[new_shard].lock().insert(new_addr, tid);
+                    self.synchronizer_owner[new_shard]
+                        .lock()
+                        .insert(new_addr, tid);
                 }
             }
         }
@@ -2614,7 +2615,13 @@ impl ThreadRegistry {
                         // root and left it behind; a miss means the deposit
                         // never published it.
                         blocked_root_gap_report(
-                            tid.0, so.frame, so.idx, so.is_stack, so.orig, so.cur, published,
+                            tid.0,
+                            so.frame,
+                            so.idx,
+                            so.is_stack,
+                            so.orig,
+                            so.cur,
+                            published,
                         );
                     }
                 }
@@ -3071,7 +3078,11 @@ mod tests {
         // (label, previous owner, new owner)
         let cases: [(&str, Option<ThreadId>, Option<ThreadId>); 6] = [
             ("first acquire by self", None, Some(ThreadId(1))),
-            ("reentrant acquire by self", Some(ThreadId(1)), Some(ThreadId(1))),
+            (
+                "reentrant acquire by self",
+                Some(ThreadId(1)),
+                Some(ThreadId(1)),
+            ),
             ("release by self", Some(ThreadId(1)), None),
             ("steal from a peer", Some(ThreadId(2)), Some(ThreadId(1))),
             ("release of a peer's lock", Some(ThreadId(2)), None),
@@ -3119,7 +3130,9 @@ mod tests {
         let registry = ThreadRegistry::new();
         let me = ThreadId(1);
         registry.register(me, "me", None);
-        let handle = registry.jmx_locked_synchronizers_of(me).expect("registered");
+        let handle = registry
+            .jmx_locked_synchronizers_of(me)
+            .expect("registered");
         handle.lock().push(fake_synchronizer(0x3000));
         assert_eq!(
             owned_synchronizers(&registry, me),

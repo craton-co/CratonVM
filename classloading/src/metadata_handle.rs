@@ -656,8 +656,8 @@ mod tests {
 
         // Crossed, both fail, and they fail by *name* rather than by returning
         // the other VM's class.
-        let err = resolve_live(&realm_b, handle_a, 16)
-            .expect_err("VM A handle must not resolve in VM B");
+        let err =
+            resolve_live(&realm_b, handle_a, 16).expect_err("VM A handle must not resolve in VM B");
         assert_eq!(err.kind(), StaleMetadataKind::WrongVm);
         assert_eq!(
             err,
@@ -707,8 +707,8 @@ mod tests {
     fn out_of_range_index_is_rejected() {
         let realm = MetadataRealm::for_vm(VM_A);
         let handle = realm.mint_class(ClassId::new(9)).expect("mint");
-        let err = resolve_live(&realm, handle, 9)
-            .expect_err("index 9 with 9 slots is past the end");
+        let err =
+            resolve_live(&realm, handle, 9).expect_err("index 9 with 9 slots is past the end");
         assert_eq!(err.kind(), StaleMetadataKind::OutOfRange);
         assert_eq!(
             err,
@@ -835,7 +835,11 @@ mod tests {
         for i in 0..64u32 {
             assert_eq!(realm.generation(ClassId::new(i)), 0);
         }
-        assert_eq!(realm.tracked_classes(), 0, "reads must not populate the map");
+        assert_eq!(
+            realm.tracked_classes(),
+            0,
+            "reads must not populate the map"
+        );
 
         realm.bump_generation(ClassId::new(5));
         assert_eq!(realm.tracked_classes(), 1);
@@ -847,8 +851,10 @@ mod tests {
     fn bulk_bump_invalidates_every_named_class() {
         let realm = MetadataRealm::for_vm(VM_A);
         let ids: Vec<ClassId> = (0..4).map(ClassId::new).collect();
-        let handles: Vec<ClassHandle> =
-            ids.iter().map(|id| realm.mint_class(*id).unwrap()).collect();
+        let handles: Vec<ClassHandle> = ids
+            .iter()
+            .map(|id| realm.mint_class(*id).unwrap())
+            .collect();
 
         realm.bump_generations(ids.iter().copied());
 

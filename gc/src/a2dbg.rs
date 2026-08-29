@@ -57,7 +57,15 @@ pub fn record(
     if !enabled() {
         return;
     }
-    record_armed(addr, class_id, kind, element_type, array_length, num_slots, size);
+    record_armed(
+        addr,
+        class_id,
+        kind,
+        element_type,
+        array_length,
+        num_slots,
+        size,
+    );
 }
 
 #[cold]

@@ -931,13 +931,16 @@ impl BigInt {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::{
         bi_add_str, bi_bitwise_and, bi_bitwise_or, bi_bitwise_xor, bi_compare, bi_div_str,
         bi_is_probable_prime_str, bi_mod_inverse_str, bi_mod_pow_str, bi_mod_str, bi_mul_str,
         bi_shift_left_str, bi_shift_right_str, bi_sub_str,
+    };
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
 
     // Deterministic LCG so the spread is reproducible without a rand dep.
@@ -1196,7 +1199,11 @@ mod tests {
             // even moduli, including powers of two (the fallback arm)
             ("123456789", "65537", "2"),
             ("123456789", "65537", "4294967296"),
-            ("123456789", "65537", "340282366920938463463374607431768211456"),
+            (
+                "123456789",
+                "65537",
+                "340282366920938463463374607431768211456",
+            ),
             ("123456789", "65537", "1000000008"),
             (
                 "99999999999999999999999999",

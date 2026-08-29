@@ -260,7 +260,7 @@ non-default backend), not a G1-specific or ZGC-specific defect. Checked one
 directly: `VirtualZipDataBlockTests` fails with the byte-for-byte
 **identical** signature under both G1 and ZGC-real — same
 `NoSuchFileException`, same `AssertionFailedError` with the same missing
-`META-INF/` entry bytes (`[77, 69, 84, 65, 45, 73, 78, 70, 47]`) in the same
+`../../../../apps/META-INF/` entry bytes (`[77, 69, 84, 65, 45, 73, 78, 70, 47]`) in the same
 position. That rules out coincidence for at least this one; the other 7
 weren't individually diffed G1-vs-ZGC this round. See the ZGC doc's own "PASS
 -> FAIL" section for the parallel list (11 there, 8 of which are this set;

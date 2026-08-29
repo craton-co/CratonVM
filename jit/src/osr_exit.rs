@@ -418,7 +418,10 @@ mod tests {
     #[test]
     fn an_exit_map_missing_from_the_set_is_named_as_such() {
         let pts = vec![point(12, 0x40, DeoptReason::OsrExit)];
-        assert_eq!(classify_exit_site(&[], &pts, 12), OsrExitSite::ExitMapMissing);
+        assert_eq!(
+            classify_exit_site(&[], &pts, 12),
+            OsrExitSite::ExitMapMissing
+        );
     }
 
     /// The one that is a defect. A bci in neither set means the artifact
@@ -563,10 +566,7 @@ mod tests {
             "the fixture only means anything while PendingException is RETHROW"
         );
         assert!(
-            matches!(
-                resume_image(&pts, 12),
-                ResumeImage::Unique { index: 0, .. }
-            ),
+            matches!(resume_image(&pts, 12), ResumeImage::Unique { index: 0, .. }),
             "the OsrExit point is the one and only resume image at bci 12"
         );
         assert_eq!(

@@ -8,7 +8,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::intern_arc;
 use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, compile_java_regex, native_noop_with_this, obj_arg};
+use crate::{compile_java_regex, native_noop_with_this, obj_arg, try_alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
 // Thread-local scratch buffers for per-element char[] reads.
@@ -376,12 +376,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(class, "getValue", "()[B", native_sb_get_value);
     registry.register(class, "getCoder", "()B", native_sb_get_coder);
     registry.register(class, "getChars", "(II[CI)V", native_sb_get_chars);
-    registry.register(
-        class,
-        "reverse",
-        &format!("()L{class};"),
-        native_sb_reverse,
-    );
+    registry.register(class, "reverse", &format!("()L{class};"), native_sb_reverse);
 
     // --- Mutation methods ---
     registry.register(
@@ -474,12 +469,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         &format!("(ILjava/lang/CharSequence;II)L{class};"),
         native_sb_insert_charsequence_range,
     );
-    registry.register(
-        class,
-        "delete",
-        &format!("(II)L{class};"),
-        native_sb_delete,
-    );
+    registry.register(class, "delete", &format!("(II)L{class};"), native_sb_delete);
     registry.register(
         class,
         "deleteCharAt",
@@ -718,7 +708,12 @@ fn surrogate_intern_pool(
     static P: std::sync::OnceLock<
         cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<Vec<u16>, usize>>,
     > = std::sync::OnceLock::new();
-    P.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+    P.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 /// The global-root handle already canonical for `units`, if any.
@@ -1044,9 +1039,7 @@ pub(crate) fn native_string_char_at(
 
     let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
-        None => {
-            return Err(cratonvm_types::error::RuntimeError::sioobe_no_length(index).into())
-        }
+        None => return Err(cratonvm_types::error::RuntimeError::sioobe_no_length(index).into()),
     };
     let is_byte_array = matches!(
         ctx.heap_element_type_of(arr),
@@ -1311,7 +1304,12 @@ pub(crate) fn native_string_substring(
     };
 
     if begin < 0 || end < begin || end > char_count as i32 {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(
+            begin,
+            end,
+            char_count as i32,
+        )
+        .into());
     }
 
     let b = begin as usize;
@@ -2931,10 +2929,7 @@ fn invoke_to_string_opt(
 /// always screened the kind; this is that rule, brought to the natives.
 fn is_plain_string(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
     ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array
-        && ctx
-            .class_name_of_id(ctx.class_id_of_object(obj))
-            .as_deref()
-            == Some("java/lang/String")
+        && ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/lang/String")
 }
 
 fn invoke_to_string_units_opt(
@@ -3605,7 +3600,9 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // null-`dst` dereference, which is why a bad source window beats a null
     // destination rather than the other way round.
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into());
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, count).into(),
+        );
     }
     let n = (src_end - src_begin) as usize;
     // (2) `dst.length` is read next, so a null `dst` is a NullPointerException —
@@ -3826,7 +3823,11 @@ pub(crate) fn native_sb_code_point_before(
     };
     let chars = sb_read_chars(ctx, this);
     if index_i32 <= 0 || (index_i32 as usize) > chars.len() {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index_i32, chars.len() as i32).into());
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(
+            index_i32,
+            chars.len() as i32,
+        )
+        .into());
     }
     let index = index_i32 as usize;
     let ch = chars[index - 1];
@@ -6072,7 +6073,12 @@ pub(crate) fn native_string_substring_one(
     let end = char_count as i32;
 
     if begin < 0 || begin > end {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range(begin, end, char_count as i32).into());
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(
+            begin,
+            end,
+            char_count as i32,
+        )
+        .into());
     }
 
     let b = begin as usize;
@@ -6479,19 +6485,17 @@ pub(crate) fn native_string_join_iterable(
     let delim = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let iterable = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
@@ -7085,10 +7089,10 @@ pub(crate) fn native_string_get_chars(
     let count = src_end - src_begin;
     let dst_len = ctx.array_length(dst) as i32;
     if bounds_off_count_violation(dst_begin, count, dst_len).is_some() {
-        return Err(
-            cratonvm_types::error::RuntimeError::sioobe_range_size(dst_begin, count, dst_len)
-                .into(),
-        );
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(
+            dst_begin, count, dst_len,
+        )
+        .into());
     }
     let src_begin = src_begin as usize;
     let dst_begin = dst_begin as usize;
@@ -7554,17 +7558,16 @@ pub(crate) fn native_string_transform(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let function = match args.get(1) {
-        Some(Value::Object(Some(f))) => *f,
-        // Returning the receiver made `s.transform(null)` behave like the
-        // identity function — a plausible, silently wrong answer. `transform`
-        // is `f.apply(this)`, so a null `f` is an NPE on OpenJDK 25.0.3+9.
-        _ => {
-            return Err(string_arg_npe(
+    let function =
+        match args.get(1) {
+            Some(Value::Object(Some(f))) => *f,
+            // Returning the receiver made `s.transform(null)` behave like the
+            // identity function — a plausible, silently wrong answer. `transform`
+            // is `f.apply(this)`, so a null `f` is an NPE on OpenJDK 25.0.3+9.
+            _ => return Err(string_arg_npe(
                 "Cannot invoke \"java.util.function.Function.apply(Object)\" because \"f\" is null",
-            ))
-        }
-    };
+            )),
+        };
     ctx.invoke_virtual(
         function,
         "apply",
@@ -7687,9 +7690,7 @@ impl FmtFault {
                 "java/util/DuplicateFormatFlagsException",
                 "(Ljava/lang/String;)V",
             ),
-            FmtFault::IllegalCodePoint(_) => {
-                ("java/util/IllegalFormatCodePointException", "(I)V")
-            }
+            FmtFault::IllegalCodePoint(_) => ("java/util/IllegalFormatCodePointException", "(I)V"),
             // The one member of the family that is PACKAGE-PRIVATE: JDK 25
             // declares `final class IllegalFormatArgumentIndexException` with
             // a package-private constructor, so only `java.util` code can name
@@ -7698,9 +7699,7 @@ impl FmtFault {
             // back to the base class if the construction is refused — so
             // asking for it costs nothing if this VM ever grows the access
             // check that HotSpot would apply to a non-`java.util` caller.
-            FmtFault::ArgumentIndex(_) => {
-                ("java/util/IllegalFormatArgumentIndexException", "(I)V")
-            }
+            FmtFault::ArgumentIndex(_) => ("java/util/IllegalFormatArgumentIndexException", "(I)V"),
         }
     }
 
@@ -7713,7 +7712,9 @@ impl FmtFault {
             FmtFault::MissingArgument(s) => format!("Format specifier '{s}'"),
             FmtFault::WrongType(c, cid) => format!(
                 "{c} != {}",
-                ctx.class_name_of_id(*cid).unwrap_or_default().replace('/', ".")
+                ctx.class_name_of_id(*cid)
+                    .unwrap_or_default()
+                    .replace('/', ".")
             ),
             FmtFault::IllegalFlags(f) => format!("Flags = '{f}'"),
             FmtFault::FlagsMismatch(f, c) => format!("Conversion = {c}, Flags = {f}"),
@@ -7930,9 +7931,7 @@ fn fmt_truncate_units(units: &mut Vec<u16>, prec: usize) {
 /// `try_reserve_exact` is the same primitive [`native_string_repeat`] uses for
 /// the same reason, one screen away in this file.
 fn fmt_repeat(ch: char, n: usize) -> Result<String, MethodCallFailed> {
-    let bytes = n
-        .checked_mul(ch.len_utf8())
-        .ok_or_else(fmt_out_of_memory)?;
+    let bytes = n.checked_mul(ch.len_utf8()).ok_or_else(fmt_out_of_memory)?;
     let mut s = String::new();
     if s.try_reserve_exact(bytes).is_err() {
         return Err(fmt_out_of_memory());
@@ -9055,11 +9054,7 @@ fn format_arg_pin_enabled() -> bool {
     })
 }
 
-fn format_impl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    locale: FmtLocale,
-) -> MethodCallResult {
+fn format_impl(ctx: &mut dyn NativeContext, args: &[Value], locale: FmtLocale) -> MethodCallResult {
     // GC. `format_impl_pinned` RUNS BYTECODE: every numeric conversion resolves
     // `FmtSymbols` through `DecimalFormatSymbols.getInstance()`, which allocates
     // and can trigger a young collection, and `format_arg_full` dispatches
@@ -9169,7 +9164,10 @@ fn format_impl_pinned(
             // '%' itself when there is none, which is why `String.format("abc%")`
             // says "Conversion = '%'" rather than naming the whole tail.
             if i + 1 >= chars.len() {
-                return Err(fmt_raise(ctx, &FmtFault::UnknownConversion("%".to_string())));
+                return Err(fmt_raise(
+                    ctx,
+                    &FmtFault::UnknownConversion("%".to_string()),
+                ));
             }
             i += 1;
             // Held for the truncated-specifier report below, which names this
@@ -9545,10 +9543,7 @@ fn format_impl_pinned(
                             }
                         }
                         if width.is_none() && flags.contains('-') {
-                            return Err(fmt_raise(
-                                ctx,
-                                &FmtFault::MissingWidth(dt_spec_text()),
-                            ));
+                            return Err(fmt_raise(ctx, &FmtFault::MissingWidth(dt_spec_text())));
                         }
                         // `'<'` with no previous conversion — the same refusal
                         // the general arm makes, quoting this arm's own
@@ -11671,12 +11666,7 @@ fn java_decimal_conversion(plain: &str, spec: char, precision: Option<usize>) ->
 /// `digits × 10^exp`, which is the only part of the family that does not care
 /// where the digits came from — a double's `Double.toString` or a
 /// BigDecimal's `toPlainString`.
-fn fmt_decimal_conversion(
-    digits: &[u8],
-    exp: i32,
-    spec: char,
-    precision: Option<usize>,
-) -> String {
+fn fmt_decimal_conversion(digits: &[u8], exp: i32, spec: char, precision: Option<usize>) -> String {
     let upper = matches!(spec, 'E' | 'G');
     match spec {
         'e' | 'E' => {
@@ -11796,7 +11786,10 @@ fn format_arg_full(
         // `MissingFormatArgumentException`). See `fmt_check_spec`, which used
         // to raise this and now deliberately does not.
         if flags.contains('#') {
-            return Err(fmt_raise(ctx, &FmtFault::FlagsMismatch("#".to_string(), 's')));
+            return Err(fmt_raise(
+                ctx,
+                &FmtFault::FlagsMismatch("#".to_string(), 's'),
+            ));
         }
     }
 
@@ -12532,8 +12525,7 @@ pub(crate) fn format_arg(
                     // moved object (forwarded header), and an argument that
                     // really is of the wrong class. Dump the header so the run
                     // says which.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FMT_WRONGTYPE")
-                        .is_some()
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FMT_WRONGTYPE").is_some()
                     {
                         let a = obj.as_ptr() as usize;
                         // SAFETY: diagnostic-only aligned read of the header
@@ -12676,9 +12668,7 @@ pub(crate) fn format_arg(
                 char::from_u32(*v as u32).unwrap_or('?').to_string()
             }
             'b' => ((*v) != 0).to_string(),
-            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
-                java_float_conversion(*v as f64, spec, None)
-            }
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => java_float_conversion(*v as f64, spec, None),
             _ => v.to_string(),
         },
         Value::Long(v) => match spec {
@@ -12686,15 +12676,11 @@ pub(crate) fn format_arg(
             'x' => format!("{:x}", *v as u64),
             'X' => format!("{:X}", *v as u64),
             'o' => format!("{:o}", *v as u64),
-            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
-                java_float_conversion(*v as f64, spec, None)
-            }
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => java_float_conversion(*v as f64, spec, None),
             _ => v.to_string(),
         },
         Value::Float(v) => match spec {
-            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
-                java_float_conversion(*v as f64, spec, None)
-            }
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => java_float_conversion(*v as f64, spec, None),
             // `%s`/no-spec of a float -> Java Double.toString form, not raw `{}`.
             _ => format_float(*v),
         },
@@ -13508,7 +13494,10 @@ pub(crate) fn native_string_utf16_get_chars(
     let count = src_end.wrapping_sub(src_begin);
     let source_len = (ctx.array_length(value) / 2) as i32;
     if bounds_off_count_violation(src_begin, count, source_len).is_some() {
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(src_begin, count, source_len).into());
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(
+            src_begin, count, source_len,
+        )
+        .into());
     }
     // The bytecode validates the source before its first destination access.
     // Preserve that ordering when both inputs are invalid/null.
@@ -13703,7 +13692,9 @@ pub(crate) fn native_string_init_from_char_array_range(
     let length = ctx.array_length(arr) as i32;
     if bounds_off_count_violation(offset, count, length).is_some() {
         // HotSpot's `Preconditions.checkFromIndexSize` wording, verbatim.
-        return Err(cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into());
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range_size(offset, count, length).into(),
+        );
     }
     let mut units = vec![0u16; count as usize];
     let written = ctx.read_char_array_into(arr, offset as usize, &mut units);
@@ -14044,10 +14035,13 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::ArrayElementType;
 
     // -----------------------------------------------------------------------
@@ -14223,11 +14217,20 @@ mod tests {
     fn compare_to_ignore_case_returns_the_folded_difference() {
         // The fold each row depends on, in the JDK's upper-then-lower order.
         let folded = |c: u16| java_char_to_lower_case(java_char_to_upper_case(c));
-        assert_eq!(i32::from(folded(b'_' as u16)) - i32::from(folded(b'a' as u16)), -2);
-        assert_eq!(i32::from(folded(b'B' as u16)) - i32::from(folded(b'a' as u16)), 1);
+        assert_eq!(
+            i32::from(folded(b'_' as u16)) - i32::from(folded(b'a' as u16)),
+            -2
+        );
+        assert_eq!(
+            i32::from(folded(b'B' as u16)) - i32::from(folded(b'a' as u16)),
+            1
+        );
         // "İ" vs "i": the uppercases differ, the lowercases do not, so the
         // loop continues and equal lengths give 0.
-        assert_ne!(java_char_to_upper_case(0x0130), java_char_to_upper_case(0x0069));
+        assert_ne!(
+            java_char_to_upper_case(0x0130),
+            java_char_to_upper_case(0x0069)
+        );
         assert_eq!(folded(0x0130), folded(0x0069));
         // A7D3 vs A7D2: both fold to themselves, so the difference is 1.
         assert_eq!(i32::from(folded(0xA7D3)) - i32::from(folded(0xA7D2)), 1);
@@ -14247,17 +14250,32 @@ mod tests {
         assert!(!region_matches_short_circuits(abc, 0, 0, -1)); // negative len does NOT save it
         assert!(!region_matches_short_circuits(abc, 3, 0, 0)); // toffset == length() - len
         assert!(!region_matches_short_circuits(0, 0, 0, 0)); // "" receiver, still reached
-        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+        assert!(!region_matches_short_circuits(
+            abc,
+            0,
+            0,
+            i64::from(i32::MIN)
+        ));
         // Decided by terms one to three -> `false`, `other` never read.
         assert!(region_matches_short_circuits(abc, -1, 0, 1)); // toffset < 0
         assert!(region_matches_short_circuits(abc, 0, -1, 1)); // ooffset < 0
         assert!(region_matches_short_circuits(abc, 99, 0, 1)); // toffset > len - len
         assert!(region_matches_short_circuits(abc, 0, 0, 4)); // 0 > 3 - 4
-        assert!(region_matches_short_circuits(abc, i64::from(i32::MAX), 0, 1));
+        assert!(region_matches_short_circuits(
+            abc,
+            i64::from(i32::MAX),
+            0,
+            1
+        ));
         // The widening is load-bearing: with `i32` arithmetic
         // `length() - Integer.MIN_VALUE` wraps negative and the third term
         // would wrongly short-circuit.
-        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+        assert!(!region_matches_short_circuits(
+            abc,
+            0,
+            0,
+            i64::from(i32::MIN)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -15094,7 +15112,8 @@ mod tests {
         assert_eq!(text.encode_utf16().count(), 7, "got {text:?}");
 
         for cp in [-1, 0x11_0000, i32::MIN, i32::MAX] {
-            let r = native_sb_append_code_point(&mut ctx, &[Value::Object(Some(sb)), Value::Int(cp)]);
+            let r =
+                native_sb_append_code_point(&mut ctx, &[Value::Object(Some(sb)), Value::Int(cp)]);
             let refused = matches!(
                 r,
                 Err(cratonvm_types::error::MethodCallFailed::InternalError(
@@ -15103,7 +15122,10 @@ mod tests {
                     )
                 ))
             );
-            assert!(refused, "appendCodePoint(0x{cp:X}) must raise IllegalArgumentException");
+            assert!(
+                refused,
+                "appendCodePoint(0x{cp:X}) must raise IllegalArgumentException"
+            );
         }
     }
 
@@ -16093,7 +16115,11 @@ mod f22_utf16_formatter_tests {
             vec![0xD800],
             "lone HIGH surrogate, not '?'"
         );
-        assert_eq!(to_units(0xDFFF), vec![0xDFFF], "lone LOW surrogate, not '?'");
+        assert_eq!(
+            to_units(0xDFFF),
+            vec![0xDFFF],
+            "lone LOW surrogate, not '?'"
+        );
         assert_eq!(to_units(0x1F600), vec![0xD83D, 0xDE00]);
         assert_eq!(to_units(0x41), vec![0x0041]);
         assert_eq!(to_units(0x10FFFF), vec![0xDBFF, 0xDFFF]);

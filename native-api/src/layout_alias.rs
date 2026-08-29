@@ -247,7 +247,9 @@ pub fn classify(requested: usize, declared: usize) -> Option<Direction> {
 #[inline]
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some())
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
+    })
 }
 
 /// Where the request came from, for the census row.
@@ -426,7 +428,11 @@ mod tests {
 
     #[test]
     fn under_and_exact_and_unmeasured() {
-        assert_eq!(classify(1, 3), Some(Direction::Under), "Kafka HashSet shape");
+        assert_eq!(
+            classify(1, 3),
+            Some(Direction::Under),
+            "Kafka HashSet shape"
+        );
         assert_eq!(classify(3, 3), None, "agreement is not a finding");
         assert_eq!(classify(0, 4), None, "caller asserts no layout");
     }

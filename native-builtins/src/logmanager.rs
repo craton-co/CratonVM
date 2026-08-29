@@ -208,8 +208,7 @@ pub(crate) fn per_vm_table<T: Send + Default + 'static>(
 /// Holds the `LogManager` singleton's raw ObjectRef address, per VM. Pointer
 /// identity is stable for the lifetime of its VM — we never free this object.
 fn singleton_cell(vm: usize) -> &'static Mutex<Option<u64>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> =
-        OnceLock::new();
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> = OnceLock::new();
     per_vm_table(&INSTANCE, vm)
 }
 
@@ -490,7 +489,10 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 ///
 /// Do not "simplify" the nulls away without reading that: they are what this
 /// file's own `Compatible`-mode natives are written around.
-fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn allocate_log_manager(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
     // Leave slot 0 as `null` — a properly-initialized `Properties` would
     // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
@@ -530,7 +532,9 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result
 /// logging extension checks that the active singleton's concrete class is the
 /// JBoss manager, so allocate our synthetic JBoss-classed singleton directly
 /// instead of invoking the real constructor.
-fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn try_allocate_property_log_manager(
+    ctx: &mut dyn NativeContext,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let Some(prop) = ctx.get_system_property("java.util.logging.manager") else {
         return Ok(None);
     };
@@ -621,7 +625,10 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Result<Opti
 /// unified system loader so `-c` paths are visible). Without the
 /// property, the JDK-default class is used as before — see
 /// `try_allocate_property_log_manager` for the loader-bypass rationale.
-fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn ensure_singleton(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     // Fast path: already cached.
     {
@@ -743,7 +750,9 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef,
 /// dotted prefix chain matters: `getLogger("a.b.c.d")` with only `a` present
 /// must parent to `a`, not to a freshly fabricated `a.b.c`.
 fn nearest_existing_ancestor_name(vm: usize, name: &str) -> String {
-    let reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let reg = logger_registry(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut cur = name;
     while let Some(idx) = cur.rfind('.') {
         cur = &cur[..idx];
@@ -866,7 +875,10 @@ fn populate_real_logger_bundle(
 /// anonymous Logger that isn't registered so the caller still receives
 /// a non-null Logger for the `.info()` / `.warning()` fallback but the
 /// bad name never enters the registry.
-pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn get_or_create_logger(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         tracing::warn!(
@@ -876,7 +888,9 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> R
         return Ok(allocate_logger(ctx, "")?);
     }
     {
-        let reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
+        let reg = logger_registry(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
                 // SAFETY: singleton-style lifetime.
@@ -890,7 +904,9 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> R
     // `LogNode.walkAndSetParent` when `addLogger` inserts an intermediate node.
     let mut reparent: Vec<u64> = Vec::new();
     {
-        let mut reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = logger_registry(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Check again under the lock (TOCTOU); if another thread beat
         // us, return their logger and drop ours on the floor (it has
         // no external references yet).
@@ -1047,7 +1063,9 @@ fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
 /// context class loader.  Calling `getLogger("")` is safe here: JULI creates
 /// and configures that root as part of its own class-loader-info bootstrap;
 /// unlike `addLogger(child)`, it does not recurse through parent logger names.
-fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn tomcat_juli_root_logger(
+    ctx: &mut dyn NativeContext,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     if ctx
         .class_name_arc_of_id(ctx.class_id_of_object(manager))
@@ -1075,7 +1093,10 @@ fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectR
     }
 }
 
-fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn get_or_create_tomcat_juli_logger(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
         return Ok(allocate_logger(ctx, "")?);
@@ -1431,7 +1452,10 @@ fn native_jboss_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// `LogContext.getLogger`, JBoss's own internal entry point — so this just
 /// wires the same allocation to the path real application/test code
 /// actually calls. Mirrors [`native_get_logger`]'s null-name NPE contract.
-fn native_get_jboss_manager_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_jboss_manager_logger(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // `getLogger(String)` — receiver in args[0], name in args[1].
     if jul_arg_is_null(args, 1) {
         return jul_throw_npe(JUL_NPE_NULL_KEY);
@@ -1503,7 +1527,9 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // deliberately outside the registry lock because it may allocate.
     let _mirror = crate::wildfly_core::get_logger(&name);
     let logger = ctx.read_native_pin(logger_pin, logger);
-    let mut reg = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let mut reg = logger_registry(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if reg.contains_key(&name) {
         ctx.unpin_native_roots(logger_pin);
         return Ok(Some(Value::Int(0)));
@@ -1590,7 +1616,12 @@ fn read_configuration_no_arg_impl(
         .or_else(|| {
             ctx.get_system_property("java.home")
                 .filter(|h| !h.trim().is_empty())
-                .map(|h| format!("{}/conf/logging.properties", h.trim_end_matches(['/', '\\'])))
+                .map(|h| {
+                    format!(
+                        "{}/conf/logging.properties",
+                        h.trim_end_matches(['/', '\\'])
+                    )
+                })
         });
     let Some(path) = path else {
         return Ok(None);
@@ -1668,7 +1699,9 @@ fn native_add_configuration_listener(
         .into());
     };
     let addr = listener.as_ptr() as u64;
-    let mut listeners = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let mut listeners = config_listeners(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if !listeners.contains(&addr) {
         listeners.push(addr);
     }
@@ -1691,7 +1724,9 @@ fn native_remove_configuration_listener(
         .into());
     };
     let addr = listener.as_ptr() as u64;
-    let mut listeners = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let mut listeners = config_listeners(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     listeners.retain(|&a| a != addr);
     Ok(None)
 }
@@ -1714,7 +1749,9 @@ fn fire_configuration_listeners(ctx: &mut dyn NativeContext) {
     // Snapshot under the lock and release it before any Java call: a listener
     // is free to call add/removeConfigurationListener, which would re-enter.
     let listeners: Vec<u64> = {
-        let guard = config_listeners(vm).lock().unwrap_or_else(|e| e.into_inner());
+        let guard = config_listeners(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if guard.is_empty() {
             return;
         }
@@ -1998,7 +2035,9 @@ fn native_get_logger_names(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     // registered against `CLS_LOGGER_ENUMERATION` so the standard JDK
     // Enumeration API works on this shape.
     let names: Vec<String> = {
-        let r = logger_registry(vm).lock().unwrap_or_else(|e| e.into_inner());
+        let r = logger_registry(vm)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         r.keys().cloned().collect()
     };
 
@@ -2234,7 +2273,10 @@ fn jboss_logger_registry(vm: usize) -> &'static Mutex<HashMap<String, u64>> {
 /// every caller was left holding a pre-move address -- the shape
 /// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
 /// forgetting the refresh a COMPILE ERROR instead of an audit finding.
-fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+fn attach_minimal_jboss_logger_node(
+    ctx: &mut dyn NativeContext,
+    logger: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let w5_pin = ctx.pin_native_root(*logger);
     let w5_out = attach_minimal_jboss_logger_node_body(ctx, *logger);
     *logger = ctx.read_native_pin(w5_pin, *logger);
@@ -2242,7 +2284,10 @@ fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: &mut Ob
     w5_out
 }
 
-fn attach_minimal_jboss_logger_node_body(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<(), MethodCallFailed> {
+fn attach_minimal_jboss_logger_node_body(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     // Some JIT/real-bytecode paths still execute JBoss Logger methods directly
     // before the native override gate can short-circuit them. Those methods all
     // start by dereferencing `this.loggerNode`. We do not model the full
@@ -2257,10 +2302,14 @@ fn attach_minimal_jboss_logger_node_body(ctx: &mut dyn NativeContext, logger: Ob
     Ok(())
 }
 
-fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn get_or_create_jboss_logger(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if !is_valid_logger_name(name) {
-        let mut obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
+        let mut obj =
+            try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
         let name_obj = ctx.create_string("");
         ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
         attach_minimal_jboss_logger_node(ctx, &mut obj)?;
@@ -2276,7 +2325,8 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
             }
         }
     }
-    let mut obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
+    let mut obj =
+        try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
     let name_obj = ctx.create_string(name);
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
@@ -3141,88 +3191,89 @@ fn native_jboss_logging_logger_do_logf(
         if let Some(rendered) = jboss_printf_format(ctx, &format, params_pin, params) {
             rendered
         } else {
-        let params = ctx.read_native_pin(params_pin, params);
-        let n = ctx.array_length(params);
-        // Snapshot and root every object element before invoking even the
-        // first `toString`. Keeping raw Values here made a later element stale
-        // whenever an earlier element's callback collected.
-        let elems: Vec<(Value, Option<usize>)> = (0..n)
-            .map(|i| {
-                let value = ctx.get_array_element(params, i);
-                let pin = match value {
-                    Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
-                    _ => None,
+            let params = ctx.read_native_pin(params_pin, params);
+            let n = ctx.array_length(params);
+            // Snapshot and root every object element before invoking even the
+            // first `toString`. Keeping raw Values here made a later element stale
+            // whenever an earlier element's callback collected.
+            let elems: Vec<(Value, Option<usize>)> = (0..n)
+                .map(|i| {
+                    let value = ctx.get_array_element(params, i);
+                    let pin = match value {
+                        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                        _ => None,
+                    };
+                    (value, pin)
+                })
+                .collect();
+            let mut param_strs: Vec<String> = Vec::with_capacity(n);
+            for (elem, elem_pin) in elems {
+                let elem = match (elem, elem_pin) {
+                    (Value::Object(Some(original)), Some(pin)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, original)))
+                    }
+                    (value, _) => value,
                 };
-                (value, pin)
-            })
-            .collect();
-        let mut param_strs: Vec<String> = Vec::with_capacity(n);
-        for (elem, elem_pin) in elems {
-            let elem = match (elem, elem_pin) {
-                (Value::Object(Some(original)), Some(pin)) => {
-                    Value::Object(Some(ctx.read_native_pin(pin, original)))
-                }
-                (value, _) => value,
-            };
-            let s = match elem {
-                Value::Object(Some(o)) => {
-                    if let Some(s) = ctx.read_string(o) {
-                        s
-                    } else {
-                        let cn = ctx
-                            .class_name_of_id(ctx.class_id_of_object(o))
-                            .unwrap_or_else(|| "?".to_string());
-                        let ts_result =
-                            ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]);
-                        match ts_result {
-                            Ok(Some(Value::Object(Some(sr)))) => {
-                                ctx.read_string(sr).unwrap_or_else(|| format!("{{{cn}}}"))
+                let s = match elem {
+                    Value::Object(Some(o)) => {
+                        if let Some(s) = ctx.read_string(o) {
+                            s
+                        } else {
+                            let cn = ctx
+                                .class_name_of_id(ctx.class_id_of_object(o))
+                                .unwrap_or_else(|| "?".to_string());
+                            let ts_result =
+                                ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]);
+                            match ts_result {
+                                Ok(Some(Value::Object(Some(sr)))) => {
+                                    ctx.read_string(sr).unwrap_or_else(|| format!("{{{cn}}}"))
+                                }
+                                _ => format!("{{{cn}}}"),
                             }
-                            _ => format!("{{{cn}}}"),
                         }
                     }
-                }
-                Value::Object(None) => "null".to_string(),
-                v => format!("{v:?}"),
-            };
-            param_strs.push(s);
-        }
-        let mut result = String::with_capacity(format.len() + 64);
-        let mut param_idx = 0usize;
-        let mut chars = format.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                result.push(c);
-                continue;
+                    Value::Object(None) => "null".to_string(),
+                    v => format!("{v:?}"),
+                };
+                param_strs.push(s);
             }
-            // Consume a whole `%[argument_index$][flags][width][.precision]c`
-            // spec. Anything that is not `%%` or `%n` consumes one parameter,
-            // even when we cannot reproduce its exact rendering -- keeping the
-            // cursor aligned matters more than the individual conversion.
-            let mut spec = String::new();
-            let mut conversion = None;
-            while let Some(&next) = chars.peek() {
-                chars.next();
-                if next.is_ascii_alphabetic() || next == '%' {
-                    conversion = Some(next);
-                    break;
+            let mut result = String::with_capacity(format.len() + 64);
+            let mut param_idx = 0usize;
+            let mut chars = format.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '%' {
+                    result.push(c);
+                    continue;
                 }
-                spec.push(next);
+                // Consume a whole `%[argument_index$][flags][width][.precision]c`
+                // spec. Anything that is not `%%` or `%n` consumes one parameter,
+                // even when we cannot reproduce its exact rendering -- keeping the
+                // cursor aligned matters more than the individual conversion.
+                let mut spec = String::new();
+                let mut conversion = None;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() || next == '%' {
+                        conversion = Some(next);
+                        break;
+                    }
+                    spec.push(next);
+                }
+                match conversion {
+                    Some('%') => result.push('%'),
+                    Some('n') => result.push('\n'),
+                    Some(_) => {
+                        result
+                            .push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
+                        param_idx += 1;
+                    }
+                    None => {
+                        result.push('%');
+                        result.push_str(&spec);
+                    }
+                }
             }
-            match conversion {
-                Some('%') => result.push('%'),
-                Some('n') => result.push('\n'),
-                Some(_) => {
-                    result.push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
-                    param_idx += 1;
-                }
-                None => {
-                    result.push('%');
-                    result.push_str(&spec);
-                }
-            }
-        }
-        result
+            result
         }
     } else {
         format
@@ -3731,7 +3782,9 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let handler_pin = ctx.pin_native_root(*handler);
     let name = read_jul_logger_name(ctx, *logger);
     let is_root = name.is_empty();
-    let mut all = logger_handlers(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = logger_handlers(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let handlers = all.entry(name).or_default();
     if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
         handlers.push(handler.as_ptr() as u64);
@@ -3808,7 +3861,9 @@ fn native_jul_logger_remove_handler(
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
-    let mut all = logger_handlers(vm).lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = logger_handlers(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(handlers) = all.get_mut(&name) {
         handlers.retain(|&addr| addr != handler.as_ptr() as u64);
     }
@@ -4138,8 +4193,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // uses. With no explicit level configured anywhere on the logger's
     // ancestry the threshold stays at the JDK root default of INFO, so the
     // default-quiet console behaviour this arm was written for is unchanged.
-    let level_value =
-        jul_standard_level_value(&level_name).unwrap_or(800);
+    let level_value = jul_standard_level_value(&level_name).unwrap_or(800);
     let console_threshold =
         jul_ancestor_explicit_level(ctx.vm_identity(), &logger_name).unwrap_or(800);
     let console_allows_fine = level_value >= console_threshold;
@@ -4468,7 +4522,10 @@ fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
 /// GC: the ancestor walk demand-creates loggers and therefore allocates, so
 /// callers MUST re-derive every reference they still hold — including `logger`
 /// itself — from its pin after this returns.
-fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn resolve_jul_handler_list(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if let Some(handlers) = crate::jul_logger_handlers_get(ctx, logger) {
         return Ok(Some(handlers));
     }
@@ -5328,7 +5385,9 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
     // which resolves a supplier for the throwable-carrying overloads.
     let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
     let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
-    let base_pin = this_pin.map(|(p, _)| p).or_else(|| level_pin.map(|(p, _)| p));
+    let base_pin = this_pin
+        .map(|(p, _)| p)
+        .or_else(|| level_pin.map(|(p, _)| p));
     // A supplier that THROWS propagates; `jul_resolve_msg` used to catch it
     // and log the supplier's `toString()` instead. Unpin on the way out —
     // an early `?` here would strand the roots pinned above.
@@ -7166,11 +7225,14 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::Value;
 
     static LOGF_SECOND_OLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -7344,7 +7406,8 @@ mod tests {
         reset_state_for_tests();
         let mut ctx = mock_ctx();
         let logger = allocate_logger(&mut ctx, "org.example.capture").unwrap();
-        let handler = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0).unwrap();
+        let handler =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0).unwrap();
         native_jul_logger_add_handler(
             &mut ctx,
             &[Value::Object(Some(logger)), Value::Object(Some(handler))],
@@ -7359,7 +7422,8 @@ mod tests {
             Some(1)
         );
 
-        let record = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5).unwrap();
+        let record =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5).unwrap();
         ctx.set_field(record, 1, Value::Long(42));
         log_record_messages()
             .lock()
@@ -7543,7 +7607,8 @@ mod tests {
             _ => panic!(),
         };
         // Build a Logger manually.
-        let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
+        let logger =
+            try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
         let name_obj = ctx.create_string("dup.logger");
         ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
 
@@ -7633,7 +7698,9 @@ mod tests {
             "foo\tbar",
             "foo\u{0000}bar",
         ] {
-            let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
+            let logger =
+                try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS)
+                    .unwrap();
             let name_obj = ctx.create_string(bad);
             ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
             let r = native_add_logger(
@@ -8086,7 +8153,10 @@ mod tests {
     /// `LogContext` singleton, and every attachment receiver/key/value).
     fn cached_addrs_snapshot() -> Vec<u64> {
         let mut v = Vec::new();
-        if let Some(a) = *singleton_cell(TEST_VM).lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(a) = *singleton_cell(TEST_VM)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             v.push(a);
         }
         if let Some(a) = *jboss_log_context_singleton(TEST_VM)
@@ -8144,8 +8214,12 @@ mod tests {
         )
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
-        let recv =
-            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let recv = try_alloc_concurrent_synthetic(
+            &mut ctx,
+            "org/jboss/logmanager/Logger",
+            LOGGER_NUM_FIELDS,
+        )
+        .unwrap();
         let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
@@ -8196,8 +8270,12 @@ mod tests {
         )
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
-        let recv =
-            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let recv = try_alloc_concurrent_synthetic(
+            &mut ctx,
+            "org/jboss/logmanager/Logger",
+            LOGGER_NUM_FIELDS,
+        )
+        .unwrap();
         let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
@@ -8214,8 +8292,7 @@ mod tests {
         // non-overlapping synthetic "relocated" address.
         let old_addrs = cached_addrs_snapshot();
         assert!(!old_addrs.is_empty());
-        let mut pointer_map: cratonvm_types::PointerMap =
-            cratonvm_types::PointerMap::default();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // Use a high base so the synthetic targets never collide with a
         // real old address (which would make the assertion ambiguous).
         let base: usize = 0x1_0000_0000_0000;

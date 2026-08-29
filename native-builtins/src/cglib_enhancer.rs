@@ -395,7 +395,12 @@ fn build_fastclass_placeholder(name: &str) -> Vec<u8> {
     let init_desc_idx = cw.add_utf8("()V");
     let code_attr_name_idx = cw.add_utf8("Code");
     let super_init_ref = cw.add_methodref(super_class_idx, "<init>", "()V");
-    let ctor = emit_default_ctor(init_name_idx, init_desc_idx, code_attr_name_idx, super_init_ref);
+    let ctor = emit_default_ctor(
+        init_name_idx,
+        init_desc_idx,
+        code_attr_name_idx,
+        super_init_ref,
+    );
     const ACC_PUBLIC: u16 = 0x0001;
     const ACC_SUPER: u16 = 0x0020;
     cw.finish(
@@ -459,7 +464,14 @@ fn emit_ctor_for_descriptor(
         .map(|p| if p == "J" || p == "D" { 2 } else { 1 })
         .sum::<u16>();
 
-    wrap_method(init_name_idx, desc_idx, code_attr_name_idx, &code, max_stack, slot)
+    wrap_method(
+        init_name_idx,
+        desc_idx,
+        code_attr_name_idx,
+        &code,
+        max_stack,
+        slot,
+    )
 }
 
 /// Emit a no-op `public static CGLIB$SET_STATIC_CALLBACKS([Lorg/springframework
@@ -480,7 +492,11 @@ fn emit_ctor_for_descriptor(
 /// `Callback` objects -- so both setters are legitimately no-ops here;
 /// their only job is to satisfy this reflective "is this class enhanced"
 /// check.
-fn emit_noop_callback_setter(cw: &mut ClassWriter, name_idx: u16, code_attr_name_idx: u16) -> Vec<u8> {
+fn emit_noop_callback_setter(
+    cw: &mut ClassWriter,
+    name_idx: u16,
+    code_attr_name_idx: u16,
+) -> Vec<u8> {
     let desc_idx = cw.add_utf8("([Lorg/springframework/cglib/proxy/Callback;)V");
     let code: [u8; 1] = [0xB1]; // return
     let mut method = Vec::new();
@@ -611,7 +627,11 @@ struct BeanMethod {
 /// `getClass()` round-trip just to reformat a name we already have).
 fn simple_name_of_internal(internal: &str) -> String {
     let after_slash = internal.rsplit('/').next().unwrap_or(internal);
-    after_slash.rsplit('$').next().unwrap_or(after_slash).to_string()
+    after_slash
+        .rsplit('$')
+        .next()
+        .unwrap_or(after_slash)
+        .to_string()
 }
 
 /// Shared constant-pool refs for `emit_bean_override`'s type-mismatch
@@ -1171,7 +1191,7 @@ fn emit_bean_override(
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&2u16.to_be_bytes()); // exception_table_length
-    // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
+                                                      // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
     code_attr.extend_from_slice(&try2_start.to_be_bytes());
     code_attr.extend_from_slice(&try2_end.to_be_bytes());
     code_attr.extend_from_slice(&handler_pc2.to_be_bytes());
@@ -1270,7 +1290,10 @@ fn emit_public_static_field(name_idx: u16, descriptor_idx: u16) -> Vec<u8> {
 /// calls them, they exist purely so an incidental `instanceof`/cast from
 /// OTHER real cglib machinery that mistakes this class for its own
 /// doesn't blow up.
-fn emit_cglib_factory_interface_methods(cw: &mut ClassWriter, code_attr_name_idx: u16) -> Vec<Vec<u8>> {
+fn emit_cglib_factory_interface_methods(
+    cw: &mut ClassWriter,
+    code_attr_name_idx: u16,
+) -> Vec<Vec<u8>> {
     let callback_desc = "Lorg/springframework/cglib/proxy/Callback;";
     let callback_arr_desc = "[Lorg/springframework/cglib/proxy/Callback;";
     let object_desc = "Ljava/lang/Object;";
@@ -1281,13 +1304,27 @@ fn emit_cglib_factory_interface_methods(cw: &mut ClassWriter, code_attr_name_idx
     {
         let name_idx = cw.add_utf8("newInstance");
         let desc_idx = cw.add_utf8(&format!("({callback_desc}){object_desc}"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0x01, 0xB0],
+            1,
+            2,
+        ));
     }
     // Object newInstance(Callback[])
     {
         let name_idx = cw.add_utf8("newInstance");
         let desc_idx = cw.add_utf8(&format!("({callback_arr_desc}){object_desc}"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0x01, 0xB0],
+            1,
+            2,
+        ));
     }
     // Object newInstance(Class[], Object[], Callback[])
     {
@@ -1295,31 +1332,66 @@ fn emit_cglib_factory_interface_methods(cw: &mut ClassWriter, code_attr_name_idx
         let desc_idx = cw.add_utf8(&format!(
             "([Ljava/lang/Class;[Ljava/lang/Object;{callback_arr_desc}){object_desc}"
         ));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 4));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0x01, 0xB0],
+            1,
+            4,
+        ));
     }
     // Callback getCallback(int)
     {
         let name_idx = cw.add_utf8("getCallback");
         let desc_idx = cw.add_utf8(&format!("(I){callback_desc}"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0x01, 0xB0],
+            1,
+            2,
+        ));
     }
     // void setCallback(int, Callback)
     {
         let name_idx = cw.add_utf8("setCallback");
         let desc_idx = cw.add_utf8(&format!("(I{callback_desc})V"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0xB1], 0, 3));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0xB1],
+            0,
+            3,
+        ));
     }
     // Callback[] getCallbacks()
     {
         let name_idx = cw.add_utf8("getCallbacks");
         let desc_idx = cw.add_utf8(&format!("(){callback_arr_desc}"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 1));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0x01, 0xB0],
+            1,
+            1,
+        ));
     }
     // void setCallbacks(Callback[])
     {
         let name_idx = cw.add_utf8("setCallbacks");
         let desc_idx = cw.add_utf8(&format!("({callback_arr_desc})V"));
-        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0xB1], 0, 2));
+        methods.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &[0xB1],
+            0,
+            2,
+        ));
     }
 
     methods
@@ -1373,9 +1445,10 @@ impl Asm {
     fn finish(mut self) -> Vec<u8> {
         for (at, label) in &self.fixups {
             let opcode_addr = *at as i32 - 1;
-            let target = *self.labels.get(label).unwrap_or_else(|| {
-                panic!("emit_bean_override_with_args: unresolved label {label}")
-            }) as i32;
+            let target =
+                *self.labels.get(label).unwrap_or_else(|| {
+                    panic!("emit_bean_override_with_args: unresolved label {label}")
+                }) as i32;
             let offset = (target - opcode_addr) as i16;
             let bytes = offset.to_be_bytes();
             self.code[*at] = bytes[0];
@@ -1834,7 +1907,7 @@ fn emit_bean_override_with_args(
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&2u16.to_be_bytes()); // exception_table_length
-    // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
+                                                      // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
     code_attr.extend_from_slice(&try2_start.to_be_bytes());
     code_attr.extend_from_slice(&try2_end.to_be_bytes());
     code_attr.extend_from_slice(&handler_pc2.to_be_bytes());
@@ -1917,7 +1990,15 @@ fn build_enhancer_class(
     };
     let mut methods: Vec<Vec<u8>> = ctor_descs
         .iter()
-        .map(|d| emit_ctor_for_descriptor(&mut cw, init_name_idx, code_attr_name_idx, super_class_idx, d))
+        .map(|d| {
+            emit_ctor_for_descriptor(
+                &mut cw,
+                init_name_idx,
+                code_attr_name_idx,
+                super_class_idx,
+                d,
+            )
+        })
         .collect();
 
     let set_bean_factory = emit_set_bean_factory(
@@ -1929,10 +2010,21 @@ fn build_enhancer_class(
     methods.push(set_bean_factory);
 
     let set_static_callbacks_name_idx = cw.add_utf8("CGLIB$SET_STATIC_CALLBACKS");
-    methods.push(emit_noop_callback_setter(&mut cw, set_static_callbacks_name_idx, code_attr_name_idx));
+    methods.push(emit_noop_callback_setter(
+        &mut cw,
+        set_static_callbacks_name_idx,
+        code_attr_name_idx,
+    ));
     let set_thread_callbacks_name_idx = cw.add_utf8("CGLIB$SET_THREAD_CALLBACKS");
-    methods.push(emit_noop_callback_setter(&mut cw, set_thread_callbacks_name_idx, code_attr_name_idx));
-    methods.extend(emit_cglib_factory_interface_methods(&mut cw, code_attr_name_idx));
+    methods.push(emit_noop_callback_setter(
+        &mut cw,
+        set_thread_callbacks_name_idx,
+        code_attr_name_idx,
+    ));
+    methods.extend(emit_cglib_factory_interface_methods(
+        &mut cw,
+        code_attr_name_idx,
+    ));
 
     let field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
     // Real-cglib-bookkeeping fields — see `emit_public_static_field`'s doc
@@ -1944,9 +2036,11 @@ fn build_enhancer_class(
     let callback_filter_name_idx = cw.add_utf8("CGLIB$CALLBACK_FILTER");
     let callback_filter_field = emit_public_static_field(callback_filter_name_idx, object_desc_idx);
     let thread_callbacks_name_idx = cw.add_utf8("CGLIB$THREAD_CALLBACKS");
-    let thread_callbacks_field = emit_public_static_field(thread_callbacks_name_idx, object_desc_idx);
+    let thread_callbacks_field =
+        emit_public_static_field(thread_callbacks_name_idx, object_desc_idx);
     let static_callbacks_name_idx = cw.add_utf8("CGLIB$STATIC_CALLBACKS");
-    let static_callbacks_field = emit_public_static_field(static_callbacks_name_idx, object_desc_idx);
+    let static_callbacks_field =
+        emit_public_static_field(static_callbacks_name_idx, object_desc_idx);
     let bound_name_idx = cw.add_utf8("CGLIB$BOUND");
     let bool_desc_idx = cw.add_utf8("Z");
     let bound_field = emit_public_static_field(bound_name_idx, bool_desc_idx);
@@ -2063,11 +2157,7 @@ fn build_enhancer_class(
                 "append",
                 "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
             ),
-            sb_tostring_ref: cw.add_methodref(
-                mismatch_sb_cls,
-                "toString",
-                "()Ljava/lang/String;",
-            ),
+            sb_tostring_ref: cw.add_methodref(mismatch_sb_cls, "toString", "()Ljava/lang/String;"),
             object_equals_ref: cw.add_methodref(
                 mismatch_object_cls,
                 "equals",
@@ -2089,7 +2179,8 @@ fn build_enhancer_class(
                 "<init>",
                 "(Ljava/lang/String;)V",
             ),
-            nsbde_cls: cw.add_class("org/springframework/beans/factory/NoSuchBeanDefinitionException"),
+            nsbde_cls: cw
+                .add_class("org/springframework/beans/factory/NoSuchBeanDefinitionException"),
             get_merged_bd_ref: cw.add_interface_methodref(
                 configurable_bf_cast_idx,
                 "getMergedBeanDefinition",
@@ -2102,7 +2193,8 @@ fn build_enhancer_class(
             ),
             lit_bean_method_prefix: cw.add_string("@Bean method "),
             lit_called_as: cw.add_string(" called as bean reference for type ["),
-            lit_overridden_by: cw.add_string("] but overridden by non-compatible bean instance of type ["),
+            lit_overridden_by: cw
+                .add_string("] but overridden by non-compatible bean instance of type ["),
             lit_close_bracket_dot: cw.add_string("]."),
             lit_overriding_bean: cw.add_string(" Overriding bean of same name declared in: "),
         };
@@ -2882,7 +2974,11 @@ pub fn build_replace_override_subclass(
     let bf_field_name_idx = cw.add_utf8("$$beanFactory");
     let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
     let bf_field_ref = cw.add_fieldref(
-        if own_bean_factory_field { this_class_idx } else { super_class_idx },
+        if own_bean_factory_field {
+            this_class_idx
+        } else {
+            super_class_idx
+        },
         "$$beanFactory",
         "Ljava/lang/Object;",
     );
@@ -3206,7 +3302,11 @@ pub fn build_replace_override_subclass(
     }
 
     let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
-    let fields: &[Vec<u8>] = if own_bean_factory_field { &[bf_field] } else { &[] };
+    let fields: &[Vec<u8>] = if own_bean_factory_field {
+        &[bf_field]
+    } else {
+        &[]
+    };
     let bytes = cw.finish(
         access_flags,
         this_class_idx,
@@ -4111,9 +4211,7 @@ fn relies_on_package_visibility(
     // (expensive) `@Bean` annotation walk is worth doing for those alone.
     let hidden: Vec<(String, String)> = methods
         .iter()
-        .filter(|m| {
-            m.name != "<init>" && m.name != "<clinit>" && m.access_flags & VISIBLE == 0
-        })
+        .filter(|m| m.name != "<init>" && m.name != "<clinit>" && m.access_flags & VISIBLE == 0)
         .map(|m| (m.name.clone(), m.descriptor.clone()))
         .collect();
     hidden
@@ -4423,8 +4521,12 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // isolation (one loader, no collision) and failed 100% deterministically in
     // the full 40-method class run.
     let mut attempt = 0u32;
-    let (mut new_name, mut bytes) =
-        build_enhancer_class(define_loader_id, &super_name, &bean_methods, &ctor_descriptors);
+    let (mut new_name, mut bytes) = build_enhancer_class(
+        define_loader_id,
+        &super_name,
+        &bean_methods,
+        &ctor_descriptors,
+    );
 
     let (cid, new_name, bytes_arc) = loop {
         let opts = DefineClassFull {
@@ -4787,7 +4889,11 @@ fn build_factory_bean_subclass_wrapper(
         cur = ctx.superclass_of(cid);
     }
     let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
-    ctx.set_field_by_name(new_obj, "$$fbBeanFactory", Value::Object(Some(bean_factory)));
+    ctx.set_field_by_name(
+        new_obj,
+        "$$fbBeanFactory",
+        Value::Object(Some(bean_factory)),
+    );
 
     let name_str = ctx.create_string(bean_name);
     let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
@@ -5075,8 +5181,13 @@ fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -
     let raw_factory = ctx.read_native_pin(pin_base, raw_factory);
     let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
     ctx.unpin_native_roots(pin_base);
-    let subclass_result =
-        build_factory_bean_subclass_wrapper(ctx, concrete_cid, raw_factory, bean_factory, &bean_name);
+    let subclass_result = build_factory_bean_subclass_wrapper(
+        ctx,
+        concrete_cid,
+        raw_factory,
+        bean_factory,
+        &bean_name,
+    );
     if crate::nbflags().dbg_fbref {
         let class_name = subclass_result.map(|o| ctx.class_name_of_id(ctx.class_id_of_object(o)));
         eprintln!(
@@ -5085,8 +5196,7 @@ fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -
             class_name
         );
     }
-    match subclass_result
-    {
+    match subclass_result {
         Some(wrapped) => Ok(Some(Value::Object(Some(wrapped)))),
         None => Ok(Some(Value::Object(Some(raw_factory)))),
     }
@@ -5140,9 +5250,12 @@ pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod fb_ref_bytecode_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Structural regression guard for `emit_bean_override`'s `fb_ref`
     /// byte-splice: build one FactoryBean-typed and one plain `@Bean`
@@ -5191,7 +5304,8 @@ mod fb_ref_bytecode_tests {
             .expect("factoryBean method present")
             .clone();
         for a in plain.attributes.iter_mut() {
-            a.decode(&class_file.constant_pool).expect("decode plainBean Code");
+            a.decode(&class_file.constant_pool)
+                .expect("decode plainBean Code");
         }
         for a in factory.attributes.iter_mut() {
             a.decode(&class_file.constant_pool)
@@ -5274,7 +5388,8 @@ mod fb_ref_bytecode_tests {
                 .unwrap_or_else(|| panic!("missing field {name}"));
             assert_eq!(&*f.descriptor, descriptor, "{name} has wrong descriptor");
             assert!(
-                f.access_flags.contains(cratonvm_reader::class_access_flags::FieldAccessFlags::PUBLIC)
+                f.access_flags
+                    .contains(cratonvm_reader::class_access_flags::FieldAccessFlags::PUBLIC)
                     && f.is_static(),
                 "{name} must be public static"
             );
@@ -5296,11 +5411,19 @@ mod fb_ref_bytecode_tests {
         let callback_desc = "Lorg/springframework/cglib/proxy/Callback;";
         let callback_arr_desc = "[Lorg/springframework/cglib/proxy/Callback;";
         for (name, desc) in [
-            ("newInstance", format!("({callback_desc})Ljava/lang/Object;")),
-            ("newInstance", format!("({callback_arr_desc})Ljava/lang/Object;")),
             (
                 "newInstance",
-                format!("([Ljava/lang/Class;[Ljava/lang/Object;{callback_arr_desc})Ljava/lang/Object;"),
+                format!("({callback_desc})Ljava/lang/Object;"),
+            ),
+            (
+                "newInstance",
+                format!("({callback_arr_desc})Ljava/lang/Object;"),
+            ),
+            (
+                "newInstance",
+                format!(
+                    "([Ljava/lang/Class;[Ljava/lang/Object;{callback_arr_desc})Ljava/lang/Object;"
+                ),
             ),
             ("getCallback", format!("(I){callback_desc}")),
             ("setCallback", format!("(I{callback_desc})V")),

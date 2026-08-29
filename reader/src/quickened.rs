@@ -404,9 +404,7 @@ fn build_start_index(starts_pcs: &[u32]) -> Option<Box<[PcBlock]>> {
 /// Is `CRATONVM_QUICKEN_STATS` set? Read once — this gates a diagnostic only.
 fn stats_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_QUICKEN_STATS").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_QUICKEN_STATS").is_some())
 }
 
 /// Print the running footprint of the quickened streams to stderr.
@@ -417,13 +415,21 @@ pub fn report_stats() {
     let (methods, ops, bytes, code_bytes, unq) = quicken_stats();
     let (index_bytes, no_index, truncated) = quicken_index_stats();
     let per_method = if methods > 0 { bytes / methods } else { 0 };
-    let per_insn = if ops > 0 { bytes as f64 / ops as f64 } else { 0.0 };
+    let per_insn = if ops > 0 {
+        bytes as f64 / ops as f64
+    } else {
+        0.0
+    };
     let per_code_byte = if code_bytes > 0 {
         bytes as f64 / code_bytes as f64
     } else {
         0.0
     };
-    let index_per_method = if methods > 0 { index_bytes / methods } else { 0 };
+    let index_per_method = if methods > 0 {
+        index_bytes / methods
+    } else {
+        0
+    };
     eprintln!(
         "[quicken] methods={methods} insns={ops} stream_bytes={bytes} \
 bytecode_bytes={code_bytes} unquickenable={unq} truncated={truncated} \
@@ -555,7 +561,7 @@ mod tests {
         b.push(0x07);
         b.push(0x60); // 14: iadd
         b.push(0x3c); // 15: istore_1
-        // 16: tableswitch (pc 16, next byte 17 -> pad to 20)
+                      // 16: tableswitch (pc 16, next byte 17 -> pad to 20)
         b.push(0xaa);
         while b.len() % 4 != 0 {
             b.push(0);
@@ -834,7 +840,10 @@ mod tests {
         let code = padded(body);
         let q = QuickenedCode::build(&code).expect("quickenable");
         assert!(q.has_dense_index());
-        assert_eq!(q.index_of_pc_direct(MAX_DENSE_START_PC), Some(MAX_DENSE_START_PC));
+        assert_eq!(
+            q.index_of_pc_direct(MAX_DENSE_START_PC),
+            Some(MAX_DENSE_START_PC)
+        );
         assert_eq!(*q.op(MAX_DENSE_START_PC), Instruction::Return);
     }
 
@@ -871,7 +880,10 @@ mod tests {
         assert!(q.index_bytes() > 0);
         assert_eq!(q.index_bytes() % std::mem::size_of::<PcBlock>(), 0);
         let floor = q.index_bytes() + q.len() * std::mem::size_of::<Instruction>();
-        assert!(q.heap_bytes() >= floor, "heap_bytes must include the dense index");
+        assert!(
+            q.heap_bytes() >= floor,
+            "heap_bytes must include the dense index"
+        );
     }
 
     #[test]

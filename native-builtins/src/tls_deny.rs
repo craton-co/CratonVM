@@ -278,11 +278,14 @@ pub(crate) fn deny_plaintext_fallback(
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Allocate an object whose runtime class is `name`.
     fn obj_of_class(ctx: &mut MockNativeContext, name: &str) -> ObjectRef {
@@ -558,7 +561,8 @@ mod tests {
         ];
         for d in socket_descs {
             assert!(
-                r.find("javax/net/SocketFactory", "createSocket", d).is_some(),
+                r.find("javax/net/SocketFactory", "createSocket", d)
+                    .is_some(),
                 "plaintext base lost {d} — update this test and the allowlists"
             );
             assert!(

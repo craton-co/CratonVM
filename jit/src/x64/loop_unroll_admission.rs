@@ -588,7 +588,10 @@ fn the_rewriter_is_off_by_default_and_armed_per_thread() {
             .expect("probe thread");
         assert!(!elsewhere, "the opt-in leaked to another thread");
     }
-    assert!(!bytecode_loop_xform_rewrites_bytecode(), "guard must disarm");
+    assert!(
+        !bytecode_loop_xform_rewrites_bytecode(),
+        "guard must disarm"
+    );
 }
 
 #[test]
@@ -606,7 +609,10 @@ fn planning_refuses_unless_armed() {
     // compile-time trip count is `[0, i32::MAX]` and the planner will not
     // duplicate four bodies without a runtime check that they are reached;
     // the failing edge runs an untouched copy of the loop.
-    let v = x.versioning.as_ref().expect("the accum fixture is versioned");
+    let v = x
+        .versioning
+        .as_ref()
+        .expect("the accum fixture is versioned");
     assert_eq!(
         v.guard,
         crate::scev::PreheaderGuard::TripCountAtLeast {
@@ -854,7 +860,11 @@ fn the_pgo_hint_sets_the_factor_exactly_as_the_native_unroller_does() {
             minimum: 2,
         })
     );
-    assert_eq!(x.code_len, 21 + 5 + 12 + 15, "guard + 2 copies + the fallback");
+    assert_eq!(
+        x.code_len,
+        21 + 5 + 12 + 15,
+        "guard + 2 copies + the fallback"
+    );
     // A degenerate factor is refused, not underflowed — and, matching the
     // native unroller, does NOT fall back to the static heuristic.
     for factor in [0usize, 1] {
@@ -924,7 +934,9 @@ fn replication_lifts_every_site_once_per_copy() {
         let l5 = replicate_pc5(&x, five);
         assert_eq!(l5.len(), 1 + (k + 1), "k={k}");
         assert!(
-            l5.iter().filter(|e| e.4).all(|e| (e.1, e.2, e.3) == (4, 5, 6)),
+            l5.iter()
+                .filter(|e| e.4)
+                .all(|e| (e.1, e.2, e.3) == (4, 5, 6)),
             "k={k}: replicate_pc5 must clone the payload verbatim"
         );
     }
@@ -998,8 +1010,7 @@ fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
     // entered only by fall-through and its own back edge, so the pre-header
     // the hoists need is reachable on every entry to it.
     let out_loops = detect_loops(&x.code, x.code_len);
-    let bypass =
-        find_bypassable_loop_headers(&x.code, x.code_len, &out_loops, &x.exception_ranges);
+    let bypass = find_bypassable_loop_headers(&x.code, x.code_len, &out_loops, &x.exception_ranges);
     let fast_steady = x.fast_base() + x.copies * x.body_len;
     assert!(
         out_loops.contains(&(fast_steady, x.fast_back_edge_pc())),
@@ -1114,7 +1125,11 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
         "unarmed, the indy trap records its own pc as its bci",
     );
     for p in &plain.deopt_points {
-        assert!(boundaries.contains(&p.bci), "unarmed: bci {} is not an instruction", p.bci);
+        assert!(
+            boundaries.contains(&p.bci),
+            "unarmed: bci {} is not an instruction",
+            p.bci
+        );
     }
 
     tally.reset();
@@ -1163,7 +1178,10 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
     );
     for &bci in &applied.osr_exit_points {
         // Cast: bci fits u32
-        assert!(boundaries.contains(&(bci as u32)), "osr exit bci {bci} is an output pc");
+        assert!(
+            boundaries.contains(&(bci as u32)),
+            "osr exit bci {bci} is an output pc"
+        );
     }
     {
         let mut seen = std::collections::HashSet::new();
@@ -1271,7 +1289,11 @@ fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
     // consumer takes ON TRUST. `reason` is the grouping key, so the field that
     // can actually differ under one key is one of the others.
     let other_pc = body_pc + x.body_len;
-    assert_eq!(x.bci_at(other_pc), Some(body_bci), "same bytecode, next copy");
+    assert_eq!(
+        x.bci_at(other_pc),
+        Some(body_bci),
+        "same bytecode, next copy"
+    );
     let mut conflicts = test_deopt_point(body_bci as u32);
     conflicts.speculation_id = 7;
     assert_eq!(conflicts.reason, point(body_bci).reason, "same group");
@@ -1313,13 +1335,8 @@ fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
     let mut untyped = test_deopt_point(body_bci as u32);
     untyped.frame_state.locals = vec![crate::deopt::FrameValue::Register(12)];
     assert!(
-        rewritten_deopt_points_are_publishable(
-            &x,
-            &[retyped, untyped],
-            &[body_pc, other_pc],
-            21,
-        )
-        .is_ok(),
+        rewritten_deopt_points_are_publishable(&x, &[retyped, untyped], &[body_pc, other_pc], 21,)
+            .is_ok(),
         "a slot-kind divergence is counted, not refused",
     );
 
@@ -1398,7 +1415,11 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
     );
 
     let rebuilt = x.rebuild_pc_to_native(out_osr, 21);
-    assert_eq!(rebuilt.len(), 22, "one slot per interpreter bci, plus the end");
+    assert_eq!(
+        rebuilt.len(),
+        22,
+        "one slot per interpreter bci, plus the end"
+    );
     // Versioning has no back-edge gap: the fallback is a full image of the
     // region, so every INSTRUCTION in it keeps an entry — including the
     // back edge itself, where a plain 4x unroll answers `-1` because its
@@ -1465,7 +1486,11 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
     // and not about whatever the emitter happened to place where.
     let synthetic: Vec<i32> = (0..80).collect();
     let rebuilt = x.rebuild_pc_to_native(&synthetic, 21);
-    assert_eq!(rebuilt.len(), 22, "one slot per interpreter bci, plus the end");
+    assert_eq!(
+        rebuilt.len(),
+        22,
+        "one slot per interpreter bci, plus the end"
+    );
     assert!(rebuilt[4] >= 0, "the loop header stays OSR-enterable");
     for gap in 16..19 {
         assert_eq!(
@@ -1501,8 +1526,8 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
     // disables the native byte-copy unroller, so "the code length changed"
     // does not prove a bytecode transform happened. `loop_xform_applied` is
     // what proves it.
-    let baseline = compile_accum_fixture()
-        .expect("the helper-free fixture must compile on the default path");
+    let baseline =
+        compile_accum_fixture().expect("the helper-free fixture must compile on the default path");
     let tally = crate::metrics::LoopXformCapture::start();
     let armed = {
         let _armed = Armed::new();
@@ -1522,7 +1547,11 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
         .osr_pc_to_native
         .as_ref()
         .expect("the armed artifact publishes OSR entries");
-    assert_eq!(base_osr.len(), 22, "baseline: one slot per bci, plus the end");
+    assert_eq!(
+        base_osr.len(),
+        22,
+        "baseline: one slot per bci, plus the end"
+    );
     assert_eq!(
         armed_osr.len(),
         22,

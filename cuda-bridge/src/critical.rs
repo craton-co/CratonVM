@@ -175,13 +175,19 @@ pub fn default_token_lease() -> Duration {
 /// setting the environment variable after startup. Production never calls
 /// this.
 pub fn set_collector_wait_budget(d: Duration) {
-    COLLECTOR_WAIT_MS.store(d.as_millis().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    COLLECTOR_WAIT_MS.store(
+        d.as_millis().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
 }
 
 /// Set the default token lease programmatically. Tests only — see
 /// [`set_collector_wait_budget`].
 pub fn set_default_token_lease(d: Duration) {
-    TOKEN_LEASE_MS.store(d.as_millis().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    TOKEN_LEASE_MS.store(
+        d.as_millis().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +752,10 @@ impl std::fmt::Display for CriticalSectionReport {
             r.longest_held_nanos as f64 / 1.0e6,
         )?;
         if r.tokens_reaped == 0 && r.tokens_reaped_at_shutdown == 0 {
-            writeln!(f, "[GPU] critical leaks: none — every token was released by its holder")?;
+            writeln!(
+                f,
+                "[GPU] critical leaks: none — every token was released by its holder"
+            )?;
         } else {
             writeln!(
                 f,
@@ -937,7 +946,9 @@ impl Registry {
             this.outstanding.store(live.len() as u32, Ordering::Release);
         }
         this.mirror_add();
-        this.counters.tokens_acquired.fetch_add(1, Ordering::Relaxed);
+        this.counters
+            .tokens_acquired
+            .fetch_add(1, Ordering::Relaxed);
         CriticalToken {
             id,
             registry: Arc::clone(registry),
@@ -967,7 +978,9 @@ impl Registry {
         self.mirror_sub(1);
         self.counters.bump_max(rec.acquired_at.elapsed());
         if cause.is_voluntary() {
-            self.counters.tokens_released.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .tokens_released
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -994,7 +1007,10 @@ impl Registry {
     /// cycles and a diff of two collections is readable.
     pub fn outstanding_keepalive_addrs(&self) -> Vec<usize> {
         let live = self.live();
-        let mut out: Vec<usize> = live.values().flat_map(|r| r.keepalive.iter().copied()).collect();
+        let mut out: Vec<usize> = live
+            .values()
+            .flat_map(|r| r.keepalive.iter().copied())
+            .collect();
         out.sort_unstable();
         out.dedup();
         out
@@ -1092,7 +1108,9 @@ impl Registry {
                 .map(|(id, _)| *id)
                 .collect();
             for id in expired {
-                let Some(rec) = live.remove(&id) else { continue };
+                let Some(rec) = live.remove(&id) else {
+                    continue;
+                };
                 rec.revoked.store(true, Ordering::Release);
                 reaped.push(TokenFacts {
                     id,
@@ -1151,7 +1169,9 @@ impl Registry {
                 .map(|(id, _)| *id)
                 .collect();
             for id in owned {
-                let Some(rec) = live.remove(&id) else { continue };
+                let Some(rec) = live.remove(&id) else {
+                    continue;
+                };
                 rec.revoked.store(true, Ordering::Release);
                 reaped.push(TokenFacts {
                     id,
@@ -1224,18 +1244,22 @@ impl Registry {
             if self.outstanding.load(Ordering::Acquire) == 0 {
                 let waited = start.elapsed();
                 self.counters.waits_drained.fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .wait_nanos
-                    .fetch_add(waited.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                self.counters.wait_nanos.fetch_add(
+                    waited.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
                 return WaitOutcome::Drained { waited };
             }
 
             let waited = start.elapsed();
             if waited >= budget {
-                self.counters.waits_timed_out.fetch_add(1, Ordering::Relaxed);
                 self.counters
-                    .wait_nanos
-                    .fetch_add(waited.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                    .waits_timed_out
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.wait_nanos.fetch_add(
+                    waited.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
                 return self.timed_out(waited);
             }
 
@@ -1310,9 +1334,7 @@ impl Registry {
             waits_drained: c.waits_drained.load(Ordering::Relaxed),
             waits_timed_out: c.waits_timed_out.load(Ordering::Relaxed),
             wait_nanos: c.wait_nanos.load(Ordering::Relaxed),
-            forced_non_moving_collections: c
-                .forced_non_moving_collections
-                .load(Ordering::Relaxed),
+            forced_non_moving_collections: c.forced_non_moving_collections.load(Ordering::Relaxed),
         }
     }
 
@@ -1596,7 +1618,10 @@ mod tests {
         let outcome = reg.wait_for_drain(budget);
         let elapsed = started.elapsed();
 
-        assert!(!outcome.drained(), "a stalled token must not report drained");
+        assert!(
+            !outcome.drained(),
+            "a stalled token must not report drained"
+        );
         assert!(
             !outcome.may_relocate(),
             "a timeout must never authorize relocation",
@@ -1746,7 +1771,10 @@ mod tests {
         )
         .expect("dispatch itself succeeds; it is the completion that never arrives");
 
-        assert!(reg.facts(id).is_some(), "the token is live right after dispatch");
+        assert!(
+            reg.facts(id).is_some(),
+            "the token is live right after dispatch"
+        );
         assert_eq!(reg.outstanding(), 1);
 
         std::thread::sleep(Duration::from_millis(5));
@@ -1758,7 +1786,9 @@ mod tests {
         );
         let reaped = reg.reaped_tokens();
         assert!(
-            reaped.iter().any(|f| f.id == id && f.owner.submission == Some(404)),
+            reaped
+                .iter()
+                .any(|f| f.id == id && f.owner.submission == Some(404)),
             "the reap log must name the abandoned submission: {reaped:?}",
         );
     }
@@ -1777,7 +1807,10 @@ mod tests {
             reg.reap_expired();
         }
         assert_eq!(reg.reaped_tokens().len(), REAP_LOG_CAPACITY);
-        assert_eq!(reg.metrics_raw().tokens_reaped, (REAP_LOG_CAPACITY * 2) as u64);
+        assert_eq!(
+            reg.metrics_raw().tokens_reaped,
+            (REAP_LOG_CAPACITY * 2) as u64
+        );
     }
 
     // ── 4. Concurrency ──────────────────────────────────────────────────
@@ -1853,7 +1886,12 @@ mod tests {
         assert!(reg.bind_mirror(mirror));
         assert!(!reg.bind_mirror(mirror), "binding twice must be refused");
 
-        let t = reg.acquire_with(owner("leaky"), Duration::ZERO, Relocation::KeepAliveOnly, &[]);
+        let t = reg.acquire_with(
+            owner("leaky"),
+            Duration::ZERO,
+            Relocation::KeepAliveOnly,
+            &[],
+        );
         std::mem::forget(t);
         assert_eq!(mirror.load(Ordering::Acquire), 1);
         assert_eq!(reg.reap_expired().len(), 1);
@@ -1884,7 +1922,10 @@ mod tests {
             if !outcome.may_relocate() {
                 // This is the collector's documented expiry behaviour.
                 let roots = outcome.keepalive_addrs().to_vec();
-                assert!(!roots.is_empty(), "the fail-safe cycle needs its extra roots");
+                assert!(
+                    !roots.is_empty(),
+                    "the fail-safe cycle needs its extra roots"
+                );
                 reg.record_forced_non_moving_collection();
                 diverted += 1;
             }
@@ -1973,7 +2014,11 @@ mod tests {
         let mut seen: Vec<&str> = Vec::new();
         for c in causes {
             assert!(!c.label().is_empty());
-            assert!(!seen.contains(&c.label()), "duplicate label {:?}", c.label());
+            assert!(
+                !seen.contains(&c.label()),
+                "duplicate label {:?}",
+                c.label()
+            );
             seen.push(c.label());
         }
         assert!(ReleaseCause::Released.is_voluntary());

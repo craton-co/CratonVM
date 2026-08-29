@@ -860,7 +860,9 @@ fn native_fc_write_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         let mut buf = vec![0u8; st.rem];
         let got = ctx.read_byte_array_into(st.hb, st.base, &mut buf);
         if got != st.rem {
-            Err(io_error("FileChannelImpl.write: short read of backing array"))
+            Err(io_error(
+                "FileChannelImpl.write: short read of backing array",
+            ))
         } else {
             // Same borrow shape as the read path: finish with the table
             // before touching the heap.
@@ -913,7 +915,13 @@ pub fn register_file_channel_fast_io(r: &mut NativeMethodRegistry) {
         native_fc_write_bytebuffer,
         NativeKind::Intrinsic,
     );
-    r.register_with_kind(FCI, "position", "()J", native_fc_position, NativeKind::Intrinsic);
+    r.register_with_kind(
+        FCI,
+        "position",
+        "()J",
+        native_fc_position,
+        NativeKind::Intrinsic,
+    );
     // The `SeekableByteChannel`-returning overload is javac's bridge and calls
     // this one, so only the declared shape is registered.
     r.register_with_kind(

@@ -175,7 +175,9 @@ fn set_origin_keeps_the_derived_mirror_in_sync() {
     // sees a stub and half sees a real class — so the invariant is checked in
     // both directions, through the only setter allowed to touch either field.
     let mut mgr = ClassManager::new(&[], &[], &[]);
-    let id = mgr.try_ensure_synthetic_class("com/example/Mirror", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+    let id = mgr
+        .try_ensure_synthetic_class("com/example/Mirror", 0)
+        .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     let class = mgr
         .get_class_mut(id)
         .expect("just-created class must be in the store");
@@ -502,7 +504,9 @@ fn dispatch_predicate_matches_the_stub_bit() {
         "java/net/InetSocketAddress",
         "java/lang/reflect/Proxy$Instance",
     ] {
-        let _ = mgr.try_ensure_synthetic_class(name, 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let _ = mgr
+            .try_ensure_synthetic_class(name, 3)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     }
     let _ = mgr.load_class("java/lang/Object");
     let _ = mgr.load_class("[Ljava/lang/Object;");
@@ -559,7 +563,11 @@ fn dispatch_predicate_matches_the_stub_bit() {
 #[test]
 fn vm_internal_allocation_shapes_stay_off_the_dispatch_branch() {
     let mut mgr = ClassManager::new(&[], &[], &[]);
-    let id = mgr.ensure_generated_class("cratonvm/synthetic/AnonymousObject$4", 4, ClassOrigin::VmInternal);
+    let id = mgr.ensure_generated_class(
+        "cratonvm/synthetic/AnonymousObject$4",
+        4,
+        ClassOrigin::VmInternal,
+    );
     let class = mgr.class_store.get(id).expect("just created");
     assert_eq!(class.origin, ClassOrigin::VmInternal);
     assert!(!class.origin.has_real_bytes(), "premise of the test");
@@ -613,7 +621,9 @@ fn fabricated_generated_names_are_compatibility_stubs() {
         "com/example/$Proxy42",
         "jdk/internal/reflect/GeneratedMethodAccessor3",
     ] {
-        let id = mgr.try_ensure_synthetic_class(name, 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id = mgr
+            .try_ensure_synthetic_class(name, 2)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let origin = &mgr.class_store.get(id).expect("just created").origin;
         assert!(
             origin.is_compatibility_stub(),
@@ -636,9 +646,15 @@ fn fabricated_generated_names_are_compatibility_stubs() {
         "java/lang/annotation/AnnotationProxy",
         "CratonVM$SomeInternalCarrier",
     ] {
-        let id = mgr.try_ensure_synthetic_class(name, 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let id = mgr
+            .try_ensure_synthetic_class(name, 2)
+            .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let origin = &mgr.class_store.get(id).expect("just created").origin;
-        assert_eq!(*origin, ClassOrigin::VmInternal, "{name} got the wrong origin");
+        assert_eq!(
+            *origin,
+            ClassOrigin::VmInternal,
+            "{name} got the wrong origin"
+        );
         assert!(
             !origin.is_compatibility_stub(),
             "{name} is a VM generation artefact; counting it as a \
@@ -651,7 +667,9 @@ fn fabricated_generated_names_are_compatibility_stubs() {
     }
 
     // The control: an ordinary missing class is still a compatibility stub.
-    let id = mgr.try_ensure_synthetic_class("com/example/GenuinelyMissing", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+    let id = mgr
+        .try_ensure_synthetic_class("com/example/GenuinelyMissing", 2)
+        .expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     assert!(mgr
         .class_store
         .get(id)

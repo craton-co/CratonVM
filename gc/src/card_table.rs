@@ -282,9 +282,7 @@ impl CardTable {
             base_addr,
             region_size,
             cells: Mutex::new(CardCells {
-                cards: (0..num_cards)
-                    .map(|_| AtomicU8::new(CARD_CLEAN))
-                    .collect(),
+                cards: (0..num_cards).map(|_| AtomicU8::new(CARD_CLEAN)).collect(),
                 dirty_cards: Vec::new(),
             }),
             pending_offsets: Mutex::new(Vec::new()),
@@ -311,12 +309,7 @@ impl CardTable {
         let mut cells = self.cells.lock();
         if index < cells.cards.len()
             && cells.cards[index]
-                .compare_exchange(
-                    CARD_CLEAN,
-                    CARD_DIRTY,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange(CARD_CLEAN, CARD_DIRTY, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
         {
             cells.dirty_cards.push(index);
@@ -345,12 +338,7 @@ impl CardTable {
             let index = (addr - self.base_addr) / CARD_SIZE;
             if index < cells.cards.len()
                 && cells.cards[index]
-                    .compare_exchange(
-                        CARD_CLEAN,
-                        CARD_DIRTY,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(CARD_CLEAN, CARD_DIRTY, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
             {
                 cells.dirty_cards.push(index);
@@ -691,12 +679,7 @@ impl CardTable {
             let index = (addr - self.base_addr) / CARD_SIZE;
             if index < cells.cards.len()
                 && cells.cards[index]
-                    .compare_exchange(
-                        CARD_CLEAN,
-                        CARD_DIRTY,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange(CARD_CLEAN, CARD_DIRTY, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
             {
                 cells.dirty_cards.push(index);

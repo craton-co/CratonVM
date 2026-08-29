@@ -484,7 +484,9 @@ fn entry_meta_at(state: &mut JarState, idx: usize) -> Option<ZipEntryMeta> {
         // An archive whose length outran the slot vector (cannot happen for
         // the handles we build, but the index is caller-supplied): grow
         // rather than panic.
-        state.meta.resize(state.archive.len().max(idx + 1), MetaSlot::Unread);
+        state
+            .meta
+            .resize(state.archive.len().max(idx + 1), MetaSlot::Unread);
     }
     match &state.meta[idx] {
         MetaSlot::Ready(meta) => return Some(meta.clone()),

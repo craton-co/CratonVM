@@ -89,8 +89,12 @@ fn the_gate_is_honoured_by_the_harness() {
     std::env::remove_var(var);
     assert!(!common::require_e2e(), "unset must read as not-demanded");
     assert!(
-        common::require_fixture("gate-selftest", "a fixture that cannot exist", &[absent.clone()])
-            .is_none(),
+        common::require_fixture(
+            "gate-selftest",
+            "a fixture that cannot exist",
+            &[absent.clone()]
+        )
+        .is_none(),
         "with the gate off a missing fixture must return None, not panic"
     );
     assert!(
@@ -105,8 +109,12 @@ fn the_gate_is_honoured_by_the_harness() {
     std::env::set_var(var, "");
     assert!(!common::require_e2e(), "empty must read as not-demanded");
     assert!(
-        common::require_fixture("gate-selftest", "a fixture that cannot exist", &[absent.clone()])
-            .is_none(),
+        common::require_fixture(
+            "gate-selftest",
+            "a fixture that cannot exist",
+            &[absent.clone()]
+        )
+        .is_none(),
         "the empty string is an off-switch, so a missing fixture must still return None"
     );
 
@@ -141,7 +149,11 @@ fn the_gate_is_honoured_by_the_harness() {
     let present = workspace_root().join("Cargo.toml");
     assert!(present.exists(), "the positive control must exist");
     assert_eq!(
-        common::require_fixture("gate-selftest", "a file that does exist", &[present.clone()]),
+        common::require_fixture(
+            "gate-selftest",
+            "a file that does exist",
+            &[present.clone()]
+        ),
         Some(present),
         "with the gate set, a fixture that IS present must be returned, not refused"
     );

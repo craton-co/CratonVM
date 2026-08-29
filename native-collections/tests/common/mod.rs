@@ -364,7 +364,6 @@ impl MockCtx {
 }
 
 impl cratonvm_native_api::NativeClassAccess for MockCtx {
-
     // ------------------------------------------------------------------
     // Class loading / dispatch — synthetic class registry only.
     // ------------------------------------------------------------------
@@ -544,8 +543,6 @@ impl cratonvm_native_api::NativeClassAccess for MockCtx {
 }
 
 impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
-
-
     fn invoke(&mut self, class: &str, method: &str, _d: &str, a: &[Value]) -> MethodCallResult {
         // Just enough of the JDK static boxers for the natives that
         // round-trip primitives through `Integer.valueOf` / `Long.valueOf`
@@ -602,7 +599,9 @@ impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
         }
         if m == "compare"
             && d == "(Ljava/lang/Object;Ljava/lang/Object;)I"
-            && self.class_name_arc_of_id(self.class_id_of_object(r)).as_deref()
+            && self
+                .class_name_arc_of_id(self.class_id_of_object(r))
+                .as_deref()
                 == Some("test/LiquibaseTieComparator")
         {
             let order_of = |ctx: &MockCtx, v: Value| -> i32 {
@@ -667,8 +666,6 @@ impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
 }
 
 impl cratonvm_native_api::NativeHeapAccess for MockCtx {
-
-
     fn new_object(&mut self, class_name: &str) -> MethodCallResult {
         let cid = self.ensure_class_initialized(class_name)?;
         let obj = self.alloc_entry(HeapEntry::Object {
@@ -962,8 +959,6 @@ impl cratonvm_native_api::NativeHeapAccess for MockCtx {
 }
 
 impl cratonvm_native_api::NativeThreadAccess for MockCtx {
-
-
     // ------------------------------------------------------------------
     // Threading — single-threaded stubs.
     // ------------------------------------------------------------------
@@ -1019,8 +1014,6 @@ impl cratonvm_native_api::NativeThreadAccess for MockCtx {
 }
 
 impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
-
-
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
@@ -1029,13 +1022,9 @@ impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
     }
 }
 
-impl cratonvm_native_api::NativeGpuAccess for MockCtx {
-
-}
+impl cratonvm_native_api::NativeGpuAccess for MockCtx {}
 
 impl cratonvm_native_api::NativeSystemAccess for MockCtx {
-
-
     fn record_printed_value(&mut self, _v: Value) {}
 
     fn record_printed_line(&mut self, _t: String) {}
@@ -1099,9 +1088,6 @@ impl cratonvm_native_api::NativeSystemAccess for MockCtx {
         None
     }
 }
-
-
-
 
 // ------------------------------------------------------------------
 // Test helpers — register the natives once per test, then dispatch.

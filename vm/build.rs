@@ -132,7 +132,10 @@ fn warn_javac_failure(
     // Then the transcript. `stdout` too: an empty stderr does not mean the
     // tool said nothing, and that ambiguity is what made this diagnostic
     // useless the first time.
-    for (stream, text) in [("stderr", &stderr), ("stdout", &String::from_utf8_lossy(&output.stdout))] {
+    for (stream, text) in [
+        ("stderr", &stderr),
+        ("stdout", &String::from_utf8_lossy(&output.stdout)),
+    ] {
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             continue;

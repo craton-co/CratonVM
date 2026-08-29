@@ -163,12 +163,7 @@ pub fn is_validated(carrier: u64, want_write: bool) -> bool {
         return false;
     }
     LAST_VALIDATED.with(|slot| match slot.get() {
-        Some(v) => {
-            v.carrier == carrier
-                && v.epoch == epoch()
-                && v.read
-                && (!want_write || v.write)
-        }
+        Some(v) => v.carrier == carrier && v.epoch == epoch() && v.read && (!want_write || v.write),
         None => false,
     })
 }

@@ -100,7 +100,7 @@ Host: Azure Linux box, `--java-home /home/victor/jdk25` (Temurin 25.0.3), `--noj
   **They do not pass yet** — see "Remaining blocker".
 - **No regression in jar handling**: a 7-jar / 12 642-entry scan of
   `getName`/`getRealName`/`getSize` hashes identically before and after, and a
-  purpose-built multi-release jar still selects `META-INF/versions/17/`.
+  purpose-built multi-release jar still selects `../../../apps/META-INF/versions/17/`.
 - `cargo test -p cratonvm-native-builtins`: 3144 passed, 0 failed.
 
 ## Remaining blocker (a different bug, now filed separately)

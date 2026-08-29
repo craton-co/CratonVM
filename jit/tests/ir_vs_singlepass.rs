@@ -56,8 +56,7 @@ const STUB_MAX_FIELD_SLOT: i64 = 64;
 /// the calling test's own assertion fail with a real message. The recorded line
 /// is what says WHY.
 fn stub_faults() -> &'static std::sync::Mutex<Vec<String>> {
-    static FAULTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
-        std::sync::OnceLock::new();
+    static FAULTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
     FAULTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -167,7 +166,10 @@ unsafe extern "C" fn legacy_putfield_int(obj: i64, idx: i64, val: i64) {
     };
     let base = (obj as *mut u8).add(HEADER_SIZE + idx * SLOT_SIZE);
     std::ptr::write_unaligned(base as *mut u32, 0);
-    std::ptr::write_unaligned(base.add(FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32, val as i32);
+    std::ptr::write_unaligned(
+        base.add(FIELD_CELL_PAYLOAD32_OFFSET) as *mut i32,
+        val as i32,
+    );
     std::ptr::write_unaligned(base.add(8) as *mut u64, 0);
 }
 
@@ -201,7 +203,9 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         i64::MIN
     }
     let deopt_unserviceable = deopt_unserviceable_stub as *const () as usize;
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_card_table_addr: 0,
         jit_card_old_base: 0,
         jit_card_old_end: 0,
@@ -315,7 +319,7 @@ fn cached(
         is_synchronized: false,
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
-            intercept_shape_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3128,7 +3132,9 @@ unsafe extern "C" fn test_drem(a: f64, b: f64) -> f64 {
 /// [`dummy_helpers`] with the two FP-remainder helpers wired to real stubs (the
 /// rest stay panic stubs — a `frem`/`drem` method calls no other helper).
 fn frem_helpers() -> JitRuntimeHelpers {
-    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+    JitRuntimeHelpers {
+        safepoint_flag_addr: 0,
+        safepoint_slow_path: 0,
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,
         self_call_stack_guard: 0,
@@ -4631,16 +4637,18 @@ fn try_catch_code(handler_reads: u8) -> Vec<u8> {
         0x05, // 5: iconst_2    │
         0x68, // 6: imul        │
         0x3c, // 7: istore_1    ┘  r = r * 2
-        0xa7, 0x00, 0x08, // 8: goto +8 -> 16
-        0x4d, // 11: astore_2       HANDLER: store the exception
+        0xa7,
+        0x00,
+        0x08,          // 8: goto +8 -> 16
+        0x4d,          // 11: astore_2       HANDLER: store the exception
         handler_reads, // 12: iload_0 (param) or iload_1 (non-param local)
-        0x74, // 13: ineg
-        0x3c, // 14: istore_1
-        0x00, // 15: nop
-        0x1b, // 16: iload_1        join
-        0x06, // 17: iconst_3
-        0x60, // 18: iadd
-        0xac, // 19: ireturn        return r + 3
+        0x74,          // 13: ineg
+        0x3c,          // 14: istore_1
+        0x00,          // 15: nop
+        0x1b,          // 16: iload_1        join
+        0x06,          // 17: iconst_3
+        0x60,          // 18: iadd
+        0xac,          // 19: ireturn        return r + 3
     ]
 }
 
@@ -5622,7 +5630,10 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         let cm = cached("gsdi", "()I", code, 1, 0);
         let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR direct getstatic");
         let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
-        assert!(ir.used_ir_backend, "cov-01: direct getstatic on the IR tier");
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: direct getstatic on the IR tier"
+        );
         assert_eq!(
             call_with_dummy_context(&ir, &[]) as i32,
             -7,
@@ -5672,7 +5683,10 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         let cm = cached("gsdr", "()Ljava/lang/Object;", code, 1, 0);
         let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR ref getstatic");
         let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
-        assert!(ir.used_ir_backend, "cov-01: a reference static on the IR tier");
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: a reference static on the IR tier"
+        );
         assert_eq!(
             call_with_dummy_context(&ir, &[]),
             0x0BAD_F00D_1234_5678u64 as i64,
@@ -5730,7 +5744,11 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             tag as char
         );
         // Against the host, only the bits the ABI defines.
-        let masked = if tag == b'F' { r_ir as u32 as i64 } else { r_ir };
+        let masked = if tag == b'F' {
+            r_ir as u32 as i64
+        } else {
+            r_ir
+        };
         assert_eq!(
             masked, want,
             "`{}` direct static: wrong bits — the marker value would mean it \
@@ -6287,8 +6305,7 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         panic!("an elidable <init>()V on a fresh `new` was DISPATCHED, not elided");
     }
     // Test-local, never shared: see `leak_zeroed_object`.
-    static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     unsafe extern "C" fn counting_dispatch(_vm: i64, _i: i64, _a: i64, num_args: i64) -> i64 {
         assert_eq!(num_args, 1, "<init>()V takes the receiver and nothing else");
@@ -6493,11 +6510,7 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
     let resolver = |cp: u16| -> Option<(String, String, String)> {
         match cp {
             2 => Some(("pkg/Corpus".into(), "<init>".into(), "(I)V".into())),
-            5 => Some((
-                "pkg/Helper".into(),
-                "sink".into(),
-                "(Lpkg/Corpus;)I".into(),
-            )),
+            5 => Some(("pkg/Helper".into(), "sink".into(), "(Lpkg/Corpus;)I".into())),
             _ => None,
         }
     };
@@ -6527,7 +6540,11 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
         // `counting_alloc`, which hands out live leaked 8-aligned buffers.
         let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
             .unwrap_or_else(|e| panic!("new + non-elidable ctor n={n}: {e:?}"));
-        assert_eq!(r, n * 5, "constructor side effect must be visible to `sink`");
+        assert_eq!(
+            r,
+            n * 5,
+            "constructor side effect must be visible to `sink`"
+        );
         assert_eq!(
             ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
             i + 1,
@@ -6655,8 +6672,9 @@ unsafe extern "C" fn instanceof_stub(
         return 0;
     }
     // SAFETY: the caller's contract above.
-    let name =
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
     let at = (obj as *const u8).add(HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
     // SAFETY: `obj` is a `make_object` buffer with a valid field-0 int cell.
     let tag = unsafe { std::ptr::read_unaligned(at as *const i32) };
@@ -6851,8 +6869,9 @@ unsafe extern "C" fn checkcast_stub(_vm: i64, obj: i64, name_ptr: *const u8, nam
         return 0;
     }
     // SAFETY: the caller's contract above.
-    let name =
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize)) };
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
     let at = (obj as *const u8).add(HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET);
     // SAFETY: `obj` is a `make_object` buffer with a valid field-0 int cell.
     let tag = unsafe { std::ptr::read_unaligned(at as *const i32) };
@@ -6871,13 +6890,7 @@ unsafe extern "C" fn checkcast_stub(_vm: i64, obj: i64, name_ptr: *const u8, nam
 /// `aload_0; checkcast #1; areturn`.
 fn checkcast_method() -> CachedBytecodeMethod {
     let code = vec![0x2a, 0xc0, 0x00, 0x01, 0xb0];
-    cached(
-        "f",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        code,
-        1,
-        1,
-    )
+    cached("f", "(Ljava/lang/Object;)Ljava/lang/Object;", code, 1, 1)
 }
 
 /// [`try_compile`] with the same two resolvers [`compile_instanceof`] uses —
@@ -7005,13 +7018,7 @@ fn ir_vs_singlepass_mixed_checkcast_and_instanceof_in_one_method() {
         0x1c, // iload_2
         0xac, // ireturn
     ];
-    let cm = cached(
-        "f",
-        "(Ljava/lang/Object;Ljava/lang/Object;)I",
-        code,
-        3,
-        2,
-    );
+    let cm = cached("f", "(Ljava/lang/Object;Ljava/lang/Object;)I", code, 3, 2);
     let mut helpers = dummy_helpers();
     helpers.instanceof_check = instanceof_stub as *const () as usize;
     helpers.checkcast = checkcast_stub as *const () as usize;
@@ -7108,7 +7115,8 @@ fn athrow_no_longer_refuses_ir_admission() {
     let r_ir = unsafe { ir.try_call(&[]) }.expect("IR call");
     let r_sp = unsafe { sp.try_call(&[]) }.expect("single-pass call");
     assert_eq!(
-        r_ir, i64::MIN,
+        r_ir,
+        i64::MIN,
         "an IR-compiled unconditional throw must propagate the deopt/exception \
          sentinel, exactly like a plain return would propagate a value"
     );
