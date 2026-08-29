@@ -1996,9 +1996,24 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let ptype0 = obj_arg(args, 1)?;
-            // morePtypes may be null or an array
+            // `morePtypes` may be EMPTY; it may not be NULL. HotSpot's
+            // `methodType(rtype, ptype0, ptypes)` runs the whole array through
+            // `checkPtypes`, which dereferences it -- a null there is an NPE,
+            // not "no more parameters". The comment this replaces said "may be
+            // null or an array" and the code obliged, so
+            // `methodType(int.class, String.class, (Class<?>[]) null)` built
+            // `(String)int` where HotSpot throws.
             let more = match args.get(2) {
                 Some(Value::Object(Some(a))) => Some(*a),
+                Some(Value::Object(None)) => {
+                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(
+                            cratonvm_types::error::RuntimeError::NullPointerException {
+                                message: Some("MethodType.methodType: ptypes must not be null".to_string()),
+                            },
+                        ),
+                    ));
+                }
                 _ => None,
             };
             let more_len = more.map(|a| ctx.array_length(a)).unwrap_or(0);
@@ -2040,11 +2055,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
+    // `parameterType(i)` is bounds-checked. HotSpot indexes its own `ptypes`
+    // array and so raises `ArrayIndexOutOfBoundsException`; this used to cast a
+    // NEGATIVE index straight to `usize` -- `-1` becoming 18 446 744 073 709
+    // 551 615 -- and hand it to `get_array_element`, which answered a null the
+    // caller then dereferenced, so the exception a caller saw was an NPE from
+    // somewhere else entirely.
     r.register(mt, "parameterType", "(I)Ljava/lang/Class;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx = args[1].as_int().unwrap_or(0) as usize;
+        let raw = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if let Value::Object(Some(arr)) = ctx.get_field(this, 1) {
-            Ok(Some(ctx.get_array_element(arr, idx)))
+            let len = ctx.array_length(arr) as i64;
+            if i64::from(raw) < 0 || i64::from(raw) >= len {
+                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: raw,
+                            message: Some(format!(
+                                "Index {raw} out of bounds for length {len}"
+                            )),
+                        },
+                    ),
+                ));
+            }
+            Ok(Some(ctx.get_array_element(arr, raw as usize)))
         } else {
             Ok(Some(Value::Object(None)))
         }
@@ -6854,31 +6888,35 @@ fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // FIRST statement on purpose: `args` still holds the ObjectRefs the VM
     // handed us and nothing below has had a chance to allocate and move them.
     lk_enforce_find_access(ctx, args, 2, None, false)?;
+    // A null argument is a CALLER BUG, not an absent member -- see
+    // `lookup_null_arg` for why answering `NoSuchMethodException` here misled
+    // the version probes this method exists to serve.
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_method_error("", "", ""));
-        }
+        _ => return Err(lookup_null_arg("refc")),
     };
     let name_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_method_error("", "", ""));
-        }
+        _ => return Err(lookup_null_arg("name")),
     };
     let mt_obj = match args.get(3) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            return Err(no_such_method_error(&class, &name, ""));
-        }
+        _ => return Err(lookup_null_arg("type")),
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
+    // `findVirtual` on a STATIC method is `IllegalAccessException`: the method
+    // is there, the access is wrong. `None` is unknown and an accept.
+    if lk_method_is_static(&*ctx, &class, &name, &desc) == Some(true) {
+        return Err(lookup_access_error(format!(
+            "{}.{}{desc}: expected a non-static method",
+            class.replace('/', "."),
+            name
+        )));
+    }
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -6973,25 +7011,30 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     lk_enforce_find_access(ctx, args, 2, None, false)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Err(no_such_method_error("", "", "")),
+        _ => return Err(lookup_null_arg("refc")),
     };
     let name_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Err(no_such_method_error("", "", "")),
+        _ => return Err(lookup_null_arg("name")),
     };
     let mt_obj = match args.get(3) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            return Err(no_such_method_error(&class, &name, ""));
-        }
+        _ => return Err(lookup_null_arg("type")),
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
+    // The mirror image of `findVirtual`'s check: `findStatic` on an INSTANCE
+    // method is `IllegalAccessException`. `None` is unknown and an accept.
+    if lk_method_is_static(&*ctx, &class, &name, &desc) == Some(false) {
+        return Err(lookup_access_error(format!(
+            "{}.{}{desc}: expected a static method",
+            class.replace('/', "."),
+            name
+        )));
+    }
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC)?;
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -7000,25 +7043,58 @@ fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     lk_enforce_find_access(ctx, args, usize::MAX, Some("<init>"), false)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_method_error("", "<init>", ""));
-        }
+        _ => return Err(lookup_null_arg("refc")),
     };
     let mt_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-            return Err(no_such_method_error(&class, "<init>", ""));
-        }
+        _ => return Err(lookup_null_arg("type")),
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
-    let mut desc = descriptor_from_method_type(ctx, mt_obj);
-    if let Some(pos) = desc.rfind(')') {
-        desc.truncate(pos + 1);
-        desc.push('V');
+    let raw = descriptor_from_method_type(ctx, mt_obj);
+    // THE RETURN TYPE MUST BE `void`, and this is not pedantry about a value
+    // nobody reads. `MethodHandles.Lookup.findConstructor` is specified to take
+    // a type whose return is `void` -- the handle it gives back returns the
+    // constructed class, but the type you ASK with does not. HotSpot answers
+    // `NoSuchMethodException` for anything else. This code used to overwrite
+    // whatever return type it was handed with `V` and carry on, so
+    // `findConstructor(Target.class, methodType(Target.class, int.class))`
+    // silently became the `(int)void` lookup instead of being refused.
+    if !raw.ends_with(")V") {
+        return Err(no_such_method_error(&class, "<init>", &raw));
     }
+    let desc = raw;
     // Ensure class is loaded so constructor resolution works at dispatch time
     let _ = ctx.ensure_class_initialized(&class);
+    // AND THE CONSTRUCTOR HAS TO EXIST. There was no existence check here at
+    // all: every other finder in this file grew one (see
+    // `lookup_require_method`'s note on `catch (Exception)` version probes) and
+    // this one was missed, so `findConstructor` for an arity the class does not
+    // declare handed back a working-looking handle whose invocation would fail
+    // later as an `Error`. An interface, a primitive and an array all declare
+    // no constructor at all and take the same path.
+    //
+    // `method_exists` is the same evidence rule as everywhere else here: it is
+    // consulted only when the class RESOLVED, so an unmodelled or synthetic
+    // class still gets the permissive answer it always had.
+    // An INTERFACE, a PRIMITIVE and an ARRAY declare no constructor at all --
+    // ever, on any image. These three do not go through the "did the class
+    // resolve" evidence rule below because they need no evidence: the answer is
+    // a property of the KIND, not of what this VM happens to model. They are
+    // also the two rows the evidence rule could not reach, since neither
+    // `int` nor an unloaded `java/lang/Runnable` resolves by name here.
+    let primitive = matches!(
+        class.as_str(),
+        "int" | "long" | "short" | "byte" | "char" | "boolean" | "float" | "double" | "void"
+    );
+    let interface = ctx
+        .class_id_by_name(&class)
+        .is_some_and(|cid| ctx.is_interface_class(cid));
+    if primitive || interface || class.starts_with('[') {
+        return Err(no_such_method_error(&class, "<init>", &desc));
+    }
+    if ctx.class_id_by_name(&class).is_some() && !ctx.method_exists(&class, "<init>", &desc) {
+        return Err(no_such_method_error(&class, "<init>", &desc));
+    }
     let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR)?;
     // Stash the ALREADY-RESOLVED ClassId (from the caller's own Class
     // mirror, class_obj) in the otherwise-unused MH_BOUND slot. Two
@@ -7102,6 +7178,136 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 /// Create a NoSuchMethodException error.
+/// `java.lang.NullPointerException` for a null argument to a `Lookup.find*`.
+///
+/// Every finder used to map a null `Class` / name / `MethodType` onto its own
+/// "absent member" exception -- `NoSuchMethodException` or
+/// `NoSuchFieldException`. Those are the answers for a member that is not
+/// there, and a null argument is not a member that is not there: it is a caller
+/// bug, and HotSpot says so with an NPE before it looks anything up.
+///
+/// The direction is what makes it worth fixing. Both wrong answers are CHECKED
+/// exceptions that version-probing code catches ON PURPOSE -- see
+/// `lookup_require_method`'s note on `catch (Exception)`. So a null slipped
+/// past the probe's guard and was reported as "this JDK does not have that
+/// method", a wrong conclusion the caller then acts on, instead of a stack
+/// trace at the line with the bug.
+fn lookup_null_arg(what: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+        cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(format!("Lookup.find*: {what} must not be null")),
+        },
+    ))
+}
+
+/// `java.lang.IllegalAccessException` for a member that EXISTS but whose
+/// static-ness, finality or kind is not what the finder asked for.
+///
+/// `MethodHandles.Lookup`: `findStatic` on an instance method, `findVirtual` on
+/// a static one, `findGetter` on a static field, `findStaticGetter` on an
+/// instance field and `findSetter` on a `final` field are all
+/// `IllegalAccessException` -- NOT `NoSuchMethodException`. The member is
+/// found; the ACCESS is what is refused, and a caller that distinguishes the
+/// two learns different things from them.
+fn lookup_access_error(what: String) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+        cratonvm_types::error::RuntimeError::IllegalAccessException { message: what },
+    ))
+}
+
+const LK_ACC_STATIC: u16 = 0x0008;
+const LK_ACC_FINAL: u16 = 0x0010;
+
+/// Is `class.name desc` declared STATIC?
+///
+/// `None` means UNKNOWN -- the class did not resolve, or nothing on its
+/// superclass chain declared that exact (name, descriptor). **Every caller must
+/// treat `None` as an ACCEPT.** This VM substitutes and synthesises JDK classes
+/// whose declared members it does not always model, so "could not see it" is
+/// not evidence of anything, and refusing on it would turn a modelling gap into
+/// a refusal of working code. Same rule `lookup_require_field` already follows,
+/// and the same reason.
+fn lk_method_is_static(
+    ctx: &dyn NativeContext,
+    class: &str,
+    name: &str,
+    desc: &str,
+) -> Option<bool> {
+    let mut cid = ctx.class_id_by_name(class)?;
+    for _ in 0..64 {
+        for m in ctx.declared_methods(cid) {
+            if m.name == name && m.descriptor == desc {
+                return Some(m.access_flags & LK_ACC_STATIC != 0);
+            }
+        }
+        cid = ctx.superclass_of(cid)?;
+    }
+    None
+}
+
+/// The declared field `class.name`, searched up the superclass chain.
+///
+/// `None` is UNKNOWN and an ACCEPT, for the reason on [`lk_method_is_static`].
+fn lk_declared_field(
+    ctx: &dyn NativeContext,
+    class: &str,
+    name: &str,
+) -> Option<cratonvm_native_api::FieldMetadata> {
+    let mut cid = ctx.class_id_by_name(class)?;
+    for _ in 0..64 {
+        for f in ctx.declared_fields(cid) {
+            if f.name == name {
+                return Some(f);
+            }
+        }
+        cid = ctx.superclass_of(cid)?;
+    }
+    None
+}
+
+/// The `IllegalAccessException` / `NoSuchFieldException` a field finder owes
+/// when the field EXISTS but does not match what was asked for, or `None`.
+///
+/// Three checks, all of them positive readings only -- an unresolvable class or
+/// an unmodelled field yields `None` and the finder proceeds exactly as it did
+/// before ([`lk_declared_field`]).
+///
+///  * the DESCRIPTOR must match. `findGetter(C, "f", String.class)` on an
+///    `int f` is `NoSuchFieldException` on HotSpot, because a field is
+///    identified by name AND type; we answered a handle whose invocation would
+///    later read an int as a String.
+///  * STATIC-ness must match the finder. `findGetter` on a static field and
+///    `findStaticGetter` on an instance field are both
+///    `IllegalAccessException`.
+///  * a `final` field has no SETTER. `findSetter` on one is
+///    `IllegalAccessException`; we handed back a handle that would have written
+///    it.
+fn lk_field_mismatch(
+    ctx: &dyn NativeContext,
+    class: &str,
+    name: &str,
+    want_desc: &str,
+    want_static: bool,
+    for_setter: bool,
+) -> Option<cratonvm_types::error::MethodCallFailed> {
+    let f = lk_declared_field(ctx, class, name)?;
+    let shown = format!("{}.{}", class.replace('/', "."), name);
+    if f.descriptor != want_desc {
+        return Some(no_such_field_error(class, name));
+    }
+    let is_static = f.is_static || (f.access_flags & LK_ACC_STATIC != 0);
+    if is_static != want_static {
+        return Some(lookup_access_error(format!(
+            "{shown}: expected a {} field",
+            if want_static { "static" } else { "non-static" }
+        )));
+    }
+    if for_setter && f.access_flags & LK_ACC_FINAL != 0 {
+        return Some(lookup_access_error(format!("{shown}: field is final")));
+    }
+    None
+}
+
 fn no_such_method_error(
     class: &str,
     method: &str,
@@ -7132,26 +7338,23 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("refc")),
     };
     let name_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("name")),
     };
     let type_obj = match args.get(3) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("type")),
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let target_cid = ctx.ensure_class_initialized(&class).ok();
+    if let Some(e) = lk_field_mismatch(&*ctx, &class, &name, &field_desc, false, false) {
+        return Err(e);
+    }
     // HotSpot raises `NoSuchFieldException` here. `lookup_require_field` only
     // does so when it could enumerate declared fields and the name was not
     // among them, which preserves the stub-class escape hatch this call site
@@ -7167,21 +7370,15 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("refc")),
     };
     let name_obj = match args.get(2) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("name")),
     };
     let type_obj = match args.get(3) {
         Some(Value::Object(Some(o))) => *o,
-        _ => {
-            return Err(no_such_field_error("", ""));
-        }
+        _ => return Err(lookup_null_arg("type")),
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
@@ -7189,6 +7386,9 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let target_cid = ctx.ensure_class_initialized(&class).ok();
     // Same evidence rule as `lookup_find_getter` above.
     lookup_require_field(ctx, target_cid, &class, &name)?;
+    if let Some(e) = lk_field_mismatch(&*ctx, &class, &name, &field_desc, false, true) {
+        return Err(e);
+    }
     let desc = format!("(L{class};{field_desc})V");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
@@ -7235,6 +7435,11 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
+    // `findStaticGetter` on an INSTANCE field is `IllegalAccessException`, and a
+    // descriptor mismatch is `NoSuchFieldException` -- see `lk_field_mismatch`.
+    if let Some(e) = lk_field_mismatch(&*ctx, &class, &name, &field_desc, true, false) {
+        return Err(e);
+    }
     let desc = format!("(){field_desc}");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))

@@ -158,6 +158,13 @@ Divided by FAMILY, sized on the static surface. Percentages are of 2244.
 The remaining ~780 rows are a long tail: **71 of the 183 classes have ≤3 rows
 each**. Nobody owns the tail yet; finish your lane before taking any of it.
 
+**First tail slice taken 2026-08-29: `java.lang.invoke`'s LOOKUP and TYPE
+surface** — `MethodHandles$Lookup` 6 triples, `MethodType` 5, `MethodHandle` 3,
+`MethodHandles` 1. 83 probe rows, **27 differing -> 1**, ten defects. Record:
+`the-invoke-lookup-surface-ten-defects-and-one-that-corrupted-an-interned-type-20260829.md`.
+Distinct from the DISPATCH surface (`invoke`/`invokeExact`) that L5's residual
+round closed — worth knowing if you take another `java.lang.invoke` slice.
+
 ---
 
 ## 3. The method — four families in, it is mechanical
