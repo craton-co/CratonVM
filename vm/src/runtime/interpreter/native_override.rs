@@ -1751,6 +1751,14 @@ pub(crate) fn is_forkjoin_native_override(
             | ("quietlyJoin", "(JLjava/util/concurrent/TimeUnit;)Z")
             | ("quietlyJoinUninterruptibly", "(JLjava/util/concurrent/TimeUnit;)Z")
             | ("quietlyJoinPoolInvokeAllTask", "(J)V")
+            // The two STATIC accessors backed by `FJP_POOL_STACK`. Must stay
+            // in step with `keep_real_forkjointask_bridge` in
+            // native-api/src/registry.rs — that list decides whether the
+            // registration SURVIVES, this one decides whether it WINS, and a
+            // registration on one list only is inert in exactly the way that
+            // reads as a fixed bug.
+            | ("inForkJoinPool", "()Z")
+            | ("getPool", "()Ljava/util/concurrent/ForkJoinPool;")
     )
 }
 
@@ -2798,6 +2806,17 @@ pub(super) fn force_native_over_real_jdk_bytecode(
             | "java/util/LinkedHashMap$LinkedValueIterator"
             | "java/util/TreeMap$ValueIterator"
             | "java/util/TreeMap$EntryIterator"
+            // The ConcurrentHashMap views, 2026-08-28. `keySet().iterator()`
+            // used to mint the FABRICATED `java/util/HashMap$KeyItr` in
+            // compatible mode and land on `Arrays$ArrayItr` when `--jdk-only`
+            // refused it, so one receiver answered two different wrong class
+            // names depending on the mode. Both are now the real per-family
+            // class, and both are single-producer: `chm_real_dual_iterator` is
+            // gone, so nothing else mints either of them (which is the
+            // condition the `Hashtable$Enumerator` and the CHM$ValueIterator
+            // attempts each failed).
+            | "java/util/concurrent/ConcurrentHashMap$KeyIterator"
+            | "java/util/concurrent/ConcurrentHashMap$EntryIterator"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {
         return true;

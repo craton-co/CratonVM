@@ -6997,6 +6997,37 @@ pub(crate) fn alloc_carrier_thread_mirror(
 /// and `ThreadFactory` wrappers that decorate `t.getName()` all collapse when
 /// every thread is literally called "Thread". Our constructors used to hand
 /// out that one constant string; number them the way the JDK does.
+/// `Thread`'s name contract, shared by the six constructors that take one.
+///
+/// Every name-taking `Thread` constructor funnels into the JDK's master
+/// constructor, which opens
+///
+/// ```text
+///   this.name = Objects.requireNonNull(name, "'name' is null");
+/// ```
+///
+/// so a null name is an NPE with that exact message — MEASURED on HotSpot
+/// 25.0.4+7 for `Thread(String)`, `Thread(Runnable, String)` and
+/// `Thread(ThreadGroup, Runnable, String, long)` alike (`probes/L6MsgProbe.java`).
+/// Every one of these bodies SUBSTITUTED the VM's default `Thread-N` name
+/// instead, which is two defects rather than one: the throw never happened,
+/// and the caller then held a thread whose name is not the one it asked for and
+/// has no way to notice.
+///
+/// A MISSING argument is a dispatch defect, not a Java-visible null, and keeps
+/// the default — the distinction `reject_null_functional` draws in
+/// `native-collections`. `setName(null)` already had this refusal; the
+/// constructors are the other half of the same contract and did not.
+fn thread_reject_null_name(arg: Option<&Value>) -> Result<(), MethodCallFailed> {
+    if matches!(arg, Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("'name' is null".to_string()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn thread_default_name(ctx: &mut dyn NativeContext) -> ObjectRef {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10299,6 +10330,7 @@ pub fn register_essential_natives_with_shims(
         "execute",
         "(Ljava/lang/Runnable;)V",
         |ctx, args| {
+            phases_early::fjp_reject_submission(ctx, args, 1)?;
             let runnable = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
@@ -10314,6 +10346,7 @@ pub fn register_essential_natives_with_shims(
         "execute",
         "(Ljava/util/concurrent/ForkJoinTask;)V",
         |ctx, args| {
+            phases_early::fjp_reject_submission(ctx, args, 1)?;
             let task = match args.get(1).copied() {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(None),
@@ -13645,7 +13678,41 @@ pub fn register_essential_natives_with_shims(
         // Instance method: read the RECEIVER's interrupt status (which may be a
         // thread *other* than the caller — e.g. `ThreadPoolExecutor`).
         let interrupted = match args.first() {
-            Some(Value::Object(Some(this))) => ctx.thread_is_interrupted(*this),
+            Some(Value::Object(Some(this))) => {
+                if ctx.thread_is_interrupted(*this) {
+                    true
+                } else if ctx.thread_run_state(*this) == 0 {
+                    // NEW — never started, so the thread registry has no entry
+                    // for it and `ctx.thread_interrupt` had nowhere to record
+                    // the request. The real `Thread.interrupt()` writes the
+                    // Java `interrupted` FIELD before it tells the VM, and
+                    // `native_thread_interrupt` already mirrors that write, so
+                    // the field is the ONLY record of an interrupt delivered to
+                    // a thread that has not run. MEASURED, both modes
+                    // (`probes/ThreadIntrDbg.java`):
+                    //
+                    //   new Thread(r); t.interrupt(); t.isInterrupted()
+                    //     HotSpot  true      CratonVM  false
+                    //
+                    // and the status has to SURVIVE the start, because
+                    // `Thread.start()` does not clear it: HotSpot answers true
+                    // again after the thread has run and finished.
+                    //
+                    // Scoped to state 0 deliberately. For a started thread the
+                    // registry is the single source of truth every native
+                    // blocking op already clears through, and OR-ing the field
+                    // in unconditionally would resurrect a status that
+                    // `Thread.interrupted()` had just cleared — the row
+                    // `isInterrupted after interrupted() cleared` measures
+                    // exactly that, and it passes today.
+                    matches!(
+                        ctx.get_field_by_name(*this, "interrupted"),
+                        Value::Int(v) if v != 0
+                    )
+                } else {
+                    false
+                }
+            }
             _ => ctx.is_interrupted(false),
         };
         Ok(Some(Value::Int(if interrupted { 1 } else { 0 })))
@@ -13703,10 +13770,60 @@ pub fn register_essential_natives_with_shims(
         }
         Ok(Some(Value::Int(0)))
     });
+    // `setDaemon` is THREE guards and then a write, and this body had none of
+    // them. MEASURED against HotSpot 25.0.4+7, both modes:
+    //
+    //   t.start(); t.setDaemon(true)            HotSpot IllegalThreadStateException
+    //   Thread.ofVirtual().unstarted(r)
+    //        .setDaemon(false)                  HotSpot IllegalArgumentException
+    //
+    // ```java
+    //   public final void setDaemon(boolean on) {
+    //       if (isVirtual() && !on)
+    //           throw new IllegalArgumentException("'false' not legal for virtual threads");
+    //       if (isAlive())
+    //           throw new IllegalThreadStateException();
+    //       if (!isVirtual())
+    //           daemon = on;
+    //   }
+    // ```
+    //
+    // The ORDER is load-bearing and is the JDK's: the virtual-thread refusal
+    // comes FIRST, so `ofVirtual().unstarted(r).setDaemon(false)` is an
+    // `IllegalArgumentException` and not the `IllegalThreadStateException` an
+    // is-alive-first reading would give a STARTED virtual thread. The
+    // is-alive guard matters most: the daemon flag is read once, when the
+    // thread starts, so writing it afterwards was a silent no-op that told the
+    // caller its non-daemon thread was now a daemon — and a JVM that will not
+    // exit is exactly what that caller was trying to avoid.
+    //
+    // `IllegalThreadStateException` carries an EMPTY message, which this
+    // variant renders as NO message rather than `""` (see `error.rs`, the same
+    // distinction `Thread.start()`'s guard needed in G72-1).
     registry.register("java/lang/Thread", "setDaemon", "(Z)V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.first() {
+            let this = *this;
             let on = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
-            if let Value::Object(Some(holder)) = ctx.get_field_by_name(*this, "holder") {
+            let virtual_thread = matches!(
+                ctx.invoke_virtual(this, "isVirtual", "()Z", &[]),
+                Ok(Some(Value::Int(v))) if v != 0
+            );
+            if virtual_thread && !on {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "'false' not legal for virtual threads".to_string(),
+                }
+                .into());
+            }
+            if ctx.thread_is_alive(this) {
+                return Err(RuntimeError::IllegalThreadStateException {
+                    message: String::new(),
+                }
+                .into());
+            }
+            if virtual_thread {
+                return Ok(None);
+            }
+            if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
                 ctx.set_field_by_name(holder, "daemon", Value::Int(if on { 1 } else { 0 }));
             }
         }
@@ -13871,6 +13988,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(1))?;
             crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let name = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13900,6 +14018,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(2))?;
             crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
@@ -13949,6 +14068,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(2))?;
             crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
@@ -13974,6 +14094,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(3))?;
             crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 // Real-JDK Thread: this native intercepts the real Java
@@ -14010,6 +14131,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(3))?;
             crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -14043,6 +14165,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            thread_reject_null_name(args.get(3))?;
             // This is the ONE public constructor that can opt OUT of
             // inheritance: `inheritThreadLocals == false` becomes
             // `characteristics |= NO_INHERIT_THREAD_LOCALS` (4), and the JDK

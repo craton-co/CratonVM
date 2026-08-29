@@ -1,7 +1,31 @@
 # `RJdkEnumerations` is RED on `dev` — bisected to the ConcurrentHashMap values-cursor change
 
-**Status: OPEN, BISECTED, NOT THIS BRANCH'S.** 2026-08-27. No fix applied; the
-owning lane's call, with a verified revert available.
+**Status: CLOSED 2026-08-29 by lane L6, and NOT by the revert this page had
+ready.** The bisect below was right and its refusal to revert another lane's
+landed work was right too: the mechanism turned out to be a THIRD option that
+keeps `a0168ed03`'s parity win.
+
+> `a0168ed03` registered this file's SNAPSHOT `hasNext`/`next` on
+> `ConcurrentHashMap$ValueIterator`, while `ConcurrentHashMap.elements()` was
+> independently building a REAL cursor of that same class. **A registration
+> keys on the CLASS and cannot tell two producers apart**, so the real cursor
+> ran the snapshot bodies over slots nothing had written. The fix removes the
+> OTHER producer — `elements()` and `keys()` now hand back the same snapshot
+> carriers `values().iterator()` and `keySet().iterator()` do, whose classes
+> implement `Enumeration` as well as `Iterator`.
+>
+> Measured: `RJdkEnumerations` PASSES in compatible mode on the L6 branch and
+> FAILS on pristine `origin/dev` at `d17feaad2`, built side by side. Under
+> `--jdk-only` the vector now gets FURTHER and dies on an unrelated Phase-1
+> fabrication in the `Properties` values-view iterator — see
+> `L6-concurrency-lane-complete-20260828.md` §8, which also names why that one
+> is lane L3's rather than L6's.
+>
+> **§4's "No mechanism" is now answered.** Everything else on this page stands
+> as the bisect record it is.
+
+**Original status: OPEN, BISECTED, NOT THIS BRANCH'S.** 2026-08-27. No fix
+applied; the owning lane's call, with a verified revert available.
 
 ## 1. The failure
 
