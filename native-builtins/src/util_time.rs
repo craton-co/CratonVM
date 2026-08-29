@@ -5572,7 +5572,7 @@ fn native_month_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             28
         }
     } else {
-        DAYS_IN_MONTH[(m - 1) as usize]
+        crate::civil_date::days_in_month_common(m)
     };
     Ok(Some(Value::Int(len)))
 }
@@ -5586,7 +5586,7 @@ fn native_month_max_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let len = if m == 2 {
         29
     } else {
-        DAYS_IN_MONTH[(m - 1) as usize]
+        crate::civil_date::days_in_month_common(m)
     };
     Ok(Some(Value::Int(len)))
 }
@@ -5600,7 +5600,7 @@ fn native_month_min_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let len = if m == 2 {
         28
     } else {
-        DAYS_IN_MONTH[(m - 1) as usize]
+        crate::civil_date::days_in_month_common(m)
     };
     Ok(Some(Value::Int(len)))
 }

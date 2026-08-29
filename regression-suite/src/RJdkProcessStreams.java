@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
  * streams that were present but not actually wired to anything: writes to
  * stdin never reached the child, and reads from stdout/stderr returned EOF
  * immediately regardless of what the child printed. See
- * {@code docs/internal/fixed-bugs/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md}
+ * {@code fixed-bugs/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md}
  * -- traced to Apache Tomcat's own
  * {@code org.apache.tomcat.security.TestSecurity2019#testCVE_2019_0232}, a
  * real CVE regression test, not a synthetic probe. {@link RJdkProcess}, the
