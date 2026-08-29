@@ -524,6 +524,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-target", on_key: Some("CRATONVM_DBG_ZGC_TARGET"), off_key: None, off_word: None },
+    // The LARGE-OBJECT end's compactor, one line per engaged cycle: what it
+    // moved and what the high free list looked like on either side of it.
+    // Declared 2026-08-29.
+    E { group: Group::DBG, token: "zgc-high", on_key: Some("CRATONVM_DBG_ZGC_HIGH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-elide-ctor", on_key: Some("CRATONVM_DBG_JIT_ELIDE_CTOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-field-sites", on_key: Some("CRATONVM_DBG_JIT_FIELD_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
@@ -1508,6 +1512,13 @@ pub const INVENTORY: &[E] = &[
     // compiled frame -- which is why the default configuration never
     // defragmented. See `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
     E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the LARGE-OBJECT end's compactor. Default-ON,
+    // so a KILL SWITCH with the same `off_word: Some("0")` as its neighbours:
+    // `=0` leaves the arena's high end exactly as it was before, which is the
+    // same-binary A/B for a repair whose whole claim is that the requests
+    // failing at 97 % free came from an end nothing could relocate. See
+    // `gc/src/zgc.rs::zgc_high_compaction_enabled`.
+    E { group: Group::GC, token: "zgc-high-compaction", on_key: Some("CRATONVM_ZGC_HIGH_COMPACTION"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the cross-thread JIT coverage handshake.
     // Default-ON, so a KILL SWITCH, with the same `off_word: Some("0")` as its
     // neighbours: `=0` restores the blanket "any peer inside compiled code

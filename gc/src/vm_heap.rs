@@ -2706,6 +2706,23 @@ impl VmHeap {
                  tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
             );
+            // THE OTHER END OF THE ARENA, on its own line.
+            //
+            // Every number above describes the LOW end. A heap can compact that
+            // one on every cycle while the allocation actually failing is
+            // served from the large-object end, which until 2026-08-29 nothing
+            // could relocate at all -- the H2
+            // `TestMVStoreTool`/`TestCachedQueryResults` failures, and the
+            // reason `targeted_pages` reads 0 on them. `declined` is printed
+            // beside `cycles` for the reason `relocation_skipped_jit` is
+            // printed beside `compaction_cycles`: `cycles=0` alone reads as a
+            // broken compactor, `cycles=0 declined=812` reads as a workload
+            // that never fragmented its large-object end, and only one of those
+            // is a defect.
+            let (hi_cycles, hi_declined, hi_moved, hi_bytes) = h.high_compaction_engagement();
+            eprintln!(
+                "[GC] zgc-high-compaction: cycles={hi_cycles} declined={hi_declined}                  objects_relocated={hi_moved} bytes_copied={hi_bytes}"
+            );
             // CONCURRENT marking, on its own line and with five fields rather
             // than one, because four different runs look identical in any
             // smaller summary:
