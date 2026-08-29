@@ -30,15 +30,49 @@ It is a family resemblance and nothing more until somebody dumps the throwable.
 ## What has already been ruled out
 
 * **Not the ZGC fragmentation defect.** Confirmed pre-existing and unrelated by
-  a kill-switch differential on 2026-08-21, and reproduced afterwards on the
-  fixed binary with zero `OutOfMemoryError` and four `arena allocation failed`.
-  The arena failures are the collector reporting; nothing throws from them here.
+  a kill-switch differential on 2026-08-21, and reproduced afterwards on a
+  binary where the fragmentation OOM was gone.
+
+  **But the OOM is back on 2026-08-29, and for a reason that is not
+  fragmentation.** Re-run on the tip with all four repairs, `--Xmx 1g`:
+
+  ```text
+  rc=1 secs=335 oom=4 arena=4
+    compaction_cycles=1 objects_relocated=5436
+    relocation_skipped_jit=16 relocation_on_proven_jit=1
+    zgc-high-compaction: cycles=0 declined=1 vacated_spans=0 vacated_bytes=0
+  ```
+
+  **The slide ran ONCE in seventeen collections.** This class is JIT-busy
+  enough that the per-cycle coverage proof refuses relocation on nearly every
+  cycle, so no repair inside `relocate_stw` gets a chance — `vacated_spans=0`
+  is the same statement from the other side. That is the
+  `relocation_skipped_jit` obligation, not the fragmentation one, and it is a
+  third failure on this class rather than a return of the first.
+
+  The parent page's own rule applies: read `relocation_on_proven_jit` before
+  `rc`. Any arm here that does not report it above zero is measuring the
+  refusal, not the heap.
 * **Not a hang.** An earlier Windows rerun classified this class as HANG at the
   1500 s cap; the Azure rerun crashes it in about two minutes. The predecessor
   page (`hangs-true-vs-perfcliff-RESOLVED-20260821.md`) flagged that shape
   mismatch and did not reconcile it; the reconciliation is that the failure is
   fast and deterministic once triggered, so whatever made the Windows run time
   out instead is a host/heap difference, not a second behaviour.
+
+## Three failures, not one
+
+As of 2026-08-29 this class carries three separable things, and a run that
+fixes any one of them still fails:
+
+1. the `Exception in thread "main" java/lang/Object` this page is named for;
+2. an `MVStoreException` wrapping `OutOfMemoryError` on the MVStore background
+   writer thread;
+3. a compaction refusal rate of 16 in 17 collections, which is what lets (2)
+   happen at all.
+
+(3) is the cheapest to attack and is not this page's — it belongs with the
+per-cycle coverage proof. (1) is what this page is for.
 
 ## What to do first
 
