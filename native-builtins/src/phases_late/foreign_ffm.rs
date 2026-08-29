@@ -561,10 +561,58 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
 /// `java.nio.ByteOrder` resolves `name` to slot 0 and gets the String;
 /// a shape where the resolved index is out of range is skipped rather than
 /// written out of bounds.
+/// `java.nio.ByteOrder.LITTLE_ENDIAN` / `BIG_ENDIAN`.
+///
+/// **The canonical static first, and a mint only as a fallback.** `ByteOrder`
+/// has exactly two instances and every caller compares them with `==`:
+/// `ByteOrder.nativeOrder()` is one of the two `public static final` fields,
+/// and `ValueLayout.JAVA_INT.order()` has to BE that same object, not an equal
+/// one. Minting a fresh carrier satisfies every null check, prints the right
+/// name, and fails the only test anyone writes. MEASURED against HotSpot
+/// 25.0.4+7, both modes (`apps/probes/FfmSegmentSweep.java`):
+///
+/// ```text
+///   ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()
+///     HotSpot  true      CratonVM  false
+/// ```
+///
+/// This is the same rule `canonical_enum_constant` states for `Thread$State`
+/// and `W7-93` states for the `StackWalker` options — a native that answers a
+/// class's own published constant must hand back the object that class's
+/// `<clinit>` stored. `ByteOrder` is not an `enum`, but its two constants are
+/// `static final` fields of its own type, which is the only property that rule
+/// needs.
+///
+/// The mint is KEPT as the fallback because a fabricated `java.nio.ByteOrder`
+/// stand-in has no statics to read, and `p67_layout_is_little` already knows
+/// how to read the flag out of slot 0 of one. So a stripped image keeps the
+/// behaviour it had; a real one gets identity.
+fn p67_canonical_byte_order(
+    ctx: &mut dyn NativeContext,
+    little_endian: bool,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized("java/nio/ByteOrder").ok()?;
+    // `ensure_class_initialized` fabricates a stand-in rather than failing, so
+    // an `Ok` is not evidence the image has the class; the static lookup is.
+    let name = if little_endian {
+        "LITTLE_ENDIAN"
+    } else {
+        "BIG_ENDIAN"
+    };
+    let idx = ctx.static_field_index_by_name(cid, name)?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub(crate) fn p67_byte_order_object(
     ctx: &mut dyn NativeContext,
     little_endian: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(canonical) = p67_canonical_byte_order(ctx, little_endian) {
+        return Ok(canonical);
+    }
     let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
     let cid = ctx.class_id_of_object(obj);
@@ -655,7 +703,32 @@ pub(crate) fn p67_layout_with_order(
 // `close()` has something to close.
 const P67_ARENA_OPEN: usize = 0;
 const P67_ARENA_SESSION: usize = 1;
-const P67_ARENA_SLOTS: usize = 2;
+/// `1` when `close()` is allowed on this arena, `0` when it is not.
+///
+/// `Arena.global()` and `Arena.ofAuto()` are NON-CLOSEABLE in the JDK and
+/// `ofConfined()`/`ofShared()` are closeable, but all four minted the same
+/// two-slot carrier here — `p67_new_arena`'s only parameter was `confined`,
+/// which records the owner thread and says nothing about closeability. So
+/// nothing could refuse, and `Arena.global().close()` CLOSED THE GLOBAL ARENA.
+/// MEASURED against HotSpot 25.0.4+7, both modes
+/// (`apps/probes/FfmSegmentSweep.java`, message from `FfmMsgProbe`):
+///
+/// ```text
+///   Arena.global().close()
+///     HotSpot   UnsupportedOperationException: Attempted to close a non-closeable session
+///     CratonVM  no-throw
+/// ```
+///
+/// Not a missing exception so much as a missing lifetime: every segment
+/// allocated from the global arena is supposed to outlive everything, and a
+/// `close()` that succeeds is a use-after-free waiting for its first reader.
+///
+/// The slot is APPENDED, so a carrier minted before this change (or by another
+/// registrar) is simply narrower and reads as closeable — the pre-fix
+/// behaviour — rather than reading garbage. `p67_arena_session` already guards
+/// on `object_num_fields`, which is the pattern this follows.
+const P67_ARENA_CLOSEABLE: usize = 2;
+const P67_ARENA_SLOTS: usize = 3;
 
 /// Slot 2 of a synthetic `MemorySegment` is its owning `Arena` — the convention
 /// `panama.rs` already established for its 6-field segments ("no arena" at
@@ -861,6 +934,16 @@ fn p67_new_arena(
     ctx: &mut dyn NativeContext,
     confined: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    p67_new_arena_kind(ctx, confined, true)
+}
+
+/// [`p67_new_arena`] with the closeability the caller knows and the carrier
+/// could not previously record. See [`P67_ARENA_CLOSEABLE`].
+fn p67_new_arena_kind(
+    ctx: &mut dyn NativeContext,
+    confined: bool,
+    closeable: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
     let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
     // The session allocation below can move the fresh arena (native stale-local
     // family).
@@ -870,6 +953,11 @@ fn p67_new_arena(
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
     ctx.set_field(arena, P67_ARENA_SESSION, session_value);
+    ctx.set_field(
+        arena,
+        P67_ARENA_CLOSEABLE,
+        Value::Int(i32::from(closeable)),
+    );
     if confined {
         if let Value::Object(Some(session)) = session_value {
             let owner = ctx.current_thread_object();
@@ -2097,6 +2185,23 @@ pub(crate) fn p67_segment_address(ctx: &mut dyn NativeContext, args: &[Value]) -
 ///
 /// `false` survives only as the fallback for a carrier too short to have the
 /// slot, which is what those (2- and 3-field) segments have always been.
+/// The backing array of a heap segment, or `None` for a native one.
+///
+/// `panama::SEG_HEAP_BASE_FIELD` is slot 6 and only a heap-aliasing carrier is
+/// that wide, so the width check IS the discriminator — the same one
+/// `al_itr_alt_base` uses one crate over, and for the same reason: an ordinary
+/// carrier pays one integer compare.
+fn p67_segment_heap_base_slot(ctx: &dyn NativeContext, seg: ObjectRef) -> Option<ObjectRef> {
+    const SEG_HEAP_BASE_FIELD: usize = 6;
+    if ctx.object_num_fields(seg) <= SEG_HEAP_BASE_FIELD {
+        return None;
+    }
+    match ctx.get_field(seg, SEG_HEAP_BASE_FIELD) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub(crate) fn p67_segment_is_read_only(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2284,6 +2389,49 @@ pub(crate) fn p67_segment_get_width(
     }
 }
 
+/// The write half of `AbstractMemorySegmentImpl.checkAccess`.
+///
+/// `p67_segment_set_width` checked the SCOPE and never the read-only flag, so
+/// every write through a native `asReadOnly()` view landed. MEASURED against
+/// HotSpot 25.0.4+7, both modes (`apps/probes/FfmSegmentSweep.java`):
+///
+/// ```text
+///   MemorySegment ro = arena.allocate(16).asReadOnly();
+///   ro.set(JAVA_INT, 0, 1)
+///     HotSpot   IllegalArgumentException: Attempt to write a read-only segment
+///     CratonVM  no-throw -- and the following read shows the write LANDED
+/// ```
+///
+/// `asReadOnly()` exists to hand a reference away without handing away the
+/// ability to write through it, so a read-only view that writes is not a
+/// missing exception: it is the one capability the call was made to remove.
+/// `F26` records the same shape one level down ("a copying slice is a wrong
+/// capability").
+///
+/// The heap path has had this check since `heap_segment_check_access`; the
+/// raw-address path never did. Unlike the ALIGNMENT rule beside it — which that
+/// function's own comment explains cannot be transplanted, because a native
+/// segment's real `maxByteAlignment` is not knowable from the carrier — the
+/// read-only flag IS on the carrier and `p67_segment_is_read_only` is the
+/// registered `isReadOnly()` body, so this reads the single source of truth
+/// rather than a second copy of it.
+fn p67_segment_check_writable(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let read_only = matches!(
+        p67_segment_is_read_only(ctx, &[Value::Object(Some(seg))])?,
+        Some(Value::Int(n)) if n != 0
+    );
+    if read_only {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Attempt to write a read-only segment".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn p67_segment_set_width(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2301,6 +2449,7 @@ pub(crate) fn p67_segment_set_width(
         _ => false,
     };
     p67_segment_check_scope(ctx, seg)?;
+    p67_segment_check_writable(ctx, seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(None);
     };
@@ -2642,11 +2791,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true)?)))),
     );
+    // NON-CLOSEABLE, like `global()` below: `Arena.ofAuto()` is closed by the
+    // collector when its segments become unreachable, never by the caller.
     r.register(
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
     );
     r.register(
         arena,
@@ -2658,7 +2809,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
     );
     r.register(
         arena,
@@ -2704,6 +2855,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     );
     r.register(arena, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // A non-closeable arena refuses BEFORE anything is torn down --
+        // `global()` and `ofAuto()`. See `P67_ARENA_CLOSEABLE` for the
+        // measurement; the message is HotSpot's, transcribed.
+        if ctx.object_num_fields(this) > P67_ARENA_CLOSEABLE
+            && matches!(ctx.get_field(this, P67_ARENA_CLOSEABLE), Value::Int(0))
+        {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Attempted to close a non-closeable session".into(),
+            }
+            .into());
+        }
         // Close the arena's session FIRST: a second `close()` must surface the
         // session's IllegalStateException rather than silently re-clearing the
         // flag, and the cleanups have to run while the arena is still open.
@@ -4653,16 +4815,53 @@ fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
         "(J)Ljava/lang/String;",
         p67_segment_get_string,
     );
-    // `MemorySegment` does not override `equals` in the JDK — segment equality
-    // IS reference identity. The constant `false` this used to return broke
-    // even reflexivity (`seg.equals(seg)` was false), so a segment could not be
-    // found in any collection it had just been put into, and the
-    // `slice.equals(other)` guards FFM callers write around aliasing all took
-    // the wrong branch.
-    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
+    // `AbstractMemorySegmentImpl` DOES override `equals`, and the comment that
+    // used to sit here — "segment equality IS reference identity" — was written
+    // from memory. MEASURED against HotSpot 25.0.4+7
+    // (`apps/probes/FfmMsgProbe.java`):
+    //
+    //   MemorySegment s = arena.allocate(16);
+    //   s.asSlice(0, 16).equals(s)   true      <- two DIFFERENT objects
+    //   s.asSlice(0, 16) == s        false
+    //   s.asSlice(0, 16).hashCode() == s.hashCode()   true
+    //
+    // so it is VALUE equality over the pair the JDK hashes: the base and the
+    // offset. Length is deliberately NOT part of it — `equals` is asking "do
+    // these two references point at the same place", which is the question the
+    // aliasing guards FFM callers write are actually asking.
+    //
+    // This is the second correction to this one line. The constant `false` it
+    // started as broke reflexivity; identity fixed that and stopped one row
+    // short. A segment and a full-length slice of it are the same place, and a
+    // caller that de-duplicates segments before a bulk copy saw two.
+    //
+    // `panama_libffi::segment_address` is the shared reader for "where does
+    // this carrier point", already `[0] + [5]` and already 0 for a heap
+    // segment (F27) — so heap segments fall back to comparing their BACKING
+    // ARRAY, which is the `unsafeGetBase()` half of the JDK's pair. Without
+    // that, every heap segment would equal every other one at address 0.
+    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let equal = matches!(args.get(1), Some(Value::Object(Some(other))) if *other == this);
-        Ok(Some(Value::Int(i32::from(equal))))
+        let Some(Value::Object(Some(other))) = args.get(1).copied() else {
+            return Ok(Some(Value::Int(0)));
+        };
+        if other == this {
+            return Ok(Some(Value::Int(1)));
+        }
+        let same_address = crate::panama_libffi::segment_address(&*ctx, this)
+            == crate::panama_libffi::segment_address(&*ctx, other);
+        // The base half. `heapBase()` is registered on both spellings and
+        // answers an `Optional`, so the raw slot is read instead: two heap
+        // segments over the same array are the same place, two over different
+        // arrays are not, and a native segment has no base on either side.
+        let this_base = p67_segment_heap_base_slot(ctx, this);
+        let other_base = p67_segment_heap_base_slot(ctx, other);
+        let same_base = match (this_base, other_base) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        Ok(Some(Value::Int(i32::from(same_address && same_base))))
     });
     r.register(
         ms,
