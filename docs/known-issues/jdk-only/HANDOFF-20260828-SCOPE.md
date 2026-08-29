@@ -21,14 +21,31 @@ been removed again.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-29** — dispatch worklist 483 rows / 20 fixed, PLUS its two recorded-open items and five more the probe found: 125 rows, **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Records: `L5-reflection-lane-complete-20260828.md` and `L5-residuals-module-packages-and-invokeexact-20260828.md` | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
+| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms) — **zero failures `--jdk-only` produces that compatible mode does not**, and Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 
-**Six of the seven lanes are DONE** — L1, L3, L4, L5, L6 and L7. L2
-(`StringBuilder` / `StringBuffer` / `AbstractStringBuilder`) is the only one
-still open, and it is taken; see the table.
+**All seven lanes are DONE** — L1 through L7, the last of them on 2026-08-29.
+Six of the seven lane handoffs are retired to `internal/jdk-only/`; L5's
+lives with its records in this directory.
+
+**This page is NOT retired with them, and should not be.** Three things on it
+are still live:
+
+* **Phase 2 is not adjudicated.** The lanes measured the surface; the worklist
+  is **1065 distinct `native-won` triples** (P4-A, corpus-wide — not the 334 a
+  five-probe screen saw), and `[has_code≠retire]` applies to every one of them:
+  a 0-diff argues KEEP as often as it argues retire.
+* **§4 still carries OPEN, owned items** — the FFM interface-classed identity
+  family, sized but deliberately not fixed, and `KeyStore.getInstance("JCEKS")`,
+  unclaimed and missing in both modes.
+* **§5 is the operational surface every lane runs from** — the landing
+  protocol, the known-red vectors and gates on `dev`, and the instrument traps.
+  Retiring it would move that out of the directory people read.
+
+A page that still poses a question belongs in `known-issues/`, even when the
+work that prompted it has landed.
 
 **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
 you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
@@ -93,7 +110,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | **Phase 1** — fabricated receiver kills its caller | **5 of 9 lanes closed.** No `NoClassDefFoundError` in 80 probe rows. A/B/D/G/I clear. |
 | **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
-| **Phase 4** — the evidence base | **CLOSED 2026-08-28 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. |
+| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot (0 strict-only failures; the worklist is 1065, not 334) and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). |
 
 ### The finding that reframes the work
 
@@ -273,7 +290,7 @@ planning:
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
 | `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
-| ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
+| **The BEHAVIOURAL half of the same surface: CLOSED 2026-08-29.** 199 differential rows over the segment/arena/layout API (`apps/probes/FfmSegmentSweep.java`) found **nine defects that are not identity** and every one is now 0-diff in both modes: a native `asReadOnly()` segment ACCEPTED WRITES; `ByteOrder` was minted per call so `ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()` was false; `Arena.global().close()` succeeded; `allocate(-1)`, two bad alignments and `ofArray(null)` did not refuse; and `s.asSlice(0, s.byteSize()).equals(s)` was false. The identity rows to the left are what REMAINS after those. | **DONE** — `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`. It also measures what the identity defect does NOT break: `isInstance`, `instanceof`, `isAssignableFrom` and a class-keyed `HashMap` round-trip all answer correctly on an interface-classed segment, in both modes — so the contract decision to the left is a decision about identity alone. || ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
@@ -342,11 +359,11 @@ prints can never fire.** That was the second inert fix of the day, and unlike th
 ```bash
 # 1. gate  (this is the whole set; do not shorten it)
 cargo test -p cratonvm-types
-cargo test -p cratonvm-native-builtins --test stub_ratchet --test registrar_drift \
-  --test registrar_reachability --test essential_wiring_ratchet \
-  --test duplicate_registration_gate --test shim_inheritance_guard --test registry_contracts
-cargo test -p cratonvm-native-builtins --features management --test stub_ratchet \
-  --test registrar_drift --test registrar_reachability
+# Name NOTHING by hand here. `ls native-builtins/tests/` is the authority and it
+# GROWS; the hand-written list this replaced named 7 of the 10 that exist.
+cargo test -p cratonvm-native-builtins --tests
+cargo test -p cratonvm-native-builtins --features management --tests
+cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests
 # plus --lib for any crate you changed
 
 # 2. the three arms, on a RELEASE build of the merged tree
@@ -361,6 +378,39 @@ git push origin HEAD:dev
 **Do not chain the push behind the gates.** I landed a red `doc_citation_paths`
 on `dev` earlier in this campaign by keying the conditional on `behind=0` instead
 of on the test result.
+
+**Why the gate list stopped naming targets (2026-08-29, L7).** It used to name
+seven `--test` targets. `native-builtins/tests/` holds **ten**, and the three it
+omitted were `lock_discipline_ratchet`, `eintr_ratchet` and `aes_gcm_kat`. The
+first is not a rounding error: it holds this crate to a raw-lock-construction
+baseline because **this crate re-enters the VM** — a native callback calls back
+into Java, which takes the heap and L10 class-manager locks — so a `Mutex` here
+with no `LockLevel` is a deadlock the order checker cannot see. It caught
+exactly that in L7's own instrument, on a commit whose other nine gates were
+green. A lane following the old list, on its promise of being "the whole set",
+would have landed it.
+
+**An unknown `--test` name exits 101, the same code a panicking test gives.**
+Seven "failing ratchets" in L7's landing script were seven stale names, and the
+output — tail-truncated — was cargo listing the targets that DO exist, which
+reads as a list of failures. If a sweep of unrelated guards goes red
+identically, suspect the invocation before the tree, and read the FIRST line of
+the output rather than the last.
+
+`--features synthetic-jdk` is in the set as well: that mode builds and runs
+again as of 2026-08-29
+(`P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md`), and a
+`#[cfg(feature = "synthetic-jdk")]` module that nothing compiles rots silently.
+
+Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
+
+* **It subsumes `--lib`**, so the line under it is redundant for this crate —
+  and the known-red `properties_sidetable` guard two sections down now shows up
+  in the gate command itself, `rc=101`, on every branch. Read that section
+  before you bisect it.
+* **The feature arms genuinely cover more**, which is the argument for running
+  all three: 4176 tests on default, 4208 under `management`, 4352 under
+  `synthetic-jdk`. The third arm alone compiles 176 tests nothing else does.
 
 ### Known-red vectors, so you can tell yours from theirs
 
@@ -381,7 +431,9 @@ of on the test result.
   here because the sequence is the point: three lanes measured the same vector
   and each was right about a different half of it.
 
-  **There is now no known-red vector in the corpus.**
+  **No vector is known-RED any more, and the one that read as intermittent was
+  the vector's own bug.** See `RSslEndpointIdentification` below: it is fixed,
+  and the note is kept because of how it looked on the way there.
 * `RExceptions` and `RJdkFailure` — **red on `dev` from `c6ccccbc8` (the L5
   lane) until `39e2ded07` fixed it. If you ran the arms in that window you saw
   two reds that were not yours and are not yours to chase.** Both assert the
@@ -390,6 +442,56 @@ of on the test result.
   spending anything on them.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
+* ~~`RSslEndpointIdentification`~~ — **FIXED 2026-08-29. It was never
+  intermittent and it was never CratonVM's**: the vector's own client loop threw
+  away the reply it asserts on, and it failed on the HOTSPOT side while CratonVM
+  passed all four checks. Kept here as a worked example of a failure mode this
+  campaign keeps meeting, not as an open row.
+  What it looked like first: green in the `--jdk-only` and `SUITE=all` arms and
+  red in the `core` arm of the same cycle, then 2-of-3 standalone passes, then —
+  an hour later on a host at load average 14 — red in three consecutive `core`
+  runs. That reads exactly like a flake becoming a regression.
+  What it was: `unwrap()` consumes ONE TLS record per call, and the loop called
+  it once per `read()`. Under load the server's NewSessionTicket, its reply and
+  its close_notify arrive in a single 350-byte read; the one `unwrap` consumed
+  the 222-byte ticket and produced no application data, the next `read` returned
+  EOF, and `break` discarded the 128 buffered bytes that were the reply. Whether
+  the records coalesce is a scheduling question — the whole of the
+  "intermittency". Proven by ABBA-interleaved A/B on one loaded host: **15
+  failures in 40 runs on the committed loop, 0 in 40 on the drained one.**
+  **Three things to take from it.** The harness had already said it: guard `G4`
+  printed *"the HotSpot oracle run FAILED (rc=1), so the 'expected' side of the
+  cross-VM diff is an artefact of the oracle's failure, not ground truth"* — read
+  which SIDE failed before reading the diff. A vector that passes standalone and
+  fails in the suite is not automatically leakage; this one passed standalone
+  because the host was quiet at the time, and reproduced under `ONLY=` once it
+  was not. And a failure rate that climbs with load is a race in someone's code,
+  not noise to be re-run away — here, ours.
+
+### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+
+`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
+`origin/dev` as of `a5c67dcda`:
+
+```
+properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
+  these functions read the UNORDERED side-table snapshot:
+  ["native_properties_clone", "native_properties_replace_all"]
+```
+
+**It is not your merge, and you can prove that without building anything.** The
+test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
+— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
+native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
+touched it, which makes the red identical to pristine `dev`'s.
+
+It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
+new guard it is: the guard and the two functions it names landed in the same
+commit. Left for that lane rather than silenced here, because the guard's two
+exits are not equivalent and picking between them is a behavioural call, not a
+gate-quieting one — `Properties.clone()` hands its key order to Java through
+`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
+that order, so "add it to ALLOWED" would be the wrong exit for both.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.

@@ -631,31 +631,36 @@ correct of the two.
 
 ## 10. Reproduce
 
-> **The `probes/` tree is no longer in the working tree.** `3b2901531`
-> (*"major doc consistency update before the realeas"*, 2026-08-29) removed 915
-> files and 126 525 lines, the whole probe corpus among them — every probe this
-> record names, and every probe the other six lane records name. The four
-> sweeps are in history and restore in one command each:
+> **The probes moved. They are `apps/probes/`, not `probes/`.** `3b2901531`
+> (*"major doc consistency update before the realeas"*, 2026-08-29) retired the
+> repo-root `probes/` tree — 915 files, 126 525 lines — and CURATED about thirty
+> of them into `apps/probes/`, which is what
+> `scripts/jdk-only-strict-probes.sh` now compiles and what every surviving lane
+> sweep (L2's, L3's, L4's) sits in.
 >
-> ```bash
-> git show c8f47f9a5:probes/ThreadShadowSweep.java   > probes/ThreadShadowSweep.java
-> git show c8f47f9a5:probes/ForkJoinShadowSweep.java > probes/ForkJoinShadowSweep.java
-> git show c8f47f9a5:probes/ChmShadowSweep.java      > probes/ChmShadowSweep.java
-> git show 2790005f4:probes/AsyncChannelSweep.java   > probes/AsyncChannelSweep.java
-> git show 2790005f4:probes/ChmElemDbg.java probes/ThreadIntrDbg.java probes/L6MsgProbe.java
-> ```
+> **The first version of this note said "deleted" and stopped there, and that
+> was wrong in the direction that loses work**: the curation ran while this lane
+> was still verifying, so the four L6 sweeps went out with the bulk removal
+> rather than being kept like their siblings. They are restored to
+> `apps/probes/` — `ThreadShadowSweep`, `ForkJoinShadowSweep`, `ChmShadowSweep`,
+> `AsyncChannelSweep`, plus the three diagnostics `ChmElemDbg`, `ThreadIntrDbg`
+> and `L6MsgProbe` — and re-measured from there: all four still 0-diff in both
+> modes.
 >
-> The final verification in §8 ran the compiled classes in `probes/out` — which
-> is untracked build output and survived the deletion — against the newly built
-> binary. That is a measurement of the BINARY with unchanged probe bytecode, not
-> a recompile, and it is stated that way rather than implied.
+> One measurement in §8 is worth stating precisely rather than implying. The
+> final full cycle ran between the removal and the restore, so `javac` found no
+> sources and the probes ran the compiled classes still sitting in the untracked
+> `probes/out`. Same probe bytecode, newly built binary — a valid measurement OF
+> THE BINARY, but not a recompile. It has since been re-run from `apps/probes/`
+> with a clean compile.
 
 ```bash
-javac -d probes/out probes/{Thread,ForkJoin,Chm}ShadowSweep.java probes/AsyncChannelSweep.java
+javac -d apps/probes/out apps/probes/{Thread,ForkJoin,Chm}ShadowSweep.java \
+                          apps/probes/AsyncChannelSweep.java
 for P in ThreadShadowSweep ForkJoinShadowSweep ChmShadowSweep AsyncChannelSweep; do
-  "$JDK/bin/java" -cp probes/out $P > hs-$P.out 2>/dev/null
-  cratonvm --java-home "$JDK"            -cp probes/out $P > cc-$P.out 2>/dev/null
-  cratonvm --java-home "$JDK" --jdk-only -cp probes/out $P > jo-$P.out 2>/dev/null
+  "$JDK/bin/java" -cp apps/probes/out $P > hs-$P.out 2>/dev/null
+  cratonvm --java-home "$JDK"            -cp apps/probes/out $P > cc-$P.out 2>/dev/null
+  cratonvm --java-home "$JDK" --jdk-only -cp apps/probes/out $P > jo-$P.out 2>/dev/null
   diff hs-$P.out cc-$P.out; diff hs-$P.out jo-$P.out
 done
 ```
@@ -668,9 +673,9 @@ read as 30 clean rows and 103 differences.
 Two one-line diagnostics, both no-flags and both modes:
 
 ```bash
-cratonvm --java-home "$JDK" -cp probes/out ChmElemDbg      # elements()  — §2.2
-cratonvm --java-home "$JDK" -cp probes/out ThreadIntrDbg   # interrupt   — §3
+cratonvm --java-home "$JDK" -cp apps/probes/out ChmElemDbg      # elements()  — §2.2
+cratonvm --java-home "$JDK" -cp apps/probes/out ThreadIntrDbg   # interrupt   — §3
 ```
 
-and `probes/L6MsgProbe.java`, which is the MESSAGE of every exception this lane
+and `apps/probes/L6MsgProbe.java`, which is the MESSAGE of every exception this lane
 started throwing, measured on the oracle before any of them was written.

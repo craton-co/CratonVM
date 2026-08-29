@@ -226,6 +226,57 @@ and it is already `#[track_caller]` — so the requester `file:line` costs
 nothing, and this is not on the per-object hot path that `layout_alias` has to
 buy a flag to observe.
 
+**The census itself lives in `native-api`, not at the funnel.** It was written
+inline in `native-builtins` and that cost the crate its 429th raw lock
+construction — `lock_discipline_ratchet` holds a baseline there because that
+crate RE-ENTERS the VM, so a `Mutex` with no `LockLevel` is a deadlock the order
+checker cannot see, and the ratchet says in as many words: do not raise the
+baseline. A diagnostic dedup set is a poor reason to spend that ceiling. It moved
+to `instantiable::observe_uninstantiable_receiver`, beside the
+`ACC_INTERFACE`/`ACC_ABSTRACT` predicate it already used, taking the shape
+`layout_alias::observe` had already established for the same problem: a plain
+`parking_lot::Mutex` (this crate's convention), a guard that lives for exactly
+one `insert`, and the `warn!` emitted with nothing held — the subscriber
+re-enters the VM.
+
+### The FFM half of this population now has its own record — and it agrees
+
+`ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`
+landed the same day and asked the segment surface 199 rows rather than one. It
+is the deeper treatment of the FFM half of what this census sees, and two of its
+findings matter here.
+
+It **fixed nine behavioural defects** on that surface — a native `asReadOnly()`
+view whose writes landed, `allocate(-1)` and `allocate(8, 0)` not throwing,
+`Arena.global().close()` not throwing — none of which is identity, and none of
+which either this census or the definition-of-done screen could see. That is a
+useful correction to the screen's reasoning, which had inferred from one row
+(`byteSize()` still answers 16) that the surface was identity-only. The
+inference was right about that row and wrong about the surface.
+
+And it **sized the residual instead of guessing**: 27 rows in compatible mode,
+47 under `--jdk-only`, one defect wearing five class names, with the damage
+bounded to identity — `isInstance`, `instanceof`, `isAssignableFrom` and a
+class-keyed `HashMap` round-trip all still answer correctly. Its reason for not
+fixing it is the one R4 gives above, reached independently: the accessors
+address this VM's six-slot carrier by raw slot index, so adopting the JDK's
+class names means adopting its layout.
+
+**Re-measured after those nine fixes landed** (2026-08-29, post-merge): this
+census still names the same seven classes, with only the line numbers moved.
+That is what their §4 predicts — they fixed behaviour, not identity — and it is
+the check worth doing rather than assuming, because a census whose population
+silently drops to zero after someone else's fix looks exactly like a census that
+broke.
+
+The move was verified by re-running the probe, not by re-running the ratchet.
+`#[track_caller]` propagating across a crate boundary is exactly what a move
+like this breaks, and a census that still compiles while reporting its own
+forwarding line is worse than one that is absent. After the move
+`AbstractReceiverSweep` names the same seven classes with the same requesters —
+`foreign_ffm.rs:864`, `panama.rs:124`, `lang_invoke.rs:2821` — so the location
+still resolves to the NATIVE.
+
 Run over the five definition-of-done arms under `--jdk-only`, it names **31
 distinct classes**, on every one of which the same report says
 `compatibility_classes: 0`:
@@ -340,27 +391,24 @@ earlier in this campaign, the `craton_gpu.rs` feature gates and the
 
 ## Where the probes are
 
-`3b2901531` ("major doc consistency update before the realeas", 2026-08-29)
-removed 915 files including the whole `probes/` tree, so every Reproduce block
-in this directory now names files the tree does not have. Following the
-convention `e1ff937b4` set for L6's sweeps, this lane's probes are named with
-the commit that carries them and a one-line restore each:
+**In the tree, at `probes/`, committed normally.**
 
-```bash
-git show 7da07b4ac:probes/DodSpringApp.java        > probes/DodSpringApp.java
-git show 7da07b4ac:probes/DodJdbcWorkload.java     > probes/DodJdbcWorkload.java
-git show 7da07b4ac:probes/DodJUnitRunner.java      > probes/DodJUnitRunner.java
-git show 7da07b4ac:probes/DodH2JdbcSuite.java      > probes/DodH2JdbcSuite.java
-git show 7da07b4ac:probes/DodServiceLoaderSweep.java > probes/DodServiceLoaderSweep.java
-git show 7da07b4ac:probes/dodscreen-linux.sh       > probes/dodscreen-linux.sh
-git show 7da07b4ac:probes/dod-arms.sh              > probes/dod-arms.sh
-git show 7da07b4ac:probes/dod-report.py            > probes/dod-report.py
-git show 7da07b4ac:probes/dod-summary.py           > probes/dod-summary.py
-git show e8776985a:probes/DodArrayStoreSweep.java  > probes/DodArrayStoreSweep.java
-git show e8776985a:probes/AbstractReceiverSweep.java > probes/AbstractReceiverSweep.java
-chmod +x probes/dodscreen-linux.sh probes/dod-arms.sh
+They were not, for one day, and this section used to say so. `3b2901531`
+("major doc consistency update before the realeas", 2026-08-29) removed 915
+files including the whole `probes/` tree, so these records were first written
+with a `git show <commit>:probes/…` restore block each, following the convention
+`e1ff937b4` set for L6's sweeps. Dev then put `probes/` back — `BdProbe`,
+`FjpProbe`, `L3ViewItrSweep`, `L5ModuleInvokeSweep` — so the restore blocks are
+withdrawn and the files are simply in the tree:
+
+```text
+probes/DodSpringApp.java     probes/DodJdbcWorkload.java   probes/DodJUnitRunner.java
+probes/DodH2JdbcSuite.java   probes/DodServiceLoaderSweep.java
+probes/DodArrayStoreSweep.java  probes/AbstractReceiverSweep.java
+probes/dodscreen-linux.sh    probes/dod-arms.sh
+probes/dod-report.py         probes/dod-summary.py
 ```
 
-`DodServiceLoaderSweep` gained its `S-iteratorClass` row after `7da07b4ac`; take
-that one from `e8776985a` too if the iterator-identity assertion is what you are
-after.
+If you are reading this from a commit inside that one-day window, `7da07b4ac`
+and `e8776985a` are the two that carry them, and `DodServiceLoaderSweep` gained
+its `S-iteratorClass` row only in the second.

@@ -86,8 +86,8 @@ count).
 
 ## Hibernate Reactive
 
-Full detail in
-[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md),
+Full detail was in the now-retired
+`residual-seven-after-the-afc-fix-20260817.md`,
 filed the same day after a fix took the Windows FAIL bucket from 238 classes
 to seven. Summarized here; nothing in the seven is a hang, a deadlock, or a
 wrong answer.
