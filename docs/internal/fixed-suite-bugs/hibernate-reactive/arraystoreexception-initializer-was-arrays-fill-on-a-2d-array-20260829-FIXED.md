@@ -121,8 +121,9 @@ copies is a defect that comes back.
 
 ## Falsification
 
-`regression-suite/src/RArrayStoreLibrary.java`, the 106th vector, is the
-LIBRARY-METHOD half of the array-store question `RArrayStoreTiers` and
+`regression-suite/src/RArrayStoreLibrary.java` is a new CORE vector — the list
+is `scheduled=76` with it and was 75 without — and it is the LIBRARY-METHOD
+half of the array-store question `RArrayStoreTiers` and
 `RArrayStoreInterfaces` ask of the opcode: 28 rows over `Arrays.fill`,
 `Arrays.copyOf(T[],int,Class)`, `ArrayList.toArray(T[])` (the `System.arraycopy`
 route), `AbstractCollection.toArray(T[])` (the `aastore` route),

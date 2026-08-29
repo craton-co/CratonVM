@@ -186,8 +186,8 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # `SUITE=core 63 / 64` all gain one to their DENOMINATOR. A run that reports
 # 104/105 without naming which vector failed has not been read carefully.
 #
-# RArrayStoreLibrary is the 106th, landed 2026-08-29, and every denominator
-# above gains one AGAIN. It is the LIBRARY-METHOD half of the array-store
+# RArrayStoreLibrary landed 2026-08-29 and every denominator above gains one
+# AGAIN — `SUITE=core` reports `scheduled=76` with it and reported 75 without. It is the LIBRARY-METHOD half of the array-store
 # question RArrayStoreTiers and RArrayStoreInterfaces ask of the OPCODE:
 # Arrays.fill / Arrays.copyOf / Collection.toArray(T[]) / System.arraycopy /
 # Array.set each perform their stores inside a native, so each holds its own
