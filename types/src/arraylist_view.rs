@@ -92,10 +92,35 @@ pub fn reset_for_test() {
 mod tests {
     use super::*;
 
+    /// Both tests below drive ONE process-global latch, and cargo runs them on
+    /// parallel threads of one process — so `reset_for_test()` in either lands
+    /// between the other's reset and its assertion:
+    ///
+    /// ```text
+    ///   revokes: reset()        -> latch false
+    ///   default: reset()        -> latch false
+    ///   revokes: note_minted()  -> latch TRUE
+    ///   default: assert!(!possible())   <- fails, and neither test is wrong
+    /// ```
+    ///
+    /// MEASURED: `the_default_licenses_the_yield` passes 5/5 alone and 5/5 as a
+    /// module, single-threaded or not, and FAILS in the full 589-test
+    /// `cargo test -p cratonvm-types` run — which is the whole gate set's first
+    /// step, so it takes out every lane's landing, not just this crate's.
+    ///
+    /// A mutex rather than `--test-threads=1`: the flag is the runner's, so it
+    /// would have to be remembered at every call site (and the gate set in
+    /// `HANDOFF-20260828-SCOPE.md` §5 does not pass it), while the lock travels
+    /// with the tests that need it. `unwrap_or_else(into_inner)` so that one
+    /// genuine assertion failure poisons nothing and the other test still
+    /// reports its own result.
+    static LATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The default licenses the yield. See the module header for why this is the
     /// right default and what the previous, inert one was.
     #[test]
     fn the_default_licenses_the_yield() {
+        let _serialised = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_for_test();
         assert!(!arraylist_classed_view_possible());
         assert_eq!(arraylist_view_fallback_count(), 0);
@@ -104,6 +129,7 @@ mod tests {
     /// One-way: a fallback mint revokes the yield and nothing restores it.
     #[test]
     fn a_fallback_mint_revokes_the_yield_permanently() {
+        let _serialised = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_for_test();
         note_arraylist_classed_view_minted();
         assert!(arraylist_classed_view_possible());
