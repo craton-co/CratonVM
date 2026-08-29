@@ -412,6 +412,24 @@ static FL_ALIGN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// spread over 1204296 bytes of contiguous arena`, occupants
 /// `java/lang/String` (80 B) and `java/lang/Object` (24 B) — inside the high
 /// region.
+///
+/// # Where it is armed, and where it was NOT (2026-08-29)
+///
+/// [`Arena::alloc`]'s LOW free-list exits cannot fire it: a low tier only ever
+/// returns an offset below `high_cursor`, so `is_high` is false there by
+/// construction. For a week the three sites it was armed at were exactly those
+/// three, and the page above recorded the resulting zero as "an untriggered
+/// instrument, not evidence". The one exit that can return a high offset —
+/// `alloc`'s last-resort `high_fit`, which spends the large-object end's own
+/// free list rather than raise `OutOfMemoryError` — is now armed too, under
+/// the site name `high-free-list-last-resort`.
+///
+/// It is still not a refusal, and should not become one: refusing would trade
+/// a fragmentation hazard for an `OutOfMemoryError` on a heap that has bytes.
+/// What changed the balance is that the damage is no longer PERMANENT —
+/// `ZgcRealHeap::compact_high_region` packs a small survivor up there against
+/// the top with everything else, so it stops walling the region at the next
+/// relocating cycle.
 static REGION_LEAK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Count of small allocations placed in the large-object region, for a test or
@@ -1251,8 +1269,26 @@ impl Arena {
         // ABSOLUTELY last, in two steps. First take from the large-object
         // end's FREE LIST if it has anything: those bytes are already claimed
         // by the high end, so spending them costs the reserve nothing.
+        //
+        // THIS IS THE ARM THAT PUTS A SMALL OBJECT IN THE LARGE-OBJECT REGION,
+        // and until 2026-08-29 it was the one arm of this function with no
+        // region tripwire on it.
+        //
+        // The `bug-h2-testkillprocess-zgc-oom-at-97-percent-free` page carried
+        // "the two small objects in the large-object region" as an open
+        // residual for a week: the fragmentation report placed an 80-byte
+        // `String` and a 24-byte `Object` above `high_cursor`, where
+        // `ZGC_LARGE_OBJECT_MIN`'s design says only large objects live, and the
+        // tripwire "fired ZERO times across a full failing run". It could not
+        // have fired. `note_region_leak` sat on the three LOW free-list exits,
+        // every one of which returns an offset below `high_cursor` by
+        // construction, so all three were unfireable by definition — and the
+        // only exit that can return a high offset had none. An untriggered
+        // instrument reading zero is not evidence, which that page said about
+        // this very counter; this is what it was missing.
         if !self.free_high.is_empty() {
             if let Some(off) = self.high_fit(alloc_size, align) {
+                self.note_region_leak("high-free-list-last-resort", off, alloc_size);
                 // SAFETY: inside the consumed block.
                 return Some(unsafe { self.data.as_mut_ptr().add(off) });
             }
@@ -3109,6 +3145,49 @@ mod tests {
             bytes.iter().all(|b| *b == 0),
             "the vacated span must be zeroed, or a conservative scan can \
              resurrect what was there"
+        );
+    }
+
+    /// **The region tripwire fires on the ONE arm that can trip it.**
+    ///
+    /// `Arena::alloc`'s low free-list exits return offsets below `high_cursor`
+    /// by construction, so arming them was arming nothing: the counter read
+    /// zero for a week on a workload whose fragmentation report was naming an
+    /// 80-byte `String` and a 24-byte `Object` above `high_cursor` at the same
+    /// time. The last-resort `high_fit` is the exit that can put a small object
+    /// in the large-object region, and this is the test that says so.
+    ///
+    /// The delta, not the absolute: the counter is process-global and bounded
+    /// logging shares it with every other test in the binary.
+    #[test]
+    fn a_small_object_served_from_the_high_free_list_trips_the_region_wire() {
+        let mut arena = Arena::new(8192);
+        // Claim and release 4 KiB at the high end, so its free list has a block
+        // and the two cursors can meet.
+        let big = arena.alloc_high(4096, 8).unwrap() as usize - arena.base_ptr() as usize;
+        arena.add_free_block(big, 4096);
+        assert_eq!(arena.high_free_shape(), (1, 4096, 4096));
+
+        // Bump the low end right up to `high_cursor`, so the ordinary paths are
+        // all exhausted and only the last resort is left.
+        arena.alloc(2048, 8).unwrap();
+        arena.alloc(2048, 8).unwrap();
+        assert_eq!(arena.low_bump_headroom(), 0, "the two ends have met");
+
+        let before = small_allocations_in_large_region();
+        let p = arena.alloc(64, 8).expect(
+            "the last resort must still serve this rather than raise OutOfMemoryError",
+        );
+        let off = p as usize - arena.base_ptr() as usize;
+        assert!(
+            off >= arena.high_cursor(),
+            "the only space left was the large-object end's own free list"
+        );
+        assert_eq!(
+            small_allocations_in_large_region(),
+            before + 1,
+            "and the region tripwire must SEE it -- the residual this closes is \
+             an untriggered instrument reading zero"
         );
     }
 
