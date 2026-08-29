@@ -78,11 +78,13 @@ Two rows in this group are *not* at the cap and still lost: `TestKillProcessWhil
 > on a heap that is **97 % free**: ZGC's stop-the-world slide, its only
 > defragmentation, declines on every cycle because a compiled frame is live,
 > which in a JIT-warm workload is every cycle. The same class passes under
-> `--nojit`, on the generational collector, and on HotSpot. **Still OPEN** — the
-> obvious repair rests on a coverage proof that is not computed for this
-> collector; see
-> `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` for the
-> measurement and for what has to change first. The lesson is the one §2b
+> `--nojit`, on the generational collector, and on HotSpot. **CLOSED 2026-08-29** — the coverage proof it
+> waited on landed on 2026-08-21/26, and three further defects behind it were
+> found and fixed on 2026-08-29 (the slide discarding what it emptied, the
+> large-object end never being compacted, and the TLAB refill floor spending
+> that end's reserve). See
+> `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+> for the whole measurement chain. The lesson is the one §2b
 > already states, applied to §2a: a row that finishes and fails deserves the
 > mechanism to be read before it is filed under the throughput story.
 

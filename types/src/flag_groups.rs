@@ -524,6 +524,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-target", on_key: Some("CRATONVM_DBG_ZGC_TARGET"), off_key: None, off_word: None },
+    // The LARGE-OBJECT end's compactor, one line per engaged cycle: what it
+    // moved and what the high free list looked like on either side of it.
+    // Declared 2026-08-29.
+    E { group: Group::DBG, token: "zgc-high", on_key: Some("CRATONVM_DBG_ZGC_HIGH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-elide-ctor", on_key: Some("CRATONVM_DBG_JIT_ELIDE_CTOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-field-sites", on_key: Some("CRATONVM_DBG_JIT_FIELD_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
@@ -1518,6 +1522,23 @@ pub const INVENTORY: &[E] = &[
     // compiled frame -- which is why the default configuration never
     // defragmented. See `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
     E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the LARGE-OBJECT end's compactor. Default-ON,
+    // so a KILL SWITCH with the same `off_word: Some("0")` as its neighbours:
+    // `=0` leaves the arena's high end exactly as it was before, which is the
+    // same-binary A/B for a repair whose whole claim is that the requests
+    // failing at 97 % free came from an end nothing could relocate. See
+    // `gc/src/zgc.rs::zgc_high_compaction_enabled`.
+    E { group: Group::GC, token: "zgc-high-compaction", on_key: Some("CRATONVM_ZGC_HIGH_COMPACTION"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the starved TLAB-refill floor. Default-ON, so a
+    // KILL SWITCH: `=0` restores the unconditional `want / 8` floor, which is
+    // what let a starved bump spend the large-object reserve on TLAB churn.
+    // See `gc/src/zgc.rs::starved_recycle_enabled`.
+    E { group: Group::GC, token: "zgc-tlab-starved-recycle", on_key: Some("CRATONVM_ZGC_TLAB_STARVED_RECYCLE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the vacated-span publication. Default-ON, so a
+    // KILL SWITCH: `=0` restores reclaim-is-the-cursor-drop-and-nothing-else,
+    // which lost every byte a slide emptied below a cursor it could not move.
+    // See `gc/src/arena.rs::compact_low_to`.
+    E { group: Group::GC, token: "zgc-publish-vacated", on_key: Some("CRATONVM_ZGC_PUBLISH_VACATED"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the cross-thread JIT coverage handshake.
     // Default-ON, so a KILL SWITCH, with the same `off_word: Some("0")` as its
     // neighbours: `=0` restores the blanket "any peer inside compiled code
@@ -1721,6 +1742,11 @@ pub const INVENTORY: &[E] = &[
     // Default ON; `0` restores the condvar-only wait that lost a delivered
     // `notifyAll()`, so the fix can be interleaved against itself on ONE binary.
     E { group: Group::THREADS, token: "monitor-pending-notify", on_key: Some("CRATONVM_MONITOR_PENDING_NOTIFY"), off_key: None, off_word: Some("0") },
+    // Windows only: bound a TIMED `LockSupport.park` with a high-resolution
+    // waitable timer instead of the condvar, whose timeout is rounded up to
+    // the 15.625 ms system tick. Default ON; `0` restores the condvar wait,
+    // so the netty scheduled-task cadence can be A/B'd on ONE binary.
+    E { group: Group::THREADS, token: "win-hires-park", on_key: Some("CRATONVM_WIN_HIRES_PARK"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "jca-lenient-getinstance", on_key: Some("CRATONVM_JCA_LENIENT_GETINSTANCE"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },

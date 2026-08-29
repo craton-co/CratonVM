@@ -172,9 +172,22 @@ fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 /// — we mirror that contract; the probe depends on the supported set
 /// (SHA-256/384/512, SHA3-256, SHA-1, MD5) succeeding.
 fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `MessageDigest.getInstance(null)` is `Objects.requireNonNull(algorithm,
+    // "null algorithm name")` -- an NPE. An EMPTY name is not special-cased at
+    // all: it simply matches no service, so it comes out as
+    // `NoSuchAlgorithmException`. Both used to arrive as
+    // `IllegalArgumentException`, which is neither, and which a caller
+    // catching `NoSuchAlgorithmException` -- the checked exception the
+    // signature forces them to handle -- does not catch. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     let algo_raw = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => String::new(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("null algorithm name".to_string()),
+            }
+            .into())
+        }
     };
     // The anonymous overload resolves aliases against the whole chain, in chain
     // order, exactly as `Security.getImpl` would.
@@ -212,12 +225,17 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// result to that provider afterwards.
 fn md_get_instance_named(ctx: &mut dyn NativeContext, algo_raw: &str) -> MethodCallResult {
     let algo_raw = algo_raw.to_string();
-    if algo_raw.is_empty() {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "algorithm must be non-null".to_string(),
-        }
-        .into());
-    }
+    // An EMPTY name is not special-cased by the JDK: it matches no service and
+    // falls out as `NoSuchAlgorithmException` below, like any other unknown
+    // name. This used to raise `IllegalArgumentException("algorithm must be
+    // non-null")` -- unchecked, so it sailed past the `catch
+    // (NoSuchAlgorithmException)` the signature forces callers to write, and
+    // its own message said "non-null" about a name that is not null. That
+    // message is the tell: the arm was standing in for the NULL case, which it
+    // could not distinguish because `read_string` on a null reference also
+    // produces "". `md_get_instance` now raises the real NPE for null, so this
+    // arm has nothing left to stand in for. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     if !algorithm_supported(&algo_raw) {
         // Real JDK throws `NoSuchAlgorithmException`, which every caller
         // catches by name. This used to raise `SecurityException` on the
@@ -517,9 +535,21 @@ fn md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             &[Value::Object(arr), Value::Int(0), Value::Int(len)],
         );
     }
+    // `update(byte[])` is `update(input, 0, input.length)`, so a null argument
+    // is dereferenced for its length before anything else happens. Doing
+    // nothing instead meant a caller who passed null got a digest of whatever
+    // had been fed so far, silently. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read the array length because \"input\" is null".to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let bytes = read_byte_array(ctx, arr);
     append_accumulator(ctx, this, &bytes);
@@ -568,9 +598,47 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    // The JDK checks the window in TWO steps with two different exceptions,
+    // and this collapsed both into one:
+    //
+    //   update(buf, 0, 10) on a 4-byte array
+    //     HotSpot  IllegalArgumentException: Input buffer too short
+    //     was      ArrayIndexOutOfBoundsException: Array index out of range: 10
+    //   update(buf, -1, 2)
+    //     HotSpot  ArrayIndexOutOfBoundsException:
+    //              Range [-1, -1 + 2) out of bounds for length 4
+    //     was      ArrayIndexOutOfBoundsException: Array index out of range: 1
+    //
+    // `MessageDigest.update(byte[], int, int)` runs
+    // `Objects.checkFromIndexSize`-shaped bounds first -- which is where the
+    // `Range [...] out of bounds for length N` text comes from -- and its own
+    // `if (input.length - offset < len) throw new IllegalArgumentException(
+    // "Input buffer too short")` second. A caller distinguishing "you passed a
+    // bad index" from "your buffer is too small" got the same answer for both.
+    // MEASURED by `apps/probes/SecuritySurfaceSweep.java`.
     let total = ctx.array_length(arr);
-    if off.saturating_add(len) > total {
-        return Err(RuntimeError::aioobe_index_only((off + len) as i32).into());
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if off_i < 0 || len_i < 0 || (off_i as i64) + (len_i as i64) > total as i64 {
+        if off_i < 0 || len_i < 0 {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/ArrayIndexOutOfBoundsException",
+                &format!(
+                    "Range [{off_i}, {off_i} + {len_i}) out of bounds for length {total}"
+                ),
+            ));
+        }
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Input buffer too short".to_string(),
+        }
+        .into());
     }
     let bytes = read_byte_array_range(ctx, arr, off, len);
     append_accumulator(ctx, this, &bytes);
@@ -593,9 +661,17 @@ fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let buf = args.get(1).copied().unwrap_or(Value::Object(None));
         return ctx.invoke_virtual(this, "engineUpdate", "(Ljava/nio/ByteBuffer;)V", &[buf]);
     }
+    // `update(ByteBuffer)` calls `input.remaining()` first, so a null buffer is
+    // an NPE with no message -- not a no-op. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let rem = match ctx.invoke_virtual(buf, "remaining", "()I", &[])? {
         Some(Value::Int(n)) if n > 0 => n as usize,
@@ -658,9 +734,22 @@ fn md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         return ctx.invoke_virtual(this, "engineDigest", "()[B", &[]);
     }
+    // `digest(byte[])` is `update(input); digest()`, so the same dereference
+    // as `update(byte[])`. Returning NULL was the worse shape of the two: a
+    // caller who passed null got a null digest back rather than an exception,
+    // and a null digest compared against an expected one is a silent
+    // authentication failure. MEASURED by
+    // `apps/probes/SecuritySurfaceSweep.java`.
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read the array length because \"input\" is null".to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let bytes = read_byte_array(ctx, arr);
     append_accumulator(ctx, this, &bytes);
@@ -711,7 +800,22 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // window must be able to hold the whole digest, else DigestException.
     let buf_len = ctx.array_length(buf);
     if len < hash.len() {
-        return Err(throw_digest_exception(ctx, "partial digests not returned"));
+        // The JDK's own text, from `DigestBase.engineDigest(byte[],int,int)`:
+        //
+        //     throw new DigestException("Length must be at least "
+        //         + digestLength + " for " + algorithm + "digests");
+        //
+        // including the missing space before "digests", which is a real
+        // artefact of that concatenation and is reproduced rather than tidied
+        // -- a caller matching on the message matches the JDK's, not a nicer
+        // one. "partial digests not returned" is a DIFFERENT JDK message, from
+        // the `len < digestLen` arm of a different Spi, and it does not tell
+        // the caller the length they needed. MEASURED by
+        // `apps/probes/SecuritySurfaceSweep.java`, ten rows -- one per
+        // algorithm, which is what made it obvious the text was a constant
+        // rather than a computation.
+        let msg = format!("Length must be at least {} for {}digests", hash.len(), algo);
+        return Err(throw_digest_exception(ctx, &msg));
     }
     if buf_len.saturating_sub(offset) < hash.len() {
         return Err(throw_digest_exception(

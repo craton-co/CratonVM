@@ -85,7 +85,7 @@ the same wiring.
 ## 4. FIXED 2026-08-29 by L8 — and it was 26 rows, not one
 
 > **Closed.** `apps/probes/UriRecompositionSweep.java` is the probe this section
-> asked for: 1258 rows aimed at recomposition rather than at the value surface,
+> asked for: 1256 rows aimed at recomposition rather than at the value surface,
 > and **0 differing lines in both modes** after the fix. The deferral below was
 > right about the blast radius and wrong about the size — this is 26 rows, every
 > `resolve` off an empty-authority base, plus six more `URI` defects the same

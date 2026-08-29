@@ -481,7 +481,34 @@ const MUST_DRIFT: &[(&str, &str, &str, &str)] = &[
 /// really is gone rather than merely losing the race. `Bridge` is
 /// `allowed_in(JdkOnly)`, and the strict dump reports `synthetic-stub: 0`
 /// whole-registry, so the surviving bodies serve both modes.
+/// **`AtomicReference.compareAndSet` (1), 2026-08-29.** The synthetic twin in
+/// `util_concurrent_ext.rs` was deleted deliberately by the JUC VarHandle
+/// composition lane, whose comment at that site records why: the real body is
+/// one line -- `return VALUE.compareAndSet(this, expectedValue, newValue);` --
+/// and `VarHandle.compareAndSet` is now thin-direct-bound, so the stub bought
+/// nothing. `register_phase54_atomics` is the sole remaining registrar, which
+/// is what "no longer drifts" means.
+///
+/// EVIDENCE, and it is source-side plus a negative runtime one rather than the
+/// usual both-modes dump, because the surviving registrar is not reached in
+/// either mode of the run used here. `--dump-native-registry` lists SIX
+/// `AtomicReference` rows in compatible mode (`<init>` x2, `get`, `getAndSet`,
+/// `lazySet`, `set`, `toString`, all `synthetic-stub` from
+/// `util_concurrent_ext.rs`) and **no `compareAndSet` among them**, and no
+/// `AtomicReference` rows at all under `--jdk-only` where the stubs are
+/// dropped. So there is no duplicate registration in either mode -- which is
+/// the property this bucket asserts -- and the sibling triples still in
+/// `DRIFT_TRIPLES` are the control: they are still listed, so the scanner has
+/// not simply lost sight of the class.
+///
+/// Moved by lane L3 while landing, because a stale baseline row fails this gate
+/// for every lane and the deletion that made it stale is not L3's.
 const FIXED_NOT_DRIFTING: &[(&str, &str, &str)] = &[
+    (
+        "java/util/concurrent/atomic/AtomicReference",
+        "compareAndSet",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
     (
         "java/lang/management/ThreadMXBean",
         "getAllThreadIds",

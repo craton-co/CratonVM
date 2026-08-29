@@ -3113,19 +3113,85 @@ fn report_unpublished_band_words(
             // words are that method's java-locals, one object in three
             // consecutive slots.
             let sp_id = frame_active_sp_id(rbp, cm);
-            let in_map = sp_id.map(|id| {
-                cm.oop_maps
-                    .iter()
-                    .filter(|m| m.bytecode_pc == id)
-                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
-            });
+            // THREE answers, not two. `sp_id.map(..)` gave `Some(false)` both
+            // when a map was found and did not name the slot AND when NO MAP
+            // EXISTS for the stored id -- and those point at opposite repairs.
+            //
+            // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+            // (2026-08-29): six of seven reported words came from one frame
+            // whose stored id was `1729768472`. That is not a bytecode pc; it
+            // is `0x671a2c18`, the low 32 bits of `0x200671a2c18` -- the heap
+            // pointer this same scan reports two slots away in the same frame.
+            // The frame's sp-id slot holds half an object pointer, so no map
+            // can match it, and `live_hi=None` on the same line says the same
+            // thing. Printed as `Some(false)` that read as "the dataflow calls
+            // this slot dead", which sends a reader at the band verifier
+            // instead of at the frame whose id is garbage.
+            //
+            // `no-map-for-id` is also the honest label for what the SCAN does
+            // here: `frame_active_map_slots` returns `None`, so the dead-slot
+            // relaxation deliberately does not fire and the word is reported.
+            // The report now says which of the two it is.
+            let in_map: &'static str = match sp_id {
+                None => "no-sp-id",
+                Some(id) => {
+                    let mut any_map = false;
+                    let mut names_slot = false;
+                    for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == id) {
+                        any_map = true;
+                        if m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off) {
+                            names_slot = true;
+                        }
+                    }
+                    if !any_map {
+                        "no-map-for-id"
+                    } else if names_slot {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
+            };
+            // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
+            // this dump exists at all.
+            //
+            // A safepoint id that is not a bytecode pc has two opposite causes:
+            // something STORED an oop into the reserved sp-id slot (a codegen
+            // defect at that offset), or `rbp` is wrong for this frame so the
+            // read lands on a NEIGHBOURING slot that legitimately holds one (a
+            // frame-resolution defect, the family of the 2026-08-26
+            // innermost-mirror repair). Printing the whole reserved-locals tail
+            // beside `sp_id_off` separates them in one line: a pointer sitting
+            // exactly at `sp_id_off` is the first; the whole tail reading like
+            // some neighbouring frame's is the second.
+            if in_map == "no-map-for-id" {
+                let lo = cm.frame_layout.java_locals_hi.max(8);
+                let hi = cm.frame_layout.locals_hi;
+                let mut tail = String::new();
+                let mut o = lo;
+                while o <= hi && o - lo < 128 {
+                    let a = rbp.wrapping_sub(o as usize);
+                    if a >= rbp - frame_size && a + 8 <= rbp && a & 7 == 0 {
+                        // SAFETY: the same bounded, aligned in-band read the
+                        // walk above makes, on this thread's own frame.
+                        let v = unsafe { (a as *const usize).read() };
+                        tail.push_str(&format!(" [{o}]=0x{v:x}"));
+                    }
+                    o += 8;
+                }
+                eprintln!(
+                    "[moving-young-band]   no-map-for-id sp_id_off={} tail({}..{}):{}",
+                    cm.sp_id_slot_off, cm.frame_layout.java_locals_hi, hi, tail,
+                );
+            }
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} in_map={in_map:?} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
                 published.len(),
+                cm.sp_id_slot_off,
                 cm.frame_layout,
             );
         }
@@ -3909,6 +3975,18 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if current_thread_jit_depth() == 0 {
         return;
     }
+    // WHICH obligation the peer's own proof fails on, when it fails.
+    //
+    // `proven=false` is the shortfall that refuses the whole cycle, and a
+    // count of them cannot be acted on: the proof has SIX ways to say no
+    // (`JIT_RELOCATION_UNSUPPORTED`, `NO_PRECISE_MAP`, `MISSING_EXACT_RBP`,
+    // `FOREIGN_INNERMOST_RBP`, `ACTIVE_FRAME_MAP`, `PARENT_FRAME_MAP`) and they
+    // want completely different repairs. The per-reason counters are already
+    // maintained process-wide, so a before/after snapshot around this one call
+    // names the term without any new bookkeeping. Only taken when the debug
+    // flag is on — it is two array reads either side of a proof that already
+    // walks the stack.
+    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -3916,8 +3994,25 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if proven && depth > 0 {
         cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
     }
-    if xt_coverage_dbg() {
-        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    if let Some(before) = before {
+        let added = cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask() & !before;
+        let mut why = String::new();
+        for i in 0..cratonvm_gc::gc_quiescence::incomplete_reason::COUNT {
+            if added & (1usize << i) != 0 {
+                if !why.is_empty() {
+                    why.push(',');
+                }
+                why.push_str(cratonvm_gc::gc_quiescence::incomplete_reason::label(i));
+            }
+        }
+        if why.is_empty() {
+            // Distinguishable from a reason literally labelled "none": this
+            // says the proof added no obligation to the mask at all, which for
+            // a `proven=false` deposit means the reason was ALREADY recorded
+            // this cycle (by this thread's earlier proof, or by a peer).
+            why.push_str("<no-new-reason>");
+        }
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth} why={why}");
     }
 }
 
@@ -5367,6 +5462,131 @@ pub fn uncovered_precise_frame_count() -> usize {
 /// is sharpest for leaf-ish compiled frames (the register/spill-resident root
 /// class, e.g. the bintrees-`main`-reads-`args` and `codePointAt` families).
 /// Counters for [`verify_precise_covers_conservative`], reported at exit.
+/// What the CLASS FILE's own verifier says about a java-local slot at a bci.
+///
+/// The reason this exists is that the oop-map oracle could not tell its three
+/// populations apart, and said so: at 5–6 % of every in-band word on every
+/// workload measured, `never_mapped` was dominated by two false positives it
+/// declared but could not subtract —
+///
+///   * a primitive `i64` whose bits happen to land on a live object header, and
+///   * a DEAD slot: an object reference left behind after its variable went out
+///     of scope (`MVStore.closeStore` slot 5, scoped 149..170, read at bci 174,
+///     plus javac's three `finally`-tail copies of it).
+///
+/// `org.h2.test.db.TestMultiThread` PASSES under a moving collector with 1.1 M
+/// never-mapped words, 670 k of them in frames asserting shadow coverage. If
+/// those were genuine the workload would corrupt. So the counter could not be a
+/// backstop, and the page tracking it recorded that "a backstop that can tell a
+/// dead slot from a live one without the map does not exist yet".
+///
+/// # Why the verifier's map is an INDEPENDENT answer and the oop map is not
+///
+/// Asking the JIT's own abstract interpreter would be circular: the oop map IS
+/// its output, so "the map does not name this slot" and "the model says it is
+/// not a live reference" are the same sentence. `classloading::type_maps` is a
+/// different oracle with a different provenance — it is what
+/// `bytecode_verifier` retains from the JVMS §4.10.1 StackMapTable walk, i.e.
+/// **javac's own claim** about the type of every local at every instruction
+/// start. It answers both false positives at once: a primitive local is not an
+/// oop there, and an out-of-scope local is `Top`, which is not an oop either.
+///
+/// # What it refuses to answer, and why each refusal is load-bearing
+///
+/// * **An INLINED frame.** A spliced callee's locals live in the same java-local
+///   region and the safepoint's bci belongs to the CALLEE's bytecode, so reading
+///   the outer method's map at that pc reads a different method's types at a
+///   coincidentally-valid pc. `Unknown`, always.
+/// * **Any slot that is not a java local.** Operand spill is `Frame::stack`
+///   indexed by runtime depth, which this frame does not carry; LICM hoists,
+///   scalar-replaced fields and the register images are regions the verifier
+///   has never heard of. Those are exactly the regions the band scan still
+///   covers, so nothing is lost.
+/// * **A pc with no row.** `local_oops_at` returns `None` for a pc that is not
+///   an instruction start — which, for a safepoint id, means the frame is not
+///   where its sp-id slot says it is. That is a finding of its own and must not
+///   be read as "not an oop".
+/// * **A name the index cannot resolve.** `class_id_of_name` is name-keyed and
+///   first-writer-wins, so two loaders' versions of one class collapse; the
+///   collision count is printed beside the verdicts so a reader can discount
+///   them.
+///
+/// Every refusal counts as [`oop_map_audit::VERIFIER_UNKNOWN`] rather than
+/// being folded into either verdict, because a backstop whose "no gap here"
+/// silently includes "could not look" is the vacuous green this whole line of
+/// work exists to avoid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifierSlotVerdict {
+    /// The class file says this local holds a REFERENCE at this bci, and no oop
+    /// map of the frame names its slot. This is the actionable number.
+    Oop,
+    /// The class file says it is a primitive or out of scope here. The word is
+    /// a false positive of the address-shaped-bits test.
+    NotOop,
+    /// No independent answer available — see the refusals above.
+    Unknown,
+}
+
+/// Split a `CompiledMethod::method_label` (`"org/h2/mvstore/MVStore.closeStore:(ZI)V"`)
+/// into its three parts.
+///
+/// Descriptor first: a descriptor cannot contain `:`, and a method name cannot
+/// contain `.` or `:`, so two `rsplit_once`es are exact. Labels the JIT writes
+/// for synthetic bodies (`"lambda-adapter->0x…"`) have neither separator and
+/// fall out as `None`.
+fn split_method_label(label: &str) -> Option<(&str, &str, &str)> {
+    let (owner_and_name, descriptor) = label.rsplit_once(':')?;
+    let (class_name, method_name) = owner_and_name.rsplit_once('.')?;
+    if class_name.is_empty() || method_name.is_empty() || descriptor.is_empty() {
+        return None;
+    }
+    Some((class_name, method_name, descriptor))
+}
+
+/// The verifier's verdict for the java local at `[rbp - off]` of `cm`, at the
+/// bci its active safepoint id names. See [`VerifierSlotVerdict`].
+fn verifier_local_verdict(
+    cm: &cratonvm_jit::CompiledMethod,
+    off: i32,
+    bci: u32,
+) -> VerifierSlotVerdict {
+    if !cm.inlined_methods.is_empty() {
+        return VerifierSlotVerdict::Unknown;
+    }
+    if bci == u32::MAX {
+        return VerifierSlotVerdict::Unknown;
+    }
+    // `FrameLayout`: java local `i` lives at `[rbp - (i + 1) * 8]`.
+    if off < 8 || off % 8 != 0 || cm.frame_layout.java_locals_hi <= 0 {
+        return VerifierSlotVerdict::Unknown;
+    }
+    if off > cm.frame_layout.java_locals_hi {
+        return VerifierSlotVerdict::Unknown;
+    }
+    let local_index = (off / 8 - 1) as usize;
+    let Some((class_name, method_name, descriptor)) = split_method_label(&cm.method_label) else {
+        return VerifierSlotVerdict::Unknown;
+    };
+    let Some(class_id) = cratonvm_classloading::class_id_of_name(class_name) else {
+        return VerifierSlotVerdict::Unknown;
+    };
+    let Some(maps) = cratonvm_classloading::type_maps_for_named(class_id, method_name, descriptor)
+    else {
+        return VerifierSlotVerdict::Unknown;
+    };
+    let Some(bits) = maps.local_oops_at(bci) else {
+        return VerifierSlotVerdict::Unknown;
+    };
+    if local_index >= bits.len() {
+        return VerifierSlotVerdict::Unknown;
+    }
+    if bits.get(local_index) {
+        VerifierSlotVerdict::Oop
+    } else {
+        VerifierSlotVerdict::NotOop
+    }
+}
+
 pub mod oop_map_audit {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5419,6 +5639,30 @@ pub mod oop_map_audit {
     /// nothing while this is also zero, because the oracle then never inspected
     /// a frame making the claim.
     pub static FRAMES_CLAIMING_SHADOW_COVERAGE: AtomicU64 = AtomicU64::new(0);
+
+    /// `never_mapped` hits the CLASS FILE's own verifier corroborates: the
+    /// local is a REFERENCE at this bci and no map of the frame names its slot.
+    ///
+    /// **This is the backstop the page tracking this said did not exist.** The
+    /// raw `never_mapped` above cannot be one -- 5-6% of every in-band word on
+    /// every workload measured, dominated by the two false positives it
+    /// declares (a primitive whose bits look like a header, and a dead
+    /// out-of-scope slot), with `TestMultiThread` PASSING on 1.1 M of them. The
+    /// verifier's type maps answer both, from a different oracle: they are what
+    /// `bytecode_verifier` retains from the StackMapTable walk, i.e. javac's
+    /// claim rather than this JIT's. A ZERO here IS a strong result; a non-zero
+    /// is a site with a method and a bci.
+    pub static VERIFIER_OOP: AtomicU64 = AtomicU64::new(0);
+    /// `never_mapped` hits the verifier REFUTES: primitive, or out of scope at
+    /// this bci. The false positives, now subtractable rather than merely
+    /// declared.
+    pub static VERIFIER_NOT_OOP: AtomicU64 = AtomicU64::new(0);
+    /// `never_mapped` hits with no independent answer -- an inlined frame, a
+    /// slot outside the java locals, a pc with no row, or a name the index
+    /// cannot resolve. Counted rather than folded into either verdict: a
+    /// backstop whose "no gap" silently includes "could not look" is the
+    /// vacuous green this exists to avoid. See `VerifierSlotVerdict`.
+    pub static VERIFIER_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 
     /// Distinct `(method entry_ptr, slot offset)` pairs reported as
     /// never-mapped, with the storage class of the slot.
@@ -5513,6 +5757,19 @@ pub mod oop_map_audit {
             FRAMES_CLAIMING_SHADOW_COVERAGE.load(Ordering::Relaxed),
             WRONG_MAP.load(Ordering::Relaxed),
             BELOW_JIT.load(Ordering::Relaxed),
+        );
+        // THE LINE TO READ FIRST. Everything above counts words that LOOK like
+        // references; this splits them by what the class file itself says, and
+        // only `verifier_oop` is a lead. `name_index` is printed because a zero
+        // there means the resolver was empty and every verdict is `unknown` for
+        // a reason that has nothing to do with the maps.
+        let (names, name_collisions) = cratonvm_classloading::name_index_shape();
+        eprintln!(
+            "[cratonvm] oop-map audit: verifier_oop={} verifier_not_oop={} \
+             verifier_unknown={} name_index=({names} names, {name_collisions} collisions)",
+            VERIFIER_OOP.load(Ordering::Relaxed),
+            VERIFIER_NOT_OOP.load(Ordering::Relaxed),
+            VERIFIER_UNKNOWN.load(Ordering::Relaxed),
         );
     }
 }
@@ -5717,6 +5974,23 @@ fn verify_precise_covers_conservative(
                     } else {
                         audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
                         let class = classify_frame_slot(off, &frame_cm.frame_layout);
+                        // WHAT THE CLASS FILE ITSELF SAYS about this slot at
+                        // this bci -- the independent answer that separates a
+                        // real coverage gap from the two false positives the
+                        // raw counter cannot subtract. See
+                        // `VerifierSlotVerdict`.
+                        let verdict = verifier_local_verdict(frame_cm, off, active_sp_id);
+                        match verdict {
+                            VerifierSlotVerdict::Oop => {
+                                audit::VERIFIER_OOP.fetch_add(1, AOrd::Relaxed)
+                            }
+                            VerifierSlotVerdict::NotOop => {
+                                audit::VERIFIER_NOT_OOP.fetch_add(1, AOrd::Relaxed)
+                            }
+                            VerifierSlotVerdict::Unknown => {
+                                audit::VERIFIER_UNKNOWN.fetch_add(1, AOrd::Relaxed)
+                            }
+                        };
                         // Only a frame that ASSERTS full coverage is evidence about
                         // the codegen bit. A map-less frame (`maps=0 covered=false`)
                         // is already reported by the NO_PRECISE_MAP obligation and
@@ -5739,6 +6013,20 @@ fn verify_precise_covers_conservative(
                             // The bit has been caught claiming coverage it does
                             // not have. Latch it: `collect_roots` consults this
                             // before skipping the conservative backstop.
+                            note_coverage_oracle_refutation();
+                        }
+                        // ...and the same latch on the claim the MOVING path
+                        // actually spends, but ONLY on a corroborated hit.
+                        //
+                        // `fully_shadow_covered` is the bit the per-frame proof
+                        // is built from, so it is the one an unmapped live oop
+                        // refutes -- but latching on the raw counter would have
+                        // suppressed every collection on every workload
+                        // measured, since 5-6% of in-band words trip it and
+                        // `TestMultiThread` passes with 670 k of them. Gated on
+                        // the verifier's own verdict, this is a refusal that
+                        // fires on evidence rather than on shape.
+                        if verdict == VerifierSlotVerdict::Oop && frame_cm.fully_shadow_covered {
                             note_coverage_oracle_refutation();
                         }
                         if STEP3_LOG_COUNT.fetch_add(1, AOrd::Relaxed) < STEP3_LOG_CAP {
@@ -6816,6 +7104,44 @@ pub fn remap_register_image_words(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The oop-map oracle identifies a frame's method by parsing
+    /// `CompiledMethod::method_label`, and everything downstream of it -- the
+    /// class-id lookup, the verifier's type maps, the `verifier_oop` verdict --
+    /// is wrong if this is. A descriptor cannot contain `:` and a method name
+    /// cannot contain `.` or `:`, so two `rsplit_once`es are exact; the cases
+    /// below are the ones that would break a `split_once` or a naive
+    /// `split('.')`.
+    #[test]
+    fn a_method_label_splits_into_class_name_and_descriptor() {
+        assert_eq!(
+            split_method_label("org/h2/mvstore/MVStore.closeStore:(ZI)V"),
+            Some(("org/h2/mvstore/MVStore", "closeStore", "(ZI)V"))
+        );
+        // A nested class, and a descriptor mentioning another class -- the two
+        // shapes with extra `/` and `;` in them.
+        assert_eq!(
+            split_method_label("org/h2/mvstore/Page$PageReference.getPage:()Lorg/h2/mvstore/Page;"),
+            Some((
+                "org/h2/mvstore/Page$PageReference",
+                "getPage",
+                "()Lorg/h2/mvstore/Page;"
+            ))
+        );
+        // `<init>` and `<clinit>` carry angle brackets, not separators.
+        assert_eq!(
+            split_method_label("java/lang/String.<init>:([BI)V"),
+            Some(("java/lang/String", "<init>", "([BI)V"))
+        );
+        // The JIT writes labels with neither separator for synthetic bodies,
+        // and an unstamped artifact carries the empty string. Both must be
+        // `None` rather than a partial parse that then resolves to some other
+        // class's maps.
+        assert_eq!(split_method_label("lambda-adapter->0x7f0011223344"), None);
+        assert_eq!(split_method_label(""), None);
+        assert_eq!(split_method_label("NoDescriptor.method"), None);
+        assert_eq!(split_method_label(".empty:()V"), None);
+    }
 
     /// The frame-shape arithmetic the A5 census prices the probe with.
     ///
