@@ -374,10 +374,9 @@ of on the test result.
   here because the sequence is the point: three lanes measured the same vector
   and each was right about a different half of it.
 
-  **No vector is known-RED any more.** One is known-INTERMITTENT: see
-  `RSslEndpointIdentification` below, which arrived after this block was
-  written and passed the strict and `all` arms of the very cycle whose
-  `core` arm it failed.
+  **No vector is known-RED any more, and the one that read as intermittent was
+  the vector's own bug.** See `RSslEndpointIdentification` below: it is fixed,
+  and the note is kept because of how it looked on the way there.
 * `RExceptions` and `RJdkFailure` — **red on `dev` from `c6ccccbc8` (the L5
   lane) until `39e2ded07` fixed it. If you ran the arms in that window you saw
   two reds that were not yours and are not yours to chase.** Both assert the
@@ -386,17 +385,31 @@ of on the test result.
   spending anything on them.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
-* `RSslEndpointIdentification` — **INTERMITTENT, and it arrived on 2026-08-29**,
-  so it will look like a regression to whoever lands next. MEASURED the same
-  day, on an otherwise-green tree: **2 of 3 standalone runs pass**, the third
-  fails with `output differs from HotSpot`, and a full `SUITE=core` re-run
-  immediately afterwards is **74 passed, 0 failed** — while the run before it
-  had failed the same vector. It also passed in the `--jdk-only` and `SUITE=all`
-  arms of the same cycle.
-  **Not called a flake outright: 3 passes and 1 failure is intermittent, not
-  diagnosed.** It drives a real TLS handshake, so entropy and timing are both
-  live. Re-run it standalone before attributing it to your change, which is what
-  turned it from a suspected regression into this note.
+* ~~`RSslEndpointIdentification`~~ — **FIXED 2026-08-29. It was never
+  intermittent and it was never CratonVM's**: the vector's own client loop threw
+  away the reply it asserts on, and it failed on the HOTSPOT side while CratonVM
+  passed all four checks. Kept here as a worked example of a failure mode this
+  campaign keeps meeting, not as an open row.
+  What it looked like first: green in the `--jdk-only` and `SUITE=all` arms and
+  red in the `core` arm of the same cycle, then 2-of-3 standalone passes, then —
+  an hour later on a host at load average 14 — red in three consecutive `core`
+  runs. That reads exactly like a flake becoming a regression.
+  What it was: `unwrap()` consumes ONE TLS record per call, and the loop called
+  it once per `read()`. Under load the server's NewSessionTicket, its reply and
+  its close_notify arrive in a single 350-byte read; the one `unwrap` consumed
+  the 222-byte ticket and produced no application data, the next `read` returned
+  EOF, and `break` discarded the 128 buffered bytes that were the reply. Whether
+  the records coalesce is a scheduling question — the whole of the
+  "intermittency". Proven by ABBA-interleaved A/B on one loaded host: **15
+  failures in 40 runs on the committed loop, 0 in 40 on the drained one.**
+  **Three things to take from it.** The harness had already said it: guard `G4`
+  printed *"the HotSpot oracle run FAILED (rc=1), so the 'expected' side of the
+  cross-VM diff is an artefact of the oracle's failure, not ground truth"* — read
+  which SIDE failed before reading the diff. A vector that passes standalone and
+  fails in the suite is not automatically leakage; this one passed standalone
+  because the host was quiet at the time, and reproduced under `ONLY=` once it
+  was not. And a failure rate that climbs with load is a race in someone's code,
+  not noise to be re-run away — here, ours.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
