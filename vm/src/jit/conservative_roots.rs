@@ -3152,13 +3152,46 @@ fn report_unpublished_band_words(
                     }
                 }
             };
+            // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
+            // this dump exists at all.
+            //
+            // A safepoint id that is not a bytecode pc has two opposite causes:
+            // something STORED an oop into the reserved sp-id slot (a codegen
+            // defect at that offset), or `rbp` is wrong for this frame so the
+            // read lands on a NEIGHBOURING slot that legitimately holds one (a
+            // frame-resolution defect, the family of the 2026-08-26
+            // innermost-mirror repair). Printing the whole reserved-locals tail
+            // beside `sp_id_off` separates them in one line: a pointer sitting
+            // exactly at `sp_id_off` is the first; the whole tail reading like
+            // some neighbouring frame's is the second.
+            if in_map == "no-map-for-id" {
+                let lo = cm.frame_layout.java_locals_hi.max(8);
+                let hi = cm.frame_layout.locals_hi;
+                let mut tail = String::new();
+                let mut o = lo;
+                while o <= hi && o - lo < 128 {
+                    let a = rbp.wrapping_sub(o as usize);
+                    if a >= rbp - frame_size && a + 8 <= rbp && a & 7 == 0 {
+                        // SAFETY: the same bounded, aligned in-band read the
+                        // walk above makes, on this thread's own frame.
+                        let v = unsafe { (a as *const usize).read() };
+                        tail.push_str(&format!(" [{o}]=0x{v:x}"));
+                    }
+                    o += 8;
+                }
+                eprintln!(
+                    "[moving-young-band]   no-map-for-id sp_id_off={} tail({}..{}):{}",
+                    cm.sp_id_slot_off, cm.frame_layout.java_locals_hi, hi, tail,
+                );
+            }
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} in_map={in_map} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
                 published.len(),
+                cm.sp_id_slot_off,
                 cm.frame_layout,
             );
         }
