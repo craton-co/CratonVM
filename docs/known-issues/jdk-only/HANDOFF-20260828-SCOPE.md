@@ -9,8 +9,8 @@ finished lane's brief moves to `internal/jdk-only/` with a retirement banner —
 L4's and L7's have. **Both came BACK into this directory when the briefs were
 first landed on `dev`, after their lanes had already retired them**, so a
 duplicate here is a merge artefact rather than a live brief: check
-`internal/jdk-only/` for a retired twin before working from one. L7 removed its
-own; L4's duplicate is still here and is L4's to take.
+`internal/jdk-only/` for a retired twin before working from one. Both have since
+been removed again.
 
 ---
 
@@ -20,12 +20,22 @@ own; L4's duplicate is still here and is L4's to take.
 | --- | --- | --- | --- |
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
-| **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
+| **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
 | **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | L1, L3, L6 | unclaimed | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
-Everything else is unclaimed.
+L4 is DONE. Everything else is unclaimed.
+
+**RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
+you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
+running the four `java.io` probes that were already in the tree found
+`probes/FilePathSweep.java` at **94 differing lines** and the largest single
+cause in that lane — a path predicate whose own comment claimed it was
+platform-independent and was not. A new probe asks the questions its author
+thought of, and L4's author was on a Linux host and did not think of
+backslashes. Cheap to do, and it is the only step that can catch what your
+fixes broke as well as what they missed.
 
 Two items L5 first recorded as OPEN were later FIXED, and both had been deferred
 for reasons that one lookup would have refuted — `Module.canUse` (the VM's own

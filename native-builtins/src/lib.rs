@@ -25828,7 +25828,7 @@ fn system_ephemeral_port_range() -> (i32, i32) {
 /// MEASURED 2026-08-28 in BOTH modes (`probes/ArraysHashSetShadowSweep.java`),
 /// against HotSpot 25.0.3+9. Every one of these natives opened with
 ///
-/// ```rust
+/// ```text
 /// let src = match args.first() {
 ///     Some(Value::Object(Some(a))) => *a,
 ///     _ => return Ok(Some(Value::Object(None))),   // <- a null array answers null
