@@ -11,9 +11,9 @@ section 3 reproduces on demand.
 
 Supersedes the open record
 `gpullama3-gpu-throughput-regression-after-bulk-marshal-20260829.md`, written
-the same morning under `docs/known-issues/gpu/`. That page was never
-committed; this one replaces it, and the commit that adds this one removes it
-from the working tree.
+the same morning under `docs/known-issues/gpu/` and landed on dev while this
+was being measured. This page replaces it and the commit that files this one
+deletes it.
 
 ---
 
