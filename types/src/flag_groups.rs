@@ -1524,6 +1524,11 @@ pub const INVENTORY: &[E] = &[
     // what let a starved bump spend the large-object reserve on TLAB churn.
     // See `gc/src/zgc.rs::starved_recycle_enabled`.
     E { group: Group::GC, token: "zgc-tlab-starved-recycle", on_key: Some("CRATONVM_ZGC_TLAB_STARVED_RECYCLE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-29 with the vacated-span publication. Default-ON, so a
+    // KILL SWITCH: `=0` restores reclaim-is-the-cursor-drop-and-nothing-else,
+    // which lost every byte a slide emptied below a cursor it could not move.
+    // See `gc/src/arena.rs::compact_low_to`.
+    E { group: Group::GC, token: "zgc-publish-vacated", on_key: Some("CRATONVM_ZGC_PUBLISH_VACATED"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the cross-thread JIT coverage handshake.
     // Default-ON, so a KILL SWITCH, with the same `off_word: Some("0")` as its
     // neighbours: `=0` restores the blanket "any peer inside compiled code

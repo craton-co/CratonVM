@@ -1412,6 +1412,159 @@ item, not target selection. Anyone picking it up should start by re-reading the
 `in_low_region=false` line above rather than the frag-profile numbers: those are
 correct and actionable, and there is currently nothing that can act on them.
 
+## Follow-up 2026-08-29: both ends are compacted now, and the floor that fed one end to the other
+
+Three defects, in the order a reader should take them: the large-object end had
+no compactor, the TLAB refill floor was spending that end's reserve on churn,
+and the instrument meant to catch small objects leaking into that end was armed
+on three sites that could not fire it.
+
+### 1. A correction to §"Follow-up 2026-08-28" before anything else
+
+That section closed with *"the LARGE-OBJECT end is never compacted, and that is
+the whole of `TestMVStoreTool`"*, on a reading where the failing window began
+3.9 MB above `used_low_for_compaction()` (`in_low_region=false`).
+
+The first clause was right and is now fixed. **The second does not hold on the
+2026-08-29 tip.** Same class, same `--Xmx 1g`, same 262 160-byte request:
+
+```text
+[zgc-target] recorded window start=234314432 end=234586208 width=271776
+             request=262160 used_low=1069022960 capacity=1073741824
+             in_low_region=true
+```
+
+`in_low_region=**true**`. The window placement varies run to run, so a single
+observation of it could never have carried "and that is the whole of" — which
+is the methodological point this page keeps re-learning, and the reason the
+sentence is corrected here rather than quietly dropped.
+
+What the same run does say, at the failing request, is where the wall really is:
+
+```text
+request=262160 used=1073545504 capacity=1073741824 free_list_bytes=815073056
+largest_free_block=104896 free_spans=63934
+high_cursor=1069219280 high_blocks=2 high_bytes=104984 high_max=104896
+high_reserve_unclaimed=129695184
+```
+
+`high_cursor - cursor` is **196 320 bytes**: the two ends have met. The
+large-object end holds 4.5 MB and is asked for 262 160; the reserve that exists
+to stop exactly this is **129 695 184 bytes unclaimed**, i.e. it was never
+claimed because the low end had already bumped through it. That is item 2
+below, and it is what "the whole of `TestMVStoreTool`" actually needed.
+
+### 2. The large-object end is relocatable — `ZgcRealHeap::compact_high_region`
+
+Survivors are packed against `capacity` in DESCENDING address order (the mirror
+of the low slide's ascending walk, and just as load-bearing), and
+`Arena::compact_high_to` publishes the emptied spans as merged blocks on the
+high free list. The pairs join the low slide's, so the rewrite pass, the
+registry rebuild and the returned `PointerMap` cover both ends with one
+mechanism rather than two. A pinned large object stays put and the walk
+continues below it; the free space on its far side is preserved rather than
+dropped, which is the memory loss `Arena::compact_low_to`'s own history records
+having made once at the other end.
+
+**It engages, and here is what it does per cycle** (`CRATONVM_DBG_ZGC_HIGH=1`,
+`TestMVStoreTool`, `--Xmx 1g`):
+
+```text
+[zgc-high] region=4260384 moved=224 copied=2108760 pinned=0 spans=1
+           before=(blocks=198 bytes=1037480 largest=10880)
+           after=(blocks=1  bytes=1037480 largest=1037480)
+[zgc-high] region=4522544 moved=308 copied=1459008 pinned=0 spans=1
+           before=(blocks=110 bytes=900688  largest=241960)
+           after=(blocks=1  bytes=900688  largest=900688)
+```
+
+**99–198 blocks into one, every cycle.** The largest servable large-object
+block goes from 10 880 to 1 037 480 bytes in the first line — a request of
+262 160 is unservable before and servable after. Run total on that arm:
+`cycles=12 declined=3 objects_relocated=2737 bytes_copied=8800848`.
+
+The engagement counters are on their own `[GC] zgc-high-compaction:` line, and
+`declined` is beside `cycles` deliberately: `cycles=0 declined=0` means the pass
+never ran, `cycles=0 declined=812` means it ran and found nothing worth doing,
+and only the first is a defect. The feature this supersedes
+(`CRATONVM_ZGC_TARGETED_COMPACTION`) shipped reading zero for a week and the
+only reason anyone found out is that it carried a counter.
+
+`CRATONVM_ZGC_HIGH_COMPACTION=0` is the same-binary bisect.
+
+### 3. A starved bump must recycle a short chunk, not eat the reserve
+
+`recycled_chunk_size`'s floor was `want / 8` unconditionally — 64 KiB against a
+512 KiB chunk, which is `ZTlabConfig::max_tlab_alloc` and a good floor while
+refusing costs one clean full-size bump.
+
+`TestMVStoreTool` fails one notch below it. From the same failure line:
+
+```text
+span_hist=8:53403 16:67817 32:1 64:1 512:1 1K:51960 2K:11501 4K:14
+          8K:63860 16K:40 32K:18 64K:1
+```
+
+815 MB free, the largest LOW block **104 896** bytes — and that one is the high
+end's; the largest low block is under 64 KiB, one notch under the floor, with
+63 860 spans of 8–16 KiB sitting unusable beneath it. So every TLAB refill in
+the process bumped. The cursor reached capacity. `Arena::alloc`'s last-resort
+arm then spent the whole 128 MiB large-object reserve on TLAB churn — that is
+the `high_reserve_unclaimed=129695184` above — and the 262 160-byte request the
+reserve exists to serve had nowhere left to go.
+
+"Is a short chunk worth taking?" has two answers and they turn on what refusing
+costs. With bump headroom, refusing buys a clean full-size bump and the short
+chunk is pure churn. With none, refusing does not buy a full chunk: it walks
+straight down to the arm that eats the reserve. The chunk is taken either way;
+the only question is out of WHICH space. Below the preferred floor the decision
+now consults `Arena::low_bump_headroom`, with a hard `want / 64` floor so dust
+is still refused and `need` still bounding both regimes.
+
+`CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` is the same-binary bisect.
+`CRATONVM_ZGC_TLAB=0` is NOT a substitute for it — that turns the whole
+thread-local buffer off and changes the allocation path, the free-list shape and
+the run time (561 s against 103 s), so an arm that differs by it differs by far
+more than this one decision.
+
+### 4. The region tripwire was armed on three sites that could not fire it
+
+§"Still open" has carried *"the two small objects in the large-object region"*
+since this page was filed, with the note that the tripwire *"fired zero times
+across a full failing run"* and the correct warning that this makes it *"an
+untriggered instrument, not evidence"*.
+
+It could not have fired. `note_region_leak` sat on `Arena::alloc`'s three LOW
+free-list exits, and a low tier only ever returns an offset below `high_cursor`,
+so `is_high` is false at all three **by construction**. The one exit that can
+return a high offset — `alloc`'s last-resort `high_fit`, which spends the
+large-object end's own free list rather than raise `OutOfMemoryError` — had no
+tripwire at all. It is armed now, as `high-free-list-last-resort`, with a test
+that exhausts the low end and watches the counter move.
+
+Still not a refusal, and it should not become one: refusing would trade a
+fragmentation hazard for an `OutOfMemoryError` on a heap that has bytes. What
+changed the balance is that the damage is no longer PERMANENT — item 2 packs a
+small survivor up there against the top with everything else, so it stops
+walling the region at the next relocating cycle.
+
+### 5. `CRATONVM_ZGC_TARGETED_COMPACTION` records a window nothing consumes
+
+Measured with the flag ON, and it is a finding about that feature rather than
+about this class: `targeted_pages=0` even though the window it recorded was
+`in_low_region=true` and therefore reachable by `logical_pages`.
+
+The `[zgc-target] recorded` line appears once in the whole run, and
+`[zgc-target] consumed` never appears. `record_compaction_target` fires on the
+allocation failure, and on this class the allocation failure is what **ends the
+run** — the last `[zgc-high]` line is one line above the first
+`arena allocation failed`. A target recorded at the failure that raises
+`OutOfMemoryError` has no next cycle to consume it.
+
+So the feature's own engagement number was never going to be non-zero on this
+family, for a reason unrelated to the one §"Follow-up 2026-08-28" gave. It stays
+default-OFF.
+
 ## Still open
 
 Ordered by what a next session should pick up first.

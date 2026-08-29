@@ -2720,8 +2720,15 @@ impl VmHeap {
             // that never fragmented its large-object end, and only one of those
             // is a defect.
             let (hi_cycles, hi_declined, hi_moved, hi_bytes) = h.high_compaction_engagement();
+            // ...and what the LOW slide handed back rather than losing. Reclaim
+            // used to be the cursor drop alone, so every byte a slide emptied
+            // below a cursor it could not move was invisible to the allocator
+            // for the rest of the process -- and to the sweep too, which walks
+            // the object-start registry the slide has just rewritten. A large
+            // `vacated_bytes` is the measure of what that cost.
+            let (vac_spans, vac_bytes) = h.vacated_publication();
             eprintln!(
-                "[GC] zgc-high-compaction: cycles={hi_cycles} declined={hi_declined}                  objects_relocated={hi_moved} bytes_copied={hi_bytes}"
+                "[GC] zgc-high-compaction: cycles={hi_cycles} declined={hi_declined}                  objects_relocated={hi_moved} bytes_copied={hi_bytes}                  vacated_spans={vac_spans} vacated_bytes={vac_bytes}"
             );
             // CONCURRENT marking, on its own line and with five fields rather
             // than one, because four different runs look identical in any

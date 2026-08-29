@@ -2159,10 +2159,36 @@ impl Arena {
         self.cursor
     }
 
+    /// `vacated` is the third argument and the reason it exists is the whole
+    /// of `Follow-up 2026-08-29` on
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`:
+    /// **the space a slide empties is only reclaimed when the CURSOR can drop
+    /// to it, and otherwise it was lost forever.**
+    ///
+    /// The sweep free-lists dead objects by walking the object-start REGISTRY.
+    /// A slide rebuilds that registry with the survivors' NEW bases, so the old
+    /// ones are gone from it and no later sweep can ever discover them. If
+    /// anything live sits above the compacted region — one survivor on an
+    /// unselected dense page is enough — `new_cursor` is pinned above the
+    /// vacated span, the span is neither below the cursor nor on the free list,
+    /// and it is invisible to the allocator for the rest of the process.
+    ///
+    /// Measured on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`: four
+    /// compaction cycles relocated **885 793 objects** and the largest free
+    /// block at the failing 262 160-byte request was **8 184 bytes**. The
+    /// slide's own output is 2 MiB-granular and contiguous by construction,
+    /// which is exactly the shape that request needed and exactly what was
+    /// being thrown away.
+    ///
+    /// So the caller now names the offset spans it emptied, and they are added
+    /// to the free list here. A kept block that overlaps one is dropped rather
+    /// than kept beside it: the span is a superset of that dead space, and
+    /// publishing both would hand the same bytes out twice.
     pub(crate) fn compact_low_to(
         &mut self,
         new_cursor: usize,
         touched: std::ops::Range<usize>,
+        vacated: &[(usize, usize)],
     ) -> usize {
         assert!(
             new_cursor <= self.cursor,
@@ -2193,12 +2219,39 @@ impl Arena {
                     return None;
                 }
                 let overlaps_touched = off < touched.end && touched.start < off + size;
-                (!overlaps_touched).then_some((off, size))
+                // ...and a block inside a span the caller is about to publish
+                // is superseded by it. By construction there are no straddlers
+                // to worry about (a block starting below `touched.end` is
+                // already dropped above, and every span starts at or above it),
+                // so an overlap here is a containment; dropping on the weaker
+                // test costs at most a few bytes and can never double-publish.
+                let inside_vacated = vacated
+                    .iter()
+                    .any(|&(s, e)| off < e && s < off + size);
+                (!overlaps_touched && !inside_vacated).then_some((off, size))
             })
             .collect();
         self.clear_low_free_list();
         for (off, size) in keep {
             self.add_free_block(off, size);
+        }
+        for &(s, e) in vacated {
+            // Clamp: bytes at or above the new cursor are un-bumped tail now,
+            // and serving them from both the list and the cursor is the
+            // double-hand-out this function's own history records.
+            let e = e.min(new_cursor);
+            if e > s {
+                // ZERO IT FIRST, for the reason the span above `new_cursor` is
+                // zeroed and the reason the sweep zeroes a dead object's header
+                // before free-listing it: a slid-away survivor leaves its old
+                // bytes behind verbatim, including a valid-looking
+                // `ObjectHeader`, and a conservative scanner that met one would
+                // resurrect a corpse. The whole span rather than the headers,
+                // because unlike the sweep this pass does not know where inside
+                // it the object grid fell.
+                self.data[s..e].fill(0);
+                self.add_free_block(s, e - s);
+            }
         }
         // Every recorded low object start just moved.
         self.clear_alloc_anchors();
@@ -2725,7 +2778,7 @@ mod tests {
         );
 
         // The slide wrote into [4096, 12288) and left the cursor at 22528.
-        let reclaimed = arena.compact_low_to(22_528, 4096..12_288);
+        let reclaimed = arena.compact_low_to(22_528, 4096..12_288, &[]);
         assert!(reclaimed > 0, "the cursor must actually retract");
 
         let kept = arena.free_blocks_sorted();

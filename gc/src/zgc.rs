@@ -3089,6 +3089,16 @@ pub struct ZgcRealHeap {
     /// whole PROCESS, so the A/B this switch exists to be could not be run
     /// inside one test binary, and `a_pinned_large_object_...`'s control arm
     /// would silently inherit whichever arm ran first.
+    /// Spans and bytes the slide emptied and handed BACK to the free list.
+    ///
+    /// The engagement counter for the 2026-08-29 repair described on
+    /// `Arena::compact_low_to`. `spans=0` on a run with a non-zero
+    /// `compaction_cycles` means every cycle's vacated space was inside the
+    /// cursor drop, which is the benign case; a large `bytes` is the measure of
+    /// what used to be lost outright.
+    publish_vacated_enabled: AtomicBool,
+    vacated_spans_published: AtomicUsize,
+    vacated_bytes_published: AtomicUsize,
     high_compaction_enabled: AtomicBool,
     high_compaction_cycles: AtomicUsize,
     high_compaction_declined: AtomicUsize,
@@ -3566,6 +3576,9 @@ impl ZgcRealHeap {
             parallel_mark_cycles: AtomicUsize::new(0),
             compaction_cycles: AtomicUsize::new(0),
             objects_relocated: AtomicUsize::new(0),
+            publish_vacated_enabled: AtomicBool::new(publish_vacated_requested_by_default()),
+            vacated_spans_published: AtomicUsize::new(0),
+            vacated_bytes_published: AtomicUsize::new(0),
             high_compaction_enabled: AtomicBool::new(zgc_high_compaction_requested_by_default()),
             high_compaction_cycles: AtomicUsize::new(0),
             high_compaction_declined: AtomicUsize::new(0),
@@ -4256,6 +4269,16 @@ impl ZgcRealHeap {
     /// point: those numbers describe the low end only, and a heap can compact
     /// its low end on every cycle while the request that is actually failing is
     /// served from the other one. See [`ZgcRealHeap::compact_high_region`].
+    /// `(spans, bytes)` the slide handed back to the free list rather than
+    /// losing — see [`ZgcRealHeap::compact_high_region`]'s neighbour,
+    /// `Arena::compact_low_to`.
+    pub fn vacated_publication(&self) -> (usize, usize) {
+        (
+            self.vacated_spans_published.load(Ordering::Relaxed),
+            self.vacated_bytes_published.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn high_compaction_engagement(&self) -> (usize, usize, usize, usize) {
         (
             self.high_compaction_cycles.load(Ordering::Relaxed),
@@ -5660,6 +5683,13 @@ impl ZgcRealHeap {
         self.high_compaction_enabled.store(on, Ordering::Relaxed);
     }
 
+    /// Turn the publication of the slide's vacated spans on or off for THIS
+    /// heap. Process-wide default: `CRATONVM_ZGC_PUBLISH_VACATED` (on unless
+    /// `0`/`off`/`false`/`no`).
+    pub fn set_publish_vacated_enabled(&self, on: bool) {
+        self.publish_vacated_enabled.store(on, Ordering::Relaxed);
+    }
+
     /// The process-wide default for [`Self::set_relocation_enabled`].
     fn relocation_requested_by_default() -> bool {
         // DEFAULT-ON since 2026-08-13, for the gauntlet.
@@ -6677,7 +6707,92 @@ impl ZgcRealHeap {
                 // still free -- see `Arena::compact_low_to` for what dropping them
                 // wholesale cost.
                 let touched = slide_floor.saturating_sub(base)..dest.saturating_sub(base);
-                reclaimed = arena.compact_low_to(new_cursor, touched);
+
+                // ---- WHAT THE SLIDE EMPTIED, AND WHY IT HAD TO BE SAID ----
+                //
+                // Reclaim used to be the cursor drop and nothing else, and that
+                // is only the whole answer when the cursor can reach `dest`.
+                // One survivor on an unselected dense page above the compacted
+                // region pins `new_cursor` above it, and then the bytes the
+                // slide just emptied are neither below the cursor nor on the
+                // free list. **No later sweep can find them either**: the sweep
+                // walks the object-start REGISTRY, which this slide is about to
+                // rebuild with the survivors' NEW bases, so the old ones stop
+                // existing as far as every other subsystem is concerned.
+                //
+                // Measured on `TestMVStoreTool` at `--Xmx 1g`: four compaction
+                // cycles, 885 793 objects relocated, and the largest free block
+                // at the failing 262 160-byte request is 8 184 bytes. The
+                // slide's own output is page-granular and contiguous -- exactly
+                // the shape that request needs -- and it was being discarded.
+                //
+                // A SELECTED page above `dest` is dead by construction: every
+                // survivor based on it was packed below `dest` (a survivor the
+                // probe could not place sets `dest` past its own end, so it is
+                // below too). What can still be alive up there is an OBSTACLE:
+                // an object based on an unselected page whose tail straddles
+                // into a selected one, which never moves.
+                //
+                // Rather than argue that the page partition excludes them, the
+                // spans are SCREENED against the live set at its post-slide
+                // addresses -- one pass, a prefix maximum, and a binary search
+                // per page. That is a check on the answer, and it is the same
+                // shape as the `live_ceiling` check above and for the same
+                // reason: every argument that the partition is exhaustive is an
+                // argument about the partition, not about what is in the span.
+                // It can only DROP a span, i.e. reclaim less.
+                let mut vacated: Vec<(usize, usize)> = Vec::new();
+                if self.publish_vacated_enabled.load(Ordering::Relaxed) {
+                    let cursor_addr = base + new_cursor;
+                    // (start, end) of every low-region survivor where it is NOW.
+                    let mut live_after: Vec<(usize, usize)> = live
+                        .iter()
+                        .copied()
+                        .filter(|b| *b >= base && *b < low_end)
+                        .map(|b| {
+                            let now = moved_to.get(&b).copied().unwrap_or(b);
+                            let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
+                                Some(sz) => now.saturating_add(sz).min(low_end),
+                                // Unsizable: bound it at the cursor rather than
+                                // guess, which makes it overlap everything above
+                                // and refuses every span. Fail-closed.
+                                None => low_end,
+                            };
+                            (now, end)
+                        })
+                        .collect();
+                    live_after.sort_unstable();
+                    // Prefix maximum of the ends, so "does anything starting
+                    // below `hi` reach past `lo`" is one binary search and one
+                    // array read instead of a scan.
+                    let mut max_end: Vec<usize> = Vec::with_capacity(live_after.len());
+                    let mut running = 0usize;
+                    for &(_, e) in &live_after {
+                        running = running.max(e);
+                        max_end.push(running);
+                    }
+                    let mut pages: Vec<u64> = selected.iter().copied().collect();
+                    pages.sort_unstable();
+                    for pg in pages {
+                        let page_lo = base + pg as usize * Self::Z_LOGICAL_PAGE_BYTES;
+                        let lo = page_lo.max(dest);
+                        let hi = (page_lo + Self::Z_LOGICAL_PAGE_BYTES).min(cursor_addr);
+                        if hi <= lo {
+                            continue;
+                        }
+                        let idx = live_after.partition_point(|(st, _)| *st < hi);
+                        if idx > 0 && max_end[idx - 1] > lo {
+                            continue; // something live is in there
+                        }
+                        vacated.push((lo - base, hi - base));
+                    }
+                    let bytes: usize = vacated.iter().map(|(s, e)| e - s).sum();
+                    self.vacated_spans_published
+                        .fetch_add(vacated.len(), Ordering::Relaxed);
+                    self.vacated_bytes_published
+                        .fetch_add(bytes, Ordering::Relaxed);
+                }
+                reclaimed = arena.compact_low_to(new_cursor, touched, &vacated);
             }
 
             // ---- THE LARGE-OBJECT END ---------------------------------
@@ -9454,6 +9569,30 @@ fn targeted_compaction_enabled() -> bool {
 ///
 /// Read once at heap construction into [`ZgcRealHeap::high_compaction_enabled`]:
 /// it decides what a collection does and must not change mid-cycle.
+/// `CRATONVM_ZGC_PUBLISH_VACATED=0` — the kill switch for handing the slide's
+/// vacated spans back to the free list. Default ON.
+///
+/// With it off, reclaim is the cursor drop and nothing else, which is what it
+/// was before 2026-08-29 — so the A/B is a re-run and not a rebuild. It is a
+/// switch rather than an unconditional change because this is the one repair on
+/// this branch that ADDS memory to the allocator's free list on a claim about
+/// what is dead, and a wrong claim there is a double hand-out rather than a
+/// missed optimisation. The screen that backs the claim is a check on the
+/// answer (see the call site), and this is what a future reader bisects with if
+/// it is ever wrong.
+/// Read once at heap construction into
+/// [`ZgcRealHeap::publish_vacated_enabled`], per heap rather than as a
+/// process-wide `OnceLock`, so the A/B is runnable inside one test binary.
+fn publish_vacated_requested_by_default() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_PUBLISH_VACATED") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 fn zgc_high_compaction_requested_by_default() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_HIGH_COMPACTION") {
         Some(raw) => {
@@ -16477,6 +16616,70 @@ pub(crate) mod tests {
             heap.get_field(moved_parent, 0),
             Value::Object(Some(unsafe { ObjectRef::from_raw(new_child as *mut u8) })),
             "the reference between two moved survivors was not rewritten"
+        );
+    }
+
+    /// **A slide that cannot drop the cursor must still hand back what it
+    /// emptied.**
+    ///
+    /// Reclaim used to be the cursor drop and nothing else. One survivor on an
+    /// unselected dense page above the compacted region pins the cursor, and
+    /// then the bytes the slide just emptied are neither below the cursor nor
+    /// on the free list -- and no later sweep can find them, because the sweep
+    /// walks the object-start REGISTRY and the slide has just rebuilt it with
+    /// the survivors' NEW bases. Lost for the life of the process.
+    ///
+    /// Measured on `org.h2.test.store.TestMVStoreTool` at `--Xmx 1g`: four
+    /// compaction cycles, 885 793 objects relocated, largest free block at the
+    /// failing 262 160-byte request **8 184 bytes**.
+    ///
+    /// The control arm is what makes this a measurement: with publication off
+    /// the same heap must reclaim NOTHING here, or the test is passing for a
+    /// reason that has nothing to do with the change.
+    #[test]
+    fn a_slide_that_cannot_drop_the_cursor_still_frees_what_it_emptied() {
+        fn run(publish: bool) -> (usize, usize) {
+            let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_publish_vacated_enabled(publish);
+            // Sparse region: 1 in 16 objects survives, so its pages are far
+            // below `max_live_occupancy` and the selector takes them.
+            let mut survivors = Vec::new();
+            for i in 0..4096 {
+                let o = heap.alloc_object(ClassId::new(1), 32);
+                if i % 16 == 0 {
+                    survivors.push(o);
+                }
+            }
+            // ...and a DENSE tail that is wholly live, so the selector refuses
+            // it and `new_cursor` cannot come down past it. This is the shape
+            // the repair is about; without it the cursor drop alone reclaims
+            // everything and the two arms agree.
+            for _ in 0..512 {
+                survivors.push(heap.alloc_object(ClassId::new(1), 32));
+            }
+            let live: Vec<usize> = survivors.iter().map(|o| o.as_ptr() as usize).collect();
+            let before = heap.arena.lock().free_list_bytes();
+            let (moved, reclaimed, _map) = heap.relocate_stw(&live);
+            assert!(moved > 0, "the sparse pages must have been compacted");
+            let after = heap.arena.lock().free_list_bytes();
+            (after - before, reclaimed)
+        }
+
+        let (off_freed, _off_reclaimed) = run(false);
+        let (on_freed, _on_reclaimed) = run(true);
+
+        assert_eq!(
+            off_freed, 0,
+            "the CONTROL must reclaim nothing to the free list: reclaim was the \
+             cursor drop and nothing else, and the cursor cannot move past the \
+             dense tail. It reclaimed {off_freed}, so this test proves nothing \
+             about the arm below"
+        );
+        assert!(
+            on_freed > 0,
+            "the slide emptied whole logical pages below a pinned cursor and \
+             every one of those bytes was being thrown away"
         );
     }
 
