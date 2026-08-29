@@ -18,10 +18,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # clang/libclang-dev cover the other -sys crates in Cargo.lock that can also
 # reach for a system library or a C toolchain beyond plain gcc (libz-sys,
 # libffi-sys, libmimalloc-sys) if their own vendored/bundled build paths
-# aren't taken.
+# aren't taken. libx11-dev/libxcb1-dev/... are link-time deps of `x11rb`
+# (native-awt): actions/runner-images' ubuntu-latest ships these already
+# (part of its X11 toolcache), which is why ci.yml never installs them —
+# this image starts from bare ubuntu:24.04 and has to name them, or the
+# final `cratonvm`/`libcratonvm` link fails with "unable to find library
+# -lxcb" despite every crate having compiled cleanly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates git pkg-config wget gnupg \
         libssl-dev zlib1g-dev cmake clang libclang-dev \
+        libx11-dev libxcb1-dev libxrender-dev libxext-dev libxi-dev \
+        libxtst-dev libfontconfig1-dev libfreetype-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust stable, same toolchain selector CI uses (dtolnay/rust-toolchain@stable
