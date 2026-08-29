@@ -186,3 +186,119 @@ fn ending_a_capture_that_never_began_is_an_error() {
         "a stream that is not capturing has no current node"
     );
 }
+
+/// A kernel whose behaviour depends on a value it reads from device
+/// memory rather than from a parameter. This is the shape that makes a
+/// launch sequence replayable: the graph bakes in the POINTER, and the
+/// host writes through it between replays.
+const PTX_SCALED: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry addk(
+    .param .u64 out_ptr,
+    .param .u64 k_ptr,
+    .param .s32 n
+)
+{
+    .reg .pred  %p<2>;
+    .reg .s32   %r<8>;
+    .reg .u64   %rd<8>;
+
+    ld.param.u64 %rd1, [out_ptr];
+    ld.param.u64 %rd5, [k_ptr];
+    ld.param.s32 %r1, [n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.s32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+    cvta.to.global.u64 %rd6, %rd5;
+    ld.global.u32 %r6, [%rd6];
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.s32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r7, [%rd4];
+    add.s32 %r7, %r7, %r6;
+    st.global.u32 [%rd4], %r7;
+DONE:
+    ret;
+}
+"#;
+
+/// The claim the whole device-resident-scalar design rests on: a graph
+/// captured once can be given new input by writing through a pointer it
+/// already holds, and the replay observes the new value.
+///
+/// Without `copy_from_host` the only way to change a kernel argument is
+/// to allocate a new buffer, which a captured graph cannot see -- it
+/// would keep running against the old pointer and quietly produce the
+/// old answer. That failure is invisible to any check that only asks
+/// whether the replay succeeded, which is why this asserts on the
+/// CONTENTS.
+#[test]
+fn a_replay_sees_a_scalar_written_through_the_captured_pointer() {
+    let Ok(ctx) = DeviceContext::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let module = DeviceModule::from_ptx(&ctx, PTX_SCALED, &["addk"]).expect("load PTX");
+    let stream = Stream::new(&ctx).expect("stream");
+    let n: i32 = 256;
+    let out: DeviceBuffer<i32> = DeviceBuffer::zeros(&ctx, n as usize).expect("alloc out");
+    let k: DeviceBuffer<i32> = DeviceBuffer::from_host(&ctx, &[1i32]).expect("alloc k");
+    let cfg = LaunchConfig::elementwise(n as u32);
+    let args = || {
+        KernelArgs::new()
+            .push_device_ptr(&out)
+            .push_device_ptr(&k)
+            .push_i32(n)
+    };
+
+    // Capture three launches, so the assertion is about the graph and
+    // not about a single kernel that happened to run.
+    stream
+        .begin_capture(CaptureMode::ThreadLocal)
+        .expect("begin capture");
+    for _ in 0..3 {
+        module
+            .launch_on_stream(&ctx, "addk", &cfg, args(), &stream)
+            .expect("captured launch");
+    }
+    let exec = stream
+        .end_capture(&ctx)
+        .expect("end capture")
+        .instantiate()
+        .expect("instantiate");
+
+    let mut host = vec![0i32; n as usize];
+
+    // k == 1: three launches add 1 each.
+    exec.launch(&stream).expect("replay 1");
+    stream.synchronize().expect("drain 1");
+    out.to_host(&mut host).expect("read 1");
+    assert_eq!(host[0], 3, "three launches of +1 should total 3");
+
+    // Now change k in place and replay the SAME graph.
+    k.copy_from_host(&[10i32]).expect("copy_from_host");
+    exec.launch(&stream).expect("replay 2");
+    stream.synchronize().expect("drain 2");
+    out.to_host(&mut host).expect("read 2");
+    assert_eq!(
+        host[0], 33,
+        "the replay must observe the new scalar (3 + 3*10); a graph replaying against          a stale value would read 6 here and look like it worked"
+    );
+    assert!(
+        host.iter().all(|&v| v == 33),
+        "every element should have taken the same path"
+    );
+
+    // And a wrong-sized write must be refused rather than partially
+    // applied: a half-updated device buffer is a wrong answer.
+    assert!(
+        k.copy_from_host(&[1i32, 2i32]).is_err(),
+        "a length mismatch must fail rather than write what fits"
+    );
+}

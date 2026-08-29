@@ -888,6 +888,29 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// `last_write` event (not the context-wide `e_k`) so the D→H copy
     /// is ordered behind THIS buffer's producing kernel / upload, even
     /// when concurrent pipelines launch on other buffers.
+    /// Overwrite this buffer in place from `host`, keeping the device
+    /// pointer.
+    ///
+    /// [`DeviceBuffer::from_host`] allocates. This does not, and that
+    /// is the whole point: a captured CUDA graph bakes each argument
+    /// pointer into its nodes, so the only way to hand a replay new
+    /// input is to write through the pointer the graph already holds.
+    /// Reallocating would leave the graph pointing at freed memory.
+    ///
+    /// Synchronous. The bytes are on the device when this returns, so
+    /// `host` may be reused immediately and a replay submitted
+    /// afterwards observes them. Because the host blocks, no event
+    /// bookkeeping is needed to order a later kernel behind this
+    /// write -- the write already happened.
+    ///
+    /// `host.len()` must equal [`DeviceBuffer::len`]. A short slice
+    /// would leave the buffer half-updated, which is a wrong answer
+    /// rather than a failure.
+    pub fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        self.inner.copy_from_host(host)
+    }
+
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
         // H10c: bind the context to this thread before driving CUDA.
         self.inner.bind_to_thread()?;
@@ -1121,6 +1144,28 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         })
     }
 
+    /// Overwrite this buffer in place from `host`, keeping the device
+    /// pointer.
+    ///
+    /// [`DeviceBuffer::from_host`] allocates. This does not, and that
+    /// is the whole point: a captured CUDA graph bakes each argument
+    /// pointer into its nodes, so the only way to hand a replay new
+    /// input is to write through the pointer the graph already holds.
+    /// Reallocating would leave the graph pointing at freed memory.
+    ///
+    /// Synchronous. The bytes are on the device when this returns, so
+    /// `host` may be reused immediately and a replay submitted
+    /// afterwards observes them. Because the host blocks, no event
+    /// bookkeeping is needed to order a later kernel behind this
+    /// write -- the write already happened.
+    ///
+    /// `host.len()` must equal [`DeviceBuffer::len`]. A short slice
+    /// would leave the buffer half-updated, which is a wrong answer
+    /// rather than a failure.
+    pub fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        self.inner.copy_from_host(host)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
@@ -1249,9 +1294,6 @@ use backend_stub as backend;
 
 pub mod critical;
 pub mod event;
-/// CUDA graph capture and replay. Cuda-mode only; the stub backend has
-/// nothing to capture.
-#[cfg(feature = "cuda")]
 pub mod graph;
 pub mod launch;
 pub mod stream;
