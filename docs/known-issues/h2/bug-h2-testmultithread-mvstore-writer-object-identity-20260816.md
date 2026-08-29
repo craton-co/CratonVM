@@ -2,6 +2,27 @@
 
 ## Status
 
+> ### 2026-08-29 — THE FACE OF THIS DEFECT WILL HAVE CHANGED
+>
+> This page's verdict is a holder that keeps naming an address the ZGC slide
+> vacated (`receiver names an address the ZGC slide VACATED …
+> target_still_live=true`), and the three faces it records — `java.lang.Object`,
+> a `java.math.BigDecimal`, a `java.lang.String` — are "whatever landed there".
+>
+> Until 2026-08-29 the usual answer was **nothing** landed there: the slide
+> reclaimed only by dropping the bump cursor, so a vacated span under a pinned
+> cursor was zeroed-or-stale memory that no allocator could hand out again. That
+> leak was also the `OutOfMemoryError` behind
+> `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, and it is
+> fixed: the span is now zeroed and returned to the free list
+> (`CRATONVM_ZGC_PUBLISH_VACATED=0` reverts).
+>
+> So the stale read now meets a FRESH object far more often, and the
+> distribution of faces on this page is stale evidence. Re-take it before
+> reasoning from it, and use `CRATONVM_ZGC_PUBLISH_VACATED=0` as the arm that
+> reproduces the old distribution.
+
+
 **STILL OPEN 2026-08-21, but no longer unexplained.** **Twenty-one** real
 defects behind it have been found and fixed — three in the reference machinery
 (below), three in the stale-reference family the second pass went after (one of
