@@ -348,17 +348,29 @@ of on the test result.
 
 ### Known-red vectors, so you can tell yours from theirs
 
-* `RJdkEnumerations` — **the cause on the strict arm is NOT `a0168ed03` any
-  more.** L6 fixed that one. MEASURED by L2 on 2026-08-29, running the vector
-  directly under `--jdk-only`: `NoClassDefFoundError:
-  cratonvm/internal/ArrayListViewItr`, identical with the builder enforcement
-  dial armed and unarmed. That is a refused FABRICATION — a Phase-1 item, not a
-  Phase-2 one — and it is UNOWNED. `native-collections/src/lib.rs:7206` already
-  carries the refusal landing for this symptom, so the surviving request is from
-  another site; see `l2-strings-residuals-the-migration-is-unpriced-20260828.md`
-  §4. Expect it red in the strict and `all` arms until someone takes it.
+* ~~`RJdkEnumerations`~~ — **GREEN in all three arms since 2026-08-29.** The row
+  that stood here was right about the cause and was overtaken: L2 traced the
+  strict-arm failure to a refused `cratonvm/internal/ArrayListViewItr`, a
+  Phase-1 fabrication, and called it UNOWNED. L6 then gave that mint site the
+  refusal landing its two sibling sites (`native_ksv_iterator`,
+  `native_hs_iterator`) have had since 2026-08-11 — it had `try_alloc_synthetic
+  (..)?` with no arm at all, so `--jdk-only` killed the caller before `next()`.
+  It was never one vector: `MapViewBehaviourProbe` died at row 0 of 194 and
+  `ItrClassProbe` at row 31 of 66 on the same fabrication. See
+  `L6-concurrency-lane-complete-20260828.md` §9.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
+* `RSslEndpointIdentification` — **INTERMITTENT, and it arrived on 2026-08-29**,
+  so it will look like a regression to whoever lands next. MEASURED the same
+  day, on an otherwise-green tree: **2 of 3 standalone runs pass**, the third
+  fails with `output differs from HotSpot`, and a full `SUITE=core` re-run
+  immediately afterwards is **74 passed, 0 failed** — while the run before it
+  had failed the same vector. It also passed in the `--jdk-only` and `SUITE=all`
+  arms of the same cycle.
+  **Not called a flake outright: 3 passes and 1 failure is intermittent, not
+  diagnosed.** It drives a real TLS handshake, so entropy and timing are both
+  live. Re-run it standalone before attributing it to your change, which is what
+  turned it from a suspected regression into this note.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
