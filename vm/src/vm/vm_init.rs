@@ -3083,6 +3083,15 @@ impl SharedVm {
                 args: &[cratonvm_types::Value],
             ) -> cratonvm_types::error::MethodCallResult {
                 use cratonvm_types::Value;
+                // `Collection.toArray(T[])` reads `a.length` before anything
+                // else, so a null template is an NPE whatever the receiver
+                // holds. MEASURED: no-throw (apps/probes/ArrayListShadowSweep 135).
+                if matches!(args.get(1), Some(Value::Object(None))) {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into());
+                }
                 let this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),

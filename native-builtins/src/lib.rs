@@ -20969,6 +20969,17 @@ pub fn register_essential_natives_with_shims(
         "getTimeZone",
         "(Ljava/lang/String;)Ljava/util/TimeZone;",
         |ctx, args| {
+            // A null id is an NPE, and it is NOT the same thing as an unknown
+            // one: `TimeZone.getTimeZone("Not/AZone")` legitimately answers GMT
+            // (measured, and reproduced here), so substituting UTC for null made
+            // the fabricated answer indistinguishable from the documented one.
+            // MEASURED no-throw (apps/probes/LocaleDateTzShadowSweep 94).
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let id = match args.first() {
                 Some(Value::Object(Some(o))) => {
                     ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())

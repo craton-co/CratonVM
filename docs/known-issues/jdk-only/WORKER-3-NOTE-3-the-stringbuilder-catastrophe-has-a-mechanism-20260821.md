@@ -1,6 +1,26 @@
 # WORKER-3-NOTE-3 — the StringBuilder catastrophe, diagnosed to a mechanism, three of its causes fixed, and the one that is a VM project
 
-**Status: N1 CLOSED 2026-08-28. The rest still OPEN — MEASURED throughout.**
+**Status: N1 and N2 CLOSED 2026-08-29, and §5's two explicit non-claims are
+REFUTED. The rest still OPEN — MEASURED throughout.**
+
+> **§5 named two things this note could not establish. Both have now been
+> measured.** *"The armed StringBuilder arm is NOT green"* — it is:
+> `RStringBuilderContent` passes all **118** checks armed on the three classes,
+> where §3 measured it dying after 56 with `ArrayStoreException: arraycopy: type
+> mismatch: can not copy byte[] into char[]`. *"No arm of
+> `regression-suite/run.sh` was run with `CRATONVM_ENFORCE_NATIVE_SHADOW` set"* —
+> one has: the whole `--jdk-only` corpus, armed on the three classes, is
+> **111/112**, and the one failure is a refused
+> `cratonvm/internal/ArrayListViewItr` fabrication that fails identically
+> unarmed.
+>
+> The dial was verified to have FIRED before those results were read: armed, the
+> three families go from 39 `native-won` to **0**, with 38 triples flipping to
+> `bytecode-won`. An armed pass over an inert dial would have said nothing.
+>
+> **And since an armed run IS the retirement, it has a price:** 2.0x-3.4x on
+> five of six benchmark shapes. So the registrations stay — measured, not
+> feared.
 
 > **N1 — the layout migration — is landed.** `sb_store_units` is the writer half
 > this note named: the payload that is already there decides the layout, so a

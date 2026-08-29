@@ -129,6 +129,10 @@ probes/*.class
 # regression-suite/perf/: the .java sources are the artifact, the .class files
 # a javac by-product.
 regression-suite/perf/**/*.class
+# Same rule again for test_classes/: the .java sources are tracked, their
+# javac output is not (60 compiled .class files had been committed here,
+# the one place in the tree this convention was missing).
+test_classes/**/*.class
 
 # local run artifacts
 dim4-*.log*

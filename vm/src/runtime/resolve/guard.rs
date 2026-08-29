@@ -258,7 +258,13 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "migration step 3a: invoke dispatch. The SEAM-02 split distributed \
          this cluster across several interpreter files; the per-needle totals \
          are pinned by `the_split_did_not_change_the_interpreter_budget` \
-         below, so no row here has to restate the distribution.",
+         below, so no row here has to restate the distribution. Briefly 4 on \
+         2026-08-28: commit 1dbbe2b36 (perf(jit): bind an invokevirtual whose \
+         target is final) added a final-target binding check without moving \
+         this row, and lane L3 raised the number to clear a red it did not \
+         cause, recording it as debt rather than permission. Commit 1fca82a5c \
+         took the site out again on 2026-08-28, so the number is back where \
+         it was and the debt is paid.",
     ),
     (
         "vm/src/runtime/interpreter/native_override.rs",
@@ -658,6 +664,21 @@ fn the_allowlist_has_no_dead_rows() {
 fn the_split_did_not_change_the_interpreter_budget() {
     // (needle, total permitted across `vm/src/runtime/interpreter*`)
     const INTERPRETER_TOTALS: &[(&str, usize)] = &[
+        // 2026-08-28, 29 -> 30 -> 29, and the round trip is worth keeping.
+        // Commit `1dbbe2b36` ("perf(jit): bind an invokevirtual whose target
+        // is final") added a fourth `find_method_recursive(` to
+        // `interpreter/invoke.rs` -- the final-target devirtualisation check
+        // -- without moving any row, so BOTH bypass guards were red on
+        // pristine `dev` and every lane was blocked behind them. Lane L3
+        // raised the number to unblock, and wrote down that it was DEBT and
+        // not permission: the site asked the metadata table the same question
+        // `MemberResolver::probe_method_ref` answers.
+        //
+        // Commit `1fca82a5c` took the site out again while fixing the
+        // spliced-bci deopt, so the count is 29 once more -- and REMOVED, not
+        // relocated to a sibling interpreter file, which is the thing this
+        // per-needle total exists to catch. Lowered back by L3 on the merge
+        // that brought it in.
         ("find_method_recursive(", 29),
         ("find_field_recursive(", 5),
         ("resolve_field_ref(", 13),
