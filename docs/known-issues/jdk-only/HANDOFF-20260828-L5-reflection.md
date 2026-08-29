@@ -1,16 +1,21 @@
-# L5 — reflection and class metadata: 207 rows — **COMPLETE 2026-08-28**
+# L5 — reflection and class metadata: 207 rows — **COMPLETE 2026-08-29**
 
 **Read `HANDOFF-20260828-SCOPE.md` first.**
 
-> **OWNER: this session. LANE COMPLETE** — 483 probed rows, 20 defects fixed,
-> **0 residuals**, both modes. Full record:
-> `L5-reflection-lane-complete-20260828.md`. The lane is free for anyone who
-> wants to extend it into the long tail; nothing here is still in flight.
+> **OWNER: this session. LANE FULLY COMPLETE, residuals included.**
+>
+> * dispatch worklist — 483 probed rows, 20 defects, all 207 `native-won`
+>   triples covered (`L5-reflection-lane-complete-20260828.md`);
+> * the two items that record left open, plus five more the probe found —
+>   125 rows, 1 differing, both modes
+>   (`L5-residuals-module-packages-and-invokeexact-20260828.md`).
+>
+> **28 defects across 608 probed rows.** Nothing is in flight; every file this
+> lane held is released. The long tail below is unowned and is the natural
+> extension.
+>
 > worktree `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee`
 > branch `claude/jdk-only-mode-handoff-09b48c`
->
-> `native-builtins/src/lang_class.rs` is FREE again — the collision warning that
-> stood here while the lane was in flight no longer applies.
 
 ## Families
 
@@ -58,12 +63,34 @@ registry. The duplicate-`defineClass` error type was recorded as needing a new
 to `java/lang/LinkageError` with HotSpot's wording. **Before recording something
 as too expensive, check the API you are assuming you lack.**
 
-## If you extend this lane
+## The residuals — DONE, same owner
 
-`java/lang/Module.getPackages()` for `java.base` is still short (`<100`), and
-`MethodHandle.invokeExact` still does not enforce its exact signature — both
-recorded in `primitive-class-had-a-loader-and-two-deeper-gaps-20260827.md` §3
-and §4. Neither is a `native-won` triple in this lane's 207, so neither blocked
-completion; both are real.
+The two items this record listed as "real but not blocking" are being closed by
+the same session, in `L5-residuals-module-packages-and-invokeexact-20260828.md`.
+`probes/L5ModuleInvokeSweep.java` (125 rows) is the instrument.
+
+* **`Module.getPackages()` — DONE.** All 15 rows clean in both modes. The
+  63-entry hand list shadowed the VM's own `ModuleRegistry`, which already
+  answered >100 through `getDescriptor().packages()` on the same VM. The probe
+  also found that all SEVEN `Module`/`ModuleDescriptor` collection accessors
+  returned MUTABLE sets — not in any record, found only because a row asked.
+* **`invokeExact` — DONE.** All 17 rows, both modes. The gap was wider than the
+  record said: arity was unchecked too (`max.invokeExact(1)` answered `1` on a
+  two-argument handle, and `(1,2,3)` answered `2`). The recorded objection —
+  a strict check killed every Groovy `IndyInterface` call site — was against
+  `MH_DESC`, which adapters do not maintain; the check reads `type`, which they
+  do. `RJdkHandles` (40 rows, the whole adapter family) passes with it on.
+* **Three more the probe found that no record mentions:** a retyped handle lost
+  its return VALUE (`(long) max.invoke(1, 2)` was `0`, HotSpot `2`), an unbound
+  virtual handle answered `0` for a null receiver instead of NPE, and `invoke`
+  accepted a narrowing primitive argument.
+
+**Final: 125 rows, 1 differing, both modes.** The remaining row is `invoke`'s
+REFERENCE-argument cast, left open with its reason and a pointer to the
+measured table whoever takes it will need.
+
+**These touched `native-builtins/src/lang_invoke.rs`, `jboss_jdkspecific.rs`,
+`vm/src/vm/vm_exec.rs` and `vm/src/runtime/interpreter/invoke.rs`** — all
+released now.
 
 The long tail (71 classes with ≤3 rows each) is unowned.

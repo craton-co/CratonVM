@@ -2,7 +2,20 @@
 
 **Read `HANDOFF-20260828-SCOPE.md` first.**
 
-**Owner: TAKEN 2026-08-28**, branch `claude/l2-strings-20260828`, worktree `/data/cvm-l2s-20260828` on the Linux build host. This lane also took `WORKER-3-NOTE-3` — nobody was on it, and its N1 residual turned out to be the root cause of four of this lane's measured defects. (Superseded text: unclaimed.) L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
+**LANE COMPLETE — landed on `dev` as `3e8280b94`, 2026-08-29.** The retired copy
+of this brief, with a table of every prediction it made against what was
+measured, is `jdk-only/HANDOFF-20260828-L2-strings-COMPLETED.md` in the internal tree.
+The work is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half`
+in the same folder; the two open residuals are
+`docs/known-issues/jdk-only/l2-strings-residuals-the-migration-is-unpriced-20260828.md`.
+
+    probes/StringBuilderShadowSweep.java   747 rows, 0 diffs in BOTH modes
+    118 native-won triples                 all probed
+    18 defects, 5 root causes              all fixed
+    62 StringBuffer shadows                retired
+    WORKER-3-NOTE-3 N1 and N2              CLOSED
+
+**Owner (historical): TAKEN 2026-08-28**, branch `claude/l2-strings-20260828`, worktree `/data/cvm-l2s-20260828` on the Linux build host. This lane also took `WORKER-3-NOTE-3` — nobody was on it, and its N1 residual turned out to be the root cause of four of this lane's measured defects. (Superseded text: unclaimed.) L5 (`claude/jdk-only-mode-handoff-09b48c`, worktree
 `h2-known-issues-206dee`) is the only lane currently running.
 
 ## Your families
