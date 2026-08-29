@@ -1921,7 +1921,26 @@ run it on a workload that reaches it"; this is that run. `rc=0` on the same run.
 `no_map=6 of 378` on the same line, and `incomplete=0` — that class is not where
 the §"Follow-up 2026-08-27" `incomplete` residual lives.
 
-### 9. `frame_cov=(… incomplete=N …)` did not need a new instrument
+### 9. `incomplete=5` does not reproduce — and the handshake names what does
+
+The residual read *"`TestCachedQueryResults` shows `incomplete=5` — the first
+time anywhere that a map refuses on its OWN claim rather than being
+unlocatable."* Re-run on the 2026-08-29 tip with `CRATONVM_DBG_JIT_ROOTSCAN=1`:
+
+```text
+frame_cov=(no_slot=0 misaligned=0 no_map=77 incomplete=0 ok=6962)
+xt_cov=(accepted=0 refused=1730 deposits=469)
+```
+
+**`incomplete=0`.** It does not reproduce.
+
+And the line beside it is the real finding for that class: **the cross-thread
+handshake refuses 1 730 times and accepts 0**, against `accepted=1 refused=8`
+on `TestMultiThread`, which passes. A cycle the handshake refuses does not
+relocate at all, so none of the four repairs above runs on it. That is where
+`TestCachedQueryResults` should be attacked, and it is on its own page now.
+
+### 10. …and the census below is still the instrument for it
 
 §"Still open" carried *"`TestCachedQueryResults` shows `incomplete=5` — the
 first time anywhere that a map refuses on its OWN claim rather than being

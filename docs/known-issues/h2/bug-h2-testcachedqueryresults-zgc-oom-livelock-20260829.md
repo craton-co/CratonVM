@@ -50,6 +50,30 @@ So the question here is not only "why can the heap not serve this request" but
 **"what is retrying, and why does it never give up"**. Those are different
 repairs, and the second one is not a collector question at all.
 
+## The lead this page ships with: the cross-thread handshake refuses 1 730 times and accepts 0
+
+`CRATONVM_DBG_JIT_ROOTSCAN=1`, same class, 2026-08-29 tip:
+
+```text
+frame_cov=(no_slot=0 misaligned=0 no_map=77 incomplete=0 ok=6962)
+xt_cov=(accepted=0 refused=1730 deposits=469)
+```
+
+**`accepted=0 refused=1730`.** The cross-thread coverage handshake — which marks
+a cycle unprovable whenever a thread OTHER than the collection initiator is in
+compiled code — refuses every single time on this class. On the same binary,
+`org.h2.test.db.TestMultiThread` reports `accepted=1 refused=8 deposits=26` and
+passes.
+
+That is a far better lead than "the heap is fragmented". A cycle the handshake
+refuses does not relocate at all, so none of the four 2026-08-29 repairs runs on
+it, and the heap fragments with nothing to repair it. **Attack the refusal
+before attacking the allocator.**
+
+`incomplete=0` on the same line, which retires a residual the parent page
+carried: it recorded `incomplete=5` here as *"the first time anywhere that a map
+refuses on its OWN claim"*. It does not reproduce on this tip.
+
 ## What to do first
 
 1. **Find the retry loop.** `rc=124` at the cap with `oom` in the thousands is a
