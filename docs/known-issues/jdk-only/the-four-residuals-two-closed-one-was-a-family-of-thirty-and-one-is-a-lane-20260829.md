@@ -193,6 +193,29 @@ could have produced — a defect on its own terms, needing no oracle.
 interface is invisible to it. Both statements are true of the `tcnetssl` arm at
 once: the DoD predicate holds and the object model is violated.
 
+### The FFM half has its own page, written the same day
+
+`arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md`
+landed on `dev` while this lane was measuring, and it is the deeper treatment of
+the FFM family: 59 rows, every `Arena` factory and every segment producer, and
+the consequence this page did not have — `jdk.incubator.vector`'s
+`fromMemorySegment0Template` opens with `checkcast
+jdk/internal/foreign/AbstractMemorySegmentImpl`, which no interface stamp can
+satisfy. Read that page for FFM; this section is the general species and the
+instrument.
+
+The two agree where they overlap, including the finding that `Arena.ofConfined()`
+is wrong in BOTH modes, reached independently.
+
+**They differ on one point of method, and both are right for their subject.**
+That page deliberately does not assert the class NAME — for FFM the concrete
+class is an implementation token the two VMs may legally disagree on. This
+lane's `AbstractReceiverSweep` prints names and diffs them, because its subject
+is 29 factories across `java.nio`, `java.security` and the platform singletons,
+where the JDK's answer often IS the contract. In both probes the oracle-free
+half is the same and is the one that matters: `isInterface || isAbstract` is a
+defect on its own terms, with no oracle needed.
+
 ### The gap is now closed — and the population is 31, not 7
 
 `try_alloc_concurrent_synthetic`, the funnel natives use to mint stand-in
