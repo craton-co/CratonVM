@@ -39,22 +39,22 @@ page retired on 640 quiet runs and then reopened by a loaded one. So the third
 retry was run under real load, and the load was verified by its own effect on
 wall time rather than assumed:
 
-| batch | shape | runs per class | result |
-|---|---|---:|---|
-| 1 | solo, while a fat-LTO `cargo build` saturated the box | 3 | clean |
-| 2 | 4 concurrent instances of the class, otherwise idle | 16 | clean |
-| 3 | 8 concurrent instances + 24 CPU spinners | 24 | clean |
-| | | **43** | **0 failures, 0 aborts** |
+| batch | shape | runs per class | `LongLongHashMapTest` mean wall | result |
+|---|---|---:|---:|---|
+| 1 | solo, while a fat-LTO `cargo build` saturated the box | 3 | — | clean |
+| 2 | 4 concurrent instances of the class, otherwise idle | 16 | 22.0 s | clean |
+| 3 | 8 concurrent instances + 24 CPU spinners | 24 | **38.6 s** | clean |
+| 4 | same, on the final binary | 16 | 26.6 s | clean |
+| | | **59** | (21.3 s solo) | **0 failures, 0 aborts** |
 
-Batch 2 is reported but should be discounted: on a 32-core host, four
-single-threaded JVMs is not contention, and its wall times prove it —
-`LongLongHashMapTest` averaged 22.0 s against 21.3 s solo. Batch 3 is the one
-that counts: the same class averaged **38.6 s, 1.8x its idle time**, so the
-runs really were fighting for the machine.
+The wall-time column is there because it is what says whether the load was
+real, and batch 2 says it was not: on a 32-core host, four single-threaded JVMs
+is not contention, and 22.0 s against 21.3 s solo proves it. Batch 3 is the one
+that counts — **1.8x idle**, so the runs really were fighting for the machine.
 
-Three classes x 43 runs, with two-thirds of them under verified load, and the
-two 2026-08-27 quiet reruns already on the original page. Both classes are
-closed as random-seed/contention noise from the original 4-shard run.
+Three classes x 59 runs, two-thirds of them under load the wall clock confirms,
+plus the two 2026-08-27 quiet reruns already on the original page. Both classes
+are closed as random-seed/contention noise from the original 4-shard run.
 
 ## The `ProxyHandlerTest` note was the most valuable thing on the page
 

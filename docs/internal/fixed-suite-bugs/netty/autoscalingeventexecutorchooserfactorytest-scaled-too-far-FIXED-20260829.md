@@ -8,12 +8,22 @@ A/B'd against itself with `CRATONVM_WIN_HIRES_PARK`:
 
 | arm | pass | fail |
 |---|---:|---:|
-| `CRATONVM_WIN_HIRES_PARK=0` (pre-fix behaviour) | 47 | **10** |
-| default (fixed) | **57** | **0** |
+| `CRATONVM_WIN_HIRES_PARK=0` (pre-fix behaviour) | 54 | **23** |
+| default (fixed) | **77** | **0** |
 
-57 runs per arm, three batches, the last two interleaved run-for-run so host
-drift lands on both arms equally: 12/12 vs 10/12, then 25/25 vs 22/25, then
-20/20 vs 15/20 on the final binary. Also `regression-suite/run.sh` 75/75.
+77 runs per arm over four batches, the last three interleaved run-for-run so
+host drift lands on both arms equally: 12/12 vs 10/12, 25/25 vs 22/25, 20/20 vs
+15/20, and 20/20 vs 7/20 on the final binary. The OFF arm's rate is not stable
+between batches (2/12 to 13/20) and is not expected to be — it is a beat
+between two ~50 ms periods, so its phase, and with it the fraction of runs that
+step over the window, drifts with anything that moves either one. What is
+stable is the fixed arm: 77 runs, 0 failures.
+
+Also `regression-suite/run.sh` 76/76, and a 150-class netty slice (every
+`io.netty.util.*`, `io.netty.channel.*`, `io.netty.resolver.*`,
+`io.netty.bootstrap.*`, `io.netty.handler.proxy.*`) run on the pre-branch and
+post-branch binaries: identical, except `ProxyHandlerTest` going 8 failures to
+0 (its own page).
 
 Superseded page:
 `known-issues/netty/autoscalingeventexecutorchooserfactorytest-scaled-too-far-20260829.md`.
