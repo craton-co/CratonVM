@@ -78,8 +78,24 @@ pub(crate) fn days_in_month(year: i32, month: i32) -> i32 {
     if month == 2 && is_leap_year(year) {
         29
     } else {
-        DAYS_IN_MONTH[(month - 1) as usize]
+        days_in_month_common(month)
     }
+}
+
+/// Length of `month` (**1-12**) in a NON-leap year.
+///
+/// Same panic contract as [`days_in_month`] above, and the same reason.
+///
+/// Exists for the callers that have a month but no year — `java.time.Month`'s
+/// `length(boolean)`, `maxLength()` and `minLength()` take the leap flag as an
+/// argument or answer both bounds, so they cannot go through the year-taking
+/// form. They were indexing a `DAYS_IN_MONTH` they did not have, which is why
+/// the `synthetic-jdk` feature arm stopped compiling; giving them this instead
+/// of a private copy of the table is what keeps this module's "one table"
+/// property true.
+#[inline]
+pub(crate) fn days_in_month_common(month: i32) -> i32 {
+    DAYS_IN_MONTH[(month - 1) as usize]
 }
 
 /// Day of year, 1-based, for a valid `(year, month, day)`.
