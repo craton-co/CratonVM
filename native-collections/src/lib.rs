@@ -2472,6 +2472,34 @@ fn real_snapshot_iterator(
     }
 }
 
+/// [`real_snapshot_iterator`] for the callers that hand back a bare
+/// `ObjectRef` rather than a `MethodCallResult`.
+///
+/// A `None`/non-object answer cannot happen — that function returns either the
+/// iterator or `Err` — but it is spelled out rather than unwrapped, because an
+/// `unwrap` here would abort the VM on a shape change instead of raising the
+/// refusal the contract names.
+fn real_snapshot_iterator_ref(
+    ctx: &mut dyn NativeContext,
+    elems: ObjectRef,
+    count: usize,
+    backing: Option<(ObjectRef, SnapshotItrRoute)>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match real_snapshot_iterator(ctx, elems, count, backing)? {
+        Some(Value::Object(Some(itr))) => Ok(itr),
+        _ => Err(cratonvm_native_api::refusal_to_java_failure(
+            ctx,
+            cratonvm_native_api::ClassIdentityError::Refused {
+                name: "java/util/Arrays$ArrayItr".to_string(),
+                reason: "--jdk-only: the snapshot iterator that stands in for the \
+                         refused `cratonvm/internal/ArrayListViewItr` did not \
+                         return an object"
+                    .to_string(),
+            },
+        )),
+    }
+}
+
 /// Allocate a real `java.util.Arrays$ArrayItr` over `arr`, or `None` when this
 /// image has no such class.
 ///
@@ -2608,6 +2636,20 @@ enum SnapshotItrRoute {
     /// `native_ad_itr_remove` already makes for the fabricated `ArrayDeque$Itr`,
     /// so this route changes the class name and nothing else.
     ArrayDeque,
+    /// An ArrayList-SHAPED backing with no real `modCount` — a `values()` view
+    /// carrier, a `Collections$SynchronizedCollection`, a bare placeholder —
+    /// removed through [`native_al_remove_obj`], which also drops the matching
+    /// entry from a live `values()` view's source map.
+    ///
+    /// The route [`AL_VIEW_ITR_CLASS`] falls back to when strict mode refuses
+    /// to fabricate it. Same element-based compromise
+    /// [`SnapshotItrRoute::LinkedList`] documents: the fabricated
+    /// `ArrayListViewItr.remove()` deletes the element at `lastRet`, this
+    /// deletes the FIRST occurrence of the element `next()` returned, and the
+    /// two differ only for a backing holding duplicates — where the
+    /// alternative is not a better-behaved `remove()` but a
+    /// `NoClassDefFoundError` before `next()`.
+    ArrayListView,
 }
 
 /// The live collection a snapshot iterator's `remove()` must delete from.
@@ -7093,7 +7135,50 @@ fn alloc_arraylist_iterator_as(
         AL_VIEW_ITR_CLASS
     };
     let roots_base = ctx.pin_native_root(list);
-    let itr = try_alloc_synthetic(ctx, itr_class, n_fields)?;
+    // A REFUSAL IS NOT THE END OF THE ROAD, and this site used to treat it as
+    // one. `AL_VIEW_ITR_CLASS` has no real counterpart in any JDK, so
+    // `--jdk-only` refuses to fabricate it and the `?` here turned that refusal
+    // into a `NoClassDefFoundError` thrown at the CALLER — the shape
+    // `regression-suite/src/RJdkEnumerations.java` died on, reached through
+    // `Properties.values()` and `Collections$SynchronizedCollection.iterator`:
+    //
+    //   NoClassDefFoundError: cratonvm/internal/ArrayListViewItr
+    //     at java/util/Collections$SynchronizedCollection.iterator
+    //
+    // A fabrication request that the caller RECOVERS from is strict mode
+    // working; one it cannot recover from is the blocking set the definition of
+    // done screens for. `real_snapshot_iterator` hands back the same elements
+    // through a real `Arrays$ArrayItr` and carries the backing so `remove()`
+    // still writes through — the same recovery `native_map_key_itr` already
+    // makes for the refused `HashMap$KeyItr`.
+    //
+    // Deliberately NOT done by minting `java/util/ArrayList$Itr` instead: that
+    // class name is a GUARANTEE that its receiver has a real `modCount`, which
+    // is what lets `next`/`hasNext` yield to real bytecode. Handing it a
+    // `modCount`-less backing re-opens the spurious-CME hazard on every
+    // `for (v : map.values())` — see [`itr_backing_has_real_mod_count`].
+    let itr = match try_alloc_synthetic(ctx, itr_class, n_fields) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let list = ctx.read_native_pin(roots_base, list);
+            let (data, size) = al_state(ctx, list);
+            let Some(data) = data else {
+                ctx.unpin_native_roots(roots_base);
+                return Err(_refused);
+            };
+            let n = size.max(0) as usize;
+            // Not `?`: `roots_base` is this frame's pin base, and unwinding past
+            // the unpin would strand it and everything pinned above it.
+            let real = real_snapshot_iterator_ref(
+                ctx,
+                data,
+                n,
+                Some((list, SnapshotItrRoute::ArrayListView)),
+            );
+            ctx.unpin_native_roots(roots_base);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let list = ctx.read_native_pin(roots_base, list);
@@ -65809,6 +65894,13 @@ fn native_snapshot_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         SnapshotItrRoute::ArrayDeque => {
             native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(state.backing)), last])
+        }
+        SnapshotItrRoute::ArrayListView => {
+            // `native_al_remove_obj` is the whole operation: it searches by
+            // `equals` through a pinned helper, shifts the tail, keeps the
+            // size/`modCount` bookkeeping, and propagates to a live `values()`
+            // view's source map. One call, exactly like the arms above.
+            native_al_remove_obj(ctx, &[Value::Object(Some(state.backing)), last])
         }
     };
     let this = ctx.read_native_pin(this_pin, this);

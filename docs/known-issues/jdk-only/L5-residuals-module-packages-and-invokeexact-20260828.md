@@ -221,7 +221,7 @@ half that closes it: the return value is now converted to the target type —
 widening only, exactly JLS 5.1.2 — and boxed against the target rather than the
 leaf.
 
-## 6. The lane's own regression, found by the arms and not by any gate
+## 6. The lane's own regression — found by the arms, and fixed on dev before this landed
 
 **The bigger finding of this round, and it is about the acceptance, not the
 code.** Running the three `regression-suite` arms — which the lane record's
@@ -240,6 +240,15 @@ RExceptions.java:382   ...naming the element, not the descriptor, got:
 from its ELEMENT type, so the name that reaches a loader, and therefore the
 message that comes back, is the element's. Both vectors assert it for `[L...;`
 and `[[L...;`, and both say so in their own comments.
+
+**The fix in the tree is `39e2ded07`'s, not this lane's.** Another lane hit the
+same two reds, diagnosed the same cause, and fixed it on `dev` inside the hour
+this lane spent building and running arms. Theirs also carried the control this
+lane had not run — a detached worktree at pristine `d17feaad2`, built from
+scratch, failing both vectors on its own, which convicts the commit without
+reference to any other binary. This lane's duplicate was backed out on merge.
+The account below is kept because it is this lane's defect and this lane's
+escape, and because the escape is the part worth reading.
 
 The cause is the shape this whole campaign keeps producing. Stopping `forName`
 from delegating an array descriptor to `loadClass` was CORRECT — the two doors

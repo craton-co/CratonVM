@@ -12,15 +12,17 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 
 | lane | owner | worktree | branch |
 | --- | --- | --- | --- |
-| **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
+| **L5 reflection & class metadata** | **COMPLETE 2026-08-29** — dispatch worklist 483 rows / 20 fixed, PLUS its two recorded-open items and five more the probe found: 125 rows, **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Records: `L5-reflection-lane-complete-20260828.md` and `L5-residuals-module-packages-and-invokeexact-20260828.md` | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | L3, L7 | unclaimed | your own worktree | your own branch |
 
-**L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
-L1, L4 and L6 are DONE. Everything else is unclaimed.
+**L5 is DONE to the bottom — its residuals too — and every file it held is
+free.** L2 is taken (see the table). L1, L4 and L6 are DONE. **L3 and L7 are
+unclaimed**, and L3 (`java.util` collections, ~380 rows) is the largest lane
+left on the board.
 
 **RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
 you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
@@ -31,6 +33,15 @@ platform-independent and was not. A new probe asks the questions its author
 thought of, and L4's author was on a Linux host and did not think of
 backslashes. Cheap to do, and it is the only step that can catch what your
 fixes broke as well as what they missed.
+
+**Every lane that has finished has found defects OUTSIDE its `native-won`
+triples, and L5 found five.** The triples are a worklist, not a boundary: they
+name where a native beat bytecode, which is a dispatch fact, not a correctness
+one. L5's residual round added `Module.getPackages()` (a hand-written table
+shadowing the VM's own registry), seven MUTABLE module collections that no
+record mentioned, and three `MethodHandle` defects including a well-formed call
+returning a wrong VALUE. None was a `native-won` triple. Budget a pass beyond
+the list.
 
 Two items L5 first recorded as OPEN were later FIXED, and both had been deferred
 for reasons that one lookup would have refuted — `Module.canUse` (the VM's own
