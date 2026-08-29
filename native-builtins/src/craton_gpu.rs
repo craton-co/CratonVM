@@ -351,6 +351,12 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         builtin_array_to_host_into,
     );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
+    registry.register(
+        KLASS,
+        "arrayCopyFromHost",
+        "(JLjava/lang/Object;)Z",
+        builtin_array_copy_from_host,
+    );
 
     registry.register(KLASS, "gemm", "(JJJIIIZZZJ)J", builtin_gemm);
     registry.register(KLASS, "futureErrorKind", "(J)I", builtin_future_error_kind);
@@ -358,12 +364,121 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "releaseFuture", "(J)V", builtin_release_future);
     registry.register(KLASS, "releaseArray", "(J)V", builtin_release_array);
     registry.register(KLASS, "releaseExecutor", "(J)V", builtin_release_executor);
+
+    // CUDA graph capture and replay. The first argument of the three
+    // capture-side entry points is the EXECUTOR handle, not a stream: a
+    // capture belongs to the stream every dispatch on that executor lands
+    // on, which is the one `resolve_or_create_default_stream` hands out.
+    registry.register(KLASS, "graphBeginCapture", "(J)Z", builtin_graph_begin_capture);
+    registry.register(KLASS, "graphEndCapture", "(J)J", builtin_graph_end_capture);
+    registry.register(KLASS, "graphReplay", "(JJ)J", builtin_graph_replay);
+    registry.register(KLASS, "graphNodeCount", "(J)I", builtin_graph_node_count);
+    registry.register(KLASS, "releaseGraph", "(J)V", builtin_release_graph);
     registry.set_category(__prev_cat);
 }
 
 /// No-op registration when the `gpu-offload` feature is disabled.
 #[cfg(not(feature = "gpu-offload"))]
 pub(crate) fn register(_registry: &mut NativeMethodRegistry) {}
+
+// ---------------------------------------------------------------------------
+// Graph capture and replay
+// ---------------------------------------------------------------------------
+//
+// Five thin shims. Every one of them resolves the executor's default
+// stream and hands the work to the offload cache through a
+// `NativeContext` escape hatch; none of them holds state here, because
+// the graph itself and the "is this stream capturing" flag both live
+// beside the stream in `OffloadCache` and a second copy of either in
+// `state` would be a second thing to keep in sync.
+//
+// The handles are opaque `long`s in both directions, so all five are
+// well-defined without a device: a driverless VM answers `false` / `0`
+// / `-1` from the `NativeContext` defaults and the Java side reports
+// that capture is unavailable, rather than reporting an empty graph
+// that replays successfully and runs nothing.
+
+/// `Native.graphBeginCapture(long execHandle) -> boolean`
+///
+/// `false` if this executor has no stream to capture on, if a capture is
+/// already open, or if the driver refuses.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_begin_capture(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let ok = match resolve_or_create_default_stream(ctx, exec) {
+        Some(stream) => ctx.gpu_graph_begin_capture(stream),
+        None => false,
+    };
+    Ok(Some(Value::Int(i32::from(ok))))
+}
+
+/// `Native.graphEndCapture(long execHandle) -> long`
+///
+/// The graph handle, or `0` for any failure: nothing was captured, the
+/// capture was invalidated, or instantiation failed. Zero is never a
+/// valid handle.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_end_capture(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let handle = match resolve_or_create_default_stream(ctx, exec) {
+        Some(stream) => ctx.gpu_graph_end_capture(stream),
+        None => 0,
+    };
+    Ok(Some(Value::Long(handle as i64)))
+}
+
+/// `Native.graphReplay(long execHandle, long graphHandle) -> long`
+///
+/// One `cuGraphLaunch` onto the executor's stream. Asynchronous, exactly
+/// like a dispatch, and answers a submission handle for the same reason:
+/// the caller awaits it before reading what the graph wrote. `0` if the
+/// replay was refused.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_replay(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let graph = arg_long(args, 1) as u64;
+    let submission = match resolve_or_create_default_stream(ctx, exec) {
+        Some(stream) => ctx.gpu_graph_replay(stream, graph),
+        None => 0,
+    };
+    Ok(Some(Value::Long(submission as i64)))
+}
+
+/// `Native.graphNodeCount(long graphHandle) -> int`
+///
+/// `-1` for an unknown handle. The count a caller checks against the
+/// number of dispatches it issued: a graph holding fewer nodes than the
+/// caller submitted launches means something was dropped, and that is
+/// worth refusing to replay.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_node_count(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let graph = arg_long(args, 0) as u64;
+    Ok(Some(Value::Int(ctx.gpu_graph_node_count(graph))))
+}
+
+/// `Native.releaseGraph(long graphHandle) -> void`
+///
+/// Idempotent, and a no-op for an unknown handle.
+#[cfg(feature = "gpu-offload")]
+fn builtin_release_graph(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    ctx.gpu_graph_release(arg_long(args, 0) as u64);
+    Ok(None)
+}
 
 // ---------------------------------------------------------------------------
 // Process-wide synthetic state (gpu-offload only)
@@ -2198,6 +2313,52 @@ fn builtin_array_to_host(
     }
 }
 
+/// `Native.arrayCopyFromHost(long arrayHandle, Object src) -> boolean`
+///
+/// Overwrite a resident array's contents from `src`, in place.
+///
+/// The mirror of `arrayToHostInto`, and the only write path into an
+/// already-uploaded array. `arrayWrap*` allocates a new handle and a new
+/// device buffer, which is exactly wrong for the caller this exists for:
+/// a captured CUDA graph holds the device pointers it was captured with,
+/// so feeding a replay new input means writing through the pointer that
+/// is already baked in, not making a new one.
+///
+/// Both copies are updated -- the host-side bytes and, if the array has
+/// ever been marshalled to a kernel, the device buffer. Answers `false`
+/// if the handle is unknown, the element type or length does not match,
+/// or the device write failed; in none of those cases has anything been
+/// changed.
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_copy_from_host(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    let src = match arg_object(args, 1) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let (element_type, element_count, bytes) = snapshot_java_array(ctx, src);
+    let matches = state::with(|s| {
+        s.arrays
+            .get(&handle)
+            .is_some_and(|e| e.element_type == element_type && e.element_count == element_count)
+    });
+    if !matches {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Device first: if the device write is refused, the host store is
+    // left alone, so the two never disagree about what the array holds.
+    // `None` means the array has no device buffer yet -- the host store
+    // is then the only copy and the first dispatch will upload it.
+    if ctx.gpu_array_upload_bytes(handle, &bytes) == Some(false) {
+        return Ok(Some(Value::Int(0)));
+    }
+    array_replace_bytes(handle, bytes);
+    Ok(Some(Value::Int(1)))
+}
+
 /// `Native.arrayIsResident(long arrayHandle) -> boolean`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_is_resident(
@@ -3041,6 +3202,7 @@ pub mod dispatch_timing {
         // what says whether the two per-launch driver-call savings below
         // are being served at all.
         cratonvm_types::gpu_event_census::exit_summary();
+        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
         eprintln!(
             "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",
