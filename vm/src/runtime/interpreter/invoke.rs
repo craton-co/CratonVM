@@ -3997,13 +3997,14 @@ pub(super) fn try_stackless_invoke(
     // route reaches and this one does not. Measured by arming there first and
     // watching the consuming native print `None` for all sixteen rows.
     //
-    // `invoke` is the one entry whose collect-or-passthrough answer depends on
-    // the type the CALLER WROTE — `mh.invoke((String[]) null)` passes the null
+    // `invoke` is the entry whose collect-or-passthrough answer depends on the
+    // type the CALLER WROTE — `mh.invoke((String[]) null)` passes the null
     // through, `mh.invoke((Object) null)` collects it — and `descriptor` here
-    // is exactly that type. See `cratonvm_native_api::poly_call_site`.
-    if method_name == "invoke"
-        && crate::vm::vm_exec::is_method_handle_signature_polymorphic_receiver(class_name)
-    {
+    // is exactly that type. `invokeExact` needs the same channel for a
+    // different reason: its whole rule is a comparison AGAINST the call site.
+    // `vm_exec::arms_poly_call_site` owns which names arm and why. See
+    // `cratonvm_native_api::poly_call_site`.
+    if crate::vm::vm_exec::arms_poly_call_site(class_name, method_name) {
         cratonvm_native_api::poly_call_site::arm(descriptor);
     }
     if crate::runtime::env_cache::dbg_mh_stack()

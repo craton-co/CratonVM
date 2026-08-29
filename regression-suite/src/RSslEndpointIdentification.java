@@ -40,8 +40,7 @@ import javax.net.ssl.TrustManagerFactory;
  * / RFC 6125 identity checking, run automatically during the handshake once the algorithm is set,
  * independent of whatever {@code TrustManager} is installed (an accepting {@code TrustManager}
  * does not switch this check off; see
- * the retired {@code fixed-bugs/testsecurity2018-endpoint-identification-never-enforced-FIXED}
- * write-up).
+ * {@code fixed-bugs/testsecurity2018-endpoint-identification-never-enforced-FIXED.md} in the internal tree).
  *
  * <p>This is deliberately NOT the same surface {@link RSslLiveSession}'s {@code verifier()} test
  * covers. That test drives {@code HttpsURLConnection}, whose hostname verification was already
