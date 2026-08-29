@@ -71,7 +71,7 @@ message, not failed).
 `regression-suite/modules/` holds a real named module built into
 `build-modules/` for `RJdkModule`; `regression-suite/resources/` is staged into
 `build/` so `RJdkServices` discovers its providers through a real
-`META-INF/services` resource.
+`../apps/META-INF/services` resource.
 
 `regression-suite/modules-overlay/` is a SECOND javac pass, run over
 `build-modules/` on a plain classpath after the module is compiled. It exists
@@ -190,7 +190,7 @@ inert. The runner now cross-checks the two sets on every run:
 | `RJdkReflect` | members, `setAccessible`, the **reflection inflation/accessor** path, annotations, serialization incl. `Externalizable` |
 | `RJdkFieldModule` | the JPMS half of `Field.get`/`set` and the typed `getInt`/`setLong` family: `exports` vs `opens`, public field of an unexported package, public field of a non-public class, cross-module protected read from a subclass — every ALLOW row paired with a DENY row |
 | `RJdkJmx` | `ObjectName` canonicalisation, MBean register/attributes/operations/notifications/queries, platform MXBeans — named P0 |
-| `RJdkServices` | class-path `ServiceLoader`: `META-INF/services` discovery, `stream()`, `reload()`, `ServiceConfigurationError` |
+| `RJdkServices` | class-path `ServiceLoader`: `../apps/META-INF/services` discovery, `stream()`, `reload()`, `ServiceConfigurationError` |
 | `RJdkModule` | a real named module on `--module-path`: descriptor, reads, exports vs opens, encapsulated resources, module service providers -- including the two ILLEGAL `provider()` factory shapes, which must raise `ServiceConfigurationError` from `iterator()` and `stream()` alike |
 | `RJdkExecutors` | fixed pool, futures, cancellation, `invokeAll`/`invokeAny`, thread factory, rejection policies, scheduled executor, interruption, `CompletableFuture` |
 | `RJdkForkJoin` | `RecursiveTask`/`RecursiveAction`/`CountedCompleter`, parallel streams, worker exceptions, quiescence |

@@ -4,7 +4,7 @@ Committed baselines for the gates in `scripts/`. One file per gate.
 
 | File | Gate | Taken by |
 |---|---|---|
-| `jdk-only-bridge-ratchet.json` | [`scripts/jdk-only-bridge-ratchet.py`](../jdk-only-bridge-ratchet.py) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
+| `jdk-only-bridge-ratchet.json` | `scripts/internal/jdk-only-bridge-ratchet.py` (gitignored; local research tooling) — the unadjudicated-`Bridge` ratchet (wave-2 lane L6) | [`regression-suite/bridge-ratchet.sh`](../../regression-suite/bridge-ratchet.sh) |
 | `jdk25-<binary.name>.tsv`, `jdk25-module-<name>.tsv` | the public/protected surface of one JDK 25 class or module, for any guard whose expected set would otherwise be transcribed from the registrar it audits. Read from Rust by [`native-builtins/src/jdk_baseline.rs`](../../native-builtins/src/jdk_baseline.rs) | [`scripts/jdk-baseline/generate.py`](../jdk-baseline/generate.py) — `--update` writes, `--check` diffs, `--verify` runs its known-answer test |
 
 `tools/jdk-only-blockers/baselines/` is a *different* directory for a different

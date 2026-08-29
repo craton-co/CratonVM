@@ -379,7 +379,7 @@ touched.
 
 Every new behaviour is gated on `module_declared`, i.e. on the provider having
 come from `ctx.service_providers_from_modules` rather than a
-`META-INF/services` descriptor. That is the JDK's `clazz.getModule().isNamed()`
+`../../../apps/META-INF/services` descriptor. That is the JDK's `clazz.getModule().isNamed()`
 test asked of the *descriptor*: a provider named in `module-info` is in a named
 module by construction. Asking the descriptor rather than the class costs no
 Java dispatch on the hot classpath path (Spring/Tomcat/Elasticsearch/WildFly

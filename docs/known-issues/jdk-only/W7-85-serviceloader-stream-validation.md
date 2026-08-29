@@ -309,7 +309,7 @@ hold:
 
 1. **The provider is module-declared.** The whole factory block is gated on
    `module_declared`, i.e. on the FQN having come from
-   `ctx.service_providers_from_modules` rather than a `META-INF/services`
+   `ctx.service_providers_from_modules` rather than a `../../../apps/META-INF/services`
    descriptor. Everything on the classpath — which is all of Spring, Hibernate,
    Tomcat, Elasticsearch, WildFly boot — never enters the block at all. Their
    behaviour is byte-for-byte unchanged.

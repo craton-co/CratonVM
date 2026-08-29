@@ -231,7 +231,7 @@ compile into the SAME `kc-runner` directory (already on the harness's cached pat
 NEW pathing jar reusing the harness's cached Class-Path but with `Main-Class: <YourRunner>` in its manifest instead
 of `KcRunner` (the raw classpath is too long for a direct command line on Windows — `CreateProcess`'s ~32,767
 character limit — hence the pathing-jar/manifest-`Class-Path` indirection; building one is cheap: extract
-`META-INF/MANIFEST.MF` from an existing cached jar under
+`../../../../apps/META-INF/MANIFEST.MF` from an existing cached jar under
 `apps\keycloak-suite-runner\.suite\pathing-jars\quarkus_runtime-*.jar`, `sed` the `Main-Class:` line, re-jar).
 
 To also get a clean stack dump when it hangs: the harness itself always passes `--stack-dump-on-timeout 0`, which

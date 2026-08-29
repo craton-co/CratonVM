@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟡 OPEN (partially). 2 of 8 failures are single-method-reproducible, root-caused, **new** bugs (annotationless XML-only JPA entities not registered; `META-INF/orm2.xml` not found inside a runtime-built `.par`). 2 of 8 are almost certainly already fixed by an unmerged-at-test-time commit (see below) — reverify before treating as open. 3 of 8 are confirmed genuine failures, not separately root-caused (time-boxed). 1 of 8 is a known harness cleanup artifact, not a bug. |
+| **Status** | 🟡 OPEN (partially). 2 of 8 failures are single-method-reproducible, root-caused, **new** bugs (annotationless XML-only JPA entities not registered; `../../../../apps/META-INF/orm2.xml` not found inside a runtime-built `.par`). 2 of 8 are almost certainly already fixed by an unmerged-at-test-time commit (see below) — reverify before treating as open. 3 of 8 are confirmed genuine failures, not separately root-caused (time-boxed). 1 of 8 is a known harness cleanup artifact, not a bug. |
 | **Area** | Hibernate `bootstrap.scanning` — JPA bootstrap from runtime-built `.par` packages (`ShrinkWrap`) added to a fresh child `URLClassLoader`; `MetadataSources`/`ScannedPersistenceUnitInfo` resource+entity discovery. |
 | **Discovered** | 2026-07-21, Hibernate ORM JUnit5 suite "passed" category rerun, `apps/hib-suite-runner/run-hib.sh`, binary from worktree `C:\craton\CratonVM-hib-local-0712` (branch `test/hib-local-0712`, merged with `origin/dev` @ `7aed580f0`). |
 | **Contradicts** | Commit `08ff46fb0` ("Merge fix/hib-scanning-deephashcode-par", 2026-06-29), whose message explicitly states `PackagedEntityManagerTest 6/15 -> 15/15`, verified against this exact, still-unmodified test file (`git diff 08ff46fb0 -- .../PackagedEntityManagerTest.java` / `PackagingTestCase.java` is empty). |
@@ -84,7 +84,7 @@ cross-method pollution.
 
 ## Bug A (root-caused) — annotationless, XML-only JPA entities not registered from `orm.xml` inside a runtime-built `.par`
 
-**`testDefaultPar`**: `defaultpar.par`'s `META-INF/orm.xml` declares three
+**`testDefaultPar`**: `defaultpar.par`'s `../../../../apps/META-INF/orm.xml` declares three
 entities — `Lighter` (`metadata-complete="true"`), `ApplicationServer`
 (`@Entity`-annotated in Java, orm.xml only adds an `<entity-listeners>`
 override), and `Mouse` (**zero** annotations in `Mouse.java` — entirely
@@ -114,16 +114,16 @@ session — candidates are the `hibernate-models`/`hibernate-scan-jandex`
 boundary (`apps/hibernate-orm/hibernate-scan-jandex/`) or whatever native
 scan feeds it a class list for the packaged jar.
 
-## Bug B (root-caused) — root-level `META-INF/*.xml` mapping-file lookup fails for some runtime-built `.par` archives but not others
+## Bug B (root-caused) — root-level `../../../../apps/META-INF/*.xml` mapping-file lookup fails for some runtime-built `.par` archives but not others
 
-**`testExcludeHbmPar`**: `excludehbmpar.par` contains `META-INF/orm2.xml` at
+**`testExcludeHbmPar`**: `excludehbmpar.par` contains `../../../../apps/META-INF/orm2.xml` at
 the jar root (confirmed present both in
 `hibernate-core/src/test/bundles/templates/excludehbmpar/META-INF/orm2.xml`
 and the built `target/bundles/.../orm2.xml`, and added via
-`archive.addAsResource(...)` the same way `defaultpar.par`'s `META-INF/orm.xml`
+`archive.addAsResource(...)` the same way `defaultpar.par`'s `../../../../apps/META-INF/orm.xml`
 is added). `UrlXmlSource.fromResource` → `classLoaderService.locateResource
 ("META-INF/orm2.xml")` returns `null` → `MappingNotFoundException`. Yet
-`defaultpar.par`'s `META-INF/orm.xml`, added identically (same
+`defaultpar.par`'s `../../../../apps/META-INF/orm.xml`, added identically (same
 `ArchivePaths.create("META-INF/...")` + `archive.addAsResource` pattern, same
 root depth), **is** found (see Bug A — orm.xml itself was located; only its
 XML-only-entity content was dropped). Also affects `testDefaultParForPersistence_1_0`'s
@@ -169,7 +169,7 @@ matches **Bug 1** of
 for the *directory* classpath entries in this harness — both
 `hibernate-core/target/classes/java/main` and `target/resources/main` are
 plain directories on the classpath ahead of `hibernate-core-8.0.0-SNAPSHOT.jar`,
-and both contain `META-INF/services/jakarta.persistence.spi.PersistenceProvider`)
+and both contain `../../../../apps/META-INF/services/jakarta.persistence.spi.PersistenceProvider`)
 is mishandled by `native-builtins/src/service_loader.rs::discover_providers`
 (strips only `"file:"`, keeping a malformed leading slash before the Windows
 drive letter; `std::fs::read` fails, silently swallowed).

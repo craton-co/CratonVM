@@ -178,14 +178,14 @@ and was measured, not inferred:
 
 | service | declared by | HotSpot | `--real-jdk` | `--jdk-only` |
 |---|---|---|---|---|
-| `MySvc` (a `META-INF/services` file on the classpath) | classpath | 1 | 1 | **1** |
+| `MySvc` (a `../../../apps/META-INF/services` file on the classpath) | classpath | 1 | 1 | **1** |
 | `java.nio.file.spi.FileSystemProvider` | module `provides` | 2 | 2 | **0** |
 | `java.util.spi.ToolProvider` | module `provides` | 9 | 9 | **0** |
 | `javax.tools.JavaCompiler` | module `provides` | 1 | 1 | **0** |
 | `javax.tools.Tool` | module `provides` | 3 | 3 | **0** |
 | `javax.tools.DocumentationTool` | module `provides` | 1 | 1 | **0** |
 
-**Classpath `META-INF/services` providers still work. Every provider declared
+**Classpath `../../../apps/META-INF/services` providers still work. Every provider declared
 by a `provides ... with ...` clause in a JDK image module is lost.** This is
 not a missing module descriptor: `ModuleLayer.boot().findModule("jdk.compiler")
 .get().getDescriptor().provides()` returns all four `provides` clauses, byte
@@ -222,7 +222,7 @@ not "the first call warms something up". `ModuleLayer.boot()` alone is enough �
 Under `--real-jdk` CratonVM's own `ServiceLoader` override
 (`native-builtins/src/service_loader.rs`, `discover_providers`) runs and finds
 the provider by a module route (`descriptors=0`, i.e. not from any
-`META-INF/services` file). Under `--jdk-only` that override is not registered,
+`../../../apps/META-INF/services` file). Under `--jdk-only` that override is not registered,
 the real JDK `ServiceLoader` bytecode runs instead, and it reads a module
 services catalog that was never built.
 
@@ -534,7 +534,7 @@ attribution this document had to undo.
 * the `--real-jdk` control over the same 14 classes
   (`regression-suite/corpus/out/h2-real-jdk-20260812-203313/`);
 * `ToolProbe`, `SvcProbe`, `SvcMatrix`, `ProvProbe`, `LatchProbe`, `OswProbe`
-  and a classpath-`META-INF/services` probe, each under HotSpot 25,
+  and a classpath-`../../../apps/META-INF/services` probe, each under HotSpot 25,
   `--jdk-only` and `--real-jdk`;
 * `TestCompatibility` and `TestAnalyzeTableTx` alone, fresh cwd,
   `--stack-dump-on-timeout=180` (§3a, §3b);

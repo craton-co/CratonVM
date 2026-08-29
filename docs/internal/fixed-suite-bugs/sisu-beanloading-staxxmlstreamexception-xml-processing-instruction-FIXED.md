@@ -17,7 +17,7 @@ Sisu 1.6.1 was inspected directly. Its Plexus descriptor path is:
 
 `JarURLConnection.getInputStream()` → `InputStreamReader(UTF_8)` → `BufferedReader` →
 `XMLInputFactory.newDefaultFactory().createXMLStreamReader(reader)` for every
-`META-INF/plexus/components.xml` resource visible to its class loader.
+`../../../apps/META-INF/plexus/components.xml` resource visible to its class loader.
 
 A temporary standalone probe recreated that exact path. It enumerated every JAR in the Azure host Maven cache
 containing that resource, loaded the selected JARs through `URLClassLoader`, opened each descriptor by resource

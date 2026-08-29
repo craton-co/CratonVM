@@ -26,7 +26,7 @@ part of this record:
 and `java/util/jar/JarFile`). It inflates the whole entry eagerly and returns a
 `java.io.ByteArrayInputStream` over the result. That sidesteps a streaming
 `Inflater` bridge, and for the case it was written for — reading `MANIFEST.MF`,
-`META-INF/services/*`, class bytes — it is indistinguishable from the real
+`../../../../apps/META-INF/services/*`, class bytes — it is indistinguishable from the real
 thing.
 
 It is not indistinguishable at end-of-entry. MEASURED, Temurin 25.0.3
