@@ -283,7 +283,7 @@ passed, 0 failed.
 
 ### Root cause
 
-`bcprov-jdk18on-1.78.1.jar`'s real jarsigner signature (`META-INF/BC2048KE.{SF,DSA}`) is signed
+`bcprov-jdk18on-1.78.1.jar`'s real jarsigner signature (`../../../../apps/META-INF/BC2048KE.{SF,DSA}`) is signed
 with a **2048-bit DSA** key (`SHA256withDSA`) — the `.DSA` file extension is literal here, not
 just jarsigner's historical default naming (confirmed via `openssl asn1parse`/`-print_certs` on
 the extracted signature block: the leaf cert "Legion of the Bouncy Castle Inc." has
@@ -473,7 +473,7 @@ exceptions, but a plain `AssertionError: Expecting actual not to be null`:
 
 Root-caused via a from-scratch, Spring-Boot-independent, reflective repro
 (`SigVerifyRepro.java`) that directly constructs a real `sun.security.util.SignatureFileVerifier`
-from the extracted `META-INF/{MANIFEST.MF,BC2048KE.SF,BC2048KE.DSA}` bytes and calls its
+from the extracted `../../../../apps/META-INF/{MANIFEST.MF,BC2048KE.SF,BC2048KE.DSA}` bytes and calls its
 package-private `process(...)` method, catching whatever it throws:
 
 ```

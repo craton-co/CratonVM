@@ -99,7 +99,7 @@ seven-class cluster completely:
    `ArrayList` backing array. This avoids both stale moving-GC references and
    native-root-window exhaustion.
 2. Once compilation and annotation processing succeeded, the metadata tests
-   failed while reading `META-INF/spring-configuration-metadata.json`.
+   failed while reading `../../../../apps/META-INF/spring-configuration-metadata.json`.
    Spring's `DynamicClassLoader` creates a `resource:` URL with an
    application-provided `URLStreamHandler` whose connection owns the generated
    in-memory bytes. CratonVM's native `URL.openStream` treated every

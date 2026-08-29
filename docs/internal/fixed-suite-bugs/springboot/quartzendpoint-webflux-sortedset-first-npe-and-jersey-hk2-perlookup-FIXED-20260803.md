@@ -14,7 +14,7 @@ both root causes as unconfirmed ("not bisected this session"):
 2. **Jersey**: `IllegalStateException: Could not find an active context for
    org.glassfish.jersey.internal.inject.PerLookup`, thrown from lazy
    `ServletContainer.init()`, hypothesized as either HK2's own
-   `META-INF/hk2-locator/default` inhabitant-file discovery not finding
+   `../../../../apps/META-INF/hk2-locator/default` inhabitant-file discovery not finding
    `PerLookupContext`, or a CratonVM thread-local/context-registry mismatch.
 
 ## Current result

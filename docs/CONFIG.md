@@ -14,7 +14,7 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--classpath <PATH>` / `-c <PATH>` / `--cp <PATH>` | Directories and JARs to search for `.class` files. Separator: `;` (Windows) or `:` (Unix). | `.` (current directory) |
-| `--jar <FILE>` | Execute a JAR. Main class is read from `META-INF/MANIFEST.MF`. `-cp` is ignored when this is set. | — |
+| `--jar <FILE>` | Execute a JAR. Main class is read from `../apps/META-INF/MANIFEST.MF`. `-cp` is ignored when this is set. | — |
 | `--Xbootclasspath <PATH>` | Override bootstrap classpath. | Auto-detected from `--java-home` |
 | `--java-home <PATH>` | JDK installation for boot/ext classpath discovery and JMOD loading. Does **not** select a mode — it only points the (already selected) real-JDK mode at a specific installation. | `CRATONVM_JAVA_HOME`, then `JAVA_HOME`, then `java` on `PATH` |
 | `--real-jdk` | Load the real JDK class files from `jmods/` or `lib/modules`, with roughly **2,700** native registrations in Rust (`REAL_JDK_NATIVE_REGISTRATIONS` in [`vm/src/config.rs`](../vm/src/config.rs)). Already the default; pass it to be explicit. Fails loudly if no usable JDK is found. | **on** (`LAUNCHER_DEFAULT_JDK_MODE`) |

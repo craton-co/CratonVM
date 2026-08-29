@@ -137,7 +137,7 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
 | Option | Description |
 |--------|-------------|
 | `-c`, `-cp`, `--classpath <PATH>` | Directories and JARs to search. Separator: `:` (Unix) / `;` (Windows). |
-| `--jar <FILE>` | Execute a JAR (main class from `META-INF/MANIFEST.MF`; classpath from the JAR and its manifest `Class-Path`). |
+| `--jar <FILE>` | Execute a JAR (main class from `apps/META-INF/MANIFEST.MF`; classpath from the JAR and its manifest `Class-Path`). |
 | `-Xmx<SIZE>`, `--Xmx <SIZE>` | Maximum heap size (`256m`, `1g`, `8g`). Default: 256 MB. |
 | `-XX:+UseG1GC` | Use the region-based G1 collector (experimental; generational is the default). |
 | `-D<name>=<value>` | Set a Java system property. |

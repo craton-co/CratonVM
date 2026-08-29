@@ -33,7 +33,7 @@ diff vs bench-baseline.json       ->  manual today; CI script later.
 
 | Probe | Source | External jar | Primary surface tested |
 |---|---|---|---|
-| `instrument` | `apps/instrument_probe/{Target,RetransformAgent,Main}.java` + `META-INF/MANIFEST.MF` | none — agent.jar built from these sources | `-javaagent:`, premain dispatch, `Instrumentation.addTransformer`, `retransformClasses` |
+| `instrument` | `apps/instrument_probe/{Target,RetransformAgent,Main}.java` + `../../../apps/META-INF/MANIFEST.MF` | none — agent.jar built from these sources | `-javaagent:`, premain dispatch, `Instrumentation.addTransformer`, `retransformClasses` |
 | `jacoco`     | `apps/jacoco_probe/{Target,Main}.java` | `jacocoagent.jar` (vendored at `C:/craton/ejbca-ce/lib/coverage/jacocoagent.jar` or local maven) | full JaCoCo coverage agent boot + classfile rewriter |
 | `mockito`    | `apps/mockito_probe/{SomeInterface,Main}.java` | `mockito-core-*.jar` + `byte-buddy-*.jar` + `byte-buddy-agent-*.jar` + `objenesis-*.jar` | Mockito MockMaker + ByteBuddy runtime attach |
 

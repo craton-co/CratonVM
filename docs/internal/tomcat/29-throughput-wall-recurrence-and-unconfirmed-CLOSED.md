@@ -98,7 +98,7 @@ CratonVM  JarFile        : first=AAAA second=BBBB  -> OK
 
 Note which path is stale. That asymmetry is exactly what made the Tomcat
 failure so confusing: `HostConfig.deployWAR` reads the WAR's
-`META-INF/context.xml` through `new JarFile(war)` — the FRESH path — and
+`../../../apps/META-INF/context.xml` through `new JarFile(war)` — the FRESH path — and
 correctly sets `unpackWAR=true`. But it then records
 `context.setConfigFile(UriUtil.buildJarUrl(war, …))`, and at context start
 `ContextConfig.processContextConfig` **re-parses that same descriptor through

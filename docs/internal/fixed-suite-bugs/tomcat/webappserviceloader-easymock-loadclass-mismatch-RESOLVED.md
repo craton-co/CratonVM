@@ -15,7 +15,7 @@ java.lang.AssertionError:
 This test mocks a `ClassLoader` and verifies Tomcat's
 `WebappServiceLoader` (the `ServiceLoader`-based mechanism that finds
 `ServletContainerInitializer` implementations via
-`META-INF/services/jakarta.servlet.ServletContainerInitializer`) makes a
+`../../../../apps/META-INF/services/jakarta.servlet.ServletContainerInitializer`) makes a
 specific, exact sequence of calls against it — in this "no initializers
 found" case, `getResources(...)` is expected to be called exactly once and
 nothing else. EasyMock's failure message is confusing at first glance (it

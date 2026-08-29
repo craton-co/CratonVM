@@ -70,7 +70,7 @@ module, `:~2842`):
 
 `classloading/src/class_path.rs`:
 - New `ClassPath::verify_signed_entries(archive, sf_bytes) -> bool` (`:~1966`):
-  reads `META-INF/MANIFEST.MF`, requires the `.SF` to bind it
+  reads `../../../../../apps/META-INF/MANIFEST.MF`, requires the `.SF` to bind it
   (`verify_sf_binds_manifest`), then for every entry the manifest digests,
   re-reads the entry and requires `digest_matches`. Fail-closed on missing
   manifest, missing/unreadable signed entry, unsafe entry name

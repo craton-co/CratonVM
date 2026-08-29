@@ -4218,6 +4218,13 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     /// decode step multiplies by the same weights every token, and
     /// re-uploading them would cost more than the arithmetic.
     ///
+    /// `_trans_a` / `_trans_b` read the corresponding operand transposed,
+    /// expressed as a stride pair rather than a separate kernel, so the
+    /// operand's element count is unchanged and only its indexing differs.
+    ///
+    /// `_stream_handle` places the launch on a Java-visible `GpuStream`;
+    /// `None` uses the shared built-in stream.
+    ///
     /// Returns a submission handle with the usual lifecycle, or `None`
     /// when this VM has no GPU offload compiled in.
     ///
@@ -4225,6 +4232,7 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     /// multiply — three nested loops, a shared tile, a barrier — and
     /// rejects such a method rather than mis-lowering it. See
     /// `vm::runtime::kernels`.
+    #[allow(clippy::too_many_arguments)]
     fn gpu_dispatch_gemm(
         &mut self,
         _half: bool,
@@ -4234,6 +4242,9 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
         _m: i32,
         _n: i32,
         _k: i32,
+        _trans_a: bool,
+        _trans_b: bool,
+        _stream_handle: Option<u64>,
     ) -> Option<u64> {
         None
     }

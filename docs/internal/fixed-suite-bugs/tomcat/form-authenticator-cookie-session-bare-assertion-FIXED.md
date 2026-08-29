@@ -44,7 +44,7 @@ commit range: see
 ### 2. `InetSocketAddress(String,int)` permanently unresolved (FIXED — commit `0e8c0df4`, merged `b76bd22e`)
 
 With (1) fixed, the login-page JSP compiles, but the FIRST request still
-500s. Root cause: the examples webapp's `META-INF/context.xml` configures
+500s. Root cause: the examples webapp's `../../../../apps/META-INF/context.xml` configures
 `<Valve className="org.apache.catalina.valves.RemoteCIDRValve" allow="127.0.0.0/8,::1/128" />`.
 `RemoteCIDRValve.invoke()` reads `request.getRequest().getRemoteAddr()`,
 which for Tomcat's NIO connector resolves via
