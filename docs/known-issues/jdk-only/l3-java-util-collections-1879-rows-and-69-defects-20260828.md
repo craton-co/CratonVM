@@ -1,20 +1,12 @@
 # L3 — `java.util` collections: 1879 probed rows, 69 defects, and what passed — 2026-08-28
 
-> **The `probes/` tree is no longer in the working tree.** `3b2901531`
-> (*"major doc consistency update before the realeas"*, 2026-08-29) removed 915
-> files and 126 525 lines, the whole probe corpus among them, and this lane's
-> twelve sweeps went the same way for consistency with that decision rather
-> than surviving as the one exception. They are in history and restore in one
-> command:
->
-> ```bash
-> for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep HashtableVectorShadowSweep ArrayListShadowSweep LinkedSequencedShadowSweep PqOptionalShadowSweep CollectionsShadowSweep LocaleDateTzShadowSweep MapViewsShadowSweep UtilTailShadowSweep MethodRefDoorProbe; do
->   git show b97c0cc8c:apps/probes/$C.java > probes/$C.java
-> done
-> ```
->
-> `b97c0cc8c` is the last commit that carries all twelve with their final
-> content; §7's reproduce block runs unchanged once they are back.
+> **The twelve probes live at `apps/probes/`.** `3b2901531` (*"major doc
+> consistency update before the realeas"*, 2026-08-29) moved `probes/` to
+> `apps/probes/`, and the move deleted the files that were still only on lane
+> branches -- these twelve among them. They are restored at the new path,
+> alongside the rest of the corpus. `apps/` is in `.gitignore`, so anything
+> added there needs `git add -f`; that is why the move carried some probe files
+> across and dropped others.
 
 
 **Status: the lane is closed except for the residuals in §6, each of which has
@@ -460,15 +452,15 @@ See the companion page. 13 of `MethodRefDoorProbe`'s 25 rows.
 CV=target/release/cratonvm
 # The twelve sources live in `apps/probes/`; the repo moved `probes/` there on
 # 2026-08-29 and this block is written for the layout after that move.
-"$JDK/bin/javac" -d apps/probes/out apps/probes/*ShadowSweep.java probes/MethodRefDoorProbe.java
+"$JDK/bin/javac" -d apps/probes/out apps/probes/*ShadowSweep.java apps/probes/MethodRefDoorProbe.java
 for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep \
          HashtableVectorShadowSweep ArrayListShadowSweep \
          LinkedSequencedShadowSweep PqOptionalShadowSweep \
          CollectionsShadowSweep LocaleDateTzShadowSweep \
          MapViewsShadowSweep UtilTailShadowSweep MethodRefDoorProbe; do
-  "$JDK/bin/java" -cp probes/out "$C" > /tmp/$C.hs 2>/dev/null
-  "$CV" --java-home "$JDK"            -cp probes/out "$C" > /tmp/$C.compat 2>/dev/null
-  "$CV" --java-home "$JDK" --jdk-only -cp probes/out "$C" > /tmp/$C.strict 2>/dev/null
+  "$JDK/bin/java" -cp apps/probes/out "$C" > /tmp/$C.hs 2>/dev/null
+  "$CV" --java-home "$JDK"            -cp apps/probes/out "$C" > /tmp/$C.compat 2>/dev/null
+  "$CV" --java-home "$JDK" --jdk-only -cp apps/probes/out "$C" > /tmp/$C.strict 2>/dev/null
   diff /tmp/$C.hs /tmp/$C.strict
 done
 ```

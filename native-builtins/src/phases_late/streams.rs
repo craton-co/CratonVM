@@ -3579,7 +3579,7 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
     // runs only under `--features synthetic-jdk`, so the rule was absent from
     // the shipping build and `treeSet.spliterator().getComparator()` fell
     // through to the interface default, which throws unconditionally
-    // (probes/UtilTailShadowSweep 143).
+    // (apps/probes/UtilTailShadowSweep 143).
     //
     // The two bodies AGREE -- this one asks `this.characteristics()` virtually,
     // which lands on the shipping body -- which is why this is the one row of

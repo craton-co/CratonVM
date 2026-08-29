@@ -5544,7 +5544,7 @@ fn unmod_is_immutable(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// [`unmod_is_immutable`] (slot 1) and NOT the class, exactly as
 /// [`unmod_list_oob_error`] splits the three out-of-range messages.
 ///
-/// MEASURED in COMPATIBLE MODE ONLY (probes/UtilTailShadowSweep 65, 66, 85,
+/// MEASURED in COMPATIBLE MODE ONLY (apps/probes/UtilTailShadowSweep 65, 66, 85,
 /// 101, 102): strict already answers correctly, because these factories are
 /// `SyntheticStub` registrations it drops in favour of real bytecode.
 fn reject_null_immutable_query(
@@ -11866,7 +11866,7 @@ fn map_init_capacity_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 ///
 /// MEASURED against HotSpot 25.0.3+9 in BOTH modes for `HashMap`
 /// (`probes/HashMapShadowSweep`), and again 2026-08-28 for `LinkedHashMap` and
-/// `LinkedHashSet` (`probes/LinkedSequencedShadowSweep` 19-21, 35):
+/// `LinkedHashSet` (`apps/probes/LinkedSequencedShadowSweep` 19-21, 35):
 ///
 /// ```text
 ///   new HashMap<>(-1)          HotSpot IllegalArgumentException  CratonVM no-throw
@@ -12494,7 +12494,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // every generic body performs. So `native_map_replace` read a `TreeMap`
     // correctly through `native_map_get` and then wrote its answer into
     // `HashMap` buckets the receiver does not have -- the map was unchanged and
-    // `replace` reported the update anyway (probes/TreeShadowSweep 212-213).
+    // `replace` reported the update anyway (apps/probes/TreeShadowSweep 212-213).
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
@@ -13965,7 +13965,7 @@ fn reject_null_functional(arg: Option<&Value>) -> Result<(), MethodCallFailed> {
 /// `Objects.requireNonNull(c)` in `ArrayList`, `LinkedList`, `ArrayDeque`,
 /// `Vector` and `AbstractCollection`, so the refusal fires on an EMPTY receiver
 /// and for an empty argument alike. MEASURED on HotSpot 25.0.4+7
-/// (`probes/ArrayListShadowSweep` 24/147/148, `probes/DequeListShadowSweep`
+/// (`apps/probes/ArrayListShadowSweep` 24/147/148, `apps/probes/DequeListShadowSweep`
 /// 9/115/162/163).
 ///
 /// Deliberately the SAME predicate rather than a second spelling of it: the
@@ -23145,7 +23145,7 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `for (int i = 0; modCount == expectedModCount && i < size; i++)` with a
     // final re-check, so `l.forEach(x -> l.clear())` throws rather than
     // completing over a list that no longer exists. MEASURED: no-throw
-    // (probes/ArrayListShadowSweep 50).
+    // (apps/probes/ArrayListShadowSweep 50).
     //
     // `al_mod_count` answers `None` for a receiver with no usable slot -- a view
     // carrier, a synthetic layout -- and the check is then SKIPPED rather than
@@ -23359,7 +23359,7 @@ fn native_opt_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     // NOT RULE F: `ifPresent` has no `requireNonNull` — its body is
     // `if (value != null) action.accept(value);`, so `empty.ifPresent(null)`
-    // does NOT throw. MEASURED (probes/PqOptionalShadowSweep 97).
+    // does NOT throw. MEASURED (apps/probes/PqOptionalShadowSweep 97).
     let val_pre = ctx.get_field(this, OPT_FIELD_VALUE);
     if !opt_value_is_empty(val_pre) {
         reject_null_functional(args.get(1))?;
@@ -23378,7 +23378,7 @@ fn native_opt_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_opt_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE F, ahead of everything: `Optional.map` opens
     // `Objects.requireNonNull(mapper)`, so an explicit null throws on an EMPTY
-    // optional too. MEASURED both ways (probes/PqOptionalShadowSweep 80-81).
+    // optional too. MEASURED both ways (apps/probes/PqOptionalShadowSweep 80-81).
     reject_null_functional(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -23485,7 +23485,7 @@ fn native_opt_or_else_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // `orElseGet` does NOT pre-validate: its body is
         // `return value != null ? value : supplier.get();`, so a null supplier
         // is an NPE on THIS branch only. MEASURED: `present.orElseGet(null)`
-        // does not throw (probes/PqOptionalShadowSweep 72-73).
+        // does not throw (apps/probes/PqOptionalShadowSweep 72-73).
         reject_null_functional(args.get(1))?;
         let supplier = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
@@ -23643,7 +23643,7 @@ fn native_al_sort_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// Every one of these opens by dereferencing its argument (`c.size()`,
 /// `list.get(0)`, `new ArrayList<>(list)`), so a null is an NPE before the
 /// algorithm starts, and on an EMPTY argument as much as a populated one.
-/// MEASURED, twelve rows, both modes (`probes/CollectionsShadowSweep` 5, 8, 12,
+/// MEASURED, twelve rows, both modes (`apps/probes/CollectionsShadowSweep` 5, 8, 12,
 /// 18, 22, 27, 34, 35, 47, 114, 147).
 ///
 /// Same missing-vs-explicitly-null distinction as [`reject_null_functional`]:
@@ -37485,7 +37485,7 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
     // `java.util.Map$Entry`, which declares no `toString`, so every one of them
     // printed as `java.util.Map$Entry@<identity hash>` -- non-deterministic as
     // well as wrong. MEASURED on `Properties.entrySet()`
-    // (probes/PropertiesShadowSweep 151) against HotSpot's `[a=over, b=2, ...]`.
+    // (apps/probes/PropertiesShadowSweep 151) against HotSpot's `[a=over, b=2, ...]`.
     // Every JDK entry implementation renders `key + "=" + value`.
     registry.register(
         "java/util/Map$Entry",
@@ -43531,7 +43531,7 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
     // ... and the three view carriers' own `reversed()`, which is real bytecode
     // over the same overlay-held chain: `sequencedKeySet().reversed()` answered
     // `[]` while `sequencedKeySet()` itself was already right
-    // (probes/LinkedSequencedShadowSweep 80-81). One class further out than the
+    // (apps/probes/LinkedSequencedShadowSweep 80-81). One class further out than the
     // round-2 fix reached.
     registry.register(
         "java/util/LinkedHashMap$LinkedKeySet",
@@ -44807,7 +44807,7 @@ fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // `afterNodeAccess(e)` on the existing node before returning it -- so in
         // ACCESS order the key moves to the tail even though nothing was
         // stored. MEASURED `{c=3, a=1, b=22}` against HotSpot's
-        // `{a=1, b=22, c=3}` (probes/LinkedSequencedShadowSweep 42); every later
+        // `{a=1, b=22, c=3}` (apps/probes/LinkedSequencedShadowSweep 42); every later
         // row of an LRU sequence inherits the wrong order from that one.
         if lhm_is_access_order(ctx, this) {
             lhm_move_to_tail(ctx, this, node);
@@ -45798,7 +45798,7 @@ fn native_ad_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // `IllegalStateException` contract, which `cursor <= 0` alone cannot
     // express. `remove()` twice with no intervening `next()` finds the cursor
     // unchanged since the previous removal. MEASURED no-throw in compatible
-    // mode (probes/DequeListShadowSweep 84); the `--jdk-only` route already had
+    // mode (apps/probes/DequeListShadowSweep 84); the `--jdk-only` route already had
     // it, through `SnapshotItrBacking::last_removed_cursor`.
     let last_removed = if ctx.object_num_fields(this) > 3 {
         ctx.get_field(this, 3).as_int().unwrap_or(0)
@@ -46133,7 +46133,7 @@ fn native_pq_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // capacity 0 is illegal, so a check copied from `HashMap`'s `< 0`
         // accepts it. Clamping an argument is not validating it: `new
         // PriorityQueue<>(0)` and a legal `new PriorityQueue<>(1)` became
-        // indistinguishable. MEASURED (probes/PqOptionalShadowSweep 27-28).
+        // indistinguishable. MEASURED (apps/probes/PqOptionalShadowSweep 27-28).
         Some(Value::Int(c)) if *c < 1 => {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalArgumentException {
@@ -46224,7 +46224,7 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // with no comparator already throws `ClassCastException`. We accepted it and
     // failed one call later with `NoSuchMethodError` from `compareTo` on a plain
     // Object, which is both the wrong type and the wrong line. MEASURED
-    // (probes/PqOptionalShadowSweep 22-23). Only the natural-ordering path
+    // (apps/probes/PqOptionalShadowSweep 22-23). Only the natural-ordering path
     // casts: a queue WITH a comparator never requires `Comparable`.
     if matches!(
         ctx.get_field(this, PQ_FIELD_COMPARATOR),
@@ -46265,7 +46265,7 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // can throw runs BEFORE the size is published, so a refused insert leaves
     // the queue exactly as it was. MEASURED: after a `ClassCastException` from
     // a mixed-type offer, `size()` answered 2 against HotSpot's 1
-    // (probes/PqOptionalShadowSweep 25) -- and the rejected element was left in
+    // (apps/probes/PqOptionalShadowSweep 25) -- and the rejected element was left in
     // the heap array at an unsorted position, where the next `poll` would find
     // it. Publishing first and sifting after cannot be reordered here (the sift
     // needs the element in place), so the store is UNDONE on the throwing path.
@@ -46882,7 +46882,7 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Z",
         native_ad_add_all,
     );
-    // MEASURED (probes/DequeListShadowSweep 86/88/90): unregistered, all three
+    // MEASURED (apps/probes/DequeListShadowSweep 86/88/90): unregistered, all three
     // ran real `ArrayDeque` bytecode, which maintains `elements`/`head`/`tail`
     // and knows nothing about this VM's FOURTH, synthetic `size` slot. The real
     // body compacted correctly and `size` stayed at the pre-removal count, so
@@ -49527,7 +49527,7 @@ fn tm_new_range_view(
     //  IllegalArgumentException("fromKey out of range");`
     // for each supplied bound. Without it a caller can narrow a view and then
     // quietly get back everything it excluded, which is the one thing a range
-    // view exists to prevent. MEASURED no-throw (probes/TreeShadowSweep 131).
+    // view exists to prevent. MEASURED no-throw (apps/probes/TreeShadowSweep 131).
     //
     // GC-SAFETY: `tm_view_in_range` dispatches the comparator, so `source` and
     // both bounds move under it; they are pinned here and read back, and the
@@ -50071,7 +50071,7 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// `getHigherEntry` / `getLowerEntry` do not: they start `Entry<K,V> p = root;`
 /// and the refusal is a side effect of the first comparison, so an empty map
 /// answers `null` for the same call. MEASURED both ways
-/// (`probes/TreeShadowSweep` 71 and 77-78).
+/// (`apps/probes/TreeShadowSweep` 71 and 77-78).
 ///
 /// With a comparator installed there is no cast and no implicit null check at
 /// all — a null-tolerant comparator is exactly why `TreeMap` HAS this split —
@@ -54304,7 +54304,7 @@ fn native_tm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// That is the whole difference between the two constructors, and it is
 /// decided by the argument's STATIC type: `new TreeMap<>((Map) sortedMap)`
 /// deliberately does not inherit it. Both spellings are in
-/// `probes/TreeShadowSweep`.
+/// `apps/probes/TreeShadowSweep`.
 fn native_tm_init_from_sorted_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     reject_null_collection(args.get(1))?;
     let this = match args.first() {
@@ -54380,7 +54380,7 @@ fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // if the mapper resized or rewrote the map in between, that write lands
     // against a decision taken on a map that no longer exists. Same defect
     // `HashMap` had (fixed 2026-08-28), at the sibling that shares the
-    // contract. MEASURED no-throw (probes/TreeShadowSweep 214).
+    // contract. MEASURED no-throw (apps/probes/TreeShadowSweep 214).
     //
     // `size` is the signal here, not `modCount`: this family's state lives in
     // an array-backed overlay whose real `modCount` slot no native writes, so
@@ -54654,7 +54654,7 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // IllegalArgumentException("key out of range"); return m.put(e, ..)`. Before
     // this the add landed in the snapshot and nowhere else, so the view reported
     // an element the source had never heard of. MEASURED
-    // (probes/TreeShadowSweep 140).
+    // (apps/probes/TreeShadowSweep 140).
     //
     // The write-through for an IN-range add needs no branch here: the wrapper
     // that installed this range also installed the `ts_view_source` marker, and
@@ -56546,7 +56546,7 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
     // `TreeMap(Map)` is `putAll(m)`, which reaches the `Map` interface native
     // and worked; `TreeMap(SortedMap)` is `buildFromSorted`, which writes
     // `root` directly and produced an EMPTY map
-    // (probes/TreeShadowSweep 220). A shim is only ever as good as the JDK path
+    // (apps/probes/TreeShadowSweep 220). A shim is only ever as good as the JDK path
     // that happens to route through it, so both are registered.
     registry.register(c, "<init>", "(Ljava/util/Map;)V", native_tm_init_from_map);
     registry.register(
@@ -58595,7 +58595,7 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // FOUND FROM `java.util.Properties`, recorded for L6 whose family this is.
     // `new Properties(-1)` answered no-throw where HotSpot raises
-    // `IllegalArgumentException` (probes/PropertiesShadowSweep 79) -- and
+    // `IllegalArgumentException` (apps/probes/PropertiesShadowSweep 79) -- and
     // `Properties` is not where the guard belongs: real `Properties(int)`
     // bytecode runs `new ConcurrentHashMap<>(initialCapacity)`, and THIS
     // constructor validated nothing. One line, the same guard every other
@@ -66363,7 +66363,7 @@ fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     al_set_size(ctx, list, n.max(0));
     // IMMUTABLE. The JDK answers a `Collections$CopiesList`, which refuses
     // `add`/`set`/`remove`; this returned a plain `ArrayList`, so
-    // `nCopies(2, "x").set(0, "y")` succeeded (probes/CollectionsShadowSweep
+    // `nCopies(2, "x").set(0, "y")` succeeded (apps/probes/CollectionsShadowSweep
     // 40-41). `nCopies` is used precisely BECAUSE its result is shared and
     // cannot change -- a mutable one is handed to several holders at once.
     // Wrapped while still pinned: the wrapper allocates.
@@ -67926,7 +67926,7 @@ fn native_spliterator_characteristics(
     args: &[Value],
 ) -> MethodCallResult {
     // WAS a constant `0x4050` for every producer. MEASURED against HotSpot
-    // (probes/UtilTailShadowSweep 141-145): a `TreeSet`'s spliterator must report
+    // (apps/probes/UtilTailShadowSweep 141-145): a `TreeSet`'s spliterator must report
     // `SORTED | DISTINCT` and a `HashSet`'s must NOT report `ORDERED`.
     //
     // Not cosmetic. `Spliterator.getComparator()`'s DEFAULT body is

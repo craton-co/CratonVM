@@ -1560,7 +1560,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // which dereferences it. Substituting `""` handed a caller with a
             // null variable a usable `Locale.ROOT` instead of the NPE that names
             // the mistake. MEASURED no-throw
-            // (probes/LocaleDateTzShadowSweep 39).
+            // (apps/probes/LocaleDateTzShadowSweep 39).
             if matches!(args.first(), Some(Value::Object(None))) {
                 return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: None,

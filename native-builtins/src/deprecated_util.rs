@@ -2046,7 +2046,7 @@ fn native_locale_get_iso3_language(
     // keeps its language in `baseLocale.language`, and fills neither the side
     // table (which `locale_alloc` and the `<init>` natives write) nor the
     // synthetic slot 0 -- so `Locale.of("en","US").getISO3Language()` answered
-    // `""` against HotSpot's `"eng"` (probes/LocaleDateTzShadowSweep 10). Ask
+    // `""` against HotSpot's `"eng"` (apps/probes/LocaleDateTzShadowSweep 10). Ask
     // our own `getLanguage()`, which is registered and already right for every
     // shape, rather than adding a third copy of the lookup: the `iso2_to_iso3`
     // table below was complete all along and simply never got a code to map.
