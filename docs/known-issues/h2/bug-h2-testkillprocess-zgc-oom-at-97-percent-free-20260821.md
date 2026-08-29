@@ -28,9 +28,12 @@
 > feature this work supersedes shipped reading zero for a week and the only
 > reason anyone found out is that it carried a counter.
 >
-> **One tracked class is NOT fixed.** `org.h2.test.jdbc.TestCachedQueryResults`
-> still livelocks — `oom=2990` in 900 s on the fixed tip against 18 048 in
-> 1 500 s before, a 3.6x lower rate and the same outcome. It throws thousands
+> **One tracked class is NOT fixed, and it is where the repairs are best
+> measured.** `org.h2.test.jdbc.TestCachedQueryResults` still livelocks, and it
+> is the one class in this family that throws THOUSANDS of `OutOfMemoryError`
+> per run rather than one — so a rate is measurable. Same binary, 900 s cap:
+> **`oom=2990` on the default against `oom=6318` with all three switches off.**
+> The repairs halve it and change nothing else. It throws thousands
 > and keeps running, which is a different shape from every other class here
 > (those failed once and died), so something is catching and retrying and that
 > is not a collector question. It has its own page:

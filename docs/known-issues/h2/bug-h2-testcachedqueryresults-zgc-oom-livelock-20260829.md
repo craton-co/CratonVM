@@ -13,11 +13,28 @@ Measured on the merged tip with all four repairs, `--Xmx 1g`, 900 s cap:
 org.h2.test.jdbc.TestCachedQueryResults  rc=124  secs=900  oom=2990  arena=11
 ```
 
-Against the parent page's last reading — `rc=124` at a **1500 s** cap with
-**18 048** `OutOfMemoryError` and 14 arena failures — that is roughly a 3.6×
-lower OOM rate per second and the same outcome. **A rate improvement on a
-livelock is not a fix**, and this page exists so that distinction is not lost
-in the parent's Status line.
+and the same-binary control beside it:
+
+| arm | rc | secs | `oom` | `arena` | load at start |
+|---|---:|---:|---:|---:|---:|
+| default (all four repairs) | 124 (cap) | 900 | **2 990** | 11 | 9.0 |
+| all three switches `=0` (pre-2026-08-29) | 124 (cap) | 900 | **6 318** | 12 | 20.9 |
+
+**The repairs halve the OOM rate and change nothing else.** This is also the one
+class in the family where a rate is measurable at all — thousands of events per
+run rather than one pass/fail — so it is the strongest evidence on that page
+that the four repairs do something, and simultaneously the proof that they are
+not enough here.
+
+Read the load column before over-reading the factor: the control ran at more
+than twice the load, and on this collector load decides how often a cycle is
+allowed to compact at all (`relocation_on_proven_jit`). The direction is solid,
+the exact ratio is not.
+
+Against the parent page's older reading — `rc=124` at a **1 500 s** cap with
+**18 048** `OutOfMemoryError` and 14 arena failures — the per-second rate is
+down about 3.6x. **A rate improvement on a livelock is not a fix**, and this
+page exists so that distinction is not lost in the parent's Status line.
 
 ## Why it is a different shape from the rest of that family
 
