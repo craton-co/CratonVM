@@ -2264,13 +2264,24 @@ mod tests {
 
         let resolved = resolve_java_executable();
 
+        // CANONICALISE BEFORE THE DELETE. `std::fs::canonicalize` resolves
+        // against the filesystem and FAILS for a path that no longer exists, so
+        // asking about `alias` after removing it silently fell through
+        // `unwrap_or` to the raw path -- while `resolve_java_executable` hands
+        // back an already-canonical extended-length one. Two spellings of the
+        // same file, and the assertion compared them: the resolved side carried
+        // the Windows `\\?\` prefix and the expected side did not.
+        //
+        // Windows-only, and it fails ALONE -- not a race with the sibling test
+        // that shares this alias path, which is what it looks like at first.
+        let expected = std::fs::canonicalize(&alias).unwrap_or_else(|_| alias.clone());
+
         if created {
             let _ = std::fs::remove_file(&alias);
         }
 
         let resolved = resolved.expect("a java.exe beside the test binary must resolve");
         let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-        let expected = std::fs::canonicalize(&alias).unwrap_or(alias);
         assert_eq!(
             resolved, expected,
             "CreateProcessW searches the calling executable's own directory \

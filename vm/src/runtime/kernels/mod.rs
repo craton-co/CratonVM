@@ -37,35 +37,53 @@ use cuda_bridge::{DeviceContext, DeviceModule, KernelArgs, LaunchConfig};
 /// cheaply detect.
 const GEMM_PTX: &str = include_str!("gemm.ptx");
 
-/// Rows of `C` one thread block computes. Must match `BM` in `gemm.cu`.
-pub const BM: u32 = 64;
+/// Rows and columns of `C` one thread block computes, small tile.
+/// Must match the `gemm_body<64, 64, ...>` instantiations in `gemm.cu`.
+pub const BM_SMALL: u32 = 64;
+/// See [`BM_SMALL`].
+pub const BN_SMALL: u32 = 64;
 
-/// Columns of `C` one thread block computes. Must match `BN` in `gemm.cu`.
-pub const BN: u32 = 64;
+/// The same for the large tile: `gemm_body<128, 128, ...>`.
+pub const BM_LARGE: u32 = 128;
+/// See [`BM_LARGE`].
+pub const BN_LARGE: u32 = 128;
 
-/// Rows of `C` one *thread* computes. Must match `TM` in `gemm.cu`.
-pub const TM: u32 = 4;
-
-/// Columns of `C` one *thread* computes. Must match `TN` in `gemm.cu`.
-pub const TN: u32 = 4;
-
-/// Threads per block along x and y: `(BN/TN, BM/TM)`, i.e. 16 x 16 = 256.
-///
-/// Note that the block *dimension* and the block *tile* are no longer the
-/// same number, which they were before register blocking. A block is 16x16
-/// threads and computes a 64x64 patch of `C`, because each thread owns a
-/// `TM x TN` sub-block. Sizing the grid by the thread count instead of the
-/// tile — the obvious mistake, and the one the old code's shape made easy
-/// — launches 16 times too many blocks and lets them write over each
-/// other.
-pub const BLOCK_X: u32 = BN / TN;
+/// Threads per block, both shapes: `(BN/TN, BM/TM)` is 16 x 16 either
+/// way, because the tile and the per-thread block grow together.
+pub const BLOCK_X: u32 = 16;
 /// See [`BLOCK_X`].
-pub const BLOCK_Y: u32 = BM / TM;
+pub const BLOCK_Y: u32 = 16;
+
+/// Output edge at or above which the large tile is used.
+///
+/// Chosen from measurement rather than theory. Kernel-only throughput on
+/// an RTX 2060, GFLOP/s:
+///
+/// | edge | 64x64 tile | 128x128 tile |
+/// |------|-----------:|-------------:|
+/// | 256  |        437 |          261 |
+/// | 512  |       1470 |         1296 |
+/// | 1024 |       1973 |         3112 |
+///
+/// The large tile does more arithmetic per shared-memory load and is
+/// therefore faster once there is enough work to fill the device — but a
+/// 128x128 tile covers a 256x256 problem in four blocks, which leaves
+/// most of a 30-SM GPU idle. 1024 is where the crossover sits here; 512
+/// still favours the small tile.
+///
+/// Deliberately a single threshold on the smaller output edge rather
+/// than an occupancy model. The real quantity is "are there enough
+/// blocks to fill this device", which depends on the SM count and so
+/// cannot be a constant — but a constant that is right on the hardware
+/// this was measured on beats a model that is wrong everywhere.
+pub const LARGE_TILE_MIN_EDGE: i32 = 1024;
 
 /// Entry points the module is loaded with.
-const ENTRY_POINTS: [&str; 4] = [
+const ENTRY_POINTS: [&str; 6] = [
     "craton_gemm_f32",
+    "craton_gemm_f32_lg",
     "craton_gemm_f16",
+    "craton_gemm_f16_lg",
     "craton_h2f",
     "craton_f2h",
 ];
@@ -84,13 +102,29 @@ pub enum GemmKind {
 }
 
 impl GemmKind {
-    /// The PTX entry point this kind launches.
-    pub fn entry_name(self) -> &'static str {
-        match self {
-            GemmKind::F32 => "craton_gemm_f32",
-            GemmKind::F16 => "craton_gemm_f16",
+    /// The PTX entry point for this kind at the tile `use_large` selects.
+    ///
+    /// Four kernels rather than two: the same templated body instantiated
+    /// at both tile sizes for both element types. Which one to launch is
+    /// [`use_large_tile`]'s decision.
+    pub fn entry_name(self, use_large: bool) -> &'static str {
+        match (self, use_large) {
+            (GemmKind::F32, false) => "craton_gemm_f32",
+            (GemmKind::F32, true) => "craton_gemm_f32_lg",
+            (GemmKind::F16, false) => "craton_gemm_f16",
+            (GemmKind::F16, true) => "craton_gemm_f16_lg",
         }
     }
+}
+
+/// Whether an `m x n` output is big enough for the large tile.
+///
+/// Both dimensions must clear the threshold. A 4096x64 output has plenty
+/// of rows and only half a tile of columns, so the large shape would
+/// waste most of every block it launched.
+#[must_use]
+pub fn use_large_tile(m: i32, n: i32) -> bool {
+    m >= LARGE_TILE_MIN_EDGE && n >= LARGE_TILE_MIN_EDGE
 }
 
 /// Load the built-in module against `ctx`.
@@ -107,18 +141,25 @@ pub fn load(ctx: &DeviceContext) -> cuda_bridge::Result<DeviceModule> {
 ///
 /// Grid sized by the BLOCK TILE, block sized by the THREAD COUNT.
 ///
-/// Each block computes a `BM x BN` patch of `C` using `BLOCK_Y x BLOCK_X`
-/// threads, so the grid is the output rounded up to the patch and the
-/// block is the thread count — two different numbers since register
-/// blocking landed. Dividing the grid by the thread count instead would
-/// launch 16x too many blocks, all writing over each other.
+/// Each block computes a tile of `C` using `BLOCK_Y x BLOCK_X` threads,
+/// so the grid is the output rounded up to the TILE and the block is the
+/// THREAD COUNT — two different numbers since register blocking landed,
+/// and now the tile itself depends on the shape. Dividing the grid by
+/// the thread count instead would launch far too many blocks, all
+/// writing over each other.
 ///
 /// Note the axis assignment: `x` indexes columns and `y` rows, matching
 /// the kernel's `row0 = blockIdx.y * BM`. Transposing this produces a
 /// correct-looking result on a square matrix and garbage on any other.
 pub fn gemm_launch_config(m: i32, n: i32) -> LaunchConfig {
-    let gx = (n.max(0) as u32).div_ceil(BN).max(1);
-    let gy = (m.max(0) as u32).div_ceil(BM).max(1);
+    let large = use_large_tile(m, n);
+    let (bm, bn) = if large {
+        (BM_LARGE, BN_LARGE)
+    } else {
+        (BM_SMALL, BN_SMALL)
+    };
+    let gx = (n.max(0) as u32).div_ceil(bn).max(1);
+    let gy = (m.max(0) as u32).div_ceil(bm).max(1);
     LaunchConfig {
         grid: (gx, gy, 1),
         block: (BLOCK_X, BLOCK_Y, 1),
@@ -333,96 +374,117 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{name} must be an integer"))
         };
 
-        assert_eq!(define("BM"), BM, "block tile rows disagree");
-        assert_eq!(define("BN"), BN, "block tile columns disagree");
-        assert_eq!(define("TM"), TM, "thread tile rows disagree");
-        assert_eq!(define("TN"), TN, "thread tile columns disagree");
+        // The tile shapes are template arguments now, not #defines, so the
+        // check is that the instantiations the host assumes are present.
+        for inst in ["gemm_body<64, 64, 4, 4>", "gemm_body<128, 128, 8, 8>"] {
+            assert!(
+                cu.contains(inst),
+                "gemm.cu must instantiate {inst}; the host sizes its grid                  by exactly these tiles"
+            );
+        }
+        assert_eq!(define("BK"), 16, "K-depth disagrees");
+        assert_eq!(define("VEC"), 4, "shared-load vector width disagrees");
     }
 
-    /// The derived thread counts must stay consistent with the tiles.
+    /// Both tile shapes must yield the same 16x16 thread block.
+    ///
+    /// They do because the tile and the per-thread block grow together —
+    /// 64/4 and 128/8 are both 16 — which is what lets one `BLOCK_X`
+    /// serve both kernels. If a future shape broke that, the launch would
+    /// use the wrong block dimension for one of them.
     #[test]
-    fn block_dimensions_follow_from_the_tiles() {
-        assert_eq!(BLOCK_X, BN / TN);
-        assert_eq!(BLOCK_Y, BM / TM);
-        // 256 threads: one warp per 32 of them, and a round number of
-        // warps is what keeps the cooperative loads uniform.
+    fn both_tiles_yield_the_same_thread_block() {
+        assert_eq!(BLOCK_X, BN_SMALL / 4);
+        assert_eq!(BLOCK_Y, BM_SMALL / 4);
+        assert_eq!(BLOCK_X, BN_LARGE / 8);
+        assert_eq!(BLOCK_Y, BM_LARGE / 8);
         assert_eq!(BLOCK_X * BLOCK_Y, 256);
         assert_eq!((BLOCK_X * BLOCK_Y) % 32, 0, "block must be whole warps");
     }
 
-    /// The cooperative loads assume the tile divides evenly by the thread
+    /// The cooperative loads assume each tile divides evenly by the thread
     /// count, so every thread does the same number of iterations.
     #[test]
     fn cooperative_loads_divide_evenly() {
         let threads = BLOCK_X * BLOCK_Y;
-        assert_eq!((BM * 16) % threads, 0, "A tile must divide by the thread count");
-        assert_eq!((16 * BN) % threads, 0, "B tile must divide by the thread count");
+        for (bm, bn) in [(BM_SMALL, BN_SMALL), (BM_LARGE, BN_LARGE)] {
+            assert_eq!((bm * 16) % threads, 0, "A tile {bm} must divide by {threads}");
+            assert_eq!((16 * bn) % threads, 0, "B tile {bn} must divide by {threads}");
+        }
     }
 
-    /// Shared memory must fit. `BK*(BM+BN)` floats, and 48 KB is the
-    /// per-block default on every architecture this targets.
+    /// Shared memory must fit, for both shapes: `BK*(BM+BN)` floats
+    /// against the 48 KB per-block default.
+    ///
+    /// Worth asserting rather than commenting because exceeding it does
+    /// not fail at build time — the PTX is fine and the *launch* fails on
+    /// whatever device is present, which is the worst place to find out.
     #[test]
     fn shared_memory_fits_a_block() {
-        let bytes = 16 * (BM + BN) * 4;
-        assert!(
-            bytes <= 48 * 1024,
-            "shared tile is {bytes} bytes, past the 48 KB per-block default"
-        );
+        let small = 16 * (BM_SMALL + BN_SMALL) * 4;
+        let large = 16 * (BM_LARGE + BN_LARGE) * 4;
+        assert_eq!(small, 8 * 1024);
+        assert_eq!(large, 16 * 1024);
+        for bytes in [small, large] {
+            assert!(
+                bytes <= 48 * 1024,
+                "shared tiles are {bytes} bytes, past the 48 KB default"
+            );
+        }
     }
 
-    /// A row-major operand reads at (cols, 1); its transpose at (1, cols).
-    #[test]
-    fn strides_describe_both_readings() {
-        // A stored 3x4 (row-major): element (i,j) at i*4 + j.
-        assert_eq!(Strides::row_major(4), Strides { row: 4, col: 1 });
-        // Read transposed as 4x3: element (i,j) is stored (j,i) at j*4 + i,
-        // so the row stride is 1 and the column stride is the STORED width.
-        assert_eq!(Strides::transposed(4), Strides { row: 1, col: 4 });
-    }
-
-    /// The indices the two layouts produce, checked by hand.
+    /// The tile choice must be the same on both sides of the launch.
     ///
-    /// Stride arithmetic is easy to get subtly wrong and impossible to
-    /// eyeball once it is inside a kernel, so the mapping is pinned here
-    /// against a worked example rather than only end-to-end on a device.
+    /// `gemm_launch_config` sizes the grid from one tile and
+    /// `GemmKind::entry_name` picks the kernel that indexes for one tile.
+    /// If they ever disagreed, the grid would cover the output for one
+    /// shape while the kernel strode by the other — every block writing
+    /// the wrong elements, with no error anywhere.
     #[test]
-    fn stride_arithmetic_matches_a_worked_example() {
-        // Stored 2x3 row-major:  [ 0 1 2 ]
-        //                        [ 3 4 5 ]
-        let rm = Strides::row_major(3);
-        let at = |st: Strides, i: i32, j: i32| i * st.row + j * st.col;
-
-        assert_eq!(at(rm, 0, 0), 0);
-        assert_eq!(at(rm, 0, 2), 2);
-        assert_eq!(at(rm, 1, 0), 3);
-        assert_eq!(at(rm, 1, 2), 5);
-
-        // The same bytes read as a 3x2 transpose:  [ 0 3 ]
-        //                                          [ 1 4 ]
-        //                                          [ 2 5 ]
-        let tr = Strides::transposed(3);
-        assert_eq!(at(tr, 0, 0), 0);
-        assert_eq!(at(tr, 0, 1), 3);
-        assert_eq!(at(tr, 1, 0), 1);
-        assert_eq!(at(tr, 2, 1), 5);
+    fn grid_and_entry_point_agree_on_the_tile() {
+        for (m, n) in [(64, 64), (512, 512), (1024, 1024), (2048, 2048),
+                       (4096, 64), (64, 4096), (1023, 1024), (1024, 1023)] {
+            let large = use_large_tile(m, n);
+            let tile = if large { BN_LARGE } else { BN_SMALL };
+            let cfg = gemm_launch_config(m, n);
+            let expected_gx = (n as u32).div_ceil(tile).max(1);
+            assert_eq!(
+                cfg.grid.0, expected_gx,
+                "{m}x{n}: grid sized for the other tile than entry_name picks"
+            );
+            let name = GemmKind::F32.entry_name(large);
+            assert_eq!(name.ends_with("_lg"), large, "{m}x{n}: wrong entry point");
+        }
     }
 
+    /// The large tile needs BOTH edges to be large.
     #[test]
-    fn of_selects_between_the_two() {
-        assert_eq!(Strides::of(false, 7), Strides::row_major(7));
-        assert_eq!(Strides::of(true, 7), Strides::transposed(7));
+    fn a_thin_output_stays_on_the_small_tile() {
+        // Plenty of rows, half a tile of columns: the large shape would
+        // waste most of every block it launched.
+        assert!(!use_large_tile(4096, 64));
+        assert!(!use_large_tile(64, 4096));
+        assert!(use_large_tile(1024, 1024));
+        // Exactly at the threshold counts as large.
+        assert!(use_large_tile(LARGE_TILE_MIN_EDGE, LARGE_TILE_MIN_EDGE));
+        assert!(!use_large_tile(LARGE_TILE_MIN_EDGE - 1, LARGE_TILE_MIN_EDGE));
     }
 
     #[test]
     fn grid_covers_every_output_element() {
-        // Exactly one block tile.
+        // Exactly one small tile.
         let cfg = gemm_launch_config(64, 64);
         assert_eq!(cfg.grid, (1, 1, 1));
         assert_eq!(cfg.block, (BLOCK_X, BLOCK_Y, 1));
 
-        // One past a tile boundary in each direction rounds up.
+        // One past a small-tile boundary in each direction rounds up.
         let cfg = gemm_launch_config(65, 129);
         assert_eq!(cfg.grid, (3, 2, 1), "grid is (ceil(N/BN), ceil(M/BM), 1)");
+
+        // Above the threshold the large tile is used, so the same output
+        // needs a quarter as many blocks per axis.
+        let cfg = gemm_launch_config(2048, 2048);
+        assert_eq!(cfg.grid, (16, 16, 1), "2048/128 = 16");
 
         // A degenerate shape still launches at least one block rather
         // than zero, which the driver rejects.
@@ -437,18 +499,19 @@ mod tests {
     /// one writing over its neighbours' output.
     #[test]
     fn grid_is_sized_by_the_tile_not_the_thread_count() {
-        let cfg = gemm_launch_config(256, 256);
-        assert_eq!(cfg.grid, (4, 4, 1), "256/BN = 4, not 256/BLOCK_X = 16");
+        // 512 is below the large-tile threshold, so this is 512/64.
+        let cfg = gemm_launch_config(512, 512);
+        assert_eq!(cfg.grid, (8, 8, 1), "512/64 = 8, not 512/BLOCK_X = 32");
     }
 
     #[test]
     fn grid_axes_are_not_transposed() {
         // Deliberately non-square: transposing the axes is invisible on a
         // square shape and wrong everywhere else.
-        let cfg = gemm_launch_config(/* m */ 256, /* n */ 64);
+        let cfg = gemm_launch_config(/* m */ 512, /* n */ 64);
         assert_eq!(
             cfg.grid,
-            (1, 4, 1),
+            (1, 8, 1),
             "x must index columns (N) and y rows (M), matching the kernel"
         );
     }

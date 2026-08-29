@@ -71,16 +71,14 @@ bit-identical to HotSpot):
 | Double div-chain (64 divs/elem)                          | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
 | 128 multiply-adds/elem (data-dependent multiplier)       | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
 | Dot-product reduction (int·int → long, x300/elem)        | 1,172 ms   | unimplemented | **12 ms**    | **98x**    | n/a          |
-| Ray tracer kernel, 1920×1440 (2.76M px, branchless 4-sphere) | 72.7 ms | 2.70 ms      | **1.08 ms**  | **67x**    | **2.5x**     |
-| Ray tracer kernel, 3840×2160 (8.3M px)                    | 208.4 ms   | 6.65 ms       | **3.06 ms**  | **68x**    | **2.2x**     |
-| Ray tracer kernel, 7680×4320 (33.2M px)                   | 837.1 ms   | 24.29 ms      | **12.29 ms** | **68x**    | **2.0x**     |
+| Ray tracer kernel, 7680×4320 (33.2M px)                  | 837.1 ms   | 24.29 ms      | **12.29 ms** | **68x**    | **2.0x**     |
 
 Ray tracer rows are 6 interleaved rounds each (arm order alternated per round
 to cancel drift), full H2D+kernel+D2H, checksums bit-identical to HotSpot; the
 3840×2160 row is pooled over two independent 6-round passes (12 rounds total,
 craton faster in all 12) run 30 minutes apart, which agreed within noise. The
 kernel is the reduced proxy (`bench-gpu/RayTracerKernel.java`), documented in
-`gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md` (under the internal tree own root),
+`gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md` in the internal tree,
 not the full `apps/TornadoVM-Ray-Tracer` app (whose real kernel — reflections,
 soft shadows, a skybox — needs dynamic-length scene loops neither engine's
 analyzer admits yet). The margin over TornadoVM shrinks with resolution

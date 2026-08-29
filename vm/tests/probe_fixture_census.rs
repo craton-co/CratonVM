@@ -282,6 +282,10 @@ const NOT_A_FIXTURE: &[(&str, &str)] = &[
         "apps/wildfly-dist/wildfly-32.0.1.Final — a third-party server distribution",
     ),
     ("probe_fixture_census.rs", "this census itself"),
+    (
+        "require_e2e_gate.rs",
+        "apps/no-such-probe-9f3c1d/NoSuchProbe.java — a path built to be ABSENT,          so `require_fixture` always takes its miss path. Same category as          `probe_compile_guard.rs`: the `apps/` literal is the subject under          test, not a lookup.",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
