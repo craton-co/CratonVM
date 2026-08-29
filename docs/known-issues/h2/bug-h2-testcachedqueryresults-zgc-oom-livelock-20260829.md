@@ -2,7 +2,14 @@
 
 ## Status
 
-**OPEN, split out 2026-08-29** from
+**OPEN, and the chain is now traced to one frame — see §"2026-08-29 (second)".**
+The `xt_cov=(accepted=0 refused=1730)` lead this page shipped with turned out to
+be four measurements deep: the peers DO park, some of their own proofs return
+false, the obligation is `UNPUBLISHED_FRAME_OOP` in 3 of 4, and six of the seven
+unpublished words belong to a single frame whose safepoint-id slot holds the low
+32 bits of a heap pointer.
+
+Split out 2026-08-29 from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which is
 retired: that page's own class passes 2/2 and the four fragmentation defects it
 ended on are fixed. **This class is not fixed by them.**
@@ -88,7 +95,106 @@ operand-stack oop marks are not exact there — a revived dead-code merge
 reconstructing the stack at a nonzero depth). Both are compiler shapes, not
 collector ones, and both feed the refusal above.
 
-## What to do first
+## 2026-08-29 (second): the handshake refuses because PEER PROOFS FAIL — and one frame's safepoint id is half an object pointer
+
+The lead this page shipped with was `xt_cov=(accepted=0 refused=1730)`. Four
+measurements later the chain is complete, and the bottom of it is one frame.
+
+### 1. The peers DO park. Their own proofs fail.
+
+The shortfall was assumed to be peers the handshake cannot see — an OS-frozen
+thread, or one blocked in a native with compiled frames below it, which deposits
+nothing. `CRATONVM_DBG_XT_COVERAGE=1` says otherwise: the deposits happen, and
+some of them carry `proven=false`.
+
+```text
+[xt-coverage] peer_depth=3 proven=0 accounted=false
+[xt-coverage] peer_depth=9 proven=0 accounted=false
+[xt-coverage] peer_depth=3 proven=3 accounted=true
+...
+6 × peer deposit proven=true  depth=N
+4 × peer deposit proven=false depth=N
+```
+
+A peer that parks, runs its own per-thread coverage proof and gets `false`
+deposits nothing — and the initiator's test is `proven >= peer_depth`, so ONE
+failing peer refuses the whole cycle. That is a different repair target from
+"reach the parked peers", and it is where the work belongs.
+
+### 2. WHICH obligation — and the counter that could not say
+
+`proven=false` has six possible causes and they want six different repairs, so
+the peer-deposit line now names the one that fired. The first attempt at that
+diagnostic diffed `moving_young_fallback_reason_counts()` around the proof and
+reported `why=none` for every failure — **a vacuous read**: `bump_reason_count`
+has exactly one caller, `record_moving_young_coverage_fallback`, which is the
+GENERATIONAL collector's per-cycle accounting. On ZGC those counters never move
+at all. The reason MASK (`incomplete_reason_mask_add`, called on every mark) is
+the signal, and diffing it gives:
+
+```text
+2 × proven=false why=compiled-frame-oop-not-published
+1 × proven=false why=compiled-frame-band-unbounded,innermost-rbp-belongs-to-unguarded-callee
+1 × proven=false why=active-safepoint-map-incomplete,compiled-frame-oop-not-published
+```
+
+**`UNPUBLISHED_FRAME_OOP` in 3 of 4.** That is the obligation the parent page
+spent 2026-08-26/27 on and relaxed for dead slots; the relaxation is not enough
+here.
+
+### 3. The band census, and the one frame under all of it
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` — seven unpublished words in the run,
+4 `operand-spill` and 3 `reserved-locals-tail`. **Six of the seven are one
+frame**, and its header is the finding:
+
+```text
+off=48 region=reserved-locals-tail value=0x200671a2c18
+       sp_id=Some(1729768472) live_hi=None
+       layout={ java_locals_hi: 32, locals_hi: 88, spill_lo: 88, spill_hi: 192 }
+```
+
+`1729768472` is not a bytecode pc — those are bounded by 65535. It is
+**`0x671a2c18`, the low 32 bits of `0x200671a2c18`** — the heap pointer this same
+scan reports at `off=48` of the same frame. **The frame's safepoint-id slot
+holds half an object pointer.**
+
+`live_hi=None` on the same line is the same fact from the other side: no map
+matched the id, so `moving_young_frame_live_hi` had nothing to return. And
+because `frame_active_map_slots` also returns `None`, the 2026-08-27 dead-slot
+relaxation deliberately does not fire — which is why all six of that frame's
+words are reported and why its proof returns `UNPUBLISHED_FRAME_OOP`.
+
+The other frame in the same run reports `sp_id=Some(3) live_hi=Some(160)` and
+exactly one word. The machinery works; one frame's id does not.
+
+> The report used to print `in_map=Some(false)` for this, which reads as "the
+> dataflow calls this slot dead" and sends a reader at the band verifier. It
+> conflated "a map was found and does not name the slot" with "no map exists for
+> this id". It now prints `no-map-for-id`, and that is the line to grep.
+
+### 4. What to do next, in order
+
+1. **Decide which of two shapes the garbage id is**, because they are opposite
+   repairs and the evidence above does not separate them:
+   * **something wrote an oop into the reserved sp-id slot** (a codegen defect:
+     a store whose offset lands in the reserved-locals tail), or
+   * **`rbp` is wrong for this frame**, so `[rbp - sp_id_slot_off]` lands on a
+     neighbouring slot that legitimately holds an oop (a frame-resolution
+     defect, the same family as the 2026-08-26 "two innermost-frame mirrors were
+     not moving together" fix on the parent page).
+
+   The discriminator is cheap: print `sp_id_slot_off` and the whole reserved
+   tail beside the id. If the pointer sits at exactly `sp_id_slot_off` the store
+   is the bug; if the tail's OTHER slots also look shifted by one, the rbp is.
+2. Only then look at the `operand-spill` words. Four of the seven are on the
+   frame with the garbage id and may simply be its neighbours.
+3. `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` remains the same-binary control: it
+   restores the blanket refusal, so it should change nothing here (the handshake
+   is already refusing every cycle) and a difference would mean the accounting,
+   not the proof, is the problem.
+
+## What to do first (superseded by the section above)
 
 1. **Find the retry loop.** `rc=124` at the cap with `oom` in the thousands is a
    caller swallowing `OutOfMemoryError` — H2's own code, or a
