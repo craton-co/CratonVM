@@ -1628,6 +1628,13 @@ free_list_bytes=797496464 largest_free_block=8184
 large-object request this page opened on, a ten-kilobyte one. That arm reports
 `vacated_spans=0 vacated_bytes=0`, which is what the switch is for.
 
+**Closed in code, not only in prose.** `recycled_chunk_size` now takes the
+publication's state and the starved floor is inert without it
+(`starved_recycle_permitted`), with a test carrying these numbers. Both default
+ON, so the shipped configuration is byte-for-byte the one measured above; this
+only affects somebody turning the publication off to bisect, and it stops that
+bisect from being worse than either endpoint.
+
 **And what the table does NOT establish**: `neither` is the pre-2026-08-29
 behaviour and it passed 2/2 here, so these runs do not show a rate improvement
 over it. They cannot: the same class on the same host, same day, on a

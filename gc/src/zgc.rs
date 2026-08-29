@@ -9690,6 +9690,7 @@ fn recycled_chunk_size(
     need: usize,
     largest_low_free: usize,
     bump_headroom: usize,
+    publish_vacated: bool,
 ) -> Option<usize> {
     let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
     if size >= want || size < need {
@@ -9700,8 +9701,33 @@ fn recycled_chunk_size(
     }
     // Below the preferred floor: worth it only when a full chunk can no longer
     // be bumped without spending the large-object reserve.
-    (starved_recycle_enabled() && bump_headroom < want && size >= (want / 64).max(need))
+    (starved_recycle_permitted(publish_vacated)
+        && bump_headroom < want
+        && size >= (want / 64).max(need))
         .then_some(size)
+}
+
+/// Is the starved floor allowed to fire at all?
+///
+/// **The two switches are not independent, and the measurement that says so is
+/// on the page this work belongs to.** `TestMVStoreTool` at `--Xmx 1g`, one
+/// binary, arms interleaved: with `CRATONVM_ZGC_PUBLISH_VACATED=0` alone the
+/// class fails 2/2 (`oom=6` at 60 s and 81 s, on a **9 888-byte** request with
+/// 797 MB free and `largest_free_block=8184`), while the arm with that switch
+/// off AND this one off passes 2/2.
+///
+/// The floor takes 8–64 KiB blocks off the free list when the bump is out of
+/// headroom. While the slide is publishing page-granular spans back, that is
+/// recycling. With the publication off, nothing replenishes the large end of
+/// the free list and the floor grinds the last of it into TLAB chunks — a
+/// bisect arm strictly worse than either endpoint, which is a footgun rather
+/// than a lever.
+///
+/// So the floor is gated on the publication. Both default ON, so the shipped
+/// configuration is byte-for-byte the one that was measured; this only affects
+/// somebody turning the publication off to bisect.
+fn starved_recycle_permitted(publish_vacated: bool) -> bool {
+    publish_vacated && starved_recycle_enabled()
 }
 
 /// `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` — the kill switch for the starved
@@ -11129,7 +11155,13 @@ impl ZgcRealHeap {
             // follows it).
             let largest = arena.largest_low_free_block();
             let headroom = arena.low_bump_headroom();
-            let sized = recycled_chunk_size(want, need, largest, headroom)
+            let sized = recycled_chunk_size(
+                want,
+                need,
+                largest,
+                headroom,
+                self.publish_vacated_enabled.load(Ordering::Relaxed),
+            )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // `alloc(want)` covers both the "the free list has a full-size
             // block" case and the bump.
@@ -14255,7 +14287,7 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         const NODE: usize = 96;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4),
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true),
             Some(CHUNK - NODE),
             "a chunk short by one AQS node must still be recycled",
         );
@@ -14267,19 +14299,19 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true), None);
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true), None);
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true),
             Some(CHUNK / 8),
             "the floor itself is acceptable",
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true), None);
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -14301,7 +14333,7 @@ pub(crate) mod tests {
                 CHUNK,
                 CHUNK * 2,
             ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom) {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true) {
                     assert!(
                         size >= need,
                         "need={need} largest={largest} produced a {size}-byte chunk",
@@ -14330,25 +14362,61 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         let short = CHUNK / 16; // 32 KiB -- below `want / 8`, above `want / 64`
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true),
             None,
             "with headroom the alternative is a clean full-size bump, so a              short chunk is pure churn",
         );
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
             Some(short),
             "without it the alternative is spending the large-object reserve,              and the chunk is taken either way -- the only question is out of              WHICH space",
         );
         // The starved floor is a floor, not an abolition: dust is still refused
         // however starved the bump is.
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true),
             None,
             "below `want / 64` a buffer is churning rather than buffering, and              that does not change with the alternative",
         );
         // ...and `need` still bounds it in the starved regime, or the refill
         // would install a chunk its own allocation cannot use.
-        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0), None);
+        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true), None);
+    }
+
+    /// **The starved floor is INERT while the vacated-span publication is off,
+    /// and that coupling is measured rather than tidy.**
+    ///
+    /// `TestMVStoreTool` at `--Xmx 1g`, one binary, arms interleaved: with
+    /// `CRATONVM_ZGC_PUBLISH_VACATED=0` alone the class fails 2/2 (`oom=6` at
+    /// 60 s and 81 s, on a **9 888-byte** request with 797 MB free and
+    /// `largest_free_block=8184`) — while the arm with that switch off AND the
+    /// starved floor off passes 2/2. A bisect arm strictly worse than either
+    /// endpoint is a footgun, not a lever.
+    ///
+    /// The floor takes 8-64 KiB blocks off the free list when the bump is out
+    /// of headroom, which is recycling while the slide is publishing
+    /// page-granular spans back and is grinding when it is not.
+    #[test]
+    fn the_starved_floor_is_inert_without_the_vacated_publication() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16;
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            Some(short),
+            "the starved regime with the publication on"
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false),
+            None,
+            "...and inert without it, because nothing would replenish what it takes"
+        );
+        // The PREFERRED floor is unaffected -- it is not the hazard, and gating
+        // it would change the shipped behaviour of a switch nobody set.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false),
+            Some(CHUNK - 96),
+            "a chunk short by one AQS node is still worth taking either way"
+        );
     }
 
     // ------------------------------------------------------------------
