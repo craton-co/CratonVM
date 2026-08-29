@@ -7112,6 +7112,65 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(itr))))
 }
 
+/// The snapshot iterator the three collection families hand out: their REAL
+/// iterator class, over a wrapper that carries the source.
+///
+/// One helper for `TreeSet`, `ArrayDeque` and `PriorityQueue` because the three
+/// wanted the same four things and had three hand-written approximations of
+/// them, each landing on a different wrong class. It gives all four at once:
+///
+/// * the class HotSpot hands out (`apps/probes/FailFastShapeProbe`), through
+///   `alloc_arraylist_iterator_as`, which REFUSES rather than fabricates and
+///   falls back to the plain shape when the carrier is not real;
+/// * `native_al_itr_*` bound to that class, from the `VALUES_ITR_CARRIERS`
+///   registration loop;
+/// * write-through `remove()`, from the source in the wrapper's trailing
+///   capacity slot, which `propagate_list_removal` routes to the family's own
+///   removal native;
+/// * fail-fast, from `al_view_itr_seed` reading `family_snapshot_generation`
+///   into the carrier's declared `expectedModCount`.
+///
+/// The wrapper never escapes: it is minted here, handed to the iterator, and
+/// never returned, so the marker's blast radius is the natives this iterator
+/// reaches and not every consumer of the marker.
+///
+/// GC: every allocation below can move the source, the elements and the array,
+/// so the source is pinned first and read back through its pin, the elements
+/// through theirs. `unpin_native_roots(src_pin)` releases all of them at once
+/// -- pins are a stack and this is the outermost.
+fn alloc_family_snapshot_iterator(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    elems: &[Value],
+    carrier: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let n = elems.len();
+    let src_pin = ctx.pin_native_root(source);
+    let (_, handles) = pin_value_slice(ctx, elems);
+    let arr = alloc_ref_array(ctx, n + 1);
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, v) in elems.iter().enumerate() {
+        let v = read_pinned_elem(ctx, handles[i], *v);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr, i, v);
+    }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let source_now = ctx.read_native_pin(src_pin, source);
+    ctx.set_array_element(arr, n, Value::Object(Some(source_now)));
+    let wrapper = match alloc_arraylist_with(ctx, arr, n as i32) {
+        Ok(w) => w,
+        Err(e) => {
+            ctx.unpin_native_roots(src_pin);
+            return Err(e);
+        }
+    };
+    let wrap_pin = ctx.pin_native_root(wrapper);
+    let wrapper = ctx.read_native_pin(wrap_pin, wrapper);
+    let itr = alloc_arraylist_iterator_as(ctx, wrapper, Some(carrier));
+    ctx.unpin_native_roots(src_pin);
+    itr
+}
+
 /// Build an ArrayList iterator without retaining either the list or the new
 /// iterator as a raw Rust local across allocation/reference stores.
 ///
@@ -12190,19 +12249,6 @@ pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// reads a bit out of the per-`ClassId` classification memo; see
 /// `CF_TREE_MAP` and the module comment on `class_facts`.
 #[inline]
-/// True when `this` is a `java/util/PriorityQueue`.
-///
-/// By class name rather than a `receiver_facts` bit on purpose: the two callers
-/// are the values-view resync guard and the removal router, both of which run
-/// once per iterator `remove()` or once per view rebuild — not on the
-/// per-element read path the memoized bits exist for. Adding a bit would cost
-/// every classification in the crate to serve two cold sites.
-fn is_priority_queue_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(this))
-        .map(|n| &*n == "java/util/PriorityQueue")
-        .unwrap_or(false)
-}
-
 fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     receiver_facts(ctx, this).has(CF_TREE_MAP)
 }
@@ -17180,17 +17226,21 @@ fn resync_values_view(
         Some(s) => s,
         None => return Ok(list),
     };
-    // A QUEUE SOURCE IS NOT REBUILT HERE. `native_pq_iterator` puts a
-    // `PriorityQueue` behind this marker so its iterator's `remove()` can write
-    // through; the read direction must not follow, because `collect_entries_any`
-    // below knows the six MAP families and a queue is none of them -- it would
-    // answer nothing and rebuild the snapshot as EMPTY, on the `next()` path.
-    // The snapshot is also the only correct content: it is in heap order, taken
-    // once, exactly as `PriorityQueue$Itr` iterates.
+    // A COLLECTION SOURCE IS NOT REBUILT HERE. The three snapshot-iterator
+    // families put a `TreeSet`, an `ArrayDeque` or a `PriorityQueue` behind
+    // this marker so their iterators' `remove()` can write through; the read
+    // direction must not follow, because `collect_entries_any` below knows the
+    // six MAP families and none of these is one -- it would answer nothing and
+    // rebuild the snapshot as EMPTY, on the `next()` path.
+    //
+    // The snapshot is also the only correct content: it is taken once, in the
+    // family's own iteration order, exactly as the real iterator walks it.
+    // Liveness is not the contract here -- fail-fast is, and that is
+    // `al_view_itr_check_comod`'s job through `family_snapshot_generation`.
     //
     // Same shape, and the same reason, as `resync_ts_view`'s
     // `is_tree_map_receiver` guard: only a MAP source is rebuilt.
-    if is_priority_queue_receiver(&*ctx, source) {
+    if family_snapshot_generation(&*ctx, source).is_some() {
         return Ok(list);
     }
     let list_pin = ctx.pin_native_root(list);
@@ -17758,12 +17808,28 @@ fn propagate_list_removal(
     source: ObjectRef,
     removed: Value,
 ) -> Result<(), MethodCallFailed> {
-    // A QUEUE SOURCE removes by VALUE through its own native, which owns the
-    // sift-down the heap invariant needs -- deleting a `PriorityQueue`'s
-    // element by index or by map-key would leave the heap unordered.
-    if is_priority_queue_receiver(&*ctx, source) {
-        let _ = native_pq_remove(ctx, &[Value::Object(Some(source)), removed])?;
+    // A COLLECTION SOURCE removes by VALUE through its own native. Each of the
+    // three owns an invariant a generic removal would break: the queue's
+    // sift-down, the deque's ring-buffer compaction, the set's tree ordering.
+    if is_tree_set_shaped(&*ctx, source) {
+        let _ = ts_remove_element(ctx, source, removed)?;
         return Ok(());
+    }
+    if let Some(name) = ctx.class_name_arc_of_id(ctx.class_id_of_object(source)) {
+        match &*name {
+            "java/util/PriorityQueue" => {
+                let _ = native_pq_remove(ctx, &[Value::Object(Some(source)), removed])?;
+                return Ok(());
+            }
+            "java/util/ArrayDeque" => {
+                let _ = native_ad_remove_first_occurrence(
+                    ctx,
+                    &[Value::Object(Some(source)), removed],
+                )?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     if let Value::Object(Some(e)) = removed {
         let cls = ctx
@@ -20166,6 +20232,27 @@ const AL_ITR_PLAIN_MAX_FIELDS: usize = 4;
 /// pair beside the `elements()` registration. Without it the enumeration is
 /// EMPTY, which is a quieter wrong answer than the non-terminating one.
 const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
+    // THE THREE COLLECTION FAMILIES, added 2026-08-29 with L3 residual 6.1.
+    //
+    // Not "values views" -- a `TreeSet`, an `ArrayDeque` and a `PriorityQueue`
+    // are sources in their own right -- but they want exactly what this table
+    // provides: the family's REAL iterator class, minted with the three
+    // snapshot fields past its declared ones, with `native_al_itr_*` bound to
+    // it and the third fail-fast door reading its `expectedModCount`.
+    //
+    // MEASURED (`apps/probes/FailFastShapeProbe`) before the change: every
+    // family that hands out its real iterator class is fail-fast and every
+    // family that does not is not. These three handed out `Arrays$ArrayItr`
+    // (TreeSet, ArrayDeque) or `ArrayList$Itr` (PriorityQueue) where HotSpot
+    // 25.0.4+7 hands out the classes below, and none of the three was
+    // fail-fast. One defect wearing two faces.
+    //
+    // Each replaces a FABRICATION -- `java/util/TreeSet$Itr`,
+    // `java/util/ArrayDeque$Itr` -- that `--jdk-only` refused and landed off,
+    // so this retires two stand-ins rather than adding any.
+    ("java/util/TreeSet", "java/util/TreeMap$KeyIterator"),
+    ("java/util/ArrayDeque", "java/util/ArrayDeque$DeqIterator"),
+    ("java/util/PriorityQueue", "java/util/PriorityQueue$Itr"),
     (
         "java/util/HashMap$Values",
         "java/util/HashMap$ValueIterator",
@@ -20247,12 +20334,77 @@ fn al_itr_alt_base(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     if w <= AL_ITR_PLAIN_MAX_FIELDS {
         return None;
     }
-    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(itr))?;
-    if VALUES_ITR_CARRIERS.iter().any(|(_, i)| *i == &*name) {
-        Some(w - AL_ITR_NUM_FIELDS)
-    } else {
-        None
+    let cid = ctx.class_id_of_object(itr);
+    let name = ctx.class_name_arc_of_id(cid)?;
+    if !VALUES_ITR_CARRIERS.iter().any(|(_, i)| *i == &*name) {
+        return None;
     }
+    // EXACT, not merely "wider than a plain `ArrayList$Itr`".
+    //
+    // The name test alone asks "is this class one we mint?", and the answer is
+    // yes for an instance of that class REAL JDK BYTECODE allocated, which has
+    // no snapshot block at all. `PriorityQueue$Itr` declares six fields, so the
+    // width gate above waves it through and `w - AL_ITR_NUM_FIELDS` lands three
+    // slots inside the declared ones -- reading `forgetMeNot` as a cursor. That
+    // is `two-producers-of-one-carrier-class-is-a-failure-family` with the
+    // second producer being the JDK itself, and it became reachable the moment
+    // these carriers stopped being classes only this crate ever allocates.
+    //
+    // Our mint is `class_num_total_fields + AL_ITR_NUM_FIELDS` and nothing else
+    // is, so requiring the exact width tells the two apart with certainty
+    // rather than by a bound. The `w <= AL_ITR_PLAIN_MAX_FIELDS` early-out is
+    // kept ahead of it: an ordinary `ArrayList` iteration still pays one
+    // integer compare and never reaches the class lookup.
+    (w == ctx.class_num_total_fields(cid) + AL_ITR_NUM_FIELDS).then_some(w - AL_ITR_NUM_FIELDS)
+}
+
+/// Run the receiver's OWN bytecode when it reached these natives by
+/// INHERITANCE rather than by this crate's mint.
+///
+/// `java.util.ArrayDeque$DescendingIterator extends DeqIterator`, so the moment
+/// `DeqIterator` joined [`VALUES_ITR_CARRIERS`] the JDK became a second
+/// producer of objects these natives are registered for -- and a real
+/// `DescendingIterator` has the four declared fields and none of the snapshot
+/// block. MEASURED on the build that added it
+/// (`apps/probes/DequeListShadowSweep` row 76):
+/// `new ArrayDeque<>(List.of("a","b","c")).descendingIterator()` walked to
+/// `[]` where HotSpot walks `[c, b, a]`, because the natives read a cursor and
+/// a list out of `cursor`/`remaining`.
+///
+/// `two-producers-of-one-carrier-class-is-a-failure-family` with the second
+/// producer being java.base itself, which no amount of single-producer
+/// discipline in this crate can prevent: it is a SUBCLASS relationship, and
+/// dispatch resolves an inherited method to the class that declares it.
+///
+/// Returns `None` for a receiver that is ours, so the caller proceeds with the
+/// native body. Same shape and the same reason as [`asl_delegate_foreign`];
+/// `invoke_virtual_bytecode_only` is what keeps this from recursing straight
+/// back into the same registration.
+fn al_itr_delegate_foreign(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(this))?;
+    // The plain shape this crate mints, at its name-resolved slots.
+    if &*name == "java/util/ArrayList$Itr" || &*name == AL_VIEW_ITR_CLASS {
+        return None;
+    }
+    // A carrier class: ours only if it carries the snapshot block, which
+    // `al_itr_alt_base` decides on the EXACT width. A JDK-allocated instance of
+    // the same class -- or of a subclass, which arrives under the declaring
+    // carrier's name -- has the declared width and no block.
+    if VALUES_ITR_CARRIERS.iter().any(|(_, i)| *i == &*name)
+        && al_itr_alt_base(&*ctx, this).is_some()
+    {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
 }
 
 /// [`al_itr_slots`] for a receiver: the carrier-aware `(cursor, list, lastRet)`.
@@ -20404,6 +20556,34 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
 /// `ConcurrentModificationException`. An iterator minted on a path that does
 /// not seed reads **0**, and 0 is a perfectly legal generation, so the raw
 /// value cannot distinguish "unseeded" from "the source is on generation 0".
+/// NO ALTERNATE GENERATION SLOT FOR `ArrayDeque$DeqIterator`, and the reason is
+/// a measurement rather than a limitation.
+///
+/// It declares no `expectedModCount` -- the JDK's own is fail-fast off
+/// `cursor`/`remaining` arithmetic against the live ring buffer, not off a
+/// counter -- so the third door has nowhere to write, and its `remaining` slot
+/// is free for the purpose (every declared field on a carrier THIS crate mints
+/// is unused; the mint writes only the three snapshot fields past them). That
+/// was tried, on 2026-08-29, and it is wrong:
+///
+/// ```text
+/// apps/probes/DequeListShadowSweep
+///   81 ad fail fast on ADD during iteration      HotSpot CME
+///   82 ad fail fast on REMOVE during iteration   HotSpot no-throw
+/// ```
+///
+/// **HotSpot's `ArrayDeque` is fail-fast on one and not the other**, because
+/// `DeqIterator` detects a modification only when the ring buffer shifts under
+/// the cursor -- which an `add` that wraps does and a `remove` from the far end
+/// does not. `family_snapshot_generation`'s size CANNOT tell the two apart: it
+/// moves for both, so seeding it closed row 81 and opened row 82. One wrong row
+/// traded for another, and in the worse direction, since a spurious
+/// `ConcurrentModificationException` is the failure this file has already paid
+/// for once (see below).
+///
+/// Row 81 stays open in the L3 record. Closing it needs a generation that
+/// counts STRUCTURAL GROWTH rather than size, which the deque has no field to
+/// hold.
 fn al_view_itr_expected_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     let base = al_itr_alt_base(ctx, itr)?;
     let cid = ctx.class_id_of_object(itr);
@@ -20426,7 +20606,56 @@ fn al_view_itr_expected_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<
 /// the no-check case.
 fn al_view_generation(ctx: &dyn NativeContext, list: ObjectRef) -> Option<i32> {
     let src = values_view_source(ctx, list).or_else(|| values_view_class_source(ctx, list))?;
-    map_itr_mod_count(ctx, src)
+    family_snapshot_generation(ctx, src).or_else(|| map_itr_mod_count(ctx, src))
+}
+
+/// The generation of a source that is one of the three snapshot-iterator
+/// COLLECTION families rather than a map: its SIZE.
+///
+/// `map_itr_mod_count` answers `None` for all three. `TreeSet` and `ArrayDeque`
+/// declare no `modCount` at all -- the JDK's own `DeqIterator` is fail-fast off
+/// `head`/`tail` arithmetic, not a counter -- and `PriorityQueue` declares one
+/// that this crate's natives never move. Size is the generation that is
+/// actually available for all three.
+///
+/// SIZE CAN ONLY MISS, NEVER FALSELY FIRE, and that direction is the whole
+/// reason it is acceptable here. A structural change moves the size, so every
+/// `add` and every `remove` during an iteration is caught; a balanced
+/// `add`+`remove` between two `next()` calls is not, where the JDK's `modCount`
+/// would be. That is a recorded gap and not a wrong answer, and the opposite
+/// error is the one this file has already paid for once -- the first attempt at
+/// the values-view door made every Spring Boot class die inside JUnit discovery
+/// with a SPURIOUS `ConcurrentModificationException` (see
+/// `al_view_itr_expected_slot`).
+///
+/// Keyed on the three class names rather than on "has no `modCount`", so no
+/// source that exists today changes behaviour.
+fn family_snapshot_generation(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
+    // `is_tree_set_shaped`, not the bare class name: `TreeMap.keySet()` hands
+    // back a `TreeMap$KeySet` carrier that this crate's `native_ts_*` family
+    // serves exactly as it serves a `java/util/TreeSet`, and its iterator comes
+    // through the same mint. Matching only the one name left the keySet view
+    // out, and its removal then fell through to the MAP path and called
+    // `entrySet()` on a `TreeMap$KeySet` -- `NoSuchMethodError`, measured on
+    // `MapViewsShadowSweep` row 142.
+    if is_tree_set_shaped(ctx, src) {
+        // A keySet VIEW's own size is itself a snapshot -- it moves only when
+        // something resyncs the carrier -- so a `put` into the source map
+        // leaves it unchanged and the check never fires. Read the MAP's
+        // generation, which is what the view is really fail-fast against.
+        // MEASURED (`apps/probes/MapViewsShadowSweep` row 173): `keySet fail
+        // fast on put` answered no-throw where HotSpot raises CME.
+        if let Some(map) = ts_view_source(ctx, src) {
+            return map_itr_mod_count(ctx, map).or_else(|| Some(tm_state(ctx, map).1));
+        }
+        return Some(ts_state(ctx, src).1);
+    }
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(src))?;
+    match &*name {
+        "java/util/ArrayDeque" => Some(ad_state(ctx, src).3),
+        "java/util/PriorityQueue" => Some(pq_state(ctx, src).1),
+        _ => None,
+    }
 }
 
 /// The stamp a source generation is stored as: `generation + 1`.
@@ -21110,6 +21339,9 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
 }
 
 fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = al_itr_delegate_foreign(ctx, args, "hasNext", "()Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -21128,6 +21360,9 @@ fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = al_itr_delegate_foreign(ctx, args, "next", "()Ljava/lang/Object;") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -21183,6 +21418,9 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// kept self-consistent. Mirrors real-JDK semantics: remove `data[lastRet]`,
 /// rewind `cursor` to `lastRet`, then reset `lastRet` to `-1`.
 fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = al_itr_delegate_foreign(ctx, args, "remove", "()V") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -43471,17 +43709,139 @@ fn alloc_linked_hash_map(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// (Log4j2 / Elasticsearch config walking). A fully live reverse-view would need
 /// a dedicated synthetic view class; this keeps the common case correct without
 /// `NoSuchMethodError` / an empty result.
+/// The overlay key a reversed map keeps its SOURCE under, and the one it keeps
+/// the source generation it was last rebuilt from under.
+///
+/// The overlay rather than a heap field or a new side table: `lhm_set` writes
+/// name-keyed entries there and nowhere else, and the overlay is already one of
+/// the tables wired into all four collector hooks -- so a source held here is
+/// rooted, remapped and pruned for free, which a fresh `HashMap<usize,
+/// ObjectRef>` would not be.
+const LHM_REVERSED_SOURCE: &str = "__reversed_source";
+const LHM_REVERSED_GENERATION: &str = "__reversed_generation";
+
 fn build_reversed_map_snapshot(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let m = alloc_linked_hash_map(ctx);
+    rebuild_reversed_from(ctx, m, source)
+}
+
+/// Fill `view` with `source`'s entries in reverse encounter order and record
+/// what it was built from.
+fn rebuild_reversed_from(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    source: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // GC: `collect_entries_any`, `native_lhm_clear` and `native_lhm_put` each
+    // dispatch Java and allocate, so the view, the source and every collected
+    // key/value can move under them. The view is the outermost pin and
+    // releasing it releases the rest.
+    let view_pin = ctx.pin_native_root(view);
+    let src_pin = ctx.pin_native_root(source);
+    let generation = lhm_source_generation(&*ctx, source);
     let mut entries = collect_entries_any(ctx, source)?;
     entries.reverse();
-    let m = alloc_linked_hash_map(ctx);
-    for (k, v) in entries {
-        native_lhm_put(ctx, &[Value::Object(Some(m)), k, v])?;
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, handles) = pin_value_slice(ctx, &flat);
+    let view_now = ctx.read_native_pin(view_pin, view);
+    native_lhm_clear(ctx, &[Value::Object(Some(view_now))])?;
+    for i in 0..entries.len() {
+        let k = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
+        let v = read_pinned_elem(ctx, handles[2 * i + 1], flat[2 * i + 1]);
+        let view_now = ctx.read_native_pin(view_pin, view);
+        native_lhm_put(ctx, &[Value::Object(Some(view_now)), k, v])?;
     }
-    Ok(m)
+    let view_now = ctx.read_native_pin(view_pin, view);
+    let source_now = ctx.read_native_pin(src_pin, source);
+    // AFTER the clear, which drops the view's overlay entry along with its
+    // contents -- writing the marker before it would lose it.
+    lhm_set(
+        ctx,
+        view_now,
+        LHM_REVERSED_SOURCE,
+        0,
+        Value::Object(Some(source_now)),
+    );
+    lhm_set(
+        ctx,
+        view_now,
+        LHM_REVERSED_GENERATION,
+        0,
+        Value::Int(generation),
+    );
+    let view_now = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(view_pin);
+    Ok(view_now)
+}
+
+/// What a reversed view watches its source for: the source's own size.
+///
+/// Size and not `modCount`, for the reason `family_snapshot_generation` records
+/// -- `LinkedHashMap` kept its whole state in the overlay and did not advance
+/// the JDK `modCount` until recently, and size is available for every map this
+/// can be taken over. It can only MISS (a balanced put+remove between two
+/// reads), never rebuild spuriously, which is the safe direction: the cost of a
+/// miss is the staleness this whole mechanism is removing, and the cost of a
+/// false positive would be an O(n) rebuild on every read.
+fn lhm_source_generation(ctx: &dyn NativeContext, source: ObjectRef) -> i32 {
+    if is_lhm_receiver(ctx, source) {
+        return lhm_state(ctx, source).1;
+    }
+    if is_tree_map_receiver(ctx, source) {
+        return tm_state(ctx, source).1;
+    }
+    map_state(ctx, source).1
+}
+
+/// `SequencedMap.reversed()`'s LIVE half: rebuild the view from its source when
+/// the source has moved since the last rebuild.
+///
+/// Returns the receiver unchanged for any map that is not a reversed view, so
+/// every call site is one line and costs one overlay lookup on an ordinary
+/// `LinkedHashMap`.
+///
+/// MEASURED (`apps/probes/LinkedSequencedShadowSweep` row 92): a `put` into the
+/// source after `reversed()` was taken was invisible --
+/// `{c=3, a=1, b=2, d=4}` where HotSpot answers `{e=5, c=3, a=1, b=2, d=4}`,
+/// because the JDK's is a `ReverseOrderLinkedHashMapView` over the live map and
+/// this VM built a snapshot. The snapshot stays -- this VM has no real
+/// `head`/`tail`/`before`/`after` chain for the JDK's view bytecode to walk --
+/// but it is now rebuilt on read, which is observationally the same thing for
+/// everything a caller can ask.
+fn resync_reversed_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let source = match lhm_get(&*ctx, this, LHM_REVERSED_SOURCE, 0) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(this),
+    };
+    let seen = match lhm_get(&*ctx, this, LHM_REVERSED_GENERATION, 0) {
+        Value::Int(g) => g,
+        _ => i32::MIN,
+    };
+    let generation = lhm_source_generation(&*ctx, source);
+    if generation == seen {
+        return Ok(this);
+    }
+    // STAMP BEFORE REBUILDING. The rebuild calls `native_lhm_clear` and
+    // `native_lhm_put`, and a read native reached from either would land back
+    // here; with the old generation still recorded it would decide to rebuild
+    // again, and so on. The clear also drops the source marker, which stops the
+    // recursion a second way -- but relying on the ORDER of two side effects
+    // for termination is the kind of thing that holds until someone reorders
+    // them, so the stamp is explicit.
+    lhm_set(
+        ctx,
+        this,
+        LHM_REVERSED_GENERATION,
+        0,
+        Value::Int(generation),
+    );
+    rebuild_reversed_from(ctx, this, source)
 }
 
 fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
@@ -44130,6 +44490,10 @@ fn native_lhm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let (_, size, _) = lhm_state(ctx, this);
     Ok(Some(Value::Int(size)))
 }
@@ -44139,6 +44503,10 @@ fn native_lhm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(1))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let (_, size, _) = lhm_state(ctx, this);
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
@@ -44394,6 +44762,10 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // GC-SAFETY: `lhm_find_node` dispatches key.hashCode()/equals() (Java
     // bytecode), which can trigger a moving GC; `this` must be re-read
@@ -44580,6 +44952,10 @@ fn native_lhm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     Ok(Some(Value::Int(
         if lhm_find_node(ctx, this, &key)?.is_some() {
@@ -44595,6 +44971,10 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     // Family-1 fix (cce0079): pinned chain walk — the per-node `equals()`
     // dispatch can move the node/target mid-scan.
@@ -44672,6 +45052,10 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     // See `native_map_key_set`: a live view can be handed out again rather than
     // rebuilt, and this is the receiver the workload that motivated it uses.
     if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_KEYSET) {
@@ -44695,6 +45079,10 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     if let Some(cached) = cached_live_values_view(ctx, this) {
         return Ok(Some(Value::Object(Some(cached))));
     }
@@ -44712,6 +45100,10 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     // `LinkedHashMap` has its OWN entrySet native, so the cache the HashMap
     // twin got does not reach it -- the same fourth-mint-site asymmetry the
     // `store_set_view_backref` note below records, and the reason it is worth
@@ -44843,6 +45235,10 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(Some(ctx.create_string("{}"))))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let mut parts = Vec::new();
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
@@ -44862,6 +45258,10 @@ fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     // GC-SAFETY: `lhm_find_node` dispatches key.hashCode()/equals() (Java
@@ -44933,6 +45333,10 @@ fn native_lhm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // `reversed()`'s live half: rebuild from the source if it has moved. A receiver
+    // that is not a reversed view is returned unchanged, at the cost of one overlay
+    // lookup. See `resync_reversed_map`.
+    let this = resync_reversed_map(ctx, this)?;
     // RULE F, empty receiver included. See `reject_null_functional`.
     reject_null_functional(args.get(1))?;
     let consumer = match args.get(1) {
@@ -45806,85 +46210,34 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
-    // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
-    // GC-SAFETY: `elems` are bare locals snapshotted out of the deque, and both
-    // `alloc_ref_array` and `alloc_synthetic` can collect — which moves the
-    // deque itself, the elements, and the array. Root the whole graph and read
-    // every part back through its pin before storing it. Covered by
-    // `gc_native_pins::array_deque_iterator_roots_snapshot_graph_across_allocations`.
-    let this_pin = ctx.pin_native_root(this);
+    // `java/util/ArrayDeque$DeqIterator` -- the class HotSpot 25.0.4+7 hands
+    // out -- through the shared family mint.
+    //
+    // This site used to mint the FABRICATION `java/util/ArrayDeque$Itr`, which
+    // `--jdk-only` refused, landing on the real `Arrays$ArrayItr`. So one
+    // receiver answered two different wrong class names depending on the mode
+    // and neither was HotSpot's. Both are gone: the real class is minted in
+    // both modes, and `alloc_arraylist_iterator_as` refuses rather than
+    // fabricates if an image ever lacks it.
+    //
+    // The reasoning the old site recorded for NOT letting real
+    // `ArrayDeque.iterator()` bytecode run still holds and is why this is a
+    // snapshot rather than a live cursor: `native_ad_itr_remove` must keep our
+    // slot-3 `size` in step with a removal real `delete(..)` bytecode knows
+    // nothing about. Write-through is preserved -- `propagate_list_removal`
+    // routes a deque source to `native_ad_remove_first_occurrence`, which is
+    // what `SnapshotItrRoute::ArrayDeque` called.
+    //
+    // NOT fail-fast, and this is the one family of the three that cannot be:
+    // `DeqIterator` declares `cursor`, `remaining`, `lastRet` and no
+    // `expectedModCount` (the JDK's own is fail-fast off head/tail arithmetic
+    // instead), so `al_view_itr_expected_slot` finds no slot to seed and the
+    // third door stays quiet. Recorded in the L3 record as the residual it is
+    // rather than worked around by writing a generation into `remaining`, which
+    // is a field real `forEachRemaining` bytecode reads.
     let elems = ad_collect_elements(ctx, this);
-    let elem_pins: Vec<usize> = elems.iter().map(|e| pin_value(ctx, *e)).collect();
-    let arr = alloc_ref_array(ctx, elems.len());
-    let arr_pin = ctx.pin_native_root(arr);
-    for (i, e) in elems.iter().enumerate() {
-        let arr = ctx.read_native_pin(arr_pin, arr);
-        let value = read_pinned_elem(ctx, elem_pins[i], *e);
-        ctx.set_array_element(arr, i, value);
-    }
-    // No JDK image declares `java/util/ArrayDeque$Itr` — the real one is
-    // `ArrayDeque$DeqIterator` — so `--jdk-only` refuses it and, before this
-    // arm, `new ArrayDeque<>(..).iterator()` raised
-    // `NoClassDefFoundError: java/util/ArrayDeque$Itr` before `hasNext()`.
-    // Land on the real `Arrays$ArrayItr` instead, exactly as the HashSet and
-    // TreeSet sites do. The trade is smaller here than anywhere else: this
-    // iterator is ALREADY snapshot-backed (field 0 is the copy taken above,
-    // not the ring buffer), and `native_ad_itr_remove`'s whole body is the
-    // `native_ad_remove_first_occurrence` call that `SnapshotItrRoute::ArrayDeque`
-    // makes — so the two shapes differ in the class name and nothing else.
-    //
-    // Letting real `ArrayDeque.iterator()` bytecode run instead was rejected on
-    // the strength of a reflective read — `elements=Object[2] head=0 tail=0` on
-    // a two-element deque, so real `DeqIterator` derives size 0 and iterates
-    // nothing.
-    //
-    // CORRECTED 2026-08-11: the observation was right and the diagnosis under
-    // it was wrong, in a way worth keeping. `tail` was never unwritten —
-    // `native_ad_add_last` writes it on every call. What that reading missed is
-    // the modulus: the deque came from `new ArrayDeque<>(List.of("a","b"))`,
-    // whose 2-slot buffer the two adds filled exactly, wrapping `tail` back
-    // onto `head`. The same deque built with the no-arg constructor reads
-    // `head=0 tail=2` and streams correctly, which is the control that names
-    // the real defect. Fixed at its source in `ad_ensure_capacity` and the two
-    // constructors: the buffer now always keeps the JDK's spare slot, so
-    // `head == tail` means empty and nothing else.
-    //
-    // The registration is still right, for the reason it always should have
-    // given: no JDK image declares `java/util/ArrayDeque$Itr`, and
-    // `native_ad_itr_remove` must keep our slot-3 `size` in step with a removal
-    // that real `delete(...)` bytecode knows nothing about. `--jdk-only` still
-    // lands on the real `Arrays$ArrayItr` below, which keeps the gap on the
-    // census. Re-measured in
-    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
-    //
-    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there.
-    let itr = match try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 4) {
-        Ok(itr) => itr,
-        Err(_refused) => {
-            let arr = ctx.read_native_pin(arr_pin, arr);
-            let this = ctx.read_native_pin(this_pin, this);
-            let real = real_snapshot_iterator(
-                ctx,
-                arr,
-                elems.len(),
-                Some((this, SnapshotItrRoute::ArrayDeque)),
-            );
-            ctx.unpin_native_roots(this_pin);
-            return real;
-        }
-    };
-    let itr_pin = ctx.pin_native_root(itr);
-    let itr = ctx.read_native_pin(itr_pin, itr);
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    let itr = ctx.read_native_pin(itr_pin, itr);
-    ctx.set_field(itr, 1, Value::Int(0));
-    let itr = ctx.read_native_pin(itr_pin, itr);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
-    let itr = ctx.read_native_pin(itr_pin, itr);
-    ctx.unpin_native_roots(this_pin);
+    let itr =
+        alloc_family_snapshot_iterator(ctx, this, &elems, "java/util/ArrayDeque$DeqIterator")?;
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -46534,51 +46887,28 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data, size) = pq_state(ctx, this);
-    // GC-safety: the allocation can move the heap buffer we copy out of -- and
-    // the receiver, which now goes into the array too, so it is rooted across
-    // the allocation alongside the buffer.
-    let mut buf_ref = data.unwrap_or(this);
-    let mut this_ref = this;
-    // ONE SLOT LONGER THAN THE SIZE, with the queue in the trailing slot: that
-    // is the `values()`-view marker `values_view_source` reads, and it is what
-    // makes `iterator().remove()` write through to the queue instead of into a
-    // disconnected snapshot. MEASURED (`apps/probes/PqOptionalShadowSweep`):
-    // `size()` answered 3 after an `iterator().remove()` where HotSpot answers
-    // 2.
+    // The heap-order snapshot, read before anything allocates, then handed to
+    // the shared family mint. This used to build its own wrapper and hand back
+    // a `java/util/ArrayList$Itr`; HotSpot 25.0.4+7 hands back
+    // `java/util/PriorityQueue$Itr`, and the class was the reason this iterator
+    // was not fail-fast (`apps/probes/FailFastShapeProbe`).
     //
-    // Nothing but this iterator can ever see the wrapper -- it is minted below,
-    // handed to the `ArrayList$Itr`, and never returned to the caller -- so the
-    // marker's blast radius is the natives THIS iterator reaches, not every
-    // consumer of the marker. Two had to learn a source can be a queue:
-    // `resync_values_view` (reached from `al_state_for_read` on every `next()`)
-    // and `propagate_list_removal`. Both changed for a `PriorityQueue` source
-    // ONLY, so no source that exists today changes behaviour.
-    let arr = rooted_across(ctx, &mut [&mut buf_ref, &mut this_ref], |ctx| {
-        alloc_ref_array(ctx, size as usize + 1)
-    });
-    let data = data.map(|_| buf_ref);
+    // The old comment here said minting `PriorityQueue$Itr` could not work,
+    // because `try_alloc_synthetic` honours the real layout and slot 0 is
+    // `cursor:int`, so storing the snapshot array there coerced it away. That
+    // was true of THAT mint. `alloc_arraylist_iterator_as` puts the three
+    // snapshot fields PAST the class's declared ones, which is exactly the
+    // mechanism the values views have used since W7-1 -- the objection was to a
+    // technique, not to the class.
+    let (data, size) = pq_state(ctx, this);
+    let n = size.max(0) as usize;
+    let mut elems = Vec::with_capacity(n);
     if let Some(buf) = data {
-        for i in 0..(size as usize) {
-            let elem = ctx.get_array_element(buf, i);
-            ctx.set_array_element(arr, i, elem);
+        for i in 0..n {
+            elems.push(ctx.get_array_element(buf, i));
         }
     }
-    ctx.set_array_element(arr, size as usize, Value::Object(Some(this_ref)));
-    // Return an `ArrayList$Itr` over an ArrayList-shaped wrapper holding the
-    // heap-order snapshot, rather than a `PriorityQueue$Itr` with the snapshot
-    // in slot 0. In real-JDK mode `try_alloc_synthetic("java/util/PriorityQueue$Itr")?`
-    // honours the real field layout — slot 0 is the `cursor:int` field — so
-    // `set_field(itr, 0, Object[])` coerced the array away and iteration saw
-    // zero elements (and, before the snapshot-iterator fix, recursed). The
-    // wrapper + name-resolved `al_itr_slots` layout is exactly the EnumSet/COWAL
-    // iteration path; `ArrayList$Itr.hasNext/next` read it correctly in both
-    // real-JDK and synthetic-jdk modes.
-    let wrapper = alloc_arraylist_with(ctx, arr, size)?;
-    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields)?;
-    ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
-    ctx.set_field(itr, cursor_slot, Value::Int(0));
+    let itr = alloc_family_snapshot_iterator(ctx, this, &elems, "java/util/PriorityQueue$Itr")?;
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -48630,9 +48960,27 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/Deque", "size", "()I", native_ad_size);
     registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
 
-    // Iterator support for ArrayDeque$Itr and PriorityQueue$Itr
-    // They follow the same 2-field snapshot pattern (field 0 = array, field 1 = cursor)
-    for itr_class in &["java/util/ArrayDeque$Itr", "java/util/PriorityQueue$Itr"] {
+    // Iterator support for the fabricated `ArrayDeque$Itr`: the 2-field snapshot
+    // pattern (field 0 = array, field 1 = cursor).
+    //
+    // `java/util/PriorityQueue$Itr` LEFT THIS LOOP on 2026-08-29, and how it
+    // failed is worth keeping. That name is a REAL JDK class, and nothing in
+    // this crate minted it -- the row described a 2-field shape the real class
+    // has never had, and it sat inert because no object of that class ever
+    // reached these natives. The moment `native_pq_iterator` started minting
+    // the real class (L3 residual 6.1), this dormant row won the slot over the
+    // `native_al_itr_*` registration that matches the shape actually minted:
+    // `owns=True inv=4` here against `owns=False inv=0` there. Iteration then
+    // reported every queue EMPTY.
+    //
+    // A registration keyed on a class nobody produces is not harmless -- it is
+    // a trap armed for whoever produces one later, and the dump shows it as a
+    // duplicate only once the class exists. `ArrayDeque$Itr` is now in that
+    // same state (its mint site became the real `DeqIterator` in the same
+    // change) and is recorded in the L3 record as a retirement candidate rather
+    // than deleted here, because deleting registrations is the shadow-retirement
+    // lane's edit and wants its own census.
+    for itr_class in &["java/util/ArrayDeque$Itr"] {
         registry.register(itr_class, "hasNext", "()Z", native_snapshot_itr_has_next);
         registry.register(
             itr_class,
@@ -55373,53 +55721,31 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let this = resync_ts_view(ctx, this)?;
+    // `java/util/TreeMap$KeyIterator` -- the class HotSpot 25.0.4+7 hands out
+    // for BOTH `TreeSet.iterator()` and `TreeMap.keySet().iterator()`, the
+    // second of which is TreeSet-carried on this VM and so comes through here
+    // too. ONE producer of the class, which is what keeps this out of
+    // `two-producers-of-one-carrier-class-is-a-failure-family`.
+    //
+    // The comment this replaces already knew the class: "No JDK declares
+    // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
+    // behind `TreeSet.iterator()`." It refused the fabrication, correctly, and
+    // then landed on `Arrays$ArrayItr` -- and the fallback is what cost both
+    // the class identity and the fail-fast check, because `Arrays$ArrayItr`'s
+    // `next()` is real bytecode with nowhere for a check to run.
+    //
+    // `descendingIterator` is untouched and still mints the `TreeSet$Itr`
+    // shape: its HotSpot class is `TreeMap$DescendingKeyIterator`, a different
+    // carrier and a separate row.
     let (data_opt, size, _) = ts_state(ctx, this);
-    // GC-safety: both allocations below collect; `this`, the backing data array
-    // and the snapshot are bare Rust locals used afterwards. See `rooted_across`.
-    let mut this = this;
-    let mut data_ref = data_opt.unwrap_or(this);
-    let mut snap = rooted_across(ctx, &mut [&mut this, &mut data_ref], |ctx| {
-        alloc_ref_array(ctx, size as usize)
-    });
-    let data_opt = data_opt.map(|_| data_ref);
+    let n = size.max(0) as usize;
+    let mut elems = Vec::with_capacity(n);
     if let Some(data) = data_opt {
-        for i in 0..(size as usize) {
-            let v = ctx.get_array_element(data, i);
-            ctx.set_array_element(snap, i, v);
+        for i in 0..n {
+            elems.push(ctx.get_array_element(data, i));
         }
     }
-    // Field 0 = snapshot array, field 1 = cursor, field 2 = owning TreeSet.
-    // The back-reference to the owning set lets `TreeSet$Itr.remove()` delete
-    // the last-returned element from the live set (real-JDK `Iterator.remove`
-    // contract) rather than throwing UnsupportedOperationException.
-    // Fallible since 2026-08-05 (JDK-only wave 2, lane L7). No JDK declares
-    // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
-    // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class
-    // — and then hand back the snapshot through a real iterator anyway.
-    let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
-        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", TS_ITR_NUM_FIELDS)
-    });
-    let itr = match refused {
-        Ok(itr) => itr,
-        // Carry the owning set through, so the strict stand-in keeps the
-        // write-through `remove()` field 2 gives the fabricated shape.
-        Err(_) => {
-            return real_snapshot_iterator(
-                ctx,
-                snap,
-                size as usize,
-                Some((this, SnapshotItrRoute::TreeSet)),
-            )
-        }
-    };
-    ctx.set_field(itr, TS_ITR_FIELD_DATA, Value::Object(Some(snap)));
-    ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
-    ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
-    ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
-    // After `TS_ITR_FIELD_OWNER`: that is how `ts_itr_comod_source` reaches the
-    // source map whose generation this cursor is fail-fast against. Both mint
-    // sites (`iterator` and `descendingIterator`) hand out this same shape.
-    ts_itr_seed_expected(ctx, itr);
+    let itr = alloc_family_snapshot_iterator(ctx, this, &elems, "java/util/TreeMap$KeyIterator")?;
     Ok(Some(Value::Object(Some(itr))))
 }
 
