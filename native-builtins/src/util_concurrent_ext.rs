@@ -893,51 +893,26 @@ fn native_lock_support_get_blocker(
 /// clamp, is the only place the under direction survives. Dropping this line
 /// would make the detector quieter in the direction it has reported since it
 /// was written.
-/// A native is about to hand back an instance of a class `new` could never
-/// have produced.
+/// Forward to `native-api`'s uninstantiable-receiver census.
 ///
-/// JVMS §6.5 makes `new` on an ABSTRACT class or an INTERFACE an
-/// `InstantiationError`, so such a receiver is one no bytecode in any image
-/// could have created — a defect on its own terms, with no oracle needed.
-/// `native-api`'s `instantiable` module already owns that predicate; what was
-/// missing is anyone asking it at the point the object is made.
+/// The census itself deliberately does NOT live here: it needs a process-global
+/// dedup set, and `lock_discipline_ratchet` holds this crate to a raw-lock
+/// baseline because this crate re-enters the VM. `native-api`'s
+/// `instantiable::observe_uninstantiable_receiver` carries the whole rationale,
+/// and it sits next to the `ACC_INTERFACE` / `ACC_ABSTRACT` predicate it uses.
 ///
-/// MEASURED 2026-08-29 (`probes/AbstractReceiverSweep`): seven `java.lang.foreign`
-/// sites answer an interface under `--jdk-only` and one — `Arena.ofConfined()`
-/// — does so in compatible mode too, while the report those runs produced said
-/// `compatibility_classes: 0`. The predicate counts classes MINTED and this
-/// species is an allocation against a class that is perfectly real.
-///
-/// Deduped by class name: a segment-heavy workload mints thousands of these and
-/// the interesting fact is the class, once, with the native that asked.
-/// `#[track_caller]` all the way up the funnel, so the location is the NATIVE,
-/// not this line.
+/// `#[track_caller]` on every hop, so the location that reaches the census is
+/// the NATIVE that asked for the shape, not this forwarding line and not
+/// `try_alloc_concurrent_synthetic` in between — the same chain
+/// `report_layout_alias` relies on.
 #[track_caller]
 fn report_uninstantiable_receiver(
     ctx: &dyn NativeContext,
     class_name: &str,
     class_id: cratonvm_types::ClassId,
 ) {
-    use cratonvm_native_api::instantiable::{ACC_ABSTRACT, ACC_INTERFACE};
     let flags = ctx.class_access_flags(class_id);
-    if flags & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
-        return;
-    }
-    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-    if !seen.lock().insert(class_name.to_string()) {
-        return;
-    }
-    let site = core::panic::Location::caller();
-    tracing::warn!(
-        class = %class_name,
-        requester = %format!("{}:{}", site.file(), site.line()),
-        kind = if flags & ACC_INTERFACE != 0 { "interface" } else { "abstract" },
-        "a native allocated an instance of a class `new` could not produce (JVMS 6.5); \
-         the definition-of-done screen's compatibility_classes counts classes MINTED and \
-         cannot see this. Reported once per class."
-    );
+    let _ = cratonvm_native_api::instantiable::observe_uninstantiable_receiver(class_name, flags);
 }
 
 #[track_caller]
