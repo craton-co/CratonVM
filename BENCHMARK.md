@@ -47,31 +47,38 @@ on this shared box it is often the only trustworthy one.
 ### Current table
 
 All seven rows come from one interleaved series. Azure EPYC bench host, JDK 25.0.3 both sides, `-Xmx8g`
-both sides, one phase per fresh process pinned to cpu 13, arms **alternated
+both sides, one phase per fresh process pinned to one core, arms **alternated
 with the order flipped on alternate pairs**, 9 pairs per phase, no sample
-discarded, checksum verified against HotSpot on every single run (zero
-mismatches). The window was opened only after the 1-minute load fell below 2.5
-**and** no other `cratonvm` process was pinned to the measuring core — the
-second check matters because two benchmarks timesharing one core is invisible
-in a load average, which is the trap this file's own methodology section
-warns about. Load ran 1.9–3.7 across the series.
+discarded, and **every one of the 18 samples per phase** checksum-verified on
+both arms — not just the medians, so a mid-series drift cannot hide behind a
+matching median. Zero mismatches. The window was opened only after the
+1-minute load fell below 2.5 **and** no other `cratonvm` process was pinned to
+the measuring core — the second check matters because two benchmarks
+timesharing one core is invisible in a load average, which is the trap this
+file's own methodology section warns about. All seven phases come from **one
+binary in one window**, load 1.8–3.8 throughout, with the series aborted and
+retried if load left the band mid-run.
 
 | Benchmark                         | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | was (2026-07) |
 |-----------------------------------|-----------|-----------|-----------|---------------|---------------|
-| Arithmetic (2B ops)               | 1,826 ms  | 3,564 ms  | 1.95x     | 0.2% | 2.44x |
-| Fibonacci(44)                     | 1,444 ms  | 8,503 ms  | 5.89x     | 3.5% | 2.79x |
-| Sieve (100K × 20,000)             | 2,402 ms† | 2,376 ms† | **0.99x** | 2.3% | 2.28x |
-| Matrix 1280×1280                  | 2,110 ms  | 2,096 ms  | **0.99x** | 0.2% | 2.93x |
-| HashMap (10M put/get, isolated)   | 981 ms    | 2,031 ms  | 2.07x     | 0.8% | **1.75x** |
-| String/Regex (100K, isolated)     | 51 ms     | 274 ms    | 5.37x     | 1.1% | **7.7x** |
-| Binary Trees (depth 18, isolated) | 177 ms    | 1,674 ms  | 9.46x     | 0.4% | 8.34x |
+| Arithmetic (2B ops)               | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
+| Fibonacci(44)                     | 1,449 ms  | 5,059 ms‡ | 3.49x‡    | 0.6% | 2.79x |
+| Sieve (100K × 20,000)             | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
+| Matrix 1280×1280                  | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
+| HashMap (10M put/get, isolated)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | **1.75x** |
+| String/Regex (100K, isolated)     | 50 ms     | 200 ms    | 4.00x     | 0.9% | **7.7x** |
+| Binary Trees (depth 18, isolated) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% | 8.34x |
 
 This replaces an older table whose rows were taken across four separate
 sessions on a host that has since been re-provisioned and three of which this
 document already flagged as unverified. Every row above comes from **one**
-interleaved series, so the rows are comparable to each other.
+interleaved series, so the rows are comparable to each other. CratonVM's
+run-to-run spread is under 1% on five of the seven rows.
 
-**Two rows are at parity with HotSpot C2**: Matrix and Sieve.
+**Two rows are at parity with HotSpot C2**: Matrix and Sieve. HashMap and
+Binary Trees sit above their `was (2026-07)` figures, but those earlier
+absolutes were taken on a since-re-provisioned host and were never re-measured
+under the current protocol — not a regression against a comparable baseline.
 
 ### † Sieve: HotSpot is bimodal on this phase
 
@@ -90,10 +97,28 @@ series read **2,386 ms**, the next read **2,734 ms**, on an unchanged binary
 and an unchanged JDK. CratonVM's own 18 samples over the same runs are
 unimodal (2,276–2,498 ms, CV 2.3%).
 
-Pooled, the two are 2,376 against 2,402 — parity. Quoting the cleanest single
-series would have given **0.87x**, i.e. CratonVM 14% *faster* than HotSpot, and
-that number is an artefact of which mode the median fell in. Parity is what the
-data supports. **Do not re-derive this row from a single 9-sample run.**
+Pooled, the two are 2,360 against 2,333 — parity. Quoting the cleanest single
+series would have given a double-digit swing in either direction depending on
+which mode the median fell in. Parity is what the data supports. **Do not
+re-derive this row from a single 9-sample run.**
+
+### ‡ Fibonacci: a known shape
+
+Both JIT backends erase the dead shadow-stack thread fetch from the prologue;
+the single-pass backend jumps over the erased ~46-byte span, and the IR
+backend previously overwrote it with one-byte `NOP`s, so every IR method that
+published nothing retired 46 NOPs on entry, on every invocation. That is
+fixed. The residual gap to the pre-IR single-pass body (near 2.9x) is
+precise-root and deopt metadata the IR tier emits and the single-pass backend
+did not: the safepoint-id slot the collector reads to pick an oop map, and the
+innermost-RBP mirror the stack walker reads. Nothing today compares an IR body
+against the C1 body it replaces before keeping it; that is an open policy
+question, not metadata to be deleted.
+
+The optimizing tier declines a method whose loops the single-pass backend
+would lower better, and what that backend can do and the IR tier cannot is
+enumerated in `jit/src/x64/single_pass_only.rs` rather than discovered one
+regression at a time.
 
 ### Sieve was 6.50x yesterday
 
@@ -107,10 +132,8 @@ lowering that backend has and the IR tier lacks are enumerated in
 `jit/src/x64/single_pass_only.rs` rather than discovered one regression at a
 time.
 
-**Fibonacci is not that, and is still unexplained.** Interleaved against a
-pre-`cov-02` control it measured 8,393–8,572 ms against the merged tree's
-8,402–8,533 — identical — so its distance from the July 4,790 ms figure
-predates all of the `cov-*` work and is unattributed.
+Fibonacci's own gap is explained above (see `‡ Fibonacci: a known shape`), not
+by this section's sieve regression.
 
 Row notes, carried over from the table this replaced:
 

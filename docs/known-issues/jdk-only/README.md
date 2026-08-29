@@ -125,7 +125,7 @@ Evidence: P4B-SYNTHETIC-JDK-MODE-20260812.md.
 * **This directory is the evidence base.** One record per defect. A record moves
   to the internal record tree **when it is fixed**, not when it is planned.
 * Related non-known-issue docs:
-  [`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
+  [`docs/jdk-only-runtime-services.md`](runtime-services-blocker-inventory.md),
   [`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
   [`docs/jdk-only-migration.md`](../../jdk-only-migration.md).
 * **The 2026-08-12 measurement deliverables, which live in this directory but

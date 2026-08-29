@@ -1,3 +1,0 @@
-# The Java file this patches is CRLF; any EOL normalisation on checkout would
-# make the context lines stop matching and `git apply` fail.
-*.patch -text

@@ -1,6 +1,0 @@
-module	class
-module/spring-boot-jooq	org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests
-module/spring-boot-kafka	org.springframework.boot.kafka.autoconfigure.KafkaAutoConfigurationIntegrationTests
-module/spring-boot-pulsar	org.springframework.boot.pulsar.autoconfigure.PulsarAutoConfigurationTests
-module/spring-boot-tomcat	org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests
-module/spring-boot-jetty	org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests
