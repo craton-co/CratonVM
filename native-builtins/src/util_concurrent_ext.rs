@@ -502,12 +502,23 @@ pub(crate) fn register_atomic_reference_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "get", "()Ljava/lang/Object;", native_atomic_ref_get);
     r.register(c, "set", "(Ljava/lang/Object;)V", native_atomic_ref_set);
     r.register(c, "lazySet", "(Ljava/lang/Object;)V", native_atomic_ref_set);
-    r.register(
-        c,
-        "compareAndSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-        native_atomic_ref_cas,
-    );
+    // Deliberately NOT registered (2026-08-29): real-JDK
+    // `AtomicReference.compareAndSet` is one line --
+    // `return VALUE.compareAndSet(this, expectedValue, newValue);` -- and that
+    // `VarHandle.compareAndSet` is now thin-direct-bound (see
+    // `performance/varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`),
+    // so running the real bytecode is now FASTER than this synthetic stub, not
+    // slower. A previous attempt at this exact change (recorded in
+    // `juc-primitives-and-composition-after-the-compile-refusals-20260828.md`,
+    // "What was tried and refuted") measured the stub WINNING (257 vs 289 ns)
+    // because at the time the CAS underneath the real bytecode was still
+    // funnel-served at ~233 ns; that arithmetic flips now that the bind exists.
+    // MEASURED (six interleaved runs, `HibfixVarHandleProbe`, kill-switch as the
+    // only difference, `--dump-native-registry` confirmed no native registered
+    // either way for this exact tuple): stub kept 519.5-543.8 ns (median 531.7),
+    // stub dropped 331.4-344.0 ns (median 332.0) -- a 1.6x win, with
+    // `AtomicInteger.incrementAndGet` unmoved (5.5-6.0 ns both arms) as the
+    // control that says this is the change and not the box.
     r.register(
         c,
         "getAndSet",
@@ -566,31 +577,6 @@ fn native_atomic_ref_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
-}
-
-fn native_atomic_ref_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
-    let expected = args.get(1).copied().unwrap_or(Value::Object(None));
-    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    if crate::nbflags().dbg_loader_trace {
-        if let Value::Object(Some(o)) = new_val {
-            let val_cid = ctx.class_id_of_object(o);
-            let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
-            if val_cn.contains("RootReference") {
-                let frames = ctx.frame_class_ids();
-                let caller_cid = frames.first().copied();
-                let caller_cn = caller_cid
-                    .and_then(|c| ctx.class_name_of_id(c))
-                    .unwrap_or_default();
-                eprintln!(
-                    "[LOADER-TRACE] native_atomic_ref_cas PRE thread={} holder_obj={:p} new_obj={:p} new_class={} new_cid={} caller_class_id={:?} caller_class={}",
-                    ctx.thread_id(), this.as_ptr(), o.as_ptr(), val_cn, val_cid.as_u32(), caller_cid, caller_cn
-                );
-            }
-        }
-    }
-    let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
-    Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
 fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

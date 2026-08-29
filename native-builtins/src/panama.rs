@@ -979,13 +979,19 @@ fn pe_arena_allocate_impl(
     // TWO arena layouts reach this body, and only one of them is the one it was
     // written for (W7-89). `register_pe_arena`'s own arena is four slots wide --
     // [0] global flag, [1] alloc-id array, [2] closed flag, [3] count -- and
-    // wins under `--synthetic-jdk`. In Compatible mode the winner of
-    // `Arena.ofConfined()` is `foreign_ffm`'s TWO-slot arena ([0] open,
-    // [1] session), measured on the native census. On that shape slot 2 and
-    // slot 3 are past the end of the object and slot 1 is the SESSION, so the
-    // id-tracking block below was calling `set_array_element` on a non-array.
-    // Both reads are now gated on the width that makes them meaningful.
-    let four_slot_layout = ctx.object_num_fields(arena_obj) > 3;
+    // wins under `--synthetic-jdk`. The rival is `foreign_ffm`'s, whose slot 2
+    // is an `open` flag with the OPPOSITE polarity to this model's `closed`
+    // flag; on it, the id-tracking block below would call `set_array_element`
+    // on a non-array.
+    //
+    // This read the WIDTH until 2026-08-29, and a width is not an identity:
+    // `foreign_ffm`'s carrier widened to four slots when it moved onto the real
+    // `ArenaImpl`, took this branch, and every `arena.allocate` in the sweep
+    // threw `Arena is closed` -- 0 of 199 rows, both modes. The two producers
+    // now mint DIFFERENT classes, so the question this was always asking ("is
+    // this the synthetic-jdk arena?") can be asked directly.
+    let four_slot_layout = PE_ARENA_CLASS_MEMO.matches(ctx, arena_obj, PE_ARENA_CLASS)
+        && ctx.object_num_fields(arena_obj) > 3;
     if four_slot_layout && matches!(ctx.get_field(arena_obj, 2), Value::Int(1)) {
         return Err(RuntimeError::IllegalStateException {
             message: "Arena is closed".into(),
@@ -2624,6 +2630,11 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
     // A native for each descriptor keeps that bytecode from running at all.
     for allocator in [
         "java/lang/foreign/Arena",
+        // An arena is minted as the real `ArenaImpl` since 2026-08-29, and
+        // native dispatch is keyed on the receiver's CLASS. Without this row
+        // the JDK default above runs and `RJdkForeign`'s downcall SIGSEGVs in
+        // `heap_read_bytes` on the segment it builds.
+        "jdk/internal/foreign/ArenaImpl",
         "java/lang/foreign/SegmentAllocator",
     ] {
         // Seven, not eight: `SegmentAllocator` declares no `boolean...`
@@ -3694,6 +3705,10 @@ fn pe_segment_as_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // shape-guessing: a miss answers "no resolvable scope" (access proceeds
 // unchanged) and never "closed".
 const PE_ARENA_CLASS: &str = "java/lang/foreign/Arena";
+/// The class `foreign_ffm` now mints an arena as. It is a REAL JDK class, so
+/// unlike `PE_ARENA_CLASS` it is not a fabrication -- and because the two
+/// producers finally differ, a class test can replace the width test below.
+const PE_ARENA_IMPL_CLASS: &str = crate::phases_late::foreign_ffm::P67_ARENA_IMPL;
 const PE_SESSION_CLASS: &str = "jdk/internal/foreign/MemorySessionImpl";
 const PE_ARENA_SESSION_FIELD: usize = 1;
 /// Slot 2 of a synthetic segment names the arena that allocated it — this
@@ -3767,6 +3782,16 @@ impl PeClassMemo {
 }
 
 static PE_ARENA_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
+static PE_ARENA_IMPL_MEMO: PeClassMemo = PeClassMemo::new();
+
+/// Whether `arena` is one of the two carriers this workspace mints for
+/// `java.lang.foreign.Arena`. One memo per name: `PeClassMemo` remembers a
+/// single hit and a single miss, so asking one memo about two names would make
+/// each answer evict the other's.
+fn pe_is_modelled_arena(ctx: &dyn NativeContext, arena: ObjectRef) -> bool {
+    PE_ARENA_CLASS_MEMO.matches(ctx, arena, PE_ARENA_CLASS)
+        || PE_ARENA_IMPL_MEMO.matches(ctx, arena, PE_ARENA_IMPL_CLASS)
+}
 static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
 
 /// Whether `session` carries the layout `foreign_ffm` writes. Anything else —
@@ -3800,12 +3825,19 @@ pub(crate) fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -
 /// that wins under `--synthetic-jdk`, where a false throw here would break
 /// every FFM access.
 fn pe_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<ObjectRef> {
-    if ctx.object_num_fields(arena) <= PE_ARENA_SESSION_FIELD
-        || !PE_ARENA_CLASS_MEMO.matches(ctx, arena, PE_ARENA_CLASS)
-    {
+    if !pe_is_modelled_arena(ctx, arena) {
         return None;
     }
-    match ctx.get_field(arena, PE_ARENA_SESSION_FIELD) {
+    // Through the shared resolver, not a second copy of the index: on
+    // `ArenaImpl` the session is the class's own declared field and is NOT at
+    // `PE_ARENA_SESSION_FIELD`. Open-coding it here is what let this file and
+    // `foreign_ffm` drift apart over the session layout, as the comment on
+    // `pe_session_modelled` above records.
+    let session_slot = crate::phases_late::foreign_ffm::p67_arena_slots(ctx, arena).session;
+    if ctx.object_num_fields(arena) <= session_slot {
+        return None;
+    }
+    match ctx.get_field(arena, session_slot) {
         Value::Object(Some(session)) if pe_session_modelled(ctx, session) => Some(session),
         _ => None,
     }

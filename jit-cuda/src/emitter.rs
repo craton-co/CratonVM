@@ -48,6 +48,17 @@ pub enum WorkBound {
     ParamLen(u32),
     /// The loop runs a compile-time-constant number of times.
     Literal(i32),
+    /// The loop runs `p<N>` times, where `p<N>` is an `int` PARAMETER
+    /// rather than an array length — `for (int i = 0; i < n; i++)`.
+    ///
+    /// Unlike [`WorkBound::ParamLen`] this one is not optional for the
+    /// host: a scalar bound may be LARGER than every array argument, so
+    /// falling back to the largest-array rule would launch fewer threads
+    /// than the Java loop has iterations and silently drop the tail.
+    /// The dispatch site must size the grid from
+    /// `max(largest_array_len, this scalar)` and refuse the launch if it
+    /// cannot read the scalar — see `vm::runtime::offload`'s `work_items`.
+    ParamScalar(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
