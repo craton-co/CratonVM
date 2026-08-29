@@ -17,6 +17,11 @@ publish = false
 
 [dependencies]
 thiserror = { workspace = true }
+# For `gpu_event_census`: the per-launch driver-call counters are written
+# here and printed on the VM's exit path in another crate, and this is the
+# crate both of them already depend on. Same arrangement as
+# `cratonvm_types::cell_census`.
+cratonvm-types = { path = "../types", version = "0.3.0" }
 bytemuck = "1.16"
 # `critical.rs` names the holder of a leaked GPU critical-section token at
 # `error` level and reports an expired collector wait at `warn` level. Both

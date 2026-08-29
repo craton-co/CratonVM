@@ -2453,42 +2453,36 @@ fn remove_from_properties_backend(
 /// — which is how this defect was found — instead of silently reading an empty
 /// map and returning a wrong answer.
 fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(Value::Object(Some(mut this))) = args.first().copied() else {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
         // A null receiver is `Object.clone`'s NPE to raise, not ours.
         return crate::native_object_clone(ctx, args);
     };
-    // Snapshot the store this clone is built from.
+    let mut this = this;
+    // Snapshot the store. ORDERED, not the raw `snapshot_kv`: these entries
+    // become the clone's `map` backing, and `chm_extra_entries` reads that
+    // backing back when the clone enumerates — so the raw, insertion-ordered
+    // snapshot would be an enumeration order this VM hands to Java, which is
+    // exactly what `only_order_insensitive_functions_read_the_unordered_snapshot`
+    // pins against (gh-11892 was one such site).
     //
-    // `ordered_snapshot_kv`, not the bare `snapshot_kv`: the entries go
-    // straight into the clone's new CHM below, so the order they are inserted
-    // in IS the order the clone will later enumerate through `keys()` /
-    // `stringPropertyNames()` — the gh-11892 surface. The real body is
-    // `clone.map = new ConcurrentHashMap<>(map)`, which walks the SOURCE map in
-    // the source map's own order, so borrowing that order here is what matches
-    // it. A receiver whose `map` is null — the very shape this override exists
-    // for — takes `ordered_snapshot_kv`'s early exit and is unaffected.
+    // `snapshot_sidetable` is the other public reader and is not usable here:
+    // it renders each entry `to_lossy()`, and a clone must not quietly mangle
+    // a key or value whose text this VM stores faithfully but cannot render.
     //
-    // Not the public `snapshot_sidetable`: that renders each entry
-    // `to_lossy()`, and a clone must not quietly mangle a key or value whose
-    // text this VM stores faithfully but cannot render.
-    //
-    // This is a GC POINT where the bare read it replaced was not:
-    // `ordered_snapshot_kv` re-enters Java to ask the CHM for its key order. It
-    // refreshes `this` through its own pin, but `args` still holds the
-    // PRE-COLLECTION receiver, so the `cloneHashtable()` step below is handed
-    // the refreshed reference rather than `args`.
-    //
-    // The same fix landed independently from the L3 lane as `c5f66112d`, which
-    // records the history worth keeping: this function and that witness each
-    // landed green from a different lane and only met in a merge. Its code half
-    // is superseded here — it kept passing `args` to `native_object_clone`
-    // below, which is the stale receiver described above.
+    // Two lanes fixed this witness independently and met in a merge; the
+    // surviving copy is the one that also refreshes the receiver below.
     let entries = ordered_snapshot_kv(ctx, &mut this);
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
     // shallow-copies the heap fields, `defaults` included, and already knows to
     // replicate a Properties' side-table onto the clone's new identity.
+    //
+    // Handed the REFRESHED receiver rather than the caller's `args`:
+    // `ordered_snapshot_kv` re-enters Java (`entrySet`/`iterator`/`getKey`) and
+    // is therefore a GC point, so `args[0]` may by now name a from-space
+    // address. `this` was refreshed across that walk by the `&mut`; `args` was
+    // not, and cloning a vacated header is a wrong answer nothing reports.
     let cloned = crate::native_object_clone(ctx, &[Value::Object(Some(this))])?;
     let Some(Value::Object(Some(clone_ref))) = cloned else {
         return Ok(cloned);
@@ -2545,7 +2539,7 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// view. Re-deriving any of those is how the side-table-vs-backing asymmetry
 /// that `native_properties_clear` documents gets reintroduced.
 fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let mut this = match args.first() {
+    let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -2554,31 +2548,36 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // `Map.replaceAll(null)` is an NPE on HotSpot too.
         _ => return Err(props_null_put_npe()),
     };
+    let mut this = this;
     // Snapshot first: the function is free to call back into this Properties,
     // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
     //
-    // `ordered_snapshot_kv`, not the bare `snapshot_kv`: this loop hands the
-    // order to Java directly, as the sequence of `apply(k, v)` calls the user's
-    // BiFunction observes. The real body is `map.replaceAll(function)`, which
-    // walks the CHM in the CHM's order, so anything else is a visible
-    // divergence in a callback the caller wrote.
+    // ORDERED, not the raw `snapshot_kv`. This loop hands the entries to a
+    // user-supplied `BiFunction` one at a time, so the iteration order is
+    // DIRECTLY observable by Java — a function that logs, counts or
+    // accumulates sees it. Reading the raw side-table order would show an
+    // order this VM would never report from `propertyNames()`/`entrySet()`,
+    // which is the divergence
+    // `only_order_insensitive_functions_read_the_unordered_snapshot` exists to
+    // prevent.
     //
-    // It is also a GC POINT where the bare read was not — it re-enters Java to
-    // ask the CHM for its key order. `func` was read out of `args` above and
-    // nothing was holding it, so it is pinned BEFORE the walk and re-read
-    // after; `this` is refreshed by `ordered_snapshot_kv` itself. `func_pin`
-    // therefore sits BELOW `this_pin`, and since unpinning pops every pin above
-    // it, releasing `func_pin` at the end releases both.
+    // ...and that re-entry is a GC POINT, which is the half the ordering fix
+    // left open. `func` is read out of `args` BEFORE the snapshot, so pin it
+    // FIRST and refresh across the walk: pinning it afterwards, as this did,
+    // registers the address the collector may already have vacated, and every
+    // `read_native_pin(func_pin, ..)` below then faithfully hands that stale
+    // address to `invoke_virtual`. The `&mut` on `ordered_snapshot_kv` makes
+    // the RECEIVER's staleness a compile error and is silent about every other
+    // ref the caller holds beside it — which is what `func` is.
     let func_pin = ctx.pin_native_root(func);
     let entries = ordered_snapshot_kv(ctx, &mut this);
     let func = ctx.read_native_pin(func_pin, func);
-    //
-    // Superseding `c5f66112d`'s half of the same fix, which pinned `func` AFTER
-    // this call rather than before it — that is the window described above.
     if entries.is_empty() {
         ctx.unpin_native_roots(func_pin);
         return Ok(None);
     }
+    // Pinned AFTER the ordered snapshot, which re-enters Java and may relocate
+    // the receiver; `this` is the refreshed ref by here.
     let this_pin = ctx.pin_native_root(this);
     for (k, v) in entries {
         // Every step below can allocate and therefore relocate; re-read each
@@ -2600,8 +2599,8 @@ fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) ->
             // removing the entry; match that instead of inventing a third
             // behaviour.
             _ => {
-                // `func_pin`, not `this_pin`: it is the lower of the two, and
-                // unpinning it pops `this_pin` with it.
+                // `func_pin` is the lowest mark now, so this releases it,
+                // `this_pin` and the iteration's `k_pin` together.
                 ctx.unpin_native_roots(func_pin);
                 return Err(props_null_put_npe());
             }
@@ -3600,29 +3599,69 @@ fn native_properties_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
+    // This function held NO pins at all, and every line below moves things:
+    // `ordered_snapshot_kv` re-enters Java, `create_property_string` allocates,
+    // and each `accept` is a full Java call. `action` in particular was read
+    // out of `args` before any of it and handed to N virtual dispatches
+    // unrefreshed. Pin it FIRST so the mark sits below everything else, then
+    // refresh at each use -- the same shape `native_properties_replace_all`
+    // and the `putAll` path already use.
+    let action_pin = ctx.pin_native_root(action);
     let mut this = this;
     let snapshot = ordered_snapshot_kv(ctx, &mut this);
+    let this_pin = ctx.pin_native_root(this);
     for (k, v) in &snapshot {
         let ks = create_property_string(ctx, k);
+        // Pin `ks` BEFORE allocating `vs`: that second allocation is what
+        // relocates the first string, and both are passed to `accept`
+        // together.
+        let ks_pin = ctx.pin_native_root(ks);
         let vs = create_property_string(ctx, v);
+        let ks_now = ctx.read_native_pin(ks_pin, ks);
+        let action_now = ctx.read_native_pin(action_pin, action);
         ctx.invoke_virtual(
-            action,
+            action_now,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[Value::Object(Some(ks)), Value::Object(Some(vs))],
+            &[Value::Object(Some(ks_now)), Value::Object(Some(vs))],
         )?;
+        ctx.unpin_native_roots(ks_pin);
     }
     // CHM-exclusive (non-String-valued) entries, with the real value object.
     let side: std::collections::HashSet<JavaText> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
-    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
+    let this_now = ctx.read_native_pin(this_pin, this);
+    let extras = chm_extra_entries(ctx, this_now, &side);
+    // Pin EVERY extra-entry ref up front rather than at the top of its own
+    // iteration: `chm_extra_entries` collects them all before the loop runs, so
+    // iteration N's `accept` can relocate the refs iterations N+1.. still hold.
+    // A pin taken at the start of iteration N+1 would register an address the
+    // previous call had already vacated, which looks like protection and is
+    // none.
+    let mut extra_pins: Vec<(usize, Option<usize>)> = Vec::with_capacity(extras.len());
+    for (key_obj, value, _kstr) in &extras {
+        let ko_pin = ctx.pin_native_root(*key_obj);
+        let v_pin = match value {
+            Value::Object(Some(o)) => Some(ctx.pin_native_root(*o)),
+            _ => None,
+        };
+        extra_pins.push((ko_pin, v_pin));
+    }
+    for ((key_obj, value, _kstr), (ko_pin, v_pin)) in extras.into_iter().zip(extra_pins) {
+        let key_now = ctx.read_native_pin(ko_pin, key_obj);
+        let value_now = match (value, v_pin) {
+            (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            (v, _) => v,
+        };
+        let action_now = ctx.read_native_pin(action_pin, action);
         ctx.invoke_virtual(
-            action,
+            action_now,
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[Value::Object(Some(key_obj)), value],
+            &[Value::Object(Some(key_now)), value_now],
         )?;
     }
+    ctx.unpin_native_roots(action_pin);
     Ok(None)
 }
 
@@ -5420,6 +5459,160 @@ mod tests {
     /// pin the call sites: a bare `snapshot_kv(` is allowed only in the
     /// functions listed here, each of which is order-insensitive or is the
     /// ordering machinery itself.
+    /// Companion witness to
+    /// `only_order_insensitive_functions_read_the_unordered_snapshot`, for the
+    /// hazard that ordering fix INTRODUCED.
+    ///
+    /// `ordered_snapshot_kv` re-enters Java (`entrySet`/`iterator`/`getKey`),
+    /// so it allocates, so it is a GC point — its own doc says exactly that.
+    /// It takes the receiver by `&mut` precisely so a caller cannot carry a
+    /// pre-GC receiver across it without a compile error. **That `&mut` says
+    /// nothing about the OTHER references the caller is holding beside the
+    /// receiver**, and moving three functions from the pure side-table read
+    /// `snapshot_kv` to this one silently put those refs across a collection:
+    ///
+    ///   * `native_properties_clone` refreshed `this` and then handed
+    ///     `native_object_clone` the caller's `args`, which nothing refreshed;
+    ///   * `native_properties_replace_all` pinned its `BiFunction` AFTER the
+    ///     walk, registering an address the collector may already have
+    ///     vacated — protection in shape only;
+    ///   * `native_properties_for_each` pinned nothing at all and dispatched
+    ///     `accept` on a `BiConsumer` read out of `args` N calls earlier.
+    ///
+    /// None of that is visible to `scripts/stale-receiver-audit.py`, whose
+    /// shape is a funnel taking the RECEIVER by value: `ordered_snapshot_kv`
+    /// already takes `&mut`, so the audit considers it solved and never looks
+    /// at what the caller holds next to it.
+    ///
+    /// The rule: a local captured out of `args` before an `ordered_snapshot_kv`
+    /// call and still used after it must be pinned BEFORE that call. The
+    /// receiver handed to the `&mut` parameter is exempt — that is what the
+    /// `&mut` is for.
+    #[test]
+    fn refs_held_across_the_ordered_snapshot_are_pinned_before_it() {
+        let src = include_str!("properties_sidetable.rs");
+        // Function bodies, in source order.
+        // Only the production half of the file: the test module below defines
+        // nested helper `fn`s, and a naive split would hand this very test's
+        // body to one of them.
+        let src = src.split("
+mod tests {").next().unwrap_or(src);
+        let mut fns: Vec<(String, Vec<&str>)> = Vec::new();
+        for line in src.lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t
+                .strip_prefix("fn ")
+                .or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("pub(crate) fn "))
+            {
+                let name = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                fns.push((name, Vec::new()));
+            }
+            if let Some(last) = fns.last_mut() {
+                last.1.push(line);
+            }
+        }
+
+        fn ident_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+            let at = line.find(marker)? + marker.len();
+            let rest = &line[at..];
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                None
+            } else {
+                Some(&rest[..end])
+            }
+        }
+        fn mentions(line: &str, ident: &str) -> bool {
+            let mut idx = 0;
+            while let Some(hit) = line[idx..].find(ident) {
+                let at = idx + hit;
+                let before_ok = at == 0
+                    || !line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let after = at + ident.len();
+                let after_ok = line[after..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if before_ok && after_ok {
+                    return true;
+                }
+                idx = at + ident.len();
+            }
+            false
+        }
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, body) in &fns {
+            let Some(call_at) = body.iter().position(|l| {
+                l.contains("ordered_snapshot_kv(") && !l.trim_start().starts_with("//")
+            }) else {
+                continue;
+            };
+            // The receiver handed to the `&mut` parameter is exempt.
+            let receiver = ident_after(body[call_at], "&mut ").unwrap_or("");
+            // Locals bound out of `args` before the call, plus `args` itself.
+            let mut captured: Vec<&str> = vec!["args"];
+            for (i, line) in body[..call_at].iter().enumerate() {
+                if !line.contains("args") {
+                    continue;
+                }
+                let after_let = match line.split_once("let ") {
+                    Some((_, rest)) => rest.strip_prefix("mut ").unwrap_or(rest),
+                    None => continue,
+                };
+                let end = after_let
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(after_let.len());
+                let id = &after_let[..end];
+                // A plain binding: `let id =` / `let id: T =`. A destructuring
+                // `let Some(Value::Object(Some(this))) = ...` yields `Some`
+                // followed by `(`, and is not a name anything reuses.
+                if id.is_empty() || !matches!(after_let[end..].trim_start().chars().next(), Some('=') | Some(':')) {
+                    continue;
+                }
+                // ...and not a binding whose own value expression CONTAINS the
+                // call (`let vals = match args.first() { .. => ordered_snapshot_kv(..) }`):
+                // that names the call's RESULT, which is not a pre-GC ref. The
+                // statement is still open if no line before the call ended one.
+                if !body[i..call_at].iter().any(|l| l.trim_end().ends_with(';')) {
+                    continue;
+                }
+                captured.push(id);
+            }
+            let pinned_before: Vec<&str> = body[..call_at]
+                .iter()
+                .filter_map(|l| ident_after(l, "ctx.pin_native_root("))
+                .collect();
+            for id in captured {
+                if id.is_empty() || id == receiver || pinned_before.contains(&id) {
+                    continue;
+                }
+                let used_after = body[call_at + 1..].iter().any(|l| {
+                    !l.trim_start().starts_with("//") && mentions(l, id)
+                });
+                if used_after {
+                    offenders.push(format!("{name} holds `{id}`"));
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "these carry a pre-GC reference across `ordered_snapshot_kv`, which              re-enters Java and can relocate it: {offenders:?}. Pin it BEFORE the              call and refresh through `read_native_pin` at each use — pinning              afterwards registers an address the collector may already have              vacated."
+        );
+    }
+
     #[test]
     fn only_order_insensitive_functions_read_the_unordered_snapshot() {
         const ALLOWED: &[&str] = &[
