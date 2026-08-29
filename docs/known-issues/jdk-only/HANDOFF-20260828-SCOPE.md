@@ -335,11 +335,11 @@ prints can never fire.** That was the second inert fix of the day, and unlike th
 ```bash
 # 1. gate  (this is the whole set; do not shorten it)
 cargo test -p cratonvm-types
-cargo test -p cratonvm-native-builtins --test stub_ratchet --test registrar_drift \
-  --test registrar_reachability --test essential_wiring_ratchet \
-  --test duplicate_registration_gate --test shim_inheritance_guard --test registry_contracts
-cargo test -p cratonvm-native-builtins --features management --test stub_ratchet \
-  --test registrar_drift --test registrar_reachability
+# Name NOTHING by hand here. `ls native-builtins/tests/` is the authority and it
+# GROWS; the hand-written list this replaced named 7 of the 10 that exist.
+cargo test -p cratonvm-native-builtins --tests
+cargo test -p cratonvm-native-builtins --features management --tests
+cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests
 # plus --lib for any crate you changed
 
 # 2. the three arms, on a RELEASE build of the merged tree
@@ -354,6 +354,39 @@ git push origin HEAD:dev
 **Do not chain the push behind the gates.** I landed a red `doc_citation_paths`
 on `dev` earlier in this campaign by keying the conditional on `behind=0` instead
 of on the test result.
+
+**Why the gate list stopped naming targets (2026-08-29, L7).** It used to name
+seven `--test` targets. `native-builtins/tests/` holds **ten**, and the three it
+omitted were `lock_discipline_ratchet`, `eintr_ratchet` and `aes_gcm_kat`. The
+first is not a rounding error: it holds this crate to a raw-lock-construction
+baseline because **this crate re-enters the VM** — a native callback calls back
+into Java, which takes the heap and L10 class-manager locks — so a `Mutex` here
+with no `LockLevel` is a deadlock the order checker cannot see. It caught
+exactly that in L7's own instrument, on a commit whose other nine gates were
+green. A lane following the old list, on its promise of being "the whole set",
+would have landed it.
+
+**An unknown `--test` name exits 101, the same code a panicking test gives.**
+Seven "failing ratchets" in L7's landing script were seven stale names, and the
+output — tail-truncated — was cargo listing the targets that DO exist, which
+reads as a list of failures. If a sweep of unrelated guards goes red
+identically, suspect the invocation before the tree, and read the FIRST line of
+the output rather than the last.
+
+`--features synthetic-jdk` is in the set as well: that mode builds and runs
+again as of 2026-08-29
+(`P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md`), and a
+`#[cfg(feature = "synthetic-jdk")]` module that nothing compiles rots silently.
+
+Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
+
+* **It subsumes `--lib`**, so the line under it is redundant for this crate —
+  and the known-red `properties_sidetable` guard two sections down now shows up
+  in the gate command itself, `rc=101`, on every branch. Read that section
+  before you bisect it.
+* **The feature arms genuinely cover more**, which is the argument for running
+  all three: 4176 tests on default, 4208 under `management`, 4352 under
+  `synthetic-jdk`. The third arm alone compiles 176 tests nothing else does.
 
 ### Known-red vectors, so you can tell yours from theirs
 
