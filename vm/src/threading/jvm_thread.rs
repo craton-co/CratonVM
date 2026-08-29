@@ -482,12 +482,31 @@ impl ParkState {
                     if remaining.is_zero() || *permit {
                         break;
                     }
-                    let wait_time = remaining.min(poll);
-                    // Windows: same reason as `park()` above. The 5 ms slices
-                    // stay — they bound how long an interrupt that did not also
-                    // unpark can go unnoticed — but each one is now accurate,
-                    // so the last slice ends ON the deadline rather than at the
-                    // next system tick after it.
+                    // Windows: same reason as `park()` above — the condvar
+                    // rounds the deadline up to the 15.625 ms system tick.
+                    // Slices stay (they bound how long an interrupt that did
+                    // NOT also unpark can go unnoticed) but each one is now
+                    // accurate, so the last slice ends ON the deadline instead
+                    // of at the next tick after it.
+                    //
+                    // The accurate slice is the longer one on purpose. A 5 ms
+                    // condvar slice does not cost a wakeup every 5 ms — the OS
+                    // rounds it out to ~15.6 ms — so asking the timer for 5 ms
+                    // would TRIPLE the wakeup rate of every timed park in the
+                    // VM to buy interrupt latency nothing was waiting on
+                    // (`thread_interrupt` already unparks, and that signal now
+                    // reaches this wait through the event). 15 ms keeps both
+                    // the wakeup rate and the interrupt latency where the
+                    // condvar path actually had them.
+                    #[cfg(target_os = "windows")]
+                    let slice = if win_park::enabled() && self.wake_event != 0 {
+                        std::time::Duration::from_millis(15)
+                    } else {
+                        poll
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let slice = poll;
+                    let wait_time = remaining.min(slice);
                     #[cfg(target_os = "windows")]
                     let accurate = if win_park::enabled() && self.wake_event != 0 {
                         drop(permit);
