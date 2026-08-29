@@ -35,6 +35,33 @@ registered by `native-builtins/src/lang_string.rs`, checked with
 `--dump-native-registry` **before** any edit. There is no duplicate registrar for
 this family and no half-fixed twin.
 
+Landing gates and the three arms, on a release build of the tree after the
+FOURTH merge of `origin/dev` (it moved four times during this lane):
+
+```text
+cargo test -p cratonvm-types                        green
+the seven native-builtins gate tests                green
+the same three under --features management          green
+cargo test -p cratonvm-native-builtins --lib        green
+cargo test -p cratonvm-vm --lib                     green
+CRATONVM_ARGS=--jdk-only regression-suite           111/112
+SUITE=all                                           110/112
+SUITE=core                                          72/72   (run alone)
+```
+
+Both residual failures are the two the brief names as dev's, and both were
+re-checked rather than assumed:
+
+* **`RJdkEnumerations`** — dev's `a0168ed03`, bisected and recorded there. It
+  fails alone here too, and it is a `ConcurrentHashMap` vector, not a string one.
+* **`RMapGcStress`** — `rc=124`, and the harness itself prints
+  `HARNESS FAULT — TIMED OUT; the harness killed the VM, it did not fail`. It
+  passed the `--jdk-only` arm and both earlier `SUITE=core` runs on this same
+  binary, and **3 of 3 alone with `TIMEOUT=600`**. `SUITE=core` re-run with
+  nothing else of this lane's running is **72/72**. The tree's own records
+  already call it "a load flake" that "read as a result in both directions";
+  the host carried a load average above 20 while the gates ran beside the arms.
+
 ---
 
 ## 1. The eighteen defects
