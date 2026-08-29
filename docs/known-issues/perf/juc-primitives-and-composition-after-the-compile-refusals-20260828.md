@@ -1,4 +1,4 @@
-# `java.util.concurrent` primitives are 16-40x, and composition is 19x, with every compile refusal gone
+# `java.util.concurrent` primitives are still 12-37x, and composition 18x, with every compile refusal gone
 
 ## Status
 **OPEN, opened 2026-08-28.** This is the residual of two pages that closed the
@@ -18,14 +18,29 @@ Nothing on this page is a compile refusal any more.
 same zero — so what follows is the cost of COMPILED code, not of the
 interpreter.
 
+## Closed since this page was filed
+
+**`VarHandle.compareAndSet` on a reference field — was the top item below, now
+bound (2026-08-28).** 156.8 ns -> **52.1 ns**, a **3.01x**, landing on the
+bound-`set` floor of 51.1. Against HotSpot's 5.3 that row goes **29.6x ->
+9.8x**, and this page's own composite row for it goes 35x -> **16.9x**.
+
+It was served from inside the funnel rather than bound, and the reason it was
+not bound — "five arguments, and Windows' ARG_REGS is four, so it needs the
+stack-argument setup this bind does not" — had stopped being true before anyone
+read it: `emit_stack_arg_setup` has marshalled exactly that since Round-8
+wave-3. See
+`performance/varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`.
+
 > **The first revision of this page was measured on a busier box and one of its
 > conclusions did not survive.** It put the range at 9-114x and named
 > `AtomicReference.compareAndSet`'s synthetic stub as a 710 ns tax with an
-> obvious fix. Re-measured on an idle box against the current dev tip, the range
-> is 16-40x and the stub is not a tax at all — see
-> "What was tried and refuted". Both tables were six interleaved runs; the
-> difference is the box, which is exactly the failure mode the `VarHandle` page
-> warned about and this page then walked into.
+> obvious fix. Re-measured on an idle box, that range was 16-40x and the stub
+> was not a tax at all — see "What was tried and refuted". Both tables were six
+> interleaved runs; the difference was the box, which is exactly the failure
+> mode the `VarHandle` page warned about and this page then walked into. The
+> table below is the third measurement, on the merged binary with the CAS bind
+> in, and every row's spread is under 3%.
 
 ## Severity
 **HIGH and broad**, for the same reason the `VarHandle` page was: these are the
@@ -34,21 +49,35 @@ primitives under `CompletableFuture`, `AbstractQueuedSynchronizer`,
 
 ## The measurement
 
+> **The CAS rows of this probe are COMPOSITES.** Each iteration does a
+> `VarHandle.get` and *then* the CAS, so "`VarHandle.compareAndSet` reference
+> 231 ns" is a 77 ns read plus a ~154 ns CAS. HotSpot's rows compose the same
+> way, so the RATIO is sound; the attribution is not, and a profile taken
+> against these rows measures two operations. `VhCasProbe` (with the rest under
+> `apps/probes/`) carries the expected value in a Java local and times the CAS
+> alone — use that one to attribute, and this one for continuity with the
+> numbers above.
+
 `HibfixVarHandleProbe`, `-Dprobe.iters=2000000`, single-threaded, idle host
 (load 0.06), six runs of each VM **interleaved**. Medians, with min and max so
 the spread is visible — every row's spread is under 6%, which is what says the
 box was quiet:
 
-| operation | CratonVM min/med/max (ns) | HotSpot min/med/max (ns) | ratio |
+| operation | CratonVM min-max (median, ns) | HotSpot | ratio |
 |---|---:|---:|---:|
-| `AtomicReference.compareAndSet` | 263.6 / **265.8** / 277.6 | 6.7 / 6.7 / 7.5 | **40x** |
-| `VarHandle.compareAndSet` reference | 229.6 / **231.0** / 242.4 | 6.6 / 6.7 / 7.0 | **35x** |
-| `VarHandle.get` reference | 76.9 / **77.0** / 77.8 | 2.4 / 2.4 / 2.6 | 32x |
-| `VarHandle.compareAndSet` int | 147.3 / **148.7** / 149.3 | 6.7 / 7.1 / 7.2 | 21x |
-| `VarHandle.set` reference | 50.8 / **50.8** / 50.8 | 2.7 / 2.8 / 3.0 | 18x |
-| `VarHandle.get` int | 41.1 / **41.3** / 41.4 | 2.3 / 2.5 / 2.5 | 17x |
-| plain field store (baseline) | 6.1 / **6.1** / 6.3 | 2.1 / 2.4 / 2.5 | 2.5x |
-| `AtomicInteger.incrementAndGet` | 4.7 / **4.7** / 4.7 | 5.7 / 5.9 / 6.0 | **0.8x** |
+| `AtomicReference.compareAndSet` | 263.4-269.8 (**266.8**) | 7.3 | **37x** |
+| `VarHandle.get` reference | 76.3-77.7 (**76.8**) | 3.2 | **24x** |
+| `VarHandle.compareAndSet` reference † | 125.0-133.1 (**128.1**) | 7.6 | 17x |
+| `VarHandle.get` int | 46.2-48.4 (**46.3**) | 3.2 | 15x |
+| `VarHandle.set` reference | 50.8-53.5 (**51.3**) | 3.6 | 14x |
+| `VarHandle.compareAndSet` int † | 87.6-89.3 (**88.2**) | 7.4 | 12x |
+| plain field store (baseline) | 5.8-6.2 (**5.9**) | 3.1 | 1.9x |
+| `AtomicInteger.incrementAndGet` | 4.7-4.9 (**4.7**) | 6.3 | **0.7x** |
+
+† a composite — see the note above. Subtracting the matching `get` row gives
+128.1 - 76.8 = **51.3** for the reference CAS alone, against `VhCasProbe`'s
+independent 52.1 for the same operation in the same window. Two probes with
+different shapes agreeing to 1.5% is the reason to trust either.
 
 **`AtomicInteger` is still the control that makes this conclusive**, and it says
 something stronger than it did on 2026-08-24: CratonVM is **faster** than
@@ -150,27 +179,33 @@ is not the problem; the CAS underneath it is**, and that is where the 35x lives.
 
 ## Where to look first
 
-1. **`VarHandle.compareAndSet` on a reference field, 231 ns against 6.7.** It is
-   the top row that is not a wrapper of another row, it is 10.47 calls per
-   composition chain, and it is already served by
-   `try_varhandle_instance_field_cas` inside `jit_invoke_dispatch` — so the
-   remaining cost is inside that fast path, not in reaching it. The int CAS at
-   148.7 is the same path with a cheaper payload, and the 82 ns between them
-   bounds what the reference-specific work (SATB pre-barrier on `expected`, the
-   post `write_barrier` on success) costs.
-2. **`VarHandle.get` on a reference field, 77.0 against 2.4 — 32x, and against
-   41.3 for the same read of an `int`.** `VARHANDLE_READ_DIRECT_FNS` binds reads
-   of PRIMITIVE fields only, and its comment says `L` and `[` "are absent on
-   purpose": a reference RETURN must be published as a handoff root before the
-   caller can store it, and the direct arm takes no thread borrow to publish one
-   with. That justification is sound, and the 1.9x is its measured price — worth
-   knowing before anyone tries to bind it, and worth re-examining now that the
-   write side found a way (a reference travels INWARD in a register the caller's
-   own frame already describes, so a write has no window to root across).
+1. **`VarHandle.get` on a reference field, 77.0 ns against 2.4 — and against
+   41.3 for the same read of an `int`.** Now the top row that is not a wrapper
+   of another row. `VARHANDLE_READ_DIRECT_FNS` binds reads of PRIMITIVE fields
+   only, and its comment says `L` and `[` "are absent on purpose": a reference
+   RETURN must be published as a handoff root before the caller can store it,
+   and the direct arm takes no thread borrow to publish one with. That
+   justification is sound and the 1.9x over the `int` read is its measured
+   price. It is also the LAST of the three access directions still unbound —
+   `set` was bound on 2026-08-24 and `compareAndSet` on 2026-08-28, both on the
+   argument that a reference travelling INWARD needs no root, and a CAS proved
+   a `Z`-returning bind carries no reference out either. A read is the one that
+   genuinely returns one, so this is the hard case rather than an oversight.
+2. **`AtomicReference.compareAndSet`, and this page's earlier refutation of it
+   is now WORTH RE-OPENING.** The refutation stands as recorded: de-registering
+   the synthetic stub measured SLOWER (289 vs 257 ns) because the JDK's
+   `VALUE.compareAndSet(...)` cost a 233 ns `VarHandle` CAS plus a frame. That
+   VarHandle CAS is now 53.6 ns, so the same arithmetic predicts the opposite
+   result — the delegating path should now be roughly 60-70 ns against the
+   stub's ~265. Predicted, NOT measured: the earlier attempt is exactly why this
+   needs the A/B and the registry dump rather than the arithmetic, and it needs
+   the gate on the registrar `--dump-native-registry` NAMES
+   (`util_concurrent_ext.rs`), not the one grep finds first.
 3. **A NATIVE profile of the composition probe with everything compiled.** The
    last one was taken when composition was 92.35% interpreted, so it measured
-   the interpreter and nothing else. Nobody has profiled the current shape, and
-   the 22% the CAS accounts for leaves most of the chain unexplained.
+   the interpreter and nothing else. The CAS bind moved composition 1.10x,
+   almost exactly the 9.6% its 10.47 CAS per chain predicted — which is
+   reassuring about the accounting and leaves ~90% of the chain unattributed.
 
 ## What is already excluded, with the evidence
 
@@ -179,7 +214,12 @@ Do not re-derive these.
 * **Compile refusals.** `hot_but_stuck_in_interpreter=0` on both probes.
   Restoring either of the two fixed refusals with its kill switch costs 2.19x
   and 2.88x, so the instrument works and reads zero.
-* **The `AtomicReference` CAS shadow.** Measured and refuted above.
+* **The `AtomicReference` CAS shadow.** Measured and refuted above — and see
+  "Where to look first" item 2, which re-opens it on new arithmetic rather than
+  on a new opinion.
+* **The `VarHandle` CAS funnel entry.** Bound 2026-08-28; the funnel arm still
+  serves the interpreter and the declined sites, and the two share one
+  implementation.
 * **The native-shadow caller seal.** `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL=0`
   changes the compile count by one method and the runtime by nothing. Its blast
   radius is real (a median 1 010 methods sealed per class on the

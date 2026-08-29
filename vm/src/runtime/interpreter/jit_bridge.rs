@@ -1717,6 +1717,40 @@ pub(super) fn compile_osr_artifact(
                             continue;
                         }
                     }
+                    // `VarHandle.compareAndSet` on an instance field — parity
+                    // with `jit::try_compile`'s recognition (see
+                    // `cratonvm_jit::VARHANDLE_CAS_DIRECT_FNS`).
+                    //
+                    // THIS door is the load-bearing one, for exactly the reason
+                    // the write bind above records in full: a benchmark-style
+                    // `main` loop, and `CompletableFuture.tryPushStack` reached
+                    // from one, live their whole lives inside an OSR body and
+                    // never pass through `jit::try_compile`.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_cas_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_cas_helper_slot(&mn, &desc) {
+                            // Address taken directly rather than out of the
+                            // jit-crate cell — this path can run before
+                            // `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_cas_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_CAS_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 3,
+                                    return_type: b'Z',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
                     // helper verifies the receiver's EXACT class and routes
