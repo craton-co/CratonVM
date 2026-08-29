@@ -3113,15 +3113,48 @@ fn report_unpublished_band_words(
             // words are that method's java-locals, one object in three
             // consecutive slots.
             let sp_id = frame_active_sp_id(rbp, cm);
-            let in_map = sp_id.map(|id| {
-                cm.oop_maps
-                    .iter()
-                    .filter(|m| m.bytecode_pc == id)
-                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
-            });
+            // THREE answers, not two. `sp_id.map(..)` gave `Some(false)` both
+            // when a map was found and did not name the slot AND when NO MAP
+            // EXISTS for the stored id -- and those point at opposite repairs.
+            //
+            // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+            // (2026-08-29): six of seven reported words came from one frame
+            // whose stored id was `1729768472`. That is not a bytecode pc; it
+            // is `0x671a2c18`, the low 32 bits of `0x200671a2c18` -- the heap
+            // pointer this same scan reports two slots away in the same frame.
+            // The frame's sp-id slot holds half an object pointer, so no map
+            // can match it, and `live_hi=None` on the same line says the same
+            // thing. Printed as `Some(false)` that read as "the dataflow calls
+            // this slot dead", which sends a reader at the band verifier
+            // instead of at the frame whose id is garbage.
+            //
+            // `no-map-for-id` is also the honest label for what the SCAN does
+            // here: `frame_active_map_slots` returns `None`, so the dead-slot
+            // relaxation deliberately does not fire and the word is reported.
+            // The report now says which of the two it is.
+            let in_map: &'static str = match sp_id {
+                None => "no-sp-id",
+                Some(id) => {
+                    let mut any_map = false;
+                    let mut names_slot = false;
+                    for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == id) {
+                        any_map = true;
+                        if m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off) {
+                            names_slot = true;
+                        }
+                    }
+                    if !any_map {
+                        "no-map-for-id"
+                    } else if names_slot {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
+            };
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} in_map={in_map:?} \
+                 sp_id={sp_id:?} in_map={in_map} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
