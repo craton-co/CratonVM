@@ -9872,15 +9872,49 @@ pub(crate) fn fsp_new_output_stream(
     // FileDescriptor — the existing FOS native overrides (write/flush/close,
     // registered in native-io::lib.rs) recover the fd via the same
     // `fd`/`handle` fields on the FileDescriptor object.
+    // THE CONSTRUCTOR NEVER RUNS, so its instance initialisers have to be
+    // reproduced here — exactly as `fsp_new_input_stream` does a hundred lines
+    // above, with the comment that says why. This is the TWIN of that repair,
+    // and it was missing: the input side set `closeLock`/`path`/`closed` and
+    // the output side set only `fd`.
+    //
+    // `java.io.FileOutputStream.close()` opens `synchronized (closeLock)`, so a
+    // null `closeLock` is
+    //
+    //   NullPointerException: Cannot enter synchronized block because
+    //                         "this.closeLock" is null
+    //       at java/io/FileOutputStream.close(FileOutputStream.java:383)
+    //       at java/nio/file/Files.copy(Files.java:2865)
+    //
+    // — on an ordinary `Files.copy` / `Files.newOutputStream` inside a
+    // try-with-resources. It is invisible TODAY only because
+    // `FileOutputStream.close()` is itself natively overridden and never
+    // reaches that bytecode. MEASURED with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/File`, which makes the overrides
+    // yield: `probes/L4FilesSweep.java` died 119 rows early on exactly this.
+    //
+    // So it is latent, and it is the kind of latent that turns a future
+    // retirement of the `FileOutputStream` shadows from free into a crash. Any
+    // real-JDK-bytecode path that reaches `close()` finds it too.
     let fos = try_alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4)?;
-    // Pin across the FileDescriptor alloc below — a moving young GC there
-    // would relocate the fresh stream (native stale-local family).
+    // Pin across the allocations below — each can trigger a moving young GC
+    // that relocates the fresh stream (native stale-local family).
     let fos_pin = ctx.pin_native_root(fos);
     let fd_obj = try_alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4)?;
+    let path_str = ctx.create_string(&p);
+    let close_lock = ctx.new_object("java/lang/Object");
     let fos = ctx.read_native_pin(fos_pin, fos);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
     ctx.set_field_by_name(fos, "fd", Value::Object(Some(fd_obj)));
+    // `path` backs `getChannel()` and the JDK's own diagnostics; `append` is
+    // read by `FileOutputStream.getChannel()`; `closed` must start false.
+    ctx.set_field_by_name(fos, "path", Value::Object(Some(path_str)));
+    ctx.set_field_by_name(fos, "append", Value::Int(i32::from(append)));
+    if let Ok(Some(lock @ Value::Object(Some(_)))) = close_lock {
+        ctx.set_field_by_name(fos, "closeLock", lock);
+    }
+    ctx.set_field_by_name(fos, "closed", Value::Int(0));
     // Belt-and-braces for legacy callers that read instance slot 0 directly.
     ctx.set_field(fos, 0, Value::Object(Some(fd_obj)));
     ctx.unpin_native_roots(fos_pin);
