@@ -1983,6 +1983,11 @@ it.
   **Measured**: `verifier_oop=0` on `TestMVStoreTool`, and on `TestMultiThread`
   — where this page recorded 1 108 464 never-mapped words — the verifier
   refutes **847 347** and leaves **262**. See §"Follow-up 2026-08-29" §7.
+* **The cross-thread coverage handshake decided nothing** — because nothing
+  had run it on a workload that reaches the condition. Run on
+  `org.h2.test.db.TestMultiThread`: `xt_cov=(accepted=1 refused=8
+  deposits=26)`, `rc=0`. It is consulted, and it both admits and refuses. See
+  §"Follow-up 2026-08-29" §8.
 * **`CRATONVM_ZGC_TARGETED_COMPACTION` engages zero times**, and §"Follow-up
   2026-08-29" §6 says why in a way §"Follow-up 2026-08-28" could not: the
   target is recorded on the allocation failure, and on this family the
