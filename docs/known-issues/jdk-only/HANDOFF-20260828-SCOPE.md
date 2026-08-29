@@ -19,7 +19,7 @@ been removed again.
 | lane | owner | worktree | branch |
 | --- | --- | --- | --- |
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-29** — dispatch worklist 483 rows / 20 fixed, PLUS its two recorded-open items and five more the probe found: 125 rows, **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Records: `L5-reflection-lane-complete-20260828.md` and `L5-residuals-module-packages-and-invokeexact-20260828.md` | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
-| **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE — landed on dev as `3e8280b94`, 2026-08-29** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
+| **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
 | **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
@@ -265,7 +265,7 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | `panama.rs` — unclaimed, closest to L1 |
+| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
 | ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
@@ -357,21 +357,30 @@ of on the test result.
 
 ### Known-red vectors, so you can tell yours from theirs
 
-* ~~`RJdkEnumerations`~~ — **GREEN as of 2026-08-29, in all three arms.** Two
-  lanes, two halves. L6 fixed the compatible-mode half (the CHM values cursor,
-  dev's `a0168ed03`). The `--jdk-only` half was a REFUSED FABRICATION THE
-  CALLER COULD NOT RECOVER FROM: `Properties.values().iterator()` minted
-  `cratonvm/internal/ArrayListViewItr`, strict mode correctly refused it, and
-  the mint site's bare `?` handed the refusal to the caller as a
-  `NoClassDefFoundError`. Fixed by recovering onto a real `Arrays$ArrayItr`
-  snapshot — `a-refused-fabrication-the-caller-cannot-recover-from-20260829.md`.
+* ~~`RJdkEnumerations`~~ — **GREEN as of 2026-08-29, in all three arms**
+  (112/112 strict, 112/112 all, 72/72 core, measured twice on two different
+  merges). Two lanes, two halves. L6 fixed the compatible-mode half (the CHM
+  values cursor, dev's `a0168ed03`) and then the strict half too
+  (`844c581fa`, `SnapshotItrRoute::ViewCollection`): `Properties.values()
+  .iterator()` minted `cratonvm/internal/ArrayListViewItr`, strict mode
+  correctly refused it, and the mint site's bare `?` handed that refusal to the
+  caller as a `NoClassDefFoundError`. It is recorded in
+  `L6-concurrency-lane-complete-20260828.md`.
+
+  **L2's note below was right when it was written** — it measured the strict-arm
+  failure directly and correctly said the cause was no longer `a0168ed03` and
+  that the surviving request came from another site. That site was
+  `alloc_arraylist_iterator`, and L6 landed its refusal arm the same day. Left
+  here because the sequence is the point: three lanes measured the same vector
+  and each was right about a different half of it.
+
   **There is now no known-red vector in the corpus.**
 * `RExceptions` and `RJdkFailure` — **red on `dev` from `c6ccccbc8` (the L5
-  lane) until `L5-residuals-...-20260828.md` §6 fixed it. If you ran the arms in
-  that window you saw two reds that were not yours and are not yours to chase.**
-  Both assert the same thing: an array `ClassNotFoundException` must name the
-  ELEMENT, not the descriptor. Fixed; verify against a binary newer than that
-  fix before spending anything on them.
+  lane) until `39e2ded07` fixed it. If you ran the arms in that window you saw
+  two reds that were not yours and are not yours to chase.** Both assert the
+  same thing: an array `ClassNotFoundException` must name the ELEMENT, not the
+  descriptor. Fixed; verify against a binary newer than that fix before
+  spending anything on them.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
 

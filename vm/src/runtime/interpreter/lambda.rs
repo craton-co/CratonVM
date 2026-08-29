@@ -2114,12 +2114,67 @@ pub(crate) fn build_lambda_impl_cached(
         return None;
     };
     // Cached bytecode bypasses native dispatch, which must retain precedence.
-    if shared
+    //
+    // PROBE THE RECEIVER'S CLASS, NOT ONLY THE DECLARING ONE. This is the
+    // difference between the two doors a bound method reference and a lambda
+    // body take, and it is the whole of the defect that
+    // `known-issues/jdk-only/a-bound-method-reference-is-a-different-dispatch-door`
+    // records:
+    //
+    //   * an ordinary `it.remove()` is an `invokeinterface`, and
+    //     `dispatch_virtual.rs` probes the registry with the RECEIVER's runtime
+    //     class -- `java/util/HashMap$KeyIterator`, which is exactly the name
+    //     `MAP_KEY_ITR_CARRIERS` registers the native under;
+    //   * `it::remove` arrives here, and `find_method_recursive` resolves to
+    //     where `remove()` is DECLARED -- `java/util/HashMap$HashIterator` --
+    //     for which nothing is registered. The single declaring-class probe
+    //     missed, the real `HashIterator.remove()` bytecode ran against an
+    //     instance this VM minted, and it raised `IllegalStateException` off a
+    //     `lastReturned` field nothing had written.
+    //
+    // MEASURED (`probes/MethodRefDoorProbe`, HotSpot 25.0.4+7, identical in
+    // both modes): `it::remove` threw ISE for `HashSet`, `HashMap.keySet()` and
+    // `Properties.keySet()` where `it.remove()` worked; `ArrayList` and
+    // `Hashtable` passed for opposite reasons, which is what made the pair a
+    // discriminator -- `ArrayList$Itr` DECLARES its own `remove()` so the two
+    // classes coincide, and `Hashtable`'s enumerator is java.base's own.
+    //
+    // Declining is the fix rather than dispatching the native here: the caller
+    // falls back to `invoke_on_class_shared`, which already owns native
+    // precedence, virtual retargeting, monitors and the exception rules. This
+    // can only ever move a call from the fast cached path to the ordinary one,
+    // never the other way, and it runs once per (proxy, receiver) cache BUILD
+    // rather than per call.
+    let native_shadows_receiver = {
+        let mut probe = Some(receiver_class_id);
+        let mut hit = false;
+        while let Some(cid) = probe {
+            let Some(c) = store.get(cid) else { break };
+            if shared
+                .natives
+                .native_methods
+                .find(&c.name, method_name, descriptor)
+                .is_some()
+            {
+                hit = true;
+                break;
+            }
+            if cid == declaring_id {
+                break;
+            }
+            probe = c.superclass;
+        }
+        hit
+    };
+    // The declaring class is probed separately because it is reachable as an
+    // INTERFACE (a default method found by `find_method_recursive`'s phase 2),
+    // which the superclass walk above never visits.
+    let native_on_declaring = shared
         .natives
         .native_methods
         .find(&class.name, method_name, descriptor)
-        .is_some()
-    {
+        .is_some();
+    if native_shadows_receiver || native_on_declaring {
         return None;
     }
     // `synchronized` needs the monitor enter/exit this frame builder does
@@ -3198,7 +3253,63 @@ pub(crate) fn try_lambda_dispatch(
             // when it is available; otherwise use the declaring owner found
             // above for private synthetic lambda methods.
             let exact_impl_owner = private_impl_class.or(private_impl_owner);
-            let cached_result = if exact_impl_owner.is_none() {
+            // THE RECEIVER-KEYED NATIVE. An ordinary `it.remove()` is an
+            // `invokeinterface`, and `dispatch_virtual.rs` probes the registry
+            // with the RECEIVER's runtime class. A bound method reference
+            // `it::remove` arrives HERE, where every remaining branch resolves
+            // the method first and so probes with the class that DECLARES it.
+            // For this VM's collection iterators those are different names:
+            // the native is registered on `java/util/HashMap$KeyIterator`
+            // (`MAP_KEY_ITR_CARRIERS`), which does not declare `remove()` --
+            // `java/util/HashMap$HashIterator` does. Resolution walked past the
+            // registration and ran the real body against an instance this VM
+            // minted, which raised `IllegalStateException` off a `lastReturned`
+            // field nothing had written.
+            //
+            // MEASURED (`probes/MethodRefDoorProbe`, HotSpot 25.0.4+7,
+            // IDENTICAL in both modes): `it::remove` threw ISE for `HashSet`,
+            // `HashMap.keySet()` and `Properties.keySet()` where the direct
+            // `it.remove()` worked. `ArrayList` and `Hashtable` passed for
+            // opposite reasons, which is what makes the pair a discriminator
+            // rather than a guess -- `ArrayList$Itr` DECLARES its own
+            // `remove()`, so the two class names coincide, and `Hashtable`'s
+            // view iterator is java.base's own `Hashtable$Enumerator` with no
+            // native in front of it at all.
+            //
+            // SCOPED to the case where the receiver's exact class does NOT
+            // declare the method. When it does declare one, the native and the
+            // body are both on the same class, resolution lands on the name the
+            // registration is keyed to, and the existing native-precedence
+            // rules downstream already decide between them -- this must not
+            // pre-empt that decision. What is left is exactly the case where
+            // the registration is the only thing registered for the receiver's
+            // own class and nothing downstream will ever look at it.
+            let receiver_native = if exact_impl_owner.is_none() {
+                recv_class_id_opt
+                    .filter(|rcv| *rcv != ClassId::new(0))
+                    .filter(|rcv| {
+                        let cm = shared.classes.class_manager.read();
+                        cm.get_class(*rcv)
+                            .map(|c| {
+                                c.find_method(
+                                    &call_site.impl_handle.member_name,
+                                    &call_site.impl_handle.descriptor,
+                                )
+                                .is_none()
+                            })
+                            .unwrap_or(false)
+                    })
+                    .and_then(|_| {
+                        shared.natives.native_methods.find(
+                            &receiver_class,
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                        )
+                    })
+            } else {
+                None
+            };
+            let cached_result = if exact_impl_owner.is_none() && receiver_native.is_none() {
                 recv_class_id_opt
                     .filter(|rcv| *rcv != ClassId::new(0))
                     .map(|rcv| {
@@ -3217,7 +3328,12 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let result = if let Some(owner_id) = exact_impl_owner {
+            let result = if let Some(callback) = receiver_native {
+                // `safe_native_call` rather than a bare `callback(..)`: it is
+                // what every other door uses, and it owns the argument pinning
+                // a native that re-enters Java needs.
+                crate::vm::safe_native_call(shared, thread, callback, &full_args)
+            } else if let Some(owner_id) = exact_impl_owner {
                 crate::vm::invoke_on_class_shared_no_retarget(
                     shared,
                     thread,

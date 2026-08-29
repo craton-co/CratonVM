@@ -149,6 +149,7 @@ inert. The runner now cross-checks the two sets on every run:
 | `RNumbers` | int/long overflow & `MIN_VALUE`, shift masking, **`Math.round` JDK‑6430675 edge**, shortest-form `Double.toString`, `BigInteger`/`BigDecimal` |
 | `RSerial` | `ObjectOutputStream`/`ObjectInputStream` round-trip: primitive + array + nested + **cyclic self-reference** fields, collections |
 | `RCrypto` | SHA‑256/HMAC KATs, AES‑GCM round-trip, **RSA‑2048 OAEP + PKCS1 + sign/verify** |
+| `RSslEndpointIdentification` | raw `SSLEngine` endpoint identification (`CVE-2018-8034` shape): a handshake to a host the server's certificate does not name must be refused even with an accepting `TrustManager`, and the same check must not reject a handshake to the name the certificate actually carries |
 | `RExceptions` | try/catch/finally, NPE/AIOOBE/CCE/arithmetic, **`ArrayStoreException` + covariant/interface-array stores**, cause chains, try-with-resources |
 | `RReflect` | methods/fields/invoke, **runtime annotations (dynamic proxy)**, records + `getRecordComponents`, enums, array reflection |
 | `ROptionalClassForName` | `Class.forName` and `ClassLoader.loadClass` throw `ClassNotFoundException` for an optional dependency absent from the classpath |
@@ -197,6 +198,7 @@ inert. The runner now cross-checks the two sets on every run:
 | `RJdkAqs` | `ReentrantLock` (hold counts, `lockInterruptibly`), `Condition`, `ReentrantReadWriteLock`, `StampedLock`, a custom `AbstractQueuedSynchronizer` |
 | `RJdkPhaser` | `Phaser` against its real `volatile long state`: `arriveAndDeregister` lowering parties and unarrived together, the terminated phase as `phase \| MIN_VALUE` (not `-1`), inertness after termination, tiering, `onAdvance` on a real subclass |
 | `RJdkProcess` | `ProcessHandle` current/parent/children/info/liveness/`onExit`, child process exit code and forcible kill — named P1 |
+| `RJdkProcessStreams` | `Process`/`Runtime.exec` stdin/stdout/stderr are live pipes, not stub streams: byte round-trip through stdin→stdout, stdout/stderr kept separate by default, `redirectErrorStream` merging, and the real child exit code |
 | `RJdkNio` | `Files`/`Path`, `RandomAccessFile`, `FileChannel` incl. **memory mapping** and locks, buffers, `Selector`, **asynchronous close** |
 | `RJdkNet` | DNS, loopback TCP echo, socket options, `SO_TIMEOUT`, close-during-read, loopback UDP |
 | `RJdkSecurity` | digest/HMAC/AES‑GCM/PBKDF2 KATs, `SecureRandom` invariants, RSA sign/verify + key encoding, `SSLContext`/`SSLEngine`, provider lookup |
