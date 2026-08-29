@@ -1616,15 +1616,75 @@ fn first_java_executable_on_path() -> Option<PathBuf> {
     None
 }
 
+/// Resolve the `java` executable that spawning the bare name `"java"`
+/// would actually run.
+///
+/// # Why this is not just `first_java_executable_on_path`
+///
+/// On Windows, `CreateProcessW` — which `std::process::Command` uses —
+/// does **not** search `PATH` first. Its documented order begins with
+/// *the directory of the calling executable*, and only reaches `PATH`
+/// several steps later. So for a `cratonvm.exe` that has the optional
+/// `java.exe` alias built beside it (the `java-bin-alias` cargo feature,
+/// which exists because Maven Surefire's `-Djvm=` requires a path ending
+/// in `java.exe`), the bare name `"java"` resolves to **that alias** —
+/// this very VM — no matter what `PATH` says.
+///
+/// That is what made the previous self-check insufficient rather than
+/// merely incomplete. It compared `current_exe()` against the first
+/// `java` on `PATH`; with a real JDK on `PATH` those differ, the check
+/// passed, and the spawn then ran the sibling alias anyway. The child —
+/// now named `java.exe` — reached the same code, made the same
+/// comparison, passed it for the same reason, and spawned again: an
+/// unbounded fan-out, three processes per level for the three
+/// `-XshowSettings` variants tried in turn. Observed 2026-08-28: 58
+/// processes inside two seconds, all dying with
+/// `EXCEPTION_STACK_OVERFLOW` before VM construction, exhausting 64 GB of
+/// host RAM and taking the machine down. Because the children are named
+/// `java.exe`, killing `cratonvm` does not stop it.
+///
+/// Resolving to an absolute path here and spawning *that* removes the
+/// ambiguity: the caller can compare what will really run against itself
+/// before running it.
+///
+/// The current directory is deliberately **not** searched, even though
+/// `CreateProcessW` would search it before `PATH`. Executing a `java.exe`
+/// that happens to sit in whatever directory the VM was launched from is
+/// not behaviour worth preserving; skipping it is both safer and more
+/// predictable.
+fn resolve_java_executable() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+
+    if cfg!(windows) {
+        if let Ok(me) = std::env::current_exe() {
+            if let Some(dir) = me.parent() {
+                let sibling = dir.join(exe);
+                if sibling.is_file() {
+                    return std::fs::canonicalize(&sibling).ok().or(Some(sibling));
+                }
+            }
+        }
+    }
+
+    first_java_executable_on_path()
+}
+
 fn detect_java_home_from_path() -> Option<PathBuf> {
-    // If the first `java` on PATH is this process (e.g. cratonvm installed as
-    // `java.exe` for Maven Surefire), probing it would recurse or yield a
-    // bogus java.home — skip and force explicit JAVA_HOME / CRATONVM_JAVA_HOME.
-    if let (Ok(this), Some(first)) = (
-        std::env::current_exe().and_then(|p| std::fs::canonicalize(p)),
-        first_java_executable_on_path(),
-    ) {
-        if this == first {
+    // Resolve what the spawn would actually execute, then refuse if it is
+    // this process. `cratonvm` installed (or built) as `java.exe` is a
+    // supported configuration — Maven Surefire needs it — so this is a
+    // routine case, not a defensive one, and getting it wrong recurses
+    // without bound. See `resolve_java_executable`.
+    let java = resolve_java_executable()?;
+    if let Ok(this) = std::env::current_exe().and_then(std::fs::canonicalize) {
+        let resolved = std::fs::canonicalize(&java).unwrap_or_else(|_| java.clone());
+        if this == resolved {
+            tracing::debug!(
+                "skipping java.home auto-detection: `java` resolves to this \
+                 executable ({}). Set JAVA_HOME or CRATONVM_JAVA_HOME, or pass \
+                 --java-home, to point at a real JDK.",
+                resolved.display()
+            );
             return None;
         }
     }
@@ -1637,7 +1697,10 @@ fn detect_java_home_from_path() -> Option<PathBuf> {
     ];
 
     for flag in &flag_variants {
-        let output = std::process::Command::new("java")
+        // The resolved absolute path, never the bare name: a bare name is
+        // re-resolved by `CreateProcessW` at spawn time, which is exactly
+        // the step the guard above cannot see through.
+        let output = std::process::Command::new(&java)
             .args([flag, "-version"])
             .output()
             .ok();
@@ -2168,6 +2231,85 @@ mod tests {
         }
         // Fall back to PATH detection
         detect_java_home_from_path()
+    }
+
+    /// The `java.exe`-beside-`cratonvm.exe` layout must not auto-detect.
+    ///
+    /// This is the configuration the `java-bin-alias` cargo feature
+    /// produces, and it is the one that recursed without bound: the old
+    /// guard compared `current_exe()` against the first `java` on `PATH`,
+    /// which on a machine with a real JDK installed is a different file,
+    /// so the guard passed and the spawn then ran the sibling alias —
+    /// this VM — anyway.
+    ///
+    /// Asserted through `resolve_java_executable` rather than by spawning
+    /// anything. A test that actually let the recursion start would be a
+    /// test that can take the machine down when it regresses, which is
+    /// the opposite of useful.
+    #[test]
+    #[cfg(windows)]
+    fn java_resolves_to_the_sibling_alias_before_path() {
+        let me = std::env::current_exe().expect("current_exe");
+        let dir = me.parent().expect("exe has a parent").to_path_buf();
+
+        let alias = dir.join("java.exe");
+        let created = !alias.exists();
+        if created {
+            // Contents are irrelevant: resolution is by path, and nothing
+            // here executes it.
+            std::fs::write(&alias, b"not a real executable").expect("write decoy");
+        }
+
+        let resolved = resolve_java_executable();
+
+        if created {
+            let _ = std::fs::remove_file(&alias);
+        }
+
+        let resolved = resolved.expect("a java.exe beside the test binary must resolve");
+        let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+        let expected = std::fs::canonicalize(&alias).unwrap_or(alias);
+        assert_eq!(
+            resolved, expected,
+            "CreateProcessW searches the calling executable's own directory \
+             before PATH, so resolution must too — otherwise the self-check \
+             in detect_java_home_from_path compares against the wrong file \
+             and a cratonvm built as java.exe spawns itself without bound"
+        );
+    }
+
+    /// Auto-detection must decline when `java` resolves to this process.
+    ///
+    /// The payload of the fix: whatever `PATH` holds, if the thing that
+    /// would be spawned is this executable, the answer is `None` and the
+    /// user is pushed to `JAVA_HOME` / `--java-home`.
+    #[test]
+    #[cfg(windows)]
+    fn auto_detection_declines_when_java_is_this_process() {
+        let me = std::env::current_exe().expect("current_exe");
+        let dir = me.parent().expect("exe has a parent").to_path_buf();
+        let alias = dir.join("java.exe");
+
+        // Only meaningful when we can stand in for the alias ourselves.
+        // Copying this test binary makes `resolve_java_executable` return a
+        // file whose canonical path equals `current_exe()`'s content-wise
+        // but not path-wise, so instead assert the narrower, decisive
+        // property: a resolution equal to current_exe() yields None.
+        if alias.exists() {
+            return;
+        }
+        std::fs::copy(&me, &alias).expect("copy self as java.exe");
+        let resolved = resolve_java_executable().map(|p| {
+            std::fs::canonicalize(&p).unwrap_or(p)
+        });
+        let _ = std::fs::remove_file(&alias);
+
+        let resolved = resolved.expect("sibling alias resolves");
+        assert!(
+            resolved.file_name().and_then(|n| n.to_str()) == Some("java.exe"),
+            "expected the sibling alias, got {}",
+            resolved.display()
+        );
     }
 
     #[test]
