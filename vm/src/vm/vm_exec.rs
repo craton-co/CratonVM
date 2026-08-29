@@ -16747,6 +16747,40 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
         }
     }
 
+    /// The failure category recorded when the submission failed.
+    ///
+    /// Read straight off the submission — whichever code path failed
+    /// stamped the category at that moment, so nothing here has to infer
+    /// it from the message.
+    fn gpu_future_error_kind(
+        &self,
+        handle: u64,
+    ) -> Option<cratonvm_native_api::registry::GpuErrorKind> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::submission_error_kind(handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Timed wait on a GPU submission, run entirely on this side of the
+    /// native boundary.
+    fn gpu_future_await(&self, handle: u64, timeout_nanos: u64) -> i32 {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::await_submission(self.shared, handle, timeout_nanos)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (handle, timeout_nanos);
+            cratonvm_native_api::registry::GPU_AWAIT_UNSUPPORTED
+        }
+    }
+
     /// GPU device enumeration: delegate to the real CUDA bridge probe.
     ///
     /// `cuda_bridge::probe()` reports the primary device (ordinal 0) or

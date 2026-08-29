@@ -3086,34 +3086,36 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
-        // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR, and every
-        // dimension is stripped. HotSpot never hands an array descriptor to a
-        // loader, so what fails to resolve — and what the exception reports —
-        // is the component:
+        // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
         //
-        //   Class.forName("[Lp.X;")   CNFE msg="p.X"
-        //   Class.forName("[[Lp.X;")  CNFE msg="p.X"
+        // MEASURED on JDK 25, and asserted by two vectors that were already in
+        // the tree before this branch existed:
         //
-        // This branch reported `dotted_name`, i.e. `[Lp.X;`, which is the one
-        // string HotSpot never puts there. `regression-suite/src/RExceptions
-        // .java` asserts both rows and went red on it; the vector's own comment
-        // carries the JDK 25 measurement.
+        //   Class.forName("[Lp.X;")   ->  CNFE msg="p.X"   cause=null
+        //   Class.forName("[[Lp.X;")  ->  CNFE msg="p.X"   cause=null
         //
-        // A descriptor that is not the `L…;` reference form (a primitive array
-        // such as `[I`) cannot reach here — those resolve — but the fallback
-        // keeps the full name rather than inventing one.
-        let element_name = {
-            let stripped = dotted_name.trim_start_matches('[');
-            match stripped.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
-                Some(element) => element.to_string(),
-                None => dotted_name.clone(),
+        // `regression-suite/src/RExceptions.java:382` and
+        // `RJdkFailure.java:168` both check exactly this, and both turned red
+        // when this branch was added with `&dotted_name` -- the descriptor --
+        // as the message. HotSpot resolves the descriptor down to the element
+        // class and reports the resolution that actually failed, which is the
+        // name a caller can act on: `[Lp.X;` is not a name anything can be
+        // asked for again.
+        let element = {
+            let mut e = dotted_name.trim_start_matches('[');
+            if e.starts_with('L') && e.ends_with(';') {
+                e = &e[1..e.len() - 1];
             }
+            // A descriptor whose element is not a reference type (`[I`, or a
+            // malformed spelling) has no element NAME to report; keep what the
+            // caller passed rather than inventing one.
+            if e.is_empty() { dotted_name.clone() } else { e.to_string() }
         };
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &element_name,
+            &element,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }

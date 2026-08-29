@@ -2823,6 +2823,21 @@ pub struct CompiledMethod {
     /// behaviour change until the resume path is wired
     /// (see `docs/feature-designs/deopt-osr.md`).
     pub can_deopt_resume: bool,
+    /// `true` when **no body this artifact spliced commits a side effect**
+    /// — no array store, no `putfield`/`putstatic`, no invoke, no monitor
+    /// action anywhere in the relocated bytecode.
+    ///
+    /// Vacuously `true` for an artifact that spliced nothing, which is why
+    /// the default is `true` rather than `false`: the interpreter pairs it
+    /// with a check of the method's own bytecode PREFIX, and a method with
+    /// no splices is fully described by that prefix.
+    ///
+    /// What it is for: a deopt taken inside a spliced body abandons an
+    /// attempt that ran the caller's bytecode up to the enclosing invoke
+    /// and then part of the callee's. The interpreter may re-run the whole
+    /// method only if neither half can have committed anything observable.
+    /// The prefix answers the first half; this answers the second.
+    pub spliced_bodies_side_effect_free: bool,
     /// deopt-osr Step 7 — `true` once the OSR-exit map emitter has recorded at
     /// least one loop-boundary exit map for this (OSR-compiled) method, i.e. it
     /// can leave a running JIT/OSR frame mid-loop at a loop bci with the loop's
@@ -3100,6 +3115,9 @@ impl CompiledMethod {
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
+            // Vacuously true: an artifact that spliced nothing has no
+            // relocated body that could commit anything.
+            spliced_bodies_side_effect_free: true,
             can_osr_exit: false,
             has_indy_trap: false,
             osr_exit_policy_memo: std::sync::OnceLock::new(),
@@ -3176,6 +3194,9 @@ impl CompiledMethod {
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
+            // Vacuously true: an artifact that spliced nothing has no
+            // relocated body that could commit anything.
+            spliced_bodies_side_effect_free: true,
             can_osr_exit: false,
             has_indy_trap: false,
             osr_exit_policy_memo: std::sync::OnceLock::new(),
@@ -6309,14 +6330,24 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// hibernate, with the sharded run's apparent +18% traced to contention rather
 /// than to compile cost.
 ///
-/// What keeps it off is a CORRECTNESS regression the soak found:
-/// `docs/known-issues/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-20260828.md`.
-/// A 3-byte out-of-bounds read through a spliced accessor raises
-/// `InternalError` ("precise deoptimization unavailable … reason
-/// UnreachedCode") instead of `IndexOutOfBoundsException` — deterministically,
-/// 5 reps per arm. Flip this once that is fixed, and note that the designated
-/// differential gate cannot see this flag at all (it splices zero times in
-/// `ir_vs_singlepass`, which has no VM to supply callee bodies).
+/// What kept it off was a CORRECTNESS regression the soak found — a 3-byte
+/// out-of-bounds read through a spliced accessor raising `InternalError`
+/// instead of `IndexOutOfBoundsException`. **That is FIXED** (2026-08-28,
+/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`):
+/// `lower_inner_with_scopes` was passing `Lowerer::new` an empty
+/// `spliced_ranges`, so every deopt inside a relocated body recorded a bci
+/// the method does not have. `DuplicatedByteBufTest` is `ok=416 failed=0`
+/// with the flag on, 3 reps, matching the flag-off arm.
+///
+/// It is still OFF, and flipping it is a separate decision this comment must
+/// not pre-empt: the soak's own record stages the flip
+/// (`performance/ir-inline-gauntlet-soak-20260828.md`, landed as "do not flip
+/// it yet"), and the blocker being gone is a precondition, not the decision.
+/// Whoever takes it should re-run the 200-class serial netty pass and the
+/// hibernate slice on the fixed binary rather than inheriting the soak's
+/// numbers, and should note that the designated differential gate cannot see
+/// this flag at all (it splices zero times in `ir_vs_singlepass`, which has
+/// no VM to supply callee bodies).
 pub fn ir_inline_enabled() -> bool {
     matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
@@ -21403,6 +21434,9 @@ fn try_compile_inner(
         // it are appended contiguously (`append_ir_inline_site` writes its own
         // code, then recurses), so one range covers the whole chain.
         let mut ir_spliced_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        // See `CompiledMethod::spliced_bodies_side_effect_free`. Vacuously true
+        // until a body is actually spliced.
+        let mut ir_spliced_bodies_pure = true;
         if ir_inline_enabled() {
             if let (Some(ir_resolver), Some(invoke_resolver)) =
                 (ir_inline_resolver, cp_invoke_resolver)
@@ -21499,6 +21533,14 @@ fn try_compile_inner(
                     // increasing, but sorting makes that a property of the data
                     // rather than of the loop above.
                     ir_spliced_ranges.sort_unstable();
+                    // Whether a whole-method replay may re-run this artifact's
+                    // abandoned attempt turns on what that attempt could have
+                    // committed, and half of that is the relocated bodies. Ask
+                    // the same predicate the interpreter's sink asks of the
+                    // caller's own bytecode, over each spliced region.
+                    ir_spliced_bodies_pure = ir_spliced_ranges
+                        .iter()
+                        .all(|&(s, e, _)| !bytecode_commits_side_effect(&combined[s..e], e - s));
                     if ir_stage_reporting() {
                         eprintln!(
                             "[ir] inline-plan {}.{}{}: {} site(s), {} spliced bod{}, {} bytes appended",
@@ -22231,6 +22273,7 @@ fn try_compile_inner(
                             cached.class_name, cached.method_name, cached.method_descriptor
                         );
                         compiled.stamp_deopt_method_key(&method_key);
+                        compiled.spliced_bodies_side_effect_free = ir_spliced_bodies_pure;
                         // The single-pass backend gets its label from the same
                         // key at `Compiler::new`; this backend never had one, so
                         // an optimizing-tier frame was anonymous to every
