@@ -631,6 +631,25 @@ correct of the two.
 
 ## 10. Reproduce
 
+> **The `probes/` tree is no longer in the working tree.** `3b2901531`
+> (*"major doc consistency update before the realeas"*, 2026-08-29) removed 915
+> files and 126 525 lines, the whole probe corpus among them — every probe this
+> record names, and every probe the other six lane records name. The four
+> sweeps are in history and restore in one command each:
+>
+> ```bash
+> git show c8f47f9a5:probes/ThreadShadowSweep.java   > probes/ThreadShadowSweep.java
+> git show c8f47f9a5:probes/ForkJoinShadowSweep.java > probes/ForkJoinShadowSweep.java
+> git show c8f47f9a5:probes/ChmShadowSweep.java      > probes/ChmShadowSweep.java
+> git show 2790005f4:probes/AsyncChannelSweep.java   > probes/AsyncChannelSweep.java
+> git show 2790005f4:probes/ChmElemDbg.java probes/ThreadIntrDbg.java probes/L6MsgProbe.java
+> ```
+>
+> The final verification in §8 ran the compiled classes in `probes/out` — which
+> is untracked build output and survived the deletion — against the newly built
+> binary. That is a measurement of the BINARY with unchanged probe bytecode, not
+> a recompile, and it is stated that way rather than implied.
+
 ```bash
 javac -d probes/out probes/{Thread,ForkJoin,Chm}ShadowSweep.java probes/AsyncChannelSweep.java
 for P in ThreadShadowSweep ForkJoinShadowSweep ChmShadowSweep AsyncChannelSweep; do
