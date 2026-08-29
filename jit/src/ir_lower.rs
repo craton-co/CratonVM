@@ -380,8 +380,18 @@ fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
 /// half stops. Historically `lower()` refused
 /// such a graph up front — see the Gap B bail there for what that cost the
 /// last time the two got out of step.
+///
+/// `pub(crate)` because the ELIGIBILITY decision has to consult it too. The
+/// direct self-recursive call (`emit_self_recursive_call`) marshals the context
+/// pointer plus every Java argument into one of these registers and has no
+/// stack-argument path of its own, so `jit::lib`'s `is_self_recursive_direct`
+/// must refuse a method that does not fit. That check used to be implied by
+/// `lower()`'s whole-method bail; when the prologue learned to read stack
+/// arguments the bail went away and the marshal's assumption became unguarded —
+/// which is the "last time the two got out of step" this doc comment already
+/// warned about, arrived at from the other side.
 #[inline]
-fn incoming_abi_reg_capacity() -> usize {
+pub(crate) fn incoming_abi_reg_capacity() -> usize {
     ENTRY_ABI_REGS.len()
 }
 
@@ -3270,8 +3280,24 @@ impl<'a> Lowerer<'a> {
         // register list `emit_prologue` reads incoming args from: abi[0] = the
         // hidden VM context pointer, abi[1 + i] = Java arg i. Each source is a
         // frame slot (memory), so loading straight into the abi registers cannot
-        // inter-clobber. `1 + num_args <= abi.len()` is guaranteed by the
-        // needs_context bail in `lower()`, so no arg spills off the register file.
+        // inter-clobber.
+        //
+        // `1 + num_args <= abi.len()` is required and is enforced at ELIGIBILITY
+        // (`jit::lib`'s `is_self_recursive_direct`, via
+        // `incoming_abi_reg_capacity`), not here. It used to be implied by
+        // `lower()`'s whole-method bail on a graph with more incoming slots than
+        // registers; when `emit_prologue` learned to read the overflow off the
+        // caller's stack (Gap B) that bail went away and this comment kept
+        // asserting a guarantee nobody was making any more.
+        //
+        // MEASURED, 2026-08-29, Windows: a `static long f(int,int,int,int)`
+        // calling itself is 4 Java args plus the context = 5 against a
+        // four-register file, so `abi[4]` panicked the compiler thread with
+        // `index out of bounds: the len is 4 but the index is 4` — and the
+        // thread does not come back, so the FIRST such method silently disables
+        // the JIT for the rest of the process. SysV has six registers and needs
+        // six arguments to reach it, which is why it showed up on Windows first.
+        // `probes/SelfRecArgs.java` is the arity sweep.
         #[cfg(target_os = "windows")]
         let abi: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
         #[cfg(not(target_os = "windows"))]
