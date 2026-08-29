@@ -36092,10 +36092,42 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((byte_arr, pos, lim, bb_off, big_endian))
         }
 
-        fn bbacb_char_at(
+        /// One read, TWO index contracts — which is the whole point of the
+        /// `relative` flag.
+        ///
+        /// `CharBuffer.charAt(int i)` is `CharSequence`'s, and the JDK's body is
+        /// literally `get(position() + checkIndex(i, 1))` — RELATIVE to the
+        /// current position. `CharBuffer.get(int index)` is the buffer's own
+        /// ABSOLUTE accessor: `Objects.checkIndex(index, limit)` and no
+        /// position anywhere.
+        ///
+        /// Both registrations called this helper and it did `pos + idx`, so
+        /// `get(int)` was silently position-relative. MEASURED against HotSpot
+        /// (`probes/L4TypedBufferSweep.java`, row `char/view get(out,1,2)`):
+        ///
+        /// ```text
+        ///   CharBuffer cb = ByteBuffer.allocate(8).asCharBuffer();  // "abcd"
+        ///   cb.flip(); cb.get();            // position is now 1
+        ///   cb.get(new char[4], 1, 2);
+        ///     HotSpot   .bc.      CratonVM  .cd.
+        /// ```
+        ///
+        /// It reads as a bulk-copy defect and is not one: the position
+        /// bookkeeping was right at every step (1 after the single get, 3
+        /// after the bulk), and `IntBuffer`/`ShortBuffer` views were correct.
+        /// `CharBuffer.get(char[],int,int)` has no native, so the REAL bytecode
+        /// ran and called the absolute `get(int)` once per element — with the
+        /// right indices, onto a body that added the position to them again.
+        /// **The wrong characters were returned with every visible number
+        /// correct.**
+        ///
+        /// This is an `Intrinsic`, so `--jdk-only` does not drop it and the
+        /// defect was identical in both modes.
+        fn bbacb_char_at_impl(
             ctx: &dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
             idx: i32,
+            relative: bool,
         ) -> Result<u16, RuntimeError> {
             let (byte_arr, pos, lim, bb_off, big_endian) = bbacb_read_underlying_bytes(ctx, this)
                 .ok_or(
@@ -36103,7 +36135,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
                 },
             )?;
-            let real = pos + idx;
+            let real = if relative { pos + idx } else { idx };
             if idx < 0 || real >= lim {
                 return Err(char_buffer_index_out_of_bounds());
             }
@@ -36124,6 +36156,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 ((lo << 8) | hi) as u16
             };
             Ok(ch)
+        }
+
+        /// `charAt(int)` — RELATIVE to the position (`CharSequence`'s contract).
+        fn bbacb_char_at(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            idx: i32,
+        ) -> Result<u16, RuntimeError> {
+            bbacb_char_at_impl(ctx, this, idx, true)
+        }
+
+        /// `get(int)` — ABSOLUTE (`Buffer`'s contract).
+        fn bbacb_char_absolute(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            idx: i32,
+        ) -> Result<u16, RuntimeError> {
+            bbacb_char_at_impl(ctx, this, idx, false)
         }
 
         for bbacb in &[
@@ -36161,7 +36211,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     Some(Value::Int(v)) => *v,
                     _ => 0,
                 };
-                let ch = bbacb_char_at(ctx, this, idx)?;
+                // ABSOLUTE — see `bbacb_char_at_impl`. This shared
+                // `bbacb_char_at` with `charAt` and was therefore relative.
+                let ch = bbacb_char_absolute(ctx, this, idx)?;
                 Ok(Some(Value::Int(ch as i32)))
             });
             // get()C — the RELATIVE getter, and the one method on this class
