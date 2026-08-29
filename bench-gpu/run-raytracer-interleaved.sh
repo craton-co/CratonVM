@@ -32,6 +32,17 @@ W="${1:-1920}"
 H="${2:-1440}"
 ROUNDS="${3:-5}"
 ITERS="${ITERS:-30}"
+# Past 8K the frame itself stops fitting in a default heap: 11520x6480 is
+# 74.6M pixels, an `int[]` of 298 MB, and all three arms allocate one. Left
+# empty below 8K so every previously published row is byte-for-byte the same
+# command that produced it.
+XMX="${XMX:-}"
+CV_HEAP=(); HS_HEAP=(); TORNADO_HEAP=()
+if [ -n "$XMX" ]; then
+  # `--jvm=-Xmx...`, joined: tornado.py's argparse reads a separate
+  # `-Xmx10g` as an option of its own and refuses the command.
+  CV_HEAP=(--Xmx "$XMX"); HS_HEAP=("-Xmx$XMX"); TORNADO_HEAP=("--jvm=-Xmx$XMX")
+fi
 # HotSpot best-of at 640x480 on this box with nothing else running. Scaled
 # by pixel count for other resolutions; the kernel is very close to linear
 # in n on the CPU, so this is a good enough contention yardstick.
@@ -58,18 +69,18 @@ tmp="$(mktemp)"
 printf '%-6s %12s %12s %12s   %s\n' round control craton-gpu tornado verdict
 
 for r in $(seq 1 "$ROUNDS"); do
-  ctl=$("$JDK/bin/java" -cp "$CP" RayTracerKernel "$W" "$H" 5 2>/dev/null | best)
+  ctl=$("$JDK/bin/java" "${HS_HEAP[@]}" -cp "$CP" RayTracerKernel "$W" "$H" 5 2>/dev/null | best)
   # Alternate which arm goes first so a systematic warm/cool drift within
   # a round cannot favour one of them.
   if [ $((r % 2)) -eq 1 ]; then
-    a=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 -cp "$CP" \
+    a=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 "${CV_HEAP[@]}" -cp "$CP" \
           RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null | best)
-    b=$(cd "$ROOT" && tornado --classpath bench-tornado RayTracerTornado \
+    b=$(cd "$ROOT" && tornado "${TORNADO_HEAP[@]}" --classpath bench-tornado RayTracerTornado \
           "$W" "$H" "$ITERS" 2>/dev/null | best)
   else
-    b=$(cd "$ROOT" && tornado --classpath bench-tornado RayTracerTornado \
+    b=$(cd "$ROOT" && tornado "${TORNADO_HEAP[@]}" --classpath bench-tornado RayTracerTornado \
           "$W" "$H" "$ITERS" 2>/dev/null | best)
-    a=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 -cp "$CP" \
+    a=$("$CV" --java-home "$JDK" --gpu --gpu-min-work 1 "${CV_HEAP[@]}" -cp "$CP" \
           RayTracerKernel "$W" "$H" "$ITERS" 2>/dev/null | best)
   fi
   verdict=$(awk -v c="$ctl" -v l="$limit" -v x="$a" -v y="$b" 'BEGIN {

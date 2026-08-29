@@ -457,6 +457,63 @@ another, in the worse direction, since a spurious
 once. Reverted. Closing row 81 needs a generation counting structural GROWTH
 rather than size, and the deque has no field to hold one.
 
+#### A FOURTH cost, found 2026-08-29 after the lane landed: one unit test left red, and the mock hole under it
+
+`cargo test -p cratonvm-native-collections --test gc_native_pins` went red on
+`array_deque_iterator_roots_snapshot_graph_across_allocations`, deterministically,
+5/5. The lane's own verification is arms and probes — `114/114 --jdk-only,
+74/74 SUITE=core` — and neither runs this crate's Rust unit tests, so a red that
+`cargo test` catches in 0.01 s survived a full landing gate.
+
+**The message named a defect that is not there.** It read
+`iterator lost backing deque: Int(-1)`, because the test hard-coded
+`get_field(iterator, 2)` against the retired fabrication's layout
+(`0 = array, 1 = cursor, 2 = backing deque`) and the real carrier's slot 2 is
+`lastRet`, which the mint sets to `-1`. `Int(-1)` in a reference slot is exactly
+the shape of the `gc::guard` "descriptor-aware field access DESTROYED the value"
+family, so the obvious reading of that panic sends the next reader after a
+coercion bug in a path that has none. The graph is fine; the test was pinning a
+contract the change deliberately replaced:
+
+```text
+  DeqIterator[b + 0] -> ArrayList-shaped wrapper
+                           wrapper[elementData] -> Object[n + 1]
+                                                     [0..n) elements
+                                                     [n]    THE SOURCE DEQUE
+  DeqIterator[b + 1] = cursor  = 0
+  DeqIterator[b + 2] = lastRet = -1        b = object_num_fields - 3
+```
+
+The test now WALKS that graph — trailing-three convention, the wrapper's one
+array-valued field, the array's trailing capacity slot — rather than indexing
+three slots that belong to three different classes, and asserts the carrier
+class by name so a silent return to a fabrication cannot leave it green.
+
+**The mock hole is the part worth keeping.** `MockCtx` did not override
+`class_num_total_fields`, so it used the trait default: **zero declared fields
+for every class**. That is not a neutral default here. `alloc_arraylist_iterator_as`
+mints `class_num_total_fields + 3`, and `al_itr_alt_base` recognises this crate's
+own mint by that EXACT width — behind an early-out for anything four fields or
+narrower. A carrier reporting zero is minted three wide, trips the early-out, and
+`al_itr_delegate_foreign` sends it to real bytecode, of which a mock has none.
+So `hasNext` answered `Ok(None)` and **the entire `VALUES_ITR_CARRIERS` path was
+unreachable from unit tests, silently** — the same species as the two traps
+above, one level further out: not a registration nobody produces, but a test
+context in which nobody can produce one. `MockCtx::declare_class_fields` closes
+it; the test declares `DeqIterator`'s real four (`this$0`, `cursor`,
+`remaining`, `lastRet`) and asserts the minted width is 7.
+
+Falsified before landing, twice, each against the restored source: skipping the
+source's `read_native_pin` fails the `assert_ne!` that names it, and skipping an
+element's fails on the element's class id. No production code changed.
+
+**The latent coupling this leaves.** `AL_ITR_PLAIN_MAX_FIELDS` (4) must stay
+below every carrier's mint width, i.e. below `class_num_total_fields + 3` for
+every entry in `VALUES_ITR_CARRIERS`. Today the narrowest is 4 declared fields
+(`TreeMap$KeyIterator`, `ArrayDeque$DeqIterator`), so the margin is three. A
+future carrier with one declared field would be delegated to its own bytecode
+without a word.
+
 ### 6.2 `PriorityQueue.iterator().remove()` does not write through — FIXED 2026-08-29
 
 Was 1 row: `size()` answered 3 after an `iterator().remove()` where HotSpot
