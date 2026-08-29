@@ -298,6 +298,7 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
 
     registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
+    registry.register(KLASS, "arrayWrapShort", "([S)J", builtin_array_wrap_short);
     registry.register(KLASS, "arrayWrapFloat", "([F)J", builtin_array_wrap_float);
     registry.register(KLASS, "arrayWrapDouble", "([D)J", builtin_array_wrap_double);
     // 2026-07-11: device-only allocation (`GpuArray.allocate`, no host
@@ -315,6 +316,12 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "arrayAllocateLong",
         "(I)J",
         builtin_array_allocate_long,
+    );
+    registry.register(
+        KLASS,
+        "arrayAllocateShort",
+        "(I)J",
+        builtin_array_allocate_short,
     );
     registry.register(
         KLASS,
@@ -345,6 +352,7 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     );
     registry.register(KLASS, "arrayIsResident", "(J)Z", builtin_array_is_resident);
 
+    registry.register(KLASS, "gemm", "(JJJIIIZ)J", builtin_gemm);
     registry.register(KLASS, "futureErrorKind", "(J)I", builtin_future_error_kind);
     registry.register(KLASS, "futureAwait", "(JJ)I", builtin_future_await);
     registry.register(KLASS, "releaseFuture", "(J)V", builtin_release_future);
@@ -647,10 +655,28 @@ fn fill_java_array(
                 ctx.set_array_element(obj, i, Value::Double(v));
             }
         }
+        ArrayElementType::Short => {
+            for i in 0..element_count {
+                let off = i * 2;
+                if off + 2 > bytes.len() {
+                    break;
+                }
+                let v = i16::from_ne_bytes(bytes[off..off + 2].try_into().unwrap());
+                ctx.set_array_element(obj, i, Value::Int(v as i32));
+            }
+        }
         _ => {
-            // Reference / Boolean / Char / Byte / Short — Phase 3 surface
-            // only declares int/long/float/double wraps. If a caller ever
-            // lands here, leave the array zero-initialized.
+            // Reference / Boolean / Char / Byte. If a caller ever lands
+            // here, leave the array zero-initialized.
+            //
+            // AUDIT 2026-08-29: `Short` used to be in this list, and
+            // silently doing nothing was much worse than it looks. The
+            // fp16 element type is a `short[]` of binary16 bit patterns,
+            // so `arrayWrapShort` recorded a length with an EMPTY byte
+            // vector, the GEMM path uploaded a zero-length device buffer,
+            // and the kernel read past the end of it —
+            // CUDA_ERROR_ILLEGAL_ADDRESS, surfacing several calls later at
+            // an unrelated `releaseArray`. The snapshot side is below.
         }
     }
 }
@@ -722,8 +748,27 @@ fn snapshot_java_array(
                 }
             }
         }
+        ArrayElementType::Short => {
+            // The fp16 element type: binary16 bit patterns carried in a
+            // Java `short[]`. Nothing here interprets them.
+            bytes.reserve_exact(length * 2);
+            for i in 0..length {
+                // The VM widens a short to Value::Int on read, as the JVM
+                // does; narrowing back is what stores the two bytes.
+                if let Value::Int(v) = ctx.get_array_element(array, i) {
+                    bytes.extend_from_slice(&(v as i16).to_ne_bytes());
+                } else {
+                    bytes.extend_from_slice(&0i16.to_ne_bytes());
+                }
+            }
+        }
         _ => {
             // Reference arrays are out-of-scope for the Phase-3 surface.
+            //
+            // Note that landing here yields an EMPTY byte vector alongside
+            // a non-zero length, which every caller has to be ready for —
+            // see the audit note in `fill_java_array` for what that cost
+            // when `Short` was in this arm.
         }
     }
     (element_type, length, bytes)
@@ -1556,6 +1601,51 @@ fn builtin_future_is_done(
     Ok(Some(Value::Int(if done { 1 } else { 0 })))
 }
 
+/// `Native.gemm(long a, long b, long c, int m, int n, int k, boolean half) -> long`
+///
+/// Built-in matrix multiply: `C[MxN] = A[MxK] * B[KxN]`, row-major.
+///
+/// The three arrays are `GpuArray` handles rather than Java arrays so
+/// their device buffers stay resident between calls — a decode step
+/// multiplies by the same weights every token, and re-uploading them
+/// would cost more than the arithmetic does.
+///
+/// `half` selects fp16 inputs with an fp32 accumulator. `C` is fp32 in
+/// both variants: the caller usually wants full precision, and writing
+/// fp16 would round twice for nothing.
+///
+/// Returns a submission handle, or `0` when this VM has no GPU offload —
+/// the same "not available" convention `submitMethodHandle` uses, which
+/// the Java side turns into a clear exception rather than a silent
+/// no-op.
+#[cfg(feature = "gpu-offload")]
+fn builtin_gemm(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let a = arg_long(args, 0) as u64;
+    let b = arg_long(args, 1) as u64;
+    let c = arg_long(args, 2) as u64;
+    let m = arg_int(args, 3);
+    let n = arg_int(args, 4);
+    let k = arg_int(args, 5);
+    let half = arg_int(args, 6) != 0;
+
+    let handle = ctx
+        .gpu_dispatch_gemm(half, a, b, c, m, n, k)
+        .unwrap_or(0);
+    Ok(Some(Value::Long(handle as i64)))
+}
+
+/// Shim for a build without `gpu-offload`: report "not available".
+#[cfg(not(feature = "gpu-offload"))]
+fn builtin_gemm(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[cratonvm_types::Value],
+) -> cratonvm_types::error::MethodCallResult {
+    Ok(Some(cratonvm_types::Value::Long(0)))
+}
+
 /// `Native.futureErrorKind(long futureHandle) -> int`
 ///
 /// The failure category for a failed submission, so the Java side can
@@ -1848,6 +1938,22 @@ fn builtin_array_wrap_float(
     wrap_primitive_array(ctx, args)
 }
 
+/// `Native.arrayWrapShort(short[]) -> long`
+///
+/// The fp16 element type. Java has no half, so a `short[]` carries the
+/// IEEE-754 binary16 bit patterns and nothing on this side interprets
+/// them — `wrap_primitive_array` records the bytes and their
+/// `ArrayElementType::Short` tag, and only the fp16 kernels read them as
+/// `__half`. That keeps the representation honest: a `short[]` of half
+/// bits IS what the device wants, not a lossy stand-in for one.
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_wrap_short(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    wrap_primitive_array(ctx, args)
+}
+
 /// `Native.arrayWrapDouble(double[]) -> long`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_wrap_double(
@@ -1914,6 +2020,18 @@ fn builtin_array_allocate_long(
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     allocate_primitive_array(ArrayElementType::Long, 8, args)
+}
+
+/// `Native.arrayAllocateShort(int length) -> long`
+///
+/// Two bytes per element: the fp16 buffer type. See
+/// `builtin_array_wrap_short`.
+#[cfg(feature = "gpu-offload")]
+fn builtin_array_allocate_short(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    allocate_primitive_array(ArrayElementType::Short, 2, args)
 }
 
 /// `Native.arrayAllocateFloat(int length) -> long`
