@@ -19,7 +19,7 @@ been removed again.
 | lane | owner | worktree | branch |
 | --- | --- | --- | --- |
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
-| **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
+| **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
 | **L7 definition of done** | **DONE 2026-08-28** — all three workloads run to completion under `--jdk-only`, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms, four VM fixes, 4 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `the-definition-of-done-run-on-the-three-real-workloads-20260828.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
@@ -256,8 +256,8 @@ planning:
 | item | owner |
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
-| `Arena`/`MemorySegment`/`ValueLayout`/`StructLayout`/`SequenceLayout` report an INTERFACE as an instance's class | **BEHAVIOURALLY CLOSED 2026-08-29**, identity still open. 199 differential rows (`apps/probes/FfmSegmentSweep.java`) found **nine behavioural defects** beside the identity one — a read-only segment that accepted writes, `ByteOrder` minted per call so `order() == nativeOrder()` was false, `Arena.global().close()` succeeding, and six missing refusals — all fixed and 0-diff. The 27 remaining rows (47 under `--jdk-only`) are the identity family, and BOTH modes are wrong differently: compatible INSTANTIATES `cratonvm.internal.foreign.MemorySegmentImpl`, strict lands on the interface. Sized in `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md` §4. |
-| ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
+| `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
+| **The BEHAVIOURAL half of the same surface: CLOSED 2026-08-29.** 199 differential rows over the segment/arena/layout API (`apps/probes/FfmSegmentSweep.java`) found **nine defects that are not identity** and every one is now 0-diff in both modes: a native `asReadOnly()` segment ACCEPTED WRITES; `ByteOrder` was minted per call so `ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()` was false; `Arena.global().close()` succeeded; `allocate(-1)`, two bad alignments and `ofArray(null)` did not refuse; and `s.asSlice(0, s.byteSize()).equals(s)` was false. The identity rows to the left are what REMAINS after those. | **DONE** — `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`. It also measures what the identity defect does NOT break: `isInstance`, `instanceof`, `isAssignableFrom` and a class-keyed `HashMap` round-trip all answer correctly on an interface-classed segment, in both modes — so the contract decision to the left is a decision about identity alone. || ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
@@ -348,8 +348,15 @@ of on the test result.
 
 ### Known-red vectors, so you can tell yours from theirs
 
-* `RJdkEnumerations` — dev's `a0168ed03`, bisected, recorded. Expect it red in
-  the strict and `all` arms.
+* `RJdkEnumerations` — **the cause on the strict arm is NOT `a0168ed03` any
+  more.** L6 fixed that one. MEASURED by L2 on 2026-08-29, running the vector
+  directly under `--jdk-only`: `NoClassDefFoundError:
+  cratonvm/internal/ArrayListViewItr`, identical with the builder enforcement
+  dial armed and unarmed. That is a refused FABRICATION — a Phase-1 item, not a
+  Phase-2 one — and it is UNOWNED. `native-collections/src/lib.rs:7206` already
+  carries the refusal landing for this symptom, so the surviving request is from
+  another site; see `l2-strings-residuals-the-migration-is-unpriced-20260828.md`
+  §4. Expect it red in the strict and `all` arms until someone takes it.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
 
