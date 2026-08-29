@@ -1570,11 +1570,23 @@ compaction_cycles=24 objects_relocated=3168136 relocation_on_proven_jit=24
   vacated_spans=4315 vacated_bytes=9023929152
 ```
 
-**5.4 GB and 9.0 GB handed back over a run, on a 512 MB heap.** That is ten to
-eighteen heaps' worth of space the slide used to empty and discard, and it is
-the number that says what "reclaim was the cursor drop and nothing else" cost —
-not the largest free block, not the OOM count, but the volume of memory the
-collector was doing the work of freeing and then not freeing.
+**5.4 GB and 9.0 GB republished over a run, on a 512 MB heap** — ten to
+eighteen heaps' worth, roughly 340 MB per cycle.
+
+**Read that number for what it is.** It is the volume handed back as
+PAGE-GRANULAR spans, and a selected page can be 100 % garbage, in which case the
+sweep had already free-listed its objects one at a time. So `vacated_bytes` is
+not all newly-recovered memory: it is the sum of (a) the space the slide's own
+survivors vacated, which really was lost before — bounded by `objects_relocated`
+times the mean object, so ~19 MB per cycle here — and (b) free space that
+existed only as dust and now exists as 2 MiB blocks.
+
+(b) is not a rounding error, it is the point. `largest_free_block=8184` with
+707 MB free was the failure; a free list of the same bytes in page-sized pieces
+is a different heap. The accounting stays exact either way —
+`compact_low_to` clears the low list and rebuilds it from the kept blocks plus
+the spans, and a kept block inside a span is dropped rather than kept beside
+it — so nothing is counted or handed out twice.
 
 **One cost is known and deliberately not optimised yet.** The span is zeroed
 with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
