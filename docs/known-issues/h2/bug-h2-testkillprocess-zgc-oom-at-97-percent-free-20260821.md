@@ -1529,6 +1529,18 @@ them. Two details are load-bearing:
   argument about the partition, not about what is in the span. It can only DROP
   a span, i.e. reclaim less.
 
+**One cost is known and deliberately not optimised yet.** The span is zeroed
+with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
+bytes — about four times what the slide itself copies — inside the pause. The
+cheaper form is the one the sweep already uses (`zgc_sweep_header_zero`): only
+the `ObjectHeader` of each address the slide vacated needs clearing, because
+"the body is only reachable through that header", and the caller has exactly
+that list in `pairs`. It is not done that way here because the safe version is
+unconditional and the cheap version depends on getting "which `from` addresses
+are above `dest` and therefore not already overwritten by a memmove" right —
+and getting that wrong zeroes a live object rather than costing a memset. Worth
+doing, worth doing with its own test.
+
 `CRATONVM_ZGC_PUBLISH_VACATED=0` is the same-binary bisect, and it is per heap
 so the A/B runs inside one test binary — which is what
 `a_slide_that_cannot_drop_the_cursor_still_frees_what_it_emptied` does: the
