@@ -1464,13 +1464,10 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
-<<<<<<< HEAD
-=======
 /// `Native.futureStatus(long futureHandle) -> int`
 ///
 /// Status codes (mirrors the Java side enum-ordinal layout in the spec):
 ///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
->>>>>>> origin/dev
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
