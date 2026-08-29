@@ -6641,33 +6641,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| fsp_new_input_stream(ctx, args, 0),
     );
 
-    r.register(
-        files,
-        "newBufferedReader",
-        "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;)Ljava/io/BufferedReader;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match p57_read_to_string(&p) {
-                Ok(content) => files_make_buffered_reader_over_string(ctx, &content),
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
-    );
-
-    r.register(
-        files,
-        "newBufferedReader",
-        "(Ljava/nio/file/Path;)Ljava/io/BufferedReader;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, path_obj);
-            match p57_read_to_string(&p) {
-                Ok(content) => files_make_buffered_reader_over_string(ctx, &content),
-                Err(e) => Err(p57_io_error(&e)),
-            }
-        },
-    );
+    // `Files.newBufferedReader` — RETIRED 2026-08-28 (lane L4), both overloads.
+    //
+    // The two bodies that stood here read the WHOLE FILE with
+    // `p57_read_to_string` and handed back a reader over the resulting string.
+    // The real method is
+    //
+    //     new BufferedReader(new InputStreamReader(Files.newInputStream(path), cs))
+    //
+    // which STREAMS, and whose `Files.newInputStream` is registered a few lines
+    // above and matches HotSpot on every input this lane measured — including
+    // the one row the eager readers got wrong:
+    //
+    //   Files.newBufferedReader(<a directory>)
+    //     HotSpot   no-throw at open; IOException on the first read
+    //     shim      IOException at open   (std::fs::read of a directory)
+    //
+    // So the shim was buying a whole-file read, in memory, at open, in exchange
+    // for a refusal at the wrong moment. Retiring it is one fix for both.
+    // `probes/L4FilesSweep.java` covers the open/read/refusal rows.
 
     // RWF86.1 (gated): native shims for BufferedReader.read([CII)I and read()I.
     //
@@ -6810,6 +6802,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     //     "if (out == null) throw new IOException("Stream closed")" — so the
     //     `None => return Ok(None)` arms were silently DISCARDING writes to a
     //     closed writer, the exact use-after-close the JDK raises on.
+    // `java/io/BufferedWriter` — RETIRED FROM THE SHIPPING BUILDS 2026-08-28
+    // (lane L4). Everything below is now behind `synthetic-jdk`, which is the
+    // only build where the second arm of each body can fire.
+    //
+    // Each of the six has exactly two arms: a delegating arm that forwards to
+    // the wrapped `out`, and an fd-backed arm reached through
+    // `bw_synthetic_fd` — and that helper is itself
+    // `#[cfg(feature = "synthetic-jdk")]` and answers `None` in every shipping
+    // build, because `Files.newBufferedWriter`'s fd path was deleted on
+    // 2026-08-05. So in `--jdk-only` and `--real-jdk` these six were pure
+    // pass-throughs standing in front of the real class, and they cost two
+    // things:
+    //
+    //   * the BUFFERING. MEASURED: `new BufferedWriter(sw, 4).write("ab")`
+    //     reached the delegate immediately, where HotSpot holds it
+    //     (`probes/L4StreamTailSweep.java`, row `writer buffered`).
+    //   * the class's OWN argument contract, which is not the delegate's.
+    //     MEASURED: `bw.write((String) null, 0, 1)` forwarded the null blind
+    //     and one character of the word "null" was written to the file as
+    //     data; the bounds failures came back as the delegate's exception type
+    //     rather than `String.getChars`'s.
+    //
+    // Both were repaired in the delegating arm earlier in this lane, which is
+    // what made the retirement provable rather than plausible: the arm is now
+    // an exact re-implementation of what the real class already does, and the
+    // probes that pin it (`L4StreamTailSweep`, `TailFamilySweep`) are 0-diff
+    // against HotSpot in both modes with the real bytecode running instead.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let bw_class = "java/io/BufferedWriter";
     r.register(bw_class, "write", "(Ljava/lang/String;II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -7080,6 +7101,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Int(-1));
         Ok(None)
     });
+    } // end #[cfg(feature = "synthetic-jdk")] java/io/BufferedWriter block
 
     r.register(
         files,
@@ -10185,6 +10207,9 @@ pub(crate) fn p57_closed_channel(ctx: &mut dyn NativeContext) -> MethodCallFaile
 /// `newLine` and `flush` in the real class opens with that check, so a
 /// BufferedWriter whose `out` is null must refuse rather than accept the
 /// characters and drop them.
+/// Only the `synthetic-jdk` `BufferedWriter` arms raise this; the shipping
+/// builds get `ensureOpen()`'s own `IOException` from the real class.
+#[allow(dead_code)]
 fn bw_stream_closed() -> MethodCallFailed {
     RuntimeError::IOException {
         message: "Stream closed".into(),
@@ -14225,13 +14250,42 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
                     | b','
             )
     }
+    // NON-ASCII IS LEFT LITERAL, and that is not a shortcut — it is what
+    // `java.net.URI` does. `File.toURI()` is `new URI("file", null,
+    // slashify(path), null)`, and the multi-argument constructor renders its
+    // string through `URI.quote`, which escapes a character below U+0080 only
+    // when the mask rejects it and otherwise **appends it unchanged**; only
+    // `toASCIIString()` encodes the rest. MEASURED:
+    //
+    //   new File("unicode/é中文").toURI().toString()
+    //     HotSpot   file:/…/unicode/é中文
+    //     CratonVM  file:/…/unicode/%C3%A9%E4%B8%AD%E6%96%87
+    //
+    // Percent-encoding it here made `toString()` and `getPath()` disagree with
+    // every real JDK, and made a URI built from a non-ASCII filename compare
+    // unequal to the one HotSpot builds from the same file.
+    //
+    // The exception `URI.quote` itself carries is kept: a non-ASCII SPACE or
+    // control character is still escaped, because those are the two classes
+    // it does encode above U+0080.
     let mut out = String::with_capacity(path.len());
-    for &b in path.as_bytes() {
-        if keep(b) {
-            out.push(b as char);
+    for c in path.chars() {
+        if c.is_ascii() {
+            let b = c as u8;
+            if keep(b) {
+                out.push(c);
+            } else {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
+        } else if c.is_whitespace() || c.is_control() {
+            let mut buf = [0u8; 4];
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
         } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", b));
+            out.push(c);
         }
     }
     out
@@ -14530,8 +14584,51 @@ pub(crate) fn fs_list_roots_bitmask() -> i32 {
 // lone surrogate, so encoding one to units and back is exact — the wrappers
 // lose nothing they did not already lack, and the two spellings cannot drift.
 
-/// `/` or `\` — the two separators Java accepts on input on every platform.
+/// The separator(s) `java.io.File` accepts **on this platform**.
+///
+/// This used to answer "`/` or `\`, on every platform", with a comment saying
+/// Java accepts both everywhere. It does not. `java.io.File` delegates to
+/// `FileSystem`, and `UnixFileSystem`'s separator is `/` alone — on Unix a
+/// backslash is an ORDINARY FILENAME CHARACTER, and a file really can be called
+/// `a\b`. MEASURED on Linux with `probes/FilePathSweep.java`, 46 differing rows
+/// over seven backslash-bearing inputs, every one of them this single cause:
+///
+/// ```text
+///   new File("..\..\up").getName()      HotSpot "..\..\up"   CratonVM "up"
+///   new File("..\..\up").getParent()    HotSpot null           CratonVM "..\.."
+///   new File("\x").isAbsolute()          HotSpot false          CratonVM true
+///   new File("trailing\").getName()      HotSpot "trailing\"   CratonVM "trailing"
+/// ```
+///
+/// The second row is the one that reaches ordinary code: a file whose name
+/// contains a backslash — which a Windows-authored filename copied onto a Linux
+/// box routinely does — was split into a directory and a basename that do not
+/// exist, so `getParentFile().mkdirs()` created a WRONG DIRECTORY and the file
+/// was written somewhere nobody asked for. The third turns a relative path into
+/// an absolute one.
+///
+/// The Windows arm is unchanged and is still both characters, which is what the
+/// 23 `#[cfg(windows)]` tests in this file pin.
 fn u_is_sep(c: u16) -> bool {
+    #[cfg(windows)]
+    {
+        c == u16::from(b'/') || c == u16::from(b'\\')
+    }
+    #[cfg(not(windows))]
+    {
+        c == u16::from(b'/')
+    }
+}
+
+/// `/` or `\`, on every platform — for the two callers that genuinely mean
+/// "either spelling", rather than "a separator here".
+///
+/// [`u_is_sep`] is platform-specific because `java.io.File`'s own separator is.
+/// A URI's syntax is not: `file:\C:\...` is a spelling this VM is documented to
+/// receive (see `file_uri_reject`), and the scan that classifies it must accept
+/// a backslash on a Linux host too or it would newly reject a URI it has always
+/// accepted.
+fn u_is_sep_either(c: u16) -> bool {
     c == u16::from(b'/') || c == u16::from(b'\\')
 }
 
@@ -15758,9 +15855,10 @@ pub(crate) fn file_alloc_units(
 /// cannot be grounded must not invent a refusal. An unreadable text answers
 /// `None`, which is the pre-existing behaviour exactly.
 ///
-/// The separator tests use [`u_is_sep`] rather than `/` alone, so the mangled
-/// `file:\C:\...` spelling this constructor is documented to receive on
-/// Windows keeps working instead of being newly rejected as opaque.
+/// The separator tests use [`u_is_sep_either`] rather than `/` alone, so the
+/// mangled `file:\C:\...` spelling this constructor is documented to receive
+/// keeps working instead of being newly rejected as opaque — on a Linux host
+/// too, where [`u_is_sep`] is `/` only.
 fn file_uri_reject(raw: &[u16]) -> Option<&'static str> {
     if raw.is_empty() {
         return None;
@@ -15772,7 +15870,7 @@ fn file_uri_reject(raw: &[u16]) -> Option<&'static str> {
     // query or fragment delimiter comes first -- otherwise the URI is relative.
     let stop = raw
         .iter()
-        .position(|&c| u_is_sep(c) || c == quest || c == hash);
+        .position(|&c| u_is_sep_either(c) || c == quest || c == hash);
     let scheme_end = match (raw.iter().position(|&c| c == colon), stop) {
         (Some(i), Some(j)) if i > j => return Some("URI is not absolute"),
         (Some(0), _) | (None, _) => return Some("URI is not absolute"),
@@ -15784,12 +15882,15 @@ fn file_uri_reject(raw: &[u16]) -> Option<&'static str> {
     }
     let rest = &raw[scheme_end + 1..];
     // Opaque: the scheme-specific part does not begin with a separator.
-    if !rest.first().is_some_and(|&c| u_is_sep(c)) {
+    if !rest.first().is_some_and(|&c| u_is_sep_either(c)) {
         return Some("URI is not hierarchical");
     }
-    if rest.len() >= 2 && u_is_sep(rest[1]) {
+    if rest.len() >= 2 && u_is_sep_either(rest[1]) {
         let after = &rest[2..];
-        let alen = after.iter().position(|&c| u_is_sep(c)).unwrap_or(after.len());
+        let alen = after
+            .iter()
+            .position(|&c| u_is_sep_either(c))
+            .unwrap_or(after.len());
         // An EMPTY authority (`file:///x`) is `getAuthority() == null`, which
         // is the ordinary spelling and must not be refused.
         if alen > 0 {
@@ -16848,7 +16949,26 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // (no `//authority`). Emitting `file://` + `/C:/...` produced the
         // malformed `file:///C:/...` whose `URI.toURL()` returned null and
         // broke every `URLClassLoader` built from `File.toURI().toURL()`.
-        let mut dir_path = path.replace('\\', "/");
+        // `slashify` IS PLATFORM-SPECIFIC. `File.toURI()` calls
+        // `fs.slashify(path)`, which on `WinNTFileSystem` rewrites `\` to `/`
+        // and on `UnixFileSystem` does nothing at all — because on Unix a
+        // backslash is an ordinary filename character, so rewriting it renames
+        // the file. What happens to it instead is that `ParseUtil.encodePath`
+        // escapes it, `\` not being a URI path character. MEASURED on Linux,
+        // nine rows of `probes/FilePathSweep.java`:
+        //
+        //   new File("relative\win\path").toURI()
+        //     HotSpot   file:/…/relative%5Cwin%5Cpath
+        //     CratonVM  file:/…/relative/win/path      <- three directories
+        //
+        // The CratonVM answer does not merely render differently: round-tripped
+        // through `new File(uri)` it names a DIFFERENT FILE, three levels down a
+        // tree that does not exist.
+        let mut dir_path = if cfg!(windows) {
+            path.replace('\\', "/")
+        } else {
+            path.clone()
+        };
         if !dir_path.starts_with('/') {
             dir_path = format!("/{dir_path}");
         }

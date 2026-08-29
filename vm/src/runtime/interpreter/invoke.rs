@@ -348,30 +348,16 @@ pub(crate) fn invokevirtual_site_final_owner(
     }
     let cp_class_id = cm.find_class_by_name_for_class(target_class, current_class_id)?;
     let store = cm.class_store();
-    let (method, declaring_id) =
-        crate::classloading::find_method_recursive(cp_class_id, method_name, descriptor, store)?;
-    if method.access_flags.intersects(
-        MethodAccessFlags::ABSTRACT
-            | MethodAccessFlags::STATIC
-            | MethodAccessFlags::NATIVE
-            | MethodAccessFlags::PRIVATE,
-    ) {
-        return None;
-    }
-    let method_is_final = method.access_flags.contains(MethodAccessFlags::FINAL);
-    // A `final` CLASS makes every one of its methods unoverridable too. Ask
-    // about the class the constant pool NAMES, not only the one that declares
-    // the method: the receiver must be an instance of the CP class, so if that
-    // is final the receiver's class IS it, and selection cannot reach anywhere
-    // `find_method_recursive` did not just look.
-    let class_is_final = |id| {
-        store
-            .get(id)
-            .is_some_and(|c| c.access_flags.contains(cratonvm_reader::class_access_flags::ClassAccessFlags::FINAL))
-    };
-    if !method_is_final && !class_is_final(cp_class_id) && !class_is_final(declaring_id) {
-        return None;
-    }
+    // The selection rule itself lives beside its two siblings in
+    // `classloading` — see `invokevirtual_final_declaring_class`. What stays
+    // here is this door's POLICY: the kill switch above and the engagement
+    // counter below.
+    let declaring_id = crate::classloading::invokevirtual_final_declaring_class(
+        cp_class_id,
+        method_name,
+        descriptor,
+        store,
+    )?;
     let owner = store.get(declaring_id).map(|c| c.name.to_string())?;
     cratonvm_jit::FINAL_INVOKEVIRTUAL_PINNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(owner)

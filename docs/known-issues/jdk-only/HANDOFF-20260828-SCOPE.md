@@ -14,11 +14,23 @@ Lane docs: `HANDOFF-20260828-L1-unsafe.md` … `L7-definition-of-done.md`.
 | --- | --- | --- | --- |
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-28** — 483 rows, 20 fixed, 0 residuals | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **TAKEN 2026-08-28** | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
-| **L4 `java.io` / `java.nio`** | **DONE 2026-08-28** — 199 native-won triples, 1461 probe rows, 49 defects fixed, 3 recorded residuals. Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| L1, L3, L6, L7 | unclaimed | your own worktree | your own branch |
+| **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
+| **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
+| **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
+| L3, L7 | unclaimed | your own worktree | your own branch |
 
 **L5 is DONE and `lang_class.rs` is free again.** L2 is taken (see the table).
-Everything else is unclaimed.
+L1, L4 and L6 are DONE. Everything else is unclaimed.
+
+**RE-RUN YOUR FAMILY'S EXISTING PROBES ON THE FINAL BINARY, not only the ones
+you wrote.** L4's five new probes were all 0-diff and the lane looked finished;
+running the four `java.io` probes that were already in the tree found
+`probes/FilePathSweep.java` at **94 differing lines** and the largest single
+cause in that lane — a path predicate whose own comment claimed it was
+platform-independent and was not. A new probe asks the questions its author
+thought of, and L4's author was on a Linux host and did not think of
+backslashes. Cheap to do, and it is the only step that can catch what your
+fixes broke as well as what they missed.
 
 Two items L5 first recorded as OPEN were later FIXED, and both had been deferred
 for reasons that one lookup would have refuted — `Module.canUse` (the VM's own
@@ -188,16 +200,46 @@ planning:
 * `the-definition-of-done-screen-run-for-the-first-time-20260828.md`
 * `phase-2-worklist-mined-28-defects-in-four-families-20260828.md`
 
+### What L1 found that changes another lane's reasoning
+
+* **A shadow can be unretirable by construction.** The JDK implements the whole
+  byte/short/char/boolean atomic family in bytecode, by masking the 32-bit word
+  at `offset & ~3`. That is meaningless when `objectFieldOffset` returns a SLOT
+  INDEX, so on CratonVM `compareAndSetByte` answered `false` with the right
+  witness and `getAndSetByte` / `getAndBitwiseOrByte` **never returned**. Any
+  retirement pass reasoning from "the real method has Code" will nominate the
+  natives that stand in front of that bytecode; the answer is no. If your family
+  has a JDK bytecode body that does OFFSET ARITHMETIC, check it before you
+  retire its native.
+* **The retirement surface IS the JDK's argument-validation layer.** Nineteen of
+  L1's 24 defects are a null check, a bounds check, a size rule or a refusal
+  type that lives in a bytecode wrapper and nowhere else, and the `0`-suffixed
+  twin the wrapper calls is already registered here — pointing at the SAME Rust
+  function. That is why the check has one home.
+* **Two spellings of one class need not share one contract.**
+  `sun.misc.Unsafe.objectFieldOffset` refuses a record component;
+  `jdk.internal.misc.Unsafe.objectFieldOffset` answers an offset. One native
+  serves both, so the receiver is the discriminator. A first pass that applied
+  the refusal to both replaced one wrong answer with another.
+* **The oracle can be the thing that crashes.**
+  `sun.misc.Unsafe.allocateInstance(null)` SIGSEGVs HotSpot 25.0.4+7, and the
+  crash summary goes to STDOUT, so it both truncates the sweep and pollutes the
+  transcript. Null and out-of-bounds arguments belong in a probe that runs one
+  call per process behind a `timeout`, where "the VM died", "the VM never
+  returned" and "the VM threw" stay three different transcripts.
+
 ### OPEN, owned, do not duplicate
 
 | item | owner |
 | --- | --- |
-| `ConcurrentHashMap.elements()` never terminates | **dev's `a0168ed03`**, bisected in two builds. L6 must know; it is not L6's to fix without talking to that lane. |
+| ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
 | `Arena`/`MemorySegment` report an INTERFACE as an instance's class | `panama.rs` — unclaimed, closest to L1 |
-| `AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture` | L6 |
+| ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
+| **NEW.** `Properties.values().iterator()` mints the fabricated `cratonvm/internal/ArrayListViewItr`, and its `try_alloc_synthetic(..)?` has **no refusal arm** — so `--jdk-only` kills the caller with `NoClassDefFoundError`. This is what `RJdkEnumerations` fails on under `--jdk-only` now that L6 fixed the CHM half. | **L3** (`Properties`/`Hashtable` cluster). Its two sibling mint sites land refusals on `real_snapshot_iterator`, which needs a `SnapshotItrRoute` for a Hashtable-backed values view. Falling back to `java/util/ArrayList$Itr` instead would add a `modCount`-less receiver to that class, which is the precondition the bytecode-yield allow-list is waiting on. |
+| ~~`Class.forName("[L<absent>;")`'s `ClassNotFoundException` names the DESCRIPTOR, not the element~~ | **FIXED by L1's `39e2ded07`, 2026-08-28**, between L6's arms run and its push. It is what made `RExceptions` and `RJdkFailure` red for every lane; `L6-concurrency-lane-complete-20260828.md` §8 records the measurement that attributed it to pristine `dev`. |
 
 ---
 
