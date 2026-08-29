@@ -1560,6 +1560,22 @@ them. Two details are load-bearing:
   argument about the partition, not about what is in the span. It can only DROP
   a span, i.e. reclaim less.
 
+**Engagement, measured on the merged tip** (`TestMVStoreTool`, `--Xmx 512m`,
+two runs, `CRATONVM_GC_STATS=1`):
+
+```text
+compaction_cycles=16 objects_relocated=3049299 relocation_on_proven_jit=16
+  vacated_spans=2579 vacated_bytes=5391509672
+compaction_cycles=24 objects_relocated=3168136 relocation_on_proven_jit=24
+  vacated_spans=4315 vacated_bytes=9023929152
+```
+
+**5.4 GB and 9.0 GB handed back over a run, on a 512 MB heap.** That is ten to
+eighteen heaps' worth of space the slide used to empty and discard, and it is
+the number that says what "reclaim was the cursor drop and nothing else" cost —
+not the largest free block, not the OOM count, but the volume of memory the
+collector was doing the work of freeing and then not freeing.
+
 **One cost is known and deliberately not optimised yet.** The span is zeroed
 with a single `fill(0)`, so the pass memsets roughly `live / max_live_occupancy`
 bytes — about four times what the slide itself copies — inside the pause. The
@@ -1620,8 +1636,15 @@ having made once at the other end.
 
 **99–198 blocks into one, every cycle.** The largest servable large-object
 block goes from 10 880 to 1 037 480 bytes in the first line — a request of
-262 160 is unservable before and servable after. Run total on that arm:
-`cycles=12 declined=3 objects_relocated=2737 bytes_copied=8800848`.
+262 160 is unservable before and servable after. Run totals, three runs across two binaries:
+`cycles=12 declined=3 objects_relocated=2737 bytes_copied=8800848`,
+`cycles=8 declined=8 objects_relocated=9895 bytes_copied=25959272`,
+`cycles=4 declined=20 objects_relocated=3259 bytes_copied=9003776`.
+
+Read `declined` beside `cycles`. It is the pass looking at the high end and
+finding under one large object's worth of contiguity to gain, which is the
+right answer and a different fact from not running — and it is why the
+`[GC] zgc-high-compaction:` line prints both.
 
 The engagement counters are on their own `[GC] zgc-high-compaction:` line, and
 `declined` is beside `cycles` deliberately: `cycles=0 declined=0` means the pass
