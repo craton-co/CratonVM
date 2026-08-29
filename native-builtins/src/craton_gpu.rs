@@ -1464,12 +1464,10 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
-// GATE RESTORED 2026-08-29 (by lane L3, clearing a red it did not cause).
-// Every sibling in this file carries it and this one lost it, so a build
-// WITHOUT `gpu-offload` could not compile `native-builtins` at all: the
-// `Value` import, `arg_long` and the `state::` module are all gated, and
-// this body uses all three. `cargo build --release -p cratonvm-cli` on
-// pristine `origin/dev` fails with 16 errors, every one of them here.
+/// `Native.futureStatus(long futureHandle) -> int`
+///
+/// Status codes (mirrors the Java side enum-ordinal layout in the spec):
+///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
@@ -1906,12 +1904,6 @@ fn builtin_array_to_host_into(
     Ok(Some(Value::Int(1)))
 }
 
-// GATE RESTORED 2026-08-29 (by lane L3, clearing a red it did not cause).
-// Every sibling in this file carries it and this one lost it, so a build
-// WITHOUT `gpu-offload` could not compile `native-builtins` at all: the
-// `Value` import, `arg_long` and the `state::` module are all gated, and
-// this body uses all three. `cargo build --release -p cratonvm-cli` on
-// pristine `origin/dev` fails with 16 errors, every one of them here.
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,

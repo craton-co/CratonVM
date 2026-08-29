@@ -3088,30 +3088,34 @@ pub(crate) fn native_class_for_name(
         }
         // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
         //
-        //   Class.forName("[Lcom.absent.X;")
-        //     HotSpot   ClassNotFoundException: com.absent.X
-        //     was       ClassNotFoundException: [Lcom.absent.X;
+        // MEASURED on JDK 25, and asserted by two vectors that were already in
+        // the tree before this branch existed:
         //
-        // The element is the class the caller asked for: the one a loader could
-        // be pointed at, and the one an error quoting the exception should
-        // show. `regression-suite/src/RExceptions.java` 377-386 asserts it for
-        // both `[L..;` and `[[L..;`, and this arm turned those rows red when it
-        // landed. Only the `L..;` form is unwrapped -- a malformed descriptor
-        // keeps its own text rather than being silently rewritten.
-        let mut element = dotted_name.as_str();
-        while let Some(rest) = element.strip_prefix('[') {
-            element = rest;
-        }
-        if element.starts_with('L') && element.ends_with(';') && element.len() > 2 {
-            element = &element[1..element.len() - 1];
-        } else {
-            element = dotted_name.as_str();
-        }
+        //   Class.forName("[Lp.X;")   ->  CNFE msg="p.X"   cause=null
+        //   Class.forName("[[Lp.X;")  ->  CNFE msg="p.X"   cause=null
+        //
+        // `regression-suite/src/RExceptions.java:382` and
+        // `RJdkFailure.java:168` both check exactly this, and both turned red
+        // when this branch was added with `&dotted_name` -- the descriptor --
+        // as the message. HotSpot resolves the descriptor down to the element
+        // class and reports the resolution that actually failed, which is the
+        // name a caller can act on: `[Lp.X;` is not a name anything can be
+        // asked for again.
+        let element = {
+            let mut e = dotted_name.trim_start_matches('[');
+            if e.starts_with('L') && e.ends_with(';') {
+                e = &e[1..e.len() - 1];
+            }
+            // A descriptor whose element is not a reference type (`[I`, or a
+            // malformed spelling) has no element NAME to report; keep what the
+            // caller passed rather than inventing one.
+            if e.is_empty() { dotted_name.clone() } else { e.to_string() }
+        };
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            element,
+            &element,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }
