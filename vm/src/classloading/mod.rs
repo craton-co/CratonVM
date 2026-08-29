@@ -21,7 +21,8 @@ pub use cratonvm_classloading::vtype;
 pub use cratonvm_classloading::{
     any_class_redefined, bump_jit_supersede_epoch, class_definition_epoch,
     find_field_recursive, find_field_recursive_by_descriptor, find_method_recursive,
-    invokespecial_selection_start, invokevirtual_private_declaring_class,
+    invokespecial_selection_start, invokevirtual_final_declaring_class,
+    invokevirtual_private_declaring_class,
     jdk_superclass_lookup, jit_supersede_epoch,
     static_common_superclass_lookup, Class, ClassId, ClassLoaderId, ClassManager, ClassPath,
     ClassState, ClassStore, ManifestInfo, ModuleDescriptor, ModuleRegistry, RecordComponentInfo,
