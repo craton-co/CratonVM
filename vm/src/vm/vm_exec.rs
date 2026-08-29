@@ -7981,6 +7981,30 @@ struct VmNativeThreadBlocker {
     thread_id: ThreadId,
 }
 
+
+/// Payload size in bytes of a primitive array, or `None` when `arr` is
+/// not one.
+///
+/// Reference arrays return `None` deliberately: the byte-level bulk
+/// accessors must never touch them, because writing raw bytes over
+/// object references would hand the collector pointers it never issued.
+#[allow(dead_code)]
+fn primitive_array_byte_capacity_of(
+    heap: &cratonvm_gc::vm_heap::VmHeap,
+    arr: cratonvm_types::ObjectRef,
+) -> Option<usize> {
+    use cratonvm_types::{ArrayElementType, ObjectKind};
+    if heap.kind_of(arr) != ObjectKind::Array {
+        return None;
+    }
+    let et = heap.element_type_of_validated(arr);
+    if et == ArrayElementType::Reference {
+        return None;
+    }
+    let width = cratonvm_types::element_byte_size(et);
+    heap.array_length(arr).checked_mul(width)
+}
+
 impl NativeThreadBlocker for VmNativeThreadBlocker {
     fn publish_os_tid(&self) {
         self.shared
@@ -12997,6 +13021,63 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
         }
         n
+    }
+
+    fn write_primitive_array_bytes(
+        &mut self,
+        arr: ObjectRef,
+        byte_off: usize,
+        src: &[u8],
+    ) -> bool {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
+        else {
+            return false;
+        };
+        if byte_off.checked_add(src.len()).map_or(true, |end| end > capacity) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: the receiver is a primitive array (checked), and the
+        // write stays inside its payload (checked). `array_data_ptr`
+        // yields the base of that payload, whose elements are contiguous
+        // and `element_byte_size` wide — the same layout argument
+        // `write_int_array_from` rests on.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(byte_off), src.len());
+                true
+            },
+            None => false,
+        }
+    }
+
+    fn read_primitive_array_bytes(
+        &self,
+        arr: ObjectRef,
+        byte_off: usize,
+        dst: &mut [u8],
+    ) -> usize {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
+        else {
+            return 0;
+        };
+        if byte_off >= capacity {
+            return 0;
+        }
+        let n = dst.len().min(capacity - byte_off);
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: as above, with the length clamped to what remains.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(base.add(byte_off), dst.as_mut_ptr(), n);
+                n
+            },
+            None => 0,
+        }
     }
 
     fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
