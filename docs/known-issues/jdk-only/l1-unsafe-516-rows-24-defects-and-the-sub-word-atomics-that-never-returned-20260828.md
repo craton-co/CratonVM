@@ -702,7 +702,40 @@ build and prints how many vectors it actually executed.
 
 ---
 
-## 10. The probes are no longer in the tree — where they went, 2026-08-29
+## 10. WITHDRAWN — the probes came back, and this section was stale within hours
+
+**Do not read the rest of this section as current.** It said the probes
+were gone from the tree and told the next reader to recover them from git
+history. `probes/` was RESTORED on `dev` the same day, and L7 committed
+its own eleven probes back with a commit that explicitly withdrew the
+same claim elsewhere (`0675e40a5`). This lane's probes are back in
+`probes/` too, as of this commit:
+
+```text
+probes/UnsafeShadowSweep.java              the 457-row differential sweep
+probes/UnsafeNullArgProbe.java             33 null/OOB rows, one call per process
+probes/UnsafeSubwordProbe.java             26 sub-word atomic rows, behind a timeout
+probes/AllocBoundary.java                  the allocateMemory IAE/OOME boundary
+probes/UnsafeImageCensus.java              the multi-image declaration census
+probes/SegmentClassProbe.java              the FFM interface-class rows
+probes/unsafe-l1-run.sh                    the three-arm runner
+probes/unsafe-l1-residual-counts.sh        the R3/R5 counters
+probes/unsafe-l1-invocation-census.py      the retirement invocation census
+probes/unsafe-registrations.txt            the 212 triples the census reads
+```
+
+**The lesson is the section, not the probes.** A page that records the
+state of the tree rather than the state of a DEFECT rots at the speed of
+the tree — this one was wrong within hours of being written, in a
+directory whose own index warns that its snapshots rot. What was worth
+keeping is below and still true: an instrument that lives in the VM
+(`note_unsafe_side_store_offset`) outlives any directory somebody can
+delete, and §12 is the proof — it answered R5 from another lane's corpus
+logs, with no probe involved at all.
+
+<details><summary>The withdrawn text, kept for the record</summary>
+
+### (withdrawn) The probes are no longer in the tree — 2026-08-29
 
 `3b2901531` *"major doc consistency update before the realeas"* (the repo
 owner, pre-release) **removed the whole `probes/` directory: 867 files,
@@ -734,6 +767,9 @@ Re-adding the probe sources was **not** the resolution taken here. The removal
 is a deliberate release decision by the repo owner, and a merge that quietly
 resurrects three files of a directory somebody just retired is the wrong kind
 of conflict resolution.
+
+
+</details>
 
 ---
 
