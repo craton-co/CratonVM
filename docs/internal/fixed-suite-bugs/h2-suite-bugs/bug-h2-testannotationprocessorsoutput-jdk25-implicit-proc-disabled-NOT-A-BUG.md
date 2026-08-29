@@ -59,7 +59,7 @@ private void testAnnotationProcessorsOutput() {
 ```
 The test expects `callCompiledFunction` to throw a `SQLException` (because
 `org.h2.test.ap.TestAnnotationProcessor` — registered via
-`META-INF/services/javax.annotation.processing.Processor` — is supposed to
+`../../../../apps/META-INF/services/javax.annotation.processing.Processor` — is supposed to
 emit a `WARNING`/`ERROR` diagnostic pair during compilation of the dynamic
 `CREATE ALIAS ... AS $$ ... $$` SQL function, which H2's
 `SourceCompiler.handleSyntaxError` then converts into
@@ -76,7 +76,7 @@ JAVA_COMPILER.getTask(writer, fileManager, null, null, null, compilationUnits).c
 ```
 with `options = null` — i.e. no `-processor`/`-proc:full`/`-proc:only`
 flag. On older JDKs, `javac` would still discover `TestAnnotationProcessor`
-via `ServiceLoader` against `META-INF/services/javax.annotation.processing.Processor`
+via `ServiceLoader` against `../../../../apps/META-INF/services/javax.annotation.processing.Processor`
 on the compile classpath and run it. On this environment's JDK
 (Temurin 25.0.3+9 LTS), that implicit discovery path is a no-op: the
 processor is never instantiated, `getSupportedAnnotationTypes()` (where
@@ -143,10 +143,10 @@ comparison:
   /home/victor/jdk25`): `AssertionError: Failure` at
   `TestFunctions.java:1898` — **fails identically**.
 - Manually adding the missing
-  `META-INF/services/javax.annotation.processing.Processor` file to
+  `../../../../apps/META-INF/services/javax.annotation.processing.Processor` file to
   `target/test-classes` (it is absent from this Maven build's test-classes
   output — H2's `pom.xml` `<testResources>` only copies specific
-  `.properties`/`.sql` files from `src/test`, not `META-INF/**`) did **not**
+  `.properties`/`.sql` files from `src/test`, not `../../../../apps/META-INF/**`) did **not**
   change the outcome on either VM, ruling out "missing service file" as the
   (sole) cause and pointing at the `javac`-level implicit-processing default
   instead — confirmed directly per the minimal repro above.

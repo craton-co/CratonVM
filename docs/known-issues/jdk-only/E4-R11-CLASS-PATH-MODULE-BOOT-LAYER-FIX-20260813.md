@@ -81,9 +81,9 @@ on `automatic = true`.
 
 **Skipping is the only arm that matches HotSpot in both sub-cases.** A jar on
 `-cp` is an unnamed-module citizen; the JDK ignores its `module-info` outright
-and its services come only from `META-INF/services`. Therefore:
+and its services come only from `../../../apps/META-INF/services`. Therefore:
 
-| jar on `-cp` | HotSpot | skip the module (this fix) | suppress `META-INF/services` instead |
+| jar on `-cp` | HotSpot | skip the module (this fix) | suppress `../../../apps/META-INF/services` instead |
 |---|---|---|---|
 | ships `provides` **and** a descriptor | 1 provider | **1** ✔ | 1 ✔ |
 | ships `provides` only (no descriptor) | **0** providers | **0** ✔ | **1** ✘ |
@@ -143,7 +143,7 @@ absent (unaffected).
 **How this was checked.** Every `cp.args` under `regression-suite/corpus/out`
 was parsed into a distinct set of jar paths (103, 0 missing from disk); each was
 opened with `System.IO.Compression` and tested for a `module-info.class` **and**
-a non-empty `META-INF/services/`; each hit's `module-info` was extracted and run
+a non-empty `../../../apps/META-INF/services/`; each hit's `module-info` was extracted and run
 through `javap -v`. Script:
 `scratchpad/e4/scan-double-source.ps1`, output `scratchpad/e4/double-source.txt`.
 
@@ -212,7 +212,7 @@ D1 §4.2 step 4 from a structural argument to a measurement.
 
 | # | measurement | before | after (**PREDICTED**) |
 |---|---|---|---|
-| 1 | the four bc-java classes in `C17` §6.2, `--jdk-only` | `JUnitException: Cannot create Launcher for multiple engines with the same ID 'junit-jupiter'`, 0 tests | run, and `ServiceLoader` yields exactly the 2 engines the 2 `META-INF/services` descriptors name |
+| 1 | the four bc-java classes in `C17` §6.2, `--jdk-only` | `JUnitException: Cannot create Launcher for multiple engines with the same ID 'junit-jupiter'`, 0 tests | run, and `ServiceLoader` yields exactly the 2 engines the 2 `../../../apps/META-INF/services` descriptors name |
 | 2 | `RServiceLoaderDoubleSource` §6 falsifier command | RED at "ModuleLayer.boot() contains a module whose only source is the CLASS path" | GREEN, `separation inBootLayer=false named=false svc=on` |
 | 3 | `RJdkModule` | green | green — its module comes from `--module-path`, `automatic = false` (requires §1.1) |
 | 4 | `FileSystemProvider` / `ToolProvider` / `JavaCompiler` counts under `--jdk-only` | 2 / 9 / 1 | 2 / 9 / 1 — unchanged, all platform modules |
@@ -235,7 +235,7 @@ only `cp.args`). bc-java's selected `AllTests` classes are asn1/pqc/util.
 **The complete fix is one more line in a file this lane owns, and it is
 deliberately NOT applied** — see §6 NOM E-6. It would make the app-class-path
 scan register its modules with an **empty package list**, so a `-cp` class
-reports the unnamed module exactly as on HotSpot, and `META-INF/services` then
+reports the unnamed module exactly as on HotSpot, and `../../../apps/META-INF/services` then
 supplies the provider (1, matching). It is held back because its blast radius is
 different in kind and would be inseparable from this one in a corpus re-run: it
 flips `Class.getModule().isNamed()` from true to false for the **13** jars that
@@ -423,7 +423,7 @@ sites have moved since D1 wrote this (they are now `:525` and `:556`, not
 Verified on HotSpot with exactly this shape (module compiled to a directory,
 placed on `-cp`, no module path): PASS, 754 checks. **PREDICTED on CratonVM
 after NOM E-1..E-3 land: PASS.** The suite module declares its providers only in
-`module-info` and ships no `META-INF/services`, so it exercises the row of §2's
+`module-info` and ships no `../../../apps/META-INF/services`, so it exercises the row of §2's
 table that the other arm gets wrong.
 
 ### NOM E-5 — `regression-suite/corpus/run-corpus.sh` — record the binary's identity

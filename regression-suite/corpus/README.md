@@ -179,7 +179,7 @@ resolution is by **built output, never by directory existence**.
 
 That distinction is not theoretical. Two H2 trees exist on this host; the one
 under `C:/craton/apps` has a `target/classes` containing exactly one file
-(`META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
+(`../../apps/META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
 and an empty `target/test-classes`. A runner resolving by existence would pick
 the decoy and report ~217 identical `NoClassDefFoundError`s that read as a
 sweeping VM regression. Equally: the presence of a `*-suite-runner` directory

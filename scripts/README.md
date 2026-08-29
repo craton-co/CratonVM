@@ -25,6 +25,12 @@ Maintained automation is split by intent:
 | --- | --- |
 | `run-app.sh` / `run-app.ps1` | Generic runner for anything under `apps/`: builds a classpath (from `--cp-file`, an app-local `craton-testcp.txt`, or `target/classes` + `target/test-classes` + `lib/*.jar`), runs one main class or jar under `cratonvm` or (`--vm hotspot`) a real JDK, and captures stdout/stderr/exit code/elapsed time. This is the common operation every `apps/*-suite-runner/` script duplicates in its own bespoke way; it does not replace them — framework-specific test discovery, sharding, and categorization stay in those scripts, which continue to exist locally under `apps/` (gitignored, no longer tracked in git). |
 
+## Running CI locally
+
+| Script | Purpose |
+| --- | --- |
+| `ci-docker.sh` | Runs an approximation of `.github/workflows/ci.yml` in Docker, split into 4 shards: 3 run `cargo test` over a fixed, roughly test-count-balanced split of the workspace's crates, the 4th runs fmt/clippy/build/doc plus the fast standalone gates. See the script's own header for exactly what it does and does not cover (no JDK-image matrix, no nightly toolchain — `jdk-only`, `fuzz-smoke`, and `miri` are out of scope for this runner). `scripts/docker/Dockerfile` is the image it builds. |
+
 ## Tests and quality gates
 
 | Script or tool | Purpose |
@@ -52,41 +58,32 @@ Maintained automation is split by intent:
 ## `--jdk-only` audit toolkit
 
 `--jdk-only` is an internal diagnostic, not a supported runtime mode — see
-[`docs/README.md`](../docs/README.md#what-is---jdk-only-mode). These scripts
-produce and adjudicate the data its CI gates and known-issue write-ups draw on.
-
-CI gates:
+[`docs/README.md`](../docs/README.md#what-is---jdk-only-mode). These are the
+CI gates that produce and adjudicate the data its known-issue write-ups draw
+on:
 
 | Script | Purpose |
 | --- | --- |
 | `jdk-only-census.sh` | Runtime census driving the synthetic-stub ratchet (`.github/workflows/ci.yml`); dumps publish under `target/jdk-only-audit/`. |
 | `jdk-only-blast-radius.sh` | Blast-radius comparison gate (`.github/workflows/jdk-only-blast-radius.yml`). |
 | `jdk-only-strict-probes.sh` | Strict-corpus probe gate (`.github/workflows/ci.yml`). |
-
-Supporting analysis (not CI gates themselves — they produce or adjudicate the
-data the gates above, and the known-issue write-ups under
-[`docs/known-issues/jdk-only/`](../docs/known-issues/jdk-only/), check):
-
-| Script | Purpose |
-| --- | --- |
-| `jdk-only-adjudicate.py` | Classifies a census run's violations against the current adjudication rules. |
-| `jdk-only-bench.sh` | Non-regression benchmark harness for `--jdk-only` runs. |
-| `jdk-only-bridge-ratchet.py` | Tracks the `SyntheticStub` → `Bridge`/`Intrinsic` promotion ratchet. |
-| `jdk-only-dead-sweep.py` | Finds registrations with no live call site. |
-| `jdk-only-image-method-index.py` / `jdk-only-image-method-sweep.py` | Cross-reference registrations against a real JDK image's actual method set. |
-| `jdk-only-inherited-decl.sh` | Checks inherited-declaration coverage. |
-| `jdk-only-interception.py` | Reports which dispatch doors a registration is actually reachable from. |
-| `jdk-only-kind-map.py` | Maps every registration to its native kind (`SyntheticStub` / `Bridge` / `Intrinsic`). |
-| `jdk-only-measure-refusals-and-overlays.sh` | Measures refusal and overlay counts. |
-| `jdk-only-no-image-methods.py` / `jdk-only-no-image-receivers.py` | Find registrations with no counterpart in a real JDK image. |
-| `jdk-only-platform-diff.py` | Diffs the registration surface across platforms. |
-| `native-registration-adjudication.py` / `native-registration-census.sh` | General (not `--jdk-only`-specific) native registration census and adjudication. |
-| `nio-concrete-receiver-audit.py` | Cross-crate coverage audit for abstract-to-concrete receiver relocations; consumes a `--dump-native-registry` JSON dump. |
 | `cratonvm-prefix-args.sh` | A `cratonvm`-binary stand-in that prepends a fixed VM flag set, for measuring `--jdk-only` criteria through suite runners that don't take extra flags directly. |
 
-`scripts/baselines/` holds the checked-in comparison data these ratchet
-against: per-class JDK method inventories, blast-radius baselines, the
-bridge-ratchet JSON, and stale-receiver/untyped-alloc site lists.
+The supporting analysis scripts that produce or adjudicate the data these
+gates check — none of them are CI gates themselves — live under
+`scripts/internal/` (gitignored, not catalogued here by the same policy as
+every other file in that directory; see the intro above). They still exist on
+disk for whoever has run this repository's `--jdk-only` initiative locally,
+and the known-issue write-ups under
+[`docs/known-issues/jdk-only/`](../docs/known-issues/jdk-only/) still cite
+them by name, but a fresh clone will not have them.
+
+`scripts/baselines/` holds the checked-in comparison data the CI gates above
+ratchet against: per-class JDK method inventories, blast-radius baselines, the
+bridge-ratchet JSON, and stale-receiver/untyped-alloc site lists. Unlike the
+scripts that consume it, this directory stays tracked — some of its
+`jdk25-*.tsv` files are `include_str!`'d directly into
+`native-builtins`'s own tests (see `scripts/baselines/README.md`).
 
 ## Maven launcher shim
 

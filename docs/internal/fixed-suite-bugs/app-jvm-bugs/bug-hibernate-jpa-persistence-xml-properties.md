@@ -32,7 +32,7 @@ Log also shows `%s` placeholders in Hibernate log lines (see [HIB-3](bug-hiberna
 
 ## HotSpot behavior
 
-Same fixture and `META-INF/persistence.xml`:
+Same fixture and `../../../../apps/META-INF/persistence.xml`:
 
 ```xml
 <property name="jakarta.persistence.jdbc.url" value="jdbc:h2:mem:smoke"/>

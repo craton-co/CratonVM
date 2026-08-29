@@ -102,9 +102,61 @@ pub fn gemm_launch_config(m: i32, n: i32) -> LaunchConfig {
     }
 }
 
+/// How a logical matrix is laid out in the buffer behind it.
+///
+/// Element `(i, j)` lives at `i * row * j * col` — that is, at
+/// `i*row + j*col`. A row-major `R x C` matrix is `(C, 1)`; reading the
+/// same bytes transposed is `(1, R)`.
+///
+/// Expressing transposition this way rather than as separate NN/NT/TN/TT
+/// kernels keeps one code path with no inner-loop branches, at the cost
+/// of one multiply per tile load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strides {
+    /// Distance between consecutive rows.
+    pub row: i32,
+    /// Distance between consecutive columns.
+    pub col: i32,
+}
+
+impl Strides {
+    /// Strides for a row-major `rows x cols` matrix read as itself.
+    #[must_use]
+    pub fn row_major(cols: i32) -> Self {
+        Strides { row: cols, col: 1 }
+    }
+
+    /// Strides for a row-major matrix read transposed.
+    ///
+    /// `stored_cols` is the column count of the matrix **as stored**, not
+    /// of the logical (transposed) view — getting that backwards produces
+    /// a correct-looking result on a square matrix and garbage otherwise.
+    #[must_use]
+    pub fn transposed(stored_cols: i32) -> Self {
+        let _ = stored_cols;
+        // For a stored `R x C` matrix, element (i, j) of its transpose is
+        // stored element (j, i) at `j*C + i`, so the transpose's row
+        // stride is 1 and its column stride is C.
+        Strides { row: 1, col: stored_cols }
+    }
+
+    /// Pick the layout for an operand.
+    ///
+    /// `stored_cols` is the operand's column count as stored in memory.
+    #[must_use]
+    pub fn of(transposed: bool, stored_cols: i32) -> Self {
+        if transposed {
+            Self::transposed(stored_cols)
+        } else {
+            Self::row_major(stored_cols)
+        }
+    }
+}
+
 /// Build the argument list for a GEMM launch.
 ///
-/// The order matches `gemm.cu`: `A, B, C, M, N, K`.
+/// The order matches `gemm.cu`: `A, B, C, M, N, K, as0, as1, bs0, bs1`.
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_args<A, B>(
     a: &cuda_bridge::DeviceBuffer<A>,
     b: &cuda_bridge::DeviceBuffer<B>,
@@ -112,6 +164,8 @@ pub fn gemm_args<A, B>(
     m: i32,
     n: i32,
     k: i32,
+    a_strides: Strides,
+    b_strides: Strides,
 ) -> KernelArgs
 where
     A: cuda_bridge::DeviceElem,
@@ -124,6 +178,10 @@ where
         .push_i32(m)
         .push_i32(n)
         .push_i32(k)
+        .push_i32(a_strides.row)
+        .push_i32(a_strides.col)
+        .push_i32(b_strides.row)
+        .push_i32(b_strides.col)
 }
 
 /// Validate a GEMM's shape before anything touches the device.
@@ -191,6 +249,32 @@ mod tests {
 
     /// The PTX must be a virtual-arch build, so the driver JITs it for
     /// whatever device is present instead of it being pinned to one.
+    /// Both GEMM entry points must take the ten parameters the host
+    /// pushes: three pointers, M/N/K, and two stride pairs.
+    ///
+    /// A mismatch here is not a compile error anywhere — the host pushes
+    /// an argument list and the driver reads however many the PTX
+    /// declares — so a stale gemm.ptx would silently feed the kernel
+    /// garbage strides.
+    #[test]
+    fn ptx_entry_points_take_the_arguments_the_host_pushes() {
+        for entry in ["craton_gemm_f32", "craton_gemm_f16"] {
+            let start = GEMM_PTX
+                .find(&format!(".visible .entry {entry}("))
+                .unwrap_or_else(|| panic!("{entry} not declared"));
+            let end = GEMM_PTX[start..]
+                .find(')')
+                .expect("entry point parameter list is unterminated")
+                + start;
+            let params = GEMM_PTX[start..end].matches(".param").count();
+            assert_eq!(
+                params, 10,
+                "{entry} declares {params} parameters; the host pushes 10 \
+                 (A, B, C, M, N, K, as0, as1, bs0, bs1). Regenerate gemm.ptx."
+            );
+        }
+    }
+
     #[test]
     fn ptx_targets_a_supported_architecture() {
         assert!(
@@ -223,6 +307,49 @@ mod tests {
             "gemm.cu's TILE and this module's TILE disagree; the launch \
              block shape would not match the kernel's shared tile"
         );
+    }
+
+    /// A row-major operand reads at (cols, 1); its transpose at (1, cols).
+    #[test]
+    fn strides_describe_both_readings() {
+        // A stored 3x4 (row-major): element (i,j) at i*4 + j.
+        assert_eq!(Strides::row_major(4), Strides { row: 4, col: 1 });
+        // Read transposed as 4x3: element (i,j) is stored (j,i) at j*4 + i,
+        // so the row stride is 1 and the column stride is the STORED width.
+        assert_eq!(Strides::transposed(4), Strides { row: 1, col: 4 });
+    }
+
+    /// The indices the two layouts produce, checked by hand.
+    ///
+    /// Stride arithmetic is easy to get subtly wrong and impossible to
+    /// eyeball once it is inside a kernel, so the mapping is pinned here
+    /// against a worked example rather than only end-to-end on a device.
+    #[test]
+    fn stride_arithmetic_matches_a_worked_example() {
+        // Stored 2x3 row-major:  [ 0 1 2 ]
+        //                        [ 3 4 5 ]
+        let rm = Strides::row_major(3);
+        let at = |st: Strides, i: i32, j: i32| i * st.row + j * st.col;
+
+        assert_eq!(at(rm, 0, 0), 0);
+        assert_eq!(at(rm, 0, 2), 2);
+        assert_eq!(at(rm, 1, 0), 3);
+        assert_eq!(at(rm, 1, 2), 5);
+
+        // The same bytes read as a 3x2 transpose:  [ 0 3 ]
+        //                                          [ 1 4 ]
+        //                                          [ 2 5 ]
+        let tr = Strides::transposed(3);
+        assert_eq!(at(tr, 0, 0), 0);
+        assert_eq!(at(tr, 0, 1), 3);
+        assert_eq!(at(tr, 1, 0), 1);
+        assert_eq!(at(tr, 2, 1), 5);
+    }
+
+    #[test]
+    fn of_selects_between_the_two() {
+        assert_eq!(Strides::of(false, 7), Strides::row_major(7));
+        assert_eq!(Strides::of(true, 7), Strides::transposed(7));
     }
 
     #[test]

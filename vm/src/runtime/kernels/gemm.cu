@@ -47,11 +47,22 @@
 // -------------------------------------------------------------------------
 // C[M,N] = A[M,K] * B[K,N], row-major, fp32 in and out.
 //
-// Every matrix is row-major and unpadded, matching a Java float[] holding
-// a flattened 2-D array -- the layout craton.gpu.GpuArray hands over. No
-// transpose variants: a caller that needs one transposes on the host,
-// which is honest about the cost rather than hiding a second kernel
-// behind the same name.
+// TRANSPOSE IS EXPRESSED AS STRIDES, NOT AS FOUR KERNELS
+//
+// Rather than NN/NT/TN/TT variants, each input carries a pair of strides:
+// element (i, j) of the logical matrix lives at `i*s0 + j*s1`. A
+// row-major MxK matrix is (s0, s1) = (K, 1); its transpose -- the same
+// bytes read as KxM -- is (1, M). The host computes the pair, so the
+// kernel has one code path, no branches in the inner loop, and one extra
+// multiply per tile load that the memory traffic swallows whole.
+//
+// What this does NOT make free is coalescing. Reading a row-major matrix
+// transposed walks a column, so consecutive threads touch addresses one
+// row apart instead of adjacent ones, and the loads stop coalescing. The
+// tile still amortises it -- each element is read once from global memory
+// and TILE times from shared -- but a transposed operand is measurably
+// slower than a non-transposed one. It is still far cheaper than
+// materialising the transpose on the host and uploading it.
 //
 // Bounds are checked on both loads and the store, so M, N and K need not
 // be multiples of TILE. The guard costs a predicate per load and buys the
@@ -61,7 +72,9 @@ extern "C" __global__ void craton_gemm_f32(
     const float* __restrict__ A,
     const float* __restrict__ B,
     float* __restrict__ C,
-    int M, int N, int K)
+    int M, int N, int K,
+    int as0, int as1,      // A: element (i,p) at i*as0 + p*as1
+    int bs0, int bs1)      // B: element (p,j) at p*bs0 + j*bs1
 {
     __shared__ float As[TILE][TILE];
     __shared__ float Bs[TILE][TILE];
@@ -80,8 +93,8 @@ extern "C" __global__ void craton_gemm_f32(
         const int aCol = t * TILE + tx;
         const int bRow = t * TILE + ty;
 
-        As[ty][tx] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[ty][tx] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        As[ty][tx] = (row < M && aCol < K) ? A[row * as0 + aCol * as1] : 0.0f;
+        Bs[ty][tx] = (bRow < K && col < N) ? B[bRow * bs0 + col * bs1] : 0.0f;
 
         // Both halves of the tile must be resident before anyone reads it.
         __syncthreads();
@@ -126,7 +139,9 @@ extern "C" __global__ void craton_gemm_f16(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
     float* __restrict__ C,
-    int M, int N, int K)
+    int M, int N, int K,
+    int as0, int as1,      // see craton_gemm_f32 for the stride convention
+    int bs0, int bs1)
 {
     // Tiles are staged as fp32. Shared memory is not the constraint at
     // TILE=16 (2 KB total), and converting once on load beats converting
@@ -146,8 +161,8 @@ extern "C" __global__ void craton_gemm_f16(
         const int aCol = t * TILE + tx;
         const int bRow = t * TILE + ty;
 
-        As[ty][tx] = (row < M && aCol < K) ? __half2float(A[row * K + aCol]) : 0.0f;
-        Bs[ty][tx] = (bRow < K && col < N) ? __half2float(B[bRow * N + col]) : 0.0f;
+        As[ty][tx] = (row < M && aCol < K) ? __half2float(A[row * as0 + aCol * as1]) : 0.0f;
+        Bs[ty][tx] = (bRow < K && col < N) ? __half2float(B[bRow * bs0 + col * bs1]) : 0.0f;
 
         __syncthreads();
 

@@ -94,7 +94,7 @@ invocation count falls from 137 643 to 90 733.
 ## 2. What profiling the loop actually named
 
 The page's instruction was to start from measurements. `perf record` on the
-reduced loop (`probes-adalloc/PcapThroughput.java`, now in-tree — the netty
+reduced loop (`../../../apps/probes-adalloc/PcapThroughput.java`, now in-tree — the netty
 checkout and its suite runner are host-side, the probes are not) put the largest single symbol somewhere the page had not looked:
 
 | symbol | self |
@@ -228,7 +228,7 @@ The page's closing argument rested on one number: "`new Object()` measures
 674 ns interpreted against HotSpot's 10 ns, and the pcap loop runs at about
 that ratio, which is the number to explain."
 
-**That rung had no control.** `probes-adalloc/AllocFloor.java` carries one: the
+**That rung had no control.** `../../../apps/probes-adalloc/AllocFloor.java` carries one: the
 same loop, the same `getstatic`, the same array store, and no allocation.
 
 | rung | HotSpot | CratonVM JIT | CratonVM `--nojit` |

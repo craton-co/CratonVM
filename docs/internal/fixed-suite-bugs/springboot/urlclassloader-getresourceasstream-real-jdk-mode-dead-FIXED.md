@@ -33,7 +33,7 @@ Confirmed via `git stash` that this reproduces identically on an unmodified
 
 ## Root cause
 
-`indexedComponentsAreRegistered()` writes a `META-INF/spring.components`
+`indexedComponentsAreRegistered()` writes a `../../../../apps/META-INF/spring.components`
 index into a `@TempDir`, then does:
 
 ```java

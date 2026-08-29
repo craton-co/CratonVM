@@ -67,7 +67,7 @@ the work remaining is a definition file, not a build.
 
 3. **The two H2 trees are not interchangeable, and the wrong one looks
    plausible.** `apps/h2database/h2/target/classes` contains exactly **one**
-   file — `META-INF/versions/21/org/h2/util/Utils21.class` — no
+   file — `../../apps/META-INF/versions/21/org/h2/util/Utils21.class` — no
    `org/h2/Driver.class`, and `target/test-classes` is empty. Meanwhile
    `cratonvm/apps/h2database/h2` is fully built **but has no `ext/` directory**,
    while the *unbuilt* root has all 13 dependency jars. **Neither root alone

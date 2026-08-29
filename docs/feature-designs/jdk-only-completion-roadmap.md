@@ -124,7 +124,7 @@ and both are wrong in that same direction:
   describes is not on the critical path here.
 * **Neither H2 root alone composes a working classpath.**
   `apps/h2database/h2/target/classes` holds exactly **one** file
-  (`META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
+  (`../../apps/META-INF/versions/21/org/h2/util/Utils21.class`), no `org/h2/Driver.class`,
   and its `target/test-classes` is empty; `cratonvm/apps/h2database/h2` is fully
   built but has **no `ext/` directory**, while the *unbuilt* root carries all 13
   dependency jars. The runner has to union the two, and must resolve on a

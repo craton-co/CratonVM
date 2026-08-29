@@ -82,7 +82,7 @@ behavioral divergence worth fixing on its own correctness merits.
 **Ruled out — CratonVM's ServiceLoader/reflection machinery is NOT broken.**
 Built a standalone repro (`ConverterProbe.java`, tests `getConverter()` for
 all 12 types Quarkus registers via
-`META-INF/services/org.eclipse.microprofile.config.spi.Converter` in
+`../../../../apps/META-INF/services/org.eclipse.microprofile.config.spi.Converter` in
 `quarkus-core-3.33.1.1.jar`) and ran it under CratonVM against `tests/base`'s
 *exact* classpath (`smallrye-config-core-3.16.0.jar` + `quarkus-core-3.33.1.1.jar`).
 With `.addDiscoveredConverters()` explicitly called, **all 11 real converters
