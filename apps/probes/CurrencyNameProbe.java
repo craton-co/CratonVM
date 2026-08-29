@@ -64,6 +64,23 @@ public class CurrencyNameProbe {
             p("localenames class", b.getClass().getName());
         });
 
+        // The whole `getBundle` surface, so the fix is chosen against what
+        // HotSpot does for EVERY shape and not just the two rows that failed.
+        for (String bn : new String[] {
+                "sun.util.resources.CurrencyNames",
+                "sun.util.resources.LocaleNames",
+                "sun.text.resources.FormatData",
+                "sun.util.resources.CalendarData",
+                "sun.util.resources.cldr.CurrencyNames",
+                "com.example.NoSuchBundleAtAll20260829" }) {
+            try {
+                ResourceBundle b = ResourceBundle.getBundle(bn, Locale.ENGLISH);
+                p("getBundle " + bn, "ok " + b.getClass().getName());
+            } catch (Throwable t) {
+                p("getBundle " + bn, "THREW " + t.getClass().getName());
+            }
+        }
+
         // And the display-name surface next door, which reads the same CLDR
         // tree: if these work and currency does not, the gap is the bundle,
         // not the provider machinery.
