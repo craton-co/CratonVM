@@ -73,7 +73,20 @@ fn workspace_root() -> PathBuf {
 /// exactly what made this test a permanent green.
 fn probe_source() -> PathBuf {
     let root = workspace_root();
+    // The TRACKED copy first. `3b2901531` moved the probe corpus to
+    // `apps/probes/`, force-added past `.gitignore` line 12; a curated 32 went
+    // with it and the rest were dropped. `FjpProbe.java` was not among the 32
+    // and — this is the part that made the harness lie — was never tracked at
+    // `probes/` either, despite the message below having named that the durable
+    // home since 2026-08-07. So both candidates were untracked, this test
+    // resolved only against the gitignored `apps/fjp_probe/` copy, and it
+    // panicked in any fresh worktree while passing on the machine that happened
+    // to hold it.
+    //
+    // The two historical paths stay behind the new one so a checkout predating
+    // the move still resolves; the tracked copy wins when both exist.
     let candidates = [
+        root.join("apps").join("probes").join("FjpProbe.java"),
         root.join("apps").join("fjp_probe").join("FjpProbe.java"),
         root.join("probes").join("FjpProbe.java"),
     ];
@@ -88,8 +101,8 @@ fn probe_source() -> PathBuf {
          2026-08-07 its absence made this test report `ok` in 0.00 s while asserting nothing. \
          Restore it (it must print `sum = 499999500000`, `depth = 10` and `OK`, and exit non-zero \
          otherwise). If you moved it, add the new path to `probe_source`. Note `apps/` is \
-         gitignored: a copy there needs `git add -f`, so `probes/FjpProbe.java` is the durable \
-         home.",
+         gitignored, so the tracked copy at `apps/probes/FjpProbe.java` was force-added and \
+         must stay that way — `git add -f` it if you ever replace it.",
         candidates
             .iter()
             .map(|p| p.display().to_string())
