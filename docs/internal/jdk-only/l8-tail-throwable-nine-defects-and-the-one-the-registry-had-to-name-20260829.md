@@ -238,6 +238,8 @@ content argument rather than a count.
 
 ### Gates and arms
 
+Final state, on the merged tree (`origin/dev` of 2026-08-29 15:00):
+
 ```text
 cargo test -p cratonvm-types                                        RC=0
 cargo test -p cratonvm-native-builtins  (the seven gate tests)      RC=0
@@ -245,29 +247,46 @@ cargo test -p cratonvm-native-builtins  (the seven gate tests)      RC=0
     essential_wiring_ratchet, duplicate_registration_gate,
     shim_inheritance_guard, registry_contracts
     ... the same three with --features management                   RC=0
-cargo test -p cratonvm-native-builtins --lib                        RC=0
 cargo test -p cratonvm-vm --lib                                     RC=0
+cargo test -p cratonvm-native-builtins --lib          RC=101, and NOT this lane's
+    properties_sidetable::tests::
+      only_order_insensitive_functions_read_the_unordered_snapshot
 
-ARM 2  SUITE=all                        114 of 114 passed
-ARM 1  CRATONVM_ARGS=--jdk-only         113 of 114   } RSslEndpointIdentification
-ARM 3  SUITE=core                        73 of  74   } only
+ARM 1  CRATONVM_ARGS=--jdk-only        115 of 115 passed
+ARM 2  SUITE=all                       115 of 115 passed
+ARM 3  SUITE=core                       75 of  75 passed
 ```
 
-`RSslEndpointIdentification` is dev's own new vector, landed into this branch by
-the merge, and it is **flaky on a loaded host in a way that is not attributable
-to any VM change**: the harness itself reports
+The one red is `dev`'s own: `5a6348d28 fix(util): Properties.clone() and
+replaceAll() NPE` added two functions that read the unordered side-table
+snapshot, which that file's own source-witness test forbids. The test's input is
+`include_str!("properties_sidetable.rs")` and nothing else, and the file here is
+byte-identical to `origin/dev`'s, so it reproduces on pristine `dev`. Recorded
+in the scope page for every lane; not fixed here, because whether
+`ordered_snapshot_kv` is the right call is a decision belonging to the lane that
+wrote that fix.
 
-```text
-HARNESS ERROR [G4] RSslEndpointIdentification: the HotSpot ORACLE run FAILED (rc=1)
-  ... CK RSslEndpointIdentification FAILED java.lang.AssertionError:
-      application data must actually flow once the handshake succeeds; got: []
-```
+### A correction, kept rather than quietly edited
 
-CratonVM passed all four of its checks in the same run. Three consecutive
-`--jdk-only` runs of the same binary gave **green, red, green**, and the red one
-failed on the oracle side again. A change to this VM's `Throwable` cannot make
-HotSpot's loopback TLS handshake time out. Recorded here rather than fixed
-because the vector is not this lane's.
+An earlier run of the arms was red on `RSslEndpointIdentification`, and **this
+page and this batch's commit message both said that was host-load flakiness**:
+the harness reported the HotSpot ORACLE failing (`rc=1`, "application data must
+actually flow once the handshake succeeds; got: []") while CratonVM passed all
+four of its own checks, and three solo runs of one binary gave green, red,
+green. That is what the evidence in hand supported, and it was the wrong
+conclusion.
+
+`HANDOFF-20260828-SCOPE.md`'s own Vectors section already had the answer, and it
+is better than the flake reading: **the vector's client loop threw away the
+reply it asserts on.** `unwrap()` consumes one TLS record per call, and under
+load the server's NewSessionTicket, its reply and its close_notify arrive in a
+single read. Fixed on `dev` the same day, which is why the arms above are green.
+
+Worth keeping because the failure mode is the campaign's most expensive one: a
+red that moves with load looks exactly like a flake, and "not mine, and it
+moves" is a comfortable enough answer to stop at. **The cheap check that was
+skipped was reading the page the vector is documented on before writing a
+diagnosis of it.**
 
 ---
 

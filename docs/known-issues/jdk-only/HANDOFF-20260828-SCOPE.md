@@ -186,14 +186,26 @@ was counted from the registry rather than from the class list — every
 `Exception`/`Error` subclass in `THROWABLE_FAMILY_CLASSES`, not just the ones
 whose names looked central.
 
-**A note for every lane, not only this one:** `RSslEndpointIdentification`, the
-vector `origin/dev` landed on 2026-08-29, is **flaky on a loaded host and fails
-on the HOTSPOT ORACLE side** — `HARNESS ERROR [G4] ... the HotSpot oracle run
-FAILED (rc=1)`, `application data must actually flow once the handshake
-succeeded; got: []`, with CratonVM passing all four of its own checks in the
-same run. Three consecutive `--jdk-only` runs of one binary gave green, red,
-green. It will redden ARM 1 and ARM 3 for anyone landing this week; it is not
-your merge.
+**A red on `dev` that is not any lane's merge:** `cargo test -p
+cratonvm-native-builtins --lib` fails on `properties_sidetable`'s own
+source-witness guard, from `5a6348d28 fix(util): Properties.clone() and
+replaceAll() NPE on a Properties this VM built`:
+
+```text
+properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
+  these functions read the UNORDERED side-table snapshot:
+  ["native_properties_clone", "native_properties_replace_all"]
+```
+
+That test reads `include_str!("properties_sidetable.rs")` and nothing else, and
+the file is byte-identical to `origin/dev`'s — so it reproduces on pristine
+`dev` and no merge can be blamed for it. The guard's message offers two ways
+out; **the escape hatch (`ALLOWED`) looks like the wrong one**, since a cloned
+`Properties` and an in-place `replaceAll` both hand an iteration order back to
+Java, which is what `ordered_snapshot_kv` exists for. Left to the lane that
+wrote the fix rather than guessed at from outside it. (For the OTHER red of the
+week, `RSslEndpointIdentification`, see the Vectors section below — it is fixed,
+and it was the vector's own bug rather than the flake it looked like.)
 
 **Re-run the tail's existing probes before writing a new one.** Restored to
 `apps/probes/` and taken on the current binary, they are: `LangMiscSweep`,
