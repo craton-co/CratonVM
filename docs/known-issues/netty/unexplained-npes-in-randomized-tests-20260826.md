@@ -2,8 +2,9 @@
 
 ## Status
 **`LongLongHashMapTest.randomOperations` CONFIRMED real, moved to its own page:
-[`longlonghashmaptest-npe-spliced-ctor-this-not-a-gc-root-FIXED-20260828.md`](fixed-suite-bugs/netty/longlonghashmaptest-npe-spliced-ctor-this-not-a-gc-root-FIXED-20260828.md)
-— read that one for the current state. Kept here only for the other two
+the retired
+`fixed-suite-bugs/netty/longlonghashmaptest-npe-spliced-ctor-this-not-a-gc-root-FIXED-20260828`
+write-up — read that one for the current state. Kept here only for the other two
 classes' history and this page's own paper trail. Not root-caused to
 the exact mechanism. Reproduced identically on THREE separate runs now: the
 original 2026-08-26 contended 4-shard run, an isolated quiet single-shard rerun

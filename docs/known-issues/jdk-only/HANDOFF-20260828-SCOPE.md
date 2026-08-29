@@ -312,7 +312,7 @@ planning:
 | --- | --- |
 | ~~`ConcurrentHashMap.elements()` never terminates~~ | **FIXED by L6, 2026-08-29.** The mechanism was two producers of one carrier class, and the fix keeps `a0168ed03`'s parity win rather than reverting it. `RJdkEnumerations` now PASSES in compatible mode where pristine `dev` fails it. See `L6-concurrency-lane-complete-20260828.md` §2.2. |
 | `Arena`/`MemorySegment` report an INTERFACE as an instance's class | **MEASURED 2026-08-29, still OPEN, blocker is a CONTRACT decision not a patch.** All four `Arena` factories in BOTH modes; every `MemorySegment` under `--jdk-only` only (its compatible-mode carrier landed 2026-08-22 and strict REFUSES it, falling back to the interface). One defect, one blocker: is `cratonvm/internal/foreign/MemorySegmentImpl` a compatibility stand-in that `--jdk-only` is right to refuse, or the VM's own allocation shape? See `arena-and-memorysegment-hand-out-an-interface-and-jdk-only-is-the-worse-mode-20260829.md` |
-| ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
+| **The BEHAVIOURAL half of the same surface: CLOSED 2026-08-29.** 199 differential rows over the segment/arena/layout API (`apps/probes/FfmSegmentSweep.java`) found **nine defects that are not identity** and every one is now 0-diff in both modes: a native `asReadOnly()` segment ACCEPTED WRITES; `ByteOrder` was minted per call so `ValueLayout.JAVA_INT.order() == ByteOrder.nativeOrder()` was false; `Arena.global().close()` succeeded; `allocate(-1)`, two bad alignments and `ofArray(null)` did not refuse; and `s.asSlice(0, s.byteSize()).equals(s)` was false. The identity rows to the left are what REMAINS after those. | **DONE** — `ffm-segment-surface-nine-behavioural-defects-and-the-interface-classed-family-20260829.md`. It also measures what the identity defect does NOT break: `isInstance`, `instanceof`, `isAssignableFrom` and a class-keyed `HashMap` round-trip all answer correctly on an interface-classed segment, in both modes — so the contract decision to the left is a decision about identity alone. || ~~`AsynchronousFileChannel.write` returns `CompletableFuture` not `PendingFuture`~~ | **FIXED by L6, 2026-08-29**, along with three behavioural gaps beside it that 38 differential rows found. §6 of the same record. |
 | `Module.canUse` over-approximates | **L5 (mine)**, documented in the registrar |
 | `KeyStore.getInstance("JCEKS")` unsupported | unclaimed; NOT a `--jdk-only` item, missing in both modes |
 | `java/lang/StringBuilder` cluster | `WORKER-3-NOTE-3` has it open — **L2 must check that note first** |
@@ -420,7 +420,9 @@ of on the test result.
   here because the sequence is the point: three lanes measured the same vector
   and each was right about a different half of it.
 
-  **There is now no known-red vector in the corpus.**
+  **No vector is known-RED any more, and the one that read as intermittent was
+  the vector's own bug.** See `RSslEndpointIdentification` below: it is fixed,
+  and the note is kept because of how it looked on the way there.
 * `RExceptions` and `RJdkFailure` — **red on `dev` from `c6ccccbc8` (the L5
   lane) until `39e2ded07` fixed it. If you ran the arms in that window you saw
   two reds that were not yours and are not yours to chase.** Both assert the
@@ -429,6 +431,56 @@ of on the test result.
   spending anything on them.
 * `RBlockingQueue` — a documented flake (`HANDOFF-20260812.md`, "do not chase
   it"). One failure under suite load, passes standalone and on repeat.
+* ~~`RSslEndpointIdentification`~~ — **FIXED 2026-08-29. It was never
+  intermittent and it was never CratonVM's**: the vector's own client loop threw
+  away the reply it asserts on, and it failed on the HOTSPOT side while CratonVM
+  passed all four checks. Kept here as a worked example of a failure mode this
+  campaign keeps meeting, not as an open row.
+  What it looked like first: green in the `--jdk-only` and `SUITE=all` arms and
+  red in the `core` arm of the same cycle, then 2-of-3 standalone passes, then —
+  an hour later on a host at load average 14 — red in three consecutive `core`
+  runs. That reads exactly like a flake becoming a regression.
+  What it was: `unwrap()` consumes ONE TLS record per call, and the loop called
+  it once per `read()`. Under load the server's NewSessionTicket, its reply and
+  its close_notify arrive in a single 350-byte read; the one `unwrap` consumed
+  the 222-byte ticket and produced no application data, the next `read` returned
+  EOF, and `break` discarded the 128 buffered bytes that were the reply. Whether
+  the records coalesce is a scheduling question — the whole of the
+  "intermittency". Proven by ABBA-interleaved A/B on one loaded host: **15
+  failures in 40 runs on the committed loop, 0 in 40 on the drained one.**
+  **Three things to take from it.** The harness had already said it: guard `G4`
+  printed *"the HotSpot oracle run FAILED (rc=1), so the 'expected' side of the
+  cross-VM diff is an artefact of the oracle's failure, not ground truth"* — read
+  which SIDE failed before reading the diff. A vector that passes standalone and
+  fails in the suite is not automatically leakage; this one passed standalone
+  because the host was quiet at the time, and reproduced under `ONLY=` once it
+  was not. And a failure rate that climbs with load is a race in someone's code,
+  not noise to be re-run away — here, ours.
+
+### Known-red GATE on `dev`, 2026-08-29 — not a vector, so the list above misses it
+
+`cargo test -p cratonvm-native-builtins --lib` is **4176 passed, 1 failed** on
+`origin/dev` as of `a5c67dcda`:
+
+```
+properties_sidetable::tests::only_order_insensitive_functions_read_the_unordered_snapshot
+  these functions read the UNORDERED side-table snapshot:
+  ["native_properties_clone", "native_properties_replace_all"]
+```
+
+**It is not your merge, and you can prove that without building anything.** The
+test is a source witness over ONE file — `include_str!("properties_sidetable.rs")`
+— so its verdict is a pure function of that file's bytes. `git diff origin/dev --
+native-builtins/src/properties_sidetable.rs` is empty on any branch that has not
+touched it, which makes the red identical to pristine `dev`'s.
+
+It arrived with `5a6348d28` (`Properties.clone()`/`replaceAll()` NPE), whose own
+new guard it is: the guard and the two functions it names landed in the same
+commit. Left for that lane rather than silenced here, because the guard's two
+exits are not equivalent and picking between them is a behavioural call, not a
+gate-quieting one — `Properties.clone()` hands its key order to Java through
+`keys()`/`stringPropertyNames()`, and `replaceAll` applies a user function in
+that order, so "add it to ALLOWED" would be the wrong exit for both.
 
 **Search the known-issues tree for a vector's name before bisecting it.** I ran a
 repeat suite to re-derive what that page already said.
