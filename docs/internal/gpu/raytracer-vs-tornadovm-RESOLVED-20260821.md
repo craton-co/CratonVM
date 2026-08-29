@@ -738,14 +738,18 @@ this bullet was wrong".
   Re-screened by weighted cost and swept, the best budget ties with the
   feature off. It ships opt-in.
 * **§12's shrinking-margin curve at 4K/8K is not yet explained down to a
-  mechanism the way §8/§8c were** — **DECOMPOSED in §13.6, and the
-  fixed-cost model this bullet expected it to confirm turns out not to
-  hold past 8K.** The bullet as written: it is read off the same
-  fixed-cost / per-pixel-cost decomposition §7 already established, not independently
-  re-decomposed at these two new sizes. A `GpuTransferFloor`-style split
-  at 4K and 8K would confirm whether the same ~0.104 ms fixed / ~0.564 ns
-  per-pixel fit still holds, or whether something changes past 8.3M
-  pixels (a device memory or PCIe-queueing effect, say). Not done.
+  mechanism the way §8/§8c were** — **DECOMPOSED at four sizes in §13.6.
+  The fit HOLDS: compute is flat at 0.018-0.029 ns/px across a 27x range,
+  so there is no cliff past 8.3M pixels and the margin is a transfer
+  story.** Getting there took four passes; the three loaded ones each
+  produced a different confident wrong answer, which is written up beside
+  the right one. The bullet as written: it is read off the same
+  fixed-cost / per-pixel-cost decomposition §7 already established, not
+  independently re-decomposed at these two new sizes. A
+  `GpuTransferFloor`-style split at 4K and 8K would confirm whether the
+  same ~0.104 ms fixed / ~0.564 ns per-pixel fit still holds, or whether
+  something changes past 8.3M pixels (a device memory or PCIe-queueing
+  effect, say). Not done.
 
 ## 10. Reproduction
 
@@ -828,17 +832,18 @@ This is the same amortising-fixed-cost mechanism §7 named, traced one
 octave further than any measurement in this document had previously
 reached.
 
-**§13 continues it one octave further still (1.85x at 11520×6480, §13.1)
-and decomposes all four sizes with `GpuTransferFloor` (§13.6) — where the
-amortising-fixed-cost explanation this section leans on turns out not to
-survive: the transfer floor's own per-pixel cost RISES with n, which no
-fixed term can produce.**
+**§13 continues it one octave further still — 1.85x at 11520×6480, 6/6
+rounds (§13.1) — and decomposes all four sizes with `GpuTransferFloor`
+(§13.6), which confirms the mechanism this section leans on: the compute
+half is flat at 0.018-0.029 ns/px across the whole 27x range, so what
+shrinks the margin is transfer amortising against a fixed cost, exactly as
+§7 said.**
 
 ---
 
 # 13. The residual pass, 2026-08-29
 
-Everything §9 left open, taken to an answer. Two of the answers are that
+Everything §9 left open, taken to an answer. Three of the answers are that
 the residual's own hypothesis was wrong; those are the interesting ones,
 because a residual that is quietly dropped leaves the wrong belief behind.
 
