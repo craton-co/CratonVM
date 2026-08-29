@@ -92,19 +92,25 @@ pub fn reset_for_test() {
 mod tests {
     use super::*;
 
-    /// The default licenses the yield. See the module header for why this is the
-    /// right default and what the previous, inert one was.
+    /// The default licenses the yield, and a fallback mint revokes it one-way.
+    ///
+    /// ONE test, not two, and that is not tidiness: the state under test is a
+    /// PROCESS-GLOBAL, so two `#[test]` functions that both call
+    /// `reset_for_test()` race each other under the default multi-threaded
+    /// harness. They passed for as long as the machine was quiet and failed on
+    /// a loaded build host on 2026-08-29 -- `assertion failed:
+    /// arraylist_classed_view_possible()`, the sibling's reset landing between
+    /// this one's `note` and its assert. That is the flake shape that costs a
+    /// lane a whole gate run to attribute. A latch with one owner has one test.
+    ///
+    /// See the module header for why this default is the right one and what the
+    /// previous, inert one was.
     #[test]
-    fn the_default_licenses_the_yield() {
+    fn the_default_licenses_the_yield_and_a_mint_revokes_it_permanently() {
         reset_for_test();
         assert!(!arraylist_classed_view_possible());
         assert_eq!(arraylist_view_fallback_count(), 0);
-    }
 
-    /// One-way: a fallback mint revokes the yield and nothing restores it.
-    #[test]
-    fn a_fallback_mint_revokes_the_yield_permanently() {
-        reset_for_test();
         note_arraylist_classed_view_minted();
         assert!(arraylist_classed_view_possible());
         assert_eq!(arraylist_view_fallback_count(), 1);

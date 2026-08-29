@@ -3086,11 +3086,32 @@ pub(crate) fn native_class_for_name(
         {
             return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
         }
+        // THE MESSAGE NAMES THE ELEMENT, NOT THE DESCRIPTOR.
+        //
+        //   Class.forName("[Lcom.absent.X;")
+        //     HotSpot   ClassNotFoundException: com.absent.X
+        //     was       ClassNotFoundException: [Lcom.absent.X;
+        //
+        // The element is the class the caller asked for: the one a loader could
+        // be pointed at, and the one an error quoting the exception should
+        // show. `regression-suite/src/RExceptions.java` 377-386 asserts it for
+        // both `[L..;` and `[[L..;`, and this arm turned those rows red when it
+        // landed. Only the `L..;` form is unwrapped -- a malformed descriptor
+        // keeps its own text rather than being silently rewritten.
+        let mut element = dotted_name.as_str();
+        while let Some(rest) = element.strip_prefix('[') {
+            element = rest;
+        }
+        if element.starts_with('L') && element.ends_with(';') && element.len() > 2 {
+            element = &element[1..element.len() - 1];
+        } else {
+            element = dotted_name.as_str();
+        }
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",
             1,
-            &dotted_name,
+            element,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc?));
     }
