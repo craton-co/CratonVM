@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Wave 1 (measurement). The static half and the runtime-census half both run today; `scripts/jdk-only-census.sh` is the supported driver for the runtime half. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) — the interface contract. This document does not define semantics; it defines how to *measure* them. |
-| **Companions** | [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) (blocker inventory) · [`jdk-only-native-review.md`](jdk-only-native-review.md) (promotion checklist) · [`jdk-only-ambient-category-audit.md`](jdk-only-ambient-category-audit.md) · [`known-issues/jdk-only/`](known-issues/jdk-only/) · [`benchmarks/jdk-only.md`](benchmarking/jdk-only.md) |
+| **Companions** | [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md) (blocker inventory) · [`jdk-only-native-review.md`](jdk-only-native-review.md) (promotion checklist) · [`jdk-only-ambient-category-audit.md`](jdk-only-ambient-category-audit.md) · [`known-issues/jdk-only/`](known-issues/jdk-only/) · [`benchmarks/jdk-only.md`](benchmarking/jdk-only.md) |
 | **Tooling** | `scripts/jdk-only-census.sh` · [`tools/jdk-only-blockers/`](../tools/jdk-only-blockers/README.md) |
 
 The purpose of this audit is to produce a **runtime-observed** inventory of every
