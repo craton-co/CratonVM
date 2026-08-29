@@ -1464,12 +1464,10 @@ fn builtin_future_cancel(
     Ok(Some(Value::Int(0)))
 }
 
-// RESTORED 2026-08-29: this attribute was missing, and the whole workspace
-// failed to compile on a DEFAULT (no `gpu-offload`) build -- `Value`,
-// `arg_long` and `state::` are all gated, so an ungated function naming
-// them is 16 hard errors in `cargo build -p cratonvm-cli`. Measured red on
-// pristine `origin/dev` at `8f9ae7a9c` before any of this branch's changes
-// were present; it is not a merge artefact.
+/// `Native.futureStatus(long futureHandle) -> int`
+///
+/// Status codes (mirrors the Java side enum-ordinal layout in the spec):
+///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
@@ -1906,12 +1904,6 @@ fn builtin_array_to_host_into(
     Ok(Some(Value::Int(1)))
 }
 
-// RESTORED 2026-08-29: this attribute was missing, and the whole workspace
-// failed to compile on a DEFAULT (no `gpu-offload`) build -- `Value`,
-// `arg_long` and `state::` are all gated, so an ungated function naming
-// them is 16 hard errors in `cargo build -p cratonvm-cli`. Measured red on
-// pristine `origin/dev` at `8f9ae7a9c` before any of this branch's changes
-// were present; it is not a merge artefact.
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
