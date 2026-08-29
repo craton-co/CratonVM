@@ -2369,9 +2369,20 @@ fn submissions(
 /// `Native.releaseFuture`. `C`'s contents land back in its `GpuArray` on
 /// finalization.
 ///
+/// `trans_a` / `trans_b` read the corresponding operand transposed. This
+/// is expressed as strides rather than as separate kernels — see
+/// [`crate::runtime::kernels::Strides`] — so the operand's element count
+/// is unchanged and only its indexing differs.
+///
+/// `stream_handle` places the launch on a Java-visible `GpuStream`,
+/// making it ordered with respect to everything else on that stream.
+/// `None` uses the shared built-in stream, which orders built-ins against
+/// each other and nothing else.
+///
 /// Errors are reported as a `Failed` submission rather than a panic, so
 /// the Java side sees a `GpuException` carrying the reason.
 #[cfg(feature = "gpu-offload")]
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_gemm(
     shared: &crate::vm::SharedVm,
     kind: crate::runtime::kernels::GemmKind,
@@ -2381,6 +2392,9 @@ pub fn dispatch_gemm(
     m: i32,
     n: i32,
     k: i32,
+    trans_a: bool,
+    trans_b: bool,
+    stream_handle: Option<u64>,
 ) -> u64 {
     use crate::runtime::kernels;
 
@@ -2412,9 +2426,27 @@ pub fn dispatch_gemm(
         Err(e) => return record_failed_submission(None, GpuErrorKind::Compile, e),
     };
 
-    let stream = match cache.default_internal_stream() {
-        Ok(s) => s,
-        Err(e) => return record_failed_submission(None, kind_of_device_error(&e), e.to_string()),
+    let stream = match stream_handle {
+        // A caller-named stream. An unknown handle is an error rather than
+        // a silent fallback to the default: the whole reason to name a
+        // stream is ordering, and quietly running somewhere else would
+        // produce a race the caller specifically asked to avoid.
+        Some(h) => match cache.resolve_stream(h) {
+            Some(s) => s,
+            None => {
+                return record_failed_submission(
+                    None,
+                    GpuErrorKind::Launch,
+                    format!("gemm: unknown or released stream handle {h}"),
+                )
+            }
+        },
+        None => match cache.default_internal_stream() {
+            Ok(s) => s,
+            Err(e) => {
+                return record_failed_submission(None, kind_of_device_error(&e), e.to_string())
+            }
+        },
     };
 
     // C is always f32 and always written, so it is resolved (and, on a
@@ -2426,6 +2458,22 @@ pub fn dispatch_gemm(
     };
 
     let launch = kernels::gemm_launch_config(m, n);
+
+    // `Strides::of` wants the operand's column count AS STORED, which is
+    // not the logical one when the operand is transposed:
+    //
+    //   A is logically MxK. Untransposed it is stored MxK, so stored
+    //   cols = K. Transposed, the logical MxK is a view of a stored KxM,
+    //   so stored cols = M.
+    //
+    //   B is logically KxN. Untransposed, stored KxN, cols = N.
+    //   Transposed, it is a view of a stored NxK, so cols = K.
+    //
+    // Passing the logical width instead is the classic version of this
+    // bug: it agrees with the correct answer on a square operand and
+    // indexes into the wrong element on every other shape.
+    let a_strides = kernels::Strides::of(trans_a, if trans_a { m } else { k });
+    let b_strides = kernels::Strides::of(trans_b, if trans_b { k } else { n });
 
     let args = match kind {
         kernels::GemmKind::F32 => {
@@ -2449,7 +2497,7 @@ pub fn dispatch_gemm(
                     )
                 }
             };
-            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k);
+            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
             // The Arcs must outlive the launch; the writeback below holds
             // one for C, and these two keep A and B alive across it.
             let _keep = (a, b);
@@ -2476,7 +2524,7 @@ pub fn dispatch_gemm(
                     )
                 }
             };
-            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k);
+            let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
             let _keep = (a, b);
             args
         }
