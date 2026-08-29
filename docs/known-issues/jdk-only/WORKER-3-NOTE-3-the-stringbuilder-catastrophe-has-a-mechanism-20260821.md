@@ -1,6 +1,50 @@
 # WORKER-3-NOTE-3 — the StringBuilder catastrophe, diagnosed to a mechanism, three of its causes fixed, and the one that is a VM project
 
-**Status: OPEN — MEASURED throughout.** WORKER 3, 2026-08-21, Linux build host,
+**Status: N1 and N2 CLOSED 2026-08-29, and §5's two explicit non-claims are
+REFUTED. The rest still OPEN — MEASURED throughout.**
+
+> **§5 named two things this note could not establish. Both have now been
+> measured.** *"The armed StringBuilder arm is NOT green"* — it is:
+> `RStringBuilderContent` passes all **118** checks armed on the three classes,
+> where §3 measured it dying after 56 with `ArrayStoreException: arraycopy: type
+> mismatch: can not copy byte[] into char[]`. *"No arm of
+> `regression-suite/run.sh` was run with `CRATONVM_ENFORCE_NATIVE_SHADOW` set"* —
+> one has: the whole `--jdk-only` corpus, armed on the three classes, is
+> **111/112**, and the one failure is a refused
+> `cratonvm/internal/ArrayListViewItr` fabrication that fails identically
+> unarmed.
+>
+> The dial was verified to have FIRED before those results were read: armed, the
+> three families go from 39 `native-won` to **0**, with 38 triples flipping to
+> `bytecode-won`. An armed pass over an inert dial would have said nothing.
+>
+> **And since an armed run IS the retirement, it has a price:** 2.0x-3.4x on
+> five of six benchmark shapes. So the registrations stay — measured, not
+> feared.
+
+> **N1 — the layout migration — is landed.** `sb_store_units` is the writer half
+> this note named: the payload that is already there decides the layout, so a
+> builder is never converted from one representation to the other and the torn
+> object §3 describes cannot be produced. The residual §3 named — the
+> `ArrayStoreException` from `arraycopy: can not copy byte[] into char[]` — is
+> gone with it, and three further defects nobody had connected to this note fell
+> out at the same time: `chars()`, `codePoints()` and `compareTo` read
+> `value`/`coder` directly and had been answering a LATIN1 truncation of every
+> character above U+00FF, and `writeObject` threw. MEASURED, 747 probe rows,
+> 0 differing lines against HotSpot jdk-25.0.4+7 in both modes. See the retired
+> `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half` write-up
+> and the open `l2-strings-residuals-the-migration-is-unpriced` page.
+>
+> **N2 is also closed**: `H25-1` §1.4 now carries a re-measurement across all
+> three images on the build host, and five of its seven marked rows are live on a
+> supported image rather than four of six — the correction is stronger than R2
+> stated, and it was taken by running `javap` again rather than by citing R2.
+>
+> **N3, the six refusals of §4 and the §7 refusal of the `java.lang.invoke`
+> block are UNTOUCHED** and are why this page is still here. Read the body for
+> them; read this banner, not the body, for N1's status.
+
+**Original status line: OPEN — MEASURED throughout.** WORKER 3, 2026-08-21, Linux build host,
 clean builds of `22cb4338d` (control) and of this branch. Every arm below was
 run; nothing here is argued from a grep.
 

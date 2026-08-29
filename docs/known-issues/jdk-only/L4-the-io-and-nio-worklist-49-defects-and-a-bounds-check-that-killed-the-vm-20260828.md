@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 52 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 67 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -11,12 +11,12 @@ HotSpot, `cratonvm --jdk-only`, and `cratonvm` in the default mode — diffed on
 
 | probe | rows | covers |
 | --- | ---: | --- |
-| `probes/L4FileSweep.java` | 486 | the 50 `java/io/File` triples |
-| `probes/L4FilesSweep.java` | 395 | `java/nio/file/Files` 31, `Path` 9, `Paths` 1 |
-| `probes/L4ByteBufferSweep.java` | 404 | `ByteBuffer` 11, `DirectByteBuffer` 9, `HeapByteBuffer` 4 |
-| `probes/L4PrintStreamSweep.java` | 123 | `PrintStream` 25, `PrintWriter` 1 |
-| `probes/L4StreamTailSweep.java` | 208 | the `java.io` stream tail and the `java.nio` tail |
-| `probes/L4Reach.java` | — | NOT a differential probe; it exists only to make the census |
+| `apps/probes/L4FileSweep.java` | 486 | the 50 `java/io/File` triples |
+| `apps/probes/L4FilesSweep.java` | 395 | `java/nio/file/Files` 31, `Path` 9, `Paths` 1 |
+| `apps/probes/L4ByteBufferSweep.java` | 404 | `ByteBuffer` 11, `DirectByteBuffer` 9, `HeapByteBuffer` 4 |
+| `apps/probes/L4PrintStreamSweep.java` | 123 | `PrintStream` 25, `PrintWriter` 1 |
+| `apps/probes/L4StreamTailSweep.java` | 208 | the `java.io` stream tail and the `java.nio` tail |
+| `apps/probes/L4Reach.java` | — | NOT a differential probe; it exists only to make the census |
 
 **1616 differential rows, 1615 identical in both modes.** The one residual is
 §4, and it is not a missing fix — it is a resolution finding no registrar edit
@@ -652,14 +652,572 @@ subrange refusal; and the whole `java.util.Formatter` surface including all six
 # the census
 cratonvm --java-home "$JDK" --jdk-only --explain-jdk-only \
     --jdk-only-report rep.json --dump-native-registry reg.json \
-    -cp probes/out L4Reach
+    -cp apps/probes/out L4Reach
 
 # the five differential probes, three arms each -- plus the four EXISTING
 # java.io probes, which is where §3.8 came from
-bash probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
+bash apps/probes/l4run.sh L4FileSweep L4FilesSweep L4ByteBufferSweep \
                      L4PrintStreamSweep L4StreamTailSweep \
                      TailFamilySweep IoSystemSweep FilesSweep FilePathSweep
 ```
 
 `FilesSweep`'s two differing lines are its own harness artefact — it prints the
 random name of the temporary directory it created, which no two runs share.
+
+---
+
+# PART TWO — the completeness question, and what asking it found
+
+**Added 2026-08-29.** Part one closed the 199 `native-won` triples. This part
+asks the question part one could not: *those are the rows a program MET — what
+about the rest of the family?* Answering it took three more defects out, one of
+them a data-corruption bug, and cleared a compile break on `dev`'s tip.
+
+**The filename says 49 defects and the title now says 55.** The slug is left
+alone deliberately — the scope doc and the retired lane brief both cite it, and
+a rename costs more than it explains.
+
+## P2.1 The number, and the instrument reading that made my first one wrong
+
+Unioned over eleven probe runs, filtering `java.io` + `java.nio` to rows that
+are `bridge`, own their slot, and shadow a real method that is declared, has
+`Code` and is not `ACC_NATIVE`:
+
+```text
+405  the static adjudication surface for this lane
+246  reached by at least one probe
+159  never reached by any of them
+  3  of those 159 are FLOORS, not totals (invocations_complete false)
+```
+
+**My first pass said 414 and it was wrong by 2.6×.** The filter read `has_code`
+out of `image_declaring_method`, and
+
+> **`--dump-native-registry` leaves `image_declaring_method` NULL unless
+> `--explain-jdk-only` is also passed.**
+
+Ten of the eleven dumps were plain `--dump-native-registry`, so every one of
+their rows failed the filter, every dump contributed zero, and the "union" was a
+single run wearing a union's clothes. The tell was a `reached 0` for a probe
+whose raw rows showed `invocations: 6` two commands earlier. `real_declaring_
+method` is populated in both shapes and is what a census should filter on.
+
+This matters beyond one lane: the scope doc's §5 sends every lane to that dump,
+and a census script that filters on the image block will silently report zero
+without erroring.
+
+The three floors are `SimpleFileVisitor`'s callbacks — which part one's
+`walkFileTree` repair provably calls, so their zero is a floor in exactly the
+way `invocations_complete` says.
+
+## P2.2 `CharBuffer.get(int)` was position-relative — the wrong characters, with every number right
+
+`apps/probes/L4TypedBufferSweep.java` is new: **501 rows**, six typed buffers
+(`Int`, `Long`, `Short`, `Float`, `Double`, `Char`) × three backings, covering
+~50 census rows no probe in the tree had ever reached. One row differed.
+
+```text
+CharBuffer cb = ByteBuffer.allocate(8).asCharBuffer();   // "abcd"
+cb.flip(); cb.get();                                      // position is now 1
+cb.get(new char[4], 1, 2);
+  HotSpot   .bc.
+  CratonVM  .cd.
+```
+
+It reads as a bulk-copy defect and is not one. **Every visible number was
+correct** — position 1 after the single `get()`, position 3 after the bulk read,
+`charAt`, `toString` and `length` all right, and the `IntBuffer` and
+`ShortBuffer` views correct on the identical sequence. Only the characters were
+wrong.
+
+`CharBuffer.get(char[],int,int)` has no native, so the real bytecode ran and
+called the absolute `get(int)` once per element with the right indices — onto a
+body that added the position to them again. `charAt(int)` and `get(int)` were
+sharing one implementation, and they are two different contracts:
+
+```text
+CharSequence.charAt(i)   ->  get(position() + checkIndex(i, 1))   RELATIVE
+Buffer      .get(index)  ->  Objects.checkIndex(index, limit)     ABSOLUTE
+```
+
+At position 0 they agree, which is why every earlier probe missed it and why
+the new rows ask both at a NON-ZERO position. It is an `Intrinsic`, so
+`--jdk-only` does not drop it and the defect was identical in both modes.
+
+## P2.3 Two latent defects the retirement dial exposed
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` makes `Bridge` natives on a receiver
+under that prefix yield to real bytecode under `--jdk-only`, which is how Phase
+2 prices a retirement without building anything. Armed at `java/io/File`:
+
+```text
+L4FilesSweep   DIED 119 rows early
+  NullPointerException: Cannot enter synchronized block because
+                        "this.closeLock" is null
+      at java/io/FileOutputStream.close(FileOutputStream.java:383)
+      at java/nio/file/Files.copy(Files.java:2865)
+L4StreamTailSweep   fos.write(null, 0, 1)   NPE -> no-throw
+```
+
+**Read the prefix carefully: `covers()` is `starts_with`**, so `java/io/File`
+also armed `FileOutputStream`, `FileInputStream` and `FileDescriptor`. That run
+priced the `java/io/File*` FAMILY, not `java.io.File`. Both blockers turned out
+to be in the siblings, and both are real:
+
+* **`FileOutputStream.closeLock` is never initialised** on a stream this VM
+  mints. `fsp_new_output_stream` allocates the object and wires the fd by hand;
+  the constructor never runs, so its instance initialisers never do either.
+  `FileOutputStream.close()` opens `synchronized (closeLock)`. This is the
+  **twin** of a repair that already existed — `fsp_new_input_stream` sets
+  `closeLock`, `path` and `closed` a hundred lines above, *with a comment saying
+  exactly why* — applied to one side of a pair and not the other.
+* **`writeBytes([BIIZ)V` accepted a null buffer** and wrote nothing. Its
+  `write([BII)V` twin got the NPE in part one; `writeBytes` is the door the real
+  `FileOutputStream.write(byte[],int,int)` bytecode arrives at, and it kept the
+  silent no-op.
+
+Both are invisible today, because the `close()` and `write()` natives above them
+never let the real bytecode through. Both would turn a future retirement from
+free into a crash, and both are one hunk.
+
+With them fixed the armed run is **fully green**: seven probes, 1671 lines,
+armed diffs identical to baseline. So the `java/io/File*` retirement is now
+priced and unblocked — **NOMINATION**, not taken here, because the dial's own
+doc is explicit that "an armed FAILURE is real; an armed ZERO is unreliable":
+the dial covers the doors it reaches, and a real retirement removes the
+registration so every door misses.
+
+## P2.4 `dev`'s tip did not compile, and it was two `#[cfg]` lines
+
+> **CREDIT, added at the merge.** Both repairs in P2.4 and P2.7 were made
+> INDEPENDENTLY and landed on `dev` first — the `#[cfg]` restoration as
+> `43088b840`, and the array-CNFE element name in the same window. When this
+> lane merged, both of its copies conflicted with the ones already there and
+> were resolved to `dev`'s side and dropped. What is left here is the
+> DIAGNOSIS, which stands either way: the control build that proved the reds
+> were not this lane's, and the two general lessons — an attribute belongs to
+> the item that follows it, and a branch that bypasses a delegation inherits
+> every contract the delegation used to satisfy.
+>
+> Two sessions finding the same two defects within an hour is itself worth
+> noting: a red tip is expensive precisely because every lane pays to
+> rediscover it.
+
+
+`cargo check -p cratonvm-native-builtins` was **17 errors** on pristine
+`origin/dev` — `cannot find type Value`, `arg_long` inaccessible,
+`state::` unresolved, across `craton_gpu.rs`, `xnio_async.rs` and
+`compression_native.rs`.
+
+The module is `gpu-offload`-only. Two new functions had been inserted **between
+an existing function's doc comment and its body**, so the
+`#[cfg(feature = "gpu-offload")]` stayed with the comment, gated the newcomer,
+and left its neighbour bare — `builtin_future_status` and
+`builtin_array_to_host`. A default build then compiled two bodies full of
+feature-only imports.
+
+Restoring the two attributes takes both arms green (default and
+`--features gpu-offload`). Not this lane's code; fixed because a red tip blocks
+every lane, which is what the scope doc's §5 asks for.
+
+Worth generalising: **an attribute belongs to the item that follows it, and
+inserting an item after a doc comment silently steals it.** Nothing warns.
+
+
+## P2.7 `dev`'s tip was red a second way, and this one was a behaviour regression
+
+The `#[cfg]` repair in P2.4 made `dev` COMPILE. Running the three arms on it
+then showed two vectors failing that had passed on this lane's part-one tree:
+
+```text
+RExceptions   AssertionError: ...naming the element, not the descriptor,
+                              got: [Lcom.cratonvm.absent.NoSuchClass20260812;
+RJdkFailure   AssertionError: an array CNFE must name the element,
+                              not the descriptor: [Lcom.cratonvm.absent.NoSuchClass20260731;
+```
+
+**Proven not this lane's**, by building a CONTROL: `origin/dev` plus the
+`#[cfg]` fix and nothing else — because pristine `dev` cannot be built at all —
+and running the two vectors on it. Both failed identically there. This lane's
+part-two changes (typed buffers, `FileOutputStream`, `writeBytes`) cannot reach
+class-name rendering, and the control says so rather than the reasoning.
+
+The cause is in L5's landing (`c6ccccbc8`), whose own commit message names the
+change:
+
+> `Class.forName("[I")` resolves; `ClassLoader.loadClass("[I")` throws. This VM
+> implemented forName by DELEGATING to loader.loadClass … The real defect was
+> the delegation: forName needs no loader for an array descriptor and now
+> resolves one directly.
+
+That new direct-resolution branch builds its `ClassNotFoundException` from
+`dotted_name` — the whole descriptor. HotSpot never hands an array descriptor to
+a loader, so what fails to resolve, and what the exception reports, is the
+COMPONENT:
+
+```text
+Class.forName("[Lp.X;")    HotSpot  CNFE msg="p.X"
+Class.forName("[[Lp.X;")   HotSpot  CNFE msg="p.X"    (every dimension stripped)
+```
+
+Fixed by stripping the dimensions and the `L…;` wrapper before building the
+message. Both vectors pass.
+
+**Two lessons, and the second is the one that cost this lane a build.**
+
+A new branch that BYPASSES a delegation inherits every contract the delegation
+used to satisfy. L5's change was right — the two doors genuinely disagree — and
+the message shape came along for the ride, unasked, because it had previously
+been produced by the loader it no longer calls.
+
+And: **this lane pushed a merge it had not built.** Part one's gates and three
+arms were green on `87fc7eeb7`; `origin/dev` then moved, the merge was taken,
+only the docs changed after it, and the result was pushed without a rebuild. The
+merge is what carried both of dev's reds in. That is exactly what the scope
+doc's landing protocol says to do and this lane did not: **re-run the gate set
+on the MERGED tree, not on the tree you tested before the merge.**
+
+## P2.5 What is left, and who it belongs to
+
+Of the 159 never-reached rows, after this part:
+
+| slice | rows | disposition |
+| --- | ---: | --- |
+| typed buffers + `Buffer` base | ~50 | **covered now** by `L4TypedBufferSweep` |
+| `java/io/UnixFileSystem` | 12 | **covered indirectly** — the armed run drives all 12 through `java.io.File`'s real bytecode, 190 invocations, 0-diff |
+| `java/nio/Buffer$2`, `java/io/FileDescriptor$1` | 22 | `SharedSecrets` access bridges, reachable only from JDK-internal callers — adjacent, not L4's |
+| `java/nio/channels/{Socket,ServerSocket,Datagram}Channel` | ~30 | network-shaped and unclaimed; `AsynchronousFileChannel` is explicitly L6's |
+| `java.io` exception classes | 86 | the shared `Throwable` table, one table serving every package |
+| the rest | ~40 | `Files`/`Path` charset and `Iterable` overloads, `FilterOutputStream`, `MappedByteBuffer` |
+
+## P2.6 Final state
+
+```text
+2117 differential rows across six probes, both modes
+2116 identical to HotSpot 25.0.4+7
+   1 residual — FileInputStream.skip past EOF (§4.3), contract-legal,
+     and a resolution finding no registrar edit can move
+```
+
+Plus four probes already in the tree re-run as a control on every binary:
+`TailFamilySweep`, `IoSystemSweep`, `FilePathSweep` all 0, `FilesSweep` 0 apart
+from the random temp-directory name it prints itself.
+
+
+---
+
+# PART THREE — the rows nothing had ever reached
+
+Part two ended with a number I did not like: of the 395 static rows in the
+completeness census, **142 had never been reached by any probe in the tree**.
+A row nothing executes is not a passing row; it is an unasked question. This
+part is what asking them found.
+
+The instrument is `apps/probes/L4TailSweep2.java` (187 rows). It is not a
+broader sweep of the same shapes — it is aimed specifically at the never-reached
+population, and one design choice in it did most of the work:
+
+```java
+static void bridges(String k, Buffer b) {
+    Buffer r1 = b.position(1);
+    ...
+```
+
+**The reference is typed `Buffer`, not `ByteBuffer`, on purpose.** `javac` emits
+`clear()Ljava/nio/Buffer;` only when the static type of the receiver is
+`Buffer`; through a `ByteBuffer` reference it emits
+`clear()Ljava/nio/ByteBuffer;` and a completely different registered slot
+answers. Every earlier probe in this lane held a `ByteBuffer`, so the covariant
+bridge descriptors had never been dispatched to at all — 30-odd registrations
+that no test in the repository could reach. That is not a gap in coverage of a
+method; it is a gap in coverage of a *descriptor*.
+
+## P3.1 Twelve defects measured, and five more fixed on the argument
+
+**Measured** — each of these appeared as a differing row against HotSpot
+25.0.4+7 in a run I can point at:
+
+| # | Method | This VM | HotSpot |
+|---|---|---|---|
+| 1 | `Buffer.reset()` with no mark, through a `Buffer` reference | `IllegalStateException` whose *message* is the string `"InvalidMarkException"` | `java.nio.InvalidMarkException` |
+| 2 | `Files.readString(Path, Charset)` | ignored the charset | decodes with it |
+| 3 | `Files.readString(p, US_ASCII)` over a byte > 0x7F | (my own first fix) U+FFFD | `MalformedInputException` |
+| 4 | `File.setReadable(false, true)` then `canRead()` | `true` | `false` |
+| 5 | `File.setExecutable(true, true)` then `canExecute()` | `false` | `true` |
+| 6 | `FilterOutputStream.write((byte[]) null)` | silently nothing | `NullPointerException` |
+| 7 | `new FilterOutputStream(null).write(1)` | silently nothing | `NullPointerException` |
+| 8 | `ByteArrayOutputStream.toString((String) null)` | a decoded string | `NullPointerException` |
+| 9 | `ByteArrayOutputStream.toString((Charset) null)` | a decoded string | `NullPointerException` |
+| 10 | `Files.walkFileTree(d1, {}, 1, v)` with `d1/d2` a directory | `preVisitDirectory(d1/d2)` | `visitFile(d1/d2)` |
+| 11 | `Files.walkFileTree(p, {}, -1, v)` | walks the whole tree | `IllegalArgumentException` |
+| 12 | `Files.walkFileTree(p, null, 1, v)` | walks | `NullPointerException` |
+| 13 | `FileSystems.newFileSystem(p, (Map) null)` | returns a filesystem | `NullPointerException` |
+
+**Fixed on the argument** — same body or same family as a measured row, no
+separate measurement of its own, and stated here so the distinction is not lost:
+`Files.readAllLines(Path, Charset)` (shares one callback with its measured
+twin), `File.canWrite`/`canExecute` (the same wrong question as `canRead`),
+`File.setWritable` (the same fabricated success as `setReadable`), and
+`FilterOutputStream.write(byte[], int, int)`.
+
+## P3.2 The covariant bridge and its target disagreed
+
+Defect 1 is the one the `Buffer`-typed reference existed to ask, and it is worth
+more than its row.
+
+`InvalidMarkException extends IllegalStateException`. So the *supertype* handler
+matched, nothing failed loudly, and the defect was invisible to any test that
+did not name the exact type. What made it findable is that
+`ByteBuffer.reset()Ljava/nio/Buffer;` is a **separate registered slot** from the
+bytecode a `ByteBuffer`-typed call reaches:
+
+```text
+  ByteBuffer bb = ...;  bb.reset()    InvalidMarkException   (real bytecode)
+  Buffer     b  = bb;   b.reset()     IllegalStateException  (this VM's bridge)
+```
+
+**One method, two answers, decided by the static type at the call site.** A
+program that catches `InvalidMarkException` — the only handler anyone writes for
+this — worked or did not work depending on how a local variable was declared.
+
+The general lesson, which the `has_code`/retirement work in this campaign keeps
+re-learning from a different direction: a native registered for a covariant
+bridge descriptor is not "the same method" as the one the ordinary call site
+reaches. It has to be checked separately, and a probe that never types a
+reference as the base class cannot check it.
+
+## P3.3 The setter was not the liar — reading the state back found the real one
+
+Defect 4 cost a build to attribute, and the way it went wrong is the useful part.
+
+`File.setReadable(false, true)` returned `true` and `canRead()` still said
+`true`, so I fixed `setReadable`: it had read its argument into a variable named
+`_readable` and then answered `std::fs::metadata(&path).is_ok()` — "does this
+file exist?". That was a real fabricated success and the fix was right.
+
+**It did not close the row.** The rebuild still answered `canRead() == true`.
+The micro-probe that settled it asked the filesystem directly:
+
+```text
+                     oracle          this VM
+  mode0              rw-rw-r--       rw-rw-r--
+  setReadable ret    true            true
+  mode1              -w-rw-r--       -w-rw-r--      <- the chmod was CORRECT
+  canRead            false           true           <- the reader is the liar
+```
+
+The setter had been fixed and the mode bits agreed with HotSpot byte for byte.
+`canRead` was the defect, and it is a different *kind* of defect: not a
+fabricated success, but the **wrong question**.
+
+```rust
+canRead     std::fs::metadata(path).is_ok()      // "does it exist?"
+canWrite    !permissions().readonly()            // any write bit, for anyone
+canExecute  mode() & 0o111 != 0                  // any execute bit, for anyone
+```
+
+A permission method asks about **this process**, not about the file. The three
+now call `fs_check_access` — `access(2)` — which is what
+`UnixFileSystem.checkAccess` in the same file has always used. That helper was
+correct and simply had no caller here: the fourth instance in this lane of *a
+correct helper the winning door does not consult*.
+
+`canExecute` is worth one more line, because it **passed** the probe. With mode
+`0o100` set and cleared, "any execute bit" and "the owner's execute bit" give
+the same answer — the row was green by luck. `canWrite` and `canExecute` are
+fixed on the argument, not on a measurement, and I would rather say so than
+claim a green row proved them.
+
+The reusable form: **`setX` and `getX` are two natives, and a probe that calls
+one and asserts its return value tests neither.** Reading the state back through
+a *second* method is what separated a correct writer from a lying reader. An
+identity-only probe would have reported both as fine.
+
+## P3.4 My own part-one fix turned a wrong answer into a wrong refusal
+
+Defect 2 has two halves, and I own the second one.
+
+`Files.readString(Path, Charset)` ignored its charset — the body said so, in a
+comment: `// Ignore charset, always UTF-8`. Before this lane that produced a
+silently wrong string. **Part one of this lane made the UTF-8 decode strict**
+(§3.4, so that malformed input raises `MalformedInputException` instead of
+returning U+FFFD), which fixed the no-charset overload and, in the same motion,
+changed the charset overloads from a wrong *answer* into a wrong *refusal*:
+
+```text
+  Files.readString(<0xC3 0x28>, ISO_8859_1)
+    HotSpot    a 2-character String        (latin-1 cannot fail, ever)
+    CratonVM   MalformedInputException     <- after part one
+```
+
+That is worse in one way and better in another — it is louder — but it is still
+wrong, and it was **introduced by a fix in this same lane**. A change that makes
+one path strict has to be walked to every caller that shares the path, including
+the overloads that should never have been on it.
+
+## P3.5 The oracle refused a row this VM answered
+
+Defect 3 is a fix of mine that was wrong when I wrote it, caught the same day.
+
+Writing the charset decoder, I gave `US-ASCII` the JDK's REPLACE action: bytes
+above 0x7F become U+FFFD. Then the probe row `readString(bad, US_ASCII)` **killed
+the HotSpot run** — because the JDK's `Files.readString` decodes with a
+`CharsetDecoder` left on its default action, which is REPORT. US-ASCII refuses.
+
+I had written the row as a value row (`p(...)`) because I expected an answer.
+The oracle threw, the run stopped, and the truncated tail is exactly the shape
+the runner's `lines=` counter exists to catch.
+
+```text
+  the same two bytes, three single-byte charsets, three different answers
+    ISO_8859_1   a 2-character String   (cannot fail)
+    UTF_8        MalformedInputException
+    US_ASCII     MalformedInputException
+```
+
+The row is now a refusal row and the decoder REPORTs. The residual approximation
+is stated in the code rather than hidden: for any charset outside those three,
+the fallback goes through `new String(byte[], Charset)`, which uses REPLACE where
+`readString` would REPORT. Driving a real `CharsetDecoder` would cost four
+re-entrant calls per read; this is the cheaper half of that trade and it is right
+for every well-formed input.
+
+## P3.6 Three overloads, and the null check I put in the wrong one
+
+Defects 6 and 7 were in the first fix batch. They did not close, and the reason
+is embarrassing enough to be worth writing down.
+
+`FilterOutputStream.write` is **three separate registered slots**:
+
+```text
+  write([B)V     -> native_output_stream_write_all   (lib.rs:9622)
+  write([BII)V   -> an inline closure                (lib.rs:10093)
+  write(I)V      -> an inline closure                (lib.rs:10066)
+```
+
+My probe rows call `write((byte[]) null)` and `write(1)`. I put the null checks
+in `write([BII)V` — the one overload neither row touches — and the fix compiled,
+built, and changed nothing. The registry dump is what named it: `inv=2` on
+`([B)V` and `inv=3` on `(I)V` while my edited slot showed `inv=4` from unrelated
+traffic.
+
+**Read the descriptor the failing row dispatches on, not the method name.** All
+three are fixed now; two of them were silent no-ops, which for a write is the
+worst available failure — the caller writes, gets no exception, closes the
+stream, and believes it holds the bytes.
+
+## P3.7 At the depth limit, a directory is a file
+
+Defect 10 is a contract detail with a sharp edge.
+
+`FileTreeWalker` only opens a directory it is allowed to descend into. An entry
+sitting *at* `maxDepth` is handed to `visitFile` with its real attributes
+(`attrs.isDirectory()` true) and never sees the
+`preVisitDirectory`/`postVisitDirectory` pair. This VM called
+`preVisitDirectory` first and checked the depth afterwards — one callback too
+late:
+
+```text
+  walkFileTree(d1, {}, 1, v)   with d1/d2 a directory
+    HotSpot    pre:d1, file:d1/d2
+    this VM    pre:d1, pre:d1/d2     (and no post — it did not descend either)
+```
+
+The visitor shape this hurts is the common one: a `SimpleFileVisitor` that
+overrides only `visitFile` **never saw the leaf at all**. Bounding a walk is
+usually done precisely to count or collect the things at the boundary.
+
+The same guard fixes `maxDepth == 0`, where the root itself is the entry at the
+limit and the JDK reports it through a single `visitFile`.
+
+Defect 11 is the fourth "correct helper with no caller" in this lane:
+`p57_max_depth_refusal` already existed and already raised
+`IllegalArgumentException: 'maxDepth' is negative` — `Files.walk` and
+`Files.find` call it, `walkFileTree` did not, and a `.max(0)` silently turned
+the refusal into an unbounded walk.
+
+## P3.8 Four probes my own record cited were producing zero lines
+
+A process defect, found by the runner and not by me.
+
+Part one's §3.8 came from re-running four probes that already existed in the
+tree — `TailFamilySweep`, `IoSystemSweep`, `FilesSweep`, `FilePathSweep`. On
+this part's first sweep they reported:
+
+```text
+=== TailFamilySweep   rc oracle=1 strict=1 compat=1
+    lines  oracle=0  strict=0  compat=0
+    DIFF   strict=0  compat=0
+```
+
+**`DIFF strict=0` on a run that produced nothing.** Commit `3b2901531` ("major
+doc consistency update before the release") deleted 856 files under `probes/`
+the night before, including all four. The class files were gone, all three arms
+failed identically, and a diff of two empty files is zero.
+
+Two things came out of it:
+
+* The four are restored under `apps/probes/`, where the reorg kept the surviving
+  probes, and are now **tracked** (`apps/` is gitignored — they need `git add
+  -f`, and a plain `git add -A` reports nothing while the commit looks complete).
+* `l4run.sh` already printed `lines=` above the diff for exactly this reason, and
+  it is the only reason I noticed. **A diff count is not a result unless a row
+  count stands next to it.**
+
+While there, two more instrument repairs:
+
+* `grep -c '^rows '` answered nothing on `L4TypedBufferSweep`, whose output
+  contains a NUL byte — `grep` treats the file as binary and prints a *message*
+  instead of a count. `grep -ac` restores the number.
+* `FilesSweep` prints its own `Files.createTempDirectory` name inside an
+  exception message, so three runs meant three names and a permanent 1-row
+  "defect" that is not there. The runner now collapses `/tmp/<word><6+ digits>`
+  in all three arms identically — narrowly, so a real path difference still
+  diffs. The first version of that regex used `[a-z][a-z0-9]{2,}` for the word
+  and greedily ate the digits it was meant to strip; it took the same
+  measurement twice to notice.
+
+## P3.9 Final state
+
+```text
+2304 differential rows across seven L4 probes, both modes
+2303 identical to HotSpot 25.0.4+7
+   1 residual — FileInputStream.skip past EOF (§4.3), contract-legal, and a
+     resolution finding no registrar edit can move
+```
+
+and the four pre-existing probes, now genuinely running:
+
+```text
+TailFamilySweep  117 lines   0 diff
+IoSystemSweep    154 lines   0 diff
+FilesSweep        39 lines   0 diff
+FilePathSweep    666 lines   0 diff
+```
+
+Reproduce:
+
+```bash
+CV=/data/vm-l4io OUT=/data/l4out bash apps/probes/l4run.sh \
+  L4TailSweep2 L4TypedBufferSweep L4FileSweep L4FilesSweep \
+  L4ByteBufferSweep L4PrintStreamSweep L4StreamTailSweep \
+  TailFamilySweep IoSystemSweep FilesSweep FilePathSweep
+```
+
+## P3.10 What part three did not fix
+
+Stated so the next reader does not have to re-derive it:
+
+* **`FileSystems.newFileSystem(path, env)` over a non-archive file** with a
+  *valid* environment should raise `ProviderNotFoundException`; it still hands
+  back a jar filesystem whose every later operation fails somewhere far from the
+  mistake. Only the null-`env` NPE is fixed. The jar loading paths reach those
+  three registrations constantly and this lane has no measurement of the blast
+  radius — it is a real defect and a deliberately unclaimed one.
+* **`native-io`'s `native_file_can_read`/`can_write`** do not own their slots
+  (`owns_slot=false`; `nio_file.rs` overwrites them) and are left alone. They
+  already do a real open, so they are not fabrications — but they are a second
+  spelling of the same question, and a build where they *did* win would answer
+  differently from the one measured here.
+* The `US-ASCII`/`ISO-8859-1`/`UTF-8` trio is decoded directly; every other
+  charset takes the REPLACE-vs-REPORT approximation described in P3.5.

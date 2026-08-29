@@ -1,5 +1,20 @@
 # L4 — `java.io` and `java.nio`: ~335 rows
 
+> **RETIRED 2026-08-28, extended twice — the lane is done and this brief is
+> history.** The numbers below are PART ONE's. Parts two and three, in the same
+> record, took the lane from 1616 rows to **2304**, from 52 defects to **67**,
+> and answered a question part one had not asked: of the 395 static rows in the
+> completeness census, **142 had never been reached by any probe in the tree.**
+> Asking them found twelve more defects, including the one that matters most
+> structurally — **a covariant bridge descriptor and its target disagreeing**,
+> because `javac` emits `reset()Ljava/nio/Buffer;` only when the reference is
+> typed `Buffer`, and every earlier probe in this lane held a `ByteBuffer`.
+>
+> **Final state: 2303 of 2304 rows identical in both modes**, plus the four
+> pre-existing family probes (`TailFamilySweep` 117, `IoSystemSweep` 154,
+> `FilesSweep` 39, `FilePathSweep` 666 lines) all 0-diff. The single residual is
+> unchanged: `FileInputStream.skip` past end of file, §4.3.
+>
 > **RETIRED 2026-08-28 — the lane is done and this brief is history.**
 >
 > Read the record instead:
@@ -7,7 +22,7 @@
 >
 > **What the lane did.** The `native-won` surface was mined rather than guessed:
 > **199 distinct triples** across `java/io` and `java/nio`, from a
-> `--jdk-only-report` over `probes/L4Reach.java`. Five new differential probes
+> `--jdk-only-report` over `apps/probes/L4Reach.java`. Five new differential probes
 > cover all of them — `L4FileSweep` (486 rows), `L4FilesSweep` (395),
 > `L4ByteBufferSweep` (404), `L4PrintStreamSweep` (123), `L4StreamTailSweep`
 > (208) — **1616 rows against HotSpot 25.0.4+7, in both modes.**

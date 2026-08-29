@@ -51,6 +51,7 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 IMAGE="cratonvm-ci-docker"
 OUT_DIR="$REPO_ROOT/target/ci-docker"
 CARGO_CACHE_VOLUME="cratonvm-ci-cargo-registry"
+TARGET_VOLUME="cratonvm-ci-target"
 
 # --- test-suite shards, by workspace package name -------------------------
 # ~6643 #[test] functions
@@ -106,32 +107,47 @@ if [ "$DO_BUILD" -eq 1 ]; then
 fi
 
 docker volume create "$CARGO_CACHE_VOLUME" >/dev/null
+docker volume create "$TARGET_VOLUME" >/dev/null
 
+# One target/ volume shared by all 4 shards, not one each. cargo's own
+# per-crate file locking already serializes two shards that need to build
+# the exact same dependency at the exact same moment -- it does not
+# corrupt the target dir, it just makes the second one wait -- and a shared
+# volume means shard 2 does not recompile a dependency shard 1 already
+# built. It also keeps `/workspace/target` as one consistent mount instead
+# of a per-shard volume shadowing the bind-mounted /workspace underneath
+# it, which used to make anything a step wrote under target/ (e.g. a
+# results file) invisible outside that one container.
 run_in_container() {
-  local shard_name="$1" target_volume="$2"
-  shift 2
-  docker volume create "$target_volume" >/dev/null
+  # No CARGO_TERM_COLOR override: leave cargo to auto-detect. Forcing
+  # `always` here broke gc-flake-gate.sh's own plain-text `sed` parse of
+  # cargo's "Executable unittests ... (path)" line -- cargo wraps
+  # individual WORDS in color codes, not whole lines, so "Executable" and
+  # "unittests" stop being adjacent in the raw bytes (`Executable<ESC[0m>
+  # unittests`), and any script doing substring/regex matching on that line
+  # silently gets nothing. `docker run` here has no `-t`, so the container's
+  # own stdout is already a pipe, not a tty; cargo's default auto-detection
+  # already produces plain output without any override.
   docker run --rm \
     -v "$(winpath "$REPO_ROOT")":/workspace \
     -v "$CARGO_CACHE_VOLUME":/usr/local/cargo/registry \
-    -v "$target_volume":/workspace/target \
+    -v "$TARGET_VOLUME":/workspace/target \
     -w /workspace \
-    -e CARGO_TERM_COLOR=always \
     "$IMAGE" bash -lc "$*"
 }
 
 shard1() {
-  run_in_container shard1 cratonvm-ci-target-1 \
+  run_in_container \
     "cargo test $(printf -- '-p %s ' "${SHARD1_CRATES[@]}")"
 }
 
 shard2() {
-  run_in_container shard2 cratonvm-ci-target-2 \
+  run_in_container \
     "cargo test $(printf -- '-p %s ' "${SHARD2_CRATES[@]}")"
 }
 
 shard3() {
-  run_in_container shard3 cratonvm-ci-target-3 \
+  run_in_container \
     "cargo test $(printf -- '-p %s ' "${SHARD3_CRATES[@]}")"
 }
 
@@ -144,27 +160,25 @@ shard3() {
 # grep, the workspace build, clippy, the doc build, and three of the
 # repo's own gate scripts that don't need a JDK-image matrix.
 #
-# Each step runs even if an earlier one failed (no `&&` chain), and its
-# PASS/FAIL is written to target/ci-docker/shard-4-steps.tsv — that is what
-# lets the top-level summary name exactly which of these 8 checks are red
-# instead of just reporting shard 4's overall exit code. A step whose own
-# prerequisite is missing (e.g. clippy after a build that failed to produce
-# what it needs) still reports FAIL for itself rather than being skipped, so
-# a red build doesn't quietly hide which of the later steps would also fail.
+# Each step runs even if an earlier one failed (no `&&` chain), and prints a
+# "CI-DOCKER-STEP:<name>:PASS|FAIL" marker to its own stdout on the way —
+# which lands in target/ci-docker/shard-4.log via run_shard()'s redirect,
+# the same as everything else this container prints. diagnose_shard() below
+# greps the log for that marker; that is what lets the top-level summary
+# name exactly which of these 8 checks are red instead of just reporting
+# shard 4's overall exit code. A step whose own prerequisite is missing
+# (e.g. clippy after a build that failed to produce what it needs) still
+# reports FAIL for itself rather than being skipped, so a red build doesn't
+# quietly hide whether the later steps would also fail.
 shard4() {
-  run_in_container shard4 cratonvm-ci-target-4 '
-    RESULTS=/workspace/target/ci-docker/shard-4-steps.tsv
-    mkdir -p "$(dirname "$RESULTS")"
-    : > "$RESULTS"
+  run_in_container '
     step() {
       local name="$1"; shift
       echo "== $name =="
       if "$@"; then
-        echo "-- PASS: $name --"
-        printf "%s\tPASS\n" "$name" >> "$RESULTS"
+        echo "CI-DOCKER-STEP:$name:PASS"
       else
-        echo "-- FAIL: $name --"
-        printf "%s\tFAIL\n" "$name" >> "$RESULTS"
+        echo "CI-DOCKER-STEP:$name:FAIL"
       fi
     }
     cfg_alias_check() {
@@ -178,8 +192,8 @@ shard4() {
     step "check-no-diag-prints.sh"      bash scripts/check-no-diag-prints.sh
     step "merge-parse-check.sh"         bash scripts/merge-parse-check.sh
     step "gc-flake-gate.sh"             bash scripts/gc-flake-gate.sh
-    ! grep -q FAIL "$RESULTS"
   '
+  ! grep -q "CI-DOCKER-STEP:.*:FAIL$" "$OUT_DIR/shard-4.log"
 }
 
 # For a FAILing shard, pull a short, specific excerpt out of its log instead
@@ -187,14 +201,10 @@ shard4() {
 diagnose_shard() {
   local n="$1" log="$OUT_DIR/shard-$n.log"
   if [ "$n" = "4" ]; then
-    local results="$OUT_DIR/shard-4-steps.tsv"
-    if [ -f "$results" ]; then
-      awk -F'\t' '$2=="FAIL"{print "    FAILED STEP: " $1}' "$results"
-      if ! grep -q . "$results" 2>/dev/null; then
-        echo "    (no step recorded any result -- container likely never started; see the log)"
-      fi
+    if grep -q "^CI-DOCKER-STEP:" "$log" 2>/dev/null; then
+      grep "^CI-DOCKER-STEP:.*:FAIL$" "$log" | sed -E 's/^CI-DOCKER-STEP:(.*):FAIL$/    FAILED STEP: \1/'
     else
-      echo "    (no per-step results file -- the container itself failed to start; see the log)"
+      echo "    (no step markers in the log -- the container likely never started; see the log)"
     fi
     return
   fi
@@ -232,7 +242,7 @@ if [ -n "$SHARD_FILTER" ]; then
   SHARDS_TO_RUN=("$SHARD_FILTER")
 fi
 
-rm -f "$OUT_DIR"/shard-*.rc "$OUT_DIR/shard-4-steps.tsv"
+rm -f "$OUT_DIR"/shard-*.rc
 
 if [ "$PARALLEL" -eq 1 ] && [ "${#SHARDS_TO_RUN[@]}" -gt 1 ]; then
   pids=()

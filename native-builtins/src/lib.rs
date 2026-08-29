@@ -2663,7 +2663,25 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `OutputStream.write(byte[] b)` IS `write(b, 0, b.length)`, and reading
+    // `b.length` off a null reference is an NPE before any byte moves. Falling
+    // through to `Ok(None)` made the call a SILENT NO-OP: the caller writes,
+    // gets no exception, closes the stream, and believes it holds the bytes.
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java` (`f.write((byte[]) null)`).
+    // The first attempt at this fix went into `write([BII)V` -- a third
+    // overload, which no row in that probe calls. `write(byte[])`,
+    // `write(byte[],int,int)` and `write(int)` are three separate registered
+    // slots, and a null check in one of them is worth nothing to the other
+    // two: read the DESCRIPTOR the failing row dispatches on, not the method
+    // name.
     let arr = match args.get(1) {
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
@@ -10079,7 +10097,21 @@ pub fn register_essential_natives_with_shims(
                     _ => None,
                 },
             };
-            if let Some(output) = output {
+            // `new FilterOutputStream(null)` is legal -- the constructor stores
+            // whatever it is given -- and the FIRST write is where the JDK
+            // fails, on `out.write(b)`. `if let Some(..)` turned that into a
+            // no-op, so a stream with nowhere to write accepted every byte and
+            // reported success.
+            //
+            // MEASURED with `apps/probes/L4TailSweep2.java` (`new
+            // FilterOutputStream(null).write(1)`).
+            let Some(output) = output else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            };
+            {
                 let _ = ctx.invoke_virtual(
                     output,
                     "write",
@@ -10099,6 +10131,23 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
+            // TWO SILENT NO-OPS, both measured with
+            // `apps/probes/L4TailSweep2.java`:
+            //
+            //   fos.write((byte[]) null, 0, 1)      HotSpot NPE, this VM nothing
+            //   new FilterOutputStream(null).write  HotSpot NPE, this VM nothing
+            //
+            // `FilterOutputStream.write(byte[],int,int)` is a loop of
+            // `out.write(b[off + i])`, so a null buffer is an NPE on the array
+            // read and a null `out` is an NPE on the call. Doing nothing
+            // instead is a write that vanishes -- the caller closes the stream
+            // and believes it holds the bytes.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let output = match ctx.get_field_by_name(this, "out") {
                 Value::Object(Some(o)) => Some(o),
                 _ => match ctx.get_field(this, 0) {
@@ -10106,7 +10155,13 @@ pub fn register_essential_natives_with_shims(
                     _ => None,
                 },
             };
-            if let Some(output) = output {
+            let Some(output) = output else {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            };
+            {
                 let _ = ctx.invoke_virtual(
                     output,
                     "write",
@@ -18752,8 +18807,46 @@ pub fn register_essential_natives_with_shims(
     // `charAt` / `toString` / `getChars` / `reverse` on the parent where
     // real bytecode expects them to be inherited.
     lang_string::register_string_builder_natives(registry, "java/lang/StringBuilder");
-    lang_string::register_string_builder_natives(registry, "java/lang/StringBuffer");
     lang_string::register_string_builder_natives(registry, "java/lang/AbstractStringBuilder");
+
+    // `java/lang/StringBuffer` is DELIBERATELY ABSENT from this real-JDK list,
+    // and its 62 rows are the largest single retirement of this campaign.
+    //
+    // MEASURED, `javap -p -c --system <jdk-25.0.4+7> java.lang.StringBuffer`:
+    // every method of that class is either a `synchronized` delegation to
+    // `super` or a body that touches only its OWN `toStringCache` / `count`
+    // before delegating. NOT ONE of them reads `value` or `coder` — the two
+    // fields whose layout the natives on `AbstractStringBuilder` exist to
+    // serve. `writeObject` is the single exception and it is serialization,
+    // not dispatch.
+    //
+    // So the real bytecode is not merely safe to run here, it supplies two
+    // things a shared native body cannot:
+    //
+    //   * **the monitor.** `StringBuffer` is synchronized and `StringBuilder`
+    //     is not, and ONE registrar served both. `probes/
+    //     StringBuilderShadowSweep.java`'s `buffer append is mutually
+    //     exclusive` row measured what that cost: two threads appending 4000
+    //     characters each to one `StringBuffer` ended with FEWER than 8000,
+    //     with no exception anywhere. HotSpot answers 8000.
+    //   * **`toStringCache` invalidation.** The cache is `StringBuffer`'s own
+    //     field and every mutator nulls it in its own body. A native that
+    //     replaces the mutator never runs that line, so the moment anything
+    //     else populates the cache the buffer answers a stale `toString()` —
+    //     the quietest failure shape in this surface.
+    //
+    // The layout work still happens natively: `StringBuffer.append(String)` is
+    // `toStringCache = null; super.append(str); return this;`, and that
+    // `invokespecial` lands on `java/lang/AbstractStringBuilder.append`, which
+    // IS registered above. `is_string_builder_layout_native_override` drops
+    // `java/lang/StringBuffer` in the same commit so the force-native gate
+    // cannot short-circuit the walk and reach the inherited native directly —
+    // which would skip both the monitor and the cache invalidation and put the
+    // defect back with the registration gone.
+    //
+    // The measurement is the retired `l2-strings-eighteen-defects-five-root-
+    // causes-and-the-writer-half` write-up; its three open residuals are the
+    // `l2-strings-residuals-the-migration-is-unpriced` page.
 
     // --- java.lang.StringUTF16 static helpers ---
     // `<clinit>` queries `isBigEndian()` to pick a byte order for its
@@ -20931,6 +21024,17 @@ pub fn register_essential_natives_with_shims(
         "getTimeZone",
         "(Ljava/lang/String;)Ljava/util/TimeZone;",
         |ctx, args| {
+            // A null id is an NPE, and it is NOT the same thing as an unknown
+            // one: `TimeZone.getTimeZone("Not/AZone")` legitimately answers GMT
+            // (measured, and reproduced here), so substituting UTC for null made
+            // the fabricated answer indistinguishable from the documented one.
+            // MEASURED no-throw (apps/probes/LocaleDateTzShadowSweep 94).
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into());
+            }
             let id = match args.first() {
                 Some(Value::Object(Some(o))) => {
                     ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
@@ -30112,7 +30216,28 @@ pub(crate) const BUFFER_ADDRESS_SENTINEL: usize = 0x7fff_ffff_ffff_fffe;
 pub(crate) fn array_index_scale_for_name(name: &str) -> i32 {
     let bytes = name.as_bytes();
     if bytes.first() != Some(&b'[') {
-        return 1;
+        // A NON-ARRAY class answers 0, which is what
+        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
+        // callers guard on (`if (scale == 0) throw`). It answered the
+        // catch-all 1 until 2026-08-29 -- a plausible basis for address
+        // arithmetic over a class that has no elements, which in this family
+        // is the dangerous direction.
+        //
+        // The oracle cannot referee this row: HotSpot's own refusal names
+        // `java/lang/InvalidClassException`, which does not exist, so the
+        // throw fails to link and the caller gets a `NoClassDefFoundError`.
+        // Recorded in
+        // `unsafe-objectfieldoffset-accepted-a-static-and-the-jdk-refusal-that-is-itself-broken-20260826.md`,
+        // and a prior session declined to change the value because the blast
+        // radius was unmeasured.
+        //
+        // MEASURED 2026-08-29, whole 117-vector corpus, both modes: this
+        // function was ASKED 161 (compatible) / 175 (strict) times, in every
+        // one of the 117 vectors -- and NOT ONCE with a non-array class. The
+        // blast radius is zero and the arm is unreachable from the corpus, so
+        // taking the specified answer costs nothing and makes a
+        // `scale == 0` guard fire where it should.
+        return 0;
     }
     match bytes.get(1).copied() {
         Some(b'Z') | Some(b'B') => 1, // boolean, byte
@@ -36033,10 +36158,42 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((byte_arr, pos, lim, bb_off, big_endian))
         }
 
-        fn bbacb_char_at(
+        /// One read, TWO index contracts — which is the whole point of the
+        /// `relative` flag.
+        ///
+        /// `CharBuffer.charAt(int i)` is `CharSequence`'s, and the JDK's body is
+        /// literally `get(position() + checkIndex(i, 1))` — RELATIVE to the
+        /// current position. `CharBuffer.get(int index)` is the buffer's own
+        /// ABSOLUTE accessor: `Objects.checkIndex(index, limit)` and no
+        /// position anywhere.
+        ///
+        /// Both registrations called this helper and it did `pos + idx`, so
+        /// `get(int)` was silently position-relative. MEASURED against HotSpot
+        /// (`probes/L4TypedBufferSweep.java`, row `char/view get(out,1,2)`):
+        ///
+        /// ```text
+        ///   CharBuffer cb = ByteBuffer.allocate(8).asCharBuffer();  // "abcd"
+        ///   cb.flip(); cb.get();            // position is now 1
+        ///   cb.get(new char[4], 1, 2);
+        ///     HotSpot   .bc.      CratonVM  .cd.
+        /// ```
+        ///
+        /// It reads as a bulk-copy defect and is not one: the position
+        /// bookkeeping was right at every step (1 after the single get, 3
+        /// after the bulk), and `IntBuffer`/`ShortBuffer` views were correct.
+        /// `CharBuffer.get(char[],int,int)` has no native, so the REAL bytecode
+        /// ran and called the absolute `get(int)` once per element — with the
+        /// right indices, onto a body that added the position to them again.
+        /// **The wrong characters were returned with every visible number
+        /// correct.**
+        ///
+        /// This is an `Intrinsic`, so `--jdk-only` does not drop it and the
+        /// defect was identical in both modes.
+        fn bbacb_char_at_impl(
             ctx: &dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
             idx: i32,
+            relative: bool,
         ) -> Result<u16, RuntimeError> {
             let (byte_arr, pos, lim, bb_off, big_endian) = bbacb_read_underlying_bytes(ctx, this)
                 .ok_or(
@@ -36044,7 +36201,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
                 },
             )?;
-            let real = pos + idx;
+            let real = if relative { pos + idx } else { idx };
             if idx < 0 || real >= lim {
                 return Err(char_buffer_index_out_of_bounds());
             }
@@ -36065,6 +36222,24 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 ((lo << 8) | hi) as u16
             };
             Ok(ch)
+        }
+
+        /// `charAt(int)` — RELATIVE to the position (`CharSequence`'s contract).
+        fn bbacb_char_at(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            idx: i32,
+        ) -> Result<u16, RuntimeError> {
+            bbacb_char_at_impl(ctx, this, idx, true)
+        }
+
+        /// `get(int)` — ABSOLUTE (`Buffer`'s contract).
+        fn bbacb_char_absolute(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            idx: i32,
+        ) -> Result<u16, RuntimeError> {
+            bbacb_char_at_impl(ctx, this, idx, false)
         }
 
         for bbacb in &[
@@ -36102,7 +36277,9 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     Some(Value::Int(v)) => *v,
                     _ => 0,
                 };
-                let ch = bbacb_char_at(ctx, this, idx)?;
+                // ABSOLUTE — see `bbacb_char_at_impl`. This shared
+                // `bbacb_char_at` with `charAt` and was therefore relative.
+                let ch = bbacb_char_absolute(ctx, this, idx)?;
                 Ok(Some(Value::Int(ch as i32)))
             });
             // get()C — the RELATIVE getter, and the one method on this class

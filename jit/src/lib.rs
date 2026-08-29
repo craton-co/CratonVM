@@ -10732,10 +10732,16 @@ pub fn varhandle_read_direct_helpers_enabled() -> bool {
 // already describes, so there is no window to root across and reference values
 // are in scope here from the start.
 //
-// `compareAndSet` is deliberately NOT bound yet. Its helper would be
-// `(vm_ptr, vh, receiver, expected, new)` — five arguments, and Windows'
-// ARG_REGS is four (RCX/RDX/R8/R9), so it needs the stack-argument setup this
-// bind does not. `set` is `(vm_ptr, vh, receiver, value)`, exactly four.
+// `compareAndSet` IS bound now — see `VARHANDLE_CAS_DIRECT_FNS` below. The
+// objection recorded here until 2026-08-28 was that its helper is
+// `(vm_ptr, vh, receiver, expected, new)`, five arguments against Windows'
+// four ARG_REGS, "so it needs the stack-argument setup this bind does not".
+// That was true when the write bind was written and had stopped being true
+// before it was read: the `0xb6 | 0xb7 | 0xb9` arm calls
+// `emit_stack_arg_setup(&arg_slots, callee_needs_ctx)`, whose own comment says
+// "stack-arg setup for invokespecial/virtual direct calls whose receiver+params
+// exceed ARG_REGS". A fifth argument lands on the stack on Win64 and in
+// `ARG_REGS[4]` on SysV, and neither door needed a line changed for it.
 // ---------------------------------------------------------------------------
 
 /// Thin direct-call helper per (write mode, value kind), or `0` for a slot that
@@ -10851,6 +10857,243 @@ pub fn varhandle_write_direct_helper_sites() -> (u64, u64) {
         VARHANDLE_WRITE_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
         VARHANDLE_WRITE_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+
+// ---------------------------------------------------------------------------
+// `VarHandle` compareAndSet thin direct-call bind.
+//
+// The CAS was served from INSIDE the funnel (`try_varhandle_instance_field_cas`)
+// rather than bound, which covers every interpreter dispatch and every site the
+// JIT declines — but leaves the funnel's own entry cost on every call. A native
+// profile of an isolated CAS probe puts that at ~25% of a reference CAS:
+// 13.2% in `try_jit_site_cached_native_dispatch` and 11.9% in
+// `forward_jit_reference_args`/`forward_jit_arg_at`, against 3.1% in
+// `compare_and_swap_field_shared` and 1.2% in `hw_atomic_addr` — i.e. the
+// hardware atomic and its barriers are ~4% of what a CAS costs and the dispatch
+// is most of the rest. A further 10.3% was `CharSearcher::next_match`: the
+// funnel arm re-parses the call site's descriptor on every call to learn the
+// operand kinds, and a bound slot knows them at bind time.
+//
+// The in-funnel arm STAYS. It is what serves the interpreter and the declined
+// sites, and the two now share one implementation
+// (`varhandle_instance_field_cas_shared`) for the reason the write pair does:
+// the SATB pre-barrier fires on `expected` BEFORE the store and the post
+// `write_barrier` only on success, and two copies of that would drift.
+//
+// Reference values are in scope, on the write bind's argument and not the read
+// bind's: `compareAndSet` returns `Z`, so there is no reference RETURN to
+// publish as a handoff root, and `expected`/`new` travel INWARD in registers
+// the compiled caller's own frame already describes.
+// ---------------------------------------------------------------------------
+
+/// Thin direct-call helper per value kind, or `0` for a slot that is not
+/// served. Indexed by [`varhandle_cas_helper_slot`].
+pub static VARHANDLE_CAS_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_CAS_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_CAS_SLOTS];
+
+/// The value kinds served, in slot order — the same nine the write bind takes,
+/// and for the same reason `L` is among them.
+pub const VARHANDLE_CAS_KINDS: [u8; 9] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D', b'L'];
+
+/// `VARHANDLE_CAS_KINDS.len()`. One mode only: `compareAndSet`.
+///
+/// `weakCompareAndSet*` and `compareAndExchange` are NOT bound with it.
+/// The registry maps each to its own callback with its own result shape
+/// (`compareAndExchange` returns the witness value, not a `boolean`), so
+/// binding them together would widen what a bound site may do — which is
+/// exactly the property the write bind's four modes have and these do not.
+pub const VARHANDLE_CAS_SLOTS: usize = 9;
+
+/// The single-reference-coordinate, two-value, `boolean`-returning shape this
+/// bind serves, as a slot into [`VARHANDLE_CAS_DIRECT_FNS`].
+///
+/// Rules out the same shapes [`varhandle_write_helper_slot`] does and for the
+/// same reasons — a static-field handle CASes with `(XX)Z` (zero coordinates),
+/// an array-element or view handle with `([BIXX)Z` (two) — and adds the one
+/// this shape needs: `expected` and `new` must be the SAME kind, which a
+/// `VarHandle` call site always satisfies and a mis-shaped descriptor does not.
+///
+/// The helper re-checks the handle at runtime and declines to the generic
+/// dispatcher for anything the side table does not describe as a resolved
+/// instance field of this kind, so this is a cheap pre-filter and not the
+/// correctness argument.
+pub fn varhandle_cas_helper_slot(method: &str, descriptor: &str) -> Option<usize> {
+    if method != "compareAndSet" {
+        return None;
+    }
+    if !descriptor.starts_with('(') {
+        return None;
+    }
+    let close = descriptor.find(')')?;
+    if &descriptor[close + 1..] != "Z" {
+        return None;
+    }
+    let params = &descriptor[1..close];
+    // Split the leading reference coordinate off; two equal values must remain.
+    let coord_len = match params.as_bytes().first()? {
+        b'L' => params.find(';')? + 1,
+        b'[' => {
+            let after = params.trim_start_matches('[');
+            let consumed = params.len() - after.len();
+            match after.as_bytes().first()? {
+                b'L' => consumed + after.find(';')? + 1,
+                c if *c != b'L' && VARHANDLE_CAS_KINDS.contains(c) => consumed + 1,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let rest = &params[coord_len..];
+    let (expected, after_expected) = split_one_cas_operand(rest)?;
+    let (new, tail) = split_one_cas_operand(after_expected)?;
+    if !tail.is_empty() || expected != new {
+        return None;
+    }
+    let kind_idx = VARHANDLE_CAS_KINDS.iter().position(|k| *k == expected)?;
+    Some(kind_idx)
+}
+
+/// One operand descriptor off the front of `s`, collapsed to its kind byte the
+/// way `varhandle_instance_field_plan` collapses a field descriptor: any
+/// reference, however deeply arrayed, is `b'L'`.
+fn split_one_cas_operand(s: &str) -> Option<(u8, &str)> {
+    let b = s.as_bytes();
+    match b.first()? {
+        b'L' => {
+            let end = s.find(';')? + 1;
+            Some((b'L', &s[end..]))
+        }
+        b'[' => {
+            let after = s.trim_start_matches('[');
+            let consumed = s.len() - after.len();
+            match after.as_bytes().first()? {
+                b'L' => Some((b'L', &s[consumed + after.find(';')? + 1..])),
+                c if VARHANDLE_CAS_KINDS.contains(c) => Some((b'L', &s[consumed + 1..])),
+                _ => None,
+            }
+        }
+        c if VARHANDLE_CAS_KINDS.contains(c) => Some((*c, &s[1..])),
+        _ => None,
+    }
+}
+
+/// Register the `VarHandle` CAS thin direct-call helpers (called once from the
+/// VM's `build_helpers`), indexed by [`varhandle_cas_helper_slot`].
+pub fn set_varhandle_cas_direct_fns(addrs: &[usize; VARHANDLE_CAS_SLOTS]) {
+    for (cell, addr) in VARHANDLE_CAS_DIRECT_FNS.iter().zip(addrs.iter()) {
+        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS=0` — send every `VarHandle` CAS
+/// back through the generic native funnel, where
+/// `try_varhandle_instance_field_cas` still serves it one funnel round trip
+/// later. Default ON.
+///
+/// The twin of the read and write switches, and there for the same reason: the
+/// blast radius has to be measurable on ONE binary.
+pub fn varhandle_cas_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to a `VarHandle` CAS helper, split by compile door.
+///
+/// Split because the write bind proved the split is what catches an inert
+/// bind: bound in the single-pass ladder alone, its census moved by zero,
+/// because a `main` loop is an OSR body.
+pub static VARHANDLE_CAS_SITES_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_CAS_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(single-pass, OSR)` `VarHandle` CAS sites bound to a thin direct helper.
+pub fn varhandle_cas_direct_helper_sites() -> (u64, u64) {
+    (
+        VARHANDLE_CAS_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_CAS_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod varhandle_cas_slot_tests {
+    use super::*;
+
+    /// The shape `CompletableFuture.tryPushStack` CASes through, and the one
+    /// this bind exists for.
+    #[test]
+    fn a_reference_instance_field_cas_gets_the_reference_slot() {
+        assert_eq!(
+            varhandle_cas_helper_slot(
+                "compareAndSet",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z"
+            ),
+            Some(8),
+        );
+        // An array-typed value collapses to the same slot, as in the plan.
+        assert_eq!(
+            varhandle_cas_helper_slot(
+                "compareAndSet",
+                "(Ljava/lang/Object;[Ljava/lang/String;[Ljava/lang/String;)Z"
+            ),
+            Some(8),
+        );
+    }
+
+    /// Primitives get their own slots, in `VARHANDLE_CAS_KINDS` order.
+    #[test]
+    fn primitive_values_get_their_own_slots() {
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;II)Z"), Some(4));
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;JJ)Z"), Some(5));
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;ZZ)Z"), Some(0));
+    }
+
+    /// Everything this bind must NOT take, each for its own reason.
+    #[test]
+    fn the_shapes_that_are_not_an_instance_field_cas_are_refused() {
+        // No coordinate at all: a static-field handle.
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(II)Z"), None);
+        // Two coordinates: an array-element or byte-view handle.
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "([BIII)Z"), None);
+        // A `MemorySegment` handle's `J` offset coordinate.
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/foreign/MemorySegment;JII)Z"),
+            None,
+        );
+        // `expected` and `new` of different kinds is not a CAS shape.
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;IJ)Z"), None);
+        // One operand only.
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;I)Z"), None);
+        // Three operands.
+        assert_eq!(varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;III)Z"), None);
+        // A non-boolean return is a different access mode.
+        assert_eq!(
+            varhandle_cas_helper_slot("compareAndSet", "(Ljava/lang/Object;II)I"),
+            None,
+        );
+    }
+
+    /// The neighbouring access modes are NOT bound with `compareAndSet`, and
+    /// the slot function is what refuses them.
+    #[test]
+    fn the_neighbouring_modes_are_not_bound() {
+        for mode in ["weakCompareAndSet", "weakCompareAndSetPlain", "compareAndExchange", "set"] {
+            assert_eq!(
+                varhandle_cas_helper_slot(mode, "(Ljava/lang/Object;II)Z"),
+                None,
+                "{mode} must not share the compareAndSet bind",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -20900,7 +21143,10 @@ fn try_compile_inner(
                                 && varhandle_read_helper_slot(&mn, &desc).is_some())
                             || (varhandle_write_direct_helpers_enabled()
                                 && cn == "java/lang/invoke/VarHandle"
-                                && varhandle_write_helper_slot(&mn, &desc).is_some());
+                                && varhandle_write_helper_slot(&mn, &desc).is_some())
+                            || (varhandle_cas_direct_helpers_enabled()
+                                && cn == "java/lang/invoke/VarHandle"
+                                && varhandle_cas_helper_slot(&mn, &desc).is_some());
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
                             all_emittable = false;
                             if ir_stage_reporting() {
@@ -23860,6 +24106,59 @@ fn try_compile_inner(
                         }
                     }
                 }
+                // `VarHandle.compareAndSet` on an instance field (see
+                // `VARHANDLE_CAS_DIRECT_FNS`). The write bind's argument
+                // carries over: `compareAndSet` resolves to ONE registered
+                // native regardless of the receiver's concrete handle class, so
+                // there is no subclass override a guard would protect, and the
+                // helper re-validates the handle at runtime.
+                //
+                // `num_params: 3` — the coordinate, `expected` and `new`. With
+                // `needs_context: true` that is five words. On SysV they are
+                // five of six `ARG_REGS`; on Win64 the fifth goes on the stack,
+                // which `emit_stack_arg_setup` has marshalled for this arm since
+                // Round-8 wave-3. The comment above `VARHANDLE_WRITE_DIRECT_FNS`
+                // said that setup did not exist and had been wrong for as long
+                // as anyone had read it.
+                if direct_jit_callee_calls_enabled
+                    && varhandle_cas_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/invoke/VarHandle"
+                {
+                    if let Some(slot) = varhandle_cas_helper_slot(&method_name, &descriptor) {
+                        // The REGISTERED (erased) descriptor, not the site's —
+                        // `register_varhandle_natives` files `compareAndSet`
+                        // under `([Ljava/lang/Object;)Z`, and asking the
+                        // registry about the site's own descriptor would find
+                        // nothing and refuse for the wrong reason. It is
+                        // `NativeKind::Bridge`, so under `JdkOnly` this bind is
+                        // refused on the same terms as the read and write ones.
+                        let entry = direct_native_helper(
+                            &VARHANDLE_CAS_DIRECT_FNS[slot],
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            "([Ljava/lang/Object;)Z",
+                        );
+                        if entry != 0 {
+                            VARHANDLE_CAS_SITES_SINGLEPASS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 3,
+                                    return_type: b'Z',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 // `Long.longValue()` — the twin of the `Integer.intValue()`
                 // bind directly above. `java/lang/Long` is `final` on exactly
                 // the same terms, so a site whose constant-pool class is
@@ -26340,6 +26639,30 @@ mod tests {
     /// the background tiering door published FOR the wrapped entry was handed
     /// to callers that supply no monitor. A gate in front of a slow path guards
     /// nothing once the fast path can answer.
+
+    /// A copy of `src` with every ASCII whitespace character removed, for
+    /// witnesses that must survive `cargo fmt`.
+    ///
+    /// A source witness exists to say "this guard is still in the code". When
+    /// it anchors on an exact string it also, silently, asserts how that string
+    /// is WRAPPED — and then a formatting pass makes it fail while reporting
+    /// that the guard is gone. `3de6b9c64` did exactly that to
+    /// `the_dispatch_helpers_jit_cache_arm_refuses_a_wrapped_entry_body`:
+    /// `jit_cache.get(` became `jit_cache\n    .get(`, the witness stopped
+    /// matching, and its message said the arm "must still exist" about an arm
+    /// that had not changed at all.
+    ///
+    /// Stripping whitespace collapses every legal formatting of the same
+    /// expression onto one string, so the assertion is about the code.
+    ///
+    /// It does NOT strip comments, and it must not: matching the CODE form is
+    /// how these witnesses avoid passing against a deleted check that a nearby
+    /// comment still describes. The patterns below all contain punctuation no
+    /// prose carries (`|compiled|!`), which is what keeps that true.
+    fn code_only(src: &str) -> String {
+        src.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+    }
+
     #[test]
     fn the_callee_cache_fast_path_refuses_a_wrapped_entry_body() {
         let src = std::fs::read_to_string(format!(
@@ -26347,12 +26670,19 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .expect("read jit_bridge.rs");
+        let flat = code_only(&src);
+        assert!(
+            flat.len() > 100_000,
+            "jit_bridge.rs collapsed to {} chars — the read did not reach the \
+             file, so everything below would pass vacuously",
+            flat.len()
+        );
 
-        let at = src
-            .find("if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id)")
+        let at = flat
+            .find("ifletSome(compiled)=jit_cache.get(class_name,method_name,descriptor,probe_class_id)")
             .expect("the callee `jit_cache` fast path must still exist");
-        let end = src[at..]
-            .find("return Some((compiled, entry, needs_ctx));")
+        let end = flat[at..]
+            .find("returnSome((compiled,entry,needs_ctx));")
             .map(|off| at + off)
             .expect("the fast path must still hand back an entry");
         // The CODE form, not the bare identifier: this arm carries an
@@ -26360,7 +26690,7 @@ mod tests {
         // let the witness pass against a deleted check. The sibling witness
         // below was caught doing exactly that.
         assert!(
-            src[at..end].contains("if compiled.requires_wrapped_entry"),
+            flat[at..end].contains("ifcompiled.requires_wrapped_entry"),
             "`try_jit_compile_callee`'s `jit_cache` fast path hands back a compiled \
              entry without asking `requires_wrapped_entry`. Every caller of this \
              function CALLs that entry raw, with no monitor."
@@ -26389,17 +26719,35 @@ mod tests {
         // that only inspects `has_indy_trap` and never hands out an entry, and
         // matching that one would make this witness pass while the real arm
         // went unguarded.
-        let at = src
-            .match_indices("if let Some(compiled) = jit_cache.get(")
-            .map(|(i, _)| i)
-            .find(|&i| src[i..(i + 200).min(src.len())].contains("info.class_name"))
+        let flat = code_only(&src);
+        assert!(
+            flat.len() > 100_000,
+            "helpers.rs collapsed to {} chars — the read did not reach the file, \
+             so everything below would pass vacuously",
+            flat.len()
+        );
+
+        // The arm is identified by what it reads (`info.*`, the dispatch site's
+        // own metadata), which is what distinguishes it from the two other
+        // `requires_wrapped_entry` filters in this file.
+        let at = flat
+            .find("ifletSome(compiled)=jit_cache.get(info.class_name,info.method_name,info.descriptor,info_class_id,)")
             .expect("the dispatch helper's jit_cache arm must still exist");
-        let window = &src[at..(at + 1400).min(src.len())];
+
+        // ORDERING, not proximity. The old form asked whether the guard
+        // appeared within 1400 characters, which says nothing about whether it
+        // gates anything. What matters is that the filter runs BEFORE the
+        // `DISPATCH_CACHE` insert: serving a synchronized body once is bad, and
+        // caching it makes every later call at the site run unlocked too.
+        let cache_at = flat[at..]
+            .find("DISPATCH_CACHE.with(")
+            .map(|off| at + off)
+            .expect("the arm must still populate DISPATCH_CACHE");
         // The CODE form. Matching the bare identifier passed against a
         // `.filter(|_c| true)` because the explanatory comment above the
         // filter still named the field -- a probe that could not fail.
         assert!(
-            window.contains("!compiled.requires_wrapped_entry"),
+            flat[at..cache_at].contains(".filter(|compiled|!compiled.requires_wrapped_entry)"),
             "`jit_invoke_dispatch`'s `jit_cache` arm fills `DISPATCH_CACHE` with a \
              raw entry without asking `requires_wrapped_entry`"
         );

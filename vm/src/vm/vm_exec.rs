@@ -2795,6 +2795,35 @@ fn prefers_exact_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/foreign/DowncallHandle"
 }
 
+/// Whether this dispatch should publish its CALL-SITE descriptor on
+/// [`cratonvm_native_api::poly_call_site`] for the native it is about to run.
+///
+/// Two names need it, for two different reasons:
+///
+/// * `invoke` -- its collect-or-passthrough answer for a trailing `null`
+///   depends on the type the caller WROTE, and a `null` carries no runtime
+///   type. This is the original consumer the channel was built for.
+/// * `invokeExact` -- the rule that the call site must match the handle's
+///   `type()` EXACTLY is a statement about the call site, so the check cannot
+///   be made anywhere that cannot see it. See
+///   `lang_invoke::exact_call_site_refusal`.
+///
+/// `java/lang/foreign/DowncallHandle` is excluded from the `invokeExact` arm on
+/// purpose. Its `invokeExact` resolves to Panama's OWN native, not
+/// `MethodHandle`'s, and that native does not TAKE the channel -- an armed
+/// descriptor it left behind would be read by a later dispatch as its own, and
+/// the module doc is explicit that a WRONG call-site type is worse than none.
+pub(crate) fn arms_poly_call_site(class_name: &str, method_name: &str) -> bool {
+    match method_name {
+        "invoke" => is_method_handle_signature_polymorphic_receiver(class_name),
+        "invokeExact" => {
+            is_method_handle_signature_polymorphic_receiver(class_name)
+                && !prefers_exact_signature_polymorphic_receiver(class_name)
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
@@ -7981,6 +8010,30 @@ struct VmNativeThreadBlocker {
     thread_id: ThreadId,
 }
 
+
+/// Payload size in bytes of a primitive array, or `None` when `arr` is
+/// not one.
+///
+/// Reference arrays return `None` deliberately: the byte-level bulk
+/// accessors must never touch them, because writing raw bytes over
+/// object references would hand the collector pointers it never issued.
+#[allow(dead_code)]
+fn primitive_array_byte_capacity_of(
+    heap: &cratonvm_gc::vm_heap::VmHeap,
+    arr: cratonvm_types::ObjectRef,
+) -> Option<usize> {
+    use cratonvm_types::{ArrayElementType, ObjectKind};
+    if heap.kind_of(arr) != ObjectKind::Array {
+        return None;
+    }
+    let et = heap.element_type_of_validated(arr);
+    if et == ArrayElementType::Reference {
+        return None;
+    }
+    let width = cratonvm_types::element_byte_size(et);
+    heap.array_length(arr).checked_mul(width)
+}
+
 impl NativeThreadBlocker for VmNativeThreadBlocker {
     fn publish_os_tid(&self) {
         self.shared
@@ -12997,6 +13050,63 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
         }
         n
+    }
+
+    fn write_primitive_array_bytes(
+        &mut self,
+        arr: ObjectRef,
+        byte_off: usize,
+        src: &[u8],
+    ) -> bool {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
+        else {
+            return false;
+        };
+        if byte_off.checked_add(src.len()).map_or(true, |end| end > capacity) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: the receiver is a primitive array (checked), and the
+        // write stays inside its payload (checked). `array_data_ptr`
+        // yields the base of that payload, whose elements are contiguous
+        // and `element_byte_size` wide — the same layout argument
+        // `write_int_array_from` rests on.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(byte_off), src.len());
+                true
+            },
+            None => false,
+        }
+    }
+
+    fn read_primitive_array_bytes(
+        &self,
+        arr: ObjectRef,
+        byte_off: usize,
+        dst: &mut [u8],
+    ) -> usize {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
+        else {
+            return 0;
+        };
+        if byte_off >= capacity {
+            return 0;
+        }
+        let n = dst.len().min(capacity - byte_off);
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: as above, with the length clamped to what remains.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(base.add(byte_off), dst.as_mut_ptr(), n);
+                n
+            },
+            None => 0,
+        }
     }
 
     fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
@@ -18570,16 +18680,17 @@ pub fn invoke_or_native(
         cratonvm_native_api::registry::lookup_census::INVOKE_GENERAL,
     );
     dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
-    // Publish the CALL-SITE descriptor for `MethodHandle.invoke`, whose
-    // collect-or-passthrough answer for a trailing `null` depends on the type
-    // the caller WROTE and on nothing observable at dispatch. See
-    // `cratonvm_native_api::poly_call_site`.
+    // Publish the CALL-SITE descriptor for the two signature-polymorphic names
+    // that cannot do their job without it. `arms_poly_call_site` owns WHICH,
+    // and why, so this site and the two others cannot drift apart: `invoke`
+    // needs the type the caller WROTE to decide collect-or-passthrough for a
+    // trailing `null`, and `invokeExact` needs it because "the call site must
+    // match the handle's type exactly" is a statement ABOUT the call site.
     //
-    // Narrowed to a MethodHandle receiver so nothing else can leave a
-    // descriptor armed, and never CLEARED here — the signature-polymorphic
-    // block in `invoke_on_class_shared_inner` owns the clearing, and this door
-    // may run before it.
-    if method_name == "invoke" && is_method_handle_signature_polymorphic_receiver(class_name) {
+    // Never CLEARED here — the signature-polymorphic block in
+    // `invoke_on_class_shared_inner` owns the clearing, and this door may run
+    // before it.
+    if arms_poly_call_site(class_name, method_name) {
         cratonvm_native_api::poly_call_site::arm(descriptor);
     }
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
@@ -24872,6 +24983,13 @@ fn invoke_on_class_shared_inner(
                                 | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"
+                                // `clone`: the real body's
+                                // `clone.map = new ConcurrentHashMap<>(map)`
+                                // NPEs on the permanently-null `map` of a
+                                // synthetic Properties. See
+                                // `properties_sidetable::native_properties_clone`.
+                                | "clone"
+                                | "replaceAll"
                             ))
                         // S111r7: HashMap / LinkedHashMap / Hashtable /
                         // ConcurrentHashMap and HashSet view-method
@@ -26976,17 +27094,13 @@ fn invoke_on_class_shared_inner(
                         // confirm it does not flip that assertion off zero,
                         // which is a measurement this lane could not make.
                         //
-                        // Publish the CALL-SITE descriptor for the one native
-                        // that cannot decide without it —
-                        // `MethodHandle.invoke`, whose collect-or-passthrough
-                        // answer for a trailing `null` depends on the type the
-                        // caller WROTE. See
-                        // `cratonvm_native_api::poly_call_site`. Armed for
-                        // `invoke` and CLEARED for every other
-                        // signature-polymorphic name, so nothing here can leave
-                        // a stale descriptor for a later dispatch to read as
-                        // its own.
-                        if method_name == "invoke" {
+                        // Publish the CALL-SITE descriptor for the natives
+                        // that cannot decide without it. `arms_poly_call_site`
+                        // owns which names those are and why; everything else
+                        // signature-polymorphic is CLEARED, so nothing here can
+                        // leave a stale descriptor for a later dispatch to read
+                        // as its own. See `cratonvm_native_api::poly_call_site`.
+                        if arms_poly_call_site(&class_name, method_name) {
                             cratonvm_native_api::poly_call_site::arm(descriptor);
                         } else {
                             cratonvm_native_api::poly_call_site::clear();
@@ -28384,9 +28498,24 @@ fn invoke_on_class_shared_inner(
             }
         } else {
             let full_sig = format!("{class_name}.{method_name}{descriptor}");
+            // Name the mode this VM is actually in. The line used to say
+            // "real-JDK mode" unconditionally, which is wrong in the one
+            // configuration whose gaps had never been catalogued: a first
+            // `--synthetic-jdk` corpus run (2026-08-29, P4-B) produced 53
+            // distinct missing natives and every one of them claimed to come
+            // from real-JDK mode. A reader's first move on seeing that is to
+            // conclude the run was misconfigured.
+            let mode = if shared.compatibility_mode().is_jdk_only() {
+                "jdk-only mode"
+            } else if shared.config.use_synthetic_jdk {
+                "synthetic-JDK mode"
+            } else {
+                "real-JDK mode"
+            };
             tracing::warn!(
                 method = %full_sig,
-                "Missing native method in real-JDK mode"
+                mode = %mode,
+                "Missing native method"
             );
             // Record in structured audit log if enabled
             if shared.config.audit_missing_natives {

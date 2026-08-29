@@ -647,59 +647,33 @@ fn native_string_init_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `<init>(Ljava/lang/StringBuilder;)V` — `new String(StringBuilder)`.
 ///
-/// Reads the builder's chars (CratonVM's synthetic SB layout: field 0 = char[]
-/// buffer, field 1 = count — same accessor `StringBuilder.toString()` uses) and
-/// initialises `this` from them. This bypasses the real JDK
-/// `String(AbstractStringBuilder, Void)` ctor, which assumes `getValue()` returns
-/// the compact-string `byte[]` and `Arrays.copyOfRange`s it — a char[]->byte[]
-/// type mismatch against CratonVM's char[]-backed builder (Tomcat DF05).
+/// Reads the builder's characters — through `sb_read_chars`, which understands
+/// WHICHEVER of the two layouts the receiver holds — and initialises `this` from
+/// them. This bypasses the real JDK `String(AbstractStringBuilder, Void)` ctor,
+/// which `Arrays.copyOfRange`s `getValue()`; that was a `char[]` -> `byte[]` type
+/// mismatch against a synthetic builder (Tomcat DF05).
+///
+/// The hand-rolled copy that used to stand in the body read slot 0 as a `char[]`
+/// and answered an EMPTY vector for a compact `byte[]` payload — which is a
+/// FABRICATION, not a refusal: the caller cannot tell an empty builder from one
+/// whose content this constructor declined to look at. MEASURED, `--jdk-only`
+/// with the builder registrations skipped so real bytecode owned the object: a
+/// builder holding "abcdefgh" reported `length() == 8` and
+/// `toString().length() == 0`, `rc = 0`, no exception — the "every append
+/// silently discarded" behaviour `H22` recorded against
+/// `register_string_builder_natives`, produced here, one class away from
+/// anything that registrar names.
+///
+/// The dispatch that lands a `(AbstractStringBuilder,Void)V` call on this
+/// `(StringBuilder)V` body is a separate defect and is NOT fixed here — see
+/// `WORKER-3-NOTE-6`. This makes the answer right whichever overload arrives.
 fn native_string_init_from_string_builder(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let sb = obj_arg(args, 1)?; // null builder -> NPE, matching the JDK ctor
-    let (buf, count) = crate::lang_string::sb_state(ctx, sb);
-    let units: Vec<u16> = match buf {
-        Some(b) => {
-            let n = count.max(0) as usize;
-            let mut chars = Vec::with_capacity(n);
-            for i in 0..n {
-                let ch = match ctx.get_array_element(b, i) {
-                    Value::Int(v) => v as u16,
-                    _ => 0,
-                };
-                chars.push(ch);
-            }
-            chars
-        }
-        // NOT `Vec::new()`. `sb_state` yields `None` for a builder whose
-        // `value` is the real compact `byte[]` — which is what real
-        // `AbstractStringBuilder` bytecode produces — and an empty vector for
-        // that receiver is a FABRICATION, not a refusal: the caller cannot
-        // tell an empty builder from one whose content this constructor
-        // declined to look at. `sb_read_chars` and `native_sb_to_string`, the
-        // two sibling copies of this read, were both given the layout-aware
-        // fallback; this one was missed, and it is the copy on the live path.
-        //
-        // MEASURED, `--jdk-only` with the builder registrations skipped so
-        // real bytecode owns the object: a builder holding "abcdefgh" reports
-        // `length() == 8` and `toString().length() == 0`, `rc = 0`, no
-        // exception. That is the "every append silently discarded" behaviour
-        // `H22` recorded against `register_string_builder_natives`, produced
-        // here, one class away from anything that registrar names.
-        //
-        // The dispatch that lands a `(AbstractStringBuilder,Void)V` call on
-        // this `(StringBuilder)V` body is a separate defect and is NOT fixed
-        // here — see `WORKER-3-NOTE-6`. This makes the answer right whichever
-        // overload arrives.
-        None => {
-            let mut units = crate::lang_string::sb_value_units(ctx, sb).unwrap_or_default();
-            let n = count.max(0) as usize;
-            units.truncate(n.min(units.len()));
-            units
-        }
-    };
+    let units: Vec<u16> = crate::lang_string::sb_read_chars(ctx, sb);
     // Write the UTF-16 units STRAIGHT into `this`.
     //
     // This used to be `String::from_utf16_lossy(&chars).into_bytes()` fed to
@@ -2067,6 +2041,22 @@ fn native_locale_get_iso3_language(
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         }
+    };
+    // THIRD FALLBACK, and the one that covers `Locale.of(..)`. A real `Locale`
+    // keeps its language in `baseLocale.language`, and fills neither the side
+    // table (which `locale_alloc` and the `<init>` natives write) nor the
+    // synthetic slot 0 -- so `Locale.of("en","US").getISO3Language()` answered
+    // `""` against HotSpot's `"eng"` (apps/probes/LocaleDateTzShadowSweep 10). Ask
+    // our own `getLanguage()`, which is registered and already right for every
+    // shape, rather than adding a third copy of the lookup: the `iso2_to_iso3`
+    // table below was complete all along and simply never got a code to map.
+    let lang2 = if lang2.is_empty() {
+        match ctx.invoke_virtual(this, "getLanguage", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    } else {
+        lang2
     };
     let iso3 = iso2_to_iso3(&lang2);
     let result = if iso3.is_empty() { &lang2 } else { iso3 };

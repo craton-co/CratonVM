@@ -1697,9 +1697,15 @@ mod tests {
         let caps = CapabilitySet::new(VmId::from_raw(0x1234), CapabilityMode::Enforce);
         // Deliberately one line, with `line!()` immediately after: `check` is
         // `#[track_caller]`, so the recorded site must be the gate's line.
-        let denied = caps
-            .check(Capability::network("metadata.internal:80"))
-            .expect_err("denied");
+        //
+        // `#[rustfmt::skip]` is LOAD-BEARING, not style. `cargo fmt` reflowed
+        // this call across three lines in `3de6b9c64`, `line!() - 1` then named
+        // the `.expect_err` line instead of the `.check` line, and the test went
+        // off by exactly one — red for every lane on the first gate it runs.
+        // The comment above already said "deliberately one line" and a comment
+        // is not a compile-time link; this attribute is.
+        #[rustfmt::skip]
+        let denied = caps.check(Capability::network("metadata.internal:80")).expect_err("denied");
         let expected_line = line!() - 1;
 
         assert_eq!(denied.capability, CapabilityKind::Network);
@@ -1837,8 +1843,11 @@ mod tests {
     #[test]
     fn audit_records_the_first_call_site_not_the_last() {
         let caps = set(CapabilityMode::Permissive);
-        caps.check(Capability::file_read("/data/a"))
-            .expect("permissive allows");
+        // One line, and `#[rustfmt::skip]` to keep it that way — see
+        // `denial_carries_kind_scope_vm_and_call_site` for what a reflow does
+        // to `line!() - 1`.
+        #[rustfmt::skip]
+        caps.check(Capability::file_read("/data/a")).expect("permissive allows");
         let first = line!() - 1;
         caps.check(Capability::file_read("/data/a"))
             .expect("permissive allows");

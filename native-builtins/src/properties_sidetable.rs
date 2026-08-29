@@ -2042,7 +2042,27 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     let key = read_java_text(ctx, key_obj).unwrap_or_default();
     let val = read_java_text(ctx, val_obj).unwrap_or_default();
-    let old = get_kv_units(ctx, this, &key);
+    // The previous value comes from `native_properties_get`, not from
+    // `get_kv_units`. The side table is String->String, so reading the return
+    // value out of it answered null for exactly the case a caller cares about:
+    // the key was mapped to something that is NOT a String, and this call is
+    // about to overwrite it. MEASURED: HotSpot 42, CratonVM null
+    // (apps/probes/PropertiesShadowSweep 43).
+    //
+    // GC-SAFETY: `native_properties_get` re-enters Java (the CHM lookup), so
+    // the receiver and both argument objects are pinned across it and re-read.
+    let this_pin = ctx.pin_native_root(this);
+    let key_obj_pin = ctx.pin_native_root(key_obj);
+    let old_obj = native_properties_get(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(key_obj))],
+    )?;
+    let old_obj_pin = match old_obj {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let _ = ctx.read_native_pin(key_obj_pin, key_obj);
     put_kv_units(ctx, this, &key, &val);
     // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap) so
     // generic Map walkers observe the entry — see native_properties_put's
@@ -2056,13 +2076,12 @@ fn native_properties_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -
     if is_system_props(ctx, this) {
         let _ = ctx.set_system_property(&key.to_lossy(), &val.to_lossy());
     }
-    match old {
-        Some(prev) => {
-            let s = create_property_string(ctx, &prev);
-            Ok(Some(Value::Object(Some(s))))
-        }
-        None => Ok(Some(Value::Object(None))),
-    }
+    let answer = match old_obj_pin {
+        Some((pin, orig)) => Value::Object(Some(ctx.read_native_pin(pin, orig))),
+        None => Value::Object(None),
+    };
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(answer))
 }
 
 /// Native `Properties.put(Object, Object)` — when callers bypass
@@ -2240,6 +2259,14 @@ fn native_properties_compute_if_absent(
     if matches!(args.get(1), None | Some(Value::Object(None))) {
         return Err(props_null_put_npe());
     }
+    // ... and the FUNCTION's, which that pass did not take.
+    // `ConcurrentHashMap.computeIfAbsent` opens
+    // `if (key == null || mappingFunction == null) throw new NullPointerException();`
+    // -- one line, both arguments. MEASURED no-throw
+    // (apps/probes/PropertiesShadowSweep 74).
+    if matches!(args.get(2), Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -2388,6 +2415,171 @@ fn remove_from_properties_backend(
     } else {
         Value::Object(None)
     }
+}
+
+/// Native `Properties.clone()Ljava/lang/Object;` — the override this module's
+/// registration header says every entry-touching method needs, and that
+/// `clone` never got.
+///
+/// The real JDK 25 body is two statements:
+///
+/// ```java
+/// Properties clone = (Properties) cloneHashtable();   // = Object.clone()
+/// clone.map = new ConcurrentHashMap<>(map);           // Properties.java:1526
+/// ```
+///
+/// The second one throws on every `Properties` this VM builds. `map` is null —
+/// **deliberately** so, per the note on `register_properties_sidetable`: the
+/// synthetic Properties keeps its entries in the identity-keyed side-table, and
+/// the inherited CHM backing "is deliberately never populated", which is why
+/// every read/write method in this module exists at all. Neither the native
+/// `<init>` nor the `System.getProperties()` synthetic allocation creates one,
+/// so a `Properties` that has never been WRITTEN through has `map == null` and
+/// any real body that dereferences it fails.
+///
+/// Measured (`PropsSurface`, 27 operations x 3 receiver shapes, diffed against
+/// HotSpot): exactly two of 81 fail, `clone` and `replaceAll`, on a fresh
+/// `new Properties()` and on `System.getProperties()` — and not on one that has
+/// been written to, because the write paths lazily create the CHM. The second
+/// NPE names the cause outright: *Cannot invoke
+/// "java.util.concurrent.ConcurrentHashMap.replaceAll(...)" because "this.map"
+/// is null*. Testcontainers hit the `clone` one on
+/// `((Properties) System.getProperties().clone())`, which `ServiceLoader`
+/// rewrapped as a `ServiceConfigurationError`, failing 138 of 191
+/// hibernate-reactive classes in one batch.
+///
+/// Note what this override does NOT do: it does not make `map` non-null in
+/// general. Leaving it null keeps every un-overridden real body failing LOUDLY
+/// — which is how this defect was found — instead of silently reading an empty
+/// map and returning a wrong answer.
+fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        // A null receiver is `Object.clone`'s NPE to raise, not ours.
+        return crate::native_object_clone(ctx, args);
+    };
+    // Snapshot before anything allocates: this side-table IS the store.
+    // `snapshot_kv`, not the public `snapshot_sidetable`: the latter renders
+    // each entry `to_lossy()`, and a clone must not quietly mangle a key or
+    // value whose text this VM stores faithfully but cannot render.
+    let entries = snapshot_kv(ctx, this);
+
+    // Step 1 — precisely what the real body's `cloneHashtable()` already
+    // reaches (`Object.clone` -> `native_object_clone`). That native
+    // shallow-copies the heap fields, `defaults` included, and already knows to
+    // replicate a Properties' side-table onto the clone's new identity.
+    let cloned = crate::native_object_clone(ctx, args)?;
+    let Some(Value::Object(Some(clone_ref))) = cloned else {
+        return Ok(cloned);
+    };
+    let clone_pin = ctx.pin_native_root(clone_ref);
+
+    // Step 2 — the statement that throws, done safely. It can be neither
+    // inherited nor skipped:
+    //
+    //   * inheriting it dereferences the null `map`;
+    //   * skipping it leaves the shallow copy's `map` ALIASING the receiver's
+    //     CHM, so a later write through the clone would land in the original —
+    //     destroying the independence `clone` exists to provide. (The receiver
+    //     has a live CHM whenever it has been written through, so this is the
+    //     common case, not a corner.)
+    //
+    // Drop the aliased reference, then rebuild the clone's own backing from the
+    // entries it actually has. `mirror_loaded_entries_to_properties_backend`
+    // creates the CHM when absent, which is the same lazy construction the
+    // write paths use.
+    ctx.set_field_by_name(clone_ref, "map", Value::Object(None));
+    if !entries.is_empty() {
+        let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
+        mirror_loaded_entries_to_properties_backend(ctx, clone_ref, &entries);
+    }
+    let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
+    ctx.unpin_native_roots(clone_pin);
+    Ok(Some(Value::Object(Some(clone_ref))))
+}
+
+/// Native `Properties.replaceAll(BiFunction)V` — the second method this
+/// module's registration header covers but never listed.
+///
+/// The real JDK body is one statement, `map.replaceAll(function)`, and it fails
+/// the same way `clone` did and for the same reason. The VM says so itself:
+///
+/// ```text
+/// NullPointerException: Cannot invoke
+///   "java.util.concurrent.ConcurrentHashMap.replaceAll(java.util.function.BiFunction)"
+///   because "this.map" is null
+/// ```
+///
+/// Note why this one could NOT be fixed by making `map` non-null. An empty CHM
+/// would make `map.replaceAll(f)` succeed while replacing nothing, on a
+/// receiver whose side-table holds 54 system properties — trading a loud NPE
+/// for a silent wrong answer. The store has to be the one that actually holds
+/// the entries, which is what every other write in this module already targets.
+///
+/// Each replacement is routed through [`native_properties_put`] rather than
+/// written here, so `replaceAll` inherits — rather than re-derives — that
+/// path's three obligations: the side-table write, the mirror into the `map`
+/// CHM that generic `Map` walkers read, and the propagation to the VM's
+/// system-property store when the receiver is the `System.getProperties()`
+/// view. Re-deriving any of those is how the side-table-vs-backing asymmetry
+/// that `native_properties_clear` documents gets reintroduced.
+fn native_properties_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let func = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        // `Map.replaceAll(null)` is an NPE on HotSpot too.
+        _ => return Err(props_null_put_npe()),
+    };
+    // Snapshot first: the function is free to call back into this Properties,
+    // and `ConcurrentHashMap.replaceAll` iterates a fixed entry set.
+    let entries = snapshot_kv(ctx, this);
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let func_pin = ctx.pin_native_root(func);
+    for (k, v) in entries {
+        // Every step below can allocate and therefore relocate; re-read each
+        // reference from its pin immediately before use.
+        let k_obj = create_property_string(ctx, &k);
+        let k_pin = ctx.pin_native_root(k_obj);
+        let v_obj = create_property_string(ctx, &v);
+        let f_now = ctx.read_native_pin(func_pin, func);
+        let k_now = ctx.read_native_pin(k_pin, k_obj);
+        let applied = ctx.invoke_virtual(
+            f_now,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_now)), Value::Object(Some(v_obj))],
+        )?;
+        let new_v = match applied {
+            Some(Value::Object(Some(o))) => o,
+            // `ConcurrentHashMap` rejects a null replacement rather than
+            // removing the entry; match that instead of inventing a third
+            // behaviour.
+            _ => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(props_null_put_npe());
+            }
+        };
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let k_now = ctx.read_native_pin(k_pin, k_obj);
+        native_properties_put(
+            ctx,
+            &[
+                Value::Object(Some(this_now)),
+                Value::Object(Some(k_now)),
+                Value::Object(Some(new_v)),
+            ],
+        )?;
+        // Release just this iteration's pins; `this_pin`/`func_pin` are below
+        // `k_pin` and survive.
+        ctx.unpin_native_roots(k_pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 /// Native `Properties.clear()V` — empties BOTH the side-table and the real
@@ -2678,6 +2870,104 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// paths mis-aligned — see `entrySet`).  `this` is pinned across the
 /// re-entrant `create_string`/`add` calls so a moving GC cannot leave a stale
 /// `vec`.
+/// Pin a slice of `Value`s, returning the base handle and one handle per slot.
+///
+/// A local mirror of `native-collections`' `pin_value_slice`: this crate cannot
+/// reach that one, and the alternative -- accumulating raw `ObjectRef`s across
+/// a Java re-entry -- is the Family-1 shape both crates have paid for.
+fn pin_props_values(ctx: &mut dyn NativeContext, vals: &[Value]) -> (usize, Vec<usize>) {
+    let mut base = usize::MAX;
+    let mut handles = Vec::with_capacity(vals.len());
+    for v in vals {
+        let h = match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        };
+        if base == usize::MAX {
+            base = h;
+        }
+        handles.push(h);
+    }
+    (base, handles)
+}
+
+/// The class name of this Properties' first OWN key that is not a `String`, if
+/// it has one. Used by `propertyNames()`, whose JDK body casts every key.
+fn props_first_non_string_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let side = side_key_set(ctx, this);
+    for (key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+        if kstr.is_none() {
+            let cid = ctx.class_id_of_object(key_obj);
+            return Some(
+                ctx.class_name_of_id(cid)
+                    .unwrap_or_else(|| "java/lang/Object".to_string())
+                    .replace('/', "."),
+            );
+        }
+    }
+    None
+}
+
+/// The `ClassCastException` `(String) e.getKey()` raises, spelled the way
+/// HotSpot spells it.
+fn props_key_cast_failure(ctx: &mut dyn NativeContext, cname: &str) -> MethodCallFailed {
+    let _ = ctx;
+    RuntimeError::ClassCastException {
+        message: format!("class {cname} cannot be cast to class java.lang.String"),
+    }
+    .into()
+}
+
+/// [`build_enumeration`] over arbitrary values rather than text.
+///
+/// `Hashtable.keys()` / `elements()` enumerate OBJECTS; only `propertyNames`
+/// and `stringPropertyNames` are text-typed. Keeping the text-typed builder as
+/// the common case and this one for the enumerations is what stops a non-String
+/// key being silently dropped on its way out.
+fn build_enumeration_of(
+    ctx: &mut dyn NativeContext,
+    items: Vec<Value>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let empty = |ctx: &mut dyn NativeContext| -> Result<ObjectRef, MethodCallFailed> {
+        crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
+    };
+    let vec = match ctx.new_object("java/util/Vector") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return empty(ctx),
+    };
+    let pin = ctx.pin_native_root(vec);
+    let (_, item_pins) = pin_props_values(ctx, &items);
+    if ctx
+        .invoke(
+            "java/util/Vector",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(vec))],
+        )
+        .is_err()
+    {
+        ctx.unpin_native_roots(pin);
+        return empty(ctx);
+    }
+    for (i, item) in items.iter().enumerate() {
+        let vec = ctx.read_native_pin(pin, vec);
+        let cur = match (item, item_pins[i]) {
+            (Value::Object(Some(o)), h) if h != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(h, *o)))
+            }
+            _ => *item,
+        };
+        let _ = ctx.invoke_virtual(vec, "add", "(Ljava/lang/Object;)Z", &[cur]);
+    }
+    let vec = ctx.read_native_pin(pin, vec);
+    let result = match ctx.invoke_virtual(vec, "elements", "()Ljava/util/Enumeration;", &[]) {
+        Ok(Some(Value::Object(Some(e)))) => e,
+        _ => empty(ctx)?,
+    };
+    ctx.unpin_native_roots(pin);
+    Ok(result)
+}
+
 fn build_enumeration(
     ctx: &mut dyn NativeContext,
     items: Vec<JavaText>,
@@ -3064,18 +3354,40 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let mut this = this;
-    let mut keys: Vec<JavaText> = ordered_snapshot_kv(ctx, &mut this)
+    let text_keys: Vec<JavaText> = ordered_snapshot_kv(ctx, &mut this)
         .into_iter()
         .map(|(k, _v)| k)
         .collect();
-    // Include String keys of CHM-exclusive (non-String-valued) entries.
+    // `Hashtable.keys()` enumerates the KEY OBJECTS, whatever their class.
+    // Filtering to the ones this file can read as text dropped every
+    // non-String key while `size()` and `containsKey()` still counted it:
+    // MEASURED `[intval, strkey]` against HotSpot's `[7, 8, intval, strkey]`
+    // (apps/probes/PropertiesShadowSweep 38). A container that reports four entries
+    // and enumerates two is worse than one that reports two.
+    let this_pin = ctx.pin_native_root(this);
+    let mut items: Vec<Value> = Vec::with_capacity(text_keys.len());
+    for k in &text_keys {
+        let s = create_property_string(ctx, k);
+        items.push(Value::Object(Some(s)));
+    }
+    let (_, item_pins) = pin_props_values(ctx, &items);
+    let this = ctx.read_native_pin(this_pin, this);
     let side = side_key_set(ctx, this);
-    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
-        if let Some(s) = kstr {
-            keys.push(s);
+    let this = ctx.read_native_pin(this_pin, this);
+    for (key_obj, _value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        items.push(Value::Object(Some(key_obj)));
+    }
+    // Everything collected before `chm_extra_entries` needs refreshing: it
+    // re-enters Java for the whole entry-set walk. The refs it RETURNS are
+    // already current.
+    for (i, pin) in item_pins.iter().enumerate() {
+        if let Value::Object(Some(o)) = items[i] {
+            items[i] = Value::Object(Some(ctx.read_native_pin(*pin, o)));
         }
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)?))))
+    let e = build_enumeration_of(ctx, items)?;
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(e))))
 }
 
 /// Collect this Properties object's own String keys (side-table + CHM-exclusive
@@ -3136,6 +3448,20 @@ fn native_properties_property_names(
     while let Some(p) = cur {
         if depth > 64 {
             break;
+        }
+        // `Properties.enumerate` is `h.put((String) e.getKey(), e.getValue())`,
+        // and that cast is the contract, not a formality: a `Properties`
+        // holding a non-String key is already outside the class's invariant,
+        // and the JDK reports it at the first enumeration rather than handing
+        // back a filtered view no later reader can tell from a complete one.
+        // MEASURED `ok [intval, strkey]` against HotSpot's
+        // `ClassCastException` (apps/probes/PropertiesShadowSweep 39).
+        //
+        // NOT the same rule as `stringPropertyNames`, which filters BY DESIGN
+        // (`enumerateStringProperties` skips a non-String key AND a non-String
+        // value) and which this file already gets right.
+        if let Some(cname) = props_first_non_string_key(ctx, p) {
+            return Err(props_key_cast_failure(ctx, &cname));
         }
         collect_own_property_names(ctx, p, &mut seen, &mut out);
         cur = props_defaults(ctx, p);
@@ -3471,7 +3797,11 @@ fn save_convert_units(units: &[u16], escape_space: bool, escape_unicode: bool) -
                     // One `\uXXXX` per code unit, so a supplementary code point
                     // round-trips as the surrogate PAIR the JDK writes and a
                     // lone half round-trips as itself.
-                    out.push_str(&format!("\\u{:04x}", unit));
+                    // UPPER-case hex: `Properties.saveConvert` indexes
+                    // `hexDigit[]`, which is `'0'..'9','A'..'F'`. `load`
+                    // accepts either case, so a round trip cannot see this and
+                    // a byte comparison against a JDK-written file can.
+                    out.push_str(&format!("\\u{:04X}", unit));
                 } else if let Some(ch) = char::from_u32(c) {
                     out.push(ch);
                 }
@@ -3874,6 +4204,25 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/Object;)Z",
             native_properties_equals,
         );
+        // `Properties.clone()` runs real JDK bytecode whose second statement
+        // dereferences the `map` CHM this module's header explains is
+        // permanently null on a synthetic Properties. See
+        // `native_properties_clone`. Companion entry in `vm_exec.rs`'s
+        // force-native list.
+        registry.register(
+            "java/util/Properties",
+            "clone",
+            "()Ljava/lang/Object;",
+            native_properties_clone,
+        );
+        // Same root cause as `clone`, found by the same differential probe —
+        // see `native_properties_replace_all`.
+        registry.register(
+            "java/util/Properties",
+            "replaceAll",
+            "(Ljava/util/function/BiFunction;)V",
+            native_properties_replace_all,
+        );
         // `Properties.store`/`save` run real JDK `store0` bytecode that iterates the
         // internal `map` ConcurrentHashMap. Our synthetic Properties keep entries in
         // the side-table, not that CHM, so the bytecode writes 0 bytes. Serialize
@@ -4150,7 +4499,436 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
             native_properties_compute_if_absent,
         );
+        // THE CONDITIONAL MUTATORS. Three of these were served by
+        // `native-collections`' `register_map_conditional_mutators` -- generic
+        // bodies that walk HashMap buckets, where a `Properties` keeps nothing --
+        // and the other three were not registered at all, so real bytecode edited
+        // the `map` CHM mirror while the side table kept the old entry and the two
+        // stores disagreed from then on. MEASURED (apps/probes/PropertiesShadowSweep
+        // 137, 141, 144-147): `replace` answered null for a present key,
+        // `replace(k,old,new)` and `remove(k,v)` answered false for a matching
+        // pair, and `computeIfPresent(k, ->null)` left the key behind.
+        //
+        // All six are written over `get`/`put`/`remove`, which is both how the JDK
+        // writes them (as defaults over the map's own three operations) and the
+        // only way to keep ONE authority: those three natives already mirror
+        // side table and CHM in step.
+        registry.register(
+            "java/util/Properties",
+            "replace",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_properties_replace,
+        );
+        registry.register(
+            "java/util/Properties",
+            "replace",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+            native_properties_replace_kvv,
+        );
+        registry.register(
+            "java/util/Properties",
+            "remove",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            native_properties_remove_kv,
+        );
+        registry.register(
+            "java/util/Properties",
+            "computeIfPresent",
+            "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_properties_compute_if_present,
+        );
+        registry.register(
+            "java/util/Properties",
+            "compute",
+            "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_properties_compute,
+        );
+        registry.register(
+            "java/util/Properties",
+            "merge",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_properties_merge,
+        );
     });
+}
+
+/// The three primitives every conditional mutator below is written over, with
+/// the receiver and every argument kept rooted across each of them -- all three
+/// re-enter Java (the CHM mirror) and are therefore collection points.
+struct PropsCell {
+    this: ObjectRef,
+    key: ObjectRef,
+    pin: usize,
+    key_pin: usize,
+}
+
+impl PropsCell {
+    fn open(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> Result<Option<PropsCell>, MethodCallFailed> {
+        // `key == null` is an NPE on every one of these: they all delegate to
+        // `ConcurrentHashMap`, whose first line it is.
+        let key = match args.get(1) {
+            Some(Value::Object(Some(k))) => *k,
+            _ => return Err(props_null_key_npe()),
+        };
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let pin = ctx.pin_native_root(this);
+        let key_pin = ctx.pin_native_root(key);
+        Ok(Some(PropsCell {
+            this,
+            key,
+            pin,
+            key_pin,
+        }))
+    }
+    fn this(&self, ctx: &mut dyn NativeContext) -> Value {
+        Value::Object(Some(ctx.read_native_pin(self.pin, self.this)))
+    }
+    fn key(&self, ctx: &mut dyn NativeContext) -> Value {
+        Value::Object(Some(ctx.read_native_pin(self.key_pin, self.key)))
+    }
+    fn get(&self, ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+        let t = self.this(ctx);
+        let k = self.key(ctx);
+        Ok(native_properties_get(ctx, &[t, k])?.unwrap_or(Value::Object(None)))
+    }
+    fn put(&self, ctx: &mut dyn NativeContext, v: Value) -> Result<(), MethodCallFailed> {
+        let t = self.this(ctx);
+        let k = self.key(ctx);
+        native_properties_put(ctx, &[t, k, v])?;
+        Ok(())
+    }
+    fn remove(&self, ctx: &mut dyn NativeContext) -> Result<(), MethodCallFailed> {
+        let t = self.this(ctx);
+        let k = self.key(ctx);
+        native_properties_remove(ctx, &[t, k])?;
+        Ok(())
+    }
+    fn close(self, ctx: &mut dyn NativeContext) {
+        ctx.unpin_native_roots(self.pin);
+    }
+}
+
+/// `Properties.replace(k, v)` — `map.replace`, i.e. only when present, and NPE
+/// on a null value as well as a null key.
+fn native_properties_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_pin = match new_val {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        if matches!(current, Value::Object(None)) {
+            return Ok(Some(Value::Object(None)));
+        }
+        let current_pin = match current {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let nv = match new_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => new_val,
+        };
+        cell.put(ctx, nv)?;
+        let answer = match current_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => current,
+        };
+        Ok(Some(answer))
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// `Properties.replace(k, expected, v)` — all three arguments are checked for
+/// null before anything happens (`ConcurrentHashMap.replace`'s first line).
+fn native_properties_replace_kvv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if matches!(args.get(2), None | Some(Value::Object(None)))
+        || matches!(args.get(3), None | Some(Value::Object(None)))
+    {
+        return Err(props_null_put_npe());
+    }
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    let exp_pin = match expected {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let new_pin = match new_val {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        let exp = match exp_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => expected,
+        };
+        if !props_values_equal(ctx, current, exp)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        let nv = match new_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => new_val,
+        };
+        cell.put(ctx, nv)?;
+        Ok(Some(Value::Int(1)))
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// `Properties.remove(k, v)` — a null VALUE is not an error here, it is simply
+/// "no match": `ConcurrentHashMap.remove(k,v)` is
+/// `if (key == null) throw NPE; return value != null && ...`.
+fn native_properties_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    if matches!(expected, Value::Object(None)) {
+        cell.close(ctx);
+        return Ok(Some(Value::Int(0)));
+    }
+    let exp_pin = match expected {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        let exp = match exp_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => expected,
+        };
+        if !props_values_equal(ctx, current, exp)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        cell.remove(ctx)?;
+        Ok(Some(Value::Int(1)))
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// `Properties.computeIfPresent(k, f)` — a null result REMOVES the entry.
+fn native_properties_compute_if_present(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let f = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            cell.close(ctx);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let f_pin = ctx.pin_native_root(f);
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        if matches!(current, Value::Object(None)) {
+            return Ok(Some(Value::Object(None)));
+        }
+        let cur_pin = match current {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let f_cur = ctx.read_native_pin(f_pin, f);
+        let k = cell.key(ctx);
+        let cur = match cur_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => current,
+        };
+        let produced = ctx
+            .invoke_virtual(
+                f_cur,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[k, cur],
+            )?
+            .unwrap_or(Value::Object(None));
+        props_store_or_remove(ctx, &cell, produced)
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// `Properties.compute(k, f)` — the mapper sees `null` for an absent key, and a
+/// null result removes (or leaves absent).
+fn native_properties_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if matches!(args.get(2), None | Some(Value::Object(None))) {
+        return Err(props_null_put_npe());
+    }
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let f = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            cell.close(ctx);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let f_pin = ctx.pin_native_root(f);
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        let cur_pin = match current {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let f_cur = ctx.read_native_pin(f_pin, f);
+        let k = cell.key(ctx);
+        let cur = match cur_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => current,
+        };
+        let produced = ctx
+            .invoke_virtual(
+                f_cur,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[k, cur],
+            )?
+            .unwrap_or(Value::Object(None));
+        props_store_or_remove(ctx, &cell, produced)
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// `Properties.merge(k, v, f)` — `v` is stored as-is when the key is absent and
+/// the remapping function is not called at all.
+fn native_properties_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if matches!(args.get(2), None | Some(Value::Object(None)))
+        || matches!(args.get(3), None | Some(Value::Object(None)))
+    {
+        return Err(props_null_put_npe());
+    }
+    let cell = match PropsCell::open(ctx, args)? {
+        Some(c) => c,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let supplied = args.get(2).copied().unwrap_or(Value::Object(None));
+    let f = match args.get(3) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            cell.close(ctx);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let sup_pin = match supplied {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let f_pin = ctx.pin_native_root(f);
+    let result = (|| -> MethodCallResult {
+        let current = cell.get(ctx)?;
+        let sup = match sup_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => supplied,
+        };
+        if matches!(current, Value::Object(None)) {
+            cell.put(ctx, sup)?;
+            let answer = match sup_pin {
+                Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+                None => supplied,
+            };
+            return Ok(Some(answer));
+        }
+        let cur_pin = match current {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let f_cur = ctx.read_native_pin(f_pin, f);
+        let cur = match cur_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => current,
+        };
+        let sup = match sup_pin {
+            Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+            None => supplied,
+        };
+        let produced = ctx
+            .invoke_virtual(
+                f_cur,
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[cur, sup],
+            )?
+            .unwrap_or(Value::Object(None));
+        props_store_or_remove(ctx, &cell, produced)
+    })();
+    cell.close(ctx);
+    result
+}
+
+/// The shared tail of `compute`/`computeIfPresent`/`merge`: a null result is a
+/// REMOVAL, anything else is stored, and the stored value is what is returned.
+fn props_store_or_remove(
+    ctx: &mut dyn NativeContext,
+    cell: &PropsCell,
+    produced: Value,
+) -> MethodCallResult {
+    if matches!(produced, Value::Object(None)) {
+        cell.remove(ctx)?;
+        return Ok(Some(Value::Object(None)));
+    }
+    let pin = match produced {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let v = match pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => produced,
+    };
+    cell.put(ctx, v)?;
+    let answer = match pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => produced,
+    };
+    Ok(Some(answer))
+}
+
+/// `Objects.equals` over two `Value`s, dispatching the real `equals`.
+fn props_values_equal(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
+        (Value::Object(Some(ao)), bv) => {
+            let r = ctx.invoke_virtual(ao, "equals", "(Ljava/lang/Object;)Z", &[bv])?;
+            Ok(matches!(r, Some(Value::Int(1))))
+        }
+        (av, bv) => Ok(av == bv),
+    }
 }
 
 /// Native `Properties.putAll(Map)` — side-table-aware copy.
@@ -4706,10 +5484,16 @@ mod tests {
 
     #[test]
     fn save_convert_unicode_escaping() {
-        // escape_unicode=true escapes non-Latin chars as one `\u` per code unit.
-        assert_eq!(save_convert("\u{00e9}", false, true), "\\u00e9"); // é
+        // escape_unicode=true escapes non-Latin chars as one `\u` per code unit,
+        // in UPPER-case hex: `Properties.saveConvert` indexes a `hexDigit[]` of
+        // `'0'..'9','A'..'F'`. These three assertions were written from THIS
+        // implementation rather than from the spec and pinned the lower-case
+        // form for as long as it was wrong; `load` accepts either case, so
+        // nothing but a byte comparison against a JDK-written file could see it
+        // (MEASURED, apps/probes/PropertiesShadowSweep 118-119).
+        assert_eq!(save_convert("\u{00e9}", false, true), "\\u00E9"); // é
                                                                       // Supplementary code point -> surrogate pair (two \u units).
-        assert_eq!(save_convert("\u{1F600}", false, true), "\\ud83d\\ude00");
+        assert_eq!(save_convert("\u{1F600}", false, true), "\\uD83D\\uDE00");
         // escape_unicode=false leaves the char literal (Writer charset encodes it).
         assert_eq!(save_convert("\u{00e9}", false, false), "\u{00e9}");
     }
@@ -4991,8 +5775,8 @@ mod tests {
         // `escape_unicode = false` is the `store(Writer)` overload, where an
         // ordinary non-ASCII char is written literally — but a lone surrogate
         // still has to be escaped, because there is no `char` to write.
-        assert_eq!(save_convert_units(&[HI], false, false), "\\ud800");
-        assert_eq!(save_convert_units(&[LO], false, true), "\\udc00");
+        assert_eq!(save_convert_units(&[HI], false, false), "\\uD800");
+        assert_eq!(save_convert_units(&[LO], false, true), "\\uDC00");
         // Round-trip: what `store` writes, `load` reads back as the same units.
         let mut text = String::new();
         text.push_str(&save_convert_units(&[b'k' as u16, HI], true, true));
@@ -5010,7 +5794,7 @@ mod tests {
         // The supplementary path must not change: two `\u` escapes, not one.
         assert_eq!(
             save_convert_units(&[0xD83D, 0xDE00], false, true),
-            "\\ud83d\\ude00"
+            "\\uD83D\\uDE00"
         );
     }
 

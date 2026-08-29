@@ -996,11 +996,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(p))))
         },
     );
+    // A NULL `env` MAP IS AN NPE, not an empty environment. Every provider the
+    // JDK consults dereferences the map (`ZipFileSystem` reads its options out
+    // of it before it will even look at the file), so `newFileSystem(path,
+    // null)` fails before the path is examined. This VM ignored the argument
+    // entirely and handed back a jar filesystem over whatever the path was --
+    // for a path that is not an archive at all, a filesystem whose every later
+    // operation is a puzzle at a site far from the mistake.
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java`. The non-null case is
+    // deliberately UNCHANGED: what these overloads should do with a valid
+    // environment over a non-archive file is `ProviderNotFoundException`, and
+    // that is a wider change than this lane has a measurement for -- the jar
+    // loading paths reach these three registrations constantly. Recorded as an
+    // observation, not fixed.
     r.register(
         file_systems,
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/util/Map;Ljava/lang/ClassLoader;)Ljava/nio/file/FileSystem;",
         |ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let jar_path = obj_arg(args, 0)
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
@@ -1014,6 +1031,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
         |ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let jar_path = obj_arg(args, 0)
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
@@ -5099,8 +5119,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            // Ignore charset, always UTF-8
-            match p57_read_to_string_strict(&p) {
+            // `readString(Path, Charset)` DECODES WITH THE CHARSET it is
+            // given -- see `p57_decode_with_charset`, and the measurement of
+            // what ignoring it cost.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
+            let raw = match p57_read_bytes(&p) {
+                Ok(b) => b,
+                Err(e) => return Err(p57_fs_error(ctx, &e, &p)),
+            };
+            let cs = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            match p57_decode_with_charset(ctx, &raw, cs) {
                 Ok(Ok(content)) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
@@ -5111,7 +5144,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                     .into()
                 })),
-                Err(e) => Err(p57_fs_error(ctx, &e, &p)),
+                // The charset could not be identified: keep the UTF-8 answer
+                // this overload gave before rather than guess a different one.
+                Err(()) => match p57_read_to_string_strict(&p) {
+                    Ok(Ok(content)) => {
+                        let s = ctx.create_string(&content);
+                        Ok(Some(Value::Object(Some(s))))
+                    }
+                    Ok(Err(len)) => Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                        RuntimeError::IOException {
+                            message: "MalformedInputException".into(),
+                        }
+                        .into()
+                    })),
+                    Err(e) => Err(p57_fs_error(ctx, &e, &p)),
+                },
             }
         },
     );
@@ -5131,17 +5178,66 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let p = p57_read_path(ctx, path_obj);
         // `readAllLines` had NO NotFound arm at all, so a missing file was a
         // bare `IOException` where every sibling raises `NoSuchFileException`.
-        let content = match p57_read_to_string_strict(&p) {
-            Ok(Ok(c)) => Ok(c),
-            Ok(Err(len)) => {
-                return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
-                    RuntimeError::IOException {
-                        message: "MalformedInputException".into(),
+        //
+        // ONE BODY SERVES BOTH DESCRIPTORS -- `(Path)` and `(Path, Charset)` --
+        // so the charset has to be read here or the two-argument overload
+        // ignores it, which is the defect `Files.readString(Path, Charset)`
+        // carried until `p57_decode_with_charset` was written. Fixing one of a
+        // pair and not the other is the shape this campaign keeps finding; the
+        // pair is the same function here, which makes it cheaper to get right
+        // and no less easy to miss.
+        //
+        // `args[1]` is a `Charset` ONLY on the two-argument form; the
+        // one-argument form has no second argument at all, and an explicit
+        // null is the JDK's NPE.
+        if matches!(args.get(1), Some(Value::Object(None))) {
+            return Err(RuntimeError::NullPointerException { message: None }.into());
+        }
+        let charset = match args.get(1) {
+            Some(Value::Object(Some(c))) => Some(*c),
+            _ => None,
+        };
+        let content = if charset.is_some() {
+            match p57_read_bytes(&p) {
+                Ok(raw) => match p57_decode_with_charset(ctx, &raw, charset) {
+                    Ok(Ok(c)) => Ok(c),
+                    Ok(Err(len)) => {
+                        return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                            RuntimeError::IOException {
+                                message: "MalformedInputException".into(),
+                            }
+                            .into()
+                        }))
                     }
-                    .into()
-                }))
+                    // Unidentifiable charset: keep the UTF-8 answer.
+                    Err(()) => match p57_read_to_string_strict(&p) {
+                        Ok(Ok(c)) => Ok(c),
+                        Ok(Err(len)) => {
+                            return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                                RuntimeError::IOException {
+                                    message: "MalformedInputException".into(),
+                                }
+                                .into()
+                            }))
+                        }
+                        Err(e) => Err(e),
+                    },
+                },
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
+        } else {
+            match p57_read_to_string_strict(&p) {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(len)) => {
+                    return Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                        RuntimeError::IOException {
+                            message: "MalformedInputException".into(),
+                        }
+                        .into()
+                    }))
+                }
+                Err(e) => Err(e),
+            }
         };
         match content {
             Ok(content) => {
@@ -9872,15 +9968,49 @@ pub(crate) fn fsp_new_output_stream(
     // FileDescriptor — the existing FOS native overrides (write/flush/close,
     // registered in native-io::lib.rs) recover the fd via the same
     // `fd`/`handle` fields on the FileDescriptor object.
+    // THE CONSTRUCTOR NEVER RUNS, so its instance initialisers have to be
+    // reproduced here — exactly as `fsp_new_input_stream` does a hundred lines
+    // above, with the comment that says why. This is the TWIN of that repair,
+    // and it was missing: the input side set `closeLock`/`path`/`closed` and
+    // the output side set only `fd`.
+    //
+    // `java.io.FileOutputStream.close()` opens `synchronized (closeLock)`, so a
+    // null `closeLock` is
+    //
+    //   NullPointerException: Cannot enter synchronized block because
+    //                         "this.closeLock" is null
+    //       at java/io/FileOutputStream.close(FileOutputStream.java:383)
+    //       at java/nio/file/Files.copy(Files.java:2865)
+    //
+    // — on an ordinary `Files.copy` / `Files.newOutputStream` inside a
+    // try-with-resources. It is invisible TODAY only because
+    // `FileOutputStream.close()` is itself natively overridden and never
+    // reaches that bytecode. MEASURED with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/File`, which makes the overrides
+    // yield: `probes/L4FilesSweep.java` died 119 rows early on exactly this.
+    //
+    // So it is latent, and it is the kind of latent that turns a future
+    // retirement of the `FileOutputStream` shadows from free into a crash. Any
+    // real-JDK-bytecode path that reaches `close()` finds it too.
     let fos = try_alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4)?;
-    // Pin across the FileDescriptor alloc below — a moving young GC there
-    // would relocate the fresh stream (native stale-local family).
+    // Pin across the allocations below — each can trigger a moving young GC
+    // that relocates the fresh stream (native stale-local family).
     let fos_pin = ctx.pin_native_root(fos);
     let fd_obj = try_alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4)?;
+    let path_str = ctx.create_string(&p);
+    let close_lock = ctx.new_object("java/lang/Object");
     let fos = ctx.read_native_pin(fos_pin, fos);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
     ctx.set_field_by_name(fos, "fd", Value::Object(Some(fd_obj)));
+    // `path` backs `getChannel()` and the JDK's own diagnostics; `append` is
+    // read by `FileOutputStream.getChannel()`; `closed` must start false.
+    ctx.set_field_by_name(fos, "path", Value::Object(Some(path_str)));
+    ctx.set_field_by_name(fos, "append", Value::Int(i32::from(append)));
+    if let Ok(Some(lock @ Value::Object(Some(_)))) = close_lock {
+        ctx.set_field_by_name(fos, "closeLock", lock);
+    }
+    ctx.set_field_by_name(fos, "closed", Value::Int(0));
     // Belt-and-braces for legacy callers that read instance slot 0 directly.
     ctx.set_field(fos, 0, Value::Object(Some(fd_obj)));
     ctx.unpin_native_roots(fos_pin);
@@ -10104,11 +10234,121 @@ pub(crate) fn p57_malformed_input(
     None
 }
 
+/// Decode `bytes` with the charset a `Files.readString`/`readAllLines`
+/// overload was actually given.
+///
+/// **The `(Path, Charset)` overloads ignored the charset**, and the body said
+/// so (`// Ignore charset, always UTF-8`). Before this lane that was a silent
+/// wrong answer: the bytes were decoded as UTF-8 with replacement, so
+/// `Files.readString(p, ISO_8859_1)` on non-UTF-8 bytes returned U+FFFD where
+/// the JDK returns the latin-1 characters. Part one of this lane made the
+/// UTF-8 decode STRICT, which fixed the default overload and turned the
+/// charset overloads into a wrong REFUSAL instead of a wrong answer:
+///
+/// ```text
+///   Files.readString(<0xC3 0x28>, ISO_8859_1)
+///     HotSpot   a 2-character String        (latin-1 cannot fail)
+///     CratonVM  MalformedInputException     <- after part one
+/// ```
+///
+/// MEASURED with `apps/probes/L4TailSweep2.java`, where it killed the run 32
+/// rows early. Both halves are the same root cause: the argument was never
+/// read.
+///
+/// `Ok(Err(len))` is a malformed-input refusal carrying the offending length,
+/// exactly as [`p57_read_to_string_strict`] reports it; `Err(())` means the
+/// charset could not be identified and the caller should keep its previous
+/// behaviour rather than guess.
+///
+/// The three single-byte charsets are decoded here because they cannot fail
+/// and because they are what a program naming a charset almost always names;
+/// anything else goes through the JDK's own `new String(byte[], Charset)`,
+/// which is right for every charset this VM can load.
+pub(crate) fn p57_decode_with_charset(
+    ctx: &mut dyn NativeContext,
+    bytes: &[u8],
+    charset: Option<ObjectRef>,
+) -> Result<Result<String, usize>, ()> {
+    let Some(cs) = charset else { return Err(()) };
+    let cid = ctx.class_id_of_object(cs);
+    match ctx.class_name_arc_of_id(cid).as_deref() {
+        // The abstract stand-in `install_charset` stamps at bootstrap means
+        // UTF-8 here, exactly as it does for `PrintStream.charset()`.
+        Some("sun/nio/cs/UTF_8") | Some("java/nio/charset/Charset") | None => {
+            Ok(match String::from_utf8(bytes.to_vec()) {
+                Ok(s) => Ok(s),
+                Err(e) => Err(e.utf8_error().error_len().unwrap_or(1)),
+            })
+        }
+        // Every byte is a character. A latin-1 decode CANNOT fail, which is
+        // the row that caught this.
+        Some("sun/nio/cs/ISO_8859_1") => {
+            Ok(Ok(bytes.iter().map(|&b| b as char).collect()))
+        }
+        // US-ASCII REPORTS. `Files.readString`/`readAllLines` decode with a
+        // `CharsetDecoder` left on its default action, which is REPORT, not
+        // REPLACE -- so a byte above 0x7F is a `MalformedInputException` and
+        // NOT a U+FFFD. MEASURED against HotSpot, which is also how the first
+        // version of this arm (a replacing one) was caught: the oracle refused
+        // the row this VM answered.
+        //
+        // The three single-byte charsets therefore answer three DIFFERENT ways
+        // to the same two bytes -- latin-1 cannot fail, UTF-8 and US-ASCII
+        // both refuse, and only latin-1 returns a string.
+        Some("sun/nio/cs/US_ASCII") => Ok(match bytes.iter().position(|&b| b >= 0x80) {
+            Some(_) => Err(1),
+            None => Ok(bytes.iter().map(|&b| b as char).collect()),
+        }),
+        // APPROXIMATION, stated rather than hidden: `new String(byte[],
+        // Charset)` decodes with REPLACE, while `Files.readString` uses a
+        // decoder on REPORT. For any charset outside the three above, a
+        // malformed sequence therefore comes back as U+FFFD here where HotSpot
+        // would refuse. The alternative is driving a real `CharsetDecoder`
+        // through four re-entrant calls per read; this is the cheaper half of
+        // that trade and it is right for every well-formed input.
+        Some(_) => {
+            use cratonvm_types::ArrayElementType;
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, bytes);
+            let s = match ctx.new_object("java/lang/String") {
+                Ok(Some(Value::Object(Some(s)))) => s,
+                _ => return Err(()),
+            };
+            let built = ctx.invoke(
+                "java/lang/String",
+                "<init>",
+                "([BLjava/nio/charset/Charset;)V",
+                &[
+                    Value::Object(Some(s)),
+                    Value::Object(Some(arr)),
+                    Value::Object(Some(cs)),
+                ],
+            );
+            match built {
+                Ok(_) => match ctx.read_string(s) {
+                    Some(text) => Ok(Ok(text)),
+                    None => Err(()),
+                },
+                Err(_) => Err(()),
+            }
+        }
+    }
+}
+
 /// [`p57_read_to_string`] with the JDK's REPORT action instead of REPLACE.
 ///
 /// Returns `Err(None)` for an I/O failure the caller must map itself, and
 /// `Err(Some(len))` when the bytes are not valid UTF-8 — `len` being the length
 /// of the offending sequence, which is what `MalformedInputException` carries.
+/// The bytes of a path, with the same jar/jrt awareness the string readers
+/// have. Split out so a charset-aware caller can decode them itself.
+pub(crate) fn p57_read_bytes(p: &str) -> Result<Vec<u8>, std::io::Error> {
+    match vfs_read(p) {
+        Some(r) => r,
+        None => std::fs::read(p),
+    }
+}
+
 pub(crate) fn p57_read_to_string_strict(p: &str) -> Result<Result<String, usize>, std::io::Error> {
     let bytes = match vfs_read(p) {
         Some(r) => r?,
@@ -16515,38 +16755,60 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let hidden = fs_boolean_attributes(&path) & FS_BA_HIDDEN != 0;
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
+    // THE THREE `can*` METHODS ASK `access(2)`, via the SAME `fs_check_access`
+    // that `UnixFileSystem.checkAccess` has always used. They used to ask three
+    // different and weaker questions about the mode BITS:
+    //
+    //   canRead     `metadata(path).is_ok()`      -- i.e. "does it exist?"
+    //   canWrite    `!permissions().readonly()`   -- any write bit, for anyone
+    //   canExecute  `mode() & 0o111 != 0`         -- any execute bit, for anyone
+    //
+    // A permission question is about THIS PROCESS, not about the file. The
+    // distance shows up the moment the two disagree, which is exactly what
+    // `File.setReadable(false, true)` arranges -- it clears the OWNER read bit
+    // and leaves group and other set:
+    //
+    //   chmod -w-rw-r-- ; canRead()      HotSpot false, this VM true
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java`. `canRead` was the visible
+    // one because the probe drove it through `setReadable`; `canWrite` and
+    // `canExecute` are the same defect one bit over, and are fixed here on the
+    // argument, not on a measurement -- a file owned by another user with mode
+    // 0o001 answered "executable" to every caller.
+    //
+    // This ALSO retires a fabricated success one layer down: the fix landed on
+    // `setReadable` first, and the setter was never the liar -- the chmod had
+    // been correct all along (`getPosixFilePermissions` agreed with HotSpot
+    // byte for byte). Reading the state back through a SECOND method is what
+    // separated them.
+    //
+    // `access(2)` costs one syscall, the same as the `stat` it replaces, and it
+    // honours ACLs, read-only mounts and root's override -- none of which a
+    // mode-bit test can see. `native-io`'s `native_file_can_read` (which opens
+    // the file) does not own these slots and is left alone.
     r.register(file, "canRead", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Approximate: if we can open it for reading or get metadata, it's readable
-        let readable = std::fs::metadata(&path).is_ok();
-        Ok(Some(Value::Int(if readable { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(fs_check_access(
+            &path,
+            FS_ACCESS_READ,
+        )))))
     });
     r.register(file, "canWrite", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let writable = std::fs::metadata(&path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(false);
-        Ok(Some(Value::Int(if writable { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(fs_check_access(
+            &path,
+            FS_ACCESS_WRITE,
+        )))))
     });
     r.register(file, "canExecute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let executable = std::fs::metadata(&path)
-                .map(|m| m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false);
-            Ok(Some(Value::Int(if executable { 1 } else { 0 })))
-        }
-        #[cfg(not(unix))]
-        {
-            // On Windows, treat existing files as executable
-            let exists = std::path::Path::new(&path).exists();
-            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
-        }
+        Ok(Some(Value::Int(i32::from(fs_check_access(
+            &path,
+            FS_ACCESS_EXECUTE,
+        )))))
     });
     r.register(file, "length", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -16669,45 +16931,54 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             0
         })))
     });
+    // THE FOUR PERMISSION SETTERS ROUTE THROUGH `fs_set_permission`, which is
+    // the same `access(2)`-shaped helper `UnixFileSystem.setPermission` already
+    // uses. Two of them used to be FABRICATED SUCCESSES: `setReadable(boolean)`
+    // read its argument into `_readable` and then ignored it, and both
+    // two-argument forms ignored BOTH arguments -- all three answered
+    // "does this file exist?" and changed nothing.
+    //
+    //   f.setReadable(false, true)   ->  true, and canRead() still true
+    //   f.setExecutable(true, true)  ->  true, and canExecute() still false
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java`. The earlier sweep asked
+    // these methods and PASSED, because it asserted the RETURN VALUE and not
+    // the effect -- an identity-only probe understating a behavioural gap. A
+    // permission API that reports success and changes nothing is the worst
+    // shape available: a program restricting access to a file believes it did.
+    //
+    // `ownerOnly` is honoured too, which `setWritable`'s `set_readonly` spelling
+    // could not express: the JDK's one-argument forms are defined as the
+    // two-argument form with `ownerOnly = true`.
     r.register(file, "setReadable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let _readable = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        // Best-effort: if file exists, return true. Real permission change is platform-dependent.
-        let ok = std::fs::metadata(&_path).is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        let path = file_read_path(ctx, this);
+        let readable = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_READ, readable, true);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setReadable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let ok = std::fs::metadata(&_path).is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        let path = file_read_path(ctx, this);
+        let readable = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let owner_only = args.get(2).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_READ, readable, owner_only);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setWritable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let writable = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        let ok = std::fs::metadata(&path)
-            .and_then(|meta| {
-                let mut perms = meta.permissions();
-                perms.set_readonly(!writable);
-                std::fs::set_permissions(&path, perms)
-            })
-            .is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        let ok = fs_set_permission(&path, FS_ACCESS_WRITE, writable, true);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setWritable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let writable = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        let ok = std::fs::metadata(&path)
-            .and_then(|meta| {
-                let mut perms = meta.permissions();
-                perms.set_readonly(!writable);
-                std::fs::set_permissions(&path, perms)
-            })
-            .is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        let owner_only = args.get(2).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_WRITE, writable, owner_only);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setExecutable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -16736,9 +17007,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
     r.register(file, "setExecutable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let ok = std::fs::metadata(&_path).is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        let path = file_read_path(ctx, this);
+        let exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let owner_only = args.get(2).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_EXECUTE, exec, owner_only);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setReadOnly", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -21507,6 +21780,26 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "walkFileTree",
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
+            // THE TWO ARGUMENT CHECKS THE 4-ARG OVERLOAD OWES, both of which it
+            // used to skip. `Files.walk`/`Files.find` already refuse a negative
+            // depth through `p57_max_depth_refusal` -- the helper was right and
+            // simply had no caller here, so `walkFileTree(p, opts, -1, v)`
+            // walked the whole tree where HotSpot raises
+            // `IllegalArgumentException`. `.max(0)` is what silently turned the
+            // refusal into an unbounded walk.
+            //
+            // A null `Set<FileVisitOption>` is an NPE in the JDK
+            // (`Objects.requireNonNull(options)`), not "no options": answering
+            // the latter means a caller that passed null by mistake gets a
+            // successful walk and never learns.
+            //
+            // MEASURED with `apps/probes/L4TailSweep2.java`.
+            if matches!(args.get(1), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
+            if let Some(refused) = p57_max_depth_refusal(args.get(2)) {
+                return Err(refused);
+            }
             // Options first: the `Set<FileVisitOption>` probe calls `isEmpty()`
             // bytecode, which can allocate, and both the root path and the
             // visitor copied out of `args` would be stale locals after it.
@@ -21895,6 +22188,55 @@ pub(crate) fn p98_walk_dir(
     remaining_depth: usize,
     follow_links: bool,
 ) -> Result<bool, MethodCallFailed> {
+    // AT THE DEPTH LIMIT A DIRECTORY IS REPORTED AS A FILE. `FileTreeWalker`
+    // only opens a directory when it is allowed to descend; an entry sitting AT
+    // `maxDepth` is handed to `visitFile` with its real attributes
+    // (`attrs.isDirectory()` true) and the `preVisitDirectory`/
+    // `postVisitDirectory` pair is never called for it.
+    //
+    //   walkFileTree(d1, {}, 1, v)   with d1/d2 a directory
+    //     HotSpot    pre:d1, file:d1/d2
+    //     this VM    pre:d1, pre:d1/d2      <- and no post, since we did not
+    //                                          descend either
+    //
+    // The old code called `preVisitDirectory` unconditionally and then checked
+    // the depth before recursing, which is one callback too late. A visitor
+    // that counts directories -- the usual reason to bound a walk -- saw the
+    // leaf twice in the wrong role, and one that only overrides `visitFile`
+    // (the common `SimpleFileVisitor` shape) never saw the leaf at all.
+    //
+    // This also fixes `maxDepth == 0`, where the ROOT itself is the entry at
+    // the limit: the JDK reports the root through a single `visitFile`.
+    //
+    // MEASURED with `apps/probes/L4TailSweep2.java`.
+    if remaining_depth == 0 {
+        if skip_file_callbacks {
+            return Ok(true);
+        }
+        let size = std::fs::symlink_metadata(dir)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        let fa = p98_alloc_basic_file_attributes(ctx, true, size);
+        let visitor_now = p98_read_pin(ctx, visitor_pin);
+        let dir_path_now = p98_read_pin(ctx, dir_path_pin);
+        let vr = p98_invoke_file_visitor(
+            ctx,
+            visitor_now,
+            "visitFile",
+            "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+            "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+            dir_path_now,
+            Value::Object(Some(fa?)),
+        )?;
+        if let Some(r) = vr {
+            // TERMINATE stops the whole walk; SKIP_SUBTREE has nothing left to
+            // skip at a leaf, so it continues like CONTINUE.
+            if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
     let visitor_now = p98_read_pin(ctx, visitor_pin);

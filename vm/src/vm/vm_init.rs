@@ -3083,6 +3083,15 @@ impl SharedVm {
                 args: &[cratonvm_types::Value],
             ) -> cratonvm_types::error::MethodCallResult {
                 use cratonvm_types::Value;
+                // `Collection.toArray(T[])` reads `a.length` before anything
+                // else, so a null template is an NPE whatever the receiver
+                // holds. MEASURED: no-throw (apps/probes/ArrayListShadowSweep 135).
+                if matches!(args.get(1), Some(Value::Object(None))) {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into());
+                }
                 let this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
@@ -3202,6 +3211,21 @@ impl SharedVm {
                                 ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
+// `AbstractCollection.toArray(T[])` stores through
+                            // `aastore`, so a narrowing element is an
+                            // `ArrayStoreException` naming the VALUE's class --
+                            // not arraycopy's sentence, which is the other
+                            // route's. MEASURED: a `HashSet<Object>` holding an
+                            // Integer, `toArray(new String[0])` ->
+                            // `ArrayStoreException: java.lang.Integer`.
+                            if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+                                ctx,
+                                cur_target,
+                                v,
+                                cratonvm_native_api::array_store::StoreRoute::Aastore,
+                            ) {
+                                return Err(e);
+                            }
                             ctx.set_array_element(cur_target, i, v);
                         }
                         let target = ctx.read_native_pin(target_pin, target);
@@ -3239,7 +3263,26 @@ impl SharedVm {
                     let d_len = ctx.array_length(d);
                     let copy = size.min(d_len);
                     for i in 0..copy {
-                        ctx.set_array_element(target, i, ctx.get_array_element(d, i));
+                        let v = ctx.get_array_element(d, i);
+// `ArrayList.toArray(T[])` is a NARROWING copy through
+                        // `Arrays.copyOf` / `System.arraycopy`, so arraycopy's
+                        // wording, with the source named `java.lang.Object[]`
+                        // because `elementData` is one whatever the list's
+                        // element type. This native wrote every element
+                        // unchecked, so compatible mode produced a `String[]`
+                        // holding an `Integer`.
+                        if let Some(e) = cratonvm_native_api::array_store::reject_unstorable(
+                            ctx,
+                            target,
+                            v,
+                            cratonvm_native_api::array_store::StoreRoute::Arraycopy {
+                                source_component: "java/lang/Object",
+                            },
+                        ) {
+                            ctx.unpin_native_roots(h);
+                            return Err(e);
+                        }
+                        ctx.set_array_element(target, i, v);
                     }
                     ctx.unpin_native_roots(h);
                 }
