@@ -67,7 +67,8 @@ vs `ServletContext.getAttribute` under CratonVM to tell them apart.
 ## Not yet done
 - Standalone repro of the two candidate mechanisms above.
 - Check whether other `FileStore`-adjacent classes (e.g. `TestFileStoreConcurrency`,
-  already fixed per `docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-Z-filestore-concurrency-gc-segv.md`)
+  already fixed per `fixed-suite-bugs/CRATONVM_BUGS/BUG-Z-filestore-concurrency-gc-segv.md`,
+  under the internal tree's own root)
   share any of this directory-resolution path.
 
 ## Repro
