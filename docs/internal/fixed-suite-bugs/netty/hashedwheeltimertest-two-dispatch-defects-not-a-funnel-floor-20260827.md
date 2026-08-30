@@ -7,6 +7,17 @@ runs here against a same-day `dev` base rate of 0 of 35, which is NOT a
 separable difference, and this page is not reporting it as one. Read "The
 page's own acceptance criterion is MET" before quoting any number from here.
 
+**Re-confirmed 2026-08-29** on `dev` at `96e07ca86`, quiet host, interleaved
+against HotSpot 25: CratonVM `ok=13 failed=1` on 3 of 3 runs, HotSpot `ok=14
+failed=0` on 2 of 3 (its third run lost four DIFFERENT tests to `@Timeout`, so
+the two VMs' failures are disjoint and HotSpot's is its own flake). The one
+CratonVM failure is `testExecutionOnTime` with `delay 650` — the same value
+this page reports as "650, every time", i.e. the tail still sitting exactly ON
+the bound. Nothing has moved in either direction; the residual named below is
+still the residual. That re-check came out of triaging five netty classes that
+were missing from `netty-nonpassed-latest.txt`, and this class needs no new
+page — it needs the list refreshed.
+
 Supersedes `known-issues/netty/hashedwheeltimertest-native-funnel-throughput-20260826.md`,
 whose diagnosis — "the per-call native-dispatch floor, ~300 ns/call, close to a
 hard floor without a JIT intrinsic, owned by several other campaigns" — is

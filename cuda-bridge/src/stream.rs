@@ -226,11 +226,39 @@ unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) 
 #[cfg(feature = "cuda")]
 pub struct Stream {
     inner: StreamCuda,
+    capturing: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(not(feature = "cuda"))]
 pub struct Stream {
     inner: StreamStub,
+    capturing: std::sync::atomic::AtomicBool,
+}
+
+impl Stream {
+    /// Whether a graph capture is open on this stream.
+    ///
+    /// A plain atomic rather than a `cuStreamIsCapturing` call, because
+    /// the launch path reads it on every launch and the answer is
+    /// something this crate already knows: `begin_capture` set it.
+    ///
+    /// The launch path needs it because the per-buffer `last_write`
+    /// event discipline is wrong inside a capture in both directions.
+    /// The completion event a captured launch records exists only
+    /// inside the graph, so a later `cuStreamWaitEvent` on it from a
+    /// download stream fails outright with `CUDA_ERROR_INVALID_VALUE` --
+    /// and the ordering it would have provided is redundant anyway,
+    /// since a single-stream capture becomes a linear chain of nodes
+    /// whose dependencies the driver derives from submission order.
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.capturing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that a capture opened or closed on this stream.
+    pub(crate) fn set_capturing(&self, on: bool) {
+        self.capturing
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Stream {
@@ -275,6 +303,7 @@ impl Stream {
                 device,
                 id,
             },
+            capturing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -287,6 +316,7 @@ impl Stream {
     pub fn new(_ctx: &DeviceContext) -> Result<Self> {
         Ok(Self {
             inner: StreamStub::new(),
+            capturing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -352,6 +382,13 @@ impl Stream {
     /// caller's `Stream` to `backend_cuda::DeviceModuleInner::
     /// launch_raw_on_stream` for true per-stream kernel submission
     /// (AUDIT 2026-05-24 C32 stream-port fix).
+    /// The device this stream belongs to, for the `bind_to_thread` prelude
+    /// every raw-handle use in this crate shares.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaDevice> {
+        &self.inner.device
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn cuda_stream_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaStream> {
         &self.inner.stream
@@ -525,6 +562,7 @@ impl Stream {
     pub(crate) fn for_test() -> Self {
         Self {
             inner: StreamStub::new(),
+            capturing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

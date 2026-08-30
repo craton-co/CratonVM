@@ -1262,13 +1262,32 @@ fn p67_session_delegate(
 /// answer into a use-after-FREE. Real segments carry their session in the named
 /// `scope` field (`AbstractMemorySegmentImpl.scope`); synthetic ones have no
 /// such field and are unaffected.
+/// The receiver is `&mut` because this function can RELOCATE it:
+/// `checkValidState()` below is Java bytecode, so the collector can run inside
+/// it and forward `segment`. Taking it by value left that entirely to the
+/// callers, and they split two ways — `p67_segment_get_string` and
+/// `lang_invoke`'s VarHandle-segment shape had each pinned around this call by
+/// hand, with a comment saying exactly why, while the three sites beside them
+/// (`p67_segment_get_width`, and both calls in `p67_segment_set_width`) went
+/// straight on to `p67_segment_parts`, which reads the receiver's fields. That
+/// is the ratio `scripts/stale-receiver-audit.py`'s header predicts, and `&mut`
+/// is its prescribed remedy: it makes an unconverted caller a COMPILE ERROR
+/// instead of something the next audit has to find again.
 pub(crate) fn p67_segment_check_scope(
     ctx: &mut dyn NativeContext,
-    segment: ObjectRef,
+    segment: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if let Value::Object(Some(scope)) = ctx.get_field_by_name(segment, "scope") {
+    if let Value::Object(Some(scope)) = ctx.get_field_by_name(*segment, "scope") {
         if p67_session_is_real(ctx, scope) {
-            ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[])?;
+            // The one GC point in this function. Pin across it and hand the
+            // caller the forwarded reference; every other branch below only
+            // reads fields and cannot move anything.
+            let pin = ctx.pin_native_root(*segment);
+            let checked =
+                ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[]);
+            *segment = ctx.read_native_pin(pin, *segment);
+            ctx.unpin_native_roots(pin);
+            checked?;
             return Ok(());
         }
         // W7-89: a REAL segment can carry one of OUR sessions. The
@@ -1294,8 +1313,8 @@ pub(crate) fn p67_segment_check_scope(
     // Synthetic segment: slot 2 names the owning arena. Deliberately NOT
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
-    if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(owner)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
+    if ctx.object_num_fields(*segment) > P67_SEGMENT_ARENA {
+        if let Value::Object(Some(owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
             if let Some(session) = p67_arena_session(ctx, owner) {
                 p67_session_check_valid(ctx, session)?;
             } else if crate::panama::pe_session_modelled(ctx, owner) {
@@ -2485,11 +2504,10 @@ pub(crate) fn p67_segment_get_string(
         _ => 0,
     };
     // GC-safety: `checkValidState()` is Java bytecode and can relocate `seg`.
-    let seg_pin = ctx.pin_native_root(seg);
-    let checked = p67_segment_check_scope(ctx, seg);
-    let seg = ctx.read_native_pin(seg_pin, seg);
-    ctx.unpin_native_roots(seg_pin);
-    checked?;
+    // The pin lives inside `p67_segment_check_scope` now, and the `&mut` hands
+    // the forwarded reference back here.
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
     let base = crate::panama_libffi::segment_address(ctx, seg);
     let size = crate::panama_libffi::segment_byte_size(ctx, seg);
     if offset < 0 || size <= 0 || offset >= size {
@@ -2539,7 +2557,8 @@ pub(crate) fn p67_segment_get_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
-    p67_segment_check_scope(ctx, seg)?;
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(Some(if width == 8 {
             Value::Long(0)
@@ -2617,12 +2636,20 @@ pub(crate) fn p67_segment_get_width(
 /// read-only flag IS on the carrier and `p67_segment_is_read_only` is the
 /// registered `isReadOnly()` body, so this reads the single source of truth
 /// rather than a second copy of it.
+/// `&mut` for the same reason as [`p67_segment_check_scope`], though this one
+/// has no Java dispatch of its own today: `p67_segment_is_read_only` only reads
+/// fields, so nothing here moves the receiver, and the only allocation is the
+/// Rust-side message on the throwing path — which never returns to the caller's
+/// reuse. It takes `&mut` anyway because its sole caller reaches it one line
+/// after `p67_segment_check_scope`, which DOES relocate, and because a
+/// by-value receiver here is the shape the audit is watching for; if this ever
+/// grows a dispatch, the callers are already correct.
 fn p67_segment_check_writable(
     ctx: &mut dyn NativeContext,
-    seg: ObjectRef,
+    seg: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     let read_only = matches!(
-        p67_segment_is_read_only(ctx, &[Value::Object(Some(seg))])?,
+        p67_segment_is_read_only(ctx, &[Value::Object(Some(*seg))])?,
         Some(Value::Int(n)) if n != 0
     );
     if read_only {
@@ -2650,8 +2677,9 @@ pub(crate) fn p67_segment_set_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
-    p67_segment_check_scope(ctx, seg)?;
-    p67_segment_check_writable(ctx, seg)?;
+    let mut seg = seg;
+    p67_segment_check_scope(ctx, &mut seg)?;
+    p67_segment_check_writable(ctx, &mut seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(None);
     };
@@ -3342,8 +3370,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             //   ((AbstractMemorySegmentImpl) segment).sessionImpl().checkValidState();
             // i.e. resolve the segment's session, then check THAT — which is
             // exactly `p67_segment_check_scope`.
-            let segment = obj_arg(args, 0)?;
-            p67_segment_check_scope(ctx, segment)?;
+            let mut segment = obj_arg(args, 0)?;
+            p67_segment_check_scope(ctx, &mut segment)?;
             Ok(None)
         },
     );
@@ -4896,9 +4924,9 @@ mod g19_scope_tests {
     fn a_stamped_session_that_has_closed_refuses_the_access() {
         let mut ctx = mock_ctx();
         let session = p67_memory_session(&mut ctx).unwrap();
-        let seg = stamped_segment(&mut ctx, session, 16);
+        let mut seg = stamped_segment(&mut ctx, session, 16);
         assert!(
-            p67_segment_check_scope(&mut ctx, seg).is_ok(),
+            p67_segment_check_scope(&mut ctx, &mut seg).is_ok(),
             "an open session must let the access through"
         );
 
@@ -4908,7 +4936,7 @@ mod g19_scope_tests {
         };
         let slots = p67_session_slots(&ctx, session_obj);
         ctx.set_field(session_obj, slots.state, Value::Int(0));
-        let err = p67_segment_check_scope(&mut ctx, seg).unwrap_err();
+        let err = p67_segment_check_scope(&mut ctx, &mut seg).unwrap_err();
         assert!(
             format!("{err:?}").contains("Already closed"),
             "a closed stamped session must refuse; got {err:?}"

@@ -1121,12 +1121,39 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// How many `close()V` calls the hook below has seen. The mock's
     /// `InvokeVirtualHook` is a bare `fn` pointer, so the counter cannot be a
-    /// captured local and has to be a static.
-    static INNER_CLOSES: AtomicUsize = AtomicUsize::new(0);
+    /// captured local — but it must not be a process-global either.
+    ///
+    /// It WAS a `static AtomicUsize`, and five tests share it
+    /// (`pushback_input_stream_close_is_idempotent_and_latches`,
+    /// `..._refuses_its_whole_surface_after_close`, `..._closed_beats_overflow`,
+    /// `pushback_reader_close_reaches_the_inner_reader_twice`,
+    /// `pushback_messages_differ_where_measured_and_agree_where_measured`).
+    /// Each opens with `store(0)` and later asserts an exact count, and cargo
+    /// runs them on PARALLEL THREADS in one process — so one test's reset
+    /// landing between another's `close()` and its `assert_eq!(.., 1)` reads 0,
+    /// and one test's close landing inside another's window reads 2. In the
+    /// full 4172-test suite the five are spread far enough apart that this hit
+    /// roughly one run in three, which is what made it look like an unexplained
+    /// flake rather than shared state; `cargo test --lib pushback`, which runs
+    /// only these five, failed 9 runs out of 10.
+    ///
+    /// Thread-local fixes it outright and costs nothing: each test runs on its
+    /// own thread, the hook is called synchronously on that same thread, and no
+    /// serialization between the five is needed.
+    thread_local! {
+        static INNER_CLOSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn inner_closes_reset() {
+        INNER_CLOSES.with(|c| c.set(0));
+    }
+
+    fn inner_closes() -> usize {
+        INNER_CLOSES.with(std::cell::Cell::get)
+    }
 
     fn count_closes(
         _ctx: &mut MockNativeContext,
@@ -1136,7 +1163,7 @@ mod tests {
         _args: &[Value],
     ) -> Option<MethodCallResult> {
         if name == "close" && desc == "()V" {
-            INNER_CLOSES.fetch_add(1, Ordering::SeqCst);
+            INNER_CLOSES.with(|c| c.set(c.get() + 1));
             return Some(Ok(None));
         }
         None
@@ -1160,11 +1187,11 @@ mod tests {
     fn pushback_input_stream_close_is_idempotent_and_latches() {
         let mut ctx = mock_ctx();
         ctx.set_invoke_virtual_hook(count_closes);
-        INNER_CLOSES.store(0, Ordering::SeqCst);
+        inner_closes_reset();
         let (this, _inner) = open_pushback(&mut ctx, ArrayElementType::Byte);
 
         p58_pushback_in_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
-        assert_eq!(INNER_CLOSES.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_closes(), 1);
         assert_eq!(
             ctx.get_field(this, 0),
             Value::Object(None),
@@ -1178,7 +1205,7 @@ mod tests {
 
         p58_pushback_in_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
         assert_eq!(
-            INNER_CLOSES.load(Ordering::SeqCst),
+            inner_closes(),
             1,
             "a second close must NOT re-close the wrapped stream (measured)"
         );
@@ -1190,7 +1217,7 @@ mod tests {
     fn pushback_input_stream_refuses_its_whole_surface_after_close() {
         let mut ctx = mock_ctx();
         ctx.set_invoke_virtual_hook(count_closes);
-        INNER_CLOSES.store(0, Ordering::SeqCst);
+        inner_closes_reset();
         let (this, _inner) = open_pushback(&mut ctx, ArrayElementType::Byte);
 
         // The PAIR, taken first so none of the refusals below can pass
@@ -1224,7 +1251,7 @@ mod tests {
             );
         }
         // And the refusals did NOT reach the wrapped stream: only the close did.
-        assert_eq!(INNER_CLOSES.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_closes(), 1);
     }
 
     /// The closed check runs BEFORE the pushback-overflow check, so a closed
@@ -1234,7 +1261,7 @@ mod tests {
     fn pushback_input_stream_closed_beats_overflow() {
         let mut ctx = mock_ctx();
         ctx.set_invoke_virtual_hook(count_closes);
-        INNER_CLOSES.store(0, Ordering::SeqCst);
+        inner_closes_reset();
         let (this, _inner) = open_pushback(&mut ctx, ArrayElementType::Byte);
         // Fill the 1-slot pushback buffer, so `pos == 0` == overflow-on-next.
         p58_pushback_in_unread(&mut ctx, &[Value::Object(Some(this)), Value::Int(65)]).unwrap();
@@ -1263,11 +1290,11 @@ mod tests {
     fn pushback_reader_close_reaches_the_inner_reader_twice() {
         let mut ctx = mock_ctx();
         ctx.set_invoke_virtual_hook(count_closes);
-        INNER_CLOSES.store(0, Ordering::SeqCst);
+        inner_closes_reset();
         let (this, _inner) = open_pushback(&mut ctx, ArrayElementType::Char);
 
         p66_pushback_reader_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
-        assert_eq!(INNER_CLOSES.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_closes(), 1);
         assert_eq!(
             ctx.get_field(this, 1),
             Value::Object(None),
@@ -1280,7 +1307,7 @@ mod tests {
 
         p66_pushback_reader_close(&mut ctx, &[Value::Object(Some(this))]).unwrap();
         assert_eq!(
-            INNER_CLOSES.load(Ordering::SeqCst),
+            inner_closes(),
             2,
             "a second PushbackReader.close() DOES re-close the wrapped Reader (measured)"
         );
