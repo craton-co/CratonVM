@@ -2,9 +2,29 @@
 
 ## Status
 
-**Mechanism 1 (the native-memory leak) is FIXED, 2026-08-30. Mechanism 2 (the
-per-call cost) is OPEN.** Two independent mechanisms, both CratonVM-specific,
-both reproducible in seconds by a standalone probe with no database.
+**RETIRED 2026-08-30.** Both of this page's own findings are fixed. The test it
+was opened for still fails, and that residual moved to
+`known-issues/hibernate/jpalargeblobtest-per-native-call-floor-20260830.md`
+— it is the VM's per-native-call floor, which is not a property of `Random`,
+blobs or H2 and wants its own owner.
+
+
+**Both of this page's own findings are CLOSED, 2026-08-30. The test still
+fails, and what is left is not this page's.** Two independent mechanisms, both
+CratonVM-specific, both reproducible in seconds by a standalone probe with no
+database.
+
+* **Mechanism 1, the native-memory leak — FIXED.** ~39 bytes per `Random` ever
+  constructed, retained forever off-heap. 16M instances: 2163.9 MB → 1354.6 MB,
+  flat across a 16x range.
+* **The `new Random()` entropy draw — FIXED.** It was a CSPRNG syscall per
+  construction, i.e. per byte of this fixture, and the spec says
+  `seedUniquifier() ^ System.nanoTime()`. 982.2 → 546.1 ns/op.
+* **Mechanism 2, the per-call cost — NOT A FINDING OF THIS PAGE.** It is the
+  VM's ~300 ns native-call floor times five calls per byte. See
+  [the arithmetic](#what-would-make-the-test-pass--the-arithmetic-closed-out).
+
+Net on the real test: **312 s → 232 s (1.35x)**, still over `@Timeout(120)`.
 
 The leak fix is `cratonvm_types::identity_side_tables`, an eviction channel the
 ZGC sweep drives; see [The fix](#the-fix-eviction-driven-from-the-sweep) below
@@ -305,18 +325,52 @@ function of the fixed seeds, so an evicted live entry — which re-seeds from OS
 entropy and still returns a number — shows up as a diverged checksum rather than
 as an error. Byte-identical to real HotSpot, 3/3 runs per arm.
 
-## What would make the test pass
+## What would make the test pass — the arithmetic, closed out
 
-The budget is 120 s for 100M bytes: **≤1200 ns/byte**, against 1670 today. A
-1.4x improvement clears it and a 2x is comfortable — so this does not need the
-whole gap closed.
+The budget is 120 s for 100M bytes: **≤1200 ns/byte**.
 
-**The leak fix does not clear it.** Freeing the memory does not make the path
-cheaper: the per-byte cost is mechanism 2, five native calls per iteration, and
-that is untouched. `JpaLargeBlobTest.jpaBlobStream` is still expected to exceed
-its `@Timeout(120)`. What the fix removes is the ~3.9 GB of unreclaimable native
-memory the test dragged along with it, which was the part that was a defect
-rather than a slowness.
+**Where it stands after the two fixes on this page.** The real test, run
+2026-08-30: `test_ms=231841` — **232 s, down from 312 s (1.35x)** — and it still
+FAILS `@Timeout(120)`.
+
+232 s / 100M bytes = **2318 ns/byte** end-to-end, against a 1200 budget. The
+decomposition (`probes/BlobStreamCost.java`, this host, quiet, after both
+fixes) splits it:
+
+| component | ns/byte | how it is isolated |
+|---|---:|---|
+| the fixture's `read()` | **1468.5** | `stream boxed+new Random` |
+| — of which BOXING | **812.2** | minus `stream prim +new Random` (656.3) |
+| — of which `new Random()`+`nextInt` | **551.2** | minus `stream prim +shared Random` (105.1) |
+| — of which loop + virtual dispatch | 105.1 | `stream prim +shared Random` |
+| H2's blob write (the remainder) | ~850 | 2318 − 1468.5 |
+
+Real HotSpot's whole `read()` is **34.0 ns/byte**.
+
+**So neither fix on this page could ever have cleared it, and nor will one
+more.** Both remaining components are the same thing — this VM's per-native-call
+floor of roughly 300 ns, times the calls the fixture makes per byte:
+
+* **boxing, 812 ns = ~3 calls.** `count > 0` is `Long.longValue`, `count--` is
+  `Long.longValue` + `Long.valueOf`.
+* **Random, 551 ns = ~2 calls.** `Random.<init>` and `Random.nextInt`.
+
+Removing the boxing alone lands at 2318 − 812 = **1506 ns/byte** — still over.
+Removing boxing AND the Random calls lands at **~955 ns/byte**, which is under
+1200 and is the first arrangement that passes.
+
+**That is a JIT-intrinsics project, not a finishing touch on this page.**
+`jit/src/lib.rs::try_resolve_intrinsic` already has the shape (a per-family
+match returning a `JitIntrinsic` the x64 ladder emits inline, as `Math.sqrt` and
+`Math.min/max` do) and reserved empty regions for other families.
+`Long.longValue` is a field load and would be a small addition; `Long.valueOf`
+needs an allocation fast path with the JDK's −128..127 cache, which is bigger.
+Both are VM-wide wins far beyond this test — the boxed-`Long` counter alone is
+140 ns/op here against HotSpot's 3.6.
+
+**This page has nothing left of its own to say about that.** Its two findings
+are closed; what remains is the per-call floor, which is a property of the VM
+and wants its own page and its own owner.
 
 ## Not yet done
 
@@ -347,9 +401,15 @@ rather than a slowness.
   a probe that reimplements the same LCG in Java measures the same question on
   today's binary with no VM change at all, and gating the registration is ~20
   lines.
-- Replace `set_entropy_seed`'s per-construction OS entropy draw with the JDK's
-  `seedUniquifier() ^ System.nanoTime()`. Not the bottleneck (falsified above),
-  but it is a syscall per `new Random()` and it is not what the spec says.
+- ~~Replace `set_entropy_seed`'s per-construction OS entropy draw with the JDK's
+  `seedUniquifier() ^ System.nanoTime()`.~~ **DONE 2026-08-30**, and it was
+  worth more than this line credited: 982.2 → 546.1 ns/op, which is 1.41x on the
+  whole fixture `read()`. The page called it "not the bottleneck (falsified
+  above)" because seeded and unseeded constructors cost the same — they did,
+  at 570 vs 620 ns, a 50 ns gap that read as noise. Re-measured quiet the gap
+  was 150 ns (832 vs 982), and it is now 9 ns (537 vs 546). **A falsification
+  measured once, on a contended host, at the resolution of the thing being
+  falsified, is not a falsification.**
 - `new StringBuilder()` measured **1076.8 ns/op** on CratonVM against HotSpot's
   0.1 in the same harness. Not on this test's path and not investigated — noted
   because it is a far broader surface than `Random` and the number is large
