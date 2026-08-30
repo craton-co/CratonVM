@@ -26,7 +26,7 @@ pub(crate) fn p67_layout_object(
     // 4 is a floor and a real `OfIntImpl` still gets its six.
     let minted = p67_value_layout_impl(class_name).unwrap_or(class_name);
     let obj = try_alloc_concurrent_synthetic(ctx, minted, 4)?;
-    let slots = p67_layout_slots(ctx, obj);
+    let slots = p67_layout_slots_for_mint(ctx, obj, 3);
     ctx.set_field(obj, slots.byte_size, Value::Long(byte_size));
     ctx.set_field(obj, slots.byte_alignment, Value::Long(byte_alignment));
     // Slot 2 is the little-endian flag, and every `java.lang.foreign` layout
@@ -106,7 +106,31 @@ pub(crate) enum P67LayoutOrder {
     Flag(usize),
 }
 
+/// [`p67_layout_slots`] for a carrier that is still being FILLED IN.
+///
+/// The fallback map's `name` index cannot be derived from slot 0 here, because
+/// slot 0 has not been written yet and an unwritten slot reads back as
+/// `Int(0)` — which is exactly the `Int` the derivation looks for. Every mint in
+/// this file writes the four-or-five slot map with `name` last, so they pass 3;
+/// asking the half-built object instead put `name` on top of the member array
+/// and cost `byteOffset(groupElement(..))` its members.
+pub(crate) fn p67_layout_slots_for_mint(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    fabricated_name: usize,
+) -> P67LayoutSlots {
+    p67_layout_slots_inner(ctx, layout, Some(fabricated_name))
+}
+
 pub(crate) fn p67_layout_slots(ctx: &dyn NativeContext, layout: ObjectRef) -> P67LayoutSlots {
+    p67_layout_slots_inner(ctx, layout, None)
+}
+
+fn p67_layout_slots_inner(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    fabricated_name: Option<usize>,
+) -> P67LayoutSlots {
     let class_id = ctx.class_id_of_object(layout);
     if let (Some(byte_size), Some(byte_alignment), Some(name)) = (
         ctx.resolve_field_index_by_class_id(class_id, "byteSize"),
@@ -141,10 +165,15 @@ pub(crate) fn p67_layout_slots(ctx: &dyn NativeContext, layout: ObjectRef) -> P6
     // value carriers -- the historical test for which is "does slot 0 hold an
     // Int", kept verbatim so this arm answers exactly what the open-coded
     // readers answered.
-    let name = if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
-        2
-    } else {
-        3
+    let name = match fabricated_name {
+        Some(slot) => slot,
+        None => {
+            if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
+                2
+            } else {
+                3
+            }
+        }
     };
     P67LayoutSlots {
         byte_size: 0,
@@ -3978,7 +4007,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
             let members_pin = ctx.pin_native_root(members);
             let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/StructLayoutImpl", 4)?;
-            let slots = p67_layout_slots(ctx, obj);
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
@@ -4111,7 +4140,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // the walk expects it at slot 2.
             let element_pin = ctx.pin_native_root(element);
             let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/SequenceLayoutImpl", 5)?;
-            let slots = p67_layout_slots(ctx, obj);
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             ctx.set_field(obj, slots.byte_size, Value::Long(total));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(elem_align.max(1)));
             let element = ctx.read_native_pin(element_pin, element);
@@ -4185,7 +4214,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // byteSize and then loses every member.
             let members_pin = ctx.pin_native_root(members);
             let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/UnionLayoutImpl", 4)?;
-            let slots = p67_layout_slots(ctx, obj);
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
@@ -4235,7 +4264,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // Padding has no payload, so the slot is explicitly null rather
             // than an `Int` that a payload reader could mistake for one.
             let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/PaddingLayoutImpl", 4)?;
-            let slots = p67_layout_slots(ctx, obj);
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             // Padding has no alignment constraint of its own — the JDK's
             // `PaddingLayoutImpl` is byte-aligned. This is the slot whose
