@@ -41,15 +41,27 @@ Rerun it at least three times before drawing any conclusion from a count.
 
 ## 2026-08-29 (later): reproduced, and the census says it is NOT to-space exhaustion
 
-Azure Linux, `--Xmx 1g -XX:+UseG1GC`, 900 s cap, `CRATONVM_GC_STATS=1`, one
-binary (`dev@a94842f04`). **Both faces reproduced in two runs**, and they have
-DIFFERENT internal signatures — which is the first thing here that the "the
-face varies" line can be replaced with:
+Azure Linux, `--Xmx 1g`, 900 s cap, `CRATONVM_GC_STATS=1`, one binary
+(`dev@a94842f04`), four G1 reps plus the default-collector control. **The "face
+varies between runs" line can now be replaced with a rule**: there are exactly
+two faces, they are mutually exclusive, and each has its own signature.
 
-| rep | rc | secs | real OOM | `[g1][SECURITY V7b]` dangling refs | implausible-header cycles |
-|---|---:|---:|---:|---:|---:|
-| 1 | 124 (cap) | 900 | **0** | **48 617** | 0 |
-| 2 | 1 | 120 | **1** | 129 | 14 (2 × "retain all regions") |
+| rep | arm | rc | secs | real OOM | `[g1][SECURITY V7b]` dangling refs | implausible-header cycles |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | `-XX:+UseG1GC` | 124 (cap) | 900 | 0 | **48 617** | 0 |
+| 2 | `-XX:+UseG1GC` | **1 (OOM)** | 120 | **4** | 129 | **14** |
+| 3 | `-XX:+UseG1GC` | 124 (cap) | 900 | 0 | **50 747** | 0 |
+| 4 | `-XX:+UseG1GC` | **1 (OOM)** | 749 | **4** | 275 | **21** |
+| 5 | **default collector** | **0 (PASS)** | 441 | **0** | **0** | **0** |
+
+**The OOM face and the implausible-header cycles occur together, 2 for 2, and
+never alongside the 50 000-dangling-reference face; the cap face is the exact
+complement.** The default collector shows zero of all three and passes — which
+is the control this page asserts and had not measured on this tip.
+
+So G1 corrupts this workload on every run. Whether that surfaces as an
+`OutOfMemoryError` or as a 900 s livelock is decided by *which* corruption the
+collector notices first, not by whether corruption happened.
 
 ### The OOM face
 
@@ -87,7 +99,7 @@ downstream of a marker that has already given up.
 
 ### The other face is a use-after-free the guard names outright
 
-The capped run never OOM'd; it logged **48 617** of these:
+The capped runs never OOM'd; they logged **48 617** and **50 747** of these:
 
 ```text
 [g1][SECURITY V7b] post-evacuation dangling reference: object 0x20045241910 in
@@ -101,8 +113,24 @@ builds and a loud log in release — so a normal run has the same UAF and prints
 nothing. This same signature is what `G1-9` was: the parallel evacuator not
 scanning a COMPACT object's reference fields, reachable only from a full VM run.
 
-`CRATONVM_G1_PARALLEL_EVAC=0` is therefore the bisect this page should run
-next, and it is running.
+`CRATONVM_G1_PARALLEL_EVAC=0` was therefore the obvious bisect. **It is
+refuted, and it fails in the direction that rules the hypothesis out rather
+than merely failing to confirm it:**
+
+| arm | rc | secs | `V7b` dangling refs |
+|---|---:|---:|---:|
+| `-XX:+UseG1GC` (parallel evac ON, default) | 124 / 1 | 900 / 120 | 48 617 / 129 |
+| `-XX:+UseG1GC` `CRATONVM_G1_PARALLEL_EVAC=0` | **139 (SIGSEGV)** | 652 | **95 332** |
+
+Turning the parallel evacuator OFF roughly **doubles** the dangling-reference
+count and adds a hard segfault — the third face this family is known for. So
+the incomplete remembered set is not the parallel evacuator's compact-object
+stride: it is in the path both evacuators share. The guard's own wording is
+the thing to take literally — *"incomplete remembered set"* — and the RSet is
+built before either evacuator runs.
+
+That also retires the `G1-9` resemblance. The signature matches; the cause
+does not.
 
 ### A measurement trap this page's own numbers may be sitting on
 

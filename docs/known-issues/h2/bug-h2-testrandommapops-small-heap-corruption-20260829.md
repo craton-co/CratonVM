@@ -130,8 +130,9 @@ Azure Linux, `--Xmx 256m`, 900 s cap, interleaved base/norelo, one binary
 | base | 2 | 1 | **786** | 21.3 | 0 | 0 | `NullPointerException` |
 | `ZGC_RELOCATE=0` | 2 | 124 (cap) | 900 | 19.9 | 0 | 9 | — none — |
 | base | 3 | 1 | **64** | 12.0 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 3 | 124 (cap) | 900 | 16.0 | 0 | 10 | — none — |
 
-**base 3/3 fail; `ZGC_RELOCATE=0` clean to the cap every time.** The cap is
+**base 3/3 fail; `ZGC_RELOCATE=0` 3/3 clean to the cap.** The cap is
 7-14x the base median, so a clean arm here carries information by this page's
 own standard.
 
