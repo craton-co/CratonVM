@@ -1,5 +1,25 @@
 # C13-1 — the interface doors never open for a values view, and what that changes
 
+> **MEASURED ON A BINARY 2026-08-30, and the class-identity prediction in this
+> record is OBSOLETE.** Every CratonVM row on this page is marked PREDICTED FROM
+> SOURCE — "no CratonVM binary and no cargo were run" — and the view-class
+> rewrite it specifies has since landed. `apps/probes/ViewIdentityProbe` asks
+> the class, the superclass, six `instanceof`s, three casts, `equals` four ways,
+> `hashCode`, the mutator refusals, serialization, the iterator classes and view
+> liveness, for `HashMap`, `LinkedHashMap`, `TreeMap`, `Hashtable` and
+> `Properties`: **303 rows, 0-diff against HotSpot 25.0.4+7 in BOTH modes.**
+>
+> So `keySet()` is a `HashMap$KeySet`, `values()` is a `HashMap$Values` with
+> `AbstractCollection` above it, neither is `Serializable`, and the casts this
+> record predicted would succeed now throw `ClassCastException` exactly where
+> HotSpot throws.
+>
+> What the probe DID find was different and narrower, and is fixed in the same
+> commit: three families never cached their view objects, so
+> `map.keySet() == map.keySet()` was false and — because `AbstractCollection`
+> does not override `equals` — `map.values().equals(map.values())` was FALSE
+> too. See `MEASURED-VIEW-IDENTITY` below.
+
 **Status:** the dispatch premise this lane was handed is **WRONG** (measured by
 source reading, §1); a routing layer landed on the strength of the corrected
 one (§4). Lane C13, 2026-08-12. Windows host, **no CratonVM binary was run and
@@ -359,3 +379,9 @@ tail. Replace:
 
 **N4 (`native-collections/src/lib.rs`, mine, NOT taken).** The flip itself, plus
 its registrations and its `vm/**` twin. Specified in C13-2 §4–§5.
+
+---
+
+## MEASURED-VIEW-IDENTITY
+
+See `C13-3-native-map-key-set-returns-a-hashset.md`'s section of this name for the 2026-08-30 measurement and the three caching defects it found. Nothing on this page is still open.
