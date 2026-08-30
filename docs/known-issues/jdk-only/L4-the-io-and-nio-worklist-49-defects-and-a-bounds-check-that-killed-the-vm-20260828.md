@@ -1677,7 +1677,9 @@ reasons, all of which have burned this campaign before:
 
 1. **Fourteen probes are not the corpus.** `invocations: 0` here bounds what
    *these* workloads reach. Spring, Tomcat and H2 reach `java.nio` constantly and
-   were not run. A shadow unreached by a probe suite is not a shadow unreached.
+   were not run *at the time this was written*. A shadow unreached by a probe
+   suite is not a shadow unreached. **(They have since been run — §P5.8. All
+   four green, all rows still zero.)**
 2. **A 0-diff argues KEEP as often as RETIRE** (the `StrictMath` adjudication,
    69 rows). Agreeing with HotSpot is what a *correct* shadow also does.
 3. **The enforcement dial is the wrong instrument here, and saying why is the
@@ -1723,11 +1725,14 @@ targeted probes *and* ten real regression vectors, all zero, on rows whose
 methods this lane's probes demonstrably call and get right.
 
 That is a much stronger case than §P5.6 opened with, and it is still **not a
-retirement**, for the reason that has not changed: the regression suite is not
-the corpus either. Spring, Tomcat and H2 are where `java.nio` gets used in
-anger, and they were not run here. What this does establish is that the 26 are
-not being reached by anything this repository routinely tests — so the next
-person can go straight to a corpus arm rather than re-deriving the list.
+retirement**, for the reason that had not changed at this point: the regression
+suite is not the corpus either. Spring, Tomcat and H2 are where `java.nio` gets
+used in anger.
+
+**§P5.8 runs them.** Four real applications, all green on this lane's binary,
+all 29 rows still zero, against a control of 114 262 `java.io`/`java.nio` native
+invocations. The reason the list is still not applied is no longer a gap in the
+evidence — it is §P5.7's layering caveat.
 
 The pattern is worth stating once: **`invocations: 0` from one workload is a
 floor, and the way to raise confidence is more DIFFERENT workloads, not more
@@ -1747,3 +1752,132 @@ from JDK-internal callers, 12 `java.io` exception classes served by the shared
 **The number to carry forward is not 125.** It is: 26 measured-inert and
 nominated, 99 inert for classified reasons, and — after five parts — *zero*
 rows in this lane's families that a probe reaches and gets wrong.
+
+
+## P5.7 Two statements in this record that look contradictory, and are not
+
+§P2.5 says `java/io/UnixFileSystem`'s 12 rows are **covered indirectly — the
+armed run drives all 12 through `java.io.File`'s real bytecode, 190
+invocations, 0-diff**. §P5.6 says those same rows are **inert, `invocations: 0`,
+nothing serves them**. A reader hitting both is entitled to think one is wrong.
+
+Neither is. Measured, same probe (`L4FileSweep`), same binary, one variable:
+
+```text
+                          unarmed                armed (java/io/File yields)
+java/io/File          827 inv / 60 rows          28 inv / 10 rows
+java/io/UnixFileSystem  1 inv /  1 row          190 inv / 16 rows
+```
+
+**The work moves one layer down.** Unarmed, `java.io.File`'s natives answer
+directly and `UnixFileSystem` is never reached — §P5.6's reading. Armed,
+`File`'s Bridge natives yield to real `java.io.File` bytecode, which calls
+`fs.<op>(...)`, and the `UnixFileSystem` natives light up — §P2.5's reading, and
+the 190 reproduces exactly.
+
+### Why this matters for the 26 nominations
+
+It is not just bookkeeping. It says **"inert" is a property of the CURRENT
+registration set, not of the row.**
+
+Every one of the 26 is inert because something above it answers first — real
+bytecode, in their case. Retire a native one layer up and rows below it can
+start firing, exactly as `UnixFileSystem` did. So a retirement worklist cannot
+be applied top-down without re-measuring after each step: the rows you cleared
+as "never invoked" are measured against a VM that still had the layer above
+them.
+
+That is the same trap as §P2.3's *half-applied retirement is worse than either
+endpoint*, seen from the other side. The order to work in is bottom-up, or
+top-down with a re-census between steps — and this record's numbers, like any
+census, describe the binary they were taken on.
+
+*(`java/io/File` keeps 28 invocations across 10 rows even when armed: the dial
+moves `Bridge` natives, and what remains is the rows it does not cover. An
+armed run is not an empty one, and a retirement priced from it inherits that
+gap.)*
+
+
+## P5.8 The corpus arm, run
+
+§P5.6 said the nominations needed "a corpus arm (Spring/Tomcat/H2), not another
+probe", and left it there. It is runnable on this host, so here it is.
+
+`/data/dod-out/cmd-<workload>-strict.txt` holds complete, already-validated
+`--jdk-only` command lines for the DoD workloads. Reused verbatim except for
+three substitutions — the binary swapped to this lane's frozen `/data/vm-l4io`,
+the report path moved so another lane's files are untouched, and
+`--dump-native-registry` added. Classpath, workload class and `--Xmx 2g` (whose
+size must be a separate argument or no report is written) left exactly as the
+lane that validated them wrote them.
+
+**All four ran green on this lane's binary:**
+
+```text
+h2jdbc     DOD TOTAL ok=12 failed=0/12      H2's own JDBC test suite, 12 classes
+sbsimple   DOD CONTEXT-UP beans=55          Spring Boot application context
+tcssl      Graceful shutdown complete       Tomcat over SSL
+jdbc       DOD RESULT OK checks=92          JDBC end-to-end
+```
+
+That is worth stating on its own: **the 82 defects this lane fixed did not break
+four real applications.** Nothing in parts one to five had established that —
+the evidence until now was probes and 116 regression vectors.
+
+### The control, first
+
+A zero is worth nothing if the workload never went near the family. It did:
+
+```text
+h2jdbc    90621 java.io/java.nio native invocations across 124 distinct rows
+tcssl     12625                                            120
+jdbc       6795                                             92
+sbsimple   4221                                             79
+```
+
+**114 262 invocations**, against a probe suite whose whole `java.nio` traffic is
+a few thousand. The instrument fires.
+
+### The answer
+
+```text
+29  rows nominated (by EXACT descriptor)
+29  present in the corpus dumps
+ 0  moved off zero
+```
+
+So the evidence for the nomination is now **fourteen targeted probes, ten
+regression vectors, and four real applications** — H2's JDBC suite, Spring Boot,
+Tomcat over SSL, and a JDBC workload — all green, all zero, with a control
+showing six figures of traffic through the same two packages.
+
+One neighbour did move, and it is the useful part of the result:
+
+```text
+java/nio/ByteBuffer  get([B)Ljava/nio/ByteBuffer;   inv=527   in h2jdbc
+```
+
+The nominated row is `get([BII)`. The **one-argument** bulk get is heavily live
+in H2 and the **three-argument** one is not reached at all. Liveness is a
+property of the DESCRIPTOR, not the method — the same thing this lane found in
+`FilterOutputStream`'s three `write` slots, in the covariant `reset()` bridges,
+and in `getNameMax0`'s two widths. A retirement list keyed on method names would
+have taken out a slot doing 527 calls in the first workload tried.
+
+### Still a nomination
+
+The list is not applied here, and the reason is now §P5.7's rather than a lack
+of evidence: **"inert" is a property of the current registration set.** These 29
+are unreached while every layer above them is in place; retiring one of those
+layers can make them fire, exactly as `java/io/UnixFileSystem` went 1 → 190 when
+`java.io.File` yielded. Whoever applies this list should work bottom-up, or
+re-census between steps.
+
+What has changed is that the next person does not need to re-derive it. The
+worklist, the reproduction, and a corpus-backed zero are all here.
+
+```bash
+# the corpus arm, reproducible (both scripts are tracked)
+bash    apps/probes/l4corp.sh       # rewrites the DoD command lines, dumps the registry
+python3 apps/probes/l4corptally.py  # the control, then the nominated rows
+```

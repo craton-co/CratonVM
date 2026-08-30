@@ -276,6 +276,35 @@ public class JdkInternalSweep {
             v.putIfAbsent(null, "boot");
             return v.get(null) + "/" + v.get(cl);
         });
+        p("removeAll then get", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "one");
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl));
+        });
+        p("removeAll leaves another loader's mapping", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "app");
+            v.putIfAbsent(null, "boot");
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl)) + "/" + String.valueOf(v.get(null));
+        });
+        p("removeAll on an empty value", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.removeAll(cl);
+            return "no throw";
+        });
+        p("removeAll twice", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "one");
+            v.removeAll(cl);
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl));
+        });
         p("remove then get", () -> {
             jdk.internal.loader.ClassLoaderValue<String> v =
                 new jdk.internal.loader.ClassLoaderValue<>();
