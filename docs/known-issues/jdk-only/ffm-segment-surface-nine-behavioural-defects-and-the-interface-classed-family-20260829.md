@@ -119,9 +119,9 @@ segments; `ofBuffer`; `heapBase()`; and every layout's `byteSize`,
 
 ## 4. The residual, sized rather than guessed
 
-**25 rows in compatible mode, 45 under `--jdk-only`, down from 27/47: the
-`Arena` family is CLOSED (2026-08-29) and the rest is one defect.** All of what
-is left is `class`, `superclass` and `isInterface` -- 13, 10 and 2 rows.
+**23 rows in compatible mode, 43 under `--jdk-only`, down from 27/47.** Two of
+the five families are CLOSED (2026-08-29): `Arena`, and the nine `ValueLayout`
+carriers. All of what is left is `class`, `superclass` and `isInterface`.
 
 ```text
                        compatible                                    --jdk-only
@@ -210,17 +210,92 @@ fields included -- these are the layouts a by-name resolver has to land on:
 
 ```text
   jdk.internal.foreign.ArenaImpl                     2   DONE 2026-08-29
+  jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   DONE 2026-08-29 (and its 8 siblings)
   jdk.internal.foreign.NativeMemorySegmentImpl       4   (min + length, readOnly, scope)
   jdk.internal.foreign.HeapMemorySegmentImpl$OfByte  5   (offset, base + the same three)
   jdk.internal.foreign.layout.SequenceLayoutImpl     5   (elemCount, elementLayout + byteSize, byteAlignment, name)
-  jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   (+ carrier, order, handle)
   jdk.internal.foreign.layout.StructLayoutImpl       6   (kind, elements, minByteAlignment + the same three)
 ```
 
-None of them is large. The segment family is the one that also clears
-`compatibility_classes > 0`, since it is the only one with a fabricated
-stand-in; it is also the widest, at 118 registered natives to move rather than
-the arena's 14.
+### 4.5 The value layouts, and the second producer that only compatible mode has
+
+Done in two steps, because the accessors had to stop guessing before any carrier
+could move:
+
+* **`p67_layout_slots`** resolves `byteSize`, `byteAlignment` and `name` from the
+  receiver's class. `AbstractLayout` declares all three, so ONE resolver serves
+  every layout -- value, struct, sequence, union, padding -- and the fabricated
+  carriers keep their old map through its fallback arm. Landing it alone left
+  the sweep at exactly 50/90, which is what "behaviour-preserving" has to mean.
+* **The carriers**, plus the four natives (`byteSize`, `byteAlignment`,
+  `byteOffset`, `varHandle`) the impl classes lacked.
+
+That fixed the STRICT arm only: 90 -> 86, compatible unchanged at 50. **A second
+producer mints these objects and only in compatible mode** --
+`make_prepared_value_layout`, the FFM preseed in `vm/src/vm/vm_util.rs`, which
+the strict arm drops entirely so the real `<clinit>` can run. Its own comment had
+already diagnosed itself:
+
+> "Every `class_name` reached here ... is an INTERFACE in the real JDK: it has
+> zero instance fields, and the concrete carrier is `ValueLayouts$Of*Impl` ...
+> The `.max(2)` above therefore invents two slots on an object of an interface
+> type ... It was NOT converted to named-field lookup, because there are no real
+> fields to name."
+
+Right about all of it, including the fix: mint the concrete carrier it names,
+and there ARE fields to name. Compatible 50 -> 46. The `<clinit>` suppression is
+untouched -- this was never about running the real initialiser, only about which
+class the object is an instance of.
+
+**The one regression, and it is the same species as the arena's.**
+`p67_layout_with_name` kept its own copy of the "slot 0 is an `Int` -> name is at
+2, else at 3" rule. On a real value layout that picks slot 3, which is `carrier`,
+while every reader now resolves by name and gets 2 -- so
+`structLayout(JAVA_INT.withName("c")).byteOffset(groupElement("c"))` answered
+`cannot resolve layout path element: no member named 'c'`. The name was written;
+nothing looked where it went. `RJdkForeign` step `layouts`, both arms. **A family
+converted at its readers and not at one writer fails exactly like a family
+converted at three methods and not the fourth.**
+
+None of them is large -- **but the field count is the wrong axis, and it is the
+axis I first priced them on.** What the move costs is step 2 of the recipe: the
+number of places that read those fields by a RAW INDEX, each of which has to go
+through the resolver or become the next `Arena is closed`. Counted by walking
+every function in the two files and matching `get_field(x, N)` / `set_field(x, N)`:
+
+```text
+                    functions   raw-index accesses   already by-name
+  layout family        19              37                  2
+  segment family       17             112                 19
+  (arena, for scale)    3               4                  0
+```
+
+**So the layout families really are the smaller half -- by 3x, not by the
+handful the field counts suggested -- and the arena was smaller than either by
+an order of magnitude.** That is why it went first and why it was the right
+place to learn the recipe; it is not evidence that the others are the same size.
+
+Two things the count does not show, both found while sizing it:
+
+* **The layout accessors already SHAPE-GUESS between carriers**, which is the
+  same species as the width test in §4.3 and has to be replaced in the same
+  change, not after it. `p67_layout_name_value` picks slot 2 or slot 3 by asking
+  whether slot 0 holds an `Int`; `p67_layout_byte_alignment` reads slot 1 and
+  falls back to slot 0 when it is not a `Long`. Value, group and sequence
+  carriers all pass through them. Move one family and the others' reads move
+  with it, so the layout half is **all thirteen carriers or none** -- nine
+  `ValueLayout`s plus struct, sequence, union and padding.
+* **Some of the work is already done, and it argues the design is right.**
+  `p67_layout_is_little` resolves the real `order` field BY NAME and separates
+  real from fabricated by asking `declared_fields` for `carrier`/`order`;
+  `p67_layout_carrier_name` already answers for both spellings; and
+  `ValueLayouts$OfIntImpl` carries 11 of the interface's 17 natives, needing
+  only `byteSize`, `byteAlignment`, `byteOffset` and `varHandle`. `StructLayoutImpl`
+  and `SequenceLayoutImpl` carry none of theirs (0 of 7, 0 of 10).
+
+The segment family remains the one that clears `compatibility_classes > 0`,
+since it is the only one with a fabricated stand-in -- and it is now measured as
+the most expensive of the three, not merely the widest by native count.
 
 ## 5. Reproduce
 

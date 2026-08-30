@@ -727,14 +727,12 @@ fn layout_vh_access(
         return Ok(None);
     };
     // GC-safety: the scope check runs `Scope.checkValidState()` bytecode, which
-    // can collect and relocate the segment. Pin it across the call and re-read
-    // the (possibly forwarded) reference before touching its fields — and
-    // release the pin BEFORE propagating a closed-scope failure.
-    let seg_pin = ctx.pin_native_root(seg);
-    let checked = crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, seg);
-    let seg = ctx.read_native_pin(seg_pin, seg);
-    ctx.unpin_native_roots(seg_pin);
-    checked?;
+    // can collect and relocate the segment. The pin and the re-read live inside
+    // `p67_segment_check_scope` now — it takes its receiver by `&mut` and hands
+    // back the forwarded reference — so this call site cannot get it wrong, and
+    // neither can the three that never had the hand-written pin this replaces.
+    let mut seg = seg;
+    crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, &mut seg)?;
     let long_at = |i: usize| -> i64 {
         match args.get(i) {
             Some(Value::Long(v)) => *v,

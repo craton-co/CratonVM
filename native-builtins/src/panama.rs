@@ -826,7 +826,11 @@ pub(crate) fn global_arena_cell(
 }
 
 /// The published handle, if any. A function so the guard cannot outlive the
-/// map read -- see the note in `shared_secrets_bridge::owner_singleton_handle`.
+/// map read. `if let Some(h) = cell.lock() { ctx.something(h) }` keeps the
+/// guard alive for the whole statement, which is a native-builtins lock held
+/// across a re-entry into the VM -- the edge `lock_discipline_ratchet` exists
+/// to keep out of this crate. `shared_secrets_bridge` carries the same note on
+/// its own copy of this shape; two lanes wrote it the same day.
 pub(crate) fn global_arena_handle() -> Option<usize> {
     *global_arena_cell().lock()
 }
