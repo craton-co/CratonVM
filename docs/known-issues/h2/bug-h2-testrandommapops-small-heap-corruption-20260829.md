@@ -166,15 +166,72 @@ other naming convention, `*_update_after_gc`, and are called. That is a
 negative result, and it removes the cheapest hypothesis rather than
 supporting it.
 
+### It narrows once more, and then the instrument names it
+
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — **2/2 clean to the 900 s cap**
+(`arena=10`, `arena=8`). That switch restores the older refusal that fires on
+the mere existence of a compiled frame, so for a JIT-active workload it is
+close to `ZGC_RELOCATE=0`; the value of the arm is that it places the defect in
+**relocation while a compiled frame is live**, not in relocation generally.
+
+`CRATONVM_DBG_REMAP_RESIDUE=1` on a failing base run then says what is wrong
+with those frames. The instrument walks a live JIT frame looking for words that
+are still **keys** in the pointer map — pre-move addresses nothing rewrote —
+and one failing run (`rc=1`, 286 s, the usual `NullPointerException`) reports:
+
+```text
+frames=235  with_stale=228 (97%)
+  cov_complete TRUE=228   cov_complete=false 0
+  mapped slots on stale frames: min=1 max=13 avg=4.5
+  stale_words: min=1 max=33 total=2844
+```
+
+**Every one of the 228 frames that still held a pre-move address had declared
+`cov_complete=true`.** Not one reported incomplete coverage. A representative
+line:
+
+```text
+[remap-frame] method=java/lang/StringLatin1.newString:([BII)Ljava/lang/String;
+  sp_id=7 frame_size=912 cov_complete=true
+  mapped=[ 8=0x20012279570] rewritten=1
+  inlined=["java/lang/String.<init>([BB)V"]
+  stale_words=12 [off=888 stale=0x200137528b8->0x20012279848]
+                 [off=688 stale=0x20013752590->0x20012279520] ...
+```
+
+A 912-byte frame, an oop map naming **one** slot, one slot rewritten — and
+twelve other words in that same frame holding addresses the collector has a
+forwarding entry for. The relocation moved those objects; the frame kept the
+old pointers; a later read through one of them is the `NullPointerException`,
+and reading through a slot whose old cell has since been REUSED is this page's
+`NoSuchMethodError: '<unknown class 2460030832>'` and its SIGSEGV. **Three
+faces, one cause.**
+
+So the defect is not "the heap is fragmented" and not the allocator: **the
+per-frame coverage proof reports complete while the frame demonstrably retains
+unrewritten references, and relocation trusts it.**
+
+Inlining is present in only 45 of the 228 (20%), so a spliced callee's unnamed
+locals are *a* contributor and not the whole of it — the average stale frame
+names 4.5 slots and carries several more live from-addresses than that.
+
+**Caveat, stated because the count is a heuristic**: `stale_words` counts frame
+words whose value is a pointer-map key. A dead slot or a spilled non-reference
+integer that happens to equal a moved object's old address would be counted
+too. At 228 frames of 235 and 2 844 words that is not a coincidence budget
+anyone can spend, but the *exact* count is an upper bound, not a proof of 2 844
+live misses.
+
 ### Next, in order
 
-1. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — splits "relocation" into
-   "relocation while a compiled frame is live" and the rest. Running.
-2. `CRATONVM_DBG_REMAP_RESIDUE=1` on a failing base run. That instrument scans
-   a live JIT frame for words that are still KEYS in the pointer map — i.e.
-   from-addresses nothing rewrote — and prints
-   `[remap-frame] ... stale_words=N [off=.. stale=0x..->0x..]`. A non-zero
-   `stale_words` names the unremapped slot outright. Running.
+1. **Find why `coverage_complete` is true here.** It is the claim that is
+   demonstrably false, and it is what relocation is gated on. The
+   `scauses(...)` census on the sibling ZGC page
+   (`dataflow=151 marks=83 inline_scope=5`) is the compile-time half of the
+   same question.
+2. Whether the map is *incomplete* or the *rewrite* skips slots it named —
+   `mapped=[…] rewritten=N` versus `stale_words` in one line separates those,
+   and above they disagree in the same frame.
 
 ## Why "repro and dump" WAS the wrong instrument
 
