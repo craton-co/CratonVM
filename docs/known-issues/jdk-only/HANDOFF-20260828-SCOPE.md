@@ -621,6 +621,29 @@ that scans a directory has to be re-run.
 **Both halves of the list matter.** This section lists known-red VECTORS, and a
 lane that runs the gates first had nothing to check a gate red against.
 
+**A THIRD, open as of `57107dbd5` (2026-08-30). The stub ratchet, both
+configurations:**
+
+```
+cargo test -p cratonvm-native-builtins --test stub_ratchet
+  synthetic_stub_count_does_not_regress
+  1582 SyntheticStub natives now registered, exceeding the frozen baseline of 1576
+  (management: 1593 against 1587)
+```
+
+**Attributed by MEASUREMENT, because this one cannot be settled by a diff:** the
+count comes from the whole registry, so no single file's bytes decide it. A
+detached worktree at pristine `origin/dev` plus
+`cargo test -p cratonvm-native-builtins --test stub_ratchet` reports the
+identical `1582` against `1576` — about five minutes, and the only honest way to
+tell your rows from theirs. `git worktree add --detach <dir> origin/dev` with its
+own `CARGO_TARGET_DIR` so it cannot disturb your build.
+
+The failure text is itself the protocol: run `dump_synthetic_stubs` in both
+trees, `comm -23` the sorted `@@STUB` lines, and classify with the SECOND column
+before touching either baseline constant. Note the dump is a plain `#[test]`, so
+`-- --ignored` runs zero tests and prints nothing.
+
 **And a second one is OPEN as of `ff92ca9a4` (2026-08-29 evening).** Same test,
 different row:
 
