@@ -55,6 +55,30 @@
 //! a graph that no longer matches the sequence it captured, and the
 //! failure would appear as wrong output rather than as an error.
 
+//! # One signature, two backends
+//!
+//! The crate builds without a driver so that everything above it — the
+//! VM's offload path, its natives, its tests — compiles and runs on a
+//! machine with no GPU. Every entry point below therefore has a
+//! driverless arm, written as a `#[cfg]` inside the body rather than as
+//! a second `impl` block.
+//!
+//! That is not a style preference. Two parallel `impl` blocks let the
+//! signatures drift, and one did: `instantiate` was changed to consume
+//! its `Graph` — the whole point being that a node handle cannot outlive
+//! the graph it names — and the stub copy kept `&self`. Nothing caught
+//! it, because `graph.instantiate()` compiles against either receiver
+//! and the stub returns before it constructs anything. The ownership
+//! rule simply was not a rule in stub builds. With one signature there
+//! is nowhere for that to hide.
+//!
+//! No driverless arm reports success. A capture that quietly produced an
+//! empty graph would replay successfully and run no kernels, which is the
+//! one failure this whole mechanism must never have. The single
+//! exception is [`Stream::capturing_node`], which answers `Ok(None)`
+//! because "am I capturing?" has a true answer without a driver and
+//! callers use it to choose a path rather than to do work.
+
 use crate::{DeviceContext, DeviceError, Event, KernelArgs, Result, Stream};
 
 /// What a capture does to work submitted on *other* threads' streams.
@@ -118,7 +142,6 @@ impl Drop for Graph {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Graph {
     /// Resolve the graph into something launchable.
     ///
@@ -127,26 +150,35 @@ impl Graph {
     /// laying out the argument buffers. It is expensive and it happens
     /// once.
     pub fn instantiate(self) -> Result<GraphExec> {
-        self.device
-            .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-        let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
-        // SAFETY: `self.raw` is a live graph on the bound context, and
-        // `exec` is a valid out-pointer for the duration of the call.
-        let status = unsafe {
-            cudarc::driver::sys::lib().cuGraphInstantiateWithFlags(&mut exec, self.raw, 0)
-        };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuGraphInstantiateWithFlags: {status:?}"
-            )));
+        #[cfg(feature = "cuda")]
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
+            // SAFETY: `self.raw` is a live graph on the bound context, and
+            // `exec` is a valid out-pointer for the duration of the call.
+            let status = unsafe {
+                cudarc::driver::sys::lib().cuGraphInstantiateWithFlags(&mut exec, self.raw, 0)
+            };
+            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuGraphInstantiateWithFlags: {status:?}"
+                )));
+            }
+            Ok(GraphExec {
+                raw: exec,
+                device: self.device.clone(),
+                slots: self.slots.clone(),
+                _graph: self,
+            })
         }
-        Ok(GraphExec {
-            raw: exec,
-            device: self.device.clone(),
-            slots: self.slots.clone(),
-            _graph: self,
-        })
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Nothing was captured, so there is nothing to instantiate.
+            let _ = self;
+            Err(DeviceError::NoDriver)
+        }
     }
 
     /// How many nodes the capture recorded.
@@ -156,19 +188,27 @@ impl Graph {
     /// something else on this thread was folded into the graph, and that is
     /// worth failing on rather than replaying.
     pub fn node_count(&self) -> Result<usize> {
-        self.device
-            .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-        let mut n: usize = 0;
-        // SAFETY: a null node array with a valid count out-pointer is the
-        // documented "just count them" form.
-        let status = unsafe {
-            cudarc::driver::sys::lib().cuGraphGetNodes(self.raw, std::ptr::null_mut(), &mut n)
-        };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!("cuGraphGetNodes: {status:?}")));
+        #[cfg(feature = "cuda")]
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            let mut n: usize = 0;
+            // SAFETY: a null node array with a valid count out-pointer is the
+            // documented "just count them" form.
+            let status = unsafe {
+                cudarc::driver::sys::lib().cuGraphGetNodes(self.raw, std::ptr::null_mut(), &mut n)
+            };
+            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!("cuGraphGetNodes: {status:?}")));
+            }
+            Ok(n)
         }
-        Ok(n)
+        #[cfg(not(feature = "cuda"))]
+        {
+            // No driver, so there is no graph to count.
+            Err(DeviceError::NoDriver)
+        }
     }
 }
 
@@ -216,7 +256,6 @@ impl Drop for GraphExec {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl GraphExec {
     /// Submit every launch in the graph onto `stream`, and answer the
     /// event that fires when they are all done.
@@ -247,21 +286,30 @@ impl GraphExec {
     /// arguments the kernel wrote, so it treats every device-pointer
     /// argument as written. Conservative, never wrong.
     pub fn launch(&self, ctx: &DeviceContext, stream: &Stream) -> Result<std::sync::Arc<Event>> {
-        self.device
-            .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-        // SAFETY: both handles live on the bound context and the call only
-        // enqueues.
-        let status = unsafe { cudarc::driver::sys::lib().cuGraphLaunch(self.raw, stream.raw()) };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!("cuGraphLaunch: {status:?}")));
+        #[cfg(feature = "cuda")]
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            // SAFETY: both handles live on the bound context and the call only
+            // enqueues.
+            let status = unsafe { cudarc::driver::sys::lib().cuGraphLaunch(self.raw, stream.raw()) };
+            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!("cuGraphLaunch: {status:?}")));
+            }
+            let done = std::sync::Arc::new(Event::new(ctx)?);
+            stream.record_event(&done)?;
+            for slot in &self.slots {
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(done.clone());
+            }
+            Ok(done)
         }
-        let done = std::sync::Arc::new(Event::new(ctx)?);
-        stream.record_event(&done)?;
-        for slot in &self.slots {
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(done.clone());
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Nothing to launch, and no event to answer with.
+            let _ = (ctx, stream);
+            Err(DeviceError::NoDriver)
         }
-        Ok(done)
     }
 
     /// Replace the arguments of one captured node, in the instantiated
@@ -295,90 +343,107 @@ impl GraphExec {
         node: GraphNode,
         args: &KernelArgs,
     ) -> Result<()> {
-        self.device
-            .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-
-        // Read the node's current parameters. This is what supplies
-        // `func` -- cudarc keeps `CudaFunction`'s raw handle private, and
-        // asking the node is better than reaching for it anyway: the
-        // launch shape then cannot drift from what was captured.
-        let mut params = cudarc::driver::sys::CUDA_KERNEL_NODE_PARAMS::default();
-        // SAFETY: `node` is a node of the graph this exec was
-        // instantiated from, and `params` is a valid out-pointer.
-        let rc = unsafe {
-            cudarc::driver::sys::lib().cuGraphKernelNodeGetParams_v2(node.0, &mut params)
-        };
-        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuGraphKernelNodeGetParams_v2: {rc:?}"
-            )));
-        }
-
-        // Two backing stores, the same shape the launch path documents:
-        // device addresses need a stable 8-byte slot to point AT, and
-        // scalars are pointed at directly inside `args.raw`.
-        let mut addrs: Vec<u64> = Vec::with_capacity(args.raw.len());
-        for a in &args.raw {
-            if let crate::KernelArg::DevicePtr { addr, .. } = a {
-                addrs.push(*addr);
+        #[cfg(feature = "cuda")]
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+    
+            // Read the node's current parameters. This is what supplies
+            // `func` -- cudarc keeps `CudaFunction`'s raw handle private, and
+            // asking the node is better than reaching for it anyway: the
+            // launch shape then cannot drift from what was captured.
+            let mut params = cudarc::driver::sys::CUDA_KERNEL_NODE_PARAMS::default();
+            // SAFETY: `node` is a node of the graph this exec was
+            // instantiated from, and `params` is a valid out-pointer.
+            let rc = unsafe {
+                cudarc::driver::sys::lib().cuGraphKernelNodeGetParams_v2(node.0, &mut params)
+            };
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuGraphKernelNodeGetParams_v2: {rc:?}"
+                )));
             }
-        }
-        let mut next = 0usize;
-        let mut param_ptrs: Vec<*mut std::ffi::c_void> = args
-            .raw
-            .iter()
-            .map(|a| match a {
-                crate::KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
-                crate::KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
-                crate::KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
-                crate::KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
-                crate::KernelArg::DevicePtr { .. } => {
-                    let slot = &addrs[next] as *const u64 as *mut std::ffi::c_void;
-                    next += 1;
-                    slot
+    
+            // Two backing stores, the same shape the launch path documents:
+            // device addresses need a stable 8-byte slot to point AT, and
+            // scalars are pointed at directly inside `args.raw`.
+            let mut addrs: Vec<u64> = Vec::with_capacity(args.raw.len());
+            for a in &args.raw {
+                if let crate::KernelArg::DevicePtr { addr, .. } = a {
+                    addrs.push(*addr);
                 }
-            })
-            .collect();
-
-        params.kernelParams = param_ptrs.as_mut_ptr();
-        // v2 params carry `func` AND a `kern`/`ctx` pair, and the driver
-        // reads `kern` only when `func` is null. The getter returns both
-        // halves populated; passing them straight back is what the
-        // driver rejects with INVALID_VALUE. Keep `func`, which is the
-        // handle the capture actually recorded.
-        params.kern = std::ptr::null_mut();
-        params.ctx = std::ptr::null_mut();
-        // `extra` and `kernelParams` are mutually exclusive; the getter
-        // may have returned a non-null `extra` and passing both is an
-        // error. We supply arguments the `kernelParams` way, as the
-        // launch path does.
-        params.extra = std::ptr::null_mut();
-
-        // SAFETY: every pointer in `param_ptrs` borrows into `args.raw`
-        // or `addrs`, both alive here and un-reallocated since the
-        // pointers were taken; the driver copies the parameter bytes
-        // before returning.
-        let rc = unsafe {
-            cudarc::driver::sys::lib().cuGraphExecKernelNodeSetParams_v2(self.raw, node.0, &params)
-        };
-        // Liveness anchor: the call has returned, so the raw pointers are
-        // no longer dereferenced. Naming both stores here makes a future
-        // refactor that drops either one early fail to compile.
-        let _keep_alive = (&args.raw, &addrs, &param_ptrs);
-        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuGraphExecKernelNodeSetParams_v2: {rc:?}"
-            )));
+            }
+            let mut next = 0usize;
+            let mut param_ptrs: Vec<*mut std::ffi::c_void> = args
+                .raw
+                .iter()
+                .map(|a| match a {
+                    crate::KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
+                    crate::KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
+                    crate::KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
+                    crate::KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
+                    crate::KernelArg::DevicePtr { .. } => {
+                        let slot = &addrs[next] as *const u64 as *mut std::ffi::c_void;
+                        next += 1;
+                        slot
+                    }
+                })
+                .collect();
+    
+            params.kernelParams = param_ptrs.as_mut_ptr();
+            // v2 params carry `func` AND a `kern`/`ctx` pair, and the driver
+            // reads `kern` only when `func` is null. The getter returns both
+            // halves populated; passing them straight back is what the
+            // driver rejects with INVALID_VALUE. Keep `func`, which is the
+            // handle the capture actually recorded.
+            params.kern = std::ptr::null_mut();
+            params.ctx = std::ptr::null_mut();
+            // `extra` and `kernelParams` are mutually exclusive; the getter
+            // may have returned a non-null `extra` and passing both is an
+            // error. We supply arguments the `kernelParams` way, as the
+            // launch path does.
+            params.extra = std::ptr::null_mut();
+    
+            // SAFETY: every pointer in `param_ptrs` borrows into `args.raw`
+            // or `addrs`, both alive here and un-reallocated since the
+            // pointers were taken; the driver copies the parameter bytes
+            // before returning.
+            let rc = unsafe {
+                cudarc::driver::sys::lib().cuGraphExecKernelNodeSetParams_v2(self.raw, node.0, &params)
+            };
+            // Liveness anchor: the call has returned, so the raw pointers are
+            // no longer dereferenced. Naming both stores here makes a future
+            // refactor that drops either one early fail to compile.
+            let _keep_alive = (&args.raw, &addrs, &param_ptrs);
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuGraphExecKernelNodeSetParams_v2: {rc:?}"
+                )));
+            }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(feature = "cuda"))]
+        {
+            // No node to update.
+            let _ = (node, args);
+            Err(DeviceError::NoDriver)
+        }
     }
 
     /// How many buffers a replay re-stamps. Exposed so a test can assert
     /// the capture actually took custody of them: a graph that collected
     /// none would replay, write, and leave every reader unsynchronised.
     pub fn tracked_buffer_count(&self) -> usize {
-        self.slots.len()
+        #[cfg(feature = "cuda")]
+        {
+            self.slots.len()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Nothing was captured, so nothing is tracked.
+            0
+        }
     }
 }
 
@@ -398,7 +463,6 @@ unsafe impl Send for GraphNode {}
 // SAFETY: as above; the handle is immutable.
 unsafe impl Sync for GraphNode {}
 
-#[cfg(feature = "cuda")]
 impl Stream {
     /// Start recording launches on this stream instead of issuing them.
     ///
@@ -409,18 +473,27 @@ impl Stream {
     /// a lean dispatch path while a capture is open rather than its usual
     /// event-and-callback one.
     pub fn begin_capture(&self, mode: CaptureMode) -> Result<()> {
-        self.bind_device()?;
-        // SAFETY: the stream belongs to the context bound above and the
-        // call only changes that stream's mode.
-        let status =
-            unsafe { cudarc::driver::sys::lib().cuStreamBeginCapture_v2(self.raw(), mode.raw()) };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuStreamBeginCapture_v2: {status:?}"
-            )));
+        #[cfg(feature = "cuda")]
+        {
+            self.bind_device()?;
+            // SAFETY: the stream belongs to the context bound above and the
+            // call only changes that stream's mode.
+            let status =
+                unsafe { cudarc::driver::sys::lib().cuStreamBeginCapture_v2(self.raw(), mode.raw()) };
+            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuStreamBeginCapture_v2: {status:?}"
+                )));
+            }
+            self.set_capturing(true);
+            Ok(())
         }
-        self.set_capturing(true);
-        Ok(())
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Capture needs a driver.
+            let _ = mode;
+            Err(DeviceError::NoDriver)
+        }
     }
 
     /// Stop recording and hand back what was recorded.
@@ -431,32 +504,41 @@ impl Stream {
     /// successfully and does nothing, which is the worst possible way for
     /// this to fail.
     pub fn end_capture(&self, ctx: &DeviceContext) -> Result<Graph> {
-        self.bind_device()?;
-        // Cleared unconditionally, including on every failure path
-        // below: a stream that is not capturing must not be left
-        // claiming that it is, or every later launch on it would skip
-        // the event discipline it needs.
-        self.set_capturing(false);
-        let mut raw: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
-        // SAFETY: valid out-pointer, stream on the bound context.
-        let status = unsafe { cudarc::driver::sys::lib().cuStreamEndCapture(self.raw(), &mut raw) };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuStreamEndCapture: {status:?}"
-            )));
+        #[cfg(feature = "cuda")]
+        {
+            self.bind_device()?;
+            // Cleared unconditionally, including on every failure path
+            // below: a stream that is not capturing must not be left
+            // claiming that it is, or every later launch on it would skip
+            // the event discipline it needs.
+            self.set_capturing(false);
+            let mut raw: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
+            // SAFETY: valid out-pointer, stream on the bound context.
+            let status = unsafe { cudarc::driver::sys::lib().cuStreamEndCapture(self.raw(), &mut raw) };
+            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuStreamEndCapture: {status:?}"
+                )));
+            }
+            if raw.is_null() {
+                return Err(DeviceError::Driver(
+                    "cuStreamEndCapture returned a null graph — the capture was invalidated \
+                     (something on this thread asked the device a question while it was open)"
+                        .to_string(),
+                ));
+            }
+            Ok(Graph {
+                raw,
+                device: ctx.inner().device().clone(),
+                slots: self.take_captured_slots(),
+            })
         }
-        if raw.is_null() {
-            return Err(DeviceError::Driver(
-                "cuStreamEndCapture returned a null graph — the capture was invalidated \
-                 (something on this thread asked the device a question while it was open)"
-                    .to_string(),
-            ));
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Never an empty graph: one would replay successfully and run nothing.
+            let _ = ctx;
+            Err(DeviceError::NoDriver)
         }
-        Ok(Graph {
-            raw,
-            device: ctx.inner().device().clone(),
-            slots: self.take_captured_slots(),
-        })
     }
 
     /// The node the most recent captured operation added, if this stream is
@@ -467,123 +549,68 @@ impl Stream {
     /// last one recorded — and anything else means the capture has a shape
     /// this cannot attribute, which is reported rather than guessed at.
     pub fn capturing_node(&self) -> Result<Option<GraphNode>> {
-        self.bind_device()?;
-        let mut status_out = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        let mut id: cudarc::driver::sys::cuuint64_t = 0;
-        let mut graph: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
-        let mut deps: *const cudarc::driver::sys::CUgraphNode = std::ptr::null();
-        let mut num_deps: usize = 0;
-        // SAFETY: five valid out-pointers; the driver writes them and
-        // `deps` borrows storage the driver owns for the duration of the
-        // capture, which is why the nodes are copied out immediately below.
-        let rc = unsafe {
-            cudarc::driver::sys::lib().cuStreamGetCaptureInfo_v2(
-                self.raw(),
-                &mut status_out,
-                &mut id,
-                &mut graph,
-                &mut deps,
-                &mut num_deps,
-            )
-        };
-        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(DeviceError::Driver(format!(
-                "cuStreamGetCaptureInfo_v2: {rc:?}"
-            )));
-        }
-        if status_out != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        #[cfg(feature = "cuda")]
         {
-            return Ok(None);
-        }
-        match num_deps {
-            0 => Ok(None),
-            1 => {
-                // SAFETY: the driver reported exactly one dependency and
-                // `deps` points at storage valid for this call.
-                Ok(Some(GraphNode(unsafe { *deps })))
+            self.bind_device()?;
+            let mut status_out = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+            let mut id: cudarc::driver::sys::cuuint64_t = 0;
+            let mut graph: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
+            let mut deps: *const cudarc::driver::sys::CUgraphNode = std::ptr::null();
+            let mut num_deps: usize = 0;
+            // SAFETY: five valid out-pointers; the driver writes them and
+            // `deps` borrows storage the driver owns for the duration of the
+            // capture, which is why the nodes are copied out immediately below.
+            let rc = unsafe {
+                cudarc::driver::sys::lib().cuStreamGetCaptureInfo_v2(
+                    self.raw(),
+                    &mut status_out,
+                    &mut id,
+                    &mut graph,
+                    &mut deps,
+                    &mut num_deps,
+                )
+            };
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                return Err(DeviceError::Driver(format!(
+                    "cuStreamGetCaptureInfo_v2: {rc:?}"
+                )));
             }
-            n => Err(DeviceError::Driver(format!(
-                "cuStreamGetCaptureInfo_v2 reported {n} current dependencies; this attributes \
-                 a captured launch to a node only for a linear single-stream capture, where \
-                 there is exactly one"
-            ))),
+            if status_out != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+            {
+                return Ok(None);
+            }
+            match num_deps {
+                0 => Ok(None),
+                1 => {
+                    // SAFETY: the driver reported exactly one dependency and
+                    // `deps` points at storage valid for this call.
+                    Ok(Some(GraphNode(unsafe { *deps })))
+                }
+                n => Err(DeviceError::Driver(format!(
+                    "cuStreamGetCaptureInfo_v2 reported {n} current dependencies; this attributes \
+                     a captured launch to a node only for a linear single-stream capture, where \
+                     there is exactly one"
+                ))),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            // A stream that cannot capture is never capturing. This one ANSWERS
+            // rather than failing: the question has a true answer without a
+            // driver, and callers use it to choose a path, not to do work.
+            Ok(None)
         }
     }
 
     /// `bind_to_thread` on this stream's device — the prelude every raw
     /// handle use in this crate shares.
+    ///
+    /// Cuda-only, unlike everything above it: there is no raw handle to
+    /// bind without a driver, and no driverless arm calls it.
+    #[cfg(feature = "cuda")]
     fn bind_device(&self) -> Result<()> {
         self.device_arc()
             .bind_to_thread()
             .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stub backend
-// ---------------------------------------------------------------------------
-//
-// The crate builds without a driver so that everything above it -- the VM's
-// offload path, its natives, its tests -- compiles and runs on a machine
-// with no GPU. The types above exist there with the same shape and no
-// fields; every entry point reports that there is no driver. There is
-// deliberately no "succeeds and does nothing" variant: a capture that
-// silently produced an empty graph would replay successfully and run no
-// kernels, which is the one failure this whole mechanism must never have.
-
-#[cfg(not(feature = "cuda"))]
-impl Graph {
-    /// Always [`DeviceError::NoDriver`]: nothing was captured.
-    pub fn instantiate(&self) -> Result<GraphExec> {
-        Err(DeviceError::NoDriver)
-    }
-
-    /// Always [`DeviceError::NoDriver`]: there is no graph to count.
-    pub fn node_count(&self) -> Result<usize> {
-        Err(DeviceError::NoDriver)
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-impl GraphExec {
-    /// Always [`DeviceError::NoDriver`]: there is nothing to launch.
-    pub fn launch(
-        &self,
-        _ctx: &DeviceContext,
-        _stream: &Stream,
-    ) -> Result<std::sync::Arc<Event>> {
-        Err(DeviceError::NoDriver)
-    }
-
-    /// Always zero: nothing was captured, so nothing is tracked.
-    pub fn tracked_buffer_count(&self) -> usize {
-        0
-    }
-
-    /// Always [`DeviceError::NoDriver`]: there is no node to update.
-    pub fn set_kernel_node_args(&self, _node: GraphNode, _args: &KernelArgs) -> Result<()> {
-        Err(DeviceError::NoDriver)
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-impl Stream {
-    /// Always [`DeviceError::NoDriver`]: capture needs a driver.
-    pub fn begin_capture(&self, _mode: CaptureMode) -> Result<()> {
-        Err(DeviceError::NoDriver)
-    }
-
-    /// Always [`DeviceError::NoDriver`], never an empty graph.
-    pub fn end_capture(&self, _ctx: &DeviceContext) -> Result<Graph> {
-        Err(DeviceError::NoDriver)
-    }
-
-    /// Always `Ok(None)`: a stream that cannot capture is never capturing.
-    ///
-    /// This one answers rather than failing because the question it answers
-    /// -- "am I in the middle of a capture?" -- has a true answer without a
-    /// driver, and callers use it to choose a path rather than to do work.
-    pub fn capturing_node(&self) -> Result<Option<GraphNode>> {
-        Ok(None)
     }
 }
