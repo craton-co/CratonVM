@@ -1237,9 +1237,11 @@ exception thrown.
 The `sun/misc/Unsafe` arm now backfills all nineteen — 16 for every
 `ARRAY_*_BASE_OFFSET`, the per-type `INDEX_SCALE`s, and `ADDRESS_SIZE = 8`
 (`size_of::<usize>()`, matching `native_unsafe_address_size` and the
-`ADDRESS_SIZE0` backfill already in that file). `set_static_by_name` writes
-only a field still holding 0, so a correctly-initialised future implementation
-stays authoritative.
+`ADDRESS_SIZE0` backfill already in that file). The repair writes only a field still
+holding 0, so a correctly-initialised future implementation stays
+authoritative -- see §18.2, which is where that became true: it was NOT true
+as originally written, and this sentence was a false claim about
+`set_static_by_name` until `set_static_if_zero` was added.
 
 After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
 and bci 166 now match.
@@ -1258,3 +1260,90 @@ store, consistently — so the latch still latches, `H2 TestFullText` and
 `TestRecovery` both pass (`rc=0`), and the only observable effect is on when
 that deprecation warning prints. This is the same reason §12 and §15 give for
 NOT refusing the fallback: 513+ rescued calls in a vector that passes.
+
+## 18. Accepting the fix — and a claim of mine that was false
+
+### 18.1 "Non-zero" is not "correct"
+
+`ClinitProbe` only asked *is it zero*. That was enough to FIND the defect and
+is not enough to ACCEPT the repair: **a backfill writing the wrong constant is
+also non-zero**, and would read as repaired.
+
+Diffing the values across VMs cannot serve as the oracle either — the right
+answers legitimately differ. CratonVM uses a uniform 16-byte header and no
+compressed oops, so `ARRAY_OBJECT_INDEX_SCALE` is 8 here and 4 on a
+compressed-oops HotSpot; a value diff would flag a correct answer as a defect.
+
+`UnsafeConstAgree.java` uses a **VM-independent invariant** instead. By the
+JDK's own construction the legacy spelling's `<clinit>` copies the internal
+constant, which the native computes, so all three are one number:
+
+```text
+sun.misc.Unsafe.ARRAY_<T>_BASE_OFFSET
+  == jdk.internal.misc.Unsafe.ARRAY_<T>_BASE_OFFSET
+  == theUnsafe.arrayBaseOffset(<T>[].class)
+```
+
+**0 disagreements on both VMs**, across all 9 types × {base, scale} plus
+`ADDRESS_SIZE` — and the access that was silently short by 16, a `byte[]` read
+through `ARRAY_BYTE_BASE_OFFSET + 2 * ARRAY_BYTE_INDEX_SCALE`, returns the byte
+actually stored there.
+
+**A probe artefact that read as a defect, recorded because it nearly became
+one.** The first version read the internal constants with `setAccessible`.
+That threw `InaccessibleObjectException` on CratonVM and succeeded on HotSpot —
+but only because the HotSpot command line carried `--add-opens` and the
+CratonVM one did not. It printed as a sentinel, which looks exactly like a
+missing field, which would have been a definition-of-done finding.
+`InternalFieldProbe.java` separated the two by reporting the *throwable class*
+rather than a value: `declared-but-InaccessibleObjectException`, so the fields
+exist and the class is the real one. (CratonVM does accept `--add-opens` and
+`--add-exports`; referencing the constants directly removes the artefact
+entirely.)
+
+### 18.2 The repair's own count was not a measurement. Now it is.
+
+**§17.1 said `set_static_by_name` "writes only a field still holding 0". That
+is false** — it writes unconditionally, returning true when it locates the
+field and the value fits the descriptor. Two consequences, both mine:
+
+* the arm's `19/19` meant *"nineteen fields found and written"*, not
+  *"nineteen were broken"* — so it was not evidence for what it was being cited
+  as evidence for;
+* the arm would overwrite a correct value if the underlying ordering were ever
+  fixed, which is the opposite of what I claimed.
+
+`set_static_if_zero` makes the claim true rather than retracting it: it reads
+the slot first and writes only a zero. The count is now a measurement —
+**`19/19` means all nineteen really were zero**, and a future `0/19` means the
+ordering has been fixed upstream and this arm is dead weight that can be
+deleted.
+
+Applied to **this lane's arm only**. The sibling `jdk/internal/misc/Unsafe`
+arm is another lane's, has its own history, and changing *when* it writes is a
+behaviour change I have no measurement for.
+
+### 18.3 The family, sized
+
+The fixup arms' own log lines from a single run:
+
+| arm | count | is the count a measurement? |
+| --- | --- | --- |
+| `jdk/internal/misc/Unsafe` ARRAY_* | 18/18 | no — unconditional, "found" |
+| `jdk/internal/misc/UnsafeConstants` | 5/5 | no — unconditional, "found" |
+| `sun/misc/Unsafe` ARRAY_*/ADDRESS_SIZE | **19/19** | **yes** — conditional |
+
+Nineteen zeroed constants are measured; the other twenty-three are *repaired*
+but their counts do not establish that they were broken. `ClinitProbe`
+independently measured two of the nineteen (bci 157, bci 166) against HotSpot
+before the fix, which is what turned the inference into a finding in the first
+place.
+
+### 18.4 An empty instrument that is NOT an absence proof
+
+`--dump-missing-natives` and `--dump-missing-natives-grouped` both come back
+empty on a run that demonstrably suffers the defect. That is **not** evidence
+that no natives were missing: nothing here shows those dumps can fire, and the
+latching happens during early boot, before the point a workload-level dump
+describes. Recorded as un-adjudicated rather than counted as a clean result —
+a zero from an instrument with no positive control is not a zero.
