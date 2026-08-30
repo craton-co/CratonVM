@@ -2285,11 +2285,13 @@ const ADVERTISED_KEYSTORE_CLASSES: &[&str] = &[
     "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
     "sun/security/provider/DomainKeyStore$DKS",
     "sun/security/pkcs12/PKCS12KeyStore",
-    // SunJCE's `KeyStore.JCEKS`. The row in `provider_chain` and this one are
-    // joined only by a string, which is what
+    // SunJCE's `KeyStore.JCEKS`. The row in `provider_chain`, this one and the
+    // `register_engine_surface` call are joined only by a string, which is what
     // `advertised_keystore_registration_tests` below exists to check -- see its
-    // doc comment for the 754-to-563 regression that gap once caused.
-    "com/sun/crypto/provider/JceKeyStore",
+    // doc comment for the 754-to-563 regression that gap once caused, and note
+    // that it caught this entry on the day it was added, with the engine
+    // surface missing.
+    JCEKS_FQN,
 ];
 
 #[cfg(test)]
@@ -2361,6 +2363,10 @@ const PKCS12_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore";
 const JKS_FQN: &str = "sun/security/provider/JavaKeyStore";
 const JKS_INNER_JKS_FQN: &str = "sun/security/provider/JavaKeyStore$JKS";
 const JKS_INNER_DUAL_FQN: &str = "sun/security/provider/JavaKeyStore$DualFormatJKS";
+/// SunJCE's `KeyStore.JCEKS`. Its on-disk format is JKS's under a different
+/// magic (`JCEKS_MAGIC`), so it shares the whole engine surface; what it does
+/// NOT share is the magic `engine_store` writes, which is keyed on this name.
+const JCEKS_FQN: &str = "com/sun/crypto/provider/JceKeyStore";
 /// `KeyStore.getInstance("PKCS12")` — the DEFAULT, and the one netty, Tomcat
 /// and every `SslContextBuilder` reach for.
 ///
@@ -2406,6 +2412,7 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     register_engine_surface(r, PKCS12_INNER_DUAL_FQN);
     register_engine_surface(r, JKS_INNER_CASE_EXACT_FQN);
     register_engine_surface(r, DKS_FQN);
+    register_engine_surface(r, JCEKS_FQN);
 
     // The `java.security.KeyStore` shim's `load`/`getKey`/`getCertificate`
     // engine surface is registered by `phases_early.rs` — we don't override

@@ -4986,6 +4986,36 @@ fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
         };
         Ok(Some(Value::Int(i32::from(same_address && same_base))))
     });
+    // `hashCode` OVER THE SAME PAIR `equals` USES. Registering one without the
+    // other is the classic split: `s.asSlice(0, s.byteSize()).equals(s)` is
+    // true and the two hashed differently, so a `HashSet<MemorySegment>` held
+    // the same place twice and a de-duplicating caller never saw it.
+    //
+    // The answer was already recorded in `equals`'s own comment above --
+    // `s.asSlice(0, 16).hashCode() == s.hashCode()` is `true` on HotSpot --
+    // three lines from the registration that was never written. Without this,
+    // real `AbstractMemorySegmentImpl.hashCode` runs and reads
+    // `length`/`readOnly`/`scope`, which this carrier does not have.
+    //
+    // The VALUE is not compared against HotSpot's and must not be: the JDK
+    // hashes `unsafeGetBase()` and `unsafeGetOffset()`, and an identity hash of
+    // a base array is not reproducible across VMs. What IS comparable, and what
+    // the contract requires, is that equal segments hash equal -- MEASURED by
+    // `apps/probes/FfmMsgProbe.java`.
+    r.register(ms, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let address = crate::panama_libffi::segment_address(&*ctx, this);
+        let base = p67_segment_heap_base_slot(ctx, this)
+            .map(|b| ctx.identity_hash_code(b))
+            .unwrap_or(0);
+        // `Objects.hash(base, offset)`'s shape: the JDK's own combiner, so two
+        // segments differing in either half are unlikely to collide.
+        let h = 31i32
+            .wrapping_mul(31i32.wrapping_add(base))
+            .wrapping_add(address as i32)
+            ^ ((address >> 32) as i32);
+        Ok(Some(Value::Int(h)))
+    });
     r.register(
         ms,
         "scope",

@@ -100,7 +100,72 @@ here so the next reader knows the argument already covers them.
 
 ---
 
-## 3. What is NOT decided here
+## 3. Applied, and measured
+
+`apps/probes/FfmCarrierProbe.java`, 104 rows, asks the one thing that IS
+comparable and never the class name:
+
+```text
+                              before          after
+FfmCarrierProbe  --jdk-only   10 rows         0
+FfmCarrierProbe  compatible    1 row          0
+```
+
+The nine were every `MemorySegment` door stamped with the interface; the tenth
+was `Arena.global()` returning a new arena per call, in both modes.
+
+### The residual, stated in the same terms
+
+`apps/probes/FfmSegmentSweep.java` still differs in **25 rows in both modes**,
+and they are two different things:
+
+* **23 of them are class and superclass NAMES** — `cratonvm.internal.foreign
+  .MemorySegmentImpl` against `jdk.internal.foreign.NativeMemorySegmentImpl`,
+  and `java.lang.Object` against `AbstractMemorySegmentImpl`. **This decision
+  says those are not comparable**: the concrete implementation of a JDK
+  interface is not part of its contract and no conforming program may depend on
+  it. They are the price of the answer, not a defect left behind — and naming
+  them here is what stops the next reader from "fixing" them by mimicking the
+  JDK's names, which is exactly the compatibility-stand-in shape this decision
+  rejects.
+
+  The honest wrinkle: `getClass().getSuperclass()` says `java.lang.Object`
+  while `instanceof AbstractMemorySegmentImpl` says true, because the
+  relationship lives in `synthetic_implements` rather than in the hierarchy.
+  Both answers are individually defensible and together they are inconsistent.
+  Nothing measured depends on it — `isInstance`, `instanceof`,
+  `isAssignableFrom` and every JDK `checkcast` are satisfied — but a program
+  that walks `getSuperclass()` to decide what it is holding would be misled.
+
+* **2 of them are the SAME defect this page decided, in a family the fix did not
+  reach**: `ValueLayout.JAVA_INT` and a struct layout still answer
+  `getClass().isInterface() == true`. The layout carriers are allocated with the
+  interface's own name (`java/lang/foreign/ValueLayout` and the ten
+  `ValueLayout$Of*` interfaces), the same shape `MemorySegment` had.
+
+### What the layout half needs
+
+It is a bigger change than the segment half, which is why it is recorded rather
+than started:
+
+1. a `cratonvm/internal/foreign/LayoutImpl` carrier minted through
+   `ensure_vm_internal_class`, as the segment carrier now is;
+2. `synthetic_implements` entries for `MemoryLayout`, `ValueLayout` and the ten
+   `ValueLayout$Of*` interfaces, so every `checkcast` the JDK emits is admitted;
+3. **the instance methods re-registered on the carrier class.** This is the part
+   that makes it work or not: native lookup is by RECEIVER CLASS NAME and drops
+   interface-declared instance natives, which is precisely why
+   `cratonvm/internal/SystemLogger` needed
+   `register_system_logger_methods(registry, CRATON_SYSTEM_LOGGER_CLASS)` beside
+   the interface registration. `byteSize`, `order`, `withName`, `varHandle` and
+   the rest are all registered on the interfaces today.
+
+The check is the two `isInterface` rows going false and `FfmSegmentSweep`'s
+other 23 staying exactly as they are.
+
+---
+
+## 4. What is NOT decided here
 
 * **Whether the DoD screen should flag anything else.** If the answer had been
   "stand-in", the question's page says the compatible carrier should have been
