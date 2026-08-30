@@ -2115,6 +2115,40 @@ pub struct G1Collector {
     /// Old-region frees, no humongous reclaim) — the Generational marker's
     /// "mark all old-gen for this cycle" fail-safe, region-flavored.
     mark_saw_implausible: AtomicBool,
+    /// Gray-set entries refused as [`GrayRefusal::NotAllocated`] -- addresses
+    /// that were never a live object in their region's current incarnation.
+    ///
+    /// These no longer drive `cleanup`'s retain-everything fail-safe, so they
+    /// need their own counter: a fail-safe that stops firing must not become a
+    /// fail-safe nobody can see. Reported on the `[GC] g1 cycle` line.
+    mark_oob_gray_skips: AtomicUsize,
+    /// Throttle counter for [`G1Collector::mark_oob_report_budget`].
+    mark_oob_report_count: AtomicUsize,
+    /// `CRATONVM_G1_DBG_GRAY_PROV=1` — for each address currently on the gray
+    /// set, WHERE it was pushed from and (for a child push) the parent object
+    /// whose field named it.
+    ///
+    /// The G1MARK-8 implausible-header gate reports the address it refused and
+    /// the region that contains it, which is enough to know the closure was
+    /// abandoned and not enough to know why. The three candidate sources want
+    /// three different repairs: a stale gray that an evacuation should have
+    /// remapped or dropped, a SATB entry logged against memory that has since
+    /// been recycled, or a field of a live object that does not hold an object
+    /// address at all. Only the pusher can tell them apart, so it records it.
+    ///
+    /// Diagnostic only, and empty unless the flag is set.
+    gray_prov: Mutex<std::collections::HashMap<usize, (&'static str, usize)>>,
+    /// Distinct `(holder, target)` pairs the V7b post-evacuation verifier has
+    /// already reported.
+    ///
+    /// The verifier walks every surviving region linearly on a rotating
+    /// budget, so a single unrepaired slot is re-reported on every pause that
+    /// reaches its region. On `TestKillProcessWhileWriting` that turned SIX
+    /// distinct holders into 48 617 log lines, and the page that recorded them
+    /// read the line count as a corruption RATE. One line per distinct pair,
+    /// with the raw total carried on the line, keeps both numbers readable and
+    /// separable.
+    v7b_reported: Mutex<std::collections::HashSet<(usize, usize)>>,
 
     /// INT-8 — referent-slot hiding. Addresses of every Weak/Soft/Phantom
     /// `Reference` OBJECT registered with the VM's `ReferenceProcessor` at
@@ -2524,6 +2558,10 @@ impl G1Collector {
             mark_worklist: Mutex::new(Vec::new()),
             mark_worklist_overflowed: AtomicBool::new(false),
             mark_saw_implausible: AtomicBool::new(false),
+            mark_oob_gray_skips: AtomicUsize::new(0),
+            mark_oob_report_count: AtomicUsize::new(0),
+            gray_prov: Mutex::new(std::collections::HashMap::new()),
+            v7b_reported: Mutex::new(std::collections::HashSet::new()),
             reference_skip: Mutex::new(FxHashSet::default()),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
@@ -6857,7 +6895,12 @@ impl G1Collector {
                             let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                             if is_dangling(raw as usize) {
                                 dangling_found += 1;
-                                self.report_dangling_cset_ref(i, obj_ptr as usize, raw as usize);
+                                self.report_dangling_cset_ref(
+                                    i,
+                                    obj_ptr as usize,
+                                    raw as usize,
+                                    regions[i].mark_bitmap.is_marked(obj_ptr as usize),
+                                );
                             }
                         }
                     }
@@ -6870,7 +6913,12 @@ impl G1Collector {
                         |_, raw, _| {
                             if is_dangling(raw) {
                                 found += 1;
-                                self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
+                                self.report_dangling_cset_ref(
+                                    i,
+                                    obj_ptr as usize,
+                                    raw,
+                                    regions[i].mark_bitmap.is_marked(obj_ptr as usize),
+                                );
                             }
                         },
                     );
@@ -6912,18 +6960,53 @@ impl G1Collector {
     /// is observable without crashing a production VM.
     #[cold]
     #[inline(never)]
-    fn report_dangling_cset_ref(&self, holder_region: usize, holder_obj: usize, target: usize) {
+    fn report_dangling_cset_ref(
+        &self,
+        holder_region: usize,
+        holder_obj: usize,
+        target: usize,
+        marked: bool,
+    ) {
+        // ONE LINE PER DISTINCT PAIR. Everything past the first is a repeat:
+        // the rotating budget re-walks a surviving region every few pauses and
+        // an unrepaired slot is still unrepaired, so the raw line count
+        // measures how often the sampler visited that region, not how much of
+        // the heap is damaged. Read as a rate it is badly misleading -- the
+        // 48 617 lines on `TestKillProcessWhileWriting` are SIX holders -- so
+        // the running total is carried on the line instead of being implied by
+        // it.
+        static TOTAL: AtomicUsize = AtomicUsize::new(0);
+        let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.v7b_reported.lock().insert((holder_obj, target)) {
+            return;
+        }
+        // WHETHER THE HOLDER IS REACHABLE is the whole question, and this
+        // verifier cannot answer it: it walks a surviving region LINEARLY, so
+        // it inspects dead objects too, and a dead object pointing at a dead
+        // CSet object that was correctly not evacuated is not a UAF at all --
+        // it is ordinary floating garbage. The mark bit is the closest thing
+        // to an answer available here (meaningful only while a mark cycle has
+        // marks), so it is reported rather than assumed, and `distinct` /
+        // `total` say how much of the log is one slot.
+        let distinct = self.v7b_reported.lock().len();
         eprintln!(
-            "[g1][SECURITY V7b] post-evacuation dangling reference: object {:#x} in \
-             surviving region {} still points at {:#x}, which lies in a freed CSet \
-             region with no forwarding entry (incomplete remembered set => UAF)",
-            holder_obj, holder_region, target
+            concat!(
+                "[g1][SECURITY V7b] post-evacuation dangling reference: object {:#x} ",
+                "in surviving region {} still points at {:#x}, which lies in a freed ",
+                "CSet region with no forwarding entry (incomplete remembered set => ",
+                "UAF). holder_marked={} marking_active={} distinct={} total={}"
+            ),
+            holder_obj,
+            holder_region,
+            target,
+            marked,
+            self.gc_state.is_marking_active(),
+            distinct,
+            total,
         );
         debug_assert!(
             false,
-            "G1 post-evacuation dangling reference into freed CSet region (V7b): \
-             holder_obj={:#x} holder_region={} target={:#x}",
-            holder_obj, holder_region, target
+            "G1 post-evacuation dangling reference into freed CSet region (V7b)"
         );
     }
 
@@ -7556,6 +7639,7 @@ impl G1Collector {
                 // worklist push is not needed and cannot be capped away.
                 keepalive.push(addr);
             } else if worklist.len() < MARK_WORKLIST_CAP {
+                self.note_gray(addr, "satb-keepalive", 0);
                 worklist.push(addr);
             } else {
                 // Seed-class entry at cap. A plain drop is NOT recoverable:
@@ -7581,9 +7665,45 @@ impl G1Collector {
     /// black-without-scan and set the overflow flag so the conservative
     /// rescan in `concurrent_mark_step` scans its fields instead. `new_addr`
     /// is a to-space (non-CSet) address, so the mark bit survives the pause.
+    /// `CRATONVM_G1_DBG_GRAY_PROV` — see [`G1Collector::gray_prov`].
+    fn gray_prov_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_G1_DBG_GRAY_PROV").is_some()
+        })
+    }
+
+    /// Record that `addr` was grayed by `tag` (naming `parent`, or `0` when the
+    /// push has no parent object). No-op unless the flag is on.
+    fn note_gray(&self, addr: usize, tag: &'static str, parent: usize) {
+        if !Self::gray_prov_enabled() {
+            return;
+        }
+        self.gray_prov.lock().insert(addr, (tag, parent));
+    }
+
+    /// Throttle for the gray-refusal report: the first 8, then powers of two.
+    ///
+    /// `NotAllocated` refusals are routine and arrive in the thousands per run;
+    /// an unthrottled `warn!` per entry is itself a several-megabyte log and
+    /// slows the marker enough to change the workload.
+    fn mark_oob_report_budget(&self) -> bool {
+        let n = self.mark_oob_report_count.fetch_add(1, Ordering::Relaxed);
+        n < 8 || n.is_power_of_two()
+    }
+
+    /// The recorded provenance of `addr`, for the implausible-header report.
+    fn gray_prov_of(&self, addr: usize) -> Option<(&'static str, usize)> {
+        if !Self::gray_prov_enabled() {
+            return None;
+        }
+        self.gray_prov.lock().get(&addr).copied()
+    }
+
     fn push_gray_or_mark(&self, regions: &[G1Region], new_addr: usize) {
         let mut worklist = self.mark_worklist.lock();
         if worklist.len() < MARK_WORKLIST_CAP {
+            self.note_gray(new_addr, "push-gray-or-mark", 0);
             worklist.push(new_addr);
         } else if let Some(idx) = self.lookup_region_for_addr(new_addr) {
             regions[idx].mark_bitmap.try_mark(new_addr);
@@ -8003,12 +8123,86 @@ impl G1Collector {
             // consistency instead). Skipping the scan can under-mark if the
             // header was genuinely torn, so the flag makes `cleanup` retain
             // everything this cycle.
-            if !plausible_mark_scan_target(&regions[region_idx], obj_addr) {
-                self.mark_saw_implausible.store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    "g1 concurrent mark: skipping gray entry {obj_addr:#x} (region {region_idx}) \
-                     with implausible header — cleanup will retain all regions this cycle"
-                );
+            if let Err(refusal) = classify_mark_scan_target(&regions[region_idx], obj_addr) {
+                // ONLY a torn header impugns the closure. `NotAllocated` says
+                // the address was never a live object in this region's current
+                // incarnation, so declining to scan it loses nothing -- and it
+                // is the COMMON case, because freed regions are not scrubbed
+                // and SATB deliberately retains objects that died mid-cycle.
+                // Driving `cleanup`'s retain-everything fail-safe from it made
+                // every reclamation decision in the cycle unavailable, which on
+                // `TestKillProcessWhileWriting` is the whole OOM: eager
+                // humongous reclaim declines every pause, collection sets go
+                // empty, and a 1 MiB `ByteBuffer.allocate` cannot be served on
+                // a 1 GiB heap that is mostly garbage.
+                let impugns = refusal == GrayRefusal::TornHeader || mark_oob_failsafe();
+                if impugns {
+                    self.mark_saw_implausible.store(true, Ordering::Relaxed);
+                } else {
+                    // Counted, not silent: a fail-safe that stops firing must
+                    // not become a fail-safe nobody can see.
+                    self.mark_oob_gray_skips.fetch_add(1, Ordering::Relaxed);
+                }
+                // The refusal alone cannot be acted on: it says WHICH of the
+                // two, not why the address exists. The region's own state
+                // separates a stale pointer into a recycled region (`cursor`
+                // far below `off`, `reuse_epoch` bumped) from a genuinely
+                // damaged one, and `CRATONVM_G1_DBG_GRAY_PROV=1` names the
+                // pusher and the parent object whose slot held it.
+                let r = &regions[region_idx];
+                let base = r.data.as_ptr() as usize;
+                let off = obj_addr.wrapping_sub(base);
+                let mut words = String::new();
+                for k in 0..4usize {
+                    let a = obj_addr.wrapping_add(k * 8);
+                    if a.wrapping_sub(base).wrapping_add(8) <= r.data.len() {
+                        // SAFETY: the span was just bounded inside this region's
+                        // own data buffer, which the regions lock holds alive;
+                        // the read is 8-aligned because an unaligned `obj_addr`
+                        // was refused above.
+                        let v = unsafe { (a as *const usize).read() };
+                        words.push_str(&format!(" [{}]=0x{v:x}", k * 8));
+                    }
+                }
+                // WHETHER THE PARENT IS REACHABLE decides what this is. A
+                // marked parent holding a stale reference is an incomplete
+                // remembered set (a real UAF). An UNMARKED parent is an object
+                // SATB retained after it died, whose referent died with it --
+                // routine, and not a defect at all.
+                let prov = self.gray_prov_of(obj_addr).map(|(tag, parent)| {
+                    let pstate = self
+                        .lookup_region_for_addr(parent)
+                        .map(|pi| {
+                            format!(
+                                "r{pi}/{:?}/marked={}",
+                                regions[pi].region_type,
+                                regions[pi].mark_bitmap.is_marked(parent)
+                            )
+                        })
+                        .unwrap_or_else(|| "r?".to_string());
+                    format!("{tag}<-0x{parent:x}[{pstate}]")
+                });
+                if self.mark_oob_report_budget() {
+                    tracing::warn!(
+                        concat!(
+                            "g1 concurrent mark: skipping gray entry {:#x} (region {}) ",
+                            "refusal={:?} impugns_cycle={} [type={:?} cursor={} off={} ",
+                            "len={} reuse_epoch={} recycled_in={} prov={:?} words:{}]"
+                        ),
+                        obj_addr,
+                        region_idx,
+                        refusal,
+                        impugns,
+                        r.region_type,
+                        r.cursor,
+                        off,
+                        r.data.len(),
+                        r.reuse_epoch,
+                        r.recycled_in_generation,
+                        prov,
+                        words,
+                    );
+                }
                 continue;
             }
 
@@ -8197,6 +8391,11 @@ impl G1Collector {
                             if worklist.len() >= MARK_WORKLIST_CAP {
                                 self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                             } else {
+                                self.note_gray(
+                                    ref_ptr as usize,
+                                    "scan-child-refarray",
+                                    obj_ptr as usize,
+                                );
                                 worklist.push(ref_ptr as usize);
                             }
                         }
@@ -8250,6 +8449,11 @@ impl G1Collector {
                                         self.mark_worklist_overflowed
                                             .store(true, Ordering::Relaxed);
                                     } else {
+                                        self.note_gray(
+                                            ref_ptr as usize,
+                                            "scan-child-compact",
+                                            obj_ptr as usize,
+                                        );
                                         worklist.push(ref_ptr as usize);
                                     }
                                 }
@@ -8298,6 +8502,11 @@ impl G1Collector {
                                 if worklist.len() >= MARK_WORKLIST_CAP {
                                     self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                                 } else {
+                                    self.note_gray(
+                                        ref_ptr as usize,
+                                        "scan-child-legacy",
+                                        obj_ptr as usize,
+                                    );
                                     worklist.push(ref_ptr as usize);
                                 }
                             }
@@ -8324,6 +8533,7 @@ impl G1Collector {
                     if worklist.len() >= MARK_WORKLIST_CAP {
                         self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                     } else {
+                        self.note_gray(addr, "scan-child-sidetable", obj_ptr as usize);
                         worklist.push(addr);
                     }
                 }
@@ -8433,6 +8643,7 @@ impl G1Collector {
                 overflow_flag.store(true, Ordering::Relaxed);
                 return;
             }
+            self.note_gray(addr, "remark-seed", 0);
             worklist.push(addr);
         };
 
@@ -8535,6 +8746,18 @@ impl G1Collector {
         // no humongous reclaim); the next cycle re-derives liveness from
         // scratch. Swap-and-clear: the flag is per-cycle.
         let saw_implausible = self.mark_saw_implausible.swap(false, Ordering::Relaxed);
+        // The routine half of the old gate, reported so its absence from the
+        // fail-safe is visible rather than assumed. A large count here with
+        // `saw_implausible` false is the expected steady state, not a warning:
+        // unscrubbed recycled regions plus SATB retention make stale gray
+        // addresses ordinary.
+        let oob_skips = self.mark_oob_gray_skips.swap(0, Ordering::Relaxed);
+        if oob_skips > 0 {
+            tracing::debug!(
+                "g1 cleanup: {} gray entries skipped as never-allocated (not a torn header;                  reclamation decisions retained)",
+                oob_skips
+            );
+        }
         if saw_implausible {
             tracing::warn!(
                 "g1 cleanup: implausible gray entry seen during marking — \
@@ -12708,9 +12931,75 @@ impl Drop for SatbPreSuppressGuard {
 /// the containment check; false negatives (a real object rejected, e.g. a
 /// torn header) under-mark, which is why the caller sets
 /// `mark_saw_implausible` and `cleanup` retains everything for the cycle.
+/// Why a gray-set entry cannot be scanned -- and, crucially, whether that
+/// says anything about the CYCLE.
+///
+/// The G1MARK-8 gate answered one bit, and the fail-safe it drives (retain
+/// every region, no in-place frees, no humongous reclaim) is the most
+/// expensive response this collector has. Two very different conditions were
+/// reaching it:
+///
+///   * an address that is provably not a live object, and
+///   * an address inside allocated memory whose header does not decode.
+///
+/// Only the second is evidence that the mark closure might be incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrayRefusal {
+    /// **Not allocated.** The address is not the start of any object in this
+    /// region's CURRENT incarnation: it is unaligned, at or beyond the
+    /// allocation cursor, or in a region type that holds no object starts.
+    ///
+    /// Skipping it under-marks nothing, because nothing live is there --
+    /// `cursor` only grows within an incarnation (every allocation path bumps
+    /// it under the regions lock, and a TLAB carve bumps it for the whole
+    /// carve), so every live object satisfies `off + size <= cursor`. The
+    /// closure stays complete and the cycle keeps its verdicts.
+    ///
+    /// This is NOT a rare corruption. Freed regions are deliberately no longer
+    /// scrubbed (see `G1Region::reset`, G1AUD-10), so a recycled region still
+    /// holds its previous incarnation's bytes above the new cursor -- and SATB
+    /// retention means the marker legitimately scans objects that died during
+    /// the cycle and whose referents were freed with their region. Measured on
+    /// `org.h2.test.store.TestKillProcessWhileWriting`: 2 226 of 2 249 refusals
+    /// in one 32 s run were this, every one of them a live object's reference
+    /// slot (`CRATONVM_G1_DBG_GRAY_PROV=1` names the pusher) naming an address
+    /// above a Survivor region's cursor.
+    NotAllocated,
+    /// **Torn header.** The address IS inside the allocated prefix, so
+    /// something was placed there, and its header does not describe an object.
+    /// The scan it would have driven may have been the only path to a live
+    /// subtree, so the cycle's `live_bytes == 0` verdicts cannot be trusted.
+    /// This is what the fail-safe is for.
+    TornHeader,
+}
+
+/// `CRATONVM_G1_MARK_OOB_FAILSAFE=1` -- treat [`GrayRefusal::NotAllocated`]
+/// as a torn header again, i.e. restore the single-bit gate.
+///
+/// The one-binary A/B for the split. With it set, `TestKillProcessWhileWriting`
+/// goes back to retaining every region on essentially every cycle.
+fn mark_oob_failsafe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_MARK_OOB_FAILSAFE").is_some()
+    })
+}
+
 fn plausible_mark_scan_target(region: &G1Region, obj_addr: usize) -> bool {
+    classify_mark_scan_target(region, obj_addr).is_ok()
+}
+
+fn classify_mark_scan_target(region: &G1Region, obj_addr: usize) -> Result<(), GrayRefusal> {
     if obj_addr & 0x7 != 0 {
-        return false;
+        // Every object start is 8-aligned, so this address was never one.
+        return Err(GrayRefusal::NotAllocated);
+    }
+    // A humongous object begins at offset 0 of its `HumongousStart` region;
+    // its continuations carry `cursor = 0` and hold only payload. A reference
+    // names an object START, so a gray landing in a continuation is an
+    // interior or stale address and never a live object.
+    if region.region_type == RegionType::HumongousContinuation {
+        return Err(GrayRefusal::NotAllocated);
     }
     let base = region.data.as_ptr() as usize;
     let off = obj_addr.wrapping_sub(base);
@@ -12720,21 +13009,24 @@ fn plausible_mark_scan_target(region: &G1Region, obj_addr: usize) -> bool {
         .checked_add(HEADER_SIZE)
         .is_none_or(|end| end > region.cursor)
     {
-        return false;
+        return Err(GrayRefusal::NotAllocated);
     }
     // SAFETY: the header span was just confirmed inside this region's
     // allocated prefix; the validator reads it field-by-field unaligned.
     let Some(size) =
         crate::concurrent_mark::concurrent_mark_object_size(obj_addr as *const ObjectHeader)
     else {
-        return false;
+        // Inside the allocated prefix and undecodable: a real torn header.
+        return Err(GrayRefusal::TornHeader);
     };
     if region.region_type != RegionType::HumongousStart
         && off.checked_add(size).is_none_or(|end| end > region.cursor)
     {
-        return false;
+        // The header decodes but claims an extent running past everything this
+        // region has ever handed out. Also a torn header, not a stale address.
+        return Err(GrayRefusal::TornHeader);
     }
-    true
+    Ok(())
 }
 
 /// TLAB-retire GAP sentinel probe (see `Tlab::retire`, tlab.rs): a

@@ -406,6 +406,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fullstack-scan", on_key: Some("CRATONVM_DBG_FULLSTACK_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdwalk", on_key: Some("CRATONVM_DBG_FWDWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdguard", on_key: Some("CRATONVM_DBG_FWDGUARD"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1-dbg-gray-prov", on_key: Some("CRATONVM_G1_DBG_GRAY_PROV"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-mark-oob-failsafe", on_key: Some("CRATONVM_G1_MARK_OOB_FAILSAFE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-headers", on_key: Some("CRATONVM_G1_DBG_HEADERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-pins", on_key: Some("CRATONVM_G1_DBG_PINS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-reach", on_key: Some("CRATONVM_G1_DBG_REACH"), off_key: None, off_word: None },
@@ -1415,6 +1417,12 @@ pub const INVENTORY: &[E] = &[
     // `verify-ir` above. `zero_sp_id_slot_enabled` reads the key and treats
     // `0`/`false`/`FALSE` as off; only `"0"` is spellable as a group token, and
     // the other two spellings keep working through the key itself.
+    // `ir-gc-point-maps` is default ON and `CRATONVM_JIT_IR_GC_POINT_MAPS=0`
+    // restores the two IR GC-capable sites that recorded no safepoint (the
+    // cooperative poll and `Op::New`), so `off_word` is exactly `"0"` -- the
+    // same shape as `zero-spid` below.
+    E { group: Group::JIT, token: "direct-call-arg-maps", on_key: Some("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
