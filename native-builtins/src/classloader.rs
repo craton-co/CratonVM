@@ -3826,7 +3826,7 @@ pub(crate) fn cl_define_class_basic(
             tracing::error!(
                 "[define_class] panic while reading byte array for {name_str}; aborting"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str.clone(),
                 message: "defineClass: panic while reading bytecode array".into(),
             }
@@ -3838,7 +3838,7 @@ pub(crate) fn cl_define_class_basic(
     // never reach `define_class_full` (cheap CAFEBABE magic check).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!("[define_class] invalid magic for {name_str}; rejecting");
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str.clone(),
             message: "defineClass: not a valid class file (bad magic)".into(),
         }
@@ -3883,7 +3883,7 @@ pub(crate) fn cl_define_class_basic(
             tracing::error!(
                 "[define_class] panic inside define_class_full for {name_str}; aborting"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str.clone(),
                 message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
             }
@@ -4287,7 +4287,7 @@ pub(crate) fn define_class_via_full(
         Ok(r) => r,
         Err(_) => {
             tracing::error!("[define_class] panic inside define_class_full for {name}; aborting");
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
             }
@@ -4757,7 +4757,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "Unsafe.defineClass({name_str}): rejecting bytecode of length {length} \
              (max={UNSAFE_DEFINE_CLASS_MAX_BYTES})"
         );
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str,
             message: format!(
                 "Unsafe.defineClass: bytecode length {length} out of range (max {UNSAFE_DEFINE_CLASS_MAX_BYTES})"
@@ -4805,7 +4805,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 "Unsafe.defineClass({name_str}): panic while reading byte array; \
                  throwing ClassFormatError"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str,
                 message: "Unsafe.defineClass: failed to read bytecode array".into(),
             }
@@ -4820,7 +4820,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Malformed bytes → ClassFormatError (JVMS 5.3.5), not a silent null.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!("Unsafe.defineClass({name_str}): bad magic — throwing ClassFormatError");
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str,
             message: "Unsafe.defineClass: not a valid class file (bad magic)".into(),
         }
@@ -4871,7 +4871,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 "Unsafe.defineClass({name_str}): panic inside define_class_full; \
                  throwing ClassFormatError"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str,
                 message: "Unsafe.defineClass: panic inside backend (likely malformed bytecode)"
                     .into(),
@@ -9121,8 +9121,18 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
 
     // Validate magic + minimal length (8 bytes = magic + minor + major).
+    // BAD BYTES ARE A `ClassFormatError`, not an `IllegalArgumentException`.
+    // The `ClassLoader.defineClass` door three thousand lines above already
+    // raises `LinkageError::ClassFormatError` here; these `Lookup` doors were
+    // the two that did not, and a caller cannot catch what it is not thrown.
+    // `ClassFormatError` is an `Error`; `IllegalArgumentException` is a
+    // RuntimeException -- a bytecode generator that guards its emit with
+    // `catch (ClassFormatError)` (which is what you write, because that is what
+    // the JVM throws) sees nothing and lets a genuinely malformed class escape
+    // as an unrelated runtime failure somewhere else.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        return Err(RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
+            class_name: "<hidden>".to_string(),
             message: "Lookup.defineClass: not a valid class file (bad magic)".into(),
         }
         .into());
@@ -9348,8 +9358,10 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let byte_array = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         Some(Value::Object(None)) => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "defineHiddenClass: bytes must not be null".into(),
+            // A NULL array is an NPE, as `Objects.requireNonNull(bytes)` in the
+            // JDK's own body gives. Measured on jdk-25.0.3.9-hotspot.
+            return Err(RuntimeError::NullPointerException {
+                message: Some("defineHiddenClass: bytes must not be null".to_string()),
             }
             .into());
         }
@@ -9390,8 +9402,12 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
 
     // --- 2. Validate the class file magic + minimal header length. ---
+    // Same rule as `Lookup.defineClass` above: malformed bytes are a
+    // `ClassFormatError`, and an EMPTY array takes this path too (HotSpot
+    // measures as `ClassFormatError`, not as a null-argument complaint).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        return Err(RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
+            class_name: "<hidden>".to_string(),
             message: "defineHiddenClass: not a valid class file (bad magic)".into(),
         }
         .into());
@@ -10168,6 +10184,17 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/Class;",
         lk_ensure_initialized,
     );
+    // BOTH of these lose their slot. `lookup_define::register_lookup_define_class`
+    // re-registers the identical triples on the WP2.3-B implementations, and
+    // runs after this function from both registrars (`lib.rs` and
+    // `reflect_annotations.rs`), so `lk_define_class` / `lk_define_hidden_class`
+    // below are never dispatched — `--dump-native-registry` reports
+    // `owns_slot: true` on `lookup_define.rs:901` and `:909`.
+    //
+    // Kept, and kept in step with the winner, because that is cheaper than
+    // re-deriving them if the ordering is ever reversed. Do NOT fix a measured
+    // `Lookup.define*` defect here: a fix applied to this pair changes nothing
+    // observable. (It cost a full 34-minute rebuild to learn that once.)
     r.register(lk, "defineClass", "([B)Ljava/lang/Class;", lk_define_class);
     r.register(lk, "defineHiddenClass", "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_define_hidden_class);
     // findVirtual/findStatic/findConstructor/findGetter/findSetter/findSpecial/

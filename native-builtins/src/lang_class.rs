@@ -5564,6 +5564,34 @@ fn widen_primitive_value(value: Value, src_prim: &str, dst_prim: &str) -> Option
 /// untouched. `expected_cid` is passed so a same-`ClassId` argument (already
 /// accepted by `is_subclass` above) can never reach here and make the walk
 /// look load-bearing when it is not.
+/// Values whose interface set is acquired at RUNTIME and is invisible to any
+/// static walk of the loaded hierarchy.
+///
+/// A lambda / method-reference proxy is not in the hierarchy at all (its
+/// `ClassId` is `>= 0x8000_0000`); a `java.lang.reflect.Proxy` and an
+/// annotation proxy implement their interfaces by construction; a VM-minted
+/// stand-in carries its relationships in the interpreter's
+/// `synthetic_implements` table. Refusing any of these on the strength of a
+/// hierarchy walk is a FALSE `IllegalArgumentException` on code that works --
+/// `hibernate-smoke` storing an `AnnotationProxy` is the canonical one -- so
+/// they are never judged.
+///
+/// `typecheck::aastore_element_assignable` carries the same three hatches and
+/// can be more precise about the middle one, because by the time it asks it has
+/// the RECORDED interface set of the generated `$ProxyN` in hand. This caller
+/// does not, so it declines rather than guesses.
+fn reflective_value_is_runtime_interfaced(ctx: &dyn NativeContext, arg_cid: ClassId) -> bool {
+    if arg_cid.as_u32() >= 0x8000_0000 {
+        return true;
+    }
+    match ctx.class_name_of_id(arg_cid) {
+        Some(n) => {
+            n.contains("$Proxy") || n.ends_with("AnnotationProxy") || ctx.is_class_synthetic_stub(&n)
+        }
+        None => true,
+    }
+}
+
 fn argument_reaches_expected_by_name(
     ctx: &dyn NativeContext,
     arg_cid: ClassId,
@@ -5749,16 +5777,75 @@ pub(crate) fn coerce_arg_strict_msg(
                             None => ctx.class_id_by_name(internal),
                         };
                         if let Some(expected_cid) = resolved {
-                            if !ctx.is_interface_class(expected_cid) {
+                            // An INTERFACE formal used to be passed through
+                            // unjudged, with the note above ("cannot be checked
+                            // safely here"). It can be, by the same walk the
+                            // `checkcast`/`aastore` path uses --
+                            // `class_assignable_to_name` compares NAMES over
+                            // supers and interfaces transitively, so it answers
+                            // an interface unaided and survives a forked loader
+                            // that gives the two sides different `ClassId`s.
+                            //
+                            // Measured, `probes/ReflectArgTypeSweep.java`:
+                            //   takeNamed(Named) invoked with an Integer
+                            //     HotSpot   IllegalArgumentException
+                            //     CratonVM  InvocationTargetException
+                            // -- i.e. the callee RAN, and failed inside itself.
+                            // The class-typed row beside it (`m.wrongRef`) was
+                            // already correct, which is what made the hole
+                            // specifically interface-shaped.
+                            //
+                            // The three populations whose interfaces are not in
+                            // the hierarchy are hatched out by
+                            // `reflective_value_is_runtime_interfaced`, and a
+                            // context that cannot answer (`None`) stays an
+                            // allow.
+                            {
                                 let arg_cid = ctx.class_id_of_object(obj);
-                                if !ctx.is_subclass(arg_cid, expected_cid)
-                                    && !argument_reaches_expected_by_name(
+                                let reaches = ctx.is_subclass(arg_cid, expected_cid)
+                                    // The interpreter's `synthetic_implements`
+                                    // table -- the door built for the VM-minted
+                                    // stand-ins whose relationship exists
+                                    // nowhere a hierarchy walk can find it.
+                                    //
+                                    // REGRESSION, caught by re-running the
+                                    // family's own probes rather than only the
+                                    // new one: judging interface formals (below)
+                                    // without this refused
+                                    // `Linker.downcallHandle(MemorySegment, ...)`
+                                    // with `argument type mismatch`, because the
+                                    // `strlen` address is a
+                                    // `cratonvm.internal.foreign.MemorySegmentImpl`
+                                    // and `is_assignable_to_name` cannot see an
+                                    // interface it does not declare.
+                                    // `probes/P1RemainingSweep.java`'s
+                                    // `ffm.downcallHandle.strlen` went from
+                                    // `(MemorySegment)long` to an
+                                    // IllegalArgumentException.
+                                    //
+                                    // `is_class_synthetic_stub` is NOT this
+                                    // question and does not answer it -- it is
+                                    // about registered synthetic-stub natives.
+                                    // Writing a second hatch list instead of
+                                    // asking the existing door is what made this
+                                    // a regression rather than a non-event.
+                                    || ctx.synthetic_implements_declared(arg_cid, internal)
+                                    || argument_reaches_expected_by_name(
                                         ctx,
                                         arg_cid,
                                         expected_cid,
                                         internal,
-                                    )
-                                {
+                                    );
+                                let refuse = if reaches {
+                                    false
+                                } else if ctx.is_interface_class(expected_cid) {
+                                    !reflective_value_is_runtime_interfaced(ctx, arg_cid)
+                                        && ctx.class_assignable_to_name(arg_cid, internal)
+                                            == Some(false)
+                                } else {
+                                    true
+                                };
+                                if refuse {
                                     if crate::nbflags().dbg_coerce {
                                         let arg_name =
                                             ctx.class_name_of_id(arg_cid).unwrap_or_default();
