@@ -382,3 +382,127 @@ fn a_replay_is_visible_to_a_stream_that_did_not_run_it() {
         "every element should have been bumped {BUMPS} times"
     );
 }
+
+/// A captured node's SCALAR argument can be changed between replays.
+///
+/// This is the half of the mechanism that needs no cooperation from the
+/// code being captured. `a_replay_sees_a_scalar_written_through_the_captured_pointer`
+/// covers the other half — values the caller moved into device memory —
+/// which is faster but only available to a caller who can change their
+/// kernels. Here the kernel is untouched and the argument is an ordinary
+/// `int` parameter baked into the graph at capture time.
+///
+/// The assertion is on the OUTPUT, not on the call succeeding. A
+/// `cuGraphExecKernelNodeSetParams` that silently kept the captured
+/// arguments would return `CUDA_SUCCESS` and replay the old value, which
+/// is the failure worth catching.
+#[test]
+fn a_captured_nodes_scalar_argument_can_be_changed_between_replays() {
+    let Ok(ctx) = DeviceContext::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let module = DeviceModule::from_ptx(&ctx, PTX_ADD_SCALAR, &["addc"]).expect("load PTX");
+    let stream = Stream::new(&ctx).expect("stream");
+    let n: i32 = 512;
+    let out: DeviceBuffer<i32> = DeviceBuffer::zeros(&ctx, n as usize).expect("alloc");
+    let cfg = LaunchConfig::elementwise(n as u32);
+    let args_with = |c: i32| {
+        KernelArgs::new()
+            .push_device_ptr(&out)
+            .push_i32(n)
+            .push_i32(c)
+    };
+
+    // Capture three launches of `+1`, keeping each node as it is added.
+    stream
+        .begin_capture(CaptureMode::ThreadLocal)
+        .expect("begin capture");
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        module
+            .launch_on_stream(&ctx, "addc", &cfg, args_with(1), &stream)
+            .expect("captured launch");
+        nodes.push(
+            stream
+                .capturing_node()
+                .expect("capture info")
+                .expect("a captured launch must report its node"),
+        );
+    }
+    let exec = stream
+        .end_capture(&ctx)
+        .expect("end capture")
+        .instantiate()
+        .expect("instantiate");
+
+    let mut host = vec![0i32; n as usize];
+    exec.launch(&ctx, &stream).expect("replay 1");
+    stream.synchronize().expect("drain 1");
+    out.to_host(&mut host).expect("read 1");
+    assert_eq!(host[0], 3, "three launches of +1");
+
+    // Now rewrite every node's scalar to 10 and replay the SAME exec.
+    for node in &nodes {
+        exec.set_kernel_node_args(*node, &args_with(10))
+            .expect("set_kernel_node_args");
+    }
+    exec.launch(&ctx, &stream).expect("replay 2");
+    stream.synchronize().expect("drain 2");
+    out.to_host(&mut host).expect("read 2");
+    assert_eq!(
+        host[0], 33,
+        "the second replay must use the NEW scalar (3 + 3*10); 6 here means the          update was accepted and ignored, which is the failure this test exists for"
+    );
+
+    // Updating one node must change one node. A whole-graph rewrite
+    // would also produce a plausible-looking number, so this pins that
+    // the update is per-node.
+    exec.set_kernel_node_args(nodes[0], &args_with(100))
+        .expect("set one node");
+    exec.launch(&ctx, &stream).expect("replay 3");
+    stream.synchronize().expect("drain 3");
+    out.to_host(&mut host).expect("read 3");
+    assert_eq!(
+        host[0], 33 + 100 + 10 + 10,
+        "only the first node should have changed"
+    );
+    assert!(host.iter().all(|&v| v == 153));
+}
+
+/// `out[i] += c`, with `c` an ordinary scalar kernel parameter — the
+/// thing a graph bakes in and this test rewrites.
+const PTX_ADD_SCALAR: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry addc(
+    .param .u64 out_ptr,
+    .param .s32 n,
+    .param .s32 c
+)
+{
+    .reg .pred  %p<2>;
+    .reg .s32   %r<8>;
+    .reg .u64   %rd<5>;
+
+    ld.param.u64 %rd1, [out_ptr];
+    ld.param.s32 %r1, [n];
+    ld.param.s32 %r6, [c];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.s32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.s32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r7, [%rd4];
+    add.s32 %r7, %r7, %r6;
+    st.global.u32 [%rd4], %r7;
+DONE:
+    ret;
+}
+"#;
