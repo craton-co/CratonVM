@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-504 tokens.
+506 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -434,6 +434,8 @@ export inherited from a parent shell.
 | `promo-seed` | `CRATONVM_DBG_PROMO_SEED` |
 | `proxy` | `CRATONVM_DBG_PROXY` |
 | `prune` | `CRATONVM_DBG_NO_PRUNE` |
+| `jit-root-scan` | `CRATONVM_DBG_NO_JIT_ROOT_SCAN` |
+| `fincand` | `CRATONVM_DBG_FINCAND` |
 | `punned-ref` | `CRATONVM_DBG_PUNNED_REF` |
 | `view-comod` | `CRATONVM_DBG_VIEW_COMOD` |
 | `quarkus-staticinit` | `CRATONVM_DBG_QUARKUS_STATICINIT` |
@@ -827,10 +829,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-81 tokens.
+83 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
@@ -912,6 +915,7 @@ export inherited from a parent shell.
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
 | `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
+| `identity-hash-evict` | `CRATONVM_IDENTITY_HASH_EVICT` |
 
 ## `CRATONVM_REAL`
 

@@ -30211,6 +30211,30 @@ pub(crate) fn is_synthetic_offset(off: usize) -> bool {
 /// allocations (the string pool returns an existing Arc on hit).  The
 /// map is sharded across `UNSAFE_SHARDS` parking_lot mutexes to avoid
 /// the single-mutex contention point under concurrent <clinit> traffic.
+/// Mint and register a static field's `Unsafe` offset, exactly as
+/// `Unsafe.staticFieldOffset(Field)` does.
+///
+/// Exists for `post_clinit_fixup`. `sun.misc.Unsafe.<clinit>` calls
+/// `staticFieldBase`/`staticFieldOffset` for its memory-access warning latch
+/// before either native is registered, so both return their return type's zero
+/// -- `null` and `0L` -- with no exception, and the latch's accesses then miss
+/// the static-field side table entirely.
+///
+/// The REGISTRATION is the load-bearing half: an offset that
+/// `unsafe_static_field_target` cannot resolve routes a null-base access into
+/// a private side store instead of the real static slot. Minting the number
+/// without registering it would move the defect rather than fix it.
+pub fn register_static_field_offset(
+    class_name: &str,
+    field_name: &str,
+    class_id: ClassId,
+    field_index: usize,
+) -> i64 {
+    let offset = synthetic_offset_for(class_name, &format!("static:{field_name}"));
+    crate::unsafe_natives_ext::remember_unsafe_static_field_offset(offset, class_id, field_index);
+    offset as i64
+}
+
 fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

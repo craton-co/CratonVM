@@ -2924,6 +2924,60 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "Post-clinit fixup: sun.misc.Unsafe ARRAY_*/ADDRESS_SIZE populated ({legacy}/19)"
             );
 
+            // The memory-access warning latch (`<clinit>` bci 185/195). Same
+            // root cause, and the last of L1 R5: `staticFieldBase` and
+            // `staticFieldOffset` were unregistered when `<clinit>` called
+            // them, so they returned `null` and `0L` without throwing, and
+            // every legacy Unsafe access since has run its latch against an
+            // offset no side table can resolve -- landing in a private store
+            // where a CAS reports success having written nowhere a reader can
+            // see (513+ times in one H2 full-text vector).
+            //
+            // Mint through the SAME call the `<clinit>` would have made, so
+            // the offset is REGISTERED and not merely numbered: an
+            // unregistered offset moves the defect instead of fixing it.
+            let warned_idx = {
+                let cm = shared.classes.class_manager.read();
+                cm.get_class(class_id).and_then(|cls| {
+                    let mut static_idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "memoryAccessWarned" {
+                                return Some(static_idx);
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    None
+                })
+            };
+            if let Some(widx) = warned_idx {
+                let offset = cratonvm_native_builtins::register_static_field_offset(
+                    "sun/misc/Unsafe",
+                    "memoryAccessWarned",
+                    class_id,
+                    widx,
+                );
+                // The class mirror is what `native_unsafe_static_field_base`
+                // answers for a static field on this VM, and `StaticBaseProbe`
+                // proved that shape round-trips byte-identically to HotSpot.
+                let mirror = super::get_or_create_class_mirror(shared, class_id);
+                let mut latch = 0;
+                latch += set_static_if_zero("MEMORY_ACCESS_WARNED_OFFSET", Value::Long(offset))
+                    as i32;
+                latch += set_static_if_zero(
+                    "MEMORY_ACCESS_WARNED_BASE",
+                    Value::Object(Some(mirror)),
+                ) as i32;
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe memory-access latch repaired ({latch}/2)"
+                );
+            } else {
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe memoryAccessWarned not found —                      latch NOT repaired"
+                );
+            }
+
             // JDK 25's `Unsafe.<clinit>` stores the result of
             // `MemoryAccessOption.value()` in MEMORY_ACCESS_OPTION. In a
             // real-JDK CratonVM boot, that particular static store can remain

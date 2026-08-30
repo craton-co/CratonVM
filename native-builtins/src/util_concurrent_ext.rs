@@ -4227,9 +4227,26 @@ pub(crate) fn native_cdl_await_timeout(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    // A null `TimeUnit` is the JDK's FIRST action, not a defaulting decision:
+    // (this guard is shared by `native_cdl_await_timeout`, which IS registered
+    // and was measurably wrong, and `native_sem_try_acquire_timeout`, which the
+    // registry says is registered NOWHERE -- its copy of the defect is latent,
+    // and is fixed here so it cannot arrive with the registration.)
+    // `await` opens with `unit.toNanos(timeout)`. Defaulting to MILLISECONDS
+    // turned `await(1, null)` into a one-millisecond wait returning `false`,
+    // where HotSpot (and this VM's own strict arm, which refuses this native
+    // and runs the bytecode) raises NPE. Message transcribed from the oracle.
     let unit_ordinal = match args.get(2) {
         Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
-        _ => 2, // MILLISECONDS
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.util.concurrent.TimeUnit.toNanos(long)\" because \"unit\" is null"
+                        .to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
@@ -4625,9 +4642,26 @@ pub(crate) fn native_sem_try_acquire_timeout(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    // A null `TimeUnit` is the JDK's FIRST action, not a defaulting decision:
+    // (this guard is shared by `native_cdl_await_timeout`, which IS registered
+    // and was measurably wrong, and `native_sem_try_acquire_timeout`, which the
+    // registry says is registered NOWHERE -- its copy of the defect is latent,
+    // and is fixed here so it cannot arrive with the registration.)
+    // `await` opens with `unit.toNanos(timeout)`. Defaulting to MILLISECONDS
+    // turned `await(1, null)` into a one-millisecond wait returning `false`,
+    // where HotSpot (and this VM's own strict arm, which refuses this native
+    // and runs the bytecode) raises NPE. Message transcribed from the oracle.
     let unit_ordinal = match args.get(2) {
         Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
-        _ => 2, // MILLISECONDS
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.util.concurrent.TimeUnit.toNanos(long)\" because \"unit\" is null"
+                        .to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
     let deadline =
@@ -6524,7 +6558,9 @@ fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     mirror_stamped_state(ctx, obj, addr);
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
-            message: format!("unlockRead: stamp {stamp} does not hold this lock"),
+            // No message: HotSpot's is null here (measured, 3 runs). The stamp
+            // is still in the caller's hand, so nothing diagnosable is lost.
+            message: String::new(),
         }
         .into());
     }
@@ -6549,7 +6585,9 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     mirror_stamped_state(ctx, obj, addr);
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
-            message: format!("unlockWrite: stamp {stamp} does not hold this lock"),
+            // No message: HotSpot's is null here (measured, 3 runs). The stamp
+            // is still in the caller's hand, so nothing diagnosable is lost.
+            message: String::new(),
         }
         .into());
     }
@@ -6609,7 +6647,9 @@ fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
-            message: format!("unlock: stamp {stamp} does not hold this lock"),
+            // No message: HotSpot's is null here (measured, 3 runs). The stamp
+            // is still in the caller's hand, so nothing diagnosable is lost.
+            message: String::new(),
         }
         .into());
     }
