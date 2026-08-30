@@ -264,17 +264,27 @@ leaking all of them.
 One binary, two arms, `CRATONVM_IDENTITY_HASH_EVICT=0|1`, `probes/RandomLeak.java`
 at `--Xmx 1000m`, peak process private bytes sampled from outside:
 
-| `Random`s constructed | evict=0 (before) | evict=1 (after) | wall, 0 → 1 |
-|---:|---:|---:|---|
-| 1,000,000 | 1,374.6 MB | **1,354.5 MB** | 1.4 s → 1.3 s |
-| 4,000,000 | 1,549.0 MB | **1,354.5 MB** | 5.2 s → 5.0 s |
-| 8,000,000 | 1,752.8 MB | **1,354.6 MB** | 12.8 s → 11.1 s |
-| 16,000,000 | 2,163.6 MB | **1,354.6 MB** | 34.6 s → 24.0 s |
+| `Random`s constructed | evict=0 (before) | evict=1 (after) |
+|---:|---:|---:|
+| 1,000,000 | 1,374.6 MB | **1,354.5 MB** |
+| 4,000,000 | 1,549.0 MB | **1,354.5 MB** |
+| 8,000,000 | 1,752.8 MB | **1,354.6 MB** |
+| 16,000,000 | 2,163.6 MB | **1,354.6 MB** |
 
 The fixed arm is **flat to 0.1 MB across a 16x range**; the leaking arm grows
-~52 bytes per instance. It is also faster — 24.0 s against 34.6 s at 16M — which
-is the leak's second cost: the tables it grows are the ones every `nextInt` then
-probes.
+~52 bytes per instance. The 16M row reproduces to a tenth of a megabyte across
+three runs (2,163.6 / 2,163.8 / 2,163.7 against 1,354.6 / 1,356.6 / 1,354.5).
+
+**It is not meaningfully faster, and an earlier draft of this page said it was.**
+The first sweep measured 34.6 s → 24.0 s at 16M and read it as the leak's second
+cost — the grown tables being the ones every `nextInt` then probes. That was a
+measurement of LOAD: it ran while a `cargo test` of `native-builtins` had this
+box at 16 concurrent `rustc` processes. Re-run on a quiet host the same arms are
+19.1 s → 18.5 s and 20.4 s → 19.4 s, i.e. 3–5%, and `probes/BlobStreamCost.java`
+at `iters=300000` puts the fixture's own `read()` shape at 2,075.6 → 2,055.1
+ns/op, which is nothing. The memory result is unaffected — it is the same to a
+tenth of a megabyte under both load regimes, which is exactly the difference
+between a structural fact and a timing.
 
 Engagement, from `CRATONVM_GC_STATS=1` on `probes/RandomLiveAcrossGc.java`:
 `zgc-sweep-cost: dead_objects=1200428`, so the reporting path really ran.
@@ -299,7 +309,14 @@ as an error. Byte-identical to real HotSpot, 3/3 runs per arm.
 
 The budget is 120 s for 100M bytes: **≤1200 ns/byte**, against 1670 today. A
 1.4x improvement clears it and a 2x is comfortable — so this does not need the
-whole gap closed. Either mechanism, addressed, is likely enough on its own.
+whole gap closed.
+
+**The leak fix does not clear it.** Freeing the memory does not make the path
+cheaper: the per-byte cost is mechanism 2, five native calls per iteration, and
+that is untouched. `JpaLargeBlobTest.jpaBlobStream` is still expected to exceed
+its `@Timeout(120)`. What the fix removes is the ~3.9 GB of unreclaimable native
+memory the test dragged along with it, which was the part that was a defect
+rather than a slowness.
 
 ## Not yet done
 
