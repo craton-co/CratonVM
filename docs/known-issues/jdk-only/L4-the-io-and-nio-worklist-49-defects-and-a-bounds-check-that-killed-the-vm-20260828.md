@@ -1551,6 +1551,12 @@ on `java/nio/DoubleBuffer` cannot be selected for a `HeapDoubleBuffer` receiver;
 buffer actually is; `FileStore.getBlockSize` cannot be selected for
 `LinuxFileStore`.
 
+> **PARTLY WITHDRAWN — see §P5.6.** The receiver-class cause above is confirmed
+> (`DoubleBuffer.allocate(3).getClass()` is `java.nio.HeapDoubleBuffer` in both
+> VMs). What this section leaves implied — that a registration on the concrete
+> class takes over — is **false**. There is no such registration for any of the
+> 125. §P5.6 measures the whole set instead of four of it.
+
 **`invocations: 0` on a row whose method demonstrably ran is not a coverage
 statement — it is a statement that the registration is unreachable.** Reading it
 as "needs a probe" is what part two did, and it is why 125 still looks like work
@@ -1607,3 +1613,137 @@ CV=/data/vm-l4io OUT=/data/l4out bash apps/probes/l4run.sh \
 The census itself is reproducible and is the thing to re-run rather than
 re-derive — `--explain-jdk-only` plus `--dump-native-registry` per probe, unioned
 under the §P2.1 filter. Its two queries for covariant bridges are in §P4.1.
+
+
+## P5.6 The whole tail measured — and the claim in P5.3 corrected
+
+§P5.3 measured four rows and generalised from them. The generalisation was half
+right, and the wrong half is the kind that quietly misleads a later reader, so
+here is the whole set.
+
+For each of the 125 never-reached rows, ask whether the same
+`(name, descriptor)` is served by **any** registration on **any** class, in the
+union of all fourteen dumps:
+
+```text
+125  never-reached rows
+  0  SERVED ELSEWHERE — another class's registration runs this triple
+125  INERT — no registration anywhere serves it
+```
+
+**Zero.** Not one of them is picked up by a concrete-class twin. §P5.3 said the
+native "was never consulted" — true — and implied that something else registered
+took over. Nothing did. What answers these calls is the **real JDK bytecode**,
+which is what `--jdk-only` exists to run.
+
+Confirmed rather than inferred, three ways:
+
+```text
+DoubleBuffer.allocate(3).getClass()   java.nio.HeapDoubleBuffer   (both VMs)
+Files.getFileStore(".").getClass()    sun.nio.fs.LinuxFileStore   (both VMs)
+violations naming java/nio/DoubleBuffer in the jdk-only report:  0
+```
+
+A zero-length violation list is the direct evidence: the report records a row
+when a native stands in front of bytecode, and for these it records nothing.
+
+### What that makes them
+
+**A registration nothing dispatches to is a change that is not happening.** For
+each row the question is which of two things it is:
+
+* the bytecode is right anyway → the registration is dead weight, and a
+  *retirement candidate*;
+* the registration encoded a fix → that fix is inert, and whatever it was meant
+  to correct is still wrong.
+
+For the subset this lane's probes actually exercise, the answer is the first,
+and it is measured: **0-diff against HotSpot on the row, and `invocations: 0`
+across all fourteen runs including a probe written to reach it.**
+
+| Registration | Exercised by | Rows |
+|---|---|---|
+| `{Short,Int,Long,Float,Double}Buffer.array()`, `.get([XII)` | `L4CensusTail` | 9 |
+| `ByteBuffer.get([BII)`, `.toString()` | `L4CensusTail` | 2 |
+| `{Heap,HeapR,String}CharBuffer.toString(II)` | `L4CensusTail` | 3 |
+| `ByteBufferAsCharBuffer{B,L,RB,RL}.toString(II)` | `L4CensusTail` | 4 |
+| `MappedByteBuffer.{force,load,isLoaded}` | `L4CensusTail` | 3 |
+| `FileStore.getBlockSize()` | `L4CensusTail` | 1 |
+| `SimpleFileVisitor` erased bridges | `L4CensusTail` | 3 |
+| `FileSystemProvider.newFileSystem(Path,Map)` | `L4CensusTail` | 1 |
+
+**26 registrations nominated for retirement, and NOT retired here.** Three
+reasons, all of which have burned this campaign before:
+
+1. **Fourteen probes are not the corpus.** `invocations: 0` here bounds what
+   *these* workloads reach. Spring, Tomcat and H2 reach `java.nio` constantly and
+   were not run. A shadow unreached by a probe suite is not a shadow unreached.
+2. **A 0-diff argues KEEP as often as RETIRE** (the `StrictMath` adjudication,
+   69 rows). Agreeing with HotSpot is what a *correct* shadow also does.
+3. **The enforcement dial is the wrong instrument here, and saying why is the
+   point.** `CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` prices a retirement by
+   making a Bridge native yield to real bytecode and measuring what changes. A
+   native that **never fires** yields nothing: arming these 26 is a no-op, every
+   probe stays green, and the green means only that a dial was set. That is the
+   vacuous-green shape this campaign already names — the dial's own rule is
+   *prove it FIRED before reading the green*, and for an `invocations: 0` row it
+   cannot fire by construction.
+
+   What they need first is a workload that **reaches** them. Run the corpus arms
+   with `--dump-native-registry` and read the same 26 rows:
+
+   * still `0` → nothing this VM runs dispatches to them, and they can be
+     retired on that evidence;
+   * now `> 0` → they are live after all, this lane's probe suite simply never
+     went there, and *then* the dial is the right instrument to price them.
+
+The list above is the input to that measurement, not a substitute for it. It is
+also the reason to run it: a shadow that fourteen targeted probes cannot reach
+is either dead weight or a blind spot, and the two look identical from here.
+
+### The measurement, taken
+
+Ten nio-facing regression vectors, each run under `--jdk-only` with its own
+`--dump-native-registry`, unioned and read against the nominated rows
+(`ONLY=<vector>` is the suite's filter — `VECTORS=` is silently ignored, which
+is worth knowing before trusting a "filtered" run):
+
+```text
+RJdkNio  RJdkForeign  RJdkAsyncChannel  RJdkWatchService  RFileChannelFastIo
+RSegmentBulkCopy  RJdkProcess  RJdkFailure  RJdkHandles  RJdkCollections
+        all ten green
+
+41 registration rows across the nominated class+method pairs
+ 0 moved off zero
+41 still zero
+```
+
+**Not one of them fired.** The evidence for the nomination is now fourteen
+targeted probes *and* ten real regression vectors, all zero, on rows whose
+methods this lane's probes demonstrably call and get right.
+
+That is a much stronger case than §P5.6 opened with, and it is still **not a
+retirement**, for the reason that has not changed: the regression suite is not
+the corpus either. Spring, Tomcat and H2 are where `java.nio` gets used in
+anger, and they were not run here. What this does establish is that the 26 are
+not being reached by anything this repository routinely tests — so the next
+person can go straight to a corpus arm rather than re-deriving the list.
+
+The pattern is worth stating once: **`invocations: 0` from one workload is a
+floor, and the way to raise confidence is more DIFFERENT workloads, not more
+runs of the same one.** Fourteen probes written by the same author to reach the
+same rows are close to one measurement; ten regression vectors written by other
+lanes for other reasons are a genuinely independent second.
+
+### The rest of the 125
+
+The other 99 are inert for reasons this lane already classified and does not
+own: 34 channels/selectors, 24 `SharedSecrets` access bridges reachable only
+from JDK-internal callers, 12 `java.io` exception classes served by the shared
+`Throwable` table, 12 `UnixFileSystem` rows driven indirectly through
+`java.io.File`'s bytecode, and 7 on abstract receivers (`java/nio/Buffer`,
+`java/io/OutputStream`) that no live object's class can ever match.
+
+**The number to carry forward is not 125.** It is: 26 measured-inert and
+nominated, 99 inert for classified reasons, and — after five parts — *zero*
+rows in this lane's families that a probe reaches and gets wrong.
