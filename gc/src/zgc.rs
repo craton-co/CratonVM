@@ -10283,6 +10283,19 @@ fn zgc_gen_minors_per_major() -> usize {
 /// only that this lands during a gauntlet sweep, and the arm being measured is
 /// the one that is already opt-in. Promoting it is one condition, with its own
 /// measurement.
+/// `CRATONVM_DBG_FINCAND=1` — per collection, report how each finalizable
+/// candidate was classified: `unregistered` (not a current allocation),
+/// `marked_alive` (something still roots it, so it is not finalizable yet), or
+/// `dead_resurrected` (kept alive for the finalizer thread and enqueued).
+///
+/// "finalize() never ran" is the same observation for all three, which is why
+/// the counters exist: they are the difference between "the object is still
+/// reachable" and "the finalizer machinery never saw it".
+fn dbg_fincand() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FINCAND").is_some())
+}
+
 fn zgc_sweep_header_zero() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -13284,16 +13297,26 @@ impl GarbageCollector for ZgcRealHeap {
         let mark_us = clock.lap();
 
         let fin_candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
+        // CRATONVM_DBG_FINCAND: name the branch each finalizable candidate takes.
+        // The three outcomes here are indistinguishable from outside — "never
+        // finalized" looks identical whether the address was not registered,
+        // or was registered and MARKED (something still roots it). See
+        // `recyclertest-thread-not-collected-once-the-jit-warms-up`.
+        let dbg_fincand = dbg_fincand();
+        let (mut c_unreg, mut c_marked, mut c_dead) = (0usize, 0usize, 0usize);
         if !fin_candidates.is_empty() {
             let mut resurrected = Vec::new();
             for addr in fin_candidates {
                 if !registered.contains(addr) {
+                    c_unreg += 1;
                     continue; // not a current allocation (already swept earlier)
                 }
                 let header = self.header_mut(addr as *mut u8);
                 if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                    c_marked += 1;
                     continue; // survived normally — stays registered, not finalized
                 }
+                c_dead += 1;
                 // Recorded PRE-slide; `collect_garbage` rewrites the list
                 // through the pointer map once relocation has run, because the
                 // contract with `collect_garbage_with_finalizers`'s caller is
@@ -13334,6 +13357,11 @@ impl GarbageCollector for ZgcRealHeap {
             if !resurrected.is_empty() {
                 *self.resurrected_finalizers.lock() = resurrected;
             }
+        }
+        if dbg_fincand && (c_unreg | c_marked | c_dead) != 0 {
+            eprintln!(
+                "[fincand] unregistered={c_unreg} marked_alive={c_marked} dead_resurrected={c_dead}"
+            );
         }
 
         // ---- Reference processing ---------------------------------------
