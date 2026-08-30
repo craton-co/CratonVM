@@ -297,11 +297,17 @@ self-consistent, and it is — the sweep round-trips every width through
 **Legal disagreement, not a defect.** Recorded because a future reader diffing
 this family will meet it again.
 
+**PROVEN 2026-08-30, having been asserted here since 2026-08-28.** Running the
+oracle as `java -XX:-UseCompressedOops` makes all three rows report `8`,
+matching CratonVM exactly, and drops the sweep diff from 20 changed lines to 14
+with no new difference in 457 rows. The probe runner now passes that flag --
+see §22.1. These three rows are gone from the residual.
+
 ### 4.3 `arrayIndexScale` / `arrayBaseOffset` on a NON-array (6 rows)
 
 ```text
 HotSpot    NoClassDefFoundError: java/lang/InvalidClassException
-CratonVM   1  and  16
+CratonVM   0  and  16      <- scale was 1 when this was written; see below
 ```
 
 Already adjudicated on 2026-08-26 in
@@ -315,11 +321,23 @@ This lane adds four rows to that record — `arrayIndexScale(int.class)` and
 `arrayIndexScale(Iface.class)` answer `1` too, so the catch-all covers
 primitives and interfaces as well as ordinary classes.
 
-**The prior adjudication stands.** Returning `0` (what the long-standing
-`sun.misc` javadoc specifies, and what callers guard on with
-`if (scale == 0) throw`) is defensible and is what I would change it to — but it
-is a behaviour change whose blast radius across JCTools-shaped consumers is
-unmeasured, the oracle cannot referee it, and a prior session weighed the same
+**UPDATED 2026-08-30 — the scale half of this was changed, and this section
+did not say so.** `array_index_scale_for_name` now returns `0` for a non-array,
+not `1`: exactly the value the paragraph below argued for, landed during this
+campaign while the text kept describing the old behaviour. All four scale rows
+(`String.class`, `int.class`, `Iface.class`, and the internal spelling) answer
+`0` today, so a caller following the documented
+`if (scale == 0) throw` guard now gets the refusal it is looking for.
+
+`arrayBaseOffset` on a non-array still answers `16`. There is no
+"`0` means invalid" convention for a base offset, no oracle can referee it —
+HotSpot's own refusal is the broken one described above — and nothing has been
+measured that would justify inventing one. That half of the prior adjudication
+stands.
+
+The original reasoning, kept because it is why the change was slow rather than
+skipped: returning `0` is a behaviour change whose blast radius across
+JCTools-shaped consumers was unmeasured, and a prior session weighed the same
 evidence and declined. Changing an adjudicated decision without new evidence is
 not a repair.
 
@@ -368,6 +386,10 @@ and refuse the fourth case with the `IllegalArgumentException` that
 `setMemory`/`copyMemory` at address 0 already produce (rows 27 and 28 of the
 null probe, where CratonVM is already correct and HotSpot SIGSEGVs). The
 prerequisite is a count of what reaches the fallback on a real workload.
+**That count exists now — see §21.** It is 0 across 116 regression vectors,
+both H2 vectors, Spring Boot and Tomcat+SSL, with a positive control that
+fires; and it is NOT yet available for the WildFly and Keycloak paths this
+section cites, which is why the refusal is still not made.
 
 ### 4.6 Nine registrations for methods this JDK image does not declare
 
@@ -1471,3 +1493,164 @@ constant says 16, native says 0
 ```
 
 The defect can now only recur loudly.
+
+## 21. §4.5's prerequisite, discharged — the fallback is reached by nothing
+
+§4.5 declined to refuse the unclassified null-base access and named exactly what
+would unblock the decision:
+
+> **The prerequisite is a count of what reaches the fallback on a real
+> workload.**
+
+Here is that count. Every row has a positive control, because every zero in this
+section is load-bearing.
+
+| population | vectors | hits |
+| --- | --- | --- |
+| regression vectors, `--jdk-only` | 116 completed rc=0 | **0** |
+| `org.h2.test.db.TestFullText` | 1 | **0** (was 11, occurrence → 513) |
+| `org.h2.test.unit.TestRecovery` | 1 | **0** (was 6) |
+| Spring Boot smoke test (`DOD RESULT OK`) | 1 | **0** |
+| Tomcat + SSL smoke test (`DOD RESULT OK`) | 1 | **0** |
+| `UnmapHackProbe` | 1 | **0** (was 3) |
+| **`NullBaseControl` (positive control)** | 1 | **2** |
+
+### 21.1 The three arms cannot answer this, and nearly said they could
+
+The obvious way to count is to grep the arm logs. It gives 0, and that 0 is
+**void**: `run.sh` captures each vector's output into a shell variable and
+passes it through `extract` before comparing, so VM chatter is discarded. The
+tell is that the arm logs contain **zero cratonvm `WARN` lines of any kind** —
+not zero of this one. A vector can warn on every call and still pass.
+
+So the sweep drives the vectors directly against the suite's own compiled
+classes with stderr kept, and runs `NullBaseControl` **in the same loop, through
+the same capture**. It reports 2. Without that row the whole table would be
+a mute instrument reported as a clean result — which this lane has now been
+caught by four times.
+
+The two DoD workloads carry their own denominator: each `.err` holds **6
+`Post-clinit fixup` lines**, so warns from this build demonstrably reach those
+files.
+
+**Caveat, stated because it bounds the claim:** the sweep runs vectors without
+their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
+exercised less than the suite gives them.
+
+### 21.2 What this does and does not license
+
+**Discharged for four workload families**: the regression corpus, H2, Spring
+Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
+`compareAndSwapInt` that returns `true` having written nowhere is unreachable
+from real code in those populations.
+
+**NOT discharged for the rest.** §4.5's own justification cites the WildFly and
+Keycloak lazy-init paths, and those workloads are other lanes' — they are not
+checked out here and this lane cannot run them. The refusal §4.5 specifies
+(classify the offset; refuse the fourth case with the
+`IllegalArgumentException` that `setMemory`/`copyMemory` at address 0 already
+produce) is now **evidence-backed but not evidence-complete**, and flipping a
+shared path on partial evidence is the overlap this lane is supposed to avoid.
+
+So this stays a measured finding rather than a speculative repair — which is
+what the lane brief asks for, and I am saying which I did. Whoever owns WildFly
+or Keycloak can discharge the remainder with one run: the instrument is in the
+tree, `NullBaseControl` is the control, and the bar is the table above.
+
+**What changed underneath it:** §4.5 was written when the JDK itself reached
+this path 513+ times per H2 vector. §19 removed that consumer. The residual is
+no longer "a rescue something depends on" — it is a path nothing measured
+reaches, kept because the measurement does not yet cover everything.
+
+## 22. Taking on the residual itself
+
+The residual had been *characterised* — every row explained — but three of its
+explanations were assertions nobody had tested, and one was a decision nobody
+had re-costed. Taking it on means testing the explanations.
+
+### 22.1 The compressed-oops rows: asserted for four sessions, now proven
+
+§4.2 said `Object[]`, `String[]` and `int[][]` report 8 here and 4 on HotSpot
+because HotSpot runs with compressed oops and CratonVM does not. Every session
+that met those rows repeated it and moved on. **It was never tested**, and it
+costs one flag:
+
+```text
+java                            sun scale [Ljava.lang.Object; |4|
+java -XX:-UseCompressedOops     sun scale [Ljava.lang.Object; |8|   <- CratonVM: 8
+```
+
+All three rows match exactly, and the sweep diff falls from **20 changed lines
+to 14** — precisely those three rows, with no new difference anywhere in 457.
+
+The fix is in the runner, not the VM: **a differential whose oracle is
+configured unlike the VM under test reports its own configuration as a defect,
+permanently, in a column readers have to be told to ignore.**
+`unsafe-l1-run.sh` now passes `-XX:-UseCompressedOops`. This does not claim
+CratonVM matches a default-configured HotSpot — it claims those three rows are
+the oops mode and nothing else, which is now measured rather than assumed.
+
+### 22.2 The mint row: measured to zero, and NOT changed — here is why
+
+`objectFieldOffset(Class, String)` for a name the class does not have: HotSpot
+throws `InternalError`, CratonVM mints a synthetic offset and routes it through
+a per-object side store.
+
+Reachability, using the per-vector captures already on disk:
+
+| population | mints |
+| --- | --- |
+| 120 regression vectors | **0** |
+| Spring Boot / Tomcat+SSL (DoD) | **0** / **0** |
+| H2 `TestFullText` / `TestRecovery` | **0** / **0** |
+| `MintReachProbe` (positive control) | **2** |
+
+And the mint's own comment names its two consumers — WildFly's
+`Class$Atomic.casReflectionData` and Spring Boot's
+`AbstractClassLoaderValue.putIfAbsent`. §14 measured **both away**:
+`Class$Atomic` resolves its three real names on JDK 25, and
+`AbstractClassLoaderValue` references `Unsafe` zero times. A program that
+"works" through the mint is running a lazy-init guard against a phantom field,
+so it is already wrong.
+
+The case for matching HotSpot is therefore strong. **It is still not made**,
+and the blocker is neither evidence nor appetite:
+
+* `RuntimeError` has **no `InternalError` variant**, and no by-name throw is
+  available to a native — `MethodCallFailed::InternalError` is documented as
+  the UNCATCHABLE form and is not a Java throwable, so it is a different
+  behaviour, not this one.
+* Adding a variant means editing a shared error enum that is matched
+  exhaustively across the VM. That is a cross-cutting change to shared code for
+  one probe row that nothing measured depends on — and this lane's remaining
+  budget is better spent not destabilising seven other lanes.
+
+Recorded with the measurement attached so whoever adds that variant for another
+reason can close this row in the same commit.
+
+### 22.3 The non-array rows: half already correct
+
+Four of the six are `arrayIndexScale`, and they answer `0` — the documented
+sentinel, which callers test with `if (scale == 0) throw`. That half is
+arguably *better* than the oracle, whose refusal is the JDK bug described in
+§4.3. The two `arrayBaseOffset` rows answer `16`; there is no sentinel
+convention for a base offset and no oracle can referee it, so they stay.
+
+### 22.4 The residual after this section
+
+```text
+sweep  14 changed lines (7 rows)   was 20 (10 rows)
+null   20 changed lines (10 rows)  unchanged
+subword 0                          unchanged
+mode drift 0 on all three          unchanged
+```
+
+**Sweep (7 rows):** 1 mint row (§22.2, measured to zero, blocked on a shared
+enum) + 6 non-array rows (§22.3, four of them already the documented answer).
+
+**Null (10 rows):** 5 where CratonVM throws NPE/IAE and HotSpot SIGSEGVs —
+CratonVM is better and stays — and the 5 null-base rows of §21, reached by
+nothing measured and left to whoever can run WildFly.
+
+Nothing in the residual is now an unexplained difference, and nothing in it is
+explained by an untested assertion.

@@ -26091,7 +26091,37 @@ fn of_list_allowing_nulls(
 /// what those factories produce.
 fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge`, so `--jdk-only` DROPS the whole family and
+    // real bytecode runs.
+    //
+    // `Bridge` asserts "no working real-bytecode fallback exists". For this
+    // family that is a compatible-mode claim wearing a mode-independent tag,
+    // and under `--jdk-only` it was not merely unnecessary but FATAL:
+    //
+    // ```text
+    // apps/probes/UtilCoverage4Sweep, --jdk-only
+    //   48 ser List.of(1)  THREW java.lang.NoClassDefFoundError
+    //   ...
+    //   java.lang.NoClassDefFoundError: cratonvm/internal/UnmodifiableList
+    // ```
+    //
+    // -- every `List.of`/`Set.of`/`Map.of` failed to DESERIALIZE. Writing
+    // worked and produced the same 59 bytes HotSpot writes; the read side then
+    // reached `native_collser_read_resolve`, which rebuilds through `of_list`
+    // and `freeze_result` into a `cratonvm/internal/Unmodifiable*` that strict
+    // mode refuses to fabricate. The producers this carrier has are supposed to
+    // be dropped in strict -- `alloc_immutable_wrapper`'s doc says so and lists
+    // them -- and this one was missed because it is registered from a DIFFERENT
+    // registrar than the factories it mirrors, under this `Bridge` window.
+    //
+    // The reason the native exists at all is in `native_collser_read_resolve`:
+    // the real body rebuilds maps through real `ImmutableCollections` ctors,
+    // producing a `table`-backed object that this crate's map natives read as
+    // empty. That is true in COMPATIBLE mode, where those natives run. It is
+    // exactly false under `--jdk-only`, where they are dropped and a real
+    // `Map1` is the right answer and the only one -- which is why the strict
+    // rows now agree with HotSpot down to the class name.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for c in [
         "java/util/ImmutableCollections$List12",
         "java/util/ImmutableCollections$ListN",
@@ -64408,6 +64438,29 @@ const UNMOD_FIELD_BACKING: usize = 0;
 /// map); keep the two in sync.
 const UNMOD_FIELD_IMMUTABLE: usize = 1;
 
+/// Slot 2 of a map-VIEW wrapper: set when the map it is a view OF came from an
+/// immutable factory.
+///
+/// Deliberately NOT `UNMOD_FIELD_IMMUTABLE`. That slot is a cross-crate
+/// contract -- `getclass_immutable_marker` in native-builtins reads it to
+/// decide whether `getClass()` says `ImmutableCollections$*` or
+/// `Collections$Unmodifiable*` -- and a `Map.of` keySet is NEITHER on HotSpot:
+/// it is `java.util.AbstractMap$1`. Widening that marker would make
+/// `getClass()` answer a third wrong name, and `unmod_is_immutable` also gates
+/// RULE I's null-query NPE, which this measurement says nothing about.
+///
+/// So this is a narrow flag with a single reader.
+const UNMOD_FIELD_IMMUTABLE_VIEW: usize = 2;
+
+/// Whether `this` is a view of a map that came from `Map.of`/`Map.copyOf`.
+fn unmod_is_immutable_map_view(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.object_num_fields(this) > UNMOD_FIELD_IMMUTABLE_VIEW
+        && matches!(
+            ctx.get_field(this, UNMOD_FIELD_IMMUTABLE_VIEW),
+            Value::Int(1)
+        )
+}
+
 fn is_unmod_set_class(name: &str) -> bool {
     matches!(
         name,
@@ -64503,6 +64556,32 @@ fn alloc_immutable_wrapper(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let wrapper = alloc_unmod_wrapper(ctx, class_name, backing)?;
     ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
+    Ok(wrapper)
+}
+
+/// Allocate a wrapper for one of a map's three VIEWS, carrying
+/// [`UNMOD_FIELD_IMMUTABLE_VIEW`] when the map itself was immutable.
+fn alloc_unmod_view_wrapper(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    backing: ObjectRef,
+    from_immutable: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if !from_immutable {
+        return alloc_unmod_wrapper(ctx, class_name, backing);
+    }
+    let backing_pin = ctx.pin_native_root(backing);
+    let wrapper = match try_alloc_synthetic(ctx, class_name, 3) {
+        Ok(w) => w,
+        Err(err) => {
+            ctx.unpin_native_roots(backing_pin);
+            return Err(err);
+        }
+    };
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE_VIEW, Value::Int(1));
+    ctx.unpin_native_roots(backing_pin);
     Ok(wrapper)
 }
 
@@ -65713,87 +65792,152 @@ fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 const SPL_IMMUTABLE_SINGLETON: i32 =
     SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_NONNULL | 0x0400 | SPL_SUBSIZED;
 
+/// The characteristics HotSpot's immutable factories answer, by shape.
+///
+/// MEASURED across the whole matrix (`apps/probes/ImmutableSplProbe`, HotSpot
+/// 25.0.4+7) rather than derived from the cells that failed, because the
+/// obvious rule -- "a size-1 immutable is a singleton" -- is contradicted by
+/// the very same map:
+///
+/// ```text
+///   Set.of("a")              17745  ImmutableCollections$Set12 / Collections$2
+///   List.of("a")             17745  ImmutableCollections$List12 / Collections$2
+///   Map.of("a",1).entrySet() 17745  ImmutableCollections$Set12 / Collections$2
+///   Map.of("a",1).keySet()   16449  AbstractMap$1 / Spliterators$IteratorSpliterator
+///   Map.of("a",1).values()   16448  AbstractMap$2 / Spliterators$IteratorSpliterator
+/// ```
+///
+/// The CLASS column is the rule. Every 17745 is `Collections$2`, which is
+/// `Collections.singletonSpliterator`, and `List12`/`Set12` route to it when
+/// their second slot is the empty sentinel -- so "size 1" is right, but only
+/// for a collection the factory built as a `List12`/`Set12`. A `Map.of`'s
+/// keySet and values are not: they are the anonymous `AbstractMap$1`/`$2`
+/// views, which carry no immutable bits at all, at any size. `entrySet` is the
+/// odd one because `Map1.entrySet()` is literally `Set.of(entry)`, and a
+/// two-entry map's `MapN$1` entrySet drops back to 16449.
+///
+/// `Collections.unmodifiableSet(hashSet)` is the control that must NOT move:
+/// the JDK's WRAPPER really does hand back the backing's spliterator, so that
+/// arm never reaches here.
 fn immutable_spliterator_characteristics(
     ctx: &dyn NativeContext,
     this: ObjectRef,
     size: i32,
+    is_map_view: bool,
 ) -> i32 {
-    // Size first: it outranks the carrier, and it is the whole reason
+    let cls = ctx.class_name_arc_of_id(ctx.class_id_of_object(this));
+    if is_map_view {
+        // A view of an immutable map is a plain `AbstractMap` view, with one
+        // exception the class name already tells apart.
+        return match cls.as_deref() {
+            Some(UNMOD_ENTRY_SET_CLASS) if size == 1 => SPL_IMMUTABLE_SINGLETON,
+            Some(UNMOD_COLLECTION_CLASS) => SPL_SIZED | SPL_SUBSIZED,
+            _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
+        };
+    }
+    // Size outranks the carrier here, and only here: it is the whole reason
     // `Set.of("a")` and `List.of("a")` agree at 17745 while their two- and
     // three-element siblings do not.
     if size == 1 {
         return SPL_IMMUTABLE_SINGLETON;
     }
-    match ctx
-        .class_name_arc_of_id(ctx.class_id_of_object(this))
-        .as_deref()
-    {
+    match cls.as_deref() {
         // A list keeps its encounter order and is not distinct.
-        Some("cratonvm/internal/UnmodifiableList") => SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED,
+        Some(UNMOD_LIST_CLASS) => SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED,
         // A values view is neither distinct nor ordered.
-        Some("cratonvm/internal/UnmodifiableCollection") => SPL_SIZED | SPL_SUBSIZED,
+        Some(UNMOD_COLLECTION_CLASS) => SPL_SIZED | SPL_SUBSIZED,
         // Sets, keySets and entrySets: distinct, no encounter order.
         _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
     }
 }
 
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // An IMMUTABLE receiver answers its own family's bits; an unmodifiable
-    // WRAPPER delegates, because the JDK's wrapper really does hand back the
-    // backing's spliterator (`unmodifiableSet(hashSet)` is 65 on both VMs, and
-    // that row is the control for leaving this arm alone).
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if unmod_is_immutable(&*ctx, *this) {
-            let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
-            // ONLY a spliterator THIS CRATE MINTED may be written to. The
-            // backing's `spliterator()` is not guaranteed to reach
-            // `native_al_spliterator`: for a `List.of` the delegate lands on
-            // java.base's own `ArrayList.spliterator()` bytecode and hands back
-            // a REAL `ArrayList$ArrayListSpliterator`, whose slot 3 is its
-            // `this$0`. Writing a characteristics mask there clobbered it, and
-            // the next `estimateSize()` died in `getFence` with "Cannot read
-            // field modCount because this.this$0 is null" -- which is how this
-            // was found, one probe row after the change that caused it.
-            //
-            // `two-producers-of-one-carrier-class` again, in its most direct
-            // form: the synthetic `java/util/Spliterator` and the JDK's own
-            // classes both arrive here, and only one of them has a slot 3 that
-            // means what this code thinks it means.
-            let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
-                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
-                    == Some("java/util/Spliterator"));
-            if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
-                let this = *this;
-                let size = match ctx.get_field(spl_obj, 2) {
-                    Value::Int(n) => n,
-                    _ => -1,
-                };
-                let chars = immutable_spliterator_characteristics(&*ctx, this, size);
-                if ctx.object_num_fields(spl_obj) > SPL_FIELD_CHARACTERISTICS {
-                    ctx.set_field(spl_obj, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
-                } else {
-                    // The backing handed back the THREE-field shape, which has
-                    // no characteristics slot and therefore reads as
-                    // `SPL_LIST_DEFAULT` however the mask is computed. Widen it:
-                    // copy the array, cursor and length across and add the slot.
-                    // Missing this is what left `List.of("a")` at 16464 after
-                    // the set shapes were already right -- the rule was correct
-                    // and had nowhere to be written.
-                    let arr = ctx.get_field(spl_obj, 0);
-                    let cursor = ctx.get_field(spl_obj, 1);
-                    let len = ctx.get_field(spl_obj, 2);
-                    let wide = try_alloc_synthetic(ctx, "java/util/Spliterator", 4)?;
-                    ctx.set_field(wide, 0, arr);
-                    ctx.set_field(wide, 1, cursor);
-                    ctx.set_field(wide, 2, len);
-                    ctx.set_field(wide, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
-                    return Ok(Some(Value::Object(Some(wide))));
-                }
-            }
+    // An IMMUTABLE receiver -- or a view of an immutable map -- answers its own
+    // family's bits; an unmodifiable WRAPPER delegates, because the JDK's
+    // wrapper really does hand back the backing's spliterator
+    // (`unmodifiableSet(hashSet)` is 65 on both VMs, and that row is the
+    // control for leaving this arm alone).
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;");
+    };
+    let is_map_view = unmod_is_immutable_map_view(&*ctx, this);
+    if !unmod_is_immutable(&*ctx, this) && !is_map_view {
+        return unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;");
+    }
+
+    let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
+
+    // ONLY a spliterator THIS CRATE MINTED may be written to. The backing's
+    // `spliterator()` is not guaranteed to reach `native_al_spliterator`: for a
+    // `List.of` the delegate lands on java.base's own `ArrayList.spliterator()`
+    // bytecode and hands back a REAL `ArrayList$ArrayListSpliterator`, whose
+    // slot 3 is its `this$0`. Writing a characteristics mask there clobbered
+    // it, and the next `estimateSize()` died in `getFence` with "Cannot read
+    // field modCount because this.this$0 is null" -- which is how this was
+    // found, one probe row after the change that caused it.
+    //
+    // `two-producers-of-one-carrier-class` again, in its most direct form: the
+    // synthetic `java/util/Spliterator` and the JDK's own classes both arrive
+    // here, and only one of them has a slot 3 that means what this code thinks
+    // it means.
+    let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
+        if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+            == Some("java/util/Spliterator"));
+
+    if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
+        let size = match ctx.get_field(spl_obj, 2) {
+            Value::Int(n) => n,
+            _ => -1,
+        };
+        let chars = immutable_spliterator_characteristics(&*ctx, this, size, is_map_view);
+        if ctx.object_num_fields(spl_obj) > SPL_FIELD_CHARACTERISTICS {
+            ctx.set_field(spl_obj, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
             return Ok(spl);
         }
+        // The backing handed back the THREE-field shape, which has no
+        // characteristics slot and therefore reads as `SPL_LIST_DEFAULT`
+        // however the mask is computed. Widen it: copy the array, cursor and
+        // length across and add the slot.
+        let arr = ctx.get_field(spl_obj, 0);
+        let cursor = ctx.get_field(spl_obj, 1);
+        let wide = try_alloc_synthetic(ctx, "java/util/Spliterator", 4)?;
+        ctx.set_field(wide, 0, arr);
+        ctx.set_field(wide, 1, cursor);
+        ctx.set_field(wide, 2, Value::Int(size));
+        ctx.set_field(wide, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+        return Ok(Some(Value::Object(Some(wide))));
     }
-    unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
+
+    // The delegate handed back one of the JDK's OWN spliterators, which we may
+    // not write to and whose mask is the BACKING's rather than the immutable
+    // family's. `List.of("a")` is that case: java.base answers 16464 for the
+    // `ArrayList` behind it where HotSpot answers 17745 for a `List12`. Mint
+    // ours over the same elements instead. The rule was already right and
+    // simply had nowhere to be written, which is what left this one cell open
+    // after the set shapes were fixed.
+    let arr = unmod_delegate(ctx, args, "toArray", "()[Ljava/lang/Object;")?;
+    if let Some(Value::Object(Some(a))) = arr {
+        let len = ctx.array_length(a) as i32;
+        let chars = immutable_spliterator_characteristics(&*ctx, this, len, is_map_view);
+        let pin = ctx.pin_native_root(a);
+        // Not `?`: the pin is this frame's base and must be released before
+        // unwinding, or it and everything pinned above it are stranded.
+        let minted = match try_alloc_synthetic(ctx, "java/util/Spliterator", 4) {
+            Ok(m) => m,
+            Err(err) => {
+                ctx.unpin_native_roots(pin);
+                return Err(err);
+            }
+        };
+        let a = ctx.read_native_pin(pin, a);
+        ctx.set_field(minted, 0, Value::Object(Some(a)));
+        ctx.set_field(minted, 1, Value::Int(0));
+        ctx.set_field(minted, 2, Value::Int(len));
+        ctx.set_field(minted, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+        ctx.unpin_native_roots(pin);
+        return Ok(Some(Value::Object(Some(minted))));
+    }
+    Ok(spl)
 }
 
 /// `subList` returns another unmodifiable view over the backing sub-list.
@@ -66190,9 +66334,11 @@ fn native_unmod_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 /// `keySet()` returns an unmodifiable Set view of the backing map's key set.
 fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let ks = unmod_delegate(ctx, args, "keySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = ks {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_SET_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(ks)
@@ -66200,9 +66346,11 @@ fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `values()` returns an unmodifiable Collection view of the backing values.
 fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let vs = unmod_delegate(ctx, args, "values", "()Ljava/util/Collection;")?;
     if let Some(Value::Object(Some(inner))) = vs {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(vs)
@@ -66214,9 +66362,11 @@ fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// backing map would let `entry.setValue(...)` mutate through the
 /// "unmodifiable" view instead of throwing.
 fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let es = unmod_delegate(ctx, args, "entrySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = es {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(es)

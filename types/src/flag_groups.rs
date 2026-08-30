@@ -1410,6 +1410,12 @@ pub const INVENTORY: &[E] = &[
     // so there is no off state to spell.
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
+    // `zero-spid` is default ON and `CRATONVM_JIT_ZERO_SPID=0` restores the
+    // pre-fix behaviour, so `off_word` is exactly `"0"` -- the same shape as
+    // `verify-ir` above. `zero_sp_id_slot_enabled` reads the key and treats
+    // `0`/`false`/`FALSE` as off; only `"0"` is spellable as a group token, and
+    // the other two spellings keep working through the key itself.
+    E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
     // in the DBG group, which is where their names say they belong and which is

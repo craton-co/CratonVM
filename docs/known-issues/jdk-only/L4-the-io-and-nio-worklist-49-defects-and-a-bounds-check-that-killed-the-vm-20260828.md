@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 85 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 89 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -2036,3 +2036,111 @@ VM, until a blanket refusal downgraded it to a bare `IOException`. It turned a
 green row red, and it is the same right-behaviour-wrong-type defect the same
 commit fixes three of. Reverted; the OOME is left OPEN with its cause named
 rather than papered over from the wrong layer.
+
+
+## P6.5 The three that cost something, taken on
+
+§P6.4 listed `ByteBuffer` (8), `Files` (14) and `Path` (102). Four more defects
+close two of them.
+
+**`ByteBuffer` → the floor.** `HeapByteBuffer`'s constructor raised
+`ArrayIndexOutOfBoundsException` for bad bounds. The real chain is
+`HeapByteBuffer -> ByteBuffer -> Buffer(mark,pos,lim,cap)`, whose
+`createCapacityException`/`createLimitException` are all
+`IllegalArgumentException` — and `ByteBuffer.wrap` is written to convert exactly
+that:
+
+```java
+try { return new HeapByteBuffer(array, offset, length, null); }
+catch (IllegalArgumentException x) { throw new IndexOutOfBoundsException(); }
+```
+
+Raising the wrong class skipped that catch, so the real `wrap` propagated ours.
+A subclass, so `catch (IndexOutOfBoundsException)` still matched and nothing
+failed loudly — the `Buffer.reset` shape from part three, one class further out.
+The constructor is `invocations: 0` unarmed (`servlet.rs`'s `wrap` owns that
+slot and never calls it), so this row existed only for the retirement.
+
+**`Files` → 14 to 6**, on three causes:
+
+* **`Files.getOwner` answered `UnsupportedOperationException` for every path.**
+  `getFileAttributeView` resolved `BasicFileAttributeView`, `DosFileAttributeView`
+  and `PosixFileAttributeView` — but not `FileOwnerAttributeView`, which
+  `PosixFileAttributeView` *extends*. Real `Files.getOwner` is
+  `getFileAttributeView(path, FileOwnerAttributeView.class)` then
+  `if (view == null) throw new UnsupportedOperationException()`. The same
+  omission the posix view itself had before
+  `bug-h2-files-setposixfilepermissions-unsupported.md`.
+
+* **`readAllBytes(<a directory>)` raised `OutOfMemoryError`**, and the cause was
+  not in `Files` at all:
+
+  ```text
+  Files.newByteChannel(<a directory>).size()
+    HotSpot   4096              this VM   9223372036854775807
+  ```
+
+  `fd_table::file_size` measured by `lseek(fd, 0, SEEK_END)`, and **`lseek` to
+  the end of a DIRECTORY returns `LONG_MAX` on Linux.** `readAllBytes` sizes its
+  buffer from `channel.size()`, so the VM tried to allocate eight exabytes and
+  died with an error the caller cannot meaningfully catch. It now uses
+  `metadata()` — an `fstat`, which is what HotSpot's `nd.size(fd)` is. Better
+  for ordinary files too: the seek dance moved the position and put it back,
+  three syscalls, not atomic against a concurrent reader of the same fd, and it
+  fails outright on a non-seekable fd.
+
+* **`readAttributes(path, null, …)` answered the basic view** where the JDK
+  NPEs. Answering something for a caller who asked for nothing is the
+  fabricated-success shape; an *absent* class argument still means "no request"
+  (the Windows arm depends on that), an *explicit* null does not.
+
+```text
+                                        before   after
+java/nio/ByteBuffer                          8       2   floor
+java/nio/file/spi/FileSystemProvider         6       2   floor  (P6.2)
+java/nio/file/Files                         14       6
+java/nio/file/Path                         102     102
+```
+
+**Sixteen of eighteen families now arm at zero cost.**
+
+## P6.6 The last two families are one cause, and it is not this lane's
+
+`Files` (6) and `Path` (102) do not need four more fixes. They need one, and it
+is structural.
+
+```text
+Path.of("a/b"), with java/nio/file/Path armed
+                HotSpot          this VM unarmed    this VM ARMED
+  class         UnixPath         UnixPath           UnixPath
+  toString      a/b              a/b                sun.nio.fs.UnixPath@17234
+  equals(copy)  true             true               false
+  equalsSelf    true             true               true
+  hashCode==    true             true               true
+  getFileName   b                b                  b
+  compareTo     0                0                  0
+```
+
+`toString` returning the IDENTITY string is the tell: `Object.toString()` ran.
+Not a wrong answer from `UnixPath.toString()` — that would NPE on an unpopulated
+`path`. **`sun/nio/fs/UnixPath` here is a class NAME with no bytecode behind
+it**, and the four rows that still work are the ones our natives still answer.
+
+`Files`'s residual is the same shape one class over: real `Files.probeContentType`
+reaches `DefaultFileTypeDetector.create()`, which calls `getFileTypeDetector()`
+on `DefaultFileSystemProvider.instance()` — an object `p57_alloc_provider` mints
+as the ABSTRACT `java/nio/file/spi/FileSystemProvider`, which declares no such
+method. The registration at `nio_file.rs:6856` already says so in a comment, and
+closes the entry point rather than the cause.
+
+**Both are the fabricated-receiver family** — the roadmap's Phase-1 item, the
+same shape as `MemorySegment`-as-an-interface, and already nominated out of this
+lane in §4. Retiring a native whose class has no real bytecode underneath has
+nothing to fall through TO, so no amount of `java.io`/`java.nio` work closes
+these two: the fix is to mint the real classes, and that is a change to how this
+VM allocates paths and providers, not to what its I/O natives do.
+
+Papering it with a second fabrication — registering `getFileTypeDetector` to
+return a synthetic detector — would move the number to the floor and make the
+retirement look safe while leaving the reason it is not exactly where it was.
+Deliberately not done.
