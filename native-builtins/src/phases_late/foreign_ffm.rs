@@ -3035,11 +3035,42 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
+    // `Arena.global()` IS A SINGLETON. The JDK's is
+    // `MemorySessionImpl.GLOBAL_SESSION` -- one object for the life of the VM,
+    // and `Arena.global() == Arena.global()` is `true` on HotSpot. This minted
+    // a fresh arena on every call, in BOTH modes, so the identity was wrong and
+    // so was every per-arena table but the last: state recorded against one
+    // global arena was invisible to the next caller's.
+    //
+    // MEASURED by `apps/probes/FfmCarrierProbe.java`. The memo lives here
+    // because this registrar OWNS the slot -- `--dump-native-registry` says
+    // `owns_slot=true` here and `panama.rs`'s `register_pe_arena` owns none of
+    // the four factories, so the first version of this fix, written there, was
+    // inert and the row stayed red while the nine beside it went green.
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
+        |ctx, _args| {
+            if let Some(existing) = crate::panama::global_arena_handle()
+                .and_then(|h| ctx.resolve_global_root(h))
+            {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            let a = p67_new_arena_kind(ctx, false, false)?;
+            // A global root: the global arena outlives every native call and
+            // must survive a moving collection.
+            let handle = ctx.add_global_root(a);
+            match crate::panama::claim_global_arena(handle) {
+                None => Ok(Some(Value::Object(Some(a)))),
+                // Lost the race -- drop ours and answer with theirs.
+                Some(published) => {
+                    ctx.remove_global_root(handle);
+                    let winner = ctx.resolve_global_root(published).unwrap_or(a);
+                    Ok(Some(Value::Object(Some(winner))))
+                }
+            }
+        },
     );
     r.register(
         arena,
@@ -5142,6 +5173,36 @@ fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
             _ => false,
         };
         Ok(Some(Value::Int(i32::from(same_address && same_base))))
+    });
+    // `hashCode` OVER THE SAME PAIR `equals` USES. Registering one without the
+    // other is the classic split: `s.asSlice(0, s.byteSize()).equals(s)` is
+    // true and the two hashed differently, so a `HashSet<MemorySegment>` held
+    // the same place twice and a de-duplicating caller never saw it.
+    //
+    // The answer was already recorded in `equals`'s own comment above --
+    // `s.asSlice(0, 16).hashCode() == s.hashCode()` is `true` on HotSpot --
+    // three lines from the registration that was never written. Without this,
+    // real `AbstractMemorySegmentImpl.hashCode` runs and reads
+    // `length`/`readOnly`/`scope`, which this carrier does not have.
+    //
+    // The VALUE is not compared against HotSpot's and must not be: the JDK
+    // hashes `unsafeGetBase()` and `unsafeGetOffset()`, and an identity hash of
+    // a base array is not reproducible across VMs. What IS comparable, and what
+    // the contract requires, is that equal segments hash equal -- MEASURED by
+    // `apps/probes/FfmMsgProbe.java`.
+    r.register(ms, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let address = crate::panama_libffi::segment_address(&*ctx, this);
+        let base = p67_segment_heap_base_slot(ctx, this)
+            .map(|b| ctx.identity_hash_code(b))
+            .unwrap_or(0);
+        // `Objects.hash(base, offset)`'s shape: the JDK's own combiner, so two
+        // segments differing in either half are unlikely to collide.
+        let h = 31i32
+            .wrapping_mul(31i32.wrapping_add(base))
+            .wrapping_add(address as i32)
+            ^ ((address >> 32) as i32);
+        Ok(Some(Value::Int(h)))
     });
     r.register(
         ms,
