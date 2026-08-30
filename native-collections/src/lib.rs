@@ -65672,7 +65672,24 @@ fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if let Some(Value::Object(Some(this))) = args.first() {
         if unmod_is_immutable(&*ctx, *this) {
             let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
-            if let Some(Value::Object(Some(spl_obj))) = spl {
+            // ONLY a spliterator THIS CRATE MINTED may be written to. The
+            // backing's `spliterator()` is not guaranteed to reach
+            // `native_al_spliterator`: for a `List.of` the delegate lands on
+            // java.base's own `ArrayList.spliterator()` bytecode and hands back
+            // a REAL `ArrayList$ArrayListSpliterator`, whose slot 3 is its
+            // `this$0`. Writing a characteristics mask there clobbered it, and
+            // the next `estimateSize()` died in `getFence` with "Cannot read
+            // field modCount because this.this$0 is null" -- which is how this
+            // was found, one probe row after the change that caused it.
+            //
+            // `two-producers-of-one-carrier-class` again, in its most direct
+            // form: the synthetic `java/util/Spliterator` and the JDK's own
+            // classes both arrive here, and only one of them has a slot 3 that
+            // means what this code thinks it means.
+            let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
+                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                    == Some("java/util/Spliterator"));
+            if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
                 let this = *this;
                 let size = match ctx.get_field(spl_obj, 2) {
                     Value::Int(n) => n,

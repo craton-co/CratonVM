@@ -1157,6 +1157,28 @@ fn reflective_receiver_type_check(
     if crate::lang_reflect::is_subclass_or_unreadable(ctx, receiver_cid, declaring_class_id) {
         return Ok(());
     }
+    // The receiver may be one of CratonVM's compatibility stand-ins, whose
+    // stamped class is `cratonvm/internal/...` while `Object.getClass()`
+    // deliberately answers with the JDK class it stands in for. A caller who
+    // did `x.getClass().getDeclaredField(..)` therefore holds a `Field` whose
+    // declaring class is the JDK one, and handing `x` straight back to it
+    // compares two class ids that name the same object and never match.
+    //
+    // `System.getenv()` is the shipped example: `getClass().getName()` is
+    // `java.util.Collections$UnmodifiableMap`, `getDeclaredField("m")`
+    // resolves against that, and `Field.get(theMap)` was refused with
+    // `... field java.util.Collections$UnmodifiableMap.m on
+    // cratonvm.internal.UnmodifiableMap` -- an object rejected for not being
+    // an instance of the class it reports itself to be.
+    //
+    // Asking `getclass_display_class_id` is the same question
+    // `Object.getClass()` asks, so the check agrees with the identity the
+    // caller was given rather than with the stamp underneath it.
+    if let Some(display_cid) = crate::getclass_display_class_id(ctx, receiver_cid, recv) {
+        if display_cid == declaring_class_id || ctx.is_subclass(display_cid, declaring_class_id) {
+            return Ok(());
+        }
+    }
     // GRAMMARS 2 and 3 -- and the quirk that forces `prep` to be a parameter:
     // the GENERIC setter passes `"to"` here, so a wrong-typed receiver prints in
     // the sentence position every other rank-6 row fills with the VALUE. The
