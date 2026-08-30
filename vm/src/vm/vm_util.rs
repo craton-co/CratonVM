@@ -2750,6 +2750,45 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         false
     };
 
+    // Write ONLY a slot that still holds zero.
+    //
+    // `set_static_by_name` below writes unconditionally, so a count of
+    // repairs made with it reports "fields found", not "fields that were
+    // broken" -- and it would overwrite a correct value if the underlying
+    // ordering were ever fixed. Reading first makes the per-arm `n/total`
+    // warning a measurement: `19/19` means nineteen really were zero, and a
+    // later `0/19` means the arm has become dead weight and can go.
+    let set_static_if_zero = |field_name: &str, value: Value| {
+        let idx = {
+            let cm = shared.classes.class_manager.read();
+            cm.get_class(class_id).and_then(|cls| {
+                let mut static_idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(static_idx);
+                        }
+                        static_idx += 1;
+                    }
+                }
+                None
+            })
+        };
+        let Some(static_idx) = idx else {
+            return false;
+        };
+        let current = super::vm_object::get_static_shared(shared, class_id, static_idx);
+        let is_zero = matches!(
+            current,
+            Value::Int(0) | Value::Long(0) | Value::Object(None)
+        );
+        if !is_zero {
+            return false;
+        }
+        set_static_by_name(field_name, value)
+    };
+
+
     match class_name {
         "jdk/internal/misc/UnsafeConstants" => {
             // Inject the platform constants HotSpot would set natively at
@@ -2863,7 +2902,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "ARRAY_DOUBLE_BASE_OFFSET",
                 "ARRAY_OBJECT_BASE_OFFSET",
             ] {
-                legacy += set_static_by_name(name, Value::Int(16)) as i32;
+                legacy += set_static_if_zero(name, Value::Int(16)) as i32;
             }
             for (name, scale) in [
                 ("ARRAY_BOOLEAN_INDEX_SCALE", 1),
@@ -2876,11 +2915,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 ("ARRAY_DOUBLE_INDEX_SCALE", 8),
                 ("ARRAY_OBJECT_INDEX_SCALE", 8),
             ] {
-                legacy += set_static_by_name(name, Value::Int(scale)) as i32;
+                legacy += set_static_if_zero(name, Value::Int(scale)) as i32;
             }
             // `size_of::<usize>()`, matching `native_unsafe_address_size` and
             // the `ADDRESS_SIZE0` backfill earlier in this file.
-            legacy += set_static_by_name("ADDRESS_SIZE", Value::Int(8)) as i32;
+            legacy += set_static_if_zero("ADDRESS_SIZE", Value::Int(8)) as i32;
             tracing::warn!(
                 "Post-clinit fixup: sun.misc.Unsafe ARRAY_*/ADDRESS_SIZE populated ({legacy}/19)"
             );
