@@ -573,14 +573,34 @@ while asserting nothing — 33 assertions went dark. Restored:
 selector}_probe/`, `apps/lm_subclass/`. `probe_fixture_census` is the instrument
 that catches this and it was correctly red the whole time.
 
-**OPEN, unowned, and worth someone's morning:**
-`warm_null_receiver_invokes_throw_npe_jit` — once its inline cache is warm,
-`invokespecial` on a NULL receiver does not throw, and the callee runs with
-`this == null`. JVMS §6.5, and the test names the consequence it was written
-for: the bogus `Cannot read field "interfaces" because "rd" is null` at
-`Class.java:1217`. Reproduced identically on four binaries spanning this
-session, so it is not recent. `invokevirtual` and `invokeinterface` both throw
-correctly; only `invokespecial` is wrong.
+**~~OPEN, unowned, and worth someone's morning:~~ FIXED 2026-08-30.**
+`warm_null_receiver_invokes_throw_npe_jit` — `invokespecial` on a NULL receiver
+did not throw once warm, and the callee ran with `this == null`. JVMS §6.5, and
+the mechanism behind the bogus `Cannot read field "interfaces" because "rd" is
+null` at `Class.java:1217`.
+
+**It was not the inline cache.** `invokevirtual`/`invokeinterface` were right
+only incidentally — their cache tests the receiver's CLASS, so a null fails
+every guard. `invokespecial` is statically bound, and both of the emitters that
+bind it jump straight into the compiled callee. The only thing left to raise the
+NPE was the callee body faulting on its own, which it does only if it
+dereferences `this`:
+
+```text
+  private callee body     HotSpot   --nojit   jit (before)
+  return 3;               NPE       NPE       NO-THROW(3)
+  return this.x;          NPE       NPE       NPE
+  return helper();        NPE       NPE       NO-THROW(5)
+```
+
+**Two emitters, and the first fix went to a third that was not involved.** The
+single-pass direct call (`x64/bytecode_walk.rs`) and the optimizing tier's
+`emit_direct_cross_call` (`ir_lower.rs`) both needed the check; which one runs
+depends on the callee, so `return 3;` and `return helper();` were fixed by
+different patches. `CRATONVM_DBG_IR_COMPILES` and `CRATONVM_DBG_JIT_GEN` name
+the tier and the path — reach for them before patching an emitter, because the
+disassembly of the *caller* is what proves the callee was not inlined.
+`apps/probes/NrpVariants.java` is the three-body probe.
 
 ### dev's tip is frequently red
 

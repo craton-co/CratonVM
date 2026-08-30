@@ -322,6 +322,19 @@ public class UtilCoverageSweep {
         p("spl Set.of()", Set.of().spliterator().characteristics());
         p("spl Set.of(1,2)", Set.of("a", "b").spliterator().characteristics());
         p("spl Set.of x3 (SetN)", Set.of("a", "b", "c").spliterator().characteristics());
+        // Is the immutable marker set for each factory? RULE I (a null query on
+        // an immutable is an NPE) fires only when it is, so this reads the flag
+        // without needing a debug build.
+        tv("List.of contains null", () -> List.of("a").contains(null));
+        tv("Set.of contains null", () -> Set.of("a").contains(null));
+        tv("Map.of containsKey null", () -> Map.of("a", 1).containsKey(null));
+        tv("unmodifiableList contains null", () -> Collections.unmodifiableList(
+                new ArrayList<>(Arrays.asList("a"))).contains(null));
+        // Slot 2 of the synthetic spliterator is what estimateSize reports, so
+        // this reads the size the characteristics rule is keying on.
+        p("est List.of(1)", List.of("a").spliterator().estimateSize());
+        p("est Set.of(1)", Set.of("a").spliterator().estimateSize());
+        p("est List.of(3)", List.of("a", "b", "c").spliterator().estimateSize());
         p("spl List.of()", List.of().spliterator().characteristics());
         p("spl List.of(1)", List.of("a").spliterator().characteristics());
         p("spl List.of x3", List.of("a", "b", "c").spliterator().characteristics());
