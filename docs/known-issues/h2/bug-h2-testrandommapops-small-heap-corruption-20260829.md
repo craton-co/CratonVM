@@ -219,23 +219,92 @@ Inlining is present in only 45 of 228 and 9 of 54 (20% and 17%), so a spliced
 callee's unnamed locals are *a* contributor and not the whole of it — the average stale frame
 names 4.5 slots and carries several more live from-addresses than that.
 
-**Caveat, stated because the count is a heuristic**: `stale_words` counts frame
-words whose value is a pointer-map key. A dead slot or a spilled non-reference
-integer that happens to equal a moved object's old address would be counted
-too. At 228 frames of 235 and 2 844 words that is not a coincidence budget
-anyone can spend, but the *exact* count is an upper bound, not a proof of 2 844
-live misses.
+**The caveat that count needed has now been paid off, and it mattered.**
+`stale_words` counted every frame word that is a pointer-map key, and the
+spill cursor *reclaims by moving, it does not clear* — so a from-space address
+above `live_frame_hi` is DEAD storage, not a missed root. The instrument now
+splits them (`stale_live` / `stale_dead` / `stale_unknown`, using the
+`live_frame_hi` the band verifier already reads). Re-measured:
+
+| rep | rc | secs | frames | frames with a **LIVE** stale word | **LIVE** words | dead words | `cov_complete` on stale frames |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 1 | 1 | 472 | 344 | **248 (72%)** | **761** | 3 559 | TRUE=342, false=0 |
+| 2 | 1 | 72 | 74 | **56 (76%)** | **159** | 721 | TRUE=74, false=0 |
+
+So roughly five in six of the original 2 844 were reclaimed spill and are
+correctly ignorable — **and 761 + 159 were not.** Those are references inside
+the live band, holding addresses the collection has a forwarding entry for,
+that nothing rewrote. Every frame carrying one declared complete coverage;
+across both runs, 416 stale frames and not one `cov_complete=false`.
+
+### The minimal witness: `String.substring(II)`, safepoint 41
+
+The same frame appears in both runs, byte for byte apart from the addresses:
+
+```text
+[remap-frame] method=java/lang/String.substring:(II)Ljava/lang/String;
+  sp_id=41 frame_size=752 cov_complete=true live_hi=120
+  mapped=[ 8=0x20012279540 ] rewritten=1 inlined=[]
+  stale_words=7 stale_live=2 stale_dead=5
+  [LIVE off=112 stale=0x200137525e0->0x20012279590]
+  [LIVE off=88  stale=0x200137525e0->0x20012279590]
+```
+
+The live band is `off < 120`. The map names **one** slot — offset 8, the
+`this` parameter home — and rewrites it. Offsets **88 and 112 are inside that
+band**, both hold the *same* reference, and the collector has a forwarding
+entry for it. They are left pointing at the pre-move address.
+
+**`inlined=[]`.** No splice, no unnamed callee locals. That retires the
+hypothesis this page reached for first: it is not a spliced callee's locals,
+it is a plain method whose own live operand slots are not in its own map.
+
+`FileStore.submitOrRun` makes the same point from the other side:
+
+```text
+mapped=[ 8=0x0 16=0x20012282400 104=0x20012282400 ] rewritten=2 live_hi=112
+stale_live=1 [LIVE off=96 stale=0x2001ad221b0->0x20012282400]
+```
+
+Slots 16 and 104 were named, rewritten, and now hold the NEW address. Slot 96
+— also inside the live band — still holds the OLD address of that same object.
+The map found two homes of one reference and missed a third.
+
+### What is actually wrong
+
+`ir_lower::emit_safepoint_map` builds `slots` from exactly two sources: the
+reference PARAMETER homes, and every `IrType::Ref` node that has a slot. It
+sets `coverable = false` only when a `Ref` node has no slot or an unencodable
+offset. **A live copy of a reference sitting in an operand-spill slot that is
+not a `Ref` node's own home is in neither source, and its absence does not
+clear `coverable`.** The map is therefore complete with respect to what the
+lowerer enumerates and incomplete with respect to what the frame holds — and
+`moving_young_coverage_complete` is the flag relocation is gated on.
+
+The contract block above that function states obligation 3 as
+*"`frame_slot_offsets` naming every frame slot that holds a live reference"*.
+That is the obligation not being met; the code checks a narrower property and
+reports it under the wider name.
 
 ### Next, in order
 
-1. **Find why `coverage_complete` is true here.** It is the claim that is
-   demonstrably false, and it is what relocation is gated on. The
-   `scauses(...)` census on the sibling ZGC page
-   (`dataflow=151 marks=83 inline_scope=5`) is the compile-time half of the
-   same question.
-2. Whether the map is *incomplete* or the *rewrite* skips slots it named —
-   `mapped=[…] rewritten=N` versus `stale_words` in one line separates those,
-   and above they disagree in the same frame.
+1. **`String.substring(II)` at safepoint 41 is a one-method reproducer.** It
+   is deterministic across runs and needs no H2 — a unit test that compiles it,
+   relocates under a live frame and asserts `stale_live == 0` would fail today
+   and is the regression test this repair wants.
+2. **Repair direction, and why it is not a one-liner.** Either the lowerer
+   names every live-band slot holding a reference (it does not know about
+   copies it did not allocate), or `coverable` is cleared whenever it cannot
+   prove it did — which is the fail-closed direction the surrounding code
+   already prefers and which would cost relocation on most frames until the
+   first option lands.
+3. **Consider defaulting `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` to OFF in the
+   meantime.** `relocate_stw`'s own doc says the consumer audit is *"the reason
+   this stays behind a default-off flag"*; it no longer is, and the proof it
+   relies on is measurably unsound. That is a project call, not a drive-by:
+   it trades this corruption for the fragmentation the arena column shows
+   (`arena=8-10` whenever relocation stops), and another lane is actively
+   working the peer-side half of the same coverage question.
 
 ## Why "repro and dump" WAS the wrong instrument
 

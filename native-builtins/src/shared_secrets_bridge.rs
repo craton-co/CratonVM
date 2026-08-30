@@ -311,12 +311,15 @@ fn alloc_singleton(
     // exactly the one getter whose helper calls that function directly, and
     // left the nine that take the real-class arm untouched -- see
     // `apps/probes/JdkInternalSweep.java`, which said so in nine rows.
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get(owner_class)
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
-    {
+    // The guard is scoped to this ONE statement on purpose. Written as
+    // `if let Some(x) = ...lock().get(..).and_then(|h| ctx.resolve_global_root(h))`
+    // the temporary guard lives to the end of the `if let`, so the
+    // `resolve_global_root` call inside the chain runs with this lock HELD --
+    // a native-builtins lock held across a re-entry into the VM, which is the
+    // exact edge `lock_discipline_ratchet` exists to keep out of this crate.
+    // Copy the handle out, drop the guard at the semicolon, then resolve.
+    let published = synthetic_singleton_roots().lock().get(owner_class).copied();
+    if let Some(existing) = published.and_then(|h| ctx.resolve_global_root(h)) {
         return Ok(existing);
     }
     // Resolve the real class when the image has it. The synthetic fallback
@@ -395,12 +398,15 @@ fn alloc_named_synthetic_singleton(
     ctx: &mut dyn NativeContext,
     owner_class: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get(owner_class)
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
-    {
+    // The guard is scoped to this ONE statement on purpose. Written as
+    // `if let Some(x) = ...lock().get(..).and_then(|h| ctx.resolve_global_root(h))`
+    // the temporary guard lives to the end of the `if let`, so the
+    // `resolve_global_root` call inside the chain runs with this lock HELD --
+    // a native-builtins lock held across a re-entry into the VM, which is the
+    // exact edge `lock_discipline_ratchet` exists to keep out of this crate.
+    // Copy the handle out, drop the guard at the semicolon, then resolve.
+    let published = synthetic_singleton_roots().lock().get(owner_class).copied();
+    if let Some(existing) = published.and_then(|h| ctx.resolve_global_root(h)) {
         return Ok(existing);
     }
     let cid = crate::util_concurrent_ext::refused_class(ctx, owner_class, 1)?;
@@ -410,12 +416,32 @@ fn alloc_named_synthetic_singleton(
 }
 
 /// Owner class name -> the global-root handle of its one accessor object.
-fn synthetic_singleton_roots(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<String, usize>> {
+///
+/// `OrderedPlMutex` at `LockLevel::Scratch` (L0), not a bare `parking_lot::Mutex`.
+/// `lock_discipline_ratchet` holds this crate to a raw-lock baseline because it
+/// RE-ENTERS the VM -- a native callback calls back into Java, which takes the
+/// heap and L10 class-manager locks -- so a global lock here with no level is a
+/// deadlock the order checker cannot see, and the ratchet says do not raise the
+/// baseline.
+///
+/// L0 is the level this lock EARNS rather than the cheapest one available: the
+/// rule is that a thread holding level N may only acquire strictly below N, and
+/// L0 therefore asserts that NOTHING is acquired while this guard is held. That
+/// is true only after the fix above -- every call site now copies the handle
+/// out and drops the guard before touching `ctx`. `servlet.rs` uses the same
+/// level for the same reason.
+fn synthetic_singleton_roots() -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    std::collections::HashMap<String, usize>,
+> {
     static ROOTS: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<String, usize>>,
     > = std::sync::OnceLock::new();
-    ROOTS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    ROOTS.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn alloc_java_nio_access_singleton(
@@ -429,12 +455,15 @@ fn alloc_java_nio_access_singleton(
     // this getter is as stable as the other nine -- `alloc_owner_instance`
     // allocates on every call, and the JDK's `getJavaNioAccess()` answers one
     // object for the life of the VM.
-    if let Some(existing) = synthetic_singleton_roots()
-        .lock()
-        .get("java/nio/Buffer$2")
-        .copied()
-        .and_then(|h| ctx.resolve_global_root(h))
-    {
+    // The guard is scoped to this ONE statement on purpose. Written as
+    // `if let Some(x) = ...lock().get(..).and_then(|h| ctx.resolve_global_root(h))`
+    // the temporary guard lives to the end of the `if let`, so the
+    // `resolve_global_root` call inside the chain runs with this lock HELD --
+    // a native-builtins lock held across a re-entry into the VM, which is the
+    // exact edge `lock_discipline_ratchet` exists to keep out of this crate.
+    // Copy the handle out, drop the guard at the semicolon, then resolve.
+    let published = synthetic_singleton_roots().lock().get("java/nio/Buffer$2").copied();
+    if let Some(existing) = published.and_then(|h| ctx.resolve_global_root(h)) {
         return Ok(existing);
     }
     let fresh = alloc_owner_instance(ctx, "java/nio/Buffer$2")
