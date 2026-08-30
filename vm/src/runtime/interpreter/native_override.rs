@@ -2003,9 +2003,13 @@ pub(crate) fn is_input_stream_transfer_to_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // Kept in step with `register_p59_bulk_stream_transfer`, which no longer
+    // registers on `java/io/InputStream`: an override of the ROOT class covers
+    // every stream in the process, and a method served from Rust cannot carry
+    // an agent's woven advice. See that registrar for the measurement.
     matches!(
         class_name,
-        "java/io/InputStream" | "java/io/FileInputStream"
+        "java/io/ByteArrayInputStream" | "java/io/FileInputStream"
     ) && method_name == "transferTo"
         && descriptor == "(Ljava/io/OutputStream;)J"
 }
