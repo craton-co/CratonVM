@@ -385,6 +385,20 @@ constant because the trade is real, because the ZGC lane needs something to
 bisect against, and because whoever hits the fragmentation side needs a lever
 that is not "turn off relocation entirely".
 
+### The switch, verified in both directions
+
+One binary, one workload, the flag the only difference:
+
+| `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` | `compaction_cycles` | `objects_relocated` | `relocation_skipped_jit` | **LIVE stale words** |
+|---|---:|---:|---:|---:|
+| ON (default) | 0 | 0 | 26 | **0** |
+| `=0` (pre-fix) | 26 | 154 | 0 | **33** |
+
+That is the causal chain end to end and in a single binary: turn the gate off,
+relocation runs under short maps and live stale words come back; turn it on,
+they are gone and relocation declines instead. It also means neither arm of
+this page's trade can be claimed without the other being measurable.
+
 ### The follow-up that removes the cost
 
 All three `staged_unmappable` sites are the same shape in
