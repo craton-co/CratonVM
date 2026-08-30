@@ -284,10 +284,16 @@ neither belongs to this lane:
 
 * **`org.h2.test.db.TestOpenClose`** — fails in both modes after ~350–450 s,
   against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
-* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with a
-  reproducible seed, which is the useful part:
-  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`. That is an
-  MVStore random-operation fuzz with the seed printed, so it replays.
+* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with
+  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`.
+  **Already owned:** `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+  whose own history records that the printed seeds do NOT replay, so that number
+  is not the lead it looks like. What this lane's measurement did add is on that
+  page as an addendum: the defect is **not** confined to the small heap the page
+  studies — 1g fails 4 of 4 and **4g fails too**, heap buying latency rather than
+  safety, and at 1g and above the dominant face is a WRONG ANSWER
+  (`Expected: 247 actual: 198`, a map short of entries) rather than the crash the
+  page opens with.
 
 ### The 21 that still do not finish
 

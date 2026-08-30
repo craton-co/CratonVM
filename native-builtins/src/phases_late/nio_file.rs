@@ -5849,11 +5849,53 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // recover from — where the kernel's `O_NOFOLLOW` would have said
             // `ELOOP`. The delegation to `newFileChannel` below carries the same
             // check for every other case; this one has to be here.
-            if fsp_scan_open_options(ctx, args.get(2).copied()).nofollow {
+            let open_opts = fsp_scan_open_options(ctx, args.get(2).copied());
+            if open_opts.nofollow {
                 if let Some(refused) = p57_nofollow_reject(&p) {
                     return Err(refused);
                 }
             }
+            // CREATE_NEW MEANS FAIL IF IT EXISTS, and this door did not check.
+            // `fsp_new_output_stream` has the check; the real
+            // `FileSystemProvider.newOutputStream` bytecode does not call that
+            // native, it calls THIS one — so the guarantee held only while our
+            // own `newOutputStream` answered:
+            //
+            //   Files.createFile(<existing>)                 no throw, was FAEE
+            //   Files.newOutputStream(<existing>, CREATE_NEW) no throw, was FAEE
+            //   Files.copy(in, <existing>)                    no throw, was FAEE
+            //
+            // Three rows, two dial scopes, one missing check. CREATE_NEW is the
+            // option callers use to mean "I must be the one who creates this" —
+            // an exclusive-create that quietly opens the existing file instead
+            // is a lost-update, not a wrong exception.
+            //
+            // MEASURED with the shadow dial armed over
+            // `java/nio/file/spi/FileSystemProvider` and `java/nio/file/Files`.
+            if open_opts.create_new && std::path::Path::new(&p).exists() {
+                return Err(p57_file_already_exists(ctx, &p));
+            }
+            // NOT REFUSED HERE, and the attempt to is worth recording.
+            //
+            // `Files.readAllBytes(<a directory>)` raises `OutOfMemoryError` on
+            // this VM where HotSpot raises `IOException` — found with the dial
+            // armed over `java/nio/file/Files`. Refusing a directory at open
+            // looked like the fix and is wrong twice over:
+            //
+            //   open READ  on a dir   Linux ALLOWS it; the failure is EISDIR at
+            //                         the first read, which is why HotSpot's
+            //                         answer is a plain `IOException`
+            //   open WRITE on a dir   already correct here — HotSpot raises
+            //                         `java.nio.file.FileSystemException` and so
+            //                         did this VM, until a blanket refusal
+            //                         downgraded it to a bare `IOException`
+            //
+            // That blanket check turned a green row red (`L4FilesSweep`,
+            // "newByteChannel on dir for write") — the same right-behaviour
+            // wrong-type defect this same commit fixes three of. The real
+            // source of the OOME is whatever `readAllBytes` sizes its buffer
+            // from, one layer up, and it is left OPEN rather than papered over
+            // from here.
             // Preserve the NIO missing-file contract: opening a non-existent
             // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
             // `java.nio.file.NoSuchFileException`, which frameworks catch to treat
