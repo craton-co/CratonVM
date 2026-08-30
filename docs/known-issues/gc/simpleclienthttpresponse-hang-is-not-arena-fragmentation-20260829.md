@@ -60,33 +60,91 @@ its W7-84 autobox sibling. **The `zgc frag gauge` line carries no `occurrence`
 field at all.** Both guards live in `cratonvm::gc::guard`, which is how the two
 came to be read as one symptom.
 
-## What it looks like it IS
+## The coercion storm is NOT the cause either — censused 2026-08-30
 
-At least **1,048,576** descriptor-coercion events in a 500 s run, and ≥524,288
-in 240 s — a sustained rate, not a burst. The class is an HTTP-client test built
-almost entirely out of Mockito mocks.
+The first version of this page stopped at "at least 1,048,576
+descriptor-coercion events" and offered that as what the hang looks like. The
+census it listed as not-yet-done has now been taken, and it retires that
+reading. **The storm is designed behaviour, and every workload has it.**
 
-A backtrace census is available but is **dangerous to take casually**:
-`CRATONVM_DBG_COERCION=1` on this class wrote **690 MB in 120 seconds** and
-filled `/` on the shared Azure host (since cleaned up). Take it to a file on
-`/data`, with a cap, or use the throttled `occurrence=` counter as above.
+### What the storm is, exactly
 
-See `known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md`
-for the mechanism, and note its own reconciliation banner: the guard sees
-descriptor MISMATCHES only, so this count is a count of wrong-*typed* writes and
-not of wrong writes. A quiet log is not a clean one, and a loud one is not
-necessarily the whole story either.
+289 backtraces in a 3 MB sample, and they are **one shape**:
+
+```text
+species="primitive-into-reference"  access="read"  descriptor=[  value=Int(0)
+class_id=64 index=2                        289 of 289
+[layout] java/util/HashMap cid=64
+```
+
+`java.util.HashMap`, slot 2 — the `table : HashMap$Node[]` field — read back as
+`Int(0)`. Every one of them arrives through `native-collections`'s `map_state`:
+
+| count | path into `map_state` |
+|---:|---|
+| 184 | `map_resize_inner <- map_resize <- native_map_put_evict_pinned` |
+| 93 | `native_map_put_evict_pinned <- native_map_put <- native_hs_add` |
+| 12 | `map_collect_keys <- collect_view_snapshot_ordered <- native_hs_iterator` |
+
+### Why that is not a defect
+
+`known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md`
+already has this row, and marks it **DESIGNED-DEGRADE**:
+
+> `HashMap.table` receiving `Int(capacity)` | degrades to null | **degrades to
+> null**, pinned by a test (§5)
+
+and, in its §1: *"The rule is deliberate, tagged `S111r29`, and load-bearing for
+`HashMap`."* The VM's own `native_map_init` writes the capacity as an `Int` into
+the JDK `table` slot; the descriptor-aware read turning that into `null` is the
+wanted answer, not a loss.
+
+MEASURED, and this is what settles it — a twenty-line program on the same
+binary:
+
+```java
+Map<String,String> m = new HashMap<>();
+for (int i = 0; i < 20000; i++) m.put("k"+i, "v"+i);
+for (String k : m.keySet()) { }
+Set<String> s = new HashSet<>();
+for (int i = 0; i < 20000; i++) s.add("s"+i);
+```
+
+**2,718 coercion-loss events, all `class_id=64 index=2`** — the identical
+species and slot — and the answers match HotSpot exactly
+(`size=20000 iter=20000 set=20000`). Any program that uses a `HashMap` produces
+this. It is not a property of this test, and a counter that climbs into the
+millions over 500 s is a counter on a hot path, not a smoking gun.
+
+### So the hang is still undiagnosed — but two candidates are now excluded
+
+* **not arena fragmentation** — the gauge fires zero times in arms that hang
+  identically (above);
+* **not the coercion storm** — designed, universal, and present in a program
+  that finishes instantly.
+
+Also measured: the storm is **not JIT-specific**. A `--nojit` arm produces it at
+the same rate (both arms saturated a 150 MB capped log inside a 90 s cap).
+
+**The lesson this page has now taught twice.** The loudest signal in the log was
+first read as the fragmentation guard's (it belongs to a different guard), and
+then as a defect (it is designed). A rate is not evidence of a cause until
+something without the failure has been measured for the same rate.
 
 ## Not yet done
 
-- The backtrace census, taken safely, to name the coercing site(s). That is the
-  one measurement that turns this from "re-attributed" into "diagnosed".
-- Whether the hang is the coercion storm's cost or something the storm is a
-  symptom of. Over a million events is enough to be the cost by itself, but
-  that has not been separated from "the same wrong write is also breaking the
-  logic and the test is spinning on it".
-- A `--nojit` arm, which the fragmentation matrix did not include and which
-  would say whether the storm is JIT-path-specific.
+- **What the class is actually doing.** Both eliminations above are negative
+  results; nothing yet says where the 500 s goes. The next instrument is a
+  sampling profile or a thread dump partway through, not another guard counter —
+  two guard counters have now each been chased to a dead end.
+- Whether the 184-of-289 `map_resize` share is itself interesting. It says
+  resize-path calls to `map_state` outnumber plain-put calls two to one AMONG
+  COERCING CALLS, which is not the same as a resize rate; `map_resize` calls
+  `map_state` more than once, so this may be arithmetic rather than a signal.
+  It has not been separated.
+- The Mockito angle, untouched: this is an HTTP-client test built almost
+  entirely of mocks, and `known-issues` already carries several
+  Mockito-dispatch records.
 
 ## Repro
 
