@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Stage 1 of 4 — **internal diagnostic**. `--jdk-only` may fail on programs that run fine under `--real-jdk`; that is the intended signal, not a bug in your program. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) |
-| **Companions** | [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md) · [`jdk-only-native-review.md`](jdk-only-native-review.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) |
+| **Companions** | [`jdk-only-runtime-services.md`](known-issues/jdk-only/runtime-services-blocker-inventory.md) · [`jdk-only-native-review.md`](jdk-only-native-review.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) · [`contributing/jdk-only-lane-operations.md`](contributing/jdk-only-lane-operations.md) |
 
 ## What the flag means
 
