@@ -1773,7 +1773,18 @@ impl RuntimeError {
             }
             RuntimeError::IllegalMonitorStateException { message } => (
                 "java/lang/IllegalMonitorStateException",
-                Some(message.as_str()),
+                // An EMPTY message is NO message, the same marker
+                // `IllegalArgumentException` and `EOFException` carry above.
+                // HotSpot's `StampedLock.unlock*(badStamp)` and
+                // `Object.wait()`-off-monitor raise this with a null message;
+                // `Some("")` would build it with a non-null empty string, which
+                // a caller printing `getMessage()` can tell apart. No site in
+                // the workspace passes a deliberate empty IMSE message.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
             ),
             RuntimeError::StringIndexOutOfBoundsException { message, .. } => (
                 "java/lang/StringIndexOutOfBoundsException",

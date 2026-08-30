@@ -1075,6 +1075,20 @@ pub struct GcFlags {
     pub sp_stats: bool,
     /// `CRATONVM_SP_TRACE`
     pub sp_trace: bool,
+
+    /// `CRATONVM_IDENTITY_HASH_EVICT` — [`parse::on_unless_zero`].
+    ///
+    /// Whether the sweep tells the native side tables keyed by identity
+    /// hash which of their keys just died
+    /// (`cratonvm_types::identity_side_tables`). ON by default: with it
+    /// off, every such table grows for the life of the process, which is
+    /// the native-memory leak the flag exists to A/B rather than a
+    /// behaviour anyone should choose.
+    ///
+    /// It is a kill switch for exactly that measurement — one binary,
+    /// two arms — and for the case where a table turns out to key
+    /// something whose lifetime is NOT the object's.
+    pub identity_hash_evict: bool,
 }
 
 impl GcFlags {
@@ -1106,6 +1120,7 @@ impl GcFlags {
             g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
