@@ -352,29 +352,70 @@ fn set_seed(ctx: &mut dyn NativeContext, obj: ObjectRef, user_seed: i64) {
     });
 }
 
-/// Install an entropy-derived seed for this object — used by the
-/// no-arg constructor.  We use an OS entropy draw (or a system-time
-/// fallback) so each unseeded `new Random()` produces a distinct
-/// sequence, just like the JDK.
-fn set_entropy_seed(ctx: &mut dyn NativeContext, obj: ObjectRef) {
-    let user_seed = os_random_u64().map(|u| u as i64).unwrap_or_else(|| {
-        // Last-resort fallback — should never trigger on a well-
-        // configured system.  The two-component mix keeps us out
-        // of trivially-collidable seed space.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        let counter = ENTROPY_FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        nanos
-            .wrapping_mul(0x9E3779B97F4A7C15u64 as i64)
-            .wrapping_add(counter as i64)
-    });
-    set_seed(ctx, obj, user_seed);
+/// `java.util.Random`'s seed uniquifier, verbatim from the JDK:
+///
+/// ```text
+/// private static long seedUniquifier() {
+///     for (;;) {
+///         long current = seedUniquifier.get();
+///         long next = current * 1181783497276652981L;
+///         if (seedUniquifier.compareAndSet(current, next)) return next;
+///     }
+/// }
+/// private static final AtomicLong seedUniquifier = new AtomicLong(8682522807148012L);
+/// ```
+///
+/// Both constants are the JDK's. The multiply is what makes successive
+/// no-arg constructions diverge even when `System.nanoTime()` has not ticked
+/// between them, which is the property the old OS-entropy draw was really
+/// buying and the reason a bare timestamp would not do.
+static SEED_UNIQUIFIER: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(8682522807148012);
+
+fn seed_uniquifier() -> i64 {
+    use std::sync::atomic::Ordering;
+    loop {
+        let current = SEED_UNIQUIFIER.load(Ordering::Relaxed);
+        let next = current.wrapping_mul(1181783497276652981);
+        if SEED_UNIQUIFIER
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
-static ENTROPY_FALLBACK_COUNTER: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
+/// Install the seed for an unseeded `new Random()`.
+///
+/// `java.util.Random()` is SPECIFIED as `this(seedUniquifier() ^
+/// System.nanoTime())`, and that is now what this does. It used to draw from
+/// the OS CSPRNG — `BCryptGenRandom` on Windows, an `open`+`read` of
+/// `/dev/urandom` on Linux — once per construction.
+///
+/// Two reasons that was wrong, in order of importance:
+///
+/// 1. **It is not what the spec says.** `java.util.Random` is documented as not
+///    cryptographically secure; drawing from a CSPRNG for it buys no property
+///    any caller may rely on, and the JDK's own algorithm is public and cheap.
+/// 2. **It was a syscall per construction**, on a class whose whole point is to
+///    be cheap. `JpaLargeBlobTest.jpaBlobStream`'s fixture calls `new Random()`
+///    once PER BYTE of a 100,000,000-byte stream, so the draw was a syscall per
+///    byte. MEASURED on this host, `probes/BlobStreamCost.java`: the unseeded
+///    constructor cost 982.2 ns/op against the seeded one's 832.0 — the ~150 ns
+///    gap is this draw.
+///
+/// Distinctness is preserved and is still checked: `probes/RandomSpec.java`'s
+/// `unseeded-distinct` row asserts two successive `new Random()` instances
+/// produce different sequences, which the uniquifier's multiply guarantees
+/// without consulting the clock at all.
+fn set_entropy_seed(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    set_seed(ctx, obj, seed_uniquifier() ^ nanos);
+}
 
 /// Run one LCG step on this object's stored seed and return the top
 /// `bits` bits.  This is the JDK's protected `next(int bits)` method:
@@ -394,16 +435,17 @@ fn lcg_next(ctx: &mut dyn NativeContext, obj: ObjectRef, bits: u32) -> i32 {
         let old = match t.get(&key) {
             Some(s) => *s,
             None => {
-                // Lazy initialization with OS entropy — defensive:
-                // shouldn't happen, but if it does we don't want to
-                // emit zeros forever.
-                let s = os_random_u64().map(|u| u & LCG_MASK).unwrap_or_else(|| {
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(1);
-                    nanos & LCG_MASK
-                });
+                // Lazy initialization — defensive: the constructor always
+                // seeds, but if it was somehow missed we must not emit zeros
+                // forever. Uses the same rule as `set_entropy_seed` so the
+                // module has ONE seeding policy rather than two that disagree
+                // about whether `java.util.Random` needs a CSPRNG (it does
+                // not, and this path used to spend a syscall deciding so).
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(1);
+                let s = scramble_seed(seed_uniquifier() ^ nanos);
                 t.insert(key, s);
                 s
             }
