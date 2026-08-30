@@ -5165,7 +5165,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
 /// one `class_manager` read + a generation lookup, but only at the handful of
 /// dispatch sites that were about to serve a native/intrinsic shadow.
 #[inline]
-pub(super) fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> bool {
+pub(crate) fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> bool {
     if !crate::classloading::any_class_redefined() {
         return false;
     }

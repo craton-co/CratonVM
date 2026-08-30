@@ -210,6 +210,16 @@ fn reject_missing_implementation(
 /// probe never got there.
 static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times `invoke_or_native` dropped a registered native because an agent had
+/// woven the class it is declared on. Non-zero on any run with an inline mock
+/// maker, zero on every run without one.
+static NATIVE_SHADOW_DROPPED_BY_REDEFINE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`NATIVE_SHADOW_DROPPED_BY_REDEFINE`].
+pub fn native_shadow_dropped_by_redefine() -> u64 {
+    NATIVE_SHADOW_DROPPED_BY_REDEFINE.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Times a `check_override` NAME disjunct was dropped because an agent had
 /// redefined the declaring class, so its woven bytecode is authoritative.
 ///
@@ -19349,12 +19359,65 @@ pub fn invoke_or_native(
     // with no field probe, and it is what keeps `ctx.invoke_virtual(pool,
     // "execute", ...)` from recursing into the same native forever (a real
     // stack overflow, confirmed via gdb, in the bug this probe was born from).
-    if let Some((callback, native_kind)) =
+    // JVMTI REDEFINE GUARD. "Always check native registry first" is right
+    // until an agent has woven advice into the class's own bytecode, at which
+    // point that bytecode is authoritative and a registered native shadowing it
+    // silently drops the instrumentation.
+    //
+    // This door is the one REFLECTION uses. `Method.invoke` reaches it as
+    // `native_method_invoke` -> `invoke_virtual` -> `invoke_or_native`, which is
+    // exactly how an instrumentation agent calls the real method, and it is how
+    // `org.springframework.http.client.SimpleClientHttpResponseTests` came to
+    // hang for a day as a suspected GC fragmentation bug. Named by a backtrace
+    // taken inside the native itself; guarding the four dispatch_virtual /
+    // invoke.rs doors first was not enough, because none of them is on this
+    // path.
+    //
+    // Mockito's inline mock maker weaves `java.io.InputStream`;
+    // `willCallRealMethod` then reflects into the real `transferTo`, landed
+    // here, and ran CratonVM's registered `transferTo` native. The advice never
+    // re-entered, so Mockito's `SelfCallInfo` self-call grant was never consumed
+    // and leaked one step: the NEXT intercepted call (`read([BII)`) was
+    // swallowed as a self-call and ran the real JDK body, which loops on
+    // `read()` -- answered with an unstubbed default 0 -- filling the buffer and
+    // reporting progress forever. The stubbed NullPointerException the test
+    // asserts on is never thrown and `transferTo` never returns.
+    //
+    // Which body ran is settled without a debugger by the buffer size: the
+    // native copies through 16 MiB, the JDK body through 16384. The mock saw
+    // 16777216 on every call where HotSpot saw 16384, while `readNBytes` and
+    // `skip` -- same shape, no native registered -- were intercepted correctly
+    // in the same run.
+    //
+    // The immunity allow-list is consulted exactly as the other doors consult
+    // it: mocking one `StringBuilder` or one synthetic collection must not
+    // expose real JDK bytecode that would read a layout CratonVM's instances do
+    // not carry. `native_shadow_suppressed_by_redefine`'s own first line is
+    // `if !any_class_redefined() { return false }`, a relaxed atomic load, so a
+    // process with no agent pays that and nothing else.
+    let native_shadow_dropped_by_redefine =
+        crate::runtime::interpreter::native_shadow_suppressed_by_redefine(shared, effective_class)
+            && !crate::runtime::interpreter::redefine_immune_forced_native(
+                effective_class,
+                method_name,
+                descriptor,
+            );
+    if native_shadow_dropped_by_redefine {
+        NATIVE_SHADOW_DROPPED_BY_REDEFINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::runtime::env_cache::dbg_native_shadow() {
+            eprintln!(
+                "[native-shadow] dropped for redefined class: {effective_class}.{method_name}{descriptor}"
+            );
+        }
+    }
+    if let Some((callback, native_kind)) = if native_shadow_dropped_by_redefine {
+        None
+    } else {
         shared
             .natives
             .native_methods
             .find_with_kind(effective_class, method_name, descriptor)
-    {
+    } {
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
         }
