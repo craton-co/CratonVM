@@ -1112,3 +1112,149 @@ this section confirms: 513+ rescued calls in a vector that passes.
 
 Both instruments stay in the tree (`note_unsafe_side_store_offset` now reports
 `caller` and `site_line`), so the next measurement costs a run and no probe.
+
+## 16. R5 CLOSED: it was never an offset that resolved to 0
+
+§15.3 named the remaining question as *"which field's offset resolved to 0."*
+That question had a false premise, and finding that out took four instruments —
+each of which killed the one before it.
+
+### 16.1 The frame walk was reading the wrong end of the stack
+
+§15's attribution came from `frame_class_ids`, whose doc says **"innermost
+(most recent call) first"**. Adding method names meant switching to
+`capture_stack_trace`, which carries `method_name` and `byte_code_index`. Its
+first three entries came back as
+
+```text
+org/h2/test/db/TestFullText.main+6
+  <- org/h2/test/TestBase.testFromMain+8
+    <- org/h2/test/db/TestFullText.test+77
+```
+
+for **every** call site — and `main` *calls* `testFromMain` *calls* `test`. A
+second case on another thread agreed: `Task.run+1 <- TestFullText$1.call+163 <-
+JdbcPreparedStatement.execute+161`.
+
+**`capture_stack_trace` returns OUTERMOST-first; `frame_class_ids` returns
+innermost-first.** Neither doc mentions the other, and nothing in the tree
+depends on both. Reading the front of one gave the stack's floor, which is
+identical for every call site in a vector and therefore says nothing.
+
+Reversed, with the `Unsafe` skip removed (the skip hid three of four frames),
+the chain is exact:
+
+```text
+sun/misc/Unsafe.invokeCleaner+18
+  -> beforeMemoryAccess+19    -> isMemoryAccessWarned+9
+                                   -> getIntVolatile(null, 0)
+  -> beforeMemoryAccessSlow+104 -> trySetMemoryAccessWarned+11
+                                   -> compareAndSetBoolean+15
+                                   -> compareAndSwapInt(null, 0, ...)
+```
+
+Not Lucene. **JDK 25's own `sun.misc.Unsafe` deprecation-warning latch**, on
+the path of every legacy Unsafe memory access — which is why a full-text vector
+reached it 513+ times.
+
+### 16.2 Two more hypotheses died on the way
+
+* **"The arguments were truncated by MethodHandle dispatch."** bci 19 of
+  Lucene's cleaner lambda is `unmapper.invokeExact(buffer)`, and
+  `unsafe_obj(args, 1)` cannot distinguish an absent argument from a null one,
+  nor `unsafe_offset(args, 2)` an absent one from a real 0. Logging
+  `args.len()` settled it: **`nargs=3` for `getIntVolatile` and `nargs=5` for
+  `compareAndSwapInt` — full arity.** The arguments arrived; the null and the 0
+  are genuine.
+* **"MethodHandle dispatch is the producer."** `UnmapHackProbe.java`
+  reproduces Lucene 9.7's unmap hack in 40 lines with **no Lucene and no H2**,
+  and pairs it with the control that isolates the axis: the same call made
+  directly. It fires on **both** arms (bci 89 through the MethodHandle, bci 149
+  through reflection). The MethodHandle is incidental.
+
+### 16.3 The cause: two `static final` fields that were never assigned
+
+`javap` on JDK 25's `sun.misc.Unsafe` shows both latch methods reading
+`MEMORY_ACCESS_WARNED_BASE` (an `Object`) and `MEMORY_ACCESS_WARNED_OFFSET` (a
+`long`) and passing them straight to `getBooleanVolatile(Object,J)` /
+`compareAndSetBoolean(Object,JZZ)`. `<clinit>` computes that pair at bci
+185/195 from `staticFieldBase`/`staticFieldOffset` of the static `boolean
+memoryAccessWarned`.
+
+`StaticBaseProbe.java` tested the obvious suspect and **acquitted it** — for an
+ordinary class this VM is byte-identical to HotSpot: non-null base, distinct
+non-zero offsets, a working false→true latch. So nothing resolved to 0.
+
+`WarnLatchProbe.java` asked the other question, with its own control in the
+same run:
+
+| | HotSpot | CratonVM |
+| --- | --- | --- |
+| `MEMORY_ACCESS_WARNED_BASE` non-null | true | **false** |
+| `MEMORY_ACCESS_WARNED_OFFSET` non-zero | true | **false** |
+| control: `staticFieldBase(memoryAccessWarned)` non-null | true | true |
+| control: `staticFieldOffset(memoryAccessWarned)` non-zero | true | true |
+
+**`null` and `0` are the DEFAULT values of two never-assigned fields**, while
+the mechanism that should have filled them works perfectly. A zero read as an
+answer when it is really an uninitialised field — the same shape as
+[`a-consumer-count-cannot-explain-its-own-zero`].
+
+## 17. The bigger defect R5 was standing in front of
+
+`ClinitProbe.java` walks `sun.misc.Unsafe.<clinit>` by bci, checking a field
+written before, during and after the region of interest:
+
+| bci | field | HotSpot | CratonVM |
+| --- | --- | --- | --- |
+| 34/40 | `theUnsafe`, `theInternalUnsafe` | set | set |
+| 157 | `ARRAY_OBJECT_INDEX_SCALE` | non-zero | **0** |
+| 166 | `ADDRESS_SIZE` | non-zero | **0** |
+| 185/195 | latch `BASE`/`OFFSET` | set | **default** |
+| 214 | `MEMORY_ACCESS_OPTION` | set | set |
+
+**Every public constant on the legacy `sun.misc.Unsafe` spelling was zero.**
+
+This is not a new failure mode — it is the one `post_clinit_fixup`'s
+`jdk/internal/misc/Unsafe` arm already exists to repair, root-caused in that
+arm's own comment (ES-FAIL-FAMILY-20260710): `<clinit>` computes these through
+natives not yet registered this early in boot, and **an unregistered native
+silently returns its return type's zero rather than throwing**, so the
+`static final` latches at 0 for the life of the process.
+
+`sun.misc.Unsafe` has its own 18 copies (`<clinit>` bci 43..157 reads
+`jdk/internal/misc/Unsafe.ARRAY_*`) plus `ADDRESS_SIZE` at bci 166 — and its
+fixup arm repaired only `MEMORY_ACCESS_OPTION`. It copies from the sibling
+*before* the sibling's own arm has run, so it copies zeros.
+
+The consequence is the one that arm already spells out: any library following
+the documented `offset = ARRAY_<T>_BASE_OFFSET + index` protocol **through the
+legacy spelling** gets an offset short by 16 and reads the wrong bytes, with no
+exception thrown.
+
+### 17.1 Fixed, with the sibling arm's own values
+
+The `sun/misc/Unsafe` arm now backfills all nineteen — 16 for every
+`ARRAY_*_BASE_OFFSET`, the per-type `INDEX_SCALE`s, and `ADDRESS_SIZE = 8`
+(`size_of::<usize>()`, matching `native_unsafe_address_size` and the
+`ADDRESS_SIZE0` backfill already in that file). `set_static_by_name` writes
+only a field still holding 0, so a correctly-initialised future implementation
+stays authoritative.
+
+After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
+and bci 166 now match.
+
+### 17.2 What is deliberately NOT fixed
+
+`MEMORY_ACCESS_WARNED_BASE`/`_OFFSET` (bci 185/195) still hold their defaults,
+so the R5 warn still fires. Backfilling them needs the class mirror and this
+VM's own static-offset encoding, which `set_static_by_name` cannot synthesise —
+a different mechanism, not a longer list.
+
+**Its severity is now known rather than assumed, which is the point of leaving
+it visible.** The latch is the JDK's once-only deprecation-warning flag. With
+the pair at `(null, 0)` the read and the CAS both land in the private side
+store, consistently — so the latch still latches, `H2 TestFullText` and
+`TestRecovery` both pass (`rc=0`), and the only observable effect is on when
+that deprecation warning prints. This is the same reason §12 and §15 give for
+NOT refusing the fallback: 513+ rescued calls in a vector that passes.
