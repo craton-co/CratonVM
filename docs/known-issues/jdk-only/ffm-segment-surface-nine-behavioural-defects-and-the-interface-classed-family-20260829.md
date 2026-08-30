@@ -119,9 +119,11 @@ segments; `ofBuffer`; `heapBase()`; and every layout's `byteSize`,
 
 ## 4. The residual, sized rather than guessed
 
-**23 rows in compatible mode, 43 under `--jdk-only`, down from 27/47.** Two of
-the five families are CLOSED (2026-08-29): `Arena`, and the nine `ValueLayout`
-carriers. All of what is left is `class`, `superclass` and `isInterface`.
+**20 rows in compatible mode, 40 under `--jdk-only`, down from 27/47.** Every
+layout and arena family is CLOSED (2026-08-29/30) -- `Arena`, the nine
+`ValueLayout` carriers, and struct/union/sequence/padding. **What remains is the
+SEGMENT family and nothing else**, and all of it is `class`, `superclass` and
+`isInterface`.
 
 ```text
                        compatible                                    --jdk-only
@@ -211,11 +213,47 @@ fields included -- these are the layouts a by-name resolver has to land on:
 ```text
   jdk.internal.foreign.ArenaImpl                     2   DONE 2026-08-29
   jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   DONE 2026-08-29 (and its 8 siblings)
+  jdk.internal.foreign.layout.StructLayoutImpl       6   DONE 2026-08-30 (with union, sequence, padding)
   jdk.internal.foreign.NativeMemorySegmentImpl       4   (min + length, readOnly, scope)
   jdk.internal.foreign.HeapMemorySegmentImpl$OfByte  5   (offset, base + the same three)
-  jdk.internal.foreign.layout.SequenceLayoutImpl     5   (elemCount, elementLayout + byteSize, byteAlignment, name)
-  jdk.internal.foreign.layout.StructLayoutImpl       6   (kind, elements, minByteAlignment + the same three)
 ```
+
+### 4.6 The group layouts, and three ways a name-scoped conversion misses
+
+All four at once -- struct, union, sequence, padding -- because they share
+`p67_layout_render` and the payload readers. 46/86 -> 40/80, and
+`apps/probes/FfmLayoutProbe.java` is 0-diff against HotSpot in both modes.
+
+`AbstractGroupLayout.elements` and `SequenceLayoutImpl.elementLayout`/`elemCount`
+joined the resolver. Everything else here is a miss, and the three are worth
+keeping because each was missed a different way:
+
+* **Scoped by NAME.** I converted every function with `layout` in its name.
+  `p67_group_members` is called `group`, reads the payload at a raw slot 2, and
+  the scan never saw it -- so `byteOffset(groupElement("c"))` answered
+  `no member named 'c'` while `memberLayouts()` listed the member correctly, one
+  line apart. **A name is not a scope.** The second pass matched
+  `get_field(x, <literal>)` across the whole file and found it, plus
+  `p67_member_size_align`, which reads slots 0 and 1 and had been right only
+  because they coincide with `AbstractLayout`'s first two fields.
+* **Never registered at all.** `toString()` was on NO class. While the carrier
+  was an interface it fell through to `Object.toString` -- an identity string
+  where HotSpot prints `[3:i4]`, wrong for as long as the family has existed and
+  tested by nothing. On the real class the JDK's own `toString` runs and
+  dereferences `carrier`, which this VM does not populate: **a wrong answer
+  became an NPE.** `p67_layout_render` had produced the oracle's rendering all
+  along and had only ever been used in error messages.
+* **Found by the census, not by reading.** Diffing each impl class against its
+  interface in `--dump-native-registry` named two gaps on `PaddingLayoutImpl`
+  (`name`, `withName`) that no amount of reading the registrars had surfaced.
+  **That diff is the check that would have caught the arena's ten missing
+  `allocateFrom` shapes**, and it costs one command.
+
+A latent defect fell out too: `elementCount()` guarded on `object_num_fields > 4`
+and read slot 4 as a `Long`. A real `SequenceLayoutImpl` has five fields with
+`elemCount` at 3, so the guard passed, slot 4 held `elementLayout`, the `Long`
+match failed, and it silently divided -- which its own comment says is wrong
+whenever the element's byteSize is 0.
 
 ### 4.5 The value layouts, and the second producer that only compatible mode has
 
