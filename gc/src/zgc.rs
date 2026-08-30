@@ -13442,6 +13442,15 @@ impl GarbageCollector for ZgcRealHeap {
 
         // ---- Sweep phase -------------------------------------------------
         let mut dead: Vec<usize> = Vec::new();
+        // Identity hashes of the dead, for the native side tables keyed by
+        // them (`cratonvm_types::identity_side_tables`). Collected HERE and
+        // not from `dead` afterwards, because by then the header is gone:
+        // the dead arm below zeroes it, and after a compacting cycle a dead
+        // base is very often a SURVIVOR's new base, so a later read would
+        // hand a live object's hash to the evictors and reset its state.
+        let collect_dead_hashes = crate::gc_flags().identity_hash_evict
+            && cratonvm_types::identity_side_tables::any_registered();
+        let mut dead_hashes: Vec<i32> = Vec::new();
         let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
         let mut bytes_freed = 0usize;
         let mut objects_copied = 0usize;
@@ -13569,6 +13578,20 @@ impl GarbageCollector for ZgcRealHeap {
                     } else {
                         size
                     };
+                    // BEFORE the zeroing: the identity hash lives in the mark
+                    // word, so `write_bytes` below is what destroys it. A `0`
+                    // means "never hashed" (or hashed then monitor-inflated,
+                    // which displaces it) and such an object cannot be a key
+                    // in an identity-hash-keyed table, so skipping it is exact
+                    // rather than approximate. See `identity_side_tables`.
+                    if collect_dead_hashes {
+                        let h = cratonvm_types::ObjectHeader::neutral_hash(
+                            header.mark_word.load(Ordering::Relaxed),
+                        );
+                        if h != 0 {
+                            dead_hashes.push(h);
+                        }
+                    }
                     unsafe { std::ptr::write_bytes(base as *mut u8, 0, zero) };
                     if base >= arena_base {
                         let off = base - arena_base;
@@ -14098,6 +14121,20 @@ impl GarbageCollector for ZgcRealHeap {
         // and creates the other.
         monitors.prune_dead(&dead);
         monitors.remap_after_gc(&pointer_map);
+
+        // THE NATIVE SIDE TABLES KEYED BY IDENTITY HASH DIE HERE TOO.
+        //
+        // Same shape as `prune_dead` immediately above, and for the same
+        // reason: a native builtin that keeps per-instance state outside the
+        // object (`java.util.Random`'s generator seed, a `VarHandle`'s
+        // metadata) keys it by identity hash, and nothing else in the process
+        // ever learns that the instance died. Left unpruned it is a native
+        // leak no Java-side heap metric can see -- ~39 bytes per `Random`
+        // ever constructed, measured flat against a flat Java heap.
+        //
+        // One batched call rather than one per object: each evictor takes its
+        // table's write lock exactly once per cycle.
+        cratonvm_types::identity_side_tables::evict_dead(&dead_hashes);
 
         // THE REFERENCE PROCESSOR'S OWN TABLES MOVE TOO.
         //
