@@ -990,37 +990,39 @@ pub(crate) fn bi_mod_pow_str_opt(base: &str, exp: &str, m: &str) -> Option<Strin
     if m == "1" || m == "-1" {
         return Some("0".to_string());
     }
-    let (m_neg, m_abs) = bi_parse_sign(m);
-    let _ = m_neg; // modulus magnitude is what matters
-                   // Reduce base mod m first (Java BigInteger always returns a nonnegative
-                   // representative in [0, |m|)).
-    let mut b = bi_mod_str(base, m_abs);
-    if b.starts_with('-') {
-        b = bi_add_str(&b, m_abs);
-    }
-    // A negative exponent is what `BigInteger.modPow` calls
-    // `this.modInverse(m).modPow(exp.negate(), m)` (JDK 25
-    // `BigInteger.java:2564-2566`) — invert the base, then raise the inverse to
-    // |exp|. `bi_mod_inverse_str` is thirty lines further down this file, so
-    // this is the JDK's own rule and not a substitution for it.
+    // LIMBS, not decimal digits.
+    //
+    // This used to be square-and-multiply over decimal STRINGS: one
+    // `bi_mul_unsigned` (schoolbook decimal) plus one `bi_mod_unsigned`
+    // (decimal long division) per exponent bit. For RSA-2048 that is ~2400
+    // modular operations on 617-digit numbers, and it is what
+    // `gaps/biginteger-limb-rewrite-scope.md` identified in May as the ~100x
+    // constant-factor loss blocking every crypto-heavy suite.
+    //
+    // `BigInt` (step 1 of that rewrite) has carried a Montgomery `modpow` and
+    // a differential test against this very function since it landed; nothing
+    // routed through it. This is that wiring for the one operation the crypto
+    // suites actually sit on -- `oddModPow` is what every RSA/DSA/DH
+    // private-key operation and every Miller-Rabin round runs.
+    //
+    // Measured on netty's `testMutualAuthSameCertChain`, which builds 96
+    // self-signed certificates: see the branch's page.
+    let (_, m_abs) = bi_parse_sign(m);
     let (e_neg, e_abs) = bi_parse_sign(exp);
+    let modulus = crate::bigint::BigInt::from_decimal(m_abs);
+    if modulus.is_zero() {
+        return Some("0".to_string());
+    }
+    // A negative exponent is `this.modInverse(m).modPow(-exp, m)`, the JDK's
+    // own rule (`BigInteger.java`), kept here rather than pushed into
+    // `BigInt::modpow` -- which takes the exponent's MAGNITUDE and so cannot
+    // see the sign.
+    let mut b = crate::bigint::BigInt::from_decimal(base).modulo(&modulus);
     if e_neg {
-        b = bi_mod_inverse_str(&b, m_abs)?;
+        b = b.mod_inverse(&modulus)?;
     }
-    let mut result = "1".to_string();
-    // Iterate bits of exp from LSB to MSB by repeated div2.
-    let mut e = e_abs.to_string();
-    while e != "0" {
-        let last = e.bytes().last().map(|b| b - b'0').unwrap_or(0);
-        if last & 1 == 1 {
-            result = bi_mod_unsigned(&bi_mul_unsigned(&result, &b), m_abs);
-        }
-        e = bi_div_unsigned(&e, "2");
-        if e != "0" {
-            b = bi_mod_unsigned(&bi_mul_unsigned(&b, &b), m_abs);
-        }
-    }
-    Some(result)
+    let e = crate::bigint::BigInt::from_decimal(e_abs);
+    Some(b.modpow(&e, &modulus).to_decimal())
 }
 
 /// `BigInteger.modInverse(m)` — extended Euclidean on arbitrary-precision
