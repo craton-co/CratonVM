@@ -60,12 +60,42 @@ fn wired(compact: &str, class: &str, method: &str, func: &str) -> bool {
 // T15.1.1-2 — MethodHandleNatives natives registered
 // ===========================================================================
 
+// MEASURED against Temurin/TornadoVM JDK 25.0.3, 2026-08-30, with
+// `javap -p -s java.lang.invoke.MethodHandleNatives`. Every entry below is
+// `static native` there. Two rows were removed because they are not:
+//
+//   getConstant(I)I    NOT DECLARED by JDK 25 at all. The nearest thing is
+//                      `private static native int getNamedCon(int, Object[])`
+//                      -- different name, different descriptor. `getConstant`
+//                      is a JDK 8 / 11 era method.
+//
+//   linkCallSite(...)  DECLARED, but as plain Java with a Code attribute, not
+//                      native -- and the descriptor this list carried
+//                      (`(Ljava/lang/Object;ILjava/lang/invoke/MemberName;...`)
+//                      does not exist in JDK 25 either, whose signature is six
+//                      Objects: `(Ljava/lang/Object;Ljava/lang/Object;
+//                      Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;
+//                      [Ljava/lang/Object;)Ljava/lang/invoke/MemberName;`.
+//
+// Both had implementations written (`native_mhn_get_constant`,
+// `native_mhn_link_call_site`) that were never registered and that nothing
+// could reach: neither method is declared by the real JDK in the shape this
+// list wanted, the synthetic class library declares no `MethodHandleNatives`
+// at all, and nothing in the tree calls either. Registering them would have
+// turned this gate green with two entries that can never be dispatched in any
+// mode, so the implementations are gone with this list (git history keeps them
+// if invokedynamic linkage ever needs them).
+//
+// NOT changed, but worth a reader's attention: `linkMethod` IS registered as a
+// native and is ALSO plain Java in JDK 25, so it shadows real bytecode. That
+// may be deliberate -- signature-polymorphic linkage is exactly the thing a VM
+// has to intercept -- but it is the same shape as the `ServiceLoader` shadow
+// that was removed for being subtly wrong, and nobody has written down which
+// it is here.
 const MHN_NATIVES: &[(&str, &str)] = &[
     ("resolve", "(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;"),
     ("init", "(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V"),
-    ("getConstant", "(I)I"),
     ("linkMethod", "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;"),
-    ("linkCallSite", "(Ljava/lang/Object;ILjava/lang/invoke/MemberName;Ljava/lang/Object;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;"),
     ("objectFieldOffset", "(Ljava/lang/invoke/MemberName;)J"),
     ("staticFieldOffset", "(Ljava/lang/invoke/MemberName;)J"),
     ("staticFieldBase", "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;"),
@@ -196,9 +226,7 @@ fn t15_vm_uid_gid_registered() {
 const T15_IMPLEMENTATIONS: &[(&str, &str)] = &[
     ("lang_invoke.rs", "native_mhn_resolve"),
     ("lang_invoke.rs", "native_mhn_init"),
-    ("lang_invoke.rs", "native_mhn_get_constant"),
     ("lang_invoke.rs", "native_mhn_link_method"),
-    ("lang_invoke.rs", "native_mhn_link_call_site"),
     ("lang_invoke.rs", "native_mhn_object_field_offset"),
     ("lang_invoke.rs", "native_mhn_static_field_offset"),
     ("lang_invoke.rs", "native_mhn_static_field_base"),
