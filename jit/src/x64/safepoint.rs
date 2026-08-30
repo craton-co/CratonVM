@@ -1662,7 +1662,47 @@ impl Compiler {
                 // walker can match the value the JIT stored into the sp-id slot.
                 bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
                 frame_slot_offsets: slots,
-                moving_young_coverage_complete: self.pending_shadow_coverage_complete,
+                // `pending_shadow_coverage_complete` AND `!map_incomplete`.
+                //
+                // The two flags answer different halves of the same question
+                // and only the first was reaching the collector.
+                // `moving_young_safepoint_coverage_complete` runs back in
+                // `emit_shadow_push`, BEFORE this function builds the slot
+                // list, so it cannot see what building it discovers: an oop
+                // still in a register, a stack/local/staged-arg offset that
+                // does not fit `i16`, an inline local whose offset does not
+                // either. Those set `map_incomplete` here, and `map_incomplete`
+                // fed exactly one consumer — `mapped_safepoint_pcs`, i.e.
+                // `fully_oop_covered`, i.e. whether the collector keeps its
+                // CONSERVATIVE backstop.
+                //
+                // That was sound while the backstop was the whole story: a
+                // conservative sweep still MARKS an oop the map missed, so
+                // nothing is lost. Relocation needs more than marking — it
+                // needs the slot REWRITTEN, and a conservative scan cannot
+                // rewrite. So a map this function already knows to be short
+                // was still published as complete coverage, and
+                // `remap_one_jit_frame` rewrote only what it named and left
+                // the rest pointing into from-space.
+                //
+                // Measured on `String.substring(II)` (safepoint 41, live band
+                // `off<120`): the map named one slot — the `this` parameter
+                // home — while offsets 88 and 112 inside that band held the
+                // same live reference and kept their pre-move addresses. That
+                // is the H2 `TestRandomMapOps` corruption, and the same shape
+                // appears in `String.substring(I)` and in ordinary application
+                // frames.
+                //
+                // Fail-closed and one-directional: this can only turn a `true`
+                // into a `false`, never the reverse. The cost is that a cycle
+                // reaching such a safepoint declines to relocate and the arena
+                // keeps its fragmentation — which is the trade
+                // `CRATONVM_ZGC_RELOCATE=0` makes today, wholesale, as the
+                // workaround.
+                moving_young_coverage_complete: relocation_coverage_complete(
+                    self.pending_shadow_coverage_complete,
+                    map_incomplete,
+                ),
                 live_frame_hi,
             });
             self.pending_shadow_coverage_complete = false;
@@ -1742,9 +1782,84 @@ impl Compiler {
     }
 }
 
+/// The relocation gate: may a moving collector rewrite this frame from this
+/// safepoint's map alone?
+///
+/// Both halves must hold, and they are discovered at different times.
+/// `shadow_complete` is [`Compiler::moving_young_safepoint_coverage_complete`],
+/// evaluated back in `emit_shadow_push`. `map_incomplete` is what BUILDING the
+/// slot list then discovers — an oop still in a register, a stack, local,
+/// staged-argument or inline-local offset that does not fit `i16`.
+///
+/// A free function, and pure, for the same reason
+/// `g1::refuse_evacuation_for_empty_publication` is: the coupling is the whole
+/// content of the fix, and a predicate that lives in a struct method a hundred
+/// lines from its inputs is one nobody can pin with a truth table.
+fn relocation_coverage_complete(shadow_complete: bool, map_incomplete: bool) -> bool {
+    shadow_complete && !map_incomplete
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The truth table of the relocation gate.
+    ///
+    /// The `map_incomplete=true, shadow_complete=true` row is the defect this
+    /// exists for: before the coupling, that row published complete coverage.
+    /// `record_oop_map` had ALREADY discovered the map was short — an oop left
+    /// in a register, or an offset that would not fit `i16` — and routed that
+    /// knowledge only to `mapped_safepoint_pcs`, which decides whether the
+    /// CONSERVATIVE backstop stays on. A conservative sweep marks what the map
+    /// missed, so that was sufficient while nothing moved. Relocation must
+    /// REWRITE the slot, which the backstop cannot do, so the short map went
+    /// to the collector labelled complete and `remap_one_jit_frame` left every
+    /// unnamed live reference pointing into from-space.
+    #[test]
+    fn a_short_map_cannot_claim_relocation_coverage() {
+        assert!(
+            !relocation_coverage_complete(true, true),
+            "a map this function knows is short must not gate relocation,              however good the shadow publication was"
+        );
+        assert!(relocation_coverage_complete(true, false));
+        assert!(!relocation_coverage_complete(false, false));
+        assert!(!relocation_coverage_complete(false, true));
+    }
+
+    /// The gate is one-directional: it can only ever REMOVE a claim.
+    ///
+    /// Stated as a property because the failure mode that matters is someone
+    /// later "simplifying" it into something that can turn a false into a
+    /// true — which would hand the collector a frame nothing proved.
+    #[test]
+    fn the_gate_only_ever_subtracts() {
+        for shadow in [false, true] {
+            for incomplete in [false, true] {
+                assert!(
+                    !relocation_coverage_complete(shadow, incomplete) || shadow,
+                    "gate turned shadow_complete=false into a claim"
+                );
+            }
+        }
+    }
+
+    /// `map_incomplete` must actually REACH the gate.
+    ///
+    /// The bug was not a wrong expression, it was a value that existed, was
+    /// maintained in seven places, and was never wired to the thing it should
+    /// have gated. A truth table over the predicate cannot see that; this can.
+    #[test]
+    fn the_pushed_map_gates_on_map_incomplete() {
+        let src = include_str!("safepoint.rs");
+        let at = src
+            .find("moving_young_coverage_complete: relocation_coverage_complete(")
+            .expect("the pushed OopMapEntry must gate through relocation_coverage_complete");
+        let tail = &src[at..at + 200];
+        assert!(
+            tail.contains("map_incomplete"),
+            "the gate at the OopMapEntry push must be fed `map_incomplete`;              found instead: {tail:?}"
+        );
+    }
 
     /// Every register a `ShadowHome::Reg` can actually name must encode as
     /// ITSELF. The `CRATONVM_DBG_SHADOW_RELOAD` probe hard-coded `0x49`
