@@ -19411,47 +19411,62 @@ pub fn invoke_or_native(
     // yield to a body that EXISTS. So resolve the method and require a
     // non-native one carrying `Code`. `transferTo` is ordinary Java bytecode
     // and passes; `Object.hashCode` is not and does not.
-    let native_shadow_dropped_by_redefine =
-        crate::runtime::interpreter::native_shadow_suppressed_by_redefine(shared, effective_class)
-            && !crate::runtime::interpreter::redefine_immune_forced_native(
-                effective_class,
-                method_name,
-                descriptor,
-            )
-            && {
-                let cm = shared.classes.class_manager.read();
-                cm.get_loaded_class_id(effective_class)
-                    .and_then(|cid| {
-                        crate::classloading::find_method_recursive(
-                            cid,
-                            method_name,
-                            descriptor,
-                            &cm.class_store,
-                        )
-                        .map(|(m, _)| !m.is_native() && m.code().is_some())
-                    })
-                    .unwrap_or(false)
-            };
+    // Resolved ONCE, against the exact declaring class, and reused by both the
+    // guard and its trace. A name lookup is a different question: it answers
+    // `get_loaded_class_id(effective_class)`, and for a boot class reached
+    // through a mock that is not necessarily the id the agent actually
+    // retransformed.
+    let redefine_probe: Option<(ClassId, bool, u32)> = {
+        let cm = shared.classes.class_manager.read();
+        cm.get_loaded_class_id(effective_class).and_then(|cid| {
+            crate::classloading::find_method_recursive(cid, method_name, descriptor, &cm.class_store)
+                .map(|(m, declaring_id)| {
+                    (
+                        declaring_id,
+                        !m.is_native() && m.code().is_some(),
+                        cm.class_redefine_generation(declaring_id),
+                    )
+                })
+        })
+    };
+    let native_shadow_dropped_by_redefine = crate::classloading::any_class_redefined()
+        && redefine_probe.is_some_and(|(_, has_body, generation)| has_body && generation > 0)
+        && !crate::runtime::interpreter::redefine_immune_forced_native(
+            effective_class,
+            method_name,
+            descriptor,
+        );
+    if crate::runtime::env_cache::dbg_native_shadow()
+        && crate::classloading::any_class_redefined()
+        && shared
+            .natives
+            .native_methods
+            .find(effective_class, method_name, descriptor)
+            .is_some()
+    {
+        // One line per distinct triple: this sits on a hot dispatch path.
+        static SEEN: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::BTreeSet<(String, String, String)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+        let key = (
+            effective_class.to_string(),
+            method_name.to_string(),
+            descriptor.to_string(),
+        );
+        if seen.lock().insert(key) {
+            eprintln!(
+                "[native-shadow] {effective_class}.{method_name}{descriptor}                  dropped={native_shadow_dropped_by_redefine} probe={redefine_probe:?}                  immune={}",
+                crate::runtime::interpreter::redefine_immune_forced_native(
+                    effective_class,
+                    method_name,
+                    descriptor
+                ),
+            );
+        }
+    }
     if native_shadow_dropped_by_redefine {
         NATIVE_SHADOW_DROPPED_BY_REDEFINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if crate::runtime::env_cache::dbg_native_shadow() {
-            // One line per distinct triple: this sits on a hot dispatch path and
-            // a per-call line buries the finding it exists to surface.
-            static SEEN: std::sync::OnceLock<
-                parking_lot::Mutex<std::collections::BTreeSet<(String, String, String)>>,
-            > = std::sync::OnceLock::new();
-            let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
-            let key = (
-                effective_class.to_string(),
-                method_name.to_string(),
-                descriptor.to_string(),
-            );
-            if seen.lock().insert(key) {
-                eprintln!(
-                    "[native-shadow] dropped for redefined class:                      {effective_class}.{method_name}{descriptor}"
-                );
-            }
-        }
     }
     if let Some((callback, native_kind)) = if native_shadow_dropped_by_redefine {
         None
