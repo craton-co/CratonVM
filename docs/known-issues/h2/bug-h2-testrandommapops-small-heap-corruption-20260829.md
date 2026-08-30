@@ -362,6 +362,29 @@ reason is that this declines only cycles that meet a live compiled frame with
 a short map, while the switch declines all of them — **not directly measured**,
 and worth confirming before it is repeated as fact.
 
+### The regression this causes, and the switch that exists for it
+
+That cost lands somewhere real. `org.h2.test.store.TestMVStoreTool` is an
+already-open ZGC fragmentation OOM, and it now arrives about **ten times
+sooner**:
+
+| arm | rep 1 | rep 2 |
+|---|---|---|
+| `dev` | `rc=1` at **581 s** | — |
+| fixed | `rc=1` at **61 s** | `rc=1` at **57 s** |
+
+Same failure either way (`OutOfMemoryError: Java heap space`, `anewarray`), so
+this is not a new defect — it is the known one reached faster, exactly as the
+engagement census predicts once relocation stops defragmenting.
+
+So the coupling ships behind **`CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE`**,
+default ON, `=0` restoring the pre-fix behaviour in one binary. Default ON
+because publishing a map the compiler has already judged short is heap
+corruption and the wrong-answer face is silent; a switch rather than a
+constant because the trade is real, because the ZGC lane needs something to
+bisect against, and because whoever hits the fragmentation side needs a lever
+that is not "turn off relocation entirely".
+
 ### The follow-up that removes the cost
 
 All three `staged_unmappable` sites are the same shape in

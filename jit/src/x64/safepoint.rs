@@ -1796,7 +1796,27 @@ impl Compiler {
 /// content of the fix, and a predicate that lives in a struct method a hundred
 /// lines from its inputs is one nobody can pin with a truth table.
 fn relocation_coverage_complete(shadow_complete: bool, map_incomplete: bool) -> bool {
-    shadow_complete && !map_incomplete
+    shadow_complete && (!map_incomplete || !reloc_gate_on_map_incomplete())
+}
+
+/// Kill switch for the coupling above (`CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE=0`).
+///
+/// Default ON, because publishing a map the compiler has already judged short
+/// as complete coverage is a heap-corruption bug. It is a switch rather than a
+/// bare constant because the fix has a MEASURED cost: on String-heavy code
+/// every cycle that meets a live compiled frame now declines to relocate
+/// (`compaction_cycles` 26 -> 0, `objects_relocated` 145 -> 0 on one probe),
+/// and that reaches `TestMVStoreTool` -- an already-open fragmentation OOM --
+/// roughly 10x sooner (57-61 s against 581 s). Both halves of that trade
+/// deserve a same-binary A/B, and the ZGC lane needs one to bisect against.
+fn reloc_gate_on_map_incomplete() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
 }
 
 #[cfg(test)]
