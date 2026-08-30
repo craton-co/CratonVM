@@ -10,6 +10,46 @@ differential said so on 2026-08-21, and the separation is now as clean as it
 will get: the class reproduces this failure on a binary with **zero**
 `OutOfMemoryError`.
 
+## ADDENDUM 2026-08-30 (L7 corpus lane): it survives `--jdk-only`, which rules the synthetic layer out
+
+The `--jdk-only` corpus hit this class and could not attribute it. Running the
+three arms gives the same signature on both CratonVM modes:
+
+```text
+HotSpot           PASS   18s
+CratonVM compat   FAIL  346s   Exception in thread "main" java/lang/Object
+CratonVM strict   FAIL  451s   Exception in thread "main" java/lang/Object
+```
+
+**And the strict run fabricated nothing**, which is the part that turns this
+from a coincidence into an elimination. Re-run with the census attached:
+
+```text
+strict  FAIL  351s   Exception in thread "main" java/lang/Object
+  mode                       : jdk-only
+  compatibility_classes      : 0
+  synthetic_stub_invocations : 0
+  partial / truncated / dropped : none / false / 0     <- a total, not a floor
+```
+
+Under `--jdk-only` a fabricated compatibility class is REFUSED and SyntheticStub
+natives are not registered, and this run's own report confirms neither happened:
+zero classes minted, zero stub invocations, on a complete census.
+
+So whatever produces a thrown `java/lang/Object` with no frames, **it is not a
+fabricated carrier and not a synthetic stub**. It lives in the path both modes
+share — real bytecode, plus bridges and intrinsics. That removes one of the two
+families the signature section offers and leaves the other: a receiver whose
+class id decoded as `0`.
+
+One caveat on the times: 346 s and 451 s against an 18 s HotSpot pass is roughly
+20x, and this class is one of the slowest in the corpus. A failure that takes
+six minutes to appear is a poor bisect target, and the ratio is itself worth a
+look — `jdk-only/P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` §5
+has the corpus-wide speed data these two rows sit in.
+
+Everything below this section predates the addendum and is unchanged.
+
 ## The signature
 
 ```text
