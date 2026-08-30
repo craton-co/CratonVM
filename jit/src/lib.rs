@@ -17855,6 +17855,34 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
 /// guard both backends emit ahead of a shadow push, restoring the pre-guard
 /// behaviour where an overrunning push stores straight on through the allocator
 /// arena. Only useful to confirm that a given failure IS the overflow.
+/// `CRATONVM_JIT_ZERO_SPID` (default ON) -- both backends establish the
+/// "this frame has taken no safepoint" sentinel in their prologue instead of
+/// leaving the safepoint-id slot holding whatever the previous frame at that
+/// stack depth left there.
+///
+/// The slot's whole contract is that the collector reads it and matches an
+/// `OopMapEntry` on the value. An uninitialised read is not merely a refused
+/// cycle: safepoint ids are small and consecutive, so a stale word can equal a
+/// VALID id for the method standing at that rbp, and relocation then rewrites
+/// the frame against the map for a DIFFERENT program point. That is a silent
+/// wrong answer, and it is the reason this is default-on with a kill switch
+/// rather than a debug aid.
+///
+/// The two backends need different sentinels because they number their ids
+/// differently -- the IR lowerer starts at 1, so `0` is free, while the
+/// single-pass backend stores the bytecode pc and **bci 0 is legal**. See
+/// [`crate::x64::safepoint::SP_ID_UNSET_BC_PC`].
+pub fn sp_id_slot_init_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ZERO_SPID").as_deref(),
+            Ok("0") | Ok("false") | Ok("FALSE")
+        )
+    })
+}
+
 pub fn shadow_end_guard_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
