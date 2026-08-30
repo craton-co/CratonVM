@@ -20245,7 +20245,7 @@ const AL_ITR_PLAIN_MAX_FIELDS: usize = 4;
 /// pair beside the `elements()` registration. Without it the enumeration is
 /// EMPTY, which is a quieter wrong answer than the non-terminating one.
 const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
-    // THE THREE COLLECTION FAMILIES, added 2026-08-29 with L3 residual 6.1.
+    // TWO COLLECTION FAMILIES, added 2026-08-29 with L3 residual 6.1.
     //
     // Not "values views" -- a `TreeSet`, an `ArrayDeque` and a `PriorityQueue`
     // are sources in their own right -- but they want exactly what this table
@@ -20263,8 +20263,13 @@ const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
     // Each replaces a FABRICATION -- `java/util/TreeSet$Itr`,
     // `java/util/ArrayDeque$Itr` -- that `--jdk-only` refused and landed off,
     // so this retires two stand-ins rather than adding any.
+    //
+    // ARRAYDEQUE LEFT THIS TABLE ON 2026-08-30, one family further along the
+    // same road: its iterator is not minted here at all now, real or
+    // fabricated. A snapshot could carry the class name but never the
+    // fail-fast, because `DeqIterator`'s is the ring buffer's layout rather
+    // than a counter. Making the layout faithful and standing aside got both.
     ("java/util/TreeSet", "java/util/TreeMap$KeyIterator"),
-    ("java/util/ArrayDeque", "java/util/ArrayDeque$DeqIterator"),
     ("java/util/PriorityQueue", "java/util/PriorityQueue$Itr"),
     (
         "java/util/HashMap$Values",
@@ -20569,15 +20574,16 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
 /// `ConcurrentModificationException`. An iterator minted on a path that does
 /// not seed reads **0**, and 0 is a perfectly legal generation, so the raw
 /// value cannot distinguish "unseeded" from "the source is on generation 0".
-/// NO ALTERNATE GENERATION SLOT FOR `ArrayDeque$DeqIterator`, and the reason is
-/// a measurement rather than a limitation.
+/// NO ALTERNATE GENERATION SLOT FOR `ArrayDeque$DeqIterator`, because there is
+/// no longer an `ArrayDeque$DeqIterator` this crate mints. That family was
+/// RETIRED on 2026-08-30 and real `ArrayDeque.iterator()` bytecode runs.
 ///
-/// It declares no `expectedModCount` -- the JDK's own is fail-fast off
-/// `cursor`/`remaining` arithmetic against the live ring buffer, not off a
-/// counter -- so the third door has nowhere to write, and its `remaining` slot
-/// is free for the purpose (every declared field on a carrier THIS crate mints
-/// is unused; the mint writes only the three snapshot fields past them). That
-/// was tried, on 2026-08-29, and it is wrong:
+/// It is worth keeping why, because the wrong answer was reached twice here.
+/// `DeqIterator` declares no `expectedModCount`; the JDK's fail-fast is a
+/// PHYSICAL index into the ring buffer, and `nonNullElementAt` reporting any
+/// null it reads as a `ConcurrentModificationException`. So the check fires
+/// exactly when a mutation moves the elements out from under that index, and
+/// that is a property of the LAYOUT, not of any counter:
 ///
 /// ```text
 /// apps/probes/DequeListShadowSweep
@@ -20585,18 +20591,20 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
 ///   82 ad fail fast on REMOVE during iteration   HotSpot no-throw
 /// ```
 ///
-/// **HotSpot's `ArrayDeque` is fail-fast on one and not the other**, because
-/// `DeqIterator` detects a modification only when the ring buffer shifts under
-/// the cursor -- which an `add` that wraps does and a `remove` from the far end
-/// does not. `family_snapshot_generation`'s size CANNOT tell the two apart: it
-/// moves for both, so seeding it closed row 81 and opened row 82. One wrong row
-/// traded for another, and in the worse direction, since a spurious
-/// `ConcurrentModificationException` is the failure this file has already paid
-/// for once (see below).
+/// An `add` that fills the buffer grows it, and the JDK's `grow` slides the
+/// first leg to the far end and nulls the slots it came from -- straight under
+/// a cursor that has already advanced. A `remove` from the head moves `head`
+/// past the cursor instead and nulls nothing the cursor will read. Any
+/// generation counter moves for both, which is why seeding one closed row 81
+/// and opened row 82: one wrong row traded for another.
 ///
-/// Row 81 stays open in the L3 record. Closing it needs a generation that
-/// counts STRUCTURAL GROWTH rather than size, which the deque has no field to
-/// hold.
+/// What closed both was making the layout faithful and then standing aside --
+/// `ad_state` derives the element count instead of storing it, and `ad_grow`
+/// and `ad_remove_at_logical` are ports of `ArrayDeque.grow` and
+/// `ArrayDeque.delete`. `apps/probes/AdFieldProbe` reads `elements`, `head` and
+/// `tail` back through reflection and the deque is byte-identical to HotSpot's
+/// through growth and both `delete` branches, so the real iterator is fail-fast
+/// for the real reason.
 fn al_view_itr_expected_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     let base = al_itr_alt_base(ctx, itr)?;
     let cid = ctx.class_id_of_object(itr);
@@ -20625,11 +20633,13 @@ fn al_view_generation(ctx: &dyn NativeContext, list: ObjectRef) -> Option<i32> {
 /// The generation of a source that is one of the three snapshot-iterator
 /// COLLECTION families rather than a map: its SIZE.
 ///
-/// `map_itr_mod_count` answers `None` for all three. `TreeSet` and `ArrayDeque`
-/// declare no `modCount` at all -- the JDK's own `DeqIterator` is fail-fast off
-/// `head`/`tail` arithmetic, not a counter -- and `PriorityQueue` declares one
-/// that this crate's natives never move. Size is the generation that is
-/// actually available for all three.
+/// `map_itr_mod_count` answers `None` for both. `TreeSet` declares no `modCount`
+/// at all, and `PriorityQueue` declares one that this crate's natives never
+/// move. Size is the generation that is actually available for either.
+///
+/// `ArrayDeque` was the third and is gone: its iterator is real JDK bytecode
+/// now, fail-fast off the ring buffer's layout, which a size cannot model in
+/// either direction. See `al_view_itr_expected_slot` for the measurement.
 ///
 /// SIZE CAN ONLY MISS, NEVER FALSELY FIRE, and that direction is the whole
 /// reason it is acceptable here. A structural change moves the size, so every
@@ -20665,7 +20675,6 @@ fn family_snapshot_generation(ctx: &dyn NativeContext, src: ObjectRef) -> Option
     }
     let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(src))?;
     match &*name {
-        "java/util/ArrayDeque" => Some(ad_state(ctx, src).3),
         "java/util/PriorityQueue" => Some(pq_state(ctx, src).1),
         _ => None,
     }
@@ -45571,10 +45580,43 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
-    let size = match ctx.get_field(this, AD_FIELD_SIZE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    // `size` is DERIVED from `head`/`tail`, never read back from slot 3.
+    //
+    // Slot 3 is ours -- the real `java.util.ArrayDeque` declares exactly
+    // `elements`/`head`/`tail`, and `synthetic_stub_fields` pads the class to
+    // four so a count could live there. Storing the count there made every real
+    // JDK body that mutates the buffer a corruption: `delete(i)` moves `head`
+    // or `tail` and cannot know slot 3 exists. `native_ad_remove_first_occurrence`
+    // carries the scar -- it exists only to keep real `delete` bytecode away
+    // from the deque, after that desync stranded H2's `waitingSessions` queue.
+    //
+    // Shadowing every mutator is the wrong level to fix that at: the leak is
+    // any real body at all, and we cannot register them all. `DeqIterator.remove()`
+    // is the proof. Measured 2026-08-30 on `descendingIterator()`, which we do
+    // not register and so already ran real bytecode:
+    //
+    // ```text
+    //   fields after remove   HotSpot  cap=4 head=0 tail=2 es=[a, b, null, null]
+    //                         CratonVM cap=4 head=0 tail=2 es=[a, b, null, null]
+    //   size()                HotSpot  2
+    //                         CratonVM 3
+    //   toString()            HotSpot  [a, b]
+    //                         CratonVM [a, b, null]
+    // ```
+    //
+    // -- the buffer was byte-for-byte right and only the count was wrong, and a
+    // null then leaked out of the deque into `toString`, `toArray`, `stream`
+    // and a re-walk. `ad_refuse_null`'s doc explains what a null inside an
+    // `ArrayDeque` costs: the JDK's own `nonNullElementAt` reads it as
+    // "another thread mutated me" and kills the next iteration.
+    //
+    // The JDK derives its count the same way (`size()` is
+    // `sub(tail, head, elements.length)`), which is why it has no such field to
+    // desync. Deriving here makes our natives and every real body agree by
+    // construction. It is only unambiguous because the buffer is never full --
+    // see `ad_ensure_capacity` for why that spare slot is load-bearing.
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let size = if cap <= 0 { 0 } else { (tail - head).rem_euclid(cap) };
     (data, head, tail, size)
 }
 
@@ -45617,36 +45659,64 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// is why it was found at all — an empty collection reads as a pass at every
 /// caller that only iterates, so the probe that caught this prints element
 /// CONTENT for every member rather than a verdict.
-fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
-    let (data, head, _tail, size) = ad_state(ctx, this);
-    let old_cap = data.map_or(0, |d| ctx.array_length(d));
-    // `<`, not `<=`: an array of exactly `min_cap` slots is full at `min_cap`
-    // elements, and full is what we must never be.
-    if min_cap < old_cap {
+fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
+    let (data, head, _tail, _size) = ad_state(ctx, this);
+    let Some(old_buf) = data else {
+        return;
+    };
+    let old_cap = ctx.array_length(old_buf) as i32;
+    if old_cap <= 0 {
         return;
     }
-    let new_cap = std::cmp::max(old_cap * 2, min_cap + 1);
+    let jump = if old_cap < 64 { old_cap + 2 } else { old_cap >> 1 };
+    let new_cap = old_cap + if jump < needed { needed } else { jump };
+
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
     let mut this = this;
-    let mut old = data.unwrap_or(this);
+    let mut old = old_buf;
     let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
-        alloc_ref_array(ctx, new_cap)
+        alloc_ref_array(ctx, new_cap as usize)
     });
-    let data = data.map(|_| old);
-    // Copy elements in order: head..end, then 0..wrap
-    if let Some(old_buf) = data {
-        let s = size as usize;
-        let h = head as usize;
-        for i in 0..s {
-            let idx = (h + i) % old_cap;
-            let val = ctx.get_array_element(old_buf, idx);
-            ctx.set_array_element(new_buf, i, val);
-        }
+
+    // `Arrays.copyOf` -- SLOT FOR SLOT, not head-first. The old code normalised
+    // instead, copying the elements in logical order and resetting
+    // `head = 0`/`tail = size`. That is a legal deque and every accessor of
+    // ours agreed with it, which is why it stood; it is not the JDK's, and the
+    // difference is visible to any real body that holds a PHYSICAL index --
+    // which `DeqIterator` does.
+    for k in 0..old_cap as usize {
+        let v = ctx.get_array_element(old, k);
+        ctx.set_array_element(new_buf, k, v);
     }
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(new_buf)));
-    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(size));
+
+    // The wrap-slide. When the elements straddle the end of the buffer, the
+    // first leg has to stay flush against the end, so it moves up by exactly
+    // the space gained and `head` follows it. `tail == head` is ambiguous
+    // between full and empty, and the JDK disambiguates it the same way we do
+    // everywhere else -- by looking at whether the head slot holds anything.
+    let tail = match ctx.get_field(this, AD_FIELD_TAIL) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let head_occupied = matches!(
+        ctx.get_array_element(new_buf, head as usize),
+        Value::Object(Some(_))
+    );
+    if tail < head || (tail == head && head_occupied) {
+        let new_space = new_cap - old_cap;
+        // `System.arraycopy(es, head, es, head + newSpace, oldCapacity - head)`.
+        // The regions overlap and move UP, so this walks from the top down.
+        for k in (0..(old_cap - head) as usize).rev() {
+            let v = ctx.get_array_element(new_buf, head as usize + k);
+            ctx.set_array_element(new_buf, (head + new_space) as usize + k, v);
+        }
+        for k in head..(head + new_space) {
+            ctx.set_array_element(new_buf, k as usize, Value::Object(None));
+        }
+        ctx.set_field(this, AD_FIELD_HEAD, Value::Int(head + new_space));
+    }
 }
 
 fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
@@ -45723,7 +45793,15 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
-    r.register(c, "iterator", "()Ljava/util/Iterator;", native_ad_iterator);
+    // NO `iterator` REGISTRATION. Real `ArrayDeque.iterator()` bytecode runs,
+    // and that is the fix for the fail-fast row this family carried, not a
+    // concession. The JDK's `DeqIterator` is fail-fast off a PHYSICAL index
+    // into the ring buffer -- `nonNullElementAt` reports any null it reads as a
+    // `ConcurrentModificationException` -- so it is exactly as fail-fast as the
+    // buffer's layout, and no counter reproduces it. `ad_state` derives the
+    // element count and `ad_grow`/`ad_remove_at_logical` reproduce the JDK's
+    // own layout byte for byte, so there is nothing left for a shadow to
+    // protect. See `native_ad_iterator`'s removal in the same commit.
     r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
     r.register(
         c,
@@ -45752,7 +45830,6 @@ fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -45794,7 +45871,6 @@ fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -45822,28 +45898,33 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Before anything is pinned or grown: see `ad_refuse_null`.
+    // Before anything is stored or grown: see `ad_refuse_null`.
     ad_refuse_null(elem)?;
-    // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
-    // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
-    // and refresh both, otherwise the store below writes a pre-GC element
-    // address into the fresh buffer and the head/size fields of a stale
-    // receiver. (`data` is safe: `ad_state` re-reads it afterwards.)
-    let this_pin = ctx.pin_native_root(this);
-    let eh = pin_value(ctx, elem);
-    let (_, _, _, size) = ad_state(ctx, this);
-    ad_ensure_capacity(ctx, this, (size + 1) as usize);
-    let this = ctx.read_native_pin(this_pin, this);
-    let elem = read_pinned_elem(ctx, eh, elem);
-    ctx.unpin_native_roots(this_pin);
-    let (data, head, _tail, size) = ad_state(ctx, this);
+    // The store comes FIRST, exactly as `ArrayDeque.addFirst` does it:
+    //
+    //     es[head = dec(head, es.length)] = e;
+    //     if (head == tail) grow(1);
+    //
+    // Growing first and storing after is what this used to do, and it made the
+    // element a bare Rust local across a GC-capable allocation -- hence the
+    // pin/refresh dance that used to stand here (Family-1 stale-at-store,
+    // cce0079). Storing first retires the dance rather than maintaining it: the
+    // element is reachable from the buffer before anything can allocate, and
+    // `ad_grow` moves it through `get_array_element`/`set_array_element`, which
+    // the collector understands.
+    let (data, head, tail, _size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    if cap <= 0 {
+        return Ok(None);
+    }
     let new_head = (head - 1 + cap) % cap;
     if let Some(buf) = data {
         ctx.set_array_element(buf, new_head as usize, elem);
     }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    if new_head == tail {
+        ad_grow(ctx, this, 1);
+    }
     Ok(None)
 }
 
@@ -45853,26 +45934,24 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Before anything is pinned or grown: see `ad_refuse_null`.
+    // Before anything is stored or grown: see `ad_refuse_null`.
     ad_refuse_null(elem)?;
-    // Family-1 stale-at-store fix (cce0079): same shape as
-    // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
-    // buffer grow and refresh both before the store.
-    let this_pin = ctx.pin_native_root(this);
-    let eh = pin_value(ctx, elem);
-    let (_, _, _, size) = ad_state(ctx, this);
-    ad_ensure_capacity(ctx, this, (size + 1) as usize);
-    let this = ctx.read_native_pin(this_pin, this);
-    let elem = read_pinned_elem(ctx, eh, elem);
-    ctx.unpin_native_roots(this_pin);
-    let (data, _head, tail, size) = ad_state(ctx, this);
+    // Store first, then advance, then grow if the buffer just filled -- the
+    // shape of `ArrayDeque.addLast`. See `native_ad_add_first` for why the
+    // order matters to the collector as well as to the layout.
+    let (data, head, tail, _size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    if cap <= 0 {
+        return Ok(None);
+    }
     if let Some(buf) = data {
         ctx.set_array_element(buf, tail as usize, elem);
     }
     let new_tail = (tail + 1) % cap;
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    if head == new_tail {
+        ad_grow(ctx, this, 1);
+    }
     Ok(None)
 }
 
@@ -45926,7 +46005,6 @@ fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let new_head = (head + 1) % cap;
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
 }
 
@@ -45954,14 +46032,36 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
     }
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
 }
 
-/// Remove the element at *logical* index `k` (0 = head) from the circular
-/// buffer: shift the elements after it one position back toward the head,
-/// clear the vacated last slot, and decrement `tail`/`size`. `head` is left
-/// unchanged. Used by the object-removal natives below.
+/// Delete the element at *logical* index `k` (0 = head), leaving the buffer in
+/// the state `ArrayDeque.delete` would have left it in.
+///
+/// The JDK closes the gap from whichever END is nearer and moves that end's
+/// index: fewer elements before the hole, and it slides them forward and
+/// advances `head`; otherwise it slides the ones after it back and retracts
+/// `tail`. This used to always slide backwards and always retract `tail`, which
+/// produces a deque holding the same elements in the same order -- so every
+/// accessor of ours agreed, and it stood.
+///
+/// It is still wrong, and the reason is the same one that makes `ad_grow`'s
+/// normalisation wrong: a PHYSICAL index into the buffer is a thing real JDK
+/// bodies hold, and `DeqIterator` holds one. Deleting the head of `[a, b, c]`
+/// with an iterator open one step in:
+///
+/// ```text
+///   HotSpot   head=1 tail=3 es=[null, b, c, null]   cursor 1 -> reads "b"
+///   was       head=0 tail=2 es=[b, c, null, null]   cursor 1 -> reads "c"
+/// ```
+///
+/// -- the same deque, and an iterator that skips an element and then reads a
+/// null, which `nonNullElementAt` reports as a `ConcurrentModificationException`
+/// against a caller that did nothing wrong.
+///
+/// The JDK's segmented `System.arraycopy` calls are written here as modular
+/// loops. They say the same thing: the array is circular, and the JDK only
+/// splits the copy because `arraycopy` is not.
 fn ad_remove_at_logical(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -45971,20 +46071,29 @@ fn ad_remove_at_logical(
     cap: i32,
     k: usize,
 ) {
-    let size_u = size as usize;
-    for j in k..(size_u - 1) {
-        let from = ((head + j as i32 + 1) % cap) as usize;
-        let to = ((head + j as i32) % cap) as usize;
-        let v = ctx.get_array_element(buf, from);
-        ctx.set_array_element(buf, to, v);
+    let front = k as i32;
+    let back = size - front - 1;
+    if front < back {
+        // Slide the elements BEFORE the hole one place forward, then drop the
+        // old head slot. Ties go to the other branch, as in the JDK.
+        for j in (0..front).rev() {
+            let v = ctx.get_array_element(buf, ((head + j) % cap) as usize);
+            ctx.set_array_element(buf, ((head + j + 1) % cap) as usize, v);
+        }
+        ctx.set_array_element(buf, head as usize, Value::Object(None));
+        ctx.set_field(this, AD_FIELD_HEAD, Value::Int((head + 1) % cap));
+    } else {
+        // Slide the elements AFTER the hole one place back, then drop the slot
+        // the tail vacates.
+        let hole = (head + front) % cap;
+        for j in 0..back {
+            let v = ctx.get_array_element(buf, ((hole + j + 1) % cap) as usize);
+            ctx.set_array_element(buf, ((hole + j) % cap) as usize, v);
+        }
+        let new_tail = (head + size - 1) % cap;
+        ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
+        ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     }
-    // Clear the (now-duplicated) last logical slot so dropped references don't
-    // pin garbage and `toArray`/iteration never observe a stale value.
-    let last = ((head + size - 1) % cap) as usize;
-    ctx.set_array_element(buf, last, Value::Object(None));
-    let new_tail = (head + size - 1) % cap; // old tail - 1 (mod cap)
-    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
 }
 
 /// `ArrayDeque.remove(Object)` / `removeFirstOccurrence(Object)` — remove the
@@ -46253,7 +46362,6 @@ fn native_ad_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -46293,41 +46401,6 @@ fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     elems
 }
 
-fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    // `java/util/ArrayDeque$DeqIterator` -- the class HotSpot 25.0.4+7 hands
-    // out -- through the shared family mint.
-    //
-    // This site used to mint the FABRICATION `java/util/ArrayDeque$Itr`, which
-    // `--jdk-only` refused, landing on the real `Arrays$ArrayItr`. So one
-    // receiver answered two different wrong class names depending on the mode
-    // and neither was HotSpot's. Both are gone: the real class is minted in
-    // both modes, and `alloc_arraylist_iterator_as` refuses rather than
-    // fabricates if an image ever lacks it.
-    //
-    // The reasoning the old site recorded for NOT letting real
-    // `ArrayDeque.iterator()` bytecode run still holds and is why this is a
-    // snapshot rather than a live cursor: `native_ad_itr_remove` must keep our
-    // slot-3 `size` in step with a removal real `delete(..)` bytecode knows
-    // nothing about. Write-through is preserved -- `propagate_list_removal`
-    // routes a deque source to `native_ad_remove_first_occurrence`, which is
-    // what `SnapshotItrRoute::ArrayDeque` called.
-    //
-    // NOT fail-fast, and this is the one family of the three that cannot be:
-    // `DeqIterator` declares `cursor`, `remaining`, `lastRet` and no
-    // `expectedModCount` (the JDK's own is fail-fast off head/tail arithmetic
-    // instead), so `al_view_itr_expected_slot` finds no slot to seed and the
-    // third door stays quiet. Recorded in the L3 record as the residual it is
-    // rather than worked around by writing a generation into `remaining`, which
-    // is a field real `forEachRemaining` bytecode reads.
-    let elems = ad_collect_elements(ctx, this);
-    let itr =
-        alloc_family_snapshot_iterator(ctx, this, &elems, "java/util/ArrayDeque$DeqIterator")?;
-    Ok(Some(Value::Object(Some(itr))))
-}
 
 /// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
 /// from the BACKING deque (field 2). Without this native, `remove()` falls to
@@ -65672,7 +65745,24 @@ fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if let Some(Value::Object(Some(this))) = args.first() {
         if unmod_is_immutable(&*ctx, *this) {
             let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
-            if let Some(Value::Object(Some(spl_obj))) = spl {
+            // ONLY a spliterator THIS CRATE MINTED may be written to. The
+            // backing's `spliterator()` is not guaranteed to reach
+            // `native_al_spliterator`: for a `List.of` the delegate lands on
+            // java.base's own `ArrayList.spliterator()` bytecode and hands back
+            // a REAL `ArrayList$ArrayListSpliterator`, whose slot 3 is its
+            // `this$0`. Writing a characteristics mask there clobbered it, and
+            // the next `estimateSize()` died in `getFence` with "Cannot read
+            // field modCount because this.this$0 is null" -- which is how this
+            // was found, one probe row after the change that caused it.
+            //
+            // `two-producers-of-one-carrier-class` again, in its most direct
+            // form: the synthetic `java/util/Spliterator` and the JDK's own
+            // classes both arrive here, and only one of them has a slot 3 that
+            // means what this code thinks it means.
+            let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
+                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                    == Some("java/util/Spliterator"));
+            if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
                 let this = *this;
                 let size = match ctx.get_field(spl_obj, 2) {
                     Value::Int(n) => n,

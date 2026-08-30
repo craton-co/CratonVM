@@ -21,7 +21,7 @@ been removed again.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-29** — dispatch worklist 483 rows / 20 fixed, PLUS its two recorded-open items and five more the probe found: 125 rows, **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Records: `L5-reflection-lane-complete-20260828.md` and `L5-residuals-module-packages-and-invokeexact-20260828.md` | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms) — **zero failures `--jdk-only` produces that compatible mode does not**, and Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
+| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms), now FULLY ADJUDICATED — **185 pass / 19 fail / 14 unresolved**, and **zero failures `--jdk-only` produces that compatible mode does not**; the single candidate for one was the harness (three concurrent `--Xmx 1g` shards OOM'd the strict arm; alone it passes). Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
@@ -124,7 +124,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | **Phase 1** — fabricated receiver kills its caller | **CLOSED 2026-08-29 — all nine lanes.** A/B/D/G/I by `Phase1Sweep` (80 rows); C/E/F/H by `probes/P1RemainingSweep.java` (29 rows, 0 differing both modes, **0 PHASE1-KILL**), each exercised through the payload the roadmap names and with all four mint sites still LIVE. Record: `phase-1-is-closed-the-last-four-lanes-measured-20260829.md`. It means the stated MECHANISM no longer fires on the nine — not that no fabricated class can kill a caller: `RJdkEnumerations` was exactly that and the CORPUS found it, not a Phase 1 probe. |
 | **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
-| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot (0 strict-only failures; the worklist is 1065, not 334) and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). |
+| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot — fully adjudicated at 185/19/14, 0 strict-only failures, worklist 1065 not 334 — and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). **Two methodology results worth more than the counts:** buy the ORACLE before raising your own cap (4 of the slowest 21 do not finish on HotSpot at 1800 s either, so no CratonVM verdict on them can mean anything), and confirm any mode-specific failure ALONE — sharding manufactured one here, as a working directory on the wrong filesystem manufactured another. |
 
 ### The finding that reframes the work
 
@@ -573,14 +573,34 @@ while asserting nothing — 33 assertions went dark. Restored:
 selector}_probe/`, `apps/lm_subclass/`. `probe_fixture_census` is the instrument
 that catches this and it was correctly red the whole time.
 
-**OPEN, unowned, and worth someone's morning:**
-`warm_null_receiver_invokes_throw_npe_jit` — once its inline cache is warm,
-`invokespecial` on a NULL receiver does not throw, and the callee runs with
-`this == null`. JVMS §6.5, and the test names the consequence it was written
-for: the bogus `Cannot read field "interfaces" because "rd" is null` at
-`Class.java:1217`. Reproduced identically on four binaries spanning this
-session, so it is not recent. `invokevirtual` and `invokeinterface` both throw
-correctly; only `invokespecial` is wrong.
+**~~OPEN, unowned, and worth someone's morning:~~ FIXED 2026-08-30.**
+`warm_null_receiver_invokes_throw_npe_jit` — `invokespecial` on a NULL receiver
+did not throw once warm, and the callee ran with `this == null`. JVMS §6.5, and
+the mechanism behind the bogus `Cannot read field "interfaces" because "rd" is
+null` at `Class.java:1217`.
+
+**It was not the inline cache.** `invokevirtual`/`invokeinterface` were right
+only incidentally — their cache tests the receiver's CLASS, so a null fails
+every guard. `invokespecial` is statically bound, and both of the emitters that
+bind it jump straight into the compiled callee. The only thing left to raise the
+NPE was the callee body faulting on its own, which it does only if it
+dereferences `this`:
+
+```text
+  private callee body     HotSpot   --nojit   jit (before)
+  return 3;               NPE       NPE       NO-THROW(3)
+  return this.x;          NPE       NPE       NPE
+  return helper();        NPE       NPE       NO-THROW(5)
+```
+
+**Two emitters, and the first fix went to a third that was not involved.** The
+single-pass direct call (`x64/bytecode_walk.rs`) and the optimizing tier's
+`emit_direct_cross_call` (`ir_lower.rs`) both needed the check; which one runs
+depends on the callee, so `return 3;` and `return helper();` were fixed by
+different patches. `CRATONVM_DBG_IR_COMPILES` and `CRATONVM_DBG_JIT_GEN` name
+the tier and the path — reach for them before patching an emitter, because the
+disassembly of the *caller* is what proves the callee was not inlined.
+`apps/probes/NrpVariants.java` is the three-body probe.
 
 ### dev's tip is frequently red
 
