@@ -3354,8 +3354,16 @@ impl<'a> Lowerer<'a> {
     /// `lib.rs` eagerly compiles a resolved `invokestatic` / non-`<init>`
     /// `invokespecial` callee via `callee_compiler` and records
     /// `(pc → (entry, callee_needs_context))`. Both call kinds are STATICALLY
-    /// bound, so no receiver type check is needed — exactly why single-pass may
+    /// bound, so no receiver TYPE check is needed — exactly why single-pass may
     /// bind them directly too.
+    ///
+    /// A null check is a different question, and this sentence used to answer
+    /// it by omission. `invokestatic` has no receiver to test; `invokespecial`
+    /// does, and JVMS 6.5 raises NPE at the INVOKE rather than inside the
+    /// callee. Jumping straight to a compiled entry skips the dispatch door
+    /// that used to raise it, so the only thing left to fault was the callee
+    /// body — and a body that never dereferences `this` does not. See
+    /// `has_receiver` below.
     ///
     /// # Why this matters
     ///
@@ -3411,6 +3419,7 @@ impl<'a> Lowerer<'a> {
     /// which both keeps the callee's buffer alive (`_direct_callee_roots`) and
     /// puts this method into the callee's invalidation closure, so the baked
     /// address can never outlive the code it points at.
+    #[allow(clippy::too_many_arguments)]
     fn emit_direct_cross_call(
         &mut self,
         inputs: &[NodeId],
@@ -3420,10 +3429,20 @@ impl<'a> Lowerer<'a> {
         callee_needs_ctx: bool,
         info_ptr: usize,
         ty: IrType,
+        has_receiver: bool,
+        bci: usize,
     ) {
         for i in 0..num_args {
             let arg = inputs[2 + i];
             self.load_to_rax(self.slot_of(arg));
+            // JVMS 6.5 on argument 0 of a receiver-bearing call. Deopt rather
+            // than raise inline: the interpreter re-executes this invoke and
+            // owns the canonical NPE, its message and its stack trace, exactly
+            // as it does for the field-access null checks above.
+            if i == 0 && has_receiver {
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+            }
             self.store_rax(self.args_stage_top_off - (i as i32) * 8);
         }
         let base = usize::from(callee_needs_ctx);
@@ -5397,6 +5416,15 @@ impl<'a> Lowerer<'a> {
                     node.bytecode_pc.and_then(|pc| self.direct_calls.get(&pc))
                 {
                     if entry != 0 {
+                        // 0 = virtual, 1 = special, 2 = interface, 3 = static,
+                        // 4 = self-recursive static. The first three carry a
+                        // receiver in argument 0; this map holds static and
+                        // special, and the test is right for all five.
+                        // SAFETY: as the `invoke_kind == 4` read above — the
+                        // pointer names a live `JitInvokeInfo` owned by
+                        // `ir_call_infos` for the lifetime of this compile.
+                        let has_receiver =
+                            matches!(unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind }, 0 | 1 | 2);
                         self.emit_direct_cross_call(
                             &node.inputs,
                             slot,
@@ -5405,6 +5433,8 @@ impl<'a> Lowerer<'a> {
                             callee_needs_ctx,
                             *info_ptr,
                             node.ty,
+                            has_receiver,
+                            node.bytecode_pc.unwrap_or(0),
                         );
                         return;
                     }
