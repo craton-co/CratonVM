@@ -2640,6 +2640,32 @@ pub struct ZgcRealHeap {
     /// CROSS_THREAD_JIT_PEER incomplete whenever a peer is in compiled code.
     /// Without this counter the two are indistinguishable at the summary line.
     relocation_on_proven_jit: AtomicUsize,
+    /// WHICH term of the relocation gate refused, per cycle.
+    ///
+    /// [`Self::relocation_skipped_jit`] is a COUNT, and a count of a
+    /// five-term conjunction cannot be acted on: `skipped_jit=13` is the same
+    /// number whether the kill switch is off, moving-young is disabled, the
+    /// per-cycle coverage proof failed, or this thread was scanned
+    /// conservatively. Each of those wants a different repair, and on
+    /// `DefaultCatalogAndSchemaTest` (2026-08-30) the difference was the whole
+    /// investigation: 13 of 14 cycles declined, and the generational
+    /// collector's own reason census read `coverage_fallbacks=0` because
+    /// `bump_reason_count` has exactly one caller and it is not on this
+    /// collector's path (see `gc_quiescence::moving_young_incomplete_reason_mask`,
+    /// which says so in as many words).
+    ///
+    /// Indexed by [`relocation_skip_reason`]. First failing term wins, in the
+    /// order the gate evaluates them, so the index names what actually forced
+    /// the decision rather than every term that happened to be false.
+    relocation_skip_reasons: [AtomicUsize; relocation_skip_reason::COUNT],
+    /// When the refusal was [`relocation_skip_reason::COVERAGE_INCOMPLETE`],
+    /// the `gc_quiescence::incomplete_reason` code that proof recorded.
+    ///
+    /// Separate from the array above because it answers the NEXT question: the
+    /// gate says "the proof failed", and this says which obligation it failed
+    /// on. Sized by the quiescence module's own `COUNT` so a new reason there
+    /// is a compile error here rather than a silently dropped column.
+    relocation_coverage_reasons: [AtomicUsize; crate::gc_quiescence::incomplete_reason::COUNT],
     /// Lifetime count of TLAB cells a [`Self::retire_all_tlabs`] could not
     /// lock, and so could not close.
     ///
@@ -3510,6 +3536,8 @@ impl ZgcRealHeap {
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
             relocation_on_proven_jit: AtomicUsize::new(0),
+            relocation_skip_reasons: std::array::from_fn(|_| AtomicUsize::new(0)),
+            relocation_coverage_reasons: std::array::from_fn(|_| AtomicUsize::new(0)),
             tlab_retire_skipped_total: AtomicUsize::new(0),
 
             unwalkable_reports: AtomicUsize::new(0),
@@ -4311,6 +4339,20 @@ impl ZgcRealHeap {
     /// coverage proof. See the field doc for why a zero here is informative.
     pub fn relocation_on_proven_jit(&self) -> usize {
         self.relocation_on_proven_jit.load(Ordering::Relaxed)
+    }
+
+    /// Per-term census of the relocation refusal — see
+    /// [`relocation_skip_reason`].
+    pub fn relocation_skip_reason_counts(&self) -> [usize; relocation_skip_reason::COUNT] {
+        std::array::from_fn(|i| self.relocation_skip_reasons[i].load(Ordering::Relaxed))
+    }
+
+    /// For refusals attributed to [`relocation_skip_reason::COVERAGE_INCOMPLETE`],
+    /// the `gc_quiescence::incomplete_reason` the proof recorded.
+    pub fn relocation_coverage_reason_counts(
+        &self,
+    ) -> [usize; crate::gc_quiescence::incomplete_reason::COUNT] {
+        std::array::from_fn(|i| self.relocation_coverage_reasons[i].load(Ordering::Relaxed))
     }
 
     /// Lifetime count of TLAB cells a retire could not lock.
@@ -6180,13 +6222,39 @@ impl ZgcRealHeap {
         // That is a real limit of the proof, not of this gate.
         let compiled_frames_live = crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack();
-        let frames_are_rewritable = zgc_relocate_under_proven_jit()
-            && crate::gc_quiescence::moving_young_enabled()
-            && !crate::gc_quiescence::moving_young_coverage_incomplete()
-            && !crate::gc_quiescence::force_non_moving_jit_roots()
-            && !crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        // FIRST FAILING TERM, not the conjunction. The five terms below used
+        // to be one `&&` chain whose only trace was `relocation_skipped_jit`,
+        // and a count of a conjunction names nothing: see
+        // [`Self::relocation_skip_reasons`] for the run that cost.
+        let refusal: Option<usize> = if !zgc_relocate_under_proven_jit() {
+            Some(relocation_skip_reason::SWITCH_OFF)
+        } else if !crate::gc_quiescence::moving_young_enabled() {
+            Some(relocation_skip_reason::MOVING_YOUNG_DISABLED)
+        } else if crate::gc_quiescence::moving_young_coverage_incomplete() {
+            Some(relocation_skip_reason::COVERAGE_INCOMPLETE)
+        } else if crate::gc_quiescence::force_non_moving_jit_roots() {
+            Some(relocation_skip_reason::FORCED_NON_MOVING_ROOTS)
+        } else if crate::gc_quiescence::unregistered_jit_frame_on_stack() {
+            Some(relocation_skip_reason::UNREGISTERED_JIT_FRAME)
+        } else {
+            None
+        };
+        let frames_are_rewritable = refusal.is_none();
         if compiled_frames_live && !frames_are_rewritable {
             self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = refusal {
+                if let Some(slot) = self.relocation_skip_reasons.get(r) {
+                    slot.fetch_add(1, Ordering::Relaxed);
+                }
+                if r == relocation_skip_reason::COVERAGE_INCOMPLETE {
+                    // WHICH obligation the proof failed on. `moving_young_incomplete_reason`
+                    // is first-wins for the cycle, which is the one that forced it.
+                    let why = crate::gc_quiescence::moving_young_incomplete_reason();
+                    if let Some(slot) = self.relocation_coverage_reasons.get(why) {
+                        slot.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
@@ -9543,6 +9611,42 @@ const ZGC_TLAB_ALIGN: usize = 8;
 /// it is not. Turn it on to exercise the low-region path or to bisect against
 /// a future high-region compactor. Latched: it decides what a collection does
 /// and must not change mid-cycle.
+/// Why a ZGC collection declined to run its low-end slide.
+///
+/// The gate in [`ZgcRealHeap::relocate_stw`] is a five-term conjunction, and
+/// until 2026-08-30 its only trace was one scalar. Each term has a different
+/// repair — a kill switch that is off wants turning on, an incomplete coverage
+/// proof wants a stronger JIT contract, a conservatively-scanned thread wants
+/// nothing at all — so the number that matters is which term said no.
+pub mod relocation_skip_reason {
+    /// `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — the kill switch.
+    pub const SWITCH_OFF: usize = 0;
+    /// Moving-young is off process-wide, so no rewritable-root contract exists
+    /// to lean on.
+    pub const MOVING_YOUNG_DISABLED: usize = 1;
+    /// The per-cycle coverage proof reported at least one unproven obligation.
+    /// `relocation_coverage_reason:` names which.
+    pub const COVERAGE_INCOMPLETE: usize = 2;
+    /// This thread's root scan asked for non-moving JIT roots.
+    pub const FORCED_NON_MOVING_ROOTS: usize = 3;
+    /// A JIT frame was on this thread's stack without a `JitEntryGuard`.
+    pub const UNREGISTERED_JIT_FRAME: usize = 4;
+    /// One past the highest code; sizes the counter array.
+    pub const COUNT: usize = 5;
+
+    /// Human-readable label, for the summary line.
+    pub fn label(code: usize) -> &'static str {
+        match code {
+            SWITCH_OFF => "relocate-under-proven-jit-switch-off",
+            MOVING_YOUNG_DISABLED => "moving-young-disabled",
+            COVERAGE_INCOMPLETE => "coverage-proof-incomplete",
+            FORCED_NON_MOVING_ROOTS => "forced-non-moving-jit-roots",
+            UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
+            _ => "unknown",
+        }
+    }
+}
+
 fn targeted_compaction_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {

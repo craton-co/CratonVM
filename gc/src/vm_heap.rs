@@ -2706,6 +2706,34 @@ impl VmHeap {
                  tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
             );
+            // WHICH of the five terms refused, and — when it was the coverage
+            // proof — which obligation. `relocation_skipped_jit` is a count of
+            // a conjunction; on its own it names nothing, and the generational
+            // collector's `moving_young_fallback_reason` census cannot fill the
+            // gap because its only writer is that collector's own per-cycle
+            // accounting (`gc_quiescence::moving_young_incomplete_reason_mask`
+            // says so). Printed only when something actually declined, so a
+            // clean run does not grow two empty sections.
+            let skip_reasons = h.relocation_skip_reason_counts();
+            for (reason, n) in skip_reasons.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] zgc-relocation-skip-reason: {}={}",
+                        crate::zgc::relocation_skip_reason::label(reason),
+                        n
+                    );
+                }
+            }
+            let cov_reasons = h.relocation_coverage_reason_counts();
+            for (reason, n) in cov_reasons.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] zgc-relocation-coverage-reason: {}={}",
+                        crate::gc_quiescence::incomplete_reason::label(reason),
+                        n
+                    );
+                }
+            }
             // THE OTHER END OF THE ARENA, on its own line.
             //
             // Every number above describes the LOW end. A heap can compact that
