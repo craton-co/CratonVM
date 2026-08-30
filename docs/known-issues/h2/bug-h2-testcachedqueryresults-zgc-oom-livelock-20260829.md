@@ -1,5 +1,63 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
+
+## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
+
+The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
+modes fail with the *same* assertion, HotSpot passes:
+
+```text
+HotSpot          PASS     9s
+CratonVM compat  FAIL  1078s   AssertionError: Expected: 100000 actual: 98304
+CratonVM strict  FAIL  1365s   AssertionError: Expected: 100000 actual: 98304
+```
+
+### The 1696 missing entries are accounted for, to the unit
+
+```text
+100000 - 98304                                    = 1696
+OutOfMemoryError (length=65536) raised in tasks   = 1691
+SQLException caught by the callable and printed   =    5
+                                                    ----
+                                                    1696
+```
+
+**That is why this page's OOM framing is right, and it also explains the thing
+an OOM does not obviously explain — why the symptom is a WRONG ANSWER instead of
+a crash.** The callable catches `SQLException` only. An `OutOfMemoryError` is an
+`Error`, so it goes straight past that `catch`, is captured by the `FutureTask`
+`invokeAll` created for it, and **the test never calls `get()` on any of the
+futures it gets back**. 1691 tasks therefore die completely silently, each one
+simply never reaching `concurrentSet.add(countAfter)`, and the only trace is the
+final count.
+
+### Three things it is NOT, each checked rather than assumed
+
+* **Not `ConcurrentHashMap.newKeySet()` losing entries.**
+  `apps/probes/ChmKeySetGrowth.java` — 5 threads, 100000 distinct adds, the same
+  shape the test uses — reports `adds-returned-true 100000`, `size 100000`,
+  `contains-misses 0` on CratonVM. Identical to HotSpot.
+* **Not `ExecutorService.invokeAll` dropping tasks**, which was a live suspicion
+  because `docs/known-issues/` records an `invokeAll` that copied 3 of 8 on a
+  ForkJoinTask arm. `apps/probes/InvokeAllCount.java` submits 100000 callables
+  through `invokeAll` on a 5-thread pool: `futures 100000`, `done 100000`,
+  `executed 100000`. Identical to HotSpot.
+* **Not a lost update, and not this VM mishandling `FOR UPDATE`** — which the
+  assertion's own shape suggests, since the set holds distinct COUNTER VALUES
+  and `add` returning false is the test's lost-update detector. The run printed
+  **zero** `LOST UPDATE!` lines and **zero** `countAfter != countAtLock` lines.
+  `TestBase.println` is NOT gated behind a verbosity flag — it goes straight to
+  `System.out` — so those absences are evidence rather than silence. Every task
+  that reached the lock saw a value no other task had seen.
+
+### One thing retracted
+
+`98304 == 131072 - (131072 >>> 2)` is exactly `ConcurrentHashMap`'s resize
+threshold for a 131072-bucket table, and the same number appearing in two
+independent runs in two modes made a deterministic growth failure look likely.
+Both probes above refute it. The resemblance is a coincidence, and it is
+recorded here so the next reader does not spend the same hour on it.
+
 ## Status
 
 **OPEN, and the chain is now traced to one frame — see §"2026-08-29 (second)".**
