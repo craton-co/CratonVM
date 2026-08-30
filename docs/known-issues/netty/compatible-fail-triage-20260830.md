@@ -92,13 +92,18 @@ Run that method ALONE, 48 parameterisations, quiet, one VM each:
 
 | | result | wall |
 |---|---|---:|
-| HotSpot 25 | **48/48** | **92 s** |
-| CratonVM | did not finish | **>900 s** (killed) |
+| HotSpot 25 | **48/48** | ~~92 s~~ **23 s** |
+| CratonVM | ~~did not finish~~ **48/48** | ~~>900 s~~ **452 s** |
 
-**Better than 10x, and the individual parameterisations blow the test's own
-30-second `@Timeout`** — which is why the symptom reads as
-`TimeoutException` rather than a wrong answer. Whole-class, quiet:
-HotSpot `ok=2621 failed=0`; CratonVM did not finish in 40 minutes.
+**CORRECTED 2026-08-30** — the struck numbers were taken while 6 `cargo` and 8
+`rustc` from other sessions were on this box. Re-measured quiet the pair is
+23 s and 452 s, i.e. **~20x**, and CratonVM **completes the method**: it does
+not fail on a quiet host at all. 452 s over 48 parameterisations is 9.4 s each
+against the test's own 30 s `@Timeout` — about 3x of headroom, which six-way
+contention erases. So this is a throughput gap that presents as a timeout under
+load, not a hard failure. The claim that this one method sits under 30 of the
+38 rows' individual failures stands. See
+`mutualauth-certchain-throughput-20260830.md`.
 
 That is one method, one cause, and 30 of the 38 rows' individual failures. It
 is the highest-value open item in the netty suite and it does not have a page
