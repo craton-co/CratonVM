@@ -1155,6 +1155,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_HTTP_MAX_BODY` | IO | `CRATONVM_IO=http-max-body` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_IAE_TRACE` | DBG | `CRATONVM_DBG=iae-trace` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_IAE_TRACE2` | DBG | `CRATONVM_DBG=iae-trace2` | opt-in | off | diag | snapshot | types |
+| `CRATONVM_IDENTITY_HASH_EVICT` | GC | `CRATONVM_GC=identity-hash-evict` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_INHERIT_THREAD_CCL` | THREADS | `CRATONVM_THREADS=inherit-thread-ccl` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_INHERIT_TL_WORKAROUND` | THREADS | `CRATONVM_THREADS=inherit-tl-workaround` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_INLINE_ALLOW_STATIC` | JIT | `CRATONVM_JIT=inline-allow-static` | opt-in | off | behaviour | snapshot | vm |
