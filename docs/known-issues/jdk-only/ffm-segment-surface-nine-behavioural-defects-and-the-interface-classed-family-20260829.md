@@ -218,6 +218,54 @@ fields included -- these are the layouts a by-name resolver has to land on:
   jdk.internal.foreign.HeapMemorySegmentImpl$OfByte  5   (offset, base + the same three)
 ```
 
+### 4.5b THE SEGMENT FAMILY IS NOT THIS LANE'S, and the two decisions must be read together
+
+`the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md` decided the segment
+carrier on 2026-08-29, in parallel with the work above, and **it decided against
+the direction this page took.** Its position, in its own terms: the concrete
+implementation class of a JDK interface is not part of that interface's
+contract, `cratonvm.internal.foreign.MemorySegmentImpl` is the VM's own
+allocation shape rather than a compatibility stand-in, and the 23 remaining
+class/superclass rows "are the price of the answer, not a defect left behind."
+It warns the next reader off "fixing" them by mimicking the JDK's names.
+
+**That page owns the segment family. This lane is not touching it**, and the
+`NativeMemorySegmentImpl`/`HeapMemorySegmentImpl$OfByte` rows in the table above
+should be read as ITS residual, not as work queued here.
+
+**The two are compatible in fact, and one discriminator is why.** That page lists
+four things, any one of which would have made its carrier a stand-in. The fourth
+is *"a JDK class of the same name that CratonVM declines to load"* — and that is
+exactly the difference:
+
+* There is **no** `cratonvm/internal/foreign/MemorySegmentImpl` in any image.
+  Nothing is being declined; the name links nothing. Mimicking
+  `NativeMemorySegmentImpl` there would mean FABRICATING a class under a JDK
+  name with a layout chosen to be read positionally — the shape that page
+  rejects, and rightly.
+* `jdk.internal.foreign.ArenaImpl`, `ValueLayouts$OfIntImpl`, `StructLayoutImpl`
+  and the rest **exist in the image, load, and declare their own fields.** The
+  carriers here are instances of those REAL classes with every field resolved BY
+  NAME, so JDK bytecode reads what it declared. None of that page's four
+  falsifiers applies.
+
+Measured rather than argued: both lanes' work composes. On the merged tree the
+strict arm fell from 80 diff lines to 40, matching compatible exactly — its
+carrier fix and these carrier moves are disjoint and additive.
+
+**What IS genuinely unsettled, and is the owner's to settle.** That page's
+closing section prescribes a different remedy for the layout half — a
+CratonVM-owned carrier through the generated-class door, with
+`synthetic_implements` entries and instance methods re-registered, whose stated
+check is "the two `isInterface` rows going false and `FfmSegmentSweep`'s other 23
+staying exactly as they are." **That is now superseded by events rather than by
+argument**: the layout half is done, the two rows are false, and the class names
+match HotSpot as well. If the principle is meant to bind the layout families too
+— that a JDK implementation class name is never worth matching, even when the
+class is real and loadable — then this work went further than the principle
+allows and should be reconsidered as a whole, not unpicked row by row. Nothing
+here is written on the assumption that it will not be.
+
 ### 4.6 The group layouts, and three ways a name-scoped conversion misses
 
 All four at once -- struct, union, sequence, padding -- because they share
@@ -331,9 +379,9 @@ Two things the count does not show, both found while sizing it:
   only `byteSize`, `byteAlignment`, `byteOffset` and `varHandle`. `StructLayoutImpl`
   and `SequenceLayoutImpl` carry none of theirs (0 of 7, 0 of 10).
 
-The segment family remains the one that clears `compatibility_classes > 0`,
-since it is the only one with a fabricated stand-in -- and it is now measured as
-the most expensive of the three, not merely the widest by native count.
+The segment family is the one that clears `compatibility_classes > 0`, and it is
+measured as the most expensive of the three -- **but it belongs to another lane's
+decision, which resolved it differently. See §4.5b before acting on this table.**
 
 ## 5. Reproduce
 
