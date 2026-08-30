@@ -8604,37 +8604,71 @@ pub fn register_essential_natives_with_shims(
             _ => Ok(Some(ctx.get_field(this, 0))),
         }
     };
-    for permission_cls in [
-        "java/security/Permission",
-        "java/security/BasicPermission",
-        "java/lang/RuntimePermission",
-        "java/util/PropertyPermission",
-        "java/util/logging/LoggingPermission",
-    ] {
-        registry.register(
-            permission_cls,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            permission_init,
-        );
-        registry.register(
-            permission_cls,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            permission_init,
-        );
-        registry.register(
-            permission_cls,
-            "getName",
-            "()Ljava/lang/String;",
-            permission_get_name,
-        );
-        // KEEP: `java.security.Permission` and its subclasses declare NO
-        // no-arg constructor in the real JDK, so this triple is reachable only
-        // for receivers CratonVM synthesizes itself — and those have nothing
-        // to initialise (the `name` slot is written by the (String) ctor above).
-        registry.register(permission_cls, "<init>", "()V", |_ctx, _args| Ok(None));
-    }
+    // `SyntheticStub`, not the ambient category, since 2026-08-29. These
+    // closures were written in `b448f2039` when this VM FABRICATED the
+    // permission classes — `synthetic_stub_fields` gave them a single field and
+    // `synthetic_stub_methods` gave them these very constructors, so writing
+    // `name` WAS the whole implementation. The real classes are loaded now,
+    // with their real bodies, and the closures went on shadowing them.
+    //
+    // What that cost, measured against HotSpot: `permission_init` writes `name`
+    // and returns, so `BasicPermission.<init>`'s `init(name)` and
+    // `PropertyPermission.<init>`'s `init(getMask(actions))` never ran. Every
+    // field those two set stayed at its default —
+    //
+    //     new PropertyPermission("a.b.*", "read,write")
+    //       HotSpot   mask=3  path="a.b.*"  getActions()="read,write"
+    //       CratonVM  mask=0  path=null     getActions()=""
+    //
+    // — so `implies()` NPEd on a null `that.path`, `new PropertyPermission(k,
+    // "bogus")` was accepted where the JDK throws, and a serialization round
+    // trip died in `readObject`'s `init(getMask(actions))` with "invalid
+    // actions mask", which is how this was found. Neither `init` nor `getMask`
+    // is broken: called reflectively both answer exactly as HotSpot does. Only
+    // the constructors that should call them were being replaced.
+    //
+    // Tagging the family `SyntheticStub` and allow-listing it in
+    // `real_protected_stub_class` hands every one of these back to the real
+    // body whenever the real body is loaded — the same route
+    // `ThreadPoolExecutor.execute` and `java/util/Objects` already take. On a
+    // synthetic image `synthetic_stub_yields_with_cm` answers false ("loaded
+    // class is itself a synthetic stub") and these keep serving, which is the
+    // configuration they were written for.
+    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
+        for permission_cls in [
+            "java/security/Permission",
+            "java/security/BasicPermission",
+            "java/lang/RuntimePermission",
+            "java/util/PropertyPermission",
+            "java/util/logging/LoggingPermission",
+        ] {
+            registry.register(
+                permission_cls,
+                "<init>",
+                "(Ljava/lang/String;)V",
+                permission_init,
+            );
+            registry.register(
+                permission_cls,
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                permission_init,
+            );
+            registry.register(
+                permission_cls,
+                "getName",
+                "()Ljava/lang/String;",
+                permission_get_name,
+            );
+            // KEEP: `java.security.Permission` and its subclasses declare NO
+            // no-arg constructor in the real JDK, so this triple is reachable
+            // only for receivers CratonVM synthesizes itself — and those have
+            // nothing to initialise (the `name` slot is written by the (String)
+            // ctor above). The yield predicate leaves it alone on its own
+            // terms: it finds no such method on the real class.
+            registry.register(permission_cls, "<init>", "()V", |_ctx, _args| Ok(None));
+        }
+    });
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         let c = "java/util/concurrent/atomic/AtomicBoolean";
         registry.register(c, "<init>", "()V", native_ab_init_default);
