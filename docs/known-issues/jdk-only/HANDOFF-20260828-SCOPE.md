@@ -122,7 +122,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | phase | status |
 | --- | --- |
 | **Phase 1** — fabricated receiver kills its caller | **CLOSED 2026-08-29 — all nine lanes.** A/B/D/G/I by `Phase1Sweep` (80 rows); C/E/F/H by `probes/P1RemainingSweep.java` (29 rows, 0 differing both modes, **0 PHASE1-KILL**), each exercised through the payload the roadmap names and with all four mint sites still LIVE. Record: `phase-1-is-closed-the-last-four-lanes-measured-20260829.md`. It means the stated MECHANISM no longer fires on the nine — not that no fabricated class can kill a caller: `RJdkEnumerations` was exactly that and the CORPUS found it, not a Phase 1 probe. |
-| **Phase 2** — retire the shadows | **ADJUDICATED 2026-08-30 (L2). 34 of 270 classes are demonstrably load-bearing; the other 236 are candidates and NOT ONE is retirable on corpus evidence.** The 14-vector corpus passes `ConcurrentHashMap` 14/14; retiring it empties `Properties.keySet()` and kills the probe. §2 below and [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md). |
+| **Phase 2** — retire the shadows | **ADJUDICATED 2026-08-30 (L2). 34 of 270 classes are demonstrably load-bearing; of the other 236, ONE TRIPLE of 1477 survived the evidence and is retired.** The 14-vector corpus passes `ConcurrentHashMap` 14/14; retiring it empties `Properties.keySet()` and kills the probe. §2 below and [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md). |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
 | **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot — fully adjudicated at 185/19/14, 0 strict-only failures, worklist 1065 not 334 — and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). **Two methodology results worth more than the counts:** buy the ORACLE before raising your own cap (4 of the slowest 21 do not finish on HotSpot at 1800 s either, so no CratonVM verdict on them can mean anything), and confirm any mode-specific failure ALONE — sharding manufactured one here, as a working directory on the wrong filesystem manufactured another. |
 
@@ -314,6 +314,23 @@ the run dies in `ConcurrentHashMap$KeyIterator.next`. **A retirement's blast
 radius is its class's USERS**, and the family's own probe being clean is the
 trap rather than the reassurance.
 
+**One triple retired**, and the ratio is the finding:
+`sun/nio/ch/FileChannelImpl.truncate(J)`, in a new
+`RETIRED_SHADOW_PHASE2_TRIPLES`. Two binaries from one tree differing only by
+that entry — `L4Diag` 4 diffs from HotSpot to 0, every other probe delta 0,
+118/118 on both. `FileChannel.truncate(-1)` now answers `Negative size` as
+HotSpot does instead of `Negative size: -1`.
+
+**Two false starts are recorded with it, and they cost more than the fix.**
+`jdk/internal/foreign/ArenaImpl` makes `Arena.allocate()` return the real
+`NativeMemorySegmentImpl` — and takes `FfmSegmentSweep` from 40 diffs to 181,
+dead at row 18. And the first triple retired was `open`, chosen because it was
+the only one the CORPUS had dispatched; it moved nothing, because the probe
+that produced the evidence exercises `truncate` (`invocations: 2`) and never
+touches `open` (`invocations: 0`). **A dial result is evidence for trying the
+table, not the table's result** — the two mechanisms differ, and a build is
+what finding that out costs.
+
 Guarded in code, not only here: `the_held_collection_families_are_not_retired`
 now carries the measurement and holds the CHM view/iterator classes too.
 
@@ -466,6 +483,26 @@ planning:
 **Read §5 of that page before your first landing.** The gate set changed on 2026-08-29 — it names no `--test` targets any more, because `native-builtins/tests/` holds ten and the hand-written list named seven. A gate script copied from an earlier lane is a script that runs 7 of 10.
 
 What remains below is DATED: which vectors were red on which day, and which lane fixed what. It decays, and it is kept here rather than moved because a permanent page should not carry a list that is wrong in a week.
+
+### `--features synthetic-jdk --tests` — was red for everyone, FIXED 2026-08-30
+
+If you have been treating that arm's `synthetic_stub_count_does_not_regress`
+failure (1591 against baseline 1582) as somebody else's drift, it was not
+drift and it is now green. **That arm had no baseline of its own.**
+`BASELINE_SYNTHETIC_STUBS` branched on `feature = "management"` and nothing
+else, so a third configuration — which compiles registrars the other two do
+not — was being scored against the DEFAULT resolve's number.
+
+Worse, its failure line printed `no-management` and named
+`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT` as the constant to paste into, which
+is the exact re-freeze-from-the-wrong-run hazard that label exists to prevent.
+Pasting 1592 there would have admitted nine stubs to the default arm silently.
+
+`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK` closes both halves. The nine rows by
+which that resolve exceeds the default are frozen, **explicitly not blessed**,
+and flagged for classification — a first freeze is not an adjudication.
+
+---
 
 ### Known-red vectors, so you can tell yours from theirs
 
