@@ -395,6 +395,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
             let uri_text = p57_uri_full_text(ctx, uri);
+            // THE SCHEME DECIDES, and both refusals were missing.
+            // `Path.of(URI)` is `Paths.get(uri)`: a URI with no scheme is not
+            // absolute and raises `IllegalArgumentException`, and a scheme no
+            // installed provider claims raises `FileSystemNotFoundException`.
+            // This VM answered a Path for both — so `Path.of(new URI(
+            // "http://example.com/x"))` handed back a relative filesystem path
+            // built out of a URL, which then resolved against the CWD.
+            //
+            // MEASURED with `apps/probes/L4CensusTail.java`. `file:` and `jar:`
+            // are the two this VM serves; anything else is a refusal rather
+            // than a guess.
+            {
+                let head = uri_text.split('/').next().unwrap_or("");
+                let scheme = match head.split_once(':') {
+                    Some((s, _)) if !s.is_empty() && s.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+                    }) && s.starts_with(|c: char| c.is_ascii_alphabetic()) => s.to_ascii_lowercase(),
+                    _ => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("URI is not absolute: {uri_text}"),
+                        }
+                        .into())
+                    }
+                };
+                if scheme != "file" && scheme != "jar" {
+                    return Err(p57_file_system_not_found(ctx, &scheme));
+                }
+            }
             // `Paths.get(jar:file:...!/entry)` is the resource-facing half of
             // the jar-FS contract. Jetty's PathResourceFactory mounts the URI
             // first, then calls this conversion for the root and every
@@ -1022,6 +1050,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -1038,6 +1069,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -1051,6 +1085,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -21042,6 +21079,107 @@ mod named_attribute_tests {
     }
 }
 
+/// `Provider "<scheme>" not installed` — a typed
+/// `java.nio.file.FileSystemNotFoundException`.
+///
+/// The TYPE is what callers key on: a fallback that catches
+/// `FileSystemNotFoundException` to try a different resolution strategy does not
+/// match a supertype instance, exactly as with [`p57_closed_channel`]. Falls
+/// back to `IllegalArgumentException` when the class is not in the image, which
+/// is still a refusal rather than a wrong Path.
+fn p57_file_system_not_found(ctx: &mut dyn NativeContext, scheme: &str) -> MethodCallFailed {
+    let msg = format!("Provider \"{scheme}\" not installed");
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/FileSystemNotFoundException")
+    {
+        let s = ctx.create_string(&msg);
+        if ctx
+            .invoke(
+                "java/nio/file/FileSystemNotFoundException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(s))],
+            )
+            .is_ok()
+        {
+            return MethodCallFailed::ExceptionThrown(exc);
+        }
+    }
+    RuntimeError::IllegalArgumentException { message: msg }.into()
+}
+
+/// Refuse `FileSystems.newFileSystem` over a path that is plainly not an
+/// archive.
+///
+/// **Part three recorded this as an unclaimed residual and it was measurable
+/// all along** — `apps/probes/L4CensusTail.java` asks HotSpot directly:
+///
+/// ```text
+///   FileSystems.newFileSystem(<a text file>, (ClassLoader) null)
+///     HotSpot   ProviderNotFoundException
+///     this VM   a jar filesystem over a text file
+/// ```
+///
+/// The reason for deferring was blast radius: these three registrations are on
+/// the hot path for every jar this VM opens. That reason survives, and it is why
+/// the check is a MAGIC-BYTE test rather than a real probe of the archive — a
+/// file whose first two bytes are `PK` still takes exactly the path it took
+/// before, and so does anything this cannot read (a jar-FS sentinel, a missing
+/// path, a directory). Only a readable regular file that is definitively not a
+/// zip is refused.
+///
+/// Returning a filesystem for a non-archive is worse than it sounds: the
+/// failure does not appear here, it appears at the first entry lookup, in a
+/// caller with no idea the mount was bogus.
+fn p57_refuse_non_archive(ctx: &mut dyn NativeContext, path: &str) -> Option<MethodCallFailed> {
+    // `jar:` sentinels and anything with an entry separator are this VM's own
+    // encoding, not host paths — never second-guess them.
+    if path.starts_with("jar:") || path.contains("!/") {
+        return None;
+    }
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    let mut head = [0u8; 2];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        if f.read_exact(&mut head).is_err() {
+            // Shorter than two bytes: cannot be a zip, and cannot be anything
+            // else this serves either.
+            return Some(p57_provider_not_found(ctx, path));
+        }
+    }
+    if &head == b"PK" {
+        return None;
+    }
+    Some(p57_provider_not_found(ctx, path))
+}
+
+/// A typed `java.nio.file.ProviderNotFoundException`, for the same reason
+/// [`p57_file_system_not_found`] is typed: callers catch the exact class.
+fn p57_provider_not_found(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let msg = format!("Provider not found for {path}");
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/ProviderNotFoundException")
+    {
+        let s = ctx.create_string(&msg);
+        if ctx
+            .invoke(
+                "java/nio/file/ProviderNotFoundException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(s))],
+            )
+            .is_ok()
+        {
+            return MethodCallFailed::ExceptionThrown(exc);
+        }
+    }
+    RuntimeError::IOException { message: msg }.into()
+}
+
 /// `FileStore.getAttribute`'s refusal, with the name the caller asked for.
 ///
 /// The JDK's message is the attribute string itself; a constant "no such
@@ -21887,16 +22025,37 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "valueOf",
         "(Ljava/lang/String;)Ljava/nio/file/FileVisitResult;",
         |ctx, args| {
+            // AN UNKNOWN NAME IS A REFUSAL, and `CONTINUE` was the worst
+            // possible thing to answer instead: `Enum.valueOf` raises
+            // `IllegalArgumentException`, and a walk that asked for TERMINATE
+            // through a misspelt or externally-supplied name kept walking. A
+            // null name is an NPE, not `CONTINUE` either.
+            //
+            // MEASURED with `apps/probes/L4CensusTail.java`.
+            // `PosixFilePermission.valueOf` — the same shape two files away —
+            // already refuses, which is what made this one visible.
             let name = match args.first() {
                 Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => "CONTINUE".to_string(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Name is null".into()),
+                    }
+                    .into())
+                }
             };
             let ordinal = match name.as_str() {
                 "CONTINUE" => 0,
                 "TERMINATE" => 1,
                 "SKIP_SUBTREE" => 2,
                 "SKIP_SIBLINGS" => 3,
-                _ => 0,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "No enum constant java.nio.file.FileVisitResult.{name}"
+                        ),
+                    }
+                    .into())
+                }
             };
             p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", &name, ordinal)
         },
@@ -23073,6 +23232,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             // Preserve the Instant's value (was dropped → stored 0, so every
             // FileTime.from(Instant) round-tripped to epoch 0). Read the real
             // java.time.Instant's named fields (seconds/nanos).
+            //
+            // A NULL Instant is an NPE (`Objects.requireNonNull(instant)`), not
+            // a FileTime of epoch 0 — which is a real timestamp, and one that
+            // compares, formats and sorts like any other. MEASURED with
+            // `apps/probes/L4CensusTail.java`.
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let millis = match args.first() {
                 Some(Value::Object(Some(inst))) => {
                     let secs = match ctx.get_field_by_name(*inst, "seconds") {

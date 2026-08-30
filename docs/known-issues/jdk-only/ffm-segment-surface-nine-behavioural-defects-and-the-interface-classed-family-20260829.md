@@ -119,9 +119,9 @@ segments; `ofBuffer`; `heapBase()`; and every layout's `byteSize`,
 
 ## 4. The residual, sized rather than guessed
 
-**25 rows in compatible mode, 45 under `--jdk-only`, down from 27/47: the
-`Arena` family is CLOSED (2026-08-29) and the rest is one defect.** All of what
-is left is `class`, `superclass` and `isInterface` -- 13, 10 and 2 rows.
+**23 rows in compatible mode, 43 under `--jdk-only`, down from 27/47.** Two of
+the five families are CLOSED (2026-08-29): `Arena`, and the nine `ValueLayout`
+carriers. All of what is left is `class`, `superclass` and `isInterface`.
 
 ```text
                        compatible                                    --jdk-only
@@ -210,12 +210,52 @@ fields included -- these are the layouts a by-name resolver has to land on:
 
 ```text
   jdk.internal.foreign.ArenaImpl                     2   DONE 2026-08-29
+  jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   DONE 2026-08-29 (and its 8 siblings)
   jdk.internal.foreign.NativeMemorySegmentImpl       4   (min + length, readOnly, scope)
   jdk.internal.foreign.HeapMemorySegmentImpl$OfByte  5   (offset, base + the same three)
   jdk.internal.foreign.layout.SequenceLayoutImpl     5   (elemCount, elementLayout + byteSize, byteAlignment, name)
-  jdk.internal.foreign.layout.ValueLayouts$OfIntImpl 6   (+ carrier, order, handle)
   jdk.internal.foreign.layout.StructLayoutImpl       6   (kind, elements, minByteAlignment + the same three)
 ```
+
+### 4.5 The value layouts, and the second producer that only compatible mode has
+
+Done in two steps, because the accessors had to stop guessing before any carrier
+could move:
+
+* **`p67_layout_slots`** resolves `byteSize`, `byteAlignment` and `name` from the
+  receiver's class. `AbstractLayout` declares all three, so ONE resolver serves
+  every layout -- value, struct, sequence, union, padding -- and the fabricated
+  carriers keep their old map through its fallback arm. Landing it alone left
+  the sweep at exactly 50/90, which is what "behaviour-preserving" has to mean.
+* **The carriers**, plus the four natives (`byteSize`, `byteAlignment`,
+  `byteOffset`, `varHandle`) the impl classes lacked.
+
+That fixed the STRICT arm only: 90 -> 86, compatible unchanged at 50. **A second
+producer mints these objects and only in compatible mode** --
+`make_prepared_value_layout`, the FFM preseed in `vm/src/vm/vm_util.rs`, which
+the strict arm drops entirely so the real `<clinit>` can run. Its own comment had
+already diagnosed itself:
+
+> "Every `class_name` reached here ... is an INTERFACE in the real JDK: it has
+> zero instance fields, and the concrete carrier is `ValueLayouts$Of*Impl` ...
+> The `.max(2)` above therefore invents two slots on an object of an interface
+> type ... It was NOT converted to named-field lookup, because there are no real
+> fields to name."
+
+Right about all of it, including the fix: mint the concrete carrier it names,
+and there ARE fields to name. Compatible 50 -> 46. The `<clinit>` suppression is
+untouched -- this was never about running the real initialiser, only about which
+class the object is an instance of.
+
+**The one regression, and it is the same species as the arena's.**
+`p67_layout_with_name` kept its own copy of the "slot 0 is an `Int` -> name is at
+2, else at 3" rule. On a real value layout that picks slot 3, which is `carrier`,
+while every reader now resolves by name and gets 2 -- so
+`structLayout(JAVA_INT.withName("c")).byteOffset(groupElement("c"))` answered
+`cannot resolve layout path element: no member named 'c'`. The name was written;
+nothing looked where it went. `RJdkForeign` step `layouts`, both arms. **A family
+converted at its readers and not at one writer fails exactly like a family
+converted at three methods and not the fourth.**
 
 None of them is large -- **but the field count is the wrong axis, and it is the
 axis I first priced them on.** What the move costs is step 2 of the recipe: the
