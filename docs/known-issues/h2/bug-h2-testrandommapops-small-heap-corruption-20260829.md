@@ -19,6 +19,52 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
+## ADDENDUM 2026-08-30 (L7 corpus lane): it is NOT a small-heap defect — 4g fails too
+
+The `--jdk-only` corpus run hit this class at `--Xmx 1g` and could not attribute
+it, which sent me here. Measuring the heap axis says the title's premise is too
+narrow. Compatible mode, default collector, release binary, host at load 3-7:
+
+```text
+ 256m   FAIL      38s   NullPointerException                       <- this page's case
+   1g   FAIL     173s   AssertionError: Expected: 247 actual: 198
+   1g   FAIL     181s   AssertionError: Expected: 57  actual: 55
+   1g   FAIL     372s   NullPointerException
+   1g   FAIL     480s   (the corpus run that started this)
+   2g   TIMEOUT 1300s   no failure within the cap -- and NOT a pass
+   4g   FAIL    1053s   AssertionError: Expected: 300 actual: 291
+```
+
+**The 256m row is a positive control and it reproduced**, so this is the same
+binary and setup this page describes, not a different experiment.
+
+Three things follow.
+
+**1. Heap sets the LATENCY, not the occurrence.** 38 s at 256m, 173-480 s at 1g,
+1053 s at 4g. Sixteen times the heap buys about twenty-five times the runway and
+then it fails anyway. `2g` timing out at 1300 s fits that curve rather than
+contradicting it — the run was still short of where 4g failed.
+
+**2. At 1g and above the dominant face is a WRONG ANSWER, not a crash.**
+`AssertionError: Expected: 247 actual: 198` at `TestRandomMapOps.testOps:162` is
+the map reporting fewer entries than were put into it. Three of the six failures
+above are that shape, at three different heaps and three different magnitudes
+(247/198, 57/55, 300/291). Silent data loss is a worse failure mode than the
+NPE this page opens with, and it is the one that scales UP with heap.
+
+**3. There is still no passing CratonVM run at any heap.** `2g` did not pass; it
+ran out of clock. So nothing here supplies the negative control this page's
+`Next` section wants, and in particular:
+
+**A caution about the `G30` coercion guard.** It fires in EVERY run above,
+256m and 4g alike, ~21-24 log lines each. Its `occurrence=` values are exact
+powers of two (131072, 262144, 524288) because the guard reports at doubling
+intervals — that is its own sampling, not a severity measure. With no passing
+run to compare against, neither its presence nor its counts discriminate
+anything here, and I am recording it as an observation rather than a lead.
+
+Everything below this section predates the addendum and is unchanged.
+
 ## The three faces
 
 All on the post-`COLL-REFRESH`-fix binary, default collector (ZGC),

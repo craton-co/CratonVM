@@ -10497,6 +10497,35 @@ impl Compiler {
                                                        // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
                             let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                            // JVMS 6.5: a null `objectref` raises NPE AT THE INVOKE,
+                            // before the callee's first instruction. A baked direct
+                            // call jumps straight into the compiled callee, so the
+                            // only thing that ever raised it here was the callee
+                            // body faulting on its own — which it does only if it
+                            // dereferences `this`. MEASURED on three private callees
+                            // behind one 50 000-call warming loop (HotSpot raises NPE
+                            // for all three):
+                            //
+                            //     return 3;          NPE interpreted, NO-THROW(3) jit
+                            //     return this.x;     NPE both
+                            //     return helper();   NPE interpreted, NO-THROW(5) jit
+                            //
+                            // `invokevirtual`/`invokeinterface` are correct only
+                            // incidentally: their inline cache tests the receiver's
+                            // class, and a null fails every guard. `invokespecial`
+                            // is statically bound, has no guard, and reaches here.
+                            // This is the mechanism behind the bogus `Cannot read
+                            // field "interfaces" because "rd" is null` at
+                            // Class.java:1217 that `vm/tests/
+                            // null_receiver_cached_invoke.rs` was written for.
+                            //
+                            // The receiver is argument 0 of every invoke that
+                            // reaches this arm — 0xb6/0xb7/0xb9 all have one, which
+                            // is why `n` above is `callee_params + 1`.
+                            if let Some(receiver) = arg_slots.first() {
+                                self.load_slot_to_reg(RAX, *receiver);
+                                self.emit_precise_null_check_field_store();
+                            }
                             // A reference staged into an area no oop map can name (the
                             // native-ABI outgoing-argument area, the direct-call service
                             // slots, or an inlined callee's parameter locals). The
