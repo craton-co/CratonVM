@@ -829,7 +829,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-82 tokens.
+83 tokens.
 
 | Token | Expands to |
 | --- | --- |
