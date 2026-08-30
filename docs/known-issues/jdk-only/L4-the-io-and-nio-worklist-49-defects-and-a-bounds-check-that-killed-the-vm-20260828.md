@@ -1747,3 +1747,47 @@ from JDK-internal callers, 12 `java.io` exception classes served by the shared
 **The number to carry forward is not 125.** It is: 26 measured-inert and
 nominated, 99 inert for classified reasons, and — after five parts — *zero*
 rows in this lane's families that a probe reaches and gets wrong.
+
+
+## P5.7 Two statements in this record that look contradictory, and are not
+
+§P2.5 says `java/io/UnixFileSystem`'s 12 rows are **covered indirectly — the
+armed run drives all 12 through `java.io.File`'s real bytecode, 190
+invocations, 0-diff**. §P5.6 says those same rows are **inert, `invocations: 0`,
+nothing serves them**. A reader hitting both is entitled to think one is wrong.
+
+Neither is. Measured, same probe (`L4FileSweep`), same binary, one variable:
+
+```text
+                          unarmed                armed (java/io/File yields)
+java/io/File          827 inv / 60 rows          28 inv / 10 rows
+java/io/UnixFileSystem  1 inv /  1 row          190 inv / 16 rows
+```
+
+**The work moves one layer down.** Unarmed, `java.io.File`'s natives answer
+directly and `UnixFileSystem` is never reached — §P5.6's reading. Armed,
+`File`'s Bridge natives yield to real `java.io.File` bytecode, which calls
+`fs.<op>(...)`, and the `UnixFileSystem` natives light up — §P2.5's reading, and
+the 190 reproduces exactly.
+
+### Why this matters for the 26 nominations
+
+It is not just bookkeeping. It says **"inert" is a property of the CURRENT
+registration set, not of the row.**
+
+Every one of the 26 is inert because something above it answers first — real
+bytecode, in their case. Retire a native one layer up and rows below it can
+start firing, exactly as `UnixFileSystem` did. So a retirement worklist cannot
+be applied top-down without re-measuring after each step: the rows you cleared
+as "never invoked" are measured against a VM that still had the layer above
+them.
+
+That is the same trap as §P2.3's *half-applied retirement is worse than either
+endpoint*, seen from the other side. The order to work in is bottom-up, or
+top-down with a re-census between steps — and this record's numbers, like any
+census, describe the binary they were taken on.
+
+*(`java/io/File` keeps 28 invocations across 10 rows even when armed: the dial
+moves `Bridge` natives, and what remains is the rows it does not cover. An
+armed run is not an empty one, and a retirement priced from it inherits that
+gap.)*

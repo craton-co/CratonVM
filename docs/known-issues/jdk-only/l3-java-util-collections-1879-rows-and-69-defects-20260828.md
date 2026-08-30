@@ -680,6 +680,85 @@ the dormant `PriorityQueue$Itr` registration in §6.1 was; here the class name i
 a label over an identical object and the natives cannot tell the producers
 apart, because there is nothing to tell apart.
 
+## 6b. The coverage sweep, and the twelve spliterator cells it found
+
+**Written after the residuals closed, from the registry rather than from a
+hypothesis.** A dump taken DURING all sixteen probes, merged, says the corpus
+reaches 445 of the 602 owning `java.util` registrations that sit over a real JDK
+body. The other 157 were never invoked.
+
+The first reading of that number is "retirement candidates". It is not: the
+never-invoked set is almost entirely the NavigableSet surface of
+`TreeMap.keySet()` (18 rows), HashMap's conditional mutators on the plain
+family (11), and the sublist `ListIterator` (7) — **a coverage gap in the
+probes, not dead code**. That is `a-zero-invocation-count-is-evidence-about-a-
+counter` in its exact shape: `invocations` is a floor.
+
+`apps/probes/UtilCoverageSweep` closes it — 141 rows over precisely those
+registrations — and found a defect on its first run.
+
+### The spliterator characteristics matrix — 12 cells
+
+§3's spliterator work moved the characteristics mask into the object and gave
+three producers their own answer. It was right about those three, because the
+probe that drove it asked about three receivers. Asking all twenty-eight:
+
+```text
+                 keySet   values   entrySet    standalone
+  HashMap           65       64       65             65
+  LinkedHashMap  16465    16464    16465          16465
+  TreeMap           85       80       85             85
+  Hashtable      16449    16448    16449             --
+  Properties      4353     4352    16449             --
+```
+
+**Twelve of those cells were wrong** — every map view, plus the standalone
+`LinkedHashSet`. Every ArrayList-shaped view took the list default, so
+`HashMap.values()` claimed an encounter order it does not have and
+`TreeMap.entrySet()` claimed neither the DISTINCT nor the SORTED it does; every
+set-shaped view took the plain `HashSet` cell, so `LinkedHashMap.keySet()` lost
+both ORDERED and SUBSIZED.
+
+Three things in the matrix are not derivable, which is why it is measured and
+not computed:
+
+* **`values` is never DISTINCT**, and for `HashMap` not ORDERED either. A values
+  view can repeat, and a hash map has no encounter order. `TreeMap`'s values are
+  ORDERED but not SORTED — the sort is on the keys.
+* **`SUBSIZED` follows the JDK's CONSTRUCTION, not the container.** The
+  `LinkedHashMap` and `Hashtable` families go through
+  `Spliterators.spliterator(Collection, ..)`, which adds `SIZED | SUBSIZED`;
+  `HashMap`'s and `TreeMap`'s have hand-written spliterator classes that do not.
+  That is the whole reason `LinkedHashSet` is 16465 and `HashSet` is 65 despite
+  being the same shape of container.
+* **`Properties` is CONCURRENT | NONNULL and NOT SIZED** — JDK 25 backs it with
+  a `ConcurrentHashMap`, the same fact behind §6.6 — and its `entrySet` takes
+  the `Hashtable` cell rather than the concurrent one. That asymmetry is
+  HotSpot's, and a derived table would have smoothed it away.
+
+These are not cosmetic: a stream pipeline reads DISTINCT to decide it may skip a
+`distinct()`, SORTED to skip a sort, and SIZED/SUBSIZED to decide how to split
+in parallel.
+
+### One row left, compatible mode only
+
+```text
+Set.of("a").spliterator().characteristics()
+  HotSpot   17745   (java.util.Collections$2)
+  CratonVM     65   (java.util.Spliterator)      compatible mode only
+```
+
+Strict is 0-diff: it drops the `SyntheticStub` factory registrations and runs
+java.base's own body. The receiver's CLASS is already right in both modes
+(`ImmutableCollections$Set12`), so the interception is upstream of the
+collection — in `java.util.Spliterators.spliterator(Collection, int)`, which is
+a different family's registrar and a different lane's row. A guard was written
+for `native_hs_spliterator` and REMOVED when a registry dump showed it never
+fired: an inert guard is a claim about the workload, and this one was false.
+
+The ninth place this campaign has found `--jdk-only` more correct than the
+default.
+
 ## 7. The final verification, and where the residuals ended
 
 Every number here was RE-TAKEN at the end, on a binary built from the merge of

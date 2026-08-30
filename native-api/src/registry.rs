@@ -4354,6 +4354,20 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
         0
     }
 
+    /// Open an argument-update pass over a captured graph: the caller
+    /// re-issues its dispatch sequence and each dispatch rewrites the
+    /// arguments of the node it corresponds to, instead of launching.
+    fn gpu_graph_begin_replay(&mut self, _stream_handle: u64, _graph_handle: u64) -> bool {
+        false
+    }
+
+    /// Close the pass and submit the graph once. Answers a submission
+    /// handle, or `0` if the caller's sequence did not match the one
+    /// that was captured.
+    fn gpu_graph_end_replay(&mut self, _stream_handle: u64) -> u64 {
+        0
+    }
+
     /// How many nodes a graph holds, or `-1` for an unknown handle. The
     /// count a caller checks against the dispatches it made while
     /// capturing: a graph with fewer nodes replays successfully and does

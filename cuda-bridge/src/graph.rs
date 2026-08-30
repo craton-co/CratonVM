@@ -38,18 +38,24 @@
 //! alternative — reading `cuGraphGetNodes` afterwards and assuming its
 //! order matches launch order — is not a documented guarantee.
 //!
-//! # What is deliberately not here yet
+//! # Updating a node's arguments between replays
 //!
-//! `cuGraphExecKernelNodeSetParams`, which is what a later increment needs
-//! to replay a graph whose scalars changed. It wants the same two-backing-
-//! store argument marshalling `launch_raw_on_stream_inner` documents at
-//! length — a stable `u64` slot per device pointer, and scalar pointers
-//! into the `KernelArg` vec — and getting that wrong is a silent wrong
-//! answer rather than a failure. It belongs with a refactor that shares
-//! that packing rather than a second copy of it. Capture and replay do not
-//! need it, and capture and replay are what has to be proven first.
+//! [`GraphExec::set_kernel_node_args`] is what makes a graph usable by a
+//! caller whose arguments change. A graph bakes each argument VALUE into
+//! its nodes, so without this the only way to feed a replay new input is
+//! to put the changing values in device memory and write through a
+//! pointer the graph already holds — which works, and is faster, but
+//! requires changing the code that issues the launches. Not every caller
+//! can do that.
+//!
+//! The update deliberately re-reads `func`, the grid, the block and the
+//! shared-memory size from the node itself rather than taking them from
+//! the caller. An argument update must be able to change arguments and
+//! nothing else: a caller who passed a different grid would silently get
+//! a graph that no longer matches the sequence it captured, and the
+//! failure would appear as wrong output rather than as an error.
 
-use crate::{DeviceContext, DeviceError, Result, Stream};
+use crate::{DeviceContext, DeviceError, Event, KernelArgs, Result, Stream};
 
 /// What a capture does to work submitted on *other* threads' streams.
 ///
@@ -87,6 +93,9 @@ pub struct Graph {
     raw: cudarc::driver::sys::CUgraph,
     #[cfg(feature = "cuda")]
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    /// The `last_write` slots of every buffer the capture named as a
+    /// kernel argument. See [`GraphExec::launch`].
+    slots: Vec<crate::LastWriteSlot>,
 }
 
 // SAFETY: mirrors `EventCuda`. The handle is only ever touched after
@@ -117,7 +126,7 @@ impl Graph {
     /// otherwise repeat: validating the topology, resolving the kernels and
     /// laying out the argument buffers. It is expensive and it happens
     /// once.
-    pub fn instantiate(&self) -> Result<GraphExec> {
+    pub fn instantiate(self) -> Result<GraphExec> {
         self.device
             .bind_to_thread()
             .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
@@ -135,6 +144,8 @@ impl Graph {
         Ok(GraphExec {
             raw: exec,
             device: self.device.clone(),
+            slots: self.slots.clone(),
+            _graph: self,
         })
     }
 
@@ -167,6 +178,26 @@ pub struct GraphExec {
     raw: cudarc::driver::sys::CUgraphExec,
     #[cfg(feature = "cuda")]
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    /// Carried from the [`Graph`]; stamped on every replay.
+    slots: Vec<crate::LastWriteSlot>,
+    /// The graph this was instantiated from, kept alive for exactly as
+    /// long as the exec.
+    ///
+    /// The driver permits destroying a graph after instantiating it, and
+    /// an exec on its own stays perfectly valid — but a [`GraphNode`]
+    /// belongs to the GRAPH, and
+    /// [`GraphExec::set_kernel_node_args`] needs one. With the graph
+    /// gone those handles dangle, and the driver does not say so:
+    /// `cuGraphKernelNodeGetParams` on a destroyed graph's node returns
+    /// `CUDA_SUCCESS` and an all-zero struct, so the failure surfaces
+    /// one call later as `CUDA_ERROR_INVALID_VALUE` from
+    /// `cuGraphExecKernelNodeSetParams` and points nowhere near the
+    /// cause. Taking ownership makes it unrepresentable: `instantiate`
+    /// consumes the graph, so a node handle cannot outlive it.
+    ///
+    /// Dropped after `Drop for GraphExec` has run `cuGraphExecDestroy`,
+    /// which is the order the driver documents.
+    _graph: Graph,
 }
 
 // SAFETY: as `Graph`.
@@ -187,12 +218,35 @@ impl Drop for GraphExec {
 
 #[cfg(feature = "cuda")]
 impl GraphExec {
-    /// Submit every launch in the graph onto `stream`.
+    /// Submit every launch in the graph onto `stream`, and answer the
+    /// event that fires when they are all done.
     ///
-    /// Asynchronous, exactly like a single launch: the call returns once the
-    /// work is queued. Ordinary stream ordering applies, so the usual
-    /// `Stream::synchronize` or an event says when it finished.
-    pub fn launch(&self, stream: &Stream) -> Result<()> {
+    /// Asynchronous, exactly like a single launch: the call returns once
+    /// the work is queued.
+    ///
+    /// # Why it records an event rather than leaving that to the caller
+    ///
+    /// The returned event is not a convenience. Every buffer this graph
+    /// names as a kernel argument had its `last_write` slot emptied when
+    /// the launch was captured -- an event recorded on a capturing
+    /// stream lives inside the graph and no other stream can wait on it,
+    /// so there was nothing valid to leave there. This stamps all of
+    /// them with the event below, which restores the invariant the rest
+    /// of the crate depends on: a buffer's `last_write` names the work
+    /// that most recently wrote it, and any stream that later reads the
+    /// buffer waits on that.
+    ///
+    /// Without this, a replay's writes would be invisible to every
+    /// stream except the one it ran on. The caller awaiting its own
+    /// submission covers the single-stream case, which is the only one
+    /// the VM uses today -- but "correct as long as nobody uses a second
+    /// stream" is not a property worth shipping when one event fixes it.
+    ///
+    /// Stamping inputs as well as outputs is deliberate and matches
+    /// `launch_raw_on_stream_inner` exactly: it cannot tell which
+    /// arguments the kernel wrote, so it treats every device-pointer
+    /// argument as written. Conservative, never wrong.
+    pub fn launch(&self, ctx: &DeviceContext, stream: &Stream) -> Result<std::sync::Arc<Event>> {
         self.device
             .bind_to_thread()
             .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
@@ -202,9 +256,130 @@ impl GraphExec {
         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(DeviceError::Driver(format!("cuGraphLaunch: {status:?}")));
         }
+        let done = std::sync::Arc::new(Event::new(ctx)?);
+        stream.record_event(&done)?;
+        for slot in &self.slots {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(done.clone());
+        }
+        Ok(done)
+    }
+
+    /// Replace the arguments of one captured node, in the instantiated
+    /// graph, without re-capturing.
+    ///
+    /// `node` comes from [`Stream::capturing_node`] at the time the
+    /// launch was recorded. Everything about the node except its
+    /// arguments — the function, the grid, the block, the shared-memory
+    /// size — is read back from the node and passed through unchanged;
+    /// see the module docs for why that is not the caller's to supply.
+    ///
+    /// # Cost
+    ///
+    /// One driver call per updated node. That makes a graph whose
+    /// arguments change every replay cheaper than re-issuing its
+    /// launches but more expensive than a graph that does not change at
+    /// all, so a caller with the option should still prefer moving the
+    /// changing values into device memory. This exists for callers
+    /// without the option.
+    ///
+    /// # Safety of the argument stores
+    ///
+    /// `cuGraphExecKernelNodeSetParams` copies the pointed-at parameter
+    /// bytes before returning, exactly as a launch does, so the two
+    /// backing stores this builds — the `KernelArgs` vec for scalars and
+    /// a local `Vec<u64>` for device addresses — only need to outlive
+    /// the call. Both are bound for the whole function and anchored
+    /// after it.
+    pub fn set_kernel_node_args(
+        &self,
+        node: GraphNode,
+        args: &KernelArgs,
+    ) -> Result<()> {
+        self.device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+
+        // Read the node's current parameters. This is what supplies
+        // `func` -- cudarc keeps `CudaFunction`'s raw handle private, and
+        // asking the node is better than reaching for it anyway: the
+        // launch shape then cannot drift from what was captured.
+        let mut params = cudarc::driver::sys::CUDA_KERNEL_NODE_PARAMS::default();
+        // SAFETY: `node` is a node of the graph this exec was
+        // instantiated from, and `params` is a valid out-pointer.
+        let rc = unsafe {
+            cudarc::driver::sys::lib().cuGraphKernelNodeGetParams_v2(node.0, &mut params)
+        };
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(DeviceError::Driver(format!(
+                "cuGraphKernelNodeGetParams_v2: {rc:?}"
+            )));
+        }
+
+        // Two backing stores, the same shape the launch path documents:
+        // device addresses need a stable 8-byte slot to point AT, and
+        // scalars are pointed at directly inside `args.raw`.
+        let mut addrs: Vec<u64> = Vec::with_capacity(args.raw.len());
+        for a in &args.raw {
+            if let crate::KernelArg::DevicePtr { addr, .. } = a {
+                addrs.push(*addr);
+            }
+        }
+        let mut next = 0usize;
+        let mut param_ptrs: Vec<*mut std::ffi::c_void> = args
+            .raw
+            .iter()
+            .map(|a| match a {
+                crate::KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
+                crate::KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
+                crate::KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
+                crate::KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
+                crate::KernelArg::DevicePtr { .. } => {
+                    let slot = &addrs[next] as *const u64 as *mut std::ffi::c_void;
+                    next += 1;
+                    slot
+                }
+            })
+            .collect();
+
+        params.kernelParams = param_ptrs.as_mut_ptr();
+        // v2 params carry `func` AND a `kern`/`ctx` pair, and the driver
+        // reads `kern` only when `func` is null. The getter returns both
+        // halves populated; passing them straight back is what the
+        // driver rejects with INVALID_VALUE. Keep `func`, which is the
+        // handle the capture actually recorded.
+        params.kern = std::ptr::null_mut();
+        params.ctx = std::ptr::null_mut();
+        // `extra` and `kernelParams` are mutually exclusive; the getter
+        // may have returned a non-null `extra` and passing both is an
+        // error. We supply arguments the `kernelParams` way, as the
+        // launch path does.
+        params.extra = std::ptr::null_mut();
+
+        // SAFETY: every pointer in `param_ptrs` borrows into `args.raw`
+        // or `addrs`, both alive here and un-reallocated since the
+        // pointers were taken; the driver copies the parameter bytes
+        // before returning.
+        let rc = unsafe {
+            cudarc::driver::sys::lib().cuGraphExecKernelNodeSetParams_v2(self.raw, node.0, &params)
+        };
+        // Liveness anchor: the call has returned, so the raw pointers are
+        // no longer dereferenced. Naming both stores here makes a future
+        // refactor that drops either one early fail to compile.
+        let _keep_alive = (&args.raw, &addrs, &param_ptrs);
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(DeviceError::Driver(format!(
+                "cuGraphExecKernelNodeSetParams_v2: {rc:?}"
+            )));
+        }
         Ok(())
     }
 
+    /// How many buffers a replay re-stamps. Exposed so a test can assert
+    /// the capture actually took custody of them: a graph that collected
+    /// none would replay, write, and leave every reader unsynchronised.
+    pub fn tracked_buffer_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 /// One node of a capture, as reported by [`Stream::capturing_node`].
@@ -280,6 +455,7 @@ impl Stream {
         Ok(Graph {
             raw,
             device: ctx.inner().device().clone(),
+            slots: self.take_captured_slots(),
         })
     }
 
@@ -371,7 +547,21 @@ impl Graph {
 #[cfg(not(feature = "cuda"))]
 impl GraphExec {
     /// Always [`DeviceError::NoDriver`]: there is nothing to launch.
-    pub fn launch(&self, _stream: &Stream) -> Result<()> {
+    pub fn launch(
+        &self,
+        _ctx: &DeviceContext,
+        _stream: &Stream,
+    ) -> Result<std::sync::Arc<Event>> {
+        Err(DeviceError::NoDriver)
+    }
+
+    /// Always zero: nothing was captured, so nothing is tracked.
+    pub fn tracked_buffer_count(&self) -> usize {
+        0
+    }
+
+    /// Always [`DeviceError::NoDriver`]: there is no node to update.
+    pub fn set_kernel_node_args(&self, _node: GraphNode, _args: &KernelArgs) -> Result<()> {
         Err(DeviceError::NoDriver)
     }
 }
