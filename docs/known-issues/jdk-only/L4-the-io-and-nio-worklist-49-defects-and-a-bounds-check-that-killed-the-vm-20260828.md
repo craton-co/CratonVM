@@ -1,4 +1,4 @@
-# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 82 defects, 8 shadows retired, and a bounds check that killed the VM
+# L4 — the `java.io` / `java.nio` worklist: 199 native-won triples, 89 defects, 8 shadows retired, and a bounds check that killed the VM
 
 **Status: MEASURED AND FIXED, 2026-08-28.** Lane L4 of
 `HANDOFF-20260828-SCOPE.md`. Worktree `/data/cvm-l4io-20260828`, branch
@@ -1881,3 +1881,266 @@ worklist, the reproduction, and a corpus-backed zero are all here.
 bash    apps/probes/l4corp.sh       # rewrites the DoD command lines, dumps the registry
 python3 apps/probes/l4corptally.py  # the control, then the nominated rows
 ```
+
+
+---
+
+# PART SIX — the dial was measuring nothing, and what it says now that it works
+
+Parts two to five all leaned on `CRATONVM_ENFORCE_NATIVE_SHADOW` — the dial that
+makes a Bridge native yield to real JDK bytecode, and the instrument this
+campaign prices every retirement with. **None of those armed measurements were
+real.** This part is what happened when the lane's thirteen probes were finally
+run against HotSpot with it armed.
+
+## P6.1 Twelve of thirteen probes printed nothing
+
+```text
+L4CensusTail   rc oracle=0 armed=0   lines 122/0   DIFF 122
+```
+
+Zero lines and a clean exit — and the VM said `main-vm run() returned Ok — VM
+main exiting normally`. A probe that emits nothing is not a probe that passed,
+but a diff of an empty file against an empty file is zero, and that is what an
+armed run had been reporting.
+
+`main` DID run: a workload that writes a side file wrote it. Narrowed to
+`java/io/PrintStream`, three writes settled the mechanism:
+
+```text
+System.out.println("A")                                          nothing, checkError()==true
+new PrintStream(new FileOutputStream(FileDescriptor.out), true)  works
+new FileOutputStream(FileDescriptor.out).write(...)              works
+```
+
+Not stdout, not `PrintStream` — *this* `System.out`. Reflection on the live
+object (`--add-opens java.base/java.io=ALL-UNNAMED`) against HotSpot:
+
+```text
+              HotSpot                  this VM
+out           BufferedOutputStream     NULL
+charOut       OutputStreamWriter       NULL
+textOut       BufferedWriter           NULL
+charset       sun.nio.cs.UTF_8         sun.nio.cs.UTF_8
+```
+
+The synthetic `PrintStream` minted for the system streams carried only
+`charset` and `autoFlush`. Nothing notices while this VM's own natives answer —
+they write to the host stream and never read those fields. The moment real
+bytecode runs, `PrintStream.writeln` calls `ensureOpen()`, finds `out == null`,
+throws `IOException`, and catches it into `trouble = true`. **Every write
+discarded, exit code 0.**
+
+`install_real_stream_fields` now builds all three from the real constructors.
+The three publish together: a half-wired stream would turn a silent discard into
+an NPE inside `writeln`, worse than either endpoint.
+
+**The generalisation is the point.** The dial's own rule is *prove it FIRED
+before reading the green*. That rule assumes the VM can still report. A family
+whose output vanishes when armed produces a green made of no rows at all, and
+§P2.3's "armed run fully green across seven probes / 1671 lines" was measured on
+a VM in exactly that state.
+
+## P6.2 Two defects that only a working dial could show
+
+**`FileSystemProvider.checkAccess` threw a bare `IOException`** whose message
+read `"NoSuchFileException: <path>"`. `Files.createDirectories` walks up for a
+live parent with `catch (NoSuchFileException x) { }`; a supertype instance is not
+caught, so it escaped the walk and the call failed naming the *parent*:
+
+```text
+Files.createDirectories("lvl1/lvl2")
+  HotSpot   creates both
+  this VM   IOException: NoSuchFileException: <cwd>/lvl1
+```
+
+Third refusal in this lane with the right message and the wrong class, after
+`Buffer.reset` and `Files.copy`. `p57_no_such_file` had existed all along. Two
+sibling sites — the jar and jrt arms of `readAttributes` — had the same shape;
+their comment said "FileTreeWalker catches it", which is true and is the trap:
+the walker catches `IOException`, so it worked for the walker and nobody else.
+
+**`FileSystemProvider.newByteChannel` ignored `CREATE_NEW`.**
+`fsp_new_output_stream` checks it; the real `newOutputStream` bytecode does not
+call that native, it calls `newByteChannel` — so the guarantee held only while
+our own `newOutputStream` answered:
+
+```text
+Files.createFile(<existing>)                   no throw, owed FileAlreadyExists
+Files.newOutputStream(<existing>, CREATE_NEW)  no throw, owed FileAlreadyExists
+Files.copy(in, <existing>)                     no throw, owed FileAlreadyExists
+```
+
+Three rows, two dial scopes, one missing check. `CREATE_NEW` is how a caller
+says *I must be the one who creates this*; an exclusive create that quietly
+opens the existing file is a lost update, not a wrong exception.
+
+## P6.3 Which retirements are safe today
+
+With the dial working, the question it exists to answer can finally be asked per
+FAMILY — the earlier sweep armed all of `java/io/` and `java/nio/` at once,
+which is not a retirement anyone would perform. Thirteen probes, one family
+armed at a time, oracle captured once (`apps/probes/l4famsweep.sh`):
+
+```text
+SCOPE                                   DIFF   TRUNCATED
+java/io/PrintStream                        2           0
+java/io/File                               2           0
+java/io/FileInputStream                    2           0
+java/io/FileOutputStream                   2           0
+java/io/ByteArrayInputStream               2           0
+java/io/ByteArrayOutputStream              2           0
+java/io/DataInputStream                    2           0
+java/io/DataOutputStream                   2           0
+java/io/BufferedReader                     2           0
+java/io/BufferedWriter                     2           0
+java/io/FilterOutputStream                 2           0
+java/nio/CharBuffer                        2           0
+java/nio/file/spi/FileSystemProvider       2           0
+java/nio/file/attribute/                   2           0
+java/nio/channels/FileChannel              2           0
+java/nio/ByteBuffer                        8           0
+java/nio/file/Files                       14           0
+java/nio/file/Path                       102           0
+```
+
+`DIFF 2` is the floor — the known `FileInputStream.skip` residual (§4.3) — so
+**fifteen of eighteen families arm at zero cost across 2920 probe rows**,
+including every `java.io` family. That is a retirement worklist with a
+measurement behind it, which is what §P5.6 could only nominate.
+
+`FileSystemProvider` reached the floor *because of* the `CREATE_NEW` fix above:
+it scored 6 before and 2 after, in the same run.
+
+## P6.4 The three that are not free, and one I got wrong
+
+* **`java/nio/file/Path` (102)** — 51 rows, one cause: armed, `Path.toString()`
+  answers `sun.nio.fs.UnixPath@0` and `equals`-self is false. The same
+  unpopulated-real-fields shape as `System.out`, in a class this VM mints on
+  every path operation. It needs its own change, not a rider.
+* **`java/nio/file/Files` (14)** — `readAllBytes(<dir>)` raises
+  `OutOfMemoryError` where HotSpot raises `IOException`; `readAttributes(p,
+  null)` does not NPE; `probeContentType` hits `NoSuchMethodError:
+  FileSystemProvider.getFileTypeDetector()`; `getOwner` answers
+  `UnsupportedOperationException`.
+* **`java/nio/ByteBuffer` (8)** — `wrap(b, -1, 2)` and friends raise
+  `ArrayIndexOutOfBoundsException` where the JDK raises plain
+  `IndexOutOfBoundsException`.
+
+**And a process note I would rather record than hide.** The first attempt at the
+`readAllBytes` OOME refused a directory at open. That is wrong twice: Linux
+*allows* opening a directory for READ (the failure is `EISDIR` at the first
+read, which is why HotSpot's answer is a plain `IOException`), and the WRITE
+case was already correct — HotSpot raises `FileSystemException` and so did this
+VM, until a blanket refusal downgraded it to a bare `IOException`. It turned a
+green row red, and it is the same right-behaviour-wrong-type defect the same
+commit fixes three of. Reverted; the OOME is left OPEN with its cause named
+rather than papered over from the wrong layer.
+
+
+## P6.5 The three that cost something, taken on
+
+§P6.4 listed `ByteBuffer` (8), `Files` (14) and `Path` (102). Four more defects
+close two of them.
+
+**`ByteBuffer` → the floor.** `HeapByteBuffer`'s constructor raised
+`ArrayIndexOutOfBoundsException` for bad bounds. The real chain is
+`HeapByteBuffer -> ByteBuffer -> Buffer(mark,pos,lim,cap)`, whose
+`createCapacityException`/`createLimitException` are all
+`IllegalArgumentException` — and `ByteBuffer.wrap` is written to convert exactly
+that:
+
+```java
+try { return new HeapByteBuffer(array, offset, length, null); }
+catch (IllegalArgumentException x) { throw new IndexOutOfBoundsException(); }
+```
+
+Raising the wrong class skipped that catch, so the real `wrap` propagated ours.
+A subclass, so `catch (IndexOutOfBoundsException)` still matched and nothing
+failed loudly — the `Buffer.reset` shape from part three, one class further out.
+The constructor is `invocations: 0` unarmed (`servlet.rs`'s `wrap` owns that
+slot and never calls it), so this row existed only for the retirement.
+
+**`Files` → 14 to 6**, on three causes:
+
+* **`Files.getOwner` answered `UnsupportedOperationException` for every path.**
+  `getFileAttributeView` resolved `BasicFileAttributeView`, `DosFileAttributeView`
+  and `PosixFileAttributeView` — but not `FileOwnerAttributeView`, which
+  `PosixFileAttributeView` *extends*. Real `Files.getOwner` is
+  `getFileAttributeView(path, FileOwnerAttributeView.class)` then
+  `if (view == null) throw new UnsupportedOperationException()`. The same
+  omission the posix view itself had before
+  `bug-h2-files-setposixfilepermissions-unsupported.md`.
+
+* **`readAllBytes(<a directory>)` raised `OutOfMemoryError`**, and the cause was
+  not in `Files` at all:
+
+  ```text
+  Files.newByteChannel(<a directory>).size()
+    HotSpot   4096              this VM   9223372036854775807
+  ```
+
+  `fd_table::file_size` measured by `lseek(fd, 0, SEEK_END)`, and **`lseek` to
+  the end of a DIRECTORY returns `LONG_MAX` on Linux.** `readAllBytes` sizes its
+  buffer from `channel.size()`, so the VM tried to allocate eight exabytes and
+  died with an error the caller cannot meaningfully catch. It now uses
+  `metadata()` — an `fstat`, which is what HotSpot's `nd.size(fd)` is. Better
+  for ordinary files too: the seek dance moved the position and put it back,
+  three syscalls, not atomic against a concurrent reader of the same fd, and it
+  fails outright on a non-seekable fd.
+
+* **`readAttributes(path, null, …)` answered the basic view** where the JDK
+  NPEs. Answering something for a caller who asked for nothing is the
+  fabricated-success shape; an *absent* class argument still means "no request"
+  (the Windows arm depends on that), an *explicit* null does not.
+
+```text
+                                        before   after
+java/nio/ByteBuffer                          8       2   floor
+java/nio/file/spi/FileSystemProvider         6       2   floor  (P6.2)
+java/nio/file/Files                         14       6
+java/nio/file/Path                         102     102
+```
+
+**Sixteen of eighteen families now arm at zero cost.**
+
+## P6.6 The last two families are one cause, and it is not this lane's
+
+`Files` (6) and `Path` (102) do not need four more fixes. They need one, and it
+is structural.
+
+```text
+Path.of("a/b"), with java/nio/file/Path armed
+                HotSpot          this VM unarmed    this VM ARMED
+  class         UnixPath         UnixPath           UnixPath
+  toString      a/b              a/b                sun.nio.fs.UnixPath@17234
+  equals(copy)  true             true               false
+  equalsSelf    true             true               true
+  hashCode==    true             true               true
+  getFileName   b                b                  b
+  compareTo     0                0                  0
+```
+
+`toString` returning the IDENTITY string is the tell: `Object.toString()` ran.
+Not a wrong answer from `UnixPath.toString()` — that would NPE on an unpopulated
+`path`. **`sun/nio/fs/UnixPath` here is a class NAME with no bytecode behind
+it**, and the four rows that still work are the ones our natives still answer.
+
+`Files`'s residual is the same shape one class over: real `Files.probeContentType`
+reaches `DefaultFileTypeDetector.create()`, which calls `getFileTypeDetector()`
+on `DefaultFileSystemProvider.instance()` — an object `p57_alloc_provider` mints
+as the ABSTRACT `java/nio/file/spi/FileSystemProvider`, which declares no such
+method. The registration at `nio_file.rs:6856` already says so in a comment, and
+closes the entry point rather than the cause.
+
+**Both are the fabricated-receiver family** — the roadmap's Phase-1 item, the
+same shape as `MemorySegment`-as-an-interface, and already nominated out of this
+lane in §4. Retiring a native whose class has no real bytecode underneath has
+nothing to fall through TO, so no amount of `java.io`/`java.nio` work closes
+these two: the fix is to mint the real classes, and that is a change to how this
+VM allocates paths and providers, not to what its I/O natives do.
+
+Papering it with a second fabrication — registering `getFileTypeDetector` to
+return a synthetic detector — would move the number to the floor and make the
+retirement look safe while leaving the reason it is not exactly where it was.
+Deliberately not done.

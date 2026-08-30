@@ -107,6 +107,10 @@ public final class PropsOrderSweep {
         List<String> names = new ArrayList<>(childClone.stringPropertyNames());
         Collections.sort(names); // membership only: the SET is the question here
         p("child clone stringPropertyNames set", names);
+        // A terminal marker, so a run that dies partway is not read as a
+        // clean diff of a short file. The three-way runner checks for one and
+        // this probe reported DONE=0 on all three arms without it.
+        System.out.println("DONE PropsOrderSweep");
     }
 
     static boolean clonesAreIndependent(Properties src) {

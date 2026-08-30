@@ -21,10 +21,10 @@ been removed again.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-29; its residual CLOSED 2026-08-30, and the follow-on round found nine more.** Original: dispatch worklist 483 rows / 20 fixed, plus its two recorded-open items and five more the probe found — **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Since: the Groovy 18-class corpus cluster root-caused to one null `Set` (`groovy-died-on-a-null-set-…`); **11 refusal-type defects on the three `Lookup.define*Class*` doors**, whose first fix landed on a shadowed registrar and changed nothing (`the-fix-that-changed-nothing-…`); and **the residual itself plus `bindTo`, `invokeWithArguments` and `Method.invoke`'s interface formals** (`the-cast-that-asType-performs-…`). `L5ModuleInvokeSweep` and `L8InvokeLookupSweep` are now 0-diff. One item OPEN and owned: `VarHandle` checks neither its receiver nor its value (`varhandle-checks-neither-…`). Records: `L5-reflection-lane-complete-20260828.md`, `L5-residuals-module-packages-and-invokeexact-20260828.md`, and the four dated pages above | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms) — **zero failures `--jdk-only` produces that compatible mode does not**, and Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
-| **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
+| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms), now FULLY ADJUDICATED — **185 pass / 19 fail / 14 unresolved**, and **zero failures `--jdk-only` produces that compatible mode does not**; the single candidate for one was the harness (three concurrent `--Xmx 1g` shards OOM'd the strict arm; alone it passes). Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
+| **L1 `Unsafe`** | **DONE 2026-08-30** — 516 probe rows, 24 defects fixed. **All 6 residuals now CLOSED** (R1 by characterising its three real consumers; R5 by root cause, below). Then the defect R5 was standing in front of: **every public constant on the legacy `sun.misc.Unsafe` spelling was ZERO** — all 18 `ARRAY_*` plus `ADDRESS_SIZE` — because `<clinit>` computes them through natives not registered that early in boot and an unregistered native returns its return type's zero instead of throwing. Any consumer following the documented `ARRAY_<T>_BASE_OFFSET + index` protocol through that spelling read bytes 16 short, silently. Fixed, plus the memory-access warning latch (`staticFieldBase`/`staticFieldOffset` returned `null`/`0` for the same reason), which took R5's 513+ null-base rescues per H2 vector to **0**. `RUnsafeArrayBase` — the core vector named for this exact surface — was green throughout because it called the METHOD and never read the CONSTANT; it now guards both and is proven to fail when they disagree. §4.5's stated prerequisite is discharged for four workload families (0 hits across 116 vectors, both H2 vectors, Spring Boot and Tomcat+SSL, with a firing positive control) and left OPEN for WildFly/Keycloak, which are not this lane's to run. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
-| **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
+| **L3 `java.util` collections** | **CLOSED 2026-08-30** — 586 owning rows, 2530 probe rows in 23 probes, 0-diff in BOTH modes on 22 of them; the 23rd differs only on class NAMES. All 8 residuals and the companion record's 13 are fixed, including `ArrayDeque` fail-fast (closed by RETIRING the iterator, not by adding a check) and a `--jdk-only` crash on deserializing any `List.of`. Records retired to `internal/jdk-only/l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `internal/jdk-only/a-bound-method-reference-is-a-different-dispatch-door-20260828.md`; what the lane found and does not own is `l3-followups-the-carrier-identity-and-the-dead-registrations-20260830.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
 | **L8 the long tail** | **DONE 2026-08-29** — all 7 batches closed: 56 defects fixed, 4 recorded, 20 141 probe rows 0-diff in both modes (§2.1) | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l8-tail-20260829` |
 
 **ALL EIGHT LANES ARE DONE** — L1 through L8, the last of them (the long tail)
@@ -122,9 +122,9 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | phase | status |
 | --- | --- |
 | **Phase 1** — fabricated receiver kills its caller | **CLOSED 2026-08-29 — all nine lanes.** A/B/D/G/I by `Phase1Sweep` (80 rows); C/E/F/H by `probes/P1RemainingSweep.java` (29 rows, 0 differing both modes, **0 PHASE1-KILL**), each exercised through the payload the roadmap names and with all four mint sites still LIVE. Record: `phase-1-is-closed-the-last-four-lanes-measured-20260829.md`. It means the stated MECHANISM no longer fires on the nine — not that no fabricated class can kill a caller: `RJdkEnumerations` was exactly that and the CORPUS found it, not a Phase 1 probe. |
-| **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
+| **Phase 2** — retire the shadows | **ADJUDICATED 2026-08-30 (L2). 34 of 270 classes are demonstrably load-bearing; of the other 236, ONE TRIPLE of 1477 survived the evidence and is retired.** The 14-vector corpus passes `ConcurrentHashMap` 14/14; retiring it empties `Properties.keySet()` and kills the probe. §2 below and [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md). |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
-| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot (0 strict-only failures; the worklist is 1065, not 334) and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). |
+| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot — fully adjudicated at 185/19/14, 0 strict-only failures, worklist 1065 not 334 — and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). **Two methodology results worth more than the counts:** buy the ORACLE before raising your own cap (4 of the slowest 21 do not finish on HotSpot at 1800 s either, so no CratonVM verdict on them can mean anything), and confirm any mode-specific failure ALONE — sharding manufactured one here, as a working directory on the wrong filesystem manufactured another. |
 
 ### The finding that reframes the work
 
@@ -255,6 +255,93 @@ were, over and over:
   level of the call chain; twelve rows across three signals meant one line.
 * **Deferrals that were requests for a measurement.** Two of them, both closed:
   the `URI` recomposition row and the `System.Logger` `OFF` arm.
+
+### Adjudicated, 2026-08-30 — and the instrument matters more than the answer
+
+Full record: [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md).
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW=<class>`, one class at a time, 270 classes,
+14-vector smoke set, one pinned binary: **34 LOAD-BEARING, 236 RETIRE-SAFE.**
+
+**Do not use that RETIRE-SAFE column as a retirement list.** Arming all 236 at
+once, on the same binary whose unarmed baseline is 118/118:
+
+```text
+armed --jdk-only    64 passed, 54 failed     (reproduced in two independent runs)
+armed SUITE=all    118 passed,  0 failed     <- the dial is inert outside --jdk-only
+armed SUITE=core    78 passed,  0 failed
+enforcement_dial  reached 14 123 530  yielded 14 055 769  LEAK 0
+```
+
+Fourteen million dispatches yielded to real bytecode, zero leaks — the
+retirement was COMPLETE — and the corpus still failed 54 vectors. It also broke
+**35 of 78 probe families and killed 20**, several byte-identical to HotSpot
+before the retirement.
+
+Each of those 236 classes passes 14/14 alone. **A per-class sweep cannot
+predict a set**, and four more full-corpus runs say why it is both reach and
+combination: `ConcurrentHashMap` passes the 14-vector smoke set 14/14 and fails
+**seven** full-corpus vectors, while `Locale` alone fails none — so no single
+class accounts for the 54.
+
+Three further checks, each cheaper than the sweep that produced it:
+
+* **146 of the 236 greens were never asked anything.** The smoke set dispatches
+  a shadowed native on only 120 of the 270 classes; for the rest, arming
+  changed nothing because nothing was called. Check
+  `enforcement_dial.reached > 0`, not a passing vector.
+* **A row does not measure the class it names.** `EnforceShadowScope::covers`
+  is `starts_with`, so `java/io/File` also armed `FileInputStream`, and
+  `java/util/HashMap` also armed `$KeyIterator`. A retirement is per-TRIPLE;
+  the dial is per-PREFIX — a fourth difference on top of the three the flag
+  documents.
+* **It would have re-retired six triples `retired_shadow.rs` deliberately holds
+  back**, reason "needs-VM-support: state is not real".
+
+Re-asking that hold list with the families' CONTENT probes — armed against
+unarmed on one binary, `yielded/reached` printed so an unasked dial could not
+pass as an answer — found the hold list correct and the corpus wrong:
+
+```text
+                         corpus (14 vectors)   own content probe        another family's probe
+ConcurrentHashMap        14/14 PASS            0 changed / 39 357 y     died 261/302, 53 changed
+```
+
+The rows it breaks are `java.util.Properties`', not ConcurrentHashMap's: JDK
+25's `Properties` delegates its `Hashtable` methods to an internal
+`ConcurrentHashMap`, so `keySet()` comes back `[]` on a three-entry table and
+the run dies in `ConcurrentHashMap$KeyIterator.next`. **A retirement's blast
+radius is its class's USERS**, and the family's own probe being clean is the
+trap rather than the reassurance.
+
+**One triple retired**, and the ratio is the finding:
+`sun/nio/ch/FileChannelImpl.truncate(J)`, in a new
+`RETIRED_SHADOW_PHASE2_TRIPLES`. Two binaries from one tree differing only by
+that entry — `L4Diag` 4 diffs from HotSpot to 0, every other probe delta 0,
+118/118 on both. `FileChannel.truncate(-1)` now answers `Negative size` as
+HotSpot does instead of `Negative size: -1`.
+
+**Two false starts are recorded with it, and they cost more than the fix.**
+`jdk/internal/foreign/ArenaImpl` makes `Arena.allocate()` return the real
+`NativeMemorySegmentImpl` — and takes `FfmSegmentSweep` from 40 diffs to 181,
+dead at row 18. And the first triple retired was `open`, chosen because it was
+the only one the CORPUS had dispatched; it moved nothing, because the probe
+that produced the evidence exercises `truncate` (`invocations: 2`) and never
+touches `open` (`invocations: 0`). **A dial result is evidence for trying the
+table, not the table's result** — the two mechanisms differ, and a build is
+what finding that out costs.
+
+Guarded in code, not only here: `the_held_collection_families_are_not_retired`
+now carries the measurement and holds the CHM view/iterator classes too.
+
+**If you take a family, it needs all four:** a dispatch proven by
+`reached > 0`; content probes of the family AND of every family that embeds it;
+image bytecode to yield to (`image_declaring_method` `has_code`, declared or
+inherited, not abstract — 262 candidate triples fail this and would trade a
+shadow for an `UnsatisfiedLinkError`); and a dispatch actually observed in the
+unarmed corpus (1357 fail this).
+
+---
 
 ### What is NOT closed
 
@@ -398,6 +485,26 @@ planning:
 **Read §5 of that page before your first landing.** The gate set changed on 2026-08-29 — it names no `--test` targets any more, because `native-builtins/tests/` holds ten and the hand-written list named seven. A gate script copied from an earlier lane is a script that runs 7 of 10.
 
 What remains below is DATED: which vectors were red on which day, and which lane fixed what. It decays, and it is kept here rather than moved because a permanent page should not carry a list that is wrong in a week.
+
+### `--features synthetic-jdk --tests` — was red for everyone, FIXED 2026-08-30
+
+If you have been treating that arm's `synthetic_stub_count_does_not_regress`
+failure (1591 against baseline 1582) as somebody else's drift, it was not
+drift and it is now green. **That arm had no baseline of its own.**
+`BASELINE_SYNTHETIC_STUBS` branched on `feature = "management"` and nothing
+else, so a third configuration — which compiles registrars the other two do
+not — was being scored against the DEFAULT resolve's number.
+
+Worse, its failure line printed `no-management` and named
+`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT` as the constant to paste into, which
+is the exact re-freeze-from-the-wrong-run hazard that label exists to prevent.
+Pasting 1592 there would have admitted nine stubs to the default arm silently.
+
+`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK` closes both halves. The nine rows by
+which that resolve exceeds the default are frozen, **explicitly not blessed**,
+and flagged for classification — a first freeze is not an adjudication.
+
+---
 
 ### Known-red vectors, so you can tell yours from theirs
 
@@ -575,14 +682,34 @@ while asserting nothing — 33 assertions went dark. Restored:
 selector}_probe/`, `apps/lm_subclass/`. `probe_fixture_census` is the instrument
 that catches this and it was correctly red the whole time.
 
-**OPEN, unowned, and worth someone's morning:**
-`warm_null_receiver_invokes_throw_npe_jit` — once its inline cache is warm,
-`invokespecial` on a NULL receiver does not throw, and the callee runs with
-`this == null`. JVMS §6.5, and the test names the consequence it was written
-for: the bogus `Cannot read field "interfaces" because "rd" is null` at
-`Class.java:1217`. Reproduced identically on four binaries spanning this
-session, so it is not recent. `invokevirtual` and `invokeinterface` both throw
-correctly; only `invokespecial` is wrong.
+**~~OPEN, unowned, and worth someone's morning:~~ FIXED 2026-08-30.**
+`warm_null_receiver_invokes_throw_npe_jit` — `invokespecial` on a NULL receiver
+did not throw once warm, and the callee ran with `this == null`. JVMS §6.5, and
+the mechanism behind the bogus `Cannot read field "interfaces" because "rd" is
+null` at `Class.java:1217`.
+
+**It was not the inline cache.** `invokevirtual`/`invokeinterface` were right
+only incidentally — their cache tests the receiver's CLASS, so a null fails
+every guard. `invokespecial` is statically bound, and both of the emitters that
+bind it jump straight into the compiled callee. The only thing left to raise the
+NPE was the callee body faulting on its own, which it does only if it
+dereferences `this`:
+
+```text
+  private callee body     HotSpot   --nojit   jit (before)
+  return 3;               NPE       NPE       NO-THROW(3)
+  return this.x;          NPE       NPE       NPE
+  return helper();        NPE       NPE       NO-THROW(5)
+```
+
+**Two emitters, and the first fix went to a third that was not involved.** The
+single-pass direct call (`x64/bytecode_walk.rs`) and the optimizing tier's
+`emit_direct_cross_call` (`ir_lower.rs`) both needed the check; which one runs
+depends on the callee, so `return 3;` and `return helper();` were fixed by
+different patches. `CRATONVM_DBG_IR_COMPILES` and `CRATONVM_DBG_JIT_GEN` name
+the tier and the path — reach for them before patching an emitter, because the
+disassembly of the *caller* is what proves the callee was not inlined.
+`apps/probes/NrpVariants.java` is the three-body probe.
 
 ### dev's tip is frequently red
 

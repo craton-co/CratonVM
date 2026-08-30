@@ -745,6 +745,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    E { group: Group::DBG, token: "jit-root-scan", on_key: None, off_key: Some("CRATONVM_DBG_NO_JIT_ROOT_SCAN"), off_word: None },
+    E { group: Group::DBG, token: "fincand", on_key: Some("CRATONVM_DBG_FINCAND"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "forced-finalizers", on_key: Some("CRATONVM_FORCED_FINALIZERS"), off_key: None, off_word: Some("0") },
     // The named-writer arm of the punned-reference counter: on a NON-ZERO
     // payload word under a non-`Object` tag, print the class and field so the
     // writer can be found rather than inferred. Diagnostic only -- the counter
@@ -1407,6 +1410,12 @@ pub const INVENTORY: &[E] = &[
     // so there is no off state to spell.
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
+    // `zero-spid` is default ON and `CRATONVM_JIT_ZERO_SPID=0` restores the
+    // pre-fix behaviour, so `off_word` is exactly `"0"` -- the same shape as
+    // `verify-ir` above. `zero_sp_id_slot_enabled` reads the key and treats
+    // `0`/`false`/`FALSE` as off; only `"0"` is spellable as a group token, and
+    // the other two spellings keep working through the key itself.
+    E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
     // in the DBG group, which is where their names say they belong and which is
@@ -1833,6 +1842,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the

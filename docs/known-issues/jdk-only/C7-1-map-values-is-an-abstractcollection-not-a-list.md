@@ -1,5 +1,25 @@
 # C7-1 — `Map.values()` is an `AbstractCollection`, and this VM returns an `ArrayList`
 
+> **MEASURED ON A BINARY 2026-08-30, and the class-identity prediction in this
+> record is OBSOLETE.** Every CratonVM row on this page is marked PREDICTED FROM
+> SOURCE — "no CratonVM binary and no cargo were run" — and the view-class
+> rewrite it specifies has since landed. `apps/probes/ViewIdentityProbe` asks
+> the class, the superclass, six `instanceof`s, three casts, `equals` four ways,
+> `hashCode`, the mutator refusals, serialization, the iterator classes and view
+> liveness, for `HashMap`, `LinkedHashMap`, `TreeMap`, `Hashtable` and
+> `Properties`: **303 rows, 0-diff against HotSpot 25.0.4+7 in BOTH modes.**
+>
+> So `keySet()` is a `HashMap$KeySet`, `values()` is a `HashMap$Values` with
+> `AbstractCollection` above it, neither is `Serializable`, and the casts this
+> record predicted would succeed now throw `ClassCastException` exactly where
+> HotSpot throws.
+>
+> What the probe DID find was different and narrower, and is fixed in the same
+> commit: three families never cached their view objects, so
+> `map.keySet() == map.keySet()` was false and — because `AbstractCollection`
+> does not override `equals` — `map.values().equals(map.values())` was FALSE
+> too. See `MEASURED-VIEW-IDENTITY` below.
+
 **Status:** PARTLY FIXED this lane (`equals`/`hashCode`), **OPEN** on class
 identity. Lane C7, 2026-08-12. Windows host, **no binary was run** — every
 "after" below is marked PREDICTED.
@@ -249,3 +269,9 @@ that suite would be attributed to whoever ran it next. Move it in with N2.
 
 **N4 (`regression-suite/run.sh`, not mine).** Register the new fixture — see
 C7-3 §5 for the exact line.
+
+---
+
+## MEASURED-VIEW-IDENTITY
+
+See `C13-3-native-map-key-set-returns-a-hashset.md`'s section of this name for the 2026-08-30 measurement and the three caching defects it found. Nothing on this page is still open.

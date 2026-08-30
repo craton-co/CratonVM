@@ -27,7 +27,7 @@ install, no `rt.jar`, one self-contained binary.
   relocating (see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
   region-based G1 (`-XX:+UseG1GC`).
 - **Real frameworks run** — Spring, Spring Boot, Tomcat, Netty, Hibernate,
-  Hibernate Reactive, Quarkus, H2 Database boot and pass large test suites.
+  Hibernate Reactive, H2 Database, Postgres driver boot and pass large test suites.
 - **Rust implementation** — Rust removes many ambient memory hazards, but the
   VM, JIT, GC, FFI, I/O, AWT, CUDA, and JFR contain reviewed and still-being-
   audited `unsafe` regions. See [SECURITY.md](SECURITY.md).

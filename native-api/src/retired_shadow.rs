@@ -1215,6 +1215,100 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // under it is retirable. `java/lang/ref/` is still absent on purpose —
     // see the `sun/nio/fs/` block in this module's header.
     "sun/nio/fs/",
+    // 2026-08-30, Phase 2. **This narrows the note above rather than
+    // overruling it.** That note is a PACKAGE verdict from a package-scoped
+    // dial sweep, and it is still the right default: this lane's own
+    // whole-corpus run agrees that `sun/nio/ch/` as a whole is not retirable.
+    // What is retired under this prefix is ONE triple, measured on its own —
+    // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
+    // binary search; the table decides what is retired, and it retires one row.
+    "sun/nio/ch/",
+];
+
+/// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
+///
+/// A THIRD table rather than an entry merged into either sibling, for the
+/// reason the second gives for existing: these were adjudicated by a different
+/// METHOD, and the method is the part worth being able to see at a glance.
+///
+/// # Why one
+///
+/// Phase 2 armed all 270 classes of the shadow surface, one at a time, and the
+/// dial called 236 of them retire-safe. Arming those 236 together fails **54 of
+/// 118 corpus vectors** and breaks **35 of 78 probe families**. So the sweep
+/// produces candidates, never verdicts, and each candidate has to earn its row
+/// against four preconditions:
+///
+///  1. the dial was ASKED — `enforcement_dial.reached > 0` for that scope, not
+///     a passing vector (146 of the 236 fail this: nothing on the class was
+///     ever called, so arming it changed nothing and read as the best possible
+///     result);
+///  2. the WHOLE probe tree, armed on that class alone, gets no worse anywhere
+///     — not just the family's own probe, which is the narrowest instrument in
+///     the building;
+///  3. the image target carries `Code` to yield to, so the retirement does not
+///     trade a shadow for an `UnsatisfiedLinkError`;
+///  4. the full corpus stays at its unarmed baseline.
+///
+/// `sun/nio/ch/FileChannelImpl` is the receiver that came through. Armed alone:
+///
+/// ```text
+///   L4Diag                      4 diffs from HotSpot -> 0        (9/9 yields)
+///   the other 77 probes         every delta exactly 0
+///   full corpus --jdk-only      118 passed, 0 failed = the unarmed baseline
+/// ```
+///
+/// The two rows it fixes are `FileChannel.truncate(-1)`'s message: this VM
+/// answered `Negative size: -1` where HotSpot answers `Negative size`. Retiring
+/// it lets the real JDK validation run, which is §1.4's remedy rather than
+/// maintaining message parity by hand in a native that should not be in front
+/// of that bytecode at all.
+///
+/// # The first entry written here was `open`, and it was INERT
+///
+/// Worth keeping, because it is precondition 4 failing in the one direction
+/// nobody expects. The dial arms a PREFIX, so "armed `sun/nio/ch/FileChannelImpl`
+/// fixes L4Diag" is a claim about every triple on that receiver. Choosing which
+/// one to retire then fell to precondition 4 — observed as `native-won` in the
+/// unarmed corpus — and the corpus offers exactly one such triple on that
+/// class, `open`. So `open` was retired, built, and measured: **L4Diag
+/// unchanged at 4 diffs, every other probe unchanged.** A whole build to move
+/// nothing.
+///
+/// The registry says why, in the column precondition 4 never consults. In an
+/// L4Diag run, `truncate(J)` has `invocations: 2` and `image_declaring_method.
+/// has_code: true`; `open` has `invocations: 0`. **The corpus never calls
+/// `FileChannel.truncate(-1)`; the probe does.** Filtering candidates by what
+/// the CORPUS dispatched therefore discards precisely the triple whose
+/// retirement the PROBE measured — the two preconditions were reading different
+/// workloads and only one of them was the workload the evidence came from.
+///
+/// So precondition 4 is really: **observed by the instrument that produced the
+/// improvement**, per triple, and the way to read it is `invocations > 0` in
+/// that instrument's own run — not membership in a corpus census.
+///
+/// # What did NOT come through, and it is the more useful half
+///
+/// `jdk/internal/foreign/ArenaImpl` was the other candidate, and it looked
+/// better: armed, `Arena.allocate()` returns the REAL
+/// `jdk.internal.foreign.NativeMemorySegmentImpl` instead of this VM's carrier,
+/// taking `AbstractReceiverSweep` from 12 diffs to 6. Precondition 2 killed it:
+///
+/// ```text
+///   FfmSegmentSweep   40 -> 181 diffs, and DIED at row 18 of 199
+///   FfmCarrierProbe    0 ->   6 diffs, and died at 104 of 106
+///   FfmMsgProbe        2 ->   7 diffs
+/// ```
+///
+/// The class NAME becomes right and the segment surface stops working, because
+/// the real implementation needs real state this VM does not keep. That is a
+/// second, independent confirmation of the FFM contract decision recorded in
+/// `docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`:
+/// the carrier is this VM's own allocation shape, and matching the JDK's class
+/// name is not a thing to fix — not by fabricating a name, and not by
+/// retirement either.
+static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[
+    ("sun/nio/ch/FileChannelImpl", "truncate", "(J)Ljava/nio/channels/FileChannel;"),
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
@@ -1242,6 +1336,7 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
     let key = (class_name, method_name, descriptor);
     RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
         || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
@@ -1285,6 +1380,72 @@ mod tests {
                 RETIRED_SHADOW_TRIPLES.binary_search(t).is_err(),
                 "{t:?} is in both tables"
             );
+        }
+        // Three tables now. A triple in two of them is not a doubled
+        // retirement -- the predicate ORs -- but it IS two provenances for one
+        // decision, and the next reader cannot tell which measurement backs it.
+        for t in RETIRED_SHADOW_PHASE2_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the phase-2 table and an earlier one"
+            );
+        }
+    }
+
+    /// Sorted and binary-searched like both siblings, and for the same reason:
+    /// an out-of-order entry makes the predicate answer `false` for a row that
+    /// is present, which reads as "not retired" and is invisible in a workload.
+    #[test]
+    fn the_phase2_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_PHASE2_TRIPLES.windows(2) {
+            assert!(w[0] < w[1], "out of order or duplicated: {:?} then {:?}", w[0], w[1]);
+        }
+    }
+
+    /// An entry outside every prefix in [`RETIRED_SHADOW_PREFIXES`] answers
+    /// `false`, which reads as "not retired" and retires nothing.
+    #[test]
+    fn every_phase2_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_PHASE2_TRIPLES {
+            assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+        }
+    }
+
+    /// The `sun/nio/ch/` prefix admits a package the 2026-08-19 sweep scored
+    /// 34/36 and called unretirable. That verdict stands for the PACKAGE; this
+    /// wave retires one triple inside it, measured alone. The guard is that the
+    /// prefix must not become a licence for the rest: every sibling below was a
+    /// `native-won` shadow in the same census and none of them was measured.
+    #[test]
+    fn the_phase2_wave_retires_only_the_triple_it_measured() {
+        assert!(triple_is_retired_shadow(
+            "sun/nio/ch/FileChannelImpl",
+            "truncate",
+            "(J)Ljava/nio/channels/FileChannel;"
+        ));
+        // `open` is NOT retired, and the doc comment above records why the
+        // first draft of this wave retired it and moved nothing.
+        assert!(!triple_is_retired_shadow(
+            "sun/nio/ch/FileChannelImpl",
+            "open",
+            "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)\
+Ljava/nio/channels/FileChannel;"
+        ));
+        for (c, m, d) in [
+            ("sun/nio/ch/SelectionKeyImpl", "cancel", "()V"),
+            ("sun/nio/ch/SelectionKeyImpl", "isValid", "()Z"),
+            ("sun/nio/ch/SocketChannelImpl", "close", "()V"),
+            ("sun/nio/ch/EPollSelectorImpl", "select", "()I"),
+            ("sun/nio/ch/NativeThread", "current", "()J"),
+            ("sun/nio/ch/FileLockImpl", "release", "()V"),
+            // ArenaImpl: measured, and REJECTED by precondition 2. Listed here
+            // rather than merely omitted, so that "not in the table" does not
+            // read as "not yet looked at".
+            ("jdk/internal/foreign/ArenaImpl", "allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("jdk/internal/foreign/ArenaImpl", "close", "()V"),
+        ] {
+            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
         }
     }
 
@@ -1645,6 +1806,44 @@ mod tests {
     ///
     /// `Arrays.copyOf` is in the list for the opposite reason: it is the one
     /// triple the five `ArrayList` retirements DEPEND on staying a `Bridge`.
+    ///
+    /// # RE-ASKED 2026-08-30, and the hold is CORRECT
+    ///
+    /// A hold list is a hypothesis with a date on it. Seven lanes had since
+    /// made these classes' state more real, which is this module's own stated
+    /// precondition for retiring a shadow, so the list was re-measured rather
+    /// than assumed. It survived — but only because it was asked with the
+    /// right instrument, and the wrong one said the opposite:
+    ///
+    /// ```text
+    ///   14-vector regression corpus, ConcurrentHashMap armed   14/14 PASS
+    ///   ChmShadowSweep, the family's OWN content probe         0 changed rows
+    ///                                                          over 39 357 yields
+    ///   MapViewsShadowSweep, ANOTHER family's probe            died at 261/302,
+    ///                                                          53 rows changed
+    /// ```
+    ///
+    /// **The rows it breaks are `java.util.Properties`', not
+    /// `ConcurrentHashMap`'s.** JDK 25's `Properties` holds a
+    /// `private transient volatile ConcurrentHashMap<Object,Object> map` and
+    /// delegates its `Hashtable` methods to it, so retiring CHM's natives puts
+    /// real CHM bytecode under a map whose state this VM keeps in a side
+    /// table. Every `Properties` view empties out — `keySet()` returns `[]` on
+    /// a three-entry table, and `keySet().remove` writes through to nothing —
+    /// and the run then dies inside `ConcurrentHashMap$KeyIterator.next`.
+    /// Silent data loss for forty rows before anything throws.
+    ///
+    /// So the entries below are held for a reason wider than the one above
+    /// them: not only "this family's own collections empty out", but **a
+    /// retirement's blast radius is its class's USERS**. The family's own
+    /// probe being clean is the trap and not the reassurance — it asks about
+    /// the operations the family declares, and a view is another class's
+    /// method returning another class's object.
+    ///
+    /// The view and iterator classes are listed explicitly for the same
+    /// reason `Logger.log`'s eighth overload is: a per-class sweep called all
+    /// five CHM classes RETIRE-SAFE, and nothing but an entry here records
+    /// that they were considered and rejected.
     #[test]
     fn the_held_collection_families_are_not_retired() {
         for (c, m, d) in [
@@ -1685,6 +1884,36 @@ mod tests {
                 "java/util/Arrays",
                 "copyOf",
                 "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+            ),
+            // 2026-08-30: the CHM VIEW surface, held for the Properties
+            // coupling in this test's doc comment. `keySet`/`values` hand out
+            // the object the view classes below then iterate, so the producer
+            // and the consumers have to be held together or the survivor is
+            // handed a receiver the retired half built.
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "keySet",
+                "()Ljava/util/Set;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "values",
+                "()Ljava/util/Collection;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+                "next",
+                "()Ljava/lang/Object;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+                "hasNext",
+                "()Z",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+                "next",
+                "()Ljava/lang/Object;",
             ),
         ] {
             assert!(

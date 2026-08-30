@@ -1,5 +1,25 @@
 # C13-2 — the five values-view classes are not one family, and the flip's blocker is in `vm/**`
 
+> **MEASURED ON A BINARY 2026-08-30, and the class-identity prediction in this
+> record is OBSOLETE.** Every CratonVM row on this page is marked PREDICTED FROM
+> SOURCE — "no CratonVM binary and no cargo were run" — and the view-class
+> rewrite it specifies has since landed. `apps/probes/ViewIdentityProbe` asks
+> the class, the superclass, six `instanceof`s, three casts, `equals` four ways,
+> `hashCode`, the mutator refusals, serialization, the iterator classes and view
+> liveness, for `HashMap`, `LinkedHashMap`, `TreeMap`, `Hashtable` and
+> `Properties`: **303 rows, 0-diff against HotSpot 25.0.4+7 in BOTH modes.**
+>
+> So `keySet()` is a `HashMap$KeySet`, `values()` is a `HashMap$Values` with
+> `AbstractCollection` above it, neither is `Serializable`, and the casts this
+> record predicted would succeed now throw `ClassCastException` exactly where
+> HotSpot throws.
+>
+> What the probe DID find was different and narrower, and is fixed in the same
+> commit: three families never cached their view objects, so
+> `map.keySet() == map.keySet()` was false and — because `AbstractCollection`
+> does not override `equals` — `map.values().equals(map.values())` was FALSE
+> too. See `MEASURED-VIEW-IDENTITY` below.
+
 **Status:** ANALYSIS + a specified, costed change **NOT taken**. Lane C13,
 2026-08-12. Windows host, **no CratonVM binary and no cargo were run**. The
 `javap -p -c` output against JDK 25.0.3+9 and the `java` transcript are
@@ -232,3 +252,9 @@ at `regression-suite/run.sh:119`:
 
 - exact old text: `RJdkForeign RJdkEnumerations RJdkAsyncChannel"`
 - exact new text: `RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews"`
+
+---
+
+## MEASURED-VIEW-IDENTITY
+
+See `C13-3-native-map-key-set-returns-a-hashset.md`'s section of this name for the 2026-08-30 measurement and the three caching defects it found. Nothing on this page is still open.

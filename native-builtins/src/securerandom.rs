@@ -209,7 +209,93 @@ fn scramble_seed(user_seed: i64) -> u64 {
 /// canonical example of this pattern.
 static SEED_TABLE: RwLock<Option<FxHashMap<i32, u64>>> = RwLock::new(None);
 
+/// Drop the generator state of every `Random`/`SecureRandom` the collector has
+/// just reclaimed.
+///
+/// Registered with `cratonvm_types::identity_side_tables`, which the sweep
+/// calls once per cycle. Without it these three tables are append-only for the
+/// life of the process: MEASURED at ~39 bytes retained per `java.util.Random`
+/// ever constructed, against a Java heap that stays flat to the kilobyte
+/// because the objects themselves are collected perfectly well. See
+/// `docs/known-issues/hibernate/jpalargeblob-random-state-side-table-20260829.md`.
+///
+/// # Why this is one function and not three registrations
+///
+/// The three tables are one object's state split by type, and a `Random` that
+/// is in `GAUSSIAN_TABLE` is in `SEED_TABLE` too. Evicting them together takes
+/// each lock once per GC cycle instead of three separate passes over the same
+/// batch.
+///
+/// The `is_none()` arms matter more than they look: a table is lazily built on
+/// first use, so a program that never constructs a `Random` never allocates the
+/// map, and this must not be what forces it into existence on every cycle.
+fn evict_dead_random_state(dead: &[i32]) {
+    let mut removed = 0usize;
+
+    // Ordered SEED -> GAUSSIAN -> SHA1PRNG, and each lock is released before
+    // the next is taken, so this introduces no lock-order edge between them.
+    {
+        let mut g = SEED_TABLE.write();
+        if let Some(t) = g.as_mut() {
+            if !t.is_empty() {
+                for h in dead {
+                    if t.remove(h).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    {
+        let mut g = GAUSSIAN_TABLE.write();
+        if let Some(t) = g.as_mut() {
+            if !t.is_empty() {
+                for h in dead {
+                    if t.remove(h).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    {
+        let mut g = SHA1PRNG_TABLE.write();
+        if let Some(t) = g.as_mut() {
+            if !t.is_empty() {
+                for h in dead {
+                    if t.remove(h).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    cratonvm_types::identity_side_tables::note_evicted(removed);
+}
+
+/// Register [`evict_dead_random_state`] exactly once.
+///
+/// Called from the three `with_*_write` helpers BEFORE they take their table
+/// lock, deliberately: registration takes the registry's write lock, and the
+/// evictor takes the table locks, so registering while already holding a table
+/// lock would build the one lock-order edge that could deadlock against a
+/// concurrent sweep. (`evict_dead` drops the registry lock before calling any
+/// evictor, so the edge does not exist today -- this keeps it that way without
+/// depending on that.)
+///
+/// Registering from the write helpers rather than at VM startup means a program
+/// that never touches these classes never registers, and the collector's
+/// `any_registered()` fast path keeps the whole mechanism off its sweep.
+fn ensure_random_evictor_registered() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        cratonvm_types::identity_side_tables::register(evict_dead_random_state);
+    });
+}
+
 fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, u64>) -> R) -> R {
+    ensure_random_evictor_registered();
     // Round-9 MED-3: parking_lot — no poison handling.
     let mut g = SEED_TABLE.write();
     if g.is_none() {
@@ -226,6 +312,7 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, u64>) -> R) -> R {
 static GAUSSIAN_TABLE: RwLock<Option<FxHashMap<i32, f64>>> = RwLock::new(None);
 
 fn with_gaussian_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, f64>) -> R) -> R {
+    ensure_random_evictor_registered();
     let mut g = GAUSSIAN_TABLE.write();
     if g.is_none() {
         *g = Some(FxHashMap::default());
@@ -235,8 +322,12 @@ fn with_gaussian_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, f64>) -> R) -
 
 /// GC-stable key for a `Random` instance.  Round-9 C12 fix: was
 /// `obj.as_ptr() as usize`, which broke after the GC relocated the
-/// `Random`.  `identity_hash_code` is preserved across compaction by
-/// `HashCodeTable::update_after_gc`.
+/// `Random`.  `identity_hash_code` is preserved across compaction because it
+/// lives in the object's MARK WORD and every mover copies the header
+/// verbatim — NOT, as this said until 2026-08-30, because
+/// `HashCodeTable::update_after_gc` remaps it. That table has no production
+/// consumer, which is worth knowing here: the false citation is what made
+/// the missing eviction look like someone else's already-solved problem.
 ///
 /// Takes `&mut dyn NativeContext` to match the `VH_META_TABLE` pattern
 /// in `lang_invoke.rs` (and to satisfy callers that hold a mutable
@@ -824,6 +915,7 @@ static SHA1PRNG_ANY_SEEDED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn with_prng_write<R>(f: impl FnOnce(&mut FxHashMap<i32, Sha1Prng>) -> R) -> R {
+    ensure_random_evictor_registered();
     let mut g = SHA1PRNG_TABLE.write();
     if g.is_none() {
         *g = Some(FxHashMap::default());

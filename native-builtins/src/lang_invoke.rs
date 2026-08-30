@@ -352,10 +352,21 @@ pub(crate) struct VarHandleMeta {
 // on real-JDK VarHandle, see WP4.2 comment above).
 //
 // The fix: use `NativeContext::identity_hash_code(vh)` as the key.
-// `identity_hash_code` is GC-stable — see `gc/src/compact_header.rs`
-// (HashCodeTable::update_after_gc remaps after compaction). All meta
-// accessors therefore take `&mut dyn NativeContext` so they can compute
-// the key.
+// `identity_hash_code` is GC-stable because it lives in the object's MARK
+// WORD (`ObjectHeader::mark_word_identity_hash`), and every mover copies the
+// header verbatim. NOT, as this said until 2026-08-30, because
+// `HashCodeTable::update_after_gc` remaps it: that table has no production
+// consumer at all (see its own doc comment). All meta accessors therefore
+// take `&mut dyn NativeContext` so they can compute the key.
+//
+// This table is deliberately NOT wired to
+// `cratonvm_types::identity_side_tables`, which evicts the entries of
+// reclaimed objects for the `java.util.Random` tables. It would never fire:
+// `vh_meta_put` below registers every VarHandle as a PERMANENT GC root, so
+// no VarHandle is ever reclaimed and the collector has nothing to report.
+// The entries do accumulate, but the root is what retains them and the root
+// is load-bearing (B-J) — so that is a separate question about VarHandle
+// lifetime, not something an eviction hook can answer.
 static VH_META_TABLE: std::sync::OnceLock<
     parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>>,
 > = std::sync::OnceLock::new();
@@ -15783,29 +15794,6 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
-/// `MethodHandleNatives.getConstant(int which)`
-///
-/// Returns VM-specific constants used by the MethodHandle implementation.
-/// Constants:
-///   0 = GC_COUNT_GWT (guard with test count) → 4
-///   1 = USE_SOFT_CACHE → 1
-///   4 = HAVE_PENDING_EXCEPTION → 0
-pub(crate) fn native_mhn_get_constant(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let which = match args.get(0) {
-        Some(Value::Int(w)) => *w,
-        _ => 0,
-    };
-    let result = match which {
-        0 => 4, // GC_COUNT_GWT — suggested MethodHandle.guardWithTest specialization threshold
-        1 => 1, // USE_SOFT_CACHE — use SoftReferences in method handle caching
-        _ => 0, // unknown constant → 0
-    };
-    Ok(Some(Value::Int(result)))
-}
-
 /// `MethodHandleNatives.linkMethod(Class<?> callerClass, int refKind, Class<?> defc, String name, Object type, Object[] appendixResult)`
 ///
 /// Links a method call site. Returns a MemberName that the VM can use for dispatch.
@@ -15851,43 +15839,6 @@ pub(crate) fn native_mhn_link_method(
     };
 
     let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind)?;
-    Ok(Some(Value::Object(Some(mh))))
-}
-
-/// `MethodHandleNatives.linkCallSite(Object callerObj, int bsmIndex, Object name, Object type, Object staticArgs, Object[] appendixResult)`
-///
-/// Links an invokedynamic call site by resolving the bootstrap method and
-/// calling it to produce a CallSite. Returns a MemberName for the target.
-pub(crate) fn native_mhn_link_call_site(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    // In our VM, invokedynamic is already handled by the interpreter's
-    // specialized bootstrap dispatch (runtime/invokedynamic.rs). This native
-    // is called when the JDK's MethodHandleNatives.linkCallSite is invoked
-    // from Java code. We return a minimal MemberName that allows the call to
-    // proceed.
-
-    // Extract name from args[2]
-    let name = match args.get(2) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => NAME_INVOKE.to_string(),
-    };
-
-    // Extract MethodType from args[3]
-    let desc = match args.get(3) {
-        Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => DESC_DEFAULT_OBJECT_RETURN.to_string(),
-    };
-
-    // Allocate a virtual MH as the linked target
-    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL)?;
-
-    // If appendixResult array is provided, store the MH as appendix
-    if let Some(Value::Object(Some(appendix_arr))) = args.get(5) {
-        ctx.set_array_element(*appendix_arr, 0, Value::Object(Some(mh)));
-    }
-
     Ok(Some(Value::Object(Some(mh))))
 }
 

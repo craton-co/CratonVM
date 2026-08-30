@@ -1913,8 +1913,14 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // before System.gc() returns.
         last_ditch_reclaim(shared, thread);
     }
-    // Run pending finalizers
-    run_finalizers(shared, thread);
+    // Run pending finalizers.
+    //
+    // FORCED, for the same reason the cleaner drain below is: deferring here is
+    // not a deferral. An application that asks for collection from inside a
+    // compiled loop never reaches a call where `is_jit_thread_set()` is false,
+    // so the guarded variant defers forever and every finalizable object in the
+    // process becomes immortal. See `run_finalizers_forced`.
+    run_finalizers_forced(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
     // shared.mem.cleaner_thread by process_references_after_gc.
     //
@@ -2129,8 +2135,82 @@ fn run_cleaner_actions_impl(shared: &SharedVm, thread: &mut JvmThread, force: bo
     }
 }
 
+/// `CRATONVM_FORCED_FINALIZERS=0` — go back to deferring `System.gc()`'s
+/// finalizer drain whenever a JIT helper holds the thread borrow.
+///
+/// That deferral is the defect this flag A/Bs, so `0` is the BROKEN arm and
+/// exists only to measure it on one binary. See [`run_finalizers_forced`].
+fn forced_finalizers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_FORCED_FINALIZERS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Dequeue pending finalizable objects and invoke their finalize() method.
+///
+/// Defers when a JIT helper holds the thread borrow. Correct for the
+/// allocation-triggered callers, which will be back within an allocation or
+/// two — and WRONG for `System.gc()`, which is why that path calls
+/// [`run_finalizers_forced`] instead.
 pub(super) fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
+    run_finalizers_impl(shared, thread, false);
+}
+
+/// `System.gc()` / `System.runFinalization()`'s drain: run pending finalizers
+/// even while a JIT helper holds the thread borrow.
+///
+/// # Why the deferral had to go on this path
+///
+/// The guard in [`run_finalizers_impl`] says "defer to the next top-level
+/// safepoint". For an application that only ever asks for finalization from
+/// inside a compiled loop, **that safepoint never comes**: every
+/// `System.gc()` arrives through a JIT helper, so `is_jit_thread_set()` is true
+/// at every call and the drain is deferred forever.
+///
+/// MEASURED (`probes/ThreadRetainMin.java`, `CRATONVM_DBG_FINCAND=1`): the
+/// objects are found dead and resurrected on EVERY cycle
+/// (`dead_resurrected=1,2,3` some thirty times each) because
+/// `finalizable_roots` re-adds the pending queue as roots to keep them alive
+/// for a finalizer that never runs. `finalize()` never executes, the object is
+/// never reclaimed, and a `WeakReference` to it never clears. Under `--nojit`
+/// the same probe resurrects once and collects in two rounds.
+///
+/// That is `RecyclerTest.testThreadCanBeCollectedEvenIfHandledObjectIsReferenced`,
+/// and it is not about Threads, netty, or JUnit: any object with a `finalize()`
+/// override is immortal once the loop asking for the collection is compiled.
+///
+/// The re-entrancy the guard protects against is handled the way
+/// [`run_cleaner_actions_forced`] already handles it for the sibling queue —
+/// re-install the JIT thread pointer for the nested Java call under RAII, so an
+/// unwinding `finalize()` cannot leave the outer level un-restored.
+pub(super) fn run_finalizers_forced(shared: &SharedVm, thread: &mut JvmThread) {
+    if !forced_finalizers_enabled() {
+        run_finalizers_impl(shared, thread, false);
+        return;
+    }
+    // RAII so an unwinding finalizer cannot leave the outer JIT level
+    // un-restored. Same shape as `run_cleaner_actions_forced`.
+    struct NestedJitScope(Option<crate::jit::helpers::JitThreadScope>);
+    impl Drop for NestedJitScope {
+        fn drop(&mut self) {
+            if let Some(scope) = self.0.take() {
+                crate::jit::helpers::restore_jit_thread(scope);
+            }
+        }
+    }
+    let _scope = NestedJitScope(if crate::jit::helpers::is_jit_thread_set() {
+        Some(crate::jit::helpers::set_jit_thread(thread))
+    } else {
+        None
+    });
+    run_finalizers_impl(shared, thread, true);
+}
+
+fn run_finalizers_impl(shared: &SharedVm, thread: &mut JvmThread, forced: bool) {
     // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
     if no_refproc() || no_cleaners() {
         return;
@@ -2139,7 +2219,10 @@ pub(super) fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
     // invoked while a JIT helper holds the `&mut JvmThread` could re-enter the
     // JIT and alias the borrow. Defer to the next top-level safepoint; the
     // queue is GC-relocated via `FinalizerThread::update_after_gc`.
-    if crate::jit::helpers::is_jit_thread_set() {
+    //
+    // `forced` callers have re-installed the JIT thread pointer around this
+    // call, so the nested invocation cannot alias the borrow.
+    if !forced && crate::jit::helpers::is_jit_thread_set() {
         return;
     }
     loop {

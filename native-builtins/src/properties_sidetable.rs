@@ -2473,6 +2473,40 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // surviving copy is the one that also refreshes the receiver below.
     let entries = ordered_snapshot_kv(ctx, &mut this);
 
+    // Does the RECEIVER have a backing CHM? Read after `ordered_snapshot_kv`,
+    // which refreshed `this` across its re-entry into Java.
+    //
+    // A clone must be as CHM-less as the thing it was cloned from, and this is
+    // the whole of
+    // `jdk-only/system-properties-clone-enumerates-in-a-different-order-than-its-source-20260829.md`
+    // (retired to docs internal on 2026-08-30, so the prefix is dropped).
+    // Enumeration prefers the CHM when there is one and the side-table's
+    // insertion order when there is not, so building the clone a CHM the source
+    // does not have makes the pair enumerate two different ways:
+    //
+    // ```text
+    // apps/probes/PropsOrderSweep, both modes
+    //   17 System clone order equals System order   HotSpot true   was false
+    // ```
+    //
+    // HotSpot has no such case: `clone.map = new ConcurrentHashMap<>(map)`
+    // copies a map that ALWAYS exists there, so both sides are CHM-ordered.
+    // Here the synthetic `System.getProperties()` singleton has no CHM, and it
+    // is the one receiver every application clones.
+    //
+    // The recorded objection to this exit was that a real `Properties.map` is
+    // what un-overridden JDK bodies dereference, and that the null `map` is
+    // deliberate (`register_properties_sidetable`) so those fail LOUDLY rather
+    // than silently reading an empty map. That objection survives intact: it
+    // argues for the SOURCE keeping a null map, and the source keeps it. What
+    // it cannot argue is that a clone should differ from its source on the very
+    // property the loudness depends on -- a clone with a CHM is a receiver
+    // where those bodies quietly succeed while the original still throws.
+    let source_has_backing = matches!(
+        ctx.get_field_by_name(this, "map"),
+        Value::Object(Some(_))
+    );
+
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
     // shallow-copies the heap fields, `defaults` included, and already knows to
@@ -2504,7 +2538,13 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // creates the CHM when absent, which is the same lazy construction the
     // write paths use.
     ctx.set_field_by_name(clone_ref, "map", Value::Object(None));
-    if !entries.is_empty() {
+    // `source_has_backing`, not just `!entries.is_empty()`: a CHM-less receiver
+    // WITH entries is exactly the `System.getProperties()` case, and rebuilding
+    // there is what created the order asymmetry. The side table itself is
+    // already on the clone -- `native_object_clone` replicates it onto the new
+    // identity -- so a clone that skips this still holds every entry and still
+    // enumerates, through the same path its source does.
+    if source_has_backing && !entries.is_empty() {
         let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
         mirror_loaded_entries_to_properties_backend(ctx, clone_ref, &entries);
     }
