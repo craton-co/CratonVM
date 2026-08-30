@@ -226,6 +226,8 @@ pub struct OffloadCache {
     /// launches are recorded, not run. Asking the device any of those
     /// questions would also invalidate the capture outright.
     capture: RwLock<Option<GraphCapture>>,
+    /// An open argument-update pass; see [`ReplayBind`].
+    replay_bind: RwLock<Option<ReplayBind>>,
     /// Class id of `craton/gpu/GpuArray`, resolved once.
     ///
     /// `try_gpu_array_shape` used to answer "is this argument a GpuArray" by
@@ -316,7 +318,7 @@ struct GraphCapture {
     /// was swallowed, which is worth failing on -- a graph with fewer nodes
     /// than the loop had launches replays successfully and does less.
     dispatches: usize,
-    nodes: usize,
+    confirmed: usize,
     /// A dispatch the capture had to refuse, kept so `end_capture` can say
     /// which one rather than just failing.
     refused: Option<String>,
@@ -342,6 +344,42 @@ struct GraphCapture {
     /// Allocated on the first captured dispatch. See the long note at
     /// its allocation site.
     flag: Option<Arc<cuda_bridge::DeviceBuffer<u64>>>,
+    /// The node each captured dispatch became, in dispatch order, with
+    /// the kernel it was.
+    ///
+    /// The kernel identity is carried so a later argument update can
+    /// refuse a caller whose sequence has drifted. Updating node `i`
+    /// with the arguments of a DIFFERENT kernel is accepted by the
+    /// driver and produces a wrong answer, which is the one failure this
+    /// whole mechanism must not have.
+    nodes: Vec<(cuda_bridge::graph::GraphNode, ClassId, u16)>,
+}
+
+/// An open "re-supply the arguments" pass over an already-captured graph.
+///
+/// The counterpart of [`GraphCapture`] for callers who cannot move their
+/// changing values into device memory. The caller re-runs the SAME
+/// dispatch sequence; each dispatch, instead of launching, rewrites the
+/// arguments of the node it corresponds to, and `end_replay` submits the
+/// graph once.
+///
+/// It is strictly more expensive than replaying a graph that does not
+/// change — a driver call per updated node, plus the caller's own
+/// per-dispatch work — and strictly cheaper than issuing the launches.
+/// It exists so that a caller who cannot change their kernels is not
+/// shut out.
+#[cfg(feature = "gpu-offload")]
+struct ReplayBind {
+    /// Stream the graph will be submitted on, by identity, as in
+    /// [`GraphCapture::stream`].
+    stream: Arc<Stream>,
+    graph_handle: u64,
+    /// How many dispatches have been consumed. Indexes the graph's node
+    /// list, so it must end equal to that list's length.
+    next: usize,
+    /// The first thing that went wrong, kept so `end_replay` can say
+    /// which dispatch rather than just refusing.
+    refused: Option<String>,
 }
 
 /// Instantiated graphs, by Java-visible handle.
@@ -365,7 +403,7 @@ fn graphs() -> &'static RwLock<FxHashMap<u64, InstalledGraph>> {
 #[cfg(feature = "gpu-offload")]
 struct InstalledGraph {
     exec: Arc<cuda_bridge::graph::GraphExec>,
-    nodes: usize,
+    node_count: usize,
     /// The device buffers the graph's nodes point at, kept alive for
     /// exactly as long as the graph. Dropped by `graph_release`.
     _pins: Vec<MarshalWriteback>,
@@ -373,6 +411,8 @@ struct InstalledGraph {
     writes: Vec<u64>,
     /// The shared failure flag, read once per replay.
     flag: Option<Arc<cuda_bridge::DeviceBuffer<u64>>>,
+    /// Per-dispatch node identity; see [`GraphCapture::nodes`].
+    nodes: Vec<(cuda_bridge::graph::GraphNode, ClassId, u16)>,
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -470,6 +510,7 @@ impl OffloadCache {
             dispatch_memo: RwLock::new(FxHashMap::default()),
             gpu_array_class_id: RwLock::new(None),
             capture: RwLock::new(None),
+            replay_bind: RwLock::new(None),
             sm,
         }
     }
@@ -591,32 +632,41 @@ impl OffloadCache {
         *held = Some(GraphCapture {
             stream: stream.clone(),
             dispatches: 0,
-            nodes: 0,
+            confirmed: 0,
             refused: None,
             pins: Vec::new(),
             writes: Vec::new(),
             flag,
+            nodes: Vec::new(),
         });
         true
     }
 
-    /// The failure-flag cell a capture on `stream` shares.
+    /// The failure-flag cell a graph on `stream` owns, if any.
     ///
-    /// `None` when this stream is not being captured, which is the
-    /// ordinary case and tells the caller to take a pooled flag as
-    /// before. The buffer itself was allocated by `graph_begin_capture`,
-    /// before the capture opened -- see the note there.
+    /// `None` when this stream is neither being captured nor having a
+    /// captured graph's arguments re-supplied, which is the ordinary
+    /// case and tells the caller to take a pooled flag as before.
+    ///
+    /// Both graph paths must answer, and for the same reason. A capture
+    /// bakes this pointer into every node. An argument UPDATE rewrites
+    /// those same nodes, so if it handed them a pooled flag instead, the
+    /// nodes would point at a buffer that goes back to the pool the
+    /// moment the pass ends -- handed to an unrelated dispatch, and
+    /// written through by the graph on its next replay. The graph's own
+    /// flag is the only correct answer in both cases.
     #[cfg(feature = "gpu-offload")]
     pub(crate) fn capture_shared_flag(
         &self,
         stream: &Arc<Stream>,
     ) -> Option<Arc<cuda_bridge::DeviceBuffer<u64>>> {
-        let held = self.capture.read();
-        let capture = held.as_ref()?;
-        if !Arc::ptr_eq(&capture.stream, stream) {
-            return None;
+        if let Some(capture) = self.capture.read().as_ref() {
+            if Arc::ptr_eq(&capture.stream, stream) {
+                return capture.flag.clone();
+            }
         }
-        capture.flag.clone()
+        let graph_handle = self.replay_binding_on(stream)?;
+        graphs().read().get(&graph_handle).and_then(|g| g.flag.clone())
     }
 
     /// Stop recording, instantiate, and register the result.
@@ -660,13 +710,13 @@ impl OffloadCache {
             }
         };
         let nodes = graph.node_count().unwrap_or(0);
-        if nodes != state.dispatches || state.nodes != state.dispatches {
+        if nodes != state.dispatches || state.confirmed != state.dispatches {
             tracing::warn!(
                 "gpu graph: captured {} dispatches but the graph holds {nodes} nodes \
                  ({} confirmed during capture). Refusing rather than handing back \
                  a graph that replays less work than was recorded.",
                 state.dispatches,
-                state.nodes,
+                state.confirmed,
             );
             return 0;
         }
@@ -682,10 +732,11 @@ impl OffloadCache {
             handle,
             InstalledGraph {
                 exec: Arc::new(exec),
-                nodes,
+                node_count: nodes,
                 _pins: state.pins,
                 writes: state.writes,
                 flag: state.flag,
+                nodes: state.nodes,
             },
         );
         tracing::debug!("gpu graph: captured {nodes} nodes as handle {handle}");
@@ -719,21 +770,20 @@ impl OffloadCache {
             return 0;
         };
         let Some(ctx) = self.device() else { return 0 };
-        if let Err(e) = exec.launch(&stream) {
-            tracing::warn!("gpu graph: replay of handle {graph_handle} failed: {e}");
-            return 0;
-        }
-        let event = match cuda_bridge::Event::new(ctx) {
-            Ok(e) => std::sync::Arc::new(e),
+        // `launch` records the completion event itself, because it also
+        // stamps it into the `last_write` slot of every buffer the graph
+        // writes -- see its doc comment. Using that same event as the
+        // submission's is not a shortcut: two events would mean the
+        // submission and the buffers were waiting on different points in
+        // the same stream, which is one more thing to get wrong for no
+        // benefit.
+        let event = match exec.launch(ctx, &stream) {
+            Ok(ev) => ev,
             Err(e) => {
-                tracing::warn!("gpu graph: Event::new after replay: {e}");
+                tracing::warn!("gpu graph: replay of handle {graph_handle} failed: {e}");
                 return 0;
             }
         };
-        if let Err(e) = stream.record_event(&event) {
-            tracing::warn!("gpu graph: record_event after replay: {e}");
-            return 0;
-        }
         // Every array the captured launches write is now ahead of its
         // host mirror. Marking is a bit each; the download happens only
         // if Java asks for one of them.
@@ -764,6 +814,134 @@ impl OffloadCache {
         }))
     }
 
+    /// Open an argument-update pass over `graph_handle`.
+    ///
+    /// Between this and [`Self::graph_end_replay`] the caller re-issues
+    /// the dispatch sequence it captured. Nothing runs: each dispatch
+    /// rewrites the arguments of the node it corresponds to.
+    #[cfg(feature = "gpu-offload")]
+    pub fn graph_begin_replay(&self, stream_handle: u64, graph_handle: u64) -> bool {
+        let Some(stream) = self.resolve_stream(stream_handle) else {
+            return false;
+        };
+        if graphs().read().get(&graph_handle).is_none() {
+            tracing::warn!("gpu graph: begin_replay on unknown handle {graph_handle}");
+            return false;
+        }
+        if self.capture.read().is_some() {
+            tracing::warn!(
+                "gpu graph: refusing to open an argument-update pass while a capture is                  open; a dispatch cannot be recorded and re-supplied at the same time"
+            );
+            return false;
+        }
+        let mut held = self.replay_bind.write();
+        if held.is_some() {
+            tracing::warn!("gpu graph: an argument-update pass is already open");
+            return false;
+        }
+        *held = Some(ReplayBind {
+            stream,
+            graph_handle,
+            next: 0,
+            refused: None,
+        });
+        true
+    }
+
+    /// Close the pass and submit the graph once.
+    ///
+    /// Refuses — and submits nothing — if the caller's sequence did not
+    /// match the captured one. A short sequence would replay some nodes
+    /// with this iteration's arguments and the rest with the previous
+    /// iteration's, which is a wrong answer rather than a failure.
+    #[cfg(feature = "gpu-offload")]
+    pub fn graph_end_replay(&self, stream_handle: u64) -> u64 {
+        let Some(bind) = self.replay_bind.write().take() else {
+            tracing::warn!("gpu graph: end_replay with no argument-update pass open");
+            return 0;
+        };
+        if let Some(reason) = bind.refused {
+            tracing::warn!("gpu graph: argument-update pass refused a dispatch: {reason}");
+            return 0;
+        }
+        let expected = graphs()
+            .read()
+            .get(&bind.graph_handle)
+            .map_or(0, |g| g.nodes.len());
+        if bind.next != expected {
+            tracing::warn!(
+                "gpu graph: the argument-update pass supplied {} dispatches but the graph                  holds {expected} nodes. Refusing: replaying now would run some nodes with                  this pass's arguments and the rest with the previous pass's.",
+                bind.next,
+            );
+            return 0;
+        }
+        self.graph_replay(stream_handle, bind.graph_handle)
+    }
+
+    /// Whether an argument-update pass is open on `stream`, and if so
+    /// the graph it is updating.
+    #[cfg(feature = "gpu-offload")]
+    fn replay_binding_on(&self, stream: &Arc<Stream>) -> Option<u64> {
+        let held = self.replay_bind.read();
+        let bind = held.as_ref()?;
+        Arc::ptr_eq(&bind.stream, stream).then_some(bind.graph_handle)
+    }
+
+    /// Rewrite the next node's arguments from this dispatch.
+    ///
+    /// Answers `Err` with a reason the caller can report. Every failure
+    /// is recorded on the bind as well, so `end_replay` refuses even if
+    /// the caller ignores the individual dispatch's status.
+    #[cfg(feature = "gpu-offload")]
+    fn update_next_node(
+        &self,
+        graph_handle: u64,
+        class_id: ClassId,
+        method_index: u16,
+        args: &cuda_bridge::KernelArgs,
+    ) -> Result<(), String> {
+        let mut held = self.replay_bind.write();
+        let Some(bind) = held.as_mut() else {
+            return Err("no argument-update pass is open".to_string());
+        };
+        let entry = graphs()
+            .read()
+            .get(&graph_handle)
+            .and_then(|g| g.nodes.get(bind.next).copied().map(|n| (g.exec.clone(), n)));
+        let Some((exec, (node, want_class, want_method))) = entry else {
+            let reason = format!(
+                "the update pass reached dispatch {} but the graph holds fewer nodes",
+                bind.next
+            );
+            bind.refused.get_or_insert(reason.clone());
+            return Err(reason);
+        };
+        // The kernel at this position must be the one captured here.
+        // Updating a node with another kernel's arguments is something
+        // the driver accepts, and it produces a wrong answer.
+        if (want_class, want_method) != (class_id, method_index) {
+            let reason = format!(
+                "dispatch {} is class_id={class_id:?} method={method_index}, but the graph                  captured class_id={want_class:?} method={want_method} at that position;                  the sequence has drifted from the one that was captured",
+                bind.next
+            );
+            bind.refused.get_or_insert(reason.clone());
+            return Err(reason);
+        }
+        bind.next += 1;
+        // Drop the lock before the driver call: nothing below touches
+        // the bind, and holding a write lock across FFI serialises
+        // nothing useful.
+        let at = bind.next - 1;
+        drop(held);
+        exec.set_kernel_node_args(node, args).map_err(|e| {
+            let reason = format!("updating node {at}: {e}");
+            if let Some(b) = self.replay_bind.write().as_mut() {
+                b.refused.get_or_insert(reason.clone());
+            }
+            reason
+        })
+    }
+
     /// How many nodes a graph holds, or `-1` for an unknown handle.
     ///
     /// A caller compares this with the number of dispatches it issued
@@ -776,7 +954,7 @@ impl OffloadCache {
         graphs()
             .read()
             .get(&graph_handle)
-            .map_or(-1, |g| i32::try_from(g.nodes).unwrap_or(i32::MAX))
+            .map_or(-1, |g| i32::try_from(g.node_count).unwrap_or(i32::MAX))
     }
 
     /// Free a graph. Idempotent, and a no-op for an unknown handle --
@@ -811,11 +989,19 @@ impl OffloadCache {
     /// the resident handles among them are remembered so a replay can
     /// mark them dirty.
     #[cfg(feature = "gpu-offload")]
-    fn note_captured(&self, node_confirmed: bool, writebacks: Vec<MarshalWriteback>) {
+    fn note_captured(
+        &self,
+        node: Option<cuda_bridge::graph::GraphNode>,
+        kernel: Option<(ClassId, u16)>,
+        writebacks: Vec<MarshalWriteback>,
+    ) {
         if let Some(c) = self.capture.write().as_mut() {
             c.dispatches += 1;
-            if node_confirmed {
-                c.nodes += 1;
+            if node.is_some() {
+                c.confirmed += 1;
+            }
+            if let (Some(node), Some((class_id, method_index))) = (node, kernel) {
+                c.nodes.push((node, class_id, method_index));
             }
             for w in &writebacks {
                 if let Some(h) = w.resident_handle() {
@@ -2672,6 +2858,34 @@ impl OffloadCache {
             block => cuda_bridge::LaunchConfig::elementwise_with_block(work, block),
         };
 
+        // 3a-update. An argument-update pass rewrites the node this
+        //     dispatch corresponds to and runs nothing. Placed before
+        //     the capture arm because the two are mutually exclusive and
+        //     `graph_begin_replay` refuses to open while a capture is
+        //     open, so reaching both is impossible by construction.
+        //
+        //     Everything above this point still happens — resolving the
+        //     kernel, marshalling the arguments — because the arguments
+        //     are the whole point. What is skipped is the launch, the
+        //     completion event, the submission-table entry and the host
+        //     callback, exactly as in a capture.
+        if let Some(graph_handle) = self.replay_binding_on(&stream) {
+            if let Err(reason) =
+                self.update_next_node(graph_handle, class_id, method_index, &args)
+            {
+                return make(SubmissionStatus::Failed {
+                    message: format!("graph argument update refused: {reason}"),
+                    kind: GpuErrorKind::Launch,
+                });
+            }
+            // As in a capture: nothing ran, so there is nothing to
+            // await. `end_replay` hands back the one handle that does
+            // name real work.
+            return make(SubmissionStatus::Completed {
+                result: SerializedResult::Void,
+            });
+        }
+
         // 3a-capture. A capture records launches instead of running them,
         //     so everything below that exists to observe a running
         //     submission is skipped: the chunked writeback (it commits host
@@ -2731,7 +2945,7 @@ impl OffloadCache {
             // holds fewer nodes than the loop had launches -- a graph like
             // that replays successfully and does less, which is the worst
             // way for this to fail.
-            let confirmed = matches!(stream.capturing_node(), Ok(Some(_)));
+            let node = stream.capturing_node().ok().flatten();
             // Take the writebacks out of the finalize state and drop the
             // rest of it. The rest is a GC-critical guard, and holding
             // one per captured launch for the life of the graph would
@@ -2739,7 +2953,7 @@ impl OffloadCache {
             // writebacks are what own the device buffers this launch was
             // given, and those must outlive the graph.
             let pins = finalize_state.map(|fs| fs.writebacks).unwrap_or_default();
-            self.note_captured(confirmed, pins);
+            self.note_captured(node, Some((class_id, method_index)), pins);
             // No handle: nothing ran, so there is nothing to await. The
             // Java side documents that a dispatch made during a capture
             // returns no usable submission.

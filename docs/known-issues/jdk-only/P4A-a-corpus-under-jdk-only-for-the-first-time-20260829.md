@@ -50,9 +50,9 @@ HotSpot          196      13        9
 
 **A `TIMEOUT` is not a failure and is not counted as one.** 38 against HotSpot's
 9, on the same shard layout and the same load, is a statement about SPEED —
-quantified in §5, which also says how far the serial re-run of those 38 got
-(3 usable verdicts, 1 withdrawn as an artefact of the re-run harness) and counts
-the other 34 as unmeasured.
+quantified in §5. **All 38 were subsequently re-run at 600 s and §6 has their
+verdicts**; the totals in this table are the 90-second ones and §6 restates them.
+
 
 ## 3. The headline: `--jdk-only` introduced no failures of its own
 
@@ -231,6 +231,72 @@ some of them — `TestIndex` at 107 s and `TestLIRSMemoryConsumption` at 264 s a
 both ordinary passes that a 90 s cap called timeouts. What they do **not**
 license is the claim that the other 34 are all passes: an unmeasured vector has
 no verdict, and `TestCases` is still over at 600 s.
+
+## 6. FINISHED 2026-08-30: the 38 were re-run, and the headline survives it
+
+§5 left 34 of the 38 capped vectors UNMEASURED and said so. They are measured
+now — all 38, at a 600-second cap, three shards, **working directory on `/data`**
+so the instrument fault §5 describes cannot recur.
+
+```text
+re-run of the 38          PASS 13    FAIL 4    TIMEOUT(600s) 21
+  rows carrying ENOSPC     0                   <- the §5 fault is gone
+```
+
+Folding that into §2 gives the corpus its complete strict-mode picture:
+
+```text
+                 PASS   FAIL   TIMEOUT
+--jdk-only, was   166     14     38  (90s)
+--jdk-only, now   179     18     21  (600s)      179+18+21 = 218
+```
+
+### The four new failures do not change §3's answer, and two of them needed the compat arm to say so
+
+```text
+                              HotSpot        CratonVM compat   CratonVM strict
+TestOutOfMemory               FAIL   17s     -                 FAIL     6s
+TestMvccMultiThreaded         FAIL    2s     -                 FAIL    10s
+TestOpenClose                 PASS   18s     FAIL   346s       FAIL   451s
+TestRandomMapOps              PASS  143s     FAIL   480s       TIMEOUT 600s
+```
+
+* The first two **fail on HotSpot too** — environment and fixture, like the nine
+  in §3.
+* The last two pass on HotSpot, so each got the third run that decides
+  attribution, and **both fail in CratonVM's COMPATIBLE mode as well**. They are
+  CratonVM defects, not `--jdk-only` defects.
+
+So after adjudicating every one of the 38, **`--jdk-only` still produces ZERO
+failures that compatible mode does not** — now over 197 adjudicated vectors
+rather than 180, which is the claim P4-A exists to make and it got stronger, not
+weaker, by being finished.
+
+`TestRandomMapOps` is worth one note: its HotSpot verdict was `TIMEOUT` at 90 s
+in §2, which is **not** "HotSpot fails". Re-run at 600 s it PASSES in 143 s. A
+cap on the oracle side is an absent oracle, and comparing against one would have
+mis-attributed this row in either direction.
+
+### Two defects to hand on
+
+Both are mode-independent CratonVM defects on classes HotSpot passes, and
+neither belongs to this lane:
+
+* **`org.h2.test.db.TestOpenClose`** — fails in both modes after ~350–450 s,
+  against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
+* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with a
+  reproducible seed, which is the useful part:
+  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`. That is an
+  MVStore random-operation fuzz with the seed printed, so it replays.
+
+### The 21 that still do not finish
+
+Still `TIMEOUT`, now at a cap **6.7x larger**, and still counted as UNMEASURED
+rather than as failures. The re-run itself ran under a host load between 12 and
+27 with other lanes active, so these remain load-qualified: a 600 s cap on a
+box at load 27 is not the same instrument as a 600 s cap on an idle one. What
+can be said is that they are the slow tail §5 predicted from the ratio data, and
+that nothing in the 17 that did resolve turned out to be a `--jdk-only` defect.
 
 ## Reproduce
 

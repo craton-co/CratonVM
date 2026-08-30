@@ -227,12 +227,14 @@ unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) 
 pub struct Stream {
     inner: StreamCuda,
     capturing: std::sync::atomic::AtomicBool,
+    captured_slots: std::sync::Mutex<Vec<crate::LastWriteSlot>>,
 }
 
 #[cfg(not(feature = "cuda"))]
 pub struct Stream {
     inner: StreamStub,
     capturing: std::sync::atomic::AtomicBool,
+    captured_slots: std::sync::Mutex<Vec<crate::LastWriteSlot>>,
 }
 
 impl Stream {
@@ -255,9 +257,50 @@ impl Stream {
     }
 
     /// Record that a capture opened or closed on this stream.
+    ///
+    /// Opening one clears the accumulated slot list: a capture owns the
+    /// buffers it touches only for its own lifetime, and inheriting the
+    /// previous capture's list would make a replay stamp buffers this
+    /// graph never writes.
     pub(crate) fn set_capturing(&self, on: bool) {
+        if on {
+            self.captured_slots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
         self.capturing
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Remember that a captured launch took `slots` as arguments.
+    ///
+    /// The launch path hands these over instead of stamping them, and
+    /// [`crate::graph::GraphExec::launch`] stamps them with the replay's
+    /// completion event. That is what keeps the per-buffer ordering
+    /// contract intact across a graph: without it a capture would leave
+    /// every buffer it touched with an empty `last_write`, and a read
+    /// from any OTHER stream after a replay would be released with
+    /// nothing to wait on.
+    ///
+    /// Deduplicated by slot identity. One buffer is typically an
+    /// argument to many launches in a graph -- GPULlama3's 453 launches
+    /// name about 1800 arguments over roughly 100 distinct buffers --
+    /// and stamping the same slot 18 times per replay is 17 wasted lock
+    /// acquisitions.
+    pub(crate) fn note_captured_slots(&self, slots: &[crate::LastWriteSlot]) {
+        let mut held = self.captured_slots.lock().unwrap_or_else(|p| p.into_inner());
+        for slot in slots {
+            if !held.iter().any(|s| std::sync::Arc::ptr_eq(s, slot)) {
+                held.push(slot.clone());
+            }
+        }
+    }
+
+    /// Take the slots accumulated since `begin_capture`, for the graph
+    /// that is being handed back.
+    pub(crate) fn take_captured_slots(&self) -> Vec<crate::LastWriteSlot> {
+        std::mem::take(&mut *self.captured_slots.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
@@ -304,6 +347,7 @@ impl Stream {
                 id,
             },
             capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -317,6 +361,7 @@ impl Stream {
         Ok(Self {
             inner: StreamStub::new(),
             capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -563,6 +608,7 @@ impl Stream {
         Self {
             inner: StreamStub::new(),
             capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
