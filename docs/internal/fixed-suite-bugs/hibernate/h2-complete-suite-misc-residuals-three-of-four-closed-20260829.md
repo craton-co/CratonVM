@@ -6,7 +6,7 @@ That page grouped four single-class failures from the 4548-class H2 run and said
 of all four: "None cross-checked against HotSpot yet. None root-caused." All
 four now have the A/B it named as missing. Three are closed here. The fourth is
 a real CratonVM defect and moves to its own page,
-`docs/known-issues/hibernate/jpalargeblob-random-state-side-table-20260829.md`,
+`docs/internal/fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`,
 because it has a named mechanism and deserves not to be filed under
 "miscellaneous".
 
@@ -122,4 +122,4 @@ HotSpot passes in `test_ms=7078`. CratonVM does not time out at 120 s so much as
 take **312 s**: the `@Timeout(120)` is a method-level JUnit annotation that no
 runner property can widen, so the run is reported as a timeout while the work
 continues to completion. Two independent mechanisms, both measured, in
-`docs/known-issues/hibernate/jpalargeblob-random-state-side-table-20260829.md`.
+`docs/internal/fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`.
