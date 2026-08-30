@@ -26942,14 +26942,30 @@ fn invoke_on_class_shared_inner(
                     // the only body there is and redefinition changes nothing
                     // about that (contract §7 step 3b).
                     //
-                    // `native_shadow_suppressed_in` rather than the `_by_redefine`
-                    // wrapper, because the `cm` read guard is still held here and a
-                    // nested read self-deadlocks under parking_lot's
-                    // writer-preferring fairness once any writer is queued.
+                    // Asked of `declaring_id` -- the class that OWNS the body the
+                    // native is shadowing -- and NOT of a name lookup.
+                    // `native_shadow_suppressed_in` resolves `class_name` through
+                    // `get_loaded_class_id`, which is a different question: a
+                    // reflective invoke arrives with the RECEIVER's class name, and
+                    // for a Mockito mock of an abstract type that is the generated
+                    // subclass, whose generation is and stays 0 while its
+                    // superclass is the one the agent wove. `find_method_recursive`
+                    // has already walked to the declaring class, so the exact id is
+                    // in hand and there is no reason to re-derive a worse one.
+                    //
+                    // Measured: with the name form this guard did not fire at all
+                    // and `Method.invoke(transferTo)` still ran the native --
+                    // `read3` saw a 16777216-byte buffer where the JDK body uses
+                    // 16384, while `readNBytes` and `skip` (no native registered)
+                    // were intercepted correctly in the same run.
+                    //
+                    // `method.is_abstract()` is deliberately NOT guarded: an
+                    // abstract method has no `Code`, so the registered native is
+                    // the only body there is and redefinition changes nothing
+                    // about that (contract §7 step 3b).
                     let name_override_suppressed_by_redefine = name_override
-                        && crate::runtime::redefine_state::native_shadow_suppressed_in(
-                            &cm, class_name,
-                        )
+                        && crate::classloading::any_class_redefined()
+                        && cm.class_redefine_generation(declaring_id) > 0
                         && !crate::runtime::interpreter::redefine_immune_forced_native(
                             class_name,
                             method_name,
