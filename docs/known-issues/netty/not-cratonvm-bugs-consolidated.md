@@ -57,7 +57,7 @@ this page is the index, not a replacement for them.
 | ~~`io.netty.handler.ssl.SslErrorTest`~~ **— WITHDRAWN 2026-08-20, this IS a CratonVM bug** | The cross-check was `found=0 started=0` on both VMs, and that is not agreement — it is two VMs running nothing. The parameterisation yielded zero cases because `OpenSsl.isAvailable()` was false, which was the CLASSPATH | **RE-TAKEN with `gen-openssl-args.sh`: HotSpot `found=72 ok=72`, CratonVM `found=72 ok=60 failed=12`.** All 12 were `clientProvider = JDK` client-side certificate rejections answering `TLSV1_ALERT_ACCESS_DENIED` where a certificate alert is required. **FIXED 2026-08-21 — 72/72, matching HotSpot** | `ssl-client-sends-access-denied-for-every-trust-rejection-FIXED-20260821.md` |
 | `io.netty.pkitesting.CertificateBuilderTest` | Result set matches HotSpot exactly, in both directions | `ok=39 failed=28 aborted=7` on both VMs; failing-test-name sets identical (`comm`-verified) | `certificatebuildertest-fail-status-not-a-regression-20260816.md` |
 | `io.netty.handler.ssl.PemEncodedTest` | `1 ok / 2 aborted` is steady-state-correct — two intentional `assumeFalse` skips, not a regression | Isolated on G1: `1 ok / 2 aborted` identical on CratonVM and HotSpot | `pemencodedtest-aborted-status-not-a-regression-20260816.md` |
-| `io.netty.bootstrap.BootstrapTest` / `io.netty.bootstrap.ServerBootstrapTest` | `mustCallInitializerExtensions()` fails identically on stock HotSpot JDK 25 (`AssertionFailedError: expected: <[id: 0x...]> but was: <null>`) — a ServiceLoader/classpath artifact of this runner (module-scoped `ChannelInitializerExtension` discovery not populated the way netty's real Maven/module build would), not a CratonVM defect | Direct HotSpot cross-check, identical failure and message | `netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md` |
+| `io.netty.bootstrap.BootstrapTest` / `io.netty.bootstrap.ServerBootstrapTest` | ~~a ServiceLoader/classpath artifact of this runner (module-scoped `ChannelInitializerExtension` discovery not populated the way netty's real Maven/module build would)~~ — it was ONE MISSING SYSTEM PROPERTY. netty gates extension discovery behind `io.netty.bootstrap.extensions=serviceload` (`ChannelInitializerExtensions.java:55`), netty's own surefire `<argLine>` passes it (`pom.xml:1679`), and `common.args` did not. The SPI resource was present in `transport/target/test-classes` the whole time; nothing ever asked for it | Was: identical `AssertionFailedError: expected: <[id: 0x...]> but was: <null>` on both VMs. **RESOLVED 2026-08-29 by adding that one line to `common.args`: `BootstrapTest` `ok=17 failed=0` and `ServerBootstrapTest` `ok=6 failed=0` on BOTH VMs.** The row stays not-a-CratonVM-bug, for a different reason — nothing fails any more | `netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md` |
 
 ## What this list is not
 
@@ -85,6 +85,18 @@ Before adding a row here, ask whether the environment gap it names is one
 this project could close. Several on this page genuinely are not (a native
 library that is not installed, Maven metadata a fork-per-class runner has no
 way to synthesize). The `-ea` one was, for a week, and nobody checked.
+
+**It happened again, and it took ten days.** The two `bootstrap` rows blamed
+"Maven metadata a fork-per-class runner has no way to synthesize" — the exact
+phrase above — for a gap that was one system property netty's own surefire
+configuration sets on the line right next to the `-ea` this page already
+learned from. The SPI resource the row assumed was missing was sitting in
+`transport/target/test-classes`.
+
+So the check has a sharper form now: **do not describe the gap, LOOK for how
+netty's own build closes it.** `grep` the reactor `pom.xml` for the property,
+the argLine, the resource. Both times the answer was one line in `common.args`,
+and both times the row's prose was a plausible story told instead of a search.
 
 ## Related
 

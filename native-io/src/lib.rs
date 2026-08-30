@@ -14887,18 +14887,37 @@ fn native_dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // `DataOutputStream.write(byte[], int, int)` validates before it writes —
+    // `out.write(b, off, len)` reaches `OutputStream.write`, which null-checks
+    // the array and range-checks the window. Returning `Ok(None)` for both made
+    // them SILENT NO-OPS: the same shape as `FilterOutputStream`'s two in part
+    // three, in the class most likely to be wrapping a socket.
+    //
+    //   dos.write(null, 0, 1)        HotSpot NPE,  this VM nothing
+    //   dos.write(new byte[2], 1, 5) HotSpot IOOBE, this VM nothing
+    //
+    // MEASURED with `apps/probes/L4CensusTail.java`.
     let buf = match args.get(1) {
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    let off_i = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let cap = ctx.array_length(buf) as i64;
+    if off_i < 0 || len_i < 0 || (len_i as i64) > cap - (off_i as i64) {
+        return Err(cratonvm_types::error::RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!("off {off_i}, len {len_i}, buffer length {cap}")),
+        }
+        .into());
+    }
+    let off = off_i as usize;
+    let len = len_i as usize;
     // GC-safety: each byte write can run a moving GC — rebind `this` to
     // dos_write_one's returned (refreshed) ref and re-read `buf` through a
     // pin every iteration.

@@ -15230,7 +15230,16 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
             // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
-            let name = ctx.create_string("TLS");
+            // The lazily-created default's protocol is the literal string
+            // "Default", not "TLS". MEASURED on jdk-25.0.3.9-hotspot:
+            // `SSLContext.getDefault().getProtocol()` answers `Default`, which
+            // is `SSLContext.getInstance("Default")` -- the name the JDK
+            // registers its pre-initialised context under. "TLS" is the name of
+            // a context you asked for by protocol and then have to `init()`
+            // yourself, so the two are not interchangeable: code that switches
+            // on `getProtocol()` to decide whether a context is ready to use
+            // reads this one as unconfigured.
+            let name = ctx.create_string("Default");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
             crate::t27_tls::set_runtime_default_ssl_context(obj);

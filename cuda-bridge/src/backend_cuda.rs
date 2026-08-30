@@ -1245,6 +1245,54 @@ impl<
         Ok(())
     }
 
+    /// Overwrite this buffer's contents in place from `host`.
+    ///
+    /// The one thing `from_host` cannot do: it allocates, and a caller
+    /// that needs the DEVICE POINTER to stay the same cannot allocate.
+    /// A captured CUDA graph bakes every argument pointer into its
+    /// nodes, so the only way to feed a replay new input is to write
+    /// through the pointer it already holds.
+    ///
+    /// Synchronous, like `from_host` and `to_host`: the copy is
+    /// observable on the device when this returns, so a caller may
+    /// reuse `host` immediately and a replay submitted afterwards sees
+    /// the new bytes. The copy runs on `copy_h2d` and host-blocks on
+    /// that stream alone, leaving `compute` and `copy_d2h` running.
+    ///
+    /// Length must match exactly. A shorter `host` would leave a
+    /// partially-updated buffer, which is a wrong answer rather than an
+    /// error, and a longer one would write past the allocation.
+    pub(crate) fn copy_from_host(&self, host: &[T]) -> Result<()> {
+        if host.len() != self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "copy_from_host length mismatch: host.len()={}, slice.len()={}",
+                host.len(),
+                self.len()
+            )));
+        }
+        if host.is_empty() {
+            return Ok(());
+        }
+        self.dev.bind_to_thread().map_err(map_err("bind_to_thread"))?;
+        let dst = *DevicePtr::device_ptr(&*self.slice);
+        // SAFETY: lengths were checked equal above, the context is bound,
+        // and the `cuStreamSynchronize` below discharges the borrow of
+        // `host` that the async copy takes.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(dst, host, self.copy_h2d_stream())
+                .map_err(map_err("cuMemcpyHtoDAsync copy_from_host"))?;
+            cudarc::driver::result::stream::synchronize(self.copy_h2d_stream())
+                .map_err(map_err("cuStreamSynchronize copy_from_host"))?;
+        }
+        Ok(())
+    }
+
+    /// The stream `copy_from_host` uploads on -- the same one the
+    /// allocation was bound to when it came from `from_host`.
+    fn copy_h2d_stream(&self) -> cudarc::driver::sys::CUstream {
+        self.stream.stream
+    }
+
     /// AUDIT 2026-05-24 (C32 stream-port fix): truly async D→H.
     ///
     /// Submits `cuMemcpyDtoHAsync` onto the caller-supplied
