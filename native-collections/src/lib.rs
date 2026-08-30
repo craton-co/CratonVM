@@ -26091,7 +26091,37 @@ fn of_list_allowing_nulls(
 /// what those factories produce.
 fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge`, so `--jdk-only` DROPS the whole family and
+    // real bytecode runs.
+    //
+    // `Bridge` asserts "no working real-bytecode fallback exists". For this
+    // family that is a compatible-mode claim wearing a mode-independent tag,
+    // and under `--jdk-only` it was not merely unnecessary but FATAL:
+    //
+    // ```text
+    // apps/probes/UtilCoverage4Sweep, --jdk-only
+    //   48 ser List.of(1)  THREW java.lang.NoClassDefFoundError
+    //   ...
+    //   java.lang.NoClassDefFoundError: cratonvm/internal/UnmodifiableList
+    // ```
+    //
+    // -- every `List.of`/`Set.of`/`Map.of` failed to DESERIALIZE. Writing
+    // worked and produced the same 59 bytes HotSpot writes; the read side then
+    // reached `native_collser_read_resolve`, which rebuilds through `of_list`
+    // and `freeze_result` into a `cratonvm/internal/Unmodifiable*` that strict
+    // mode refuses to fabricate. The producers this carrier has are supposed to
+    // be dropped in strict -- `alloc_immutable_wrapper`'s doc says so and lists
+    // them -- and this one was missed because it is registered from a DIFFERENT
+    // registrar than the factories it mirrors, under this `Bridge` window.
+    //
+    // The reason the native exists at all is in `native_collser_read_resolve`:
+    // the real body rebuilds maps through real `ImmutableCollections` ctors,
+    // producing a `table`-backed object that this crate's map natives read as
+    // empty. That is true in COMPATIBLE mode, where those natives run. It is
+    // exactly false under `--jdk-only`, where they are dropped and a real
+    // `Map1` is the right answer and the only one -- which is why the strict
+    // rows now agree with HotSpot down to the class name.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for c in [
         "java/util/ImmutableCollections$List12",
         "java/util/ImmutableCollections$ListN",
